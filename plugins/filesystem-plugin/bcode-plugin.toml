@@ -1,0 +1,15 @@
+id      = "bcode.filesystem"
+name    = "Bcode Filesystem Plugin"
+version = "0.0.1"
+
+[[services]]
+description  = "Filesystem read/write utility service"
+interface_id = "bcode.filesystem/v1"
+name         = "Filesystem"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_filesystem_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"
