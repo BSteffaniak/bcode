@@ -63,6 +63,7 @@ struct ServerState {
     plugins: Mutex<bcode_plugin::PluginHost>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
+    permission_policy: PermissionPolicy,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
@@ -83,12 +84,40 @@ struct PendingPermission {
     notify: Arc<Notify>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PermissionPolicy {
+    allow_tools: BTreeSet<String>,
+    deny_tools: BTreeSet<String>,
+}
+
+impl PermissionPolicy {
+    fn decision_for_tool(&self, tool_name: &str) -> Option<bool> {
+        if self.deny_tools.contains(tool_name) {
+            Some(false)
+        } else if self.allow_tools.contains(tool_name) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<&bcode_config::PermissionConfig> for PermissionPolicy {
+    fn from(value: &bcode_config::PermissionConfig) -> Self {
+        Self {
+            allow_tools: value.allow_tools.clone(),
+            deny_tools: value.deny_tools.clone(),
+        }
+    }
+}
+
 impl ServerState {
     fn new(
         sessions: SessionManager,
         plugins: bcode_plugin::PluginHost,
         selected_provider_plugin_id: Option<String>,
         selected_model_id: Option<String>,
+        permission_policy: PermissionPolicy,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
@@ -96,6 +125,7 @@ impl ServerState {
             plugins: Mutex::new(plugins),
             selected_provider_plugin_id,
             selected_model_id,
+            permission_policy,
             active_turns: Mutex::default(),
             pending_permissions: Mutex::default(),
             next_permission_id: Mutex::new(1),
@@ -144,6 +174,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         plugins,
         config.model.provider_plugin_id.clone(),
         config.model.model_id.clone(),
+        PermissionPolicy::from(&config.permissions),
     ));
     let mut shutdown = state.subscribe_shutdown();
     loop {
@@ -563,18 +594,13 @@ async fn handle_resolve_permission(
     };
     *permission.decision.lock().await = Some(approved);
     permission.notify.notify_waiters();
-    match state
-        .sessions
-        .append_permission_resolved(
-            permission.summary.session_id,
-            permission.summary.permission_id,
-            approved,
-        )
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append permission result: {error}"),
-    }
+    append_permission_resolved_event(
+        state,
+        permission.summary.session_id,
+        permission.summary.permission_id,
+        approved,
+    )
+    .await;
     send_response(
         writer,
         request_id,
@@ -1015,48 +1041,90 @@ async fn request_tool_permission(
     call: &bcode_model::ToolCall,
     definition: &ServiceToolDefinition,
 ) -> bool {
-    let permission_id = {
-        let mut next = state.next_permission_id.lock().await;
-        let permission_id = format!("perm-{}", *next);
-        *next += 1;
-        permission_id
-    };
+    let permission_id = next_permission_id(state).await;
+    let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
+    append_permission_requested_event(
+        state,
+        session_id,
+        permission_id.clone(),
+        call.id.clone(),
+        definition.name.clone(),
+        arguments_json.clone(),
+    )
+    .await;
+    if let Some(decision) = state.permission_policy.decision_for_tool(&definition.name) {
+        append_permission_resolved_event(state, session_id, permission_id, decision).await;
+        return decision;
+    }
     let pending = PendingPermission {
         summary: PermissionSummary {
             permission_id: permission_id.clone(),
             session_id,
             tool_call_id: call.id.clone(),
             tool_name: definition.name.clone(),
-            arguments_json: serde_json::to_string(&call.arguments).unwrap_or_default(),
+            arguments_json,
         },
         decision: Arc::new(Mutex::new(None)),
         notify: Arc::new(Notify::new()),
     };
-    match state
-        .sessions
-        .append_permission_requested(
-            session_id,
-            permission_id.clone(),
-            call.id.clone(),
-            definition.name.clone(),
-            serde_json::to_string(&call.arguments).unwrap_or_default(),
-        )
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append permission request: {error}"),
-    }
     state
         .pending_permissions
         .lock()
         .await
-        .insert(permission_id.clone(), pending.clone());
+        .insert(permission_id, pending.clone());
     loop {
         let decision = *pending.decision.lock().await;
         if let Some(decision) = decision {
             return decision;
         }
         pending.notify.notified().await;
+    }
+}
+
+async fn next_permission_id(state: &ServerState) -> String {
+    let mut next = state.next_permission_id.lock().await;
+    let permission_id = format!("perm-{}", *next);
+    *next += 1;
+    permission_id
+}
+
+async fn append_permission_requested_event(
+    state: &ServerState,
+    session_id: SessionId,
+    permission_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    arguments_json: String,
+) {
+    match state
+        .sessions
+        .append_permission_requested(
+            session_id,
+            permission_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append permission request: {error}"),
+    }
+}
+
+async fn append_permission_resolved_event(
+    state: &ServerState,
+    session_id: SessionId,
+    permission_id: String,
+    approved: bool,
+) {
+    match state
+        .sessions
+        .append_permission_resolved(session_id, permission_id, approved)
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append permission result: {error}"),
     }
 }
 

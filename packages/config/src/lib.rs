@@ -21,12 +21,15 @@ pub struct BcodeConfig {
     pub plugins: PluginConfig,
     #[serde(default)]
     pub model: ModelConfig,
+    #[serde(default)]
+    pub permissions: PermissionConfig,
 }
 
 impl BcodeConfig {
     fn merge(&mut self, next: Self) {
         self.plugins.merge(next.plugins);
         self.model.merge(next.model);
+        self.permissions.merge(next.permissions);
     }
 }
 
@@ -47,6 +50,22 @@ impl ModelConfig {
         if next.model_id.is_some() {
             self.model_id = next.model_id;
         }
+    }
+}
+
+/// Permission policy configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionConfig {
+    #[serde(default)]
+    pub allow_tools: BTreeSet<String>,
+    #[serde(default)]
+    pub deny_tools: BTreeSet<String>,
+}
+
+impl PermissionConfig {
+    fn merge(&mut self, next: Self) {
+        self.allow_tools.extend(next.allow_tools);
+        self.deny_tools.extend(next.deny_tools);
     }
 }
 
@@ -188,6 +207,10 @@ disabled = ["example.b"]
 [plugins]
 enabled = ["example.c"]
 disabled = ["example.d"]
+
+[permissions]
+allow_tools = ["filesystem.read"]
+deny_tools = ["shell.run"]
 "#,
         )
         .expect("project config should be written");
@@ -197,6 +220,8 @@ disabled = ["example.d"]
         assert!(config.plugins.enabled.contains("example.c"));
         assert!(config.plugins.disabled.contains("example.b"));
         assert!(config.plugins.disabled.contains("example.d"));
+        assert!(config.permissions.allow_tools.contains("filesystem.read"));
+        assert!(config.permissions.deny_tools.contains("shell.run"));
 
         std::fs::remove_dir_all(root).expect("temp root should clean up");
     }
