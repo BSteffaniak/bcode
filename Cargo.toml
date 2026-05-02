@@ -1,15 +1,42 @@
 [workspace]
-members  = []
+members = [
+    "packages/bcode",
+    "packages/cli",
+    "packages/client",
+    "packages/ipc",
+    "packages/server",
+    "packages/session",
+    "packages/session/models",
+]
 resolver = "2"
 
 [workspace.package]
 authors    = ["Braden Steffaniak"]
 edition    = "2024"
 license    = "MPL-2.0"
+readme     = "README.md"
 repository = "https://github.com/BSteffaniak/bcode"
 version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
+# Internal bcode packages
+bcode_cli            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
+bcode_client         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bcode_ipc            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
+bcode_server         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
+bcode_session        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
+bcode_session_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+
+# BMUX reuse
+bmux_codec = { default-features = false, path = "../bmux/packages/codec" }
+bmux_ipc   = { default-features = false, path = "../bmux/packages/ipc" }
+
+# External dependencies
+clap      = { version = "4.5.40", default-features = false }
+serde     = { version = "1.0.219", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.12", default-features = false }
+tokio     = { version = "1.45.1", default-features = false }
+uuid      = { version = "1.21.0", default-features = false }
 
 [profile.release]
 codegen-units = 1

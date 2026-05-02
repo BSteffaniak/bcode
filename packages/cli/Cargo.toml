@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Command-line interface for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "cli"]
+license     = { workspace = true }
+name        = "bcode_cli"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_client         = { workspace = true }
+bcode_ipc            = { workspace = true }
+bcode_server         = { workspace = true }
+bcode_session_models = { workspace = true }
+clap                 = { workspace = true, features = ["derive", "help", "std", "usage"] }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["signal"] }
+
+[features]
+default          = []
+fail-on-warnings = []

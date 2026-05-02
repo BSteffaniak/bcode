@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Session protocol models for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "session", "models"]
+license     = { workspace = true }
+name        = "bcode_session_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+uuid  = { workspace = true, features = ["serde", "std", "v4"] }
+
+[features]
+default          = []
+fail-on-warnings = []

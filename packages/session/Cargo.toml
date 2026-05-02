@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Session lifecycle and attachment management for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "session"]
+license     = { workspace = true }
+name        = "bcode_session"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["sync"] }
+
+[features]
+default          = []
+fail-on-warnings = []

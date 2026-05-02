@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Local bcode daemon runtime"
+edition     = { workspace = true }
+keywords    = ["bcode", "server", "daemon"]
+license     = { workspace = true }
+name        = "bcode_server"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_ipc = { workspace = true }
+bcode_session = { workspace = true }
+bcode_session_models = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

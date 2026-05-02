@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Umbrella binary for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "coding-agent"]
+license     = { workspace = true }
+name        = "bcode"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bcode"
+path = "src/main.rs"
+
+[dependencies]
+bcode_cli = { workspace = true }
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+default          = []
+fail-on-warnings = []

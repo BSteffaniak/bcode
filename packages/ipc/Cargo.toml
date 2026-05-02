@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Client/server IPC protocol for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "ipc", "protocol"]
+license     = { workspace = true }
+name        = "bcode_ipc"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+bmux_codec           = { workspace = true }
+bmux_ipc             = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["io-util"] }
+
+[features]
+default          = []
+fail-on-warnings = []
