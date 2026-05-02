@@ -27,6 +27,8 @@ type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
 pub enum ServerError {
     #[error("IPC transport error: {0}")]
     Transport(#[from] bcode_ipc::IpcTransportError),
+    #[error("config error: {0}")]
+    Config(#[from] bcode_config::ConfigError),
     #[error("IPC codec error: {0}")]
     Codec(#[from] CodecError),
     #[error("plugin error: {0}")]
@@ -84,8 +86,9 @@ impl ServerState {
 ///
 /// Returns an error when the server cannot bind or accept local IPC connections.
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
-    let mut plugins =
-        bcode_plugin::PluginHost::load_defaults(&bcode_plugin::PluginSelection::all_enabled())?;
+    let config = bcode_config::load_config()?;
+    let plugin_selection = bcode_plugin::PluginSelection::from(&config);
+    let mut plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
     let listener = LocalIpcListener::bind(&endpoint).await?;
     let sessions = SessionManager::persistent(default_session_store_dir())?;
     let state = Arc::new(ServerState::new(sessions));

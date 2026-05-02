@@ -46,6 +46,22 @@ abi_version = 1
 library = "${dylib}"
 EOF
 
+export BCODE_CONFIG="${workdir}/bcode.toml"
+cat >"${BCODE_CONFIG}" <<EOF
+[plugins]
+disabled = ["example.hello"]
+EOF
+
+if cargo run --quiet -p bcode -- plugin list --root "${workdir}/plugins" | grep -q "example.hello"; then
+    echo "disabled plugin should not be listed" >&2
+    exit 1
+fi
+
+cat >"${BCODE_CONFIG}" <<EOF
+[plugins]
+enabled = ["example.hello"]
+EOF
+
 cargo run --quiet -p bcode -- plugin list --root "${workdir}/plugins" | grep -q "example.hello"
 cargo run --quiet -p bcode -- plugin check --root "${workdir}/plugins" | grep -q $'example.hello\tOK'
 

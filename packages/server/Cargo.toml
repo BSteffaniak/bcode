@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_config = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_plugin = { workspace = true }
 bcode_session = { workspace = true }

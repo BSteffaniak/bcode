@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Configuration loading for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "config"]
+license     = { workspace = true }
+name        = "bcode_config"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_plugin = { workspace = true }
+serde        = { workspace = true, features = ["derive", "std"] }
+thiserror    = { workspace = true }
+toml         = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

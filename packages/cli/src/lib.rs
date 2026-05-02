@@ -17,6 +17,8 @@ use thiserror::Error;
 pub enum CliError {
     #[error("client error: {0}")]
     Client(#[from] ClientError),
+    #[error("config error: {0}")]
+    Config(#[from] bcode_config::ConfigError),
     #[error("server error: {0}")]
     Server(#[from] bcode_server::ServerError),
     #[error("TUI error: {0}")]
@@ -130,7 +132,10 @@ enum PluginCommand {
 }
 
 fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
-    let plugins = discover_plugins_for_cli(roots)?;
+    let config = bcode_config::load_config()?;
+    let selection = bcode_plugin::PluginSelection::from(&config);
+    let plugins =
+        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
 
     if plugins.is_empty() {
         println!("no plugins discovered");
@@ -150,7 +155,10 @@ fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
 }
 
 fn check_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
-    let plugins = discover_plugins_for_cli(roots)?;
+    let config = bcode_config::load_config()?;
+    let selection = bcode_plugin::PluginSelection::from(&config);
+    let plugins =
+        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     if plugins.is_empty() {
         println!("no plugins discovered");
         return Ok(());
