@@ -107,6 +107,10 @@ pub enum Request {
         operation: String,
         payload: Vec<u8>,
     },
+    PublishPluginEvent {
+        topic: String,
+        payload: Vec<u8>,
+    },
 }
 
 /// Local server status summary.
@@ -172,6 +176,9 @@ pub enum ResponsePayload {
     },
     PluginServiceResult {
         response: PluginServiceResponse,
+    },
+    PluginEventPublished {
+        delivered: usize,
     },
 }
 

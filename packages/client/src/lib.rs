@@ -213,6 +213,26 @@ impl BcodeClient {
         }
     }
 
+    /// Publish an event to matching daemon plugin subscriptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn publish_plugin_event(
+        &self,
+        topic: String,
+        payload: Vec<u8>,
+    ) -> Result<usize, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::PublishPluginEvent { topic, payload })
+            .await?
+        {
+            ResponsePayload::PluginEventPublished { delivered } => Ok(delivered),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Open a long-lived connection to the daemon.
     ///
     /// # Errors

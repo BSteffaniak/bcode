@@ -233,6 +233,9 @@ async fn handle_request(
             handle_call_plugin_service(request_id, state, writer, &interface_id, operation, payload)
                 .await
         }
+        Request::PublishPluginEvent { topic, payload } => {
+            handle_publish_plugin_event(request_id, state, writer, &topic, &payload).await
+        }
     }
 }
 
@@ -460,6 +463,37 @@ async fn handle_call_plugin_service(
         plugins.invoke_service_by_interface(interface_id, operation, payload)
     };
     send_plugin_service_response(writer, request_id, response).await
+}
+
+async fn handle_publish_plugin_event(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    topic: &str,
+    payload: &[u8],
+) -> Result<(), ServerError> {
+    let response = {
+        let plugins = state.plugins.lock().await;
+        plugins.publish_event(topic, payload)
+    };
+    match response {
+        Ok(delivered) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PluginEventPublished { delivered }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("plugin_error", error.to_string())),
+            )
+            .await
+        }
+    }
 }
 
 async fn send_plugin_service_response(

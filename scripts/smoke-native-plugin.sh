@@ -105,6 +105,8 @@ cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 echo "hello 
 session_id="$(cargo run --quiet -p bcode -- session create plugin-event-smoke)"
 cargo run --quiet -p bcode -- send "${session_id}" "plugin event smoke" >/dev/null
 cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 event-count | grep -q "2"
+cargo run --quiet -p bcode -- plugin publish --daemon example.event "daemon event" | grep -q $'delivered\t1'
+cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 event-count | grep -q "3"
 cargo run --quiet -p bcode -- server stop >/dev/null
 wait "${server_pid}"
 server_pid=""

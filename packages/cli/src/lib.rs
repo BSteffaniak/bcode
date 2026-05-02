@@ -82,9 +82,10 @@ pub async fn run() -> Result<(), CliError> {
             } => call_plugin_service(&root, &interface_id, &operation, payload, daemon).await?,
             PluginCommand::Publish {
                 root,
+                daemon,
                 topic,
                 payload,
-            } => publish_plugin_event(&root, &topic, payload)?,
+            } => publish_plugin_event(&root, &topic, payload, daemon).await?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -190,6 +191,8 @@ enum PluginCommand {
     Publish {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        daemon: bool,
         topic: String,
         payload: Option<String>,
     },
@@ -380,17 +383,26 @@ impl From<bcode_ipc::PluginServiceResponse> for PrintableServiceResponse {
     }
 }
 
-fn publish_plugin_event(
+async fn publish_plugin_event(
     roots: &[std::path::PathBuf],
     topic: &str,
     payload: Option<String>,
+    daemon: bool,
 ) -> Result<(), CliError> {
+    let payload = payload.unwrap_or_default().into_bytes();
+    if daemon {
+        let delivered = BcodeClient::default_endpoint()
+            .publish_plugin_event(topic.to_string(), payload)
+            .await?;
+        println!("delivered\t{delivered}");
+        return Ok(());
+    }
+
     let config = bcode_config::load_config()?;
     let selection = bcode_plugin::PluginSelection::from(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
-    let payload = payload.unwrap_or_default().into_bytes();
     let delivered = host.publish_event(topic, &payload)?;
     host.deactivate_all()?;
     println!("delivered\t{delivered}");
