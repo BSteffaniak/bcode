@@ -51,21 +51,35 @@ pub async fn run() -> Result<(), CliError> {
         },
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
-            PluginCommand::Services { root } => list_plugin_services(&root)?,
+            PluginCommand::Services { root, daemon } => {
+                list_plugin_services(&root, daemon).await?;
+            }
             PluginCommand::Check { root } => check_plugins(&root)?,
             PluginCommand::Invoke {
                 root,
+                daemon,
                 plugin_id,
                 interface_id,
                 operation,
                 payload,
-            } => invoke_plugin_service(&root, &plugin_id, &interface_id, &operation, payload)?,
+            } => {
+                invoke_plugin_service(
+                    &root,
+                    &plugin_id,
+                    &interface_id,
+                    &operation,
+                    payload,
+                    daemon,
+                )
+                .await?;
+            }
             PluginCommand::Call {
                 root,
+                daemon,
                 interface_id,
                 operation,
                 payload,
-            } => call_plugin_service(&root, &interface_id, &operation, payload)?,
+            } => call_plugin_service(&root, &interface_id, &operation, payload, daemon).await?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -142,6 +156,8 @@ enum PluginCommand {
     Services {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        daemon: bool,
     },
     Check {
         #[arg(long = "root")]
@@ -150,6 +166,8 @@ enum PluginCommand {
     Invoke {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        daemon: bool,
         plugin_id: String,
         interface_id: String,
         operation: String,
@@ -158,6 +176,8 @@ enum PluginCommand {
     Call {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        daemon: bool,
         interface_id: String,
         operation: String,
         payload: Option<String>,
@@ -187,7 +207,24 @@ fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn list_plugin_services(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
+async fn list_plugin_services(roots: &[std::path::PathBuf], daemon: bool) -> Result<(), CliError> {
+    if daemon {
+        let services = BcodeClient::default_endpoint().plugin_services().await?;
+        if services.is_empty() {
+            println!("no plugin services discovered");
+            return Ok(());
+        }
+        for service in services {
+            println!(
+                "{}\t{}\t{}",
+                service.interface_id,
+                service.plugin_id,
+                service.name.unwrap_or_else(|| "<unnamed>".to_string())
+            );
+        }
+        return Ok(());
+    }
+
     let config = bcode_config::load_config()?;
     let selection = bcode_plugin::PluginSelection::from(&config);
     let plugins =
@@ -229,55 +266,106 @@ fn check_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn invoke_plugin_service(
+async fn invoke_plugin_service(
     roots: &[std::path::PathBuf],
     plugin_id: &str,
     interface_id: &str,
     operation: &str,
     payload: Option<String>,
+    daemon: bool,
 ) -> Result<(), CliError> {
+    let payload = payload.unwrap_or_default().into_bytes();
+    if daemon {
+        let response = BcodeClient::default_endpoint()
+            .invoke_plugin_service(
+                plugin_id.to_string(),
+                interface_id.to_string(),
+                operation.to_string(),
+                payload,
+            )
+            .await?;
+        print_service_response(response);
+        return Ok(());
+    }
+
     let config = bcode_config::load_config()?;
     let selection = bcode_plugin::PluginSelection::from(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
-    let response = host.invoke_service(
-        plugin_id,
-        interface_id,
-        operation,
-        payload.unwrap_or_default().into_bytes(),
-    )?;
+    let response = host.invoke_service(plugin_id, interface_id, operation, payload)?;
     host.deactivate_all()?;
     print_service_response(response);
     Ok(())
 }
 
-fn call_plugin_service(
+async fn call_plugin_service(
     roots: &[std::path::PathBuf],
     interface_id: &str,
     operation: &str,
     payload: Option<String>,
+    daemon: bool,
 ) -> Result<(), CliError> {
+    let payload = payload.unwrap_or_default().into_bytes();
+    if daemon {
+        let response = BcodeClient::default_endpoint()
+            .call_plugin_service(interface_id.to_string(), operation.to_string(), payload)
+            .await?;
+        print_service_response(response);
+        return Ok(());
+    }
+
     let config = bcode_config::load_config()?;
     let selection = bcode_plugin::PluginSelection::from(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
-    let response = host.invoke_service_by_interface(
-        interface_id,
-        operation,
-        payload.unwrap_or_default().into_bytes(),
-    )?;
+    let response = host.invoke_service_by_interface(interface_id, operation, payload)?;
     host.deactivate_all()?;
     print_service_response(response);
     Ok(())
 }
 
-fn print_service_response(response: bcode_plugin::ServiceResponse) {
+fn print_service_response(response: impl Into<PrintableServiceResponse>) {
+    let response = response.into();
     if let Some(error) = response.error {
         println!("ERROR\t{}\t{}", error.code, error.message);
     } else {
         println!("{}", String::from_utf8_lossy(&response.payload));
+    }
+}
+
+struct PrintableServiceResponse {
+    payload: Vec<u8>,
+    error: Option<PrintableServiceError>,
+}
+
+struct PrintableServiceError {
+    code: String,
+    message: String,
+}
+
+impl From<bcode_plugin::ServiceResponse> for PrintableServiceResponse {
+    fn from(value: bcode_plugin::ServiceResponse) -> Self {
+        Self {
+            payload: value.payload,
+            error: value.error.map(|error| PrintableServiceError {
+                code: error.code,
+                message: error.message,
+            }),
+        }
+    }
+}
+
+impl From<bcode_ipc::PluginServiceResponse> for PrintableServiceResponse {
+    fn from(value: bcode_ipc::PluginServiceResponse) -> Self {
+        Self {
+            payload: value.payload,
+            error: value.error.map(|error| PrintableServiceError {
+                code: error.code,
+                message: error.message,
+            }),
+        }
     }
 }
 

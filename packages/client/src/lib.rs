@@ -5,8 +5,9 @@
 //! Programmatic client API for Bcode.
 
 use bcode_ipc::{
-    CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream, Request, Response,
-    ResponsePayload, decode, default_endpoint, recv_envelope, request_envelope, send_envelope,
+    CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream,
+    PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, decode,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{ClientId, SessionEvent, SessionId, SessionSummary};
 use thiserror::Error;
@@ -145,6 +146,71 @@ impl BcodeClient {
     ) -> Result<(), ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         connection.send_user_message(session_id, text).await
+    }
+
+    /// List services provided by loaded daemon plugins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn plugin_services(&self) -> Result<Vec<PluginServiceSummary>, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::ListPluginServices).await? {
+            ResponsePayload::PluginServices { services } => Ok(services),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Invoke a loaded daemon plugin service by explicit plugin ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn invoke_plugin_service(
+        &self,
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Result<PluginServiceResponse, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::InvokePluginService {
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::PluginServiceResult { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Invoke a loaded daemon plugin service by interface ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn call_plugin_service(
+        &self,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Result<PluginServiceResponse, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::CallPluginService {
+                interface_id,
+                operation,
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::PluginServiceResult { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     /// Open a long-lived connection to the daemon.

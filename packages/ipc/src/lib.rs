@@ -75,15 +75,38 @@ impl Envelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
-    Hello { client_name: String },
+    Hello {
+        client_name: String,
+    },
     Ping,
     ServerStatus,
     ServerStop,
-    CreateSession { name: Option<String> },
+    CreateSession {
+        name: Option<String>,
+    },
     ListSessions,
-    SessionHistory { session_id: SessionId },
-    AttachSession { session_id: SessionId },
-    SendUserMessage { session_id: SessionId, text: String },
+    SessionHistory {
+        session_id: SessionId,
+    },
+    AttachSession {
+        session_id: SessionId,
+    },
+    SendUserMessage {
+        session_id: SessionId,
+        text: String,
+    },
+    ListPluginServices,
+    InvokePluginService {
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    },
+    CallPluginService {
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    },
 }
 
 /// Local server status summary.
@@ -91,6 +114,29 @@ pub enum Request {
 pub struct ServerStatus {
     pub connected_client_count: usize,
     pub sessions: Vec<SessionSummary>,
+}
+
+/// Service interface provided by a loaded plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginServiceSummary {
+    pub plugin_id: String,
+    pub interface_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Plugin service invocation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginServiceResponse {
+    pub payload: Vec<u8>,
+    pub error: Option<PluginServiceError>,
+}
+
+/// Plugin service invocation error payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginServiceError {
+    pub code: String,
+    pub message: String,
 }
 
 /// Successful response payload variants.
@@ -121,6 +167,12 @@ pub enum ResponsePayload {
         history: Vec<SessionEvent>,
     },
     MessageSent,
+    PluginServices {
+        services: Vec<PluginServiceSummary>,
+    },
+    PluginServiceResult {
+        response: PluginServiceResponse,
+    },
 }
 
 /// Structured error response.

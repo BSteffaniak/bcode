@@ -6,8 +6,9 @@
 
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcListener, LocalIpcStream,
-    Request, Response, ResponsePayload, ServerStatus, decode, event_envelope, recv_envelope,
-    response_envelope, send_envelope,
+    PluginServiceError, PluginServiceResponse, PluginServiceSummary, Request, Response,
+    ResponsePayload, ServerStatus, decode, event_envelope, recv_envelope, response_envelope,
+    send_envelope,
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{ClientId, SessionId};
@@ -42,15 +43,17 @@ pub enum ServerError {
 #[derive(Debug)]
 struct ServerState {
     sessions: SessionManager,
+    plugins: Mutex<bcode_plugin::PluginHost>,
     clients: Mutex<BTreeSet<ClientId>>,
     shutdown: broadcast::Sender<()>,
 }
 
 impl ServerState {
-    fn new(sessions: SessionManager) -> Self {
+    fn new(sessions: SessionManager, plugins: bcode_plugin::PluginHost) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions,
+            plugins: Mutex::new(plugins),
             clients: Mutex::default(),
             shutdown,
         }
@@ -88,10 +91,10 @@ impl ServerState {
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let config = bcode_config::load_config()?;
     let plugin_selection = bcode_plugin::PluginSelection::from(&config);
-    let mut plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
+    let plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
     let listener = LocalIpcListener::bind(&endpoint).await?;
     let sessions = SessionManager::persistent(default_session_store_dir())?;
-    let state = Arc::new(ServerState::new(sessions));
+    let state = Arc::new(ServerState::new(sessions, plugins));
     let mut shutdown = state.subscribe_shutdown();
     loop {
         tokio::select! {
@@ -107,7 +110,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             _ = shutdown.recv() => break,
         }
     }
-    plugins.deactivate_all()?;
+    state.plugins.lock().await.deactivate_all()?;
     Ok(())
 }
 
@@ -196,6 +199,32 @@ async fn handle_request(
         }
         Request::SendUserMessage { session_id, text } => {
             handle_user_message(request_id, client_id, state, writer, session_id, text).await
+        }
+        Request::ListPluginServices => handle_list_plugin_services(request_id, state, writer).await,
+        Request::InvokePluginService {
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+        } => {
+            handle_invoke_plugin_service(
+                request_id,
+                state,
+                writer,
+                &plugin_id,
+                &interface_id,
+                operation,
+                payload,
+            )
+            .await
+        }
+        Request::CallPluginService {
+            interface_id,
+            operation,
+            payload,
+        } => {
+            handle_call_plugin_service(request_id, state, writer, &interface_id, operation, payload)
+                .await
         }
     }
 }
@@ -369,6 +398,89 @@ async fn handle_user_message(
             .await
         }
     }
+}
+
+async fn handle_list_plugin_services(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let services = {
+        let plugins = state.plugins.lock().await;
+        plugin_service_summaries(&plugins)
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PluginServices { services }),
+    )
+    .await
+}
+
+async fn handle_invoke_plugin_service(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    plugin_id: &str,
+    interface_id: &str,
+    operation: String,
+    payload: Vec<u8>,
+) -> Result<(), ServerError> {
+    let response = {
+        let plugins = state.plugins.lock().await;
+        plugins.invoke_service(plugin_id, interface_id, operation, payload)
+    };
+    send_plugin_service_response(writer, request_id, response).await
+}
+
+async fn handle_call_plugin_service(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    interface_id: &str,
+    operation: String,
+    payload: Vec<u8>,
+) -> Result<(), ServerError> {
+    let response = {
+        let plugins = state.plugins.lock().await;
+        plugins.invoke_service_by_interface(interface_id, operation, payload)
+    };
+    send_plugin_service_response(writer, request_id, response).await
+}
+
+async fn send_plugin_service_response(
+    writer: &SharedWriter,
+    request_id: u64,
+    response: Result<bcode_plugin::ServiceResponse, bcode_plugin::PluginLoadError>,
+) -> Result<(), ServerError> {
+    let response = match response {
+        Ok(response) => Response::Ok(ResponsePayload::PluginServiceResult {
+            response: PluginServiceResponse {
+                payload: response.payload,
+                error: response.error.map(|error| PluginServiceError {
+                    code: error.code,
+                    message: error.message,
+                }),
+            },
+        }),
+        Err(error) => Response::Err(ErrorResponse::new("plugin_error", error.to_string())),
+    };
+    send_response(writer, request_id, response).await
+}
+
+fn plugin_service_summaries(plugins: &bcode_plugin::PluginHost) -> Vec<PluginServiceSummary> {
+    let mut services = Vec::new();
+    for plugin in plugins.loaded_plugins() {
+        for service in &plugin.manifest().services {
+            services.push(PluginServiceSummary {
+                plugin_id: plugin.manifest().id.clone(),
+                interface_id: service.interface_id.clone(),
+                name: service.name.clone(),
+                description: service.description.clone(),
+            });
+        }
+    }
+    services
 }
 
 fn forward_session_events(
