@@ -10,8 +10,13 @@ use bcode_ipc::{
     ResponsePayload, ServerStatus, decode, event_envelope, recv_envelope, response_envelope,
     send_envelope,
 };
+use bcode_model::{
+    ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelMessage,
+    ModelParameters, ModelTurnRequest, OP_FINISH_TURN, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse,
+};
 use bcode_session::SessionManager;
-use bcode_session_models::{ClientId, SessionId};
+use bcode_session_models::{ClientId, SessionEventKind, SessionId};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::PathBuf;
@@ -399,6 +404,7 @@ async fn handle_user_message(
     {
         Ok(event) => {
             publish_session_event(state, &event).await;
+            run_model_turn(state, session_id, &event).await;
             send_response(
                 writer,
                 request_id,
@@ -414,6 +420,231 @@ async fn handle_user_message(
             )
             .await
         }
+    }
+}
+
+async fn run_model_turn(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+) {
+    if !has_model_provider(state).await {
+        return;
+    }
+
+    let request = match build_model_turn_request(state, session_id, trigger_event).await {
+        Ok(request) => request,
+        Err(error) => {
+            append_system_event(state, session_id, format!("model request error: {error}")).await;
+            return;
+        }
+    };
+
+    let start = {
+        let plugins = state.plugins.lock().await;
+        plugins.invoke_service_by_interface_json::<_, StartTurnResponse>(
+            MODEL_PROVIDER_INTERFACE_ID,
+            OP_START_TURN,
+            &request,
+        )
+    };
+    let start = match start {
+        Ok(start) => start,
+        Err(error) => {
+            append_system_event(state, session_id, format!("model provider error: {error}")).await;
+            return;
+        }
+    };
+
+    let mut assistant_text = String::new();
+    let mut finished = false;
+    for _ in 0..100 {
+        let poll = PollTurnEventsRequest {
+            provider_turn_id: start.provider_turn_id.clone(),
+        };
+        let response = {
+            let plugins = state.plugins.lock().await;
+            plugins.invoke_service_by_interface_json::<_, PollTurnEventsResponse>(
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_POLL_TURN_EVENTS,
+                &poll,
+            )
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                append_system_event(state, session_id, format!("model provider error: {error}"))
+                    .await;
+                break;
+            }
+        };
+        if response.events.is_empty() {
+            break;
+        }
+        for event in response.events {
+            handle_provider_turn_event(
+                state,
+                session_id,
+                event,
+                &mut assistant_text,
+                &mut finished,
+            )
+            .await;
+        }
+        if finished {
+            break;
+        }
+    }
+
+    if !assistant_text.is_empty() {
+        append_assistant_message_event(state, session_id, assistant_text).await;
+    }
+
+    let finish = FinishTurnRequest {
+        provider_turn_id: start.provider_turn_id,
+    };
+    let _ = {
+        let plugins = state.plugins.lock().await;
+        plugins.invoke_service_by_interface_json::<_, bcode_model::AckResponse>(
+            MODEL_PROVIDER_INTERFACE_ID,
+            OP_FINISH_TURN,
+            &finish,
+        )
+    };
+}
+
+async fn handle_provider_turn_event(
+    state: &ServerState,
+    session_id: SessionId,
+    event: ProviderTurnEvent,
+    assistant_text: &mut String,
+    finished: &mut bool,
+) {
+    match event {
+        ProviderTurnEvent::TextDelta { text } => {
+            assistant_text.push_str(&text);
+            append_assistant_delta_event(state, session_id, text).await;
+        }
+        ProviderTurnEvent::Error { error } => {
+            append_system_event(
+                state,
+                session_id,
+                format!("model error {}: {}", error.code, error.message),
+            )
+            .await;
+            *finished = true;
+        }
+        ProviderTurnEvent::TurnFinished { .. } | ProviderTurnEvent::Cancelled => {
+            *finished = true;
+        }
+        ProviderTurnEvent::ToolCallStarted { call_id, name } => {
+            append_tool_request_event(state, session_id, call_id, name).await;
+        }
+        ProviderTurnEvent::ToolCallFinished { call } => {
+            append_tool_request_event(state, session_id, call.id, call.name).await;
+        }
+        ProviderTurnEvent::Warning { message } => {
+            append_system_event(state, session_id, format!("model warning: {message}")).await;
+        }
+        ProviderTurnEvent::TurnStarted
+        | ProviderTurnEvent::ReasoningDelta { .. }
+        | ProviderTurnEvent::ToolCallDelta { .. }
+        | ProviderTurnEvent::Usage { .. } => {}
+    }
+}
+
+async fn has_model_provider(state: &ServerState) -> bool {
+    let plugins = state.plugins.lock().await;
+    plugins
+        .service_registry()
+        .providers_for(MODEL_PROVIDER_INTERFACE_ID)
+        .is_some()
+}
+
+async fn build_model_turn_request(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+) -> Result<ModelTurnRequest, bcode_session::SessionError> {
+    let history = state.sessions.session_history(session_id).await?;
+    let messages = history
+        .iter()
+        .filter_map(session_event_to_model_message)
+        .collect();
+    Ok(ModelTurnRequest {
+        session_id,
+        turn_id: format!("{}-{}", session_id, trigger_event.sequence),
+        model_id: "fake-echo".to_string(),
+        system_prompt: None,
+        messages,
+        tools: Vec::new(),
+        parameters: ModelParameters::default(),
+        metadata: std::collections::BTreeMap::new(),
+    })
+}
+
+fn session_event_to_model_message(
+    event: &bcode_session_models::SessionEvent,
+) -> Option<ModelMessage> {
+    match &event.kind {
+        SessionEventKind::UserMessage { text, .. } => Some(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text { text: text.clone() }],
+        }),
+        SessionEventKind::AssistantMessage { text } => Some(ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Text { text: text.clone() }],
+        }),
+        SessionEventKind::SystemMessage { text } => Some(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text { text: text.clone() }],
+        }),
+        _ => None,
+    }
+}
+
+async fn append_assistant_delta_event(state: &ServerState, session_id: SessionId, text: String) {
+    match state
+        .sessions
+        .append_assistant_delta(session_id, text)
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append assistant delta: {error}"),
+    }
+}
+
+async fn append_assistant_message_event(state: &ServerState, session_id: SessionId, text: String) {
+    match state
+        .sessions
+        .append_assistant_message(session_id, text)
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append assistant message: {error}"),
+    }
+}
+
+async fn append_tool_request_event(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: String,
+    tool_name: String,
+) {
+    match state
+        .sessions
+        .append_tool_call_requested(session_id, tool_call_id, tool_name)
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append tool request: {error}"),
+    }
+}
+
+async fn append_system_event(state: &ServerState, session_id: SessionId, text: String) {
+    match state.sessions.append_system_message(session_id, text).await {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append system message: {error}"),
     }
 }
 

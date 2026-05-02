@@ -195,23 +195,8 @@ impl LoadedPlugin {
         };
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let mut output_len = 0_usize;
-        let status = unsafe {
-            (self.invoke_service)(
-                input.as_ptr(),
-                input.len(),
-                std::ptr::null_mut(),
-                0,
-                &raw mut output_len,
-            )
-        };
-        if status != SERVICE_STATUS_BUFFER_TOO_SMALL && status != SERVICE_STATUS_OK {
-            return Err(PluginLoadError::ServiceInvokeFailed {
-                plugin_id: self.manifest.id.clone(),
-                code: status,
-            });
-        }
-        let mut output = vec![0_u8; output_len];
-        let status = unsafe {
+        let mut output = vec![0_u8; 65_536];
+        let mut status = unsafe {
             (self.invoke_service)(
                 input.as_ptr(),
                 input.len(),
@@ -220,6 +205,18 @@ impl LoadedPlugin {
                 &raw mut output_len,
             )
         };
+        if status == SERVICE_STATUS_BUFFER_TOO_SMALL {
+            output.resize(output_len, 0);
+            status = unsafe {
+                (self.invoke_service)(
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &raw mut output_len,
+                )
+            };
+        }
         if status != SERVICE_STATUS_OK {
             return Err(PluginLoadError::ServiceInvokeFailed {
                 plugin_id: self.manifest.id.clone(),

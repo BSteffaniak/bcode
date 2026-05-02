@@ -1,0 +1,15 @@
+id      = "bcode.fake-provider"
+name    = "Bcode Fake Model Provider"
+version = "0.0.1"
+
+[[services]]
+description  = "Deterministic model provider used by tests and smoke flows"
+interface_id = "bcode.model-provider/v1"
+name         = "Fake Model Provider"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_fake_provider_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

@@ -14,11 +14,13 @@ version     = { workspace = true }
 bcode_client         = { workspace = true }
 bcode_config         = { workspace = true }
 bcode_ipc            = { workspace = true }
+bcode_model          = { workspace = true }
 bcode_plugin         = { workspace = true }
 bcode_server         = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tui            = { workspace = true }
 clap                 = { workspace = true, features = ["derive", "help", "std", "usage"] }
+serde_json           = { workspace = true }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["signal", "time"] }
 

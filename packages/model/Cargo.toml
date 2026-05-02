@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Model provider contract types for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "provider"]
+license     = { workspace = true }
+name        = "bcode_model"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -35,11 +35,13 @@ dependencies = [
  "bcode_client",
  "bcode_config",
  "bcode_ipc",
+ "bcode_model",
  "bcode_plugin",
  "bcode_server",
  "bcode_session_models",
  "bcode_tui",
  "clap",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -61,6 +63,16 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "bcode_fake_provider_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model",
+ "bcode_plugin_sdk",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -92,6 +104,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_model"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -118,6 +139,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
  "bcode_ipc",
+ "bcode_model",
  "bcode_plugin",
  "bcode_session",
  "bcode_session_models",

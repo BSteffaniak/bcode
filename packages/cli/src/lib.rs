@@ -21,6 +21,8 @@ pub enum CliError {
     Config(#[from] bcode_config::ConfigError),
     #[error("server error: {0}")]
     Server(#[from] bcode_server::ServerError),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("TUI error: {0}")]
     Tui(#[from] bcode_tui::TuiError),
     #[error("plugin error: {0}")]
@@ -87,6 +89,10 @@ pub async fn run() -> Result<(), CliError> {
                 payload,
             } => publish_plugin_event(&root, &topic, payload, daemon).await?,
         },
+        Commands::Model { command } => match command {
+            ModelCommand::List => list_models().await?,
+            ModelCommand::Capabilities => model_capabilities().await?,
+        },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
             ensure_server_running().await?;
@@ -121,6 +127,10 @@ enum Commands {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     Attach {
         session_id: SessionId,
     },
@@ -151,6 +161,12 @@ enum SessionCommand {
     Create { name: Option<String> },
     List,
     History { session_id: SessionId },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    List,
+    Capabilities,
 }
 
 #[derive(Debug, Subcommand)]
@@ -406,6 +422,53 @@ async fn publish_plugin_event(
     let delivered = host.publish_event(topic, &payload)?;
     host.deactivate_all()?;
     println!("delivered\t{delivered}");
+    Ok(())
+}
+
+async fn list_models() -> Result<(), CliError> {
+    let response = BcodeClient::default_endpoint()
+        .call_plugin_service(
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+            bcode_model::OP_MODELS.to_string(),
+            Vec::new(),
+        )
+        .await?;
+    if let Some(error) = response.error {
+        println!("ERROR\t{}\t{}", error.code, error.message);
+        return Ok(());
+    }
+    let models: bcode_model::ModelList = serde_json::from_slice(&response.payload)?;
+    for model in models.models {
+        let default_marker = if model.is_default { "\tdefault" } else { "" };
+        println!(
+            "{}\t{}{}",
+            model.model_id, model.display_name, default_marker
+        );
+    }
+    Ok(())
+}
+
+async fn model_capabilities() -> Result<(), CliError> {
+    let response = BcodeClient::default_endpoint()
+        .call_plugin_service(
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+            bcode_model::OP_CAPABILITIES.to_string(),
+            Vec::new(),
+        )
+        .await?;
+    if let Some(error) = response.error {
+        println!("ERROR\t{}\t{}", error.code, error.message);
+        return Ok(());
+    }
+    let capabilities: bcode_model::ProviderCapabilities =
+        serde_json::from_slice(&response.payload)?;
+    println!(
+        "{}\t{}",
+        capabilities.provider_id, capabilities.display_name
+    );
+    for capability in capabilities.capabilities {
+        println!("capability\t{capability:?}");
+    }
     Ok(())
 }
 
