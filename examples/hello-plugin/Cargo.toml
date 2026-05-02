@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Example native plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "plugin", "example"]
+license     = { workspace = true }
+name        = "bcode_hello_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_plugin_sdk = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

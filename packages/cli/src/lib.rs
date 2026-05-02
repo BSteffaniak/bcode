@@ -49,6 +49,7 @@ pub async fn run() -> Result<(), CliError> {
         },
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
+            PluginCommand::Check { root } => check_plugins(&root)?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -122,15 +123,14 @@ enum PluginCommand {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
     },
+    Check {
+        #[arg(long = "root")]
+        root: Vec<std::path::PathBuf>,
+    },
 }
 
 fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
-    let plugins = if roots.is_empty() {
-        bcode_plugin::discover_plugins()
-    } else {
-        bcode_plugin::discover_plugins_in_roots(roots)
-    }
-    .map_err(CliError::Plugin)?;
+    let plugins = discover_plugins_for_cli(roots)?;
 
     if plugins.is_empty() {
         println!("no plugins discovered");
@@ -147,6 +147,32 @@ fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+fn check_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
+    let plugins = discover_plugins_for_cli(roots)?;
+    if plugins.is_empty() {
+        println!("no plugins discovered");
+        return Ok(());
+    }
+
+    for plugin in plugins {
+        let loaded = bcode_plugin::load_registered_plugin(&plugin)?;
+        loaded.activate()?;
+        loaded.deactivate()?;
+        println!("{}\tOK", loaded.manifest().id);
+    }
+    Ok(())
+}
+
+fn discover_plugins_for_cli(
+    roots: &[std::path::PathBuf],
+) -> Result<Vec<bcode_plugin::RegisteredPlugin>, CliError> {
+    if roots.is_empty() {
+        bcode_plugin::discover_plugins().map_err(CliError::Plugin)
+    } else {
+        bcode_plugin::discover_plugins_in_roots(roots).map_err(CliError::Plugin)
+    }
 }
 
 async fn ensure_server_running() -> Result<(), CliError> {

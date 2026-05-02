@@ -1,0 +1,8 @@
+id      = "example.hello"
+name    = "Hello Example Plugin"
+version = "0.0.1"
+
+[runtime]
+abi_version = 1
+library     = "libbcode_hello_plugin.dylib"
+type        = "native"
