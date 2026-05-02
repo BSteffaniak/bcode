@@ -5,17 +5,19 @@
 //! OpenAI-compatible model provider plugin for Bcode.
 
 use bcode_model::{
-    AckResponse, ContentBlock, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability,
-    ModelInfo, ModelList, ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES,
-    OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
-    PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities, ProviderCapability,
-    ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse, StopReason,
-    ValidateConfigResponse,
+    AckResponse, CancelTurnRequest, ContentBlock, MODEL_PROVIDER_INTERFACE_ID, MessageRole,
+    ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest, OP_CANCEL_TURN,
+    OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
+    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse,
+    StopReason, ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::BufRead;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -26,7 +28,26 @@ const PROVIDER_ID: &str = "bcode.openai-compatible";
 #[derive(Default)]
 pub struct OpenAiCompatibleProviderPlugin {
     next_turn: u64,
-    turns: BTreeMap<String, Vec<ProviderTurnEvent>>,
+    turns: BTreeMap<String, TurnState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TurnState {
+    events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
+}
+
+impl TurnState {
+    fn push(&self, event: ProviderTurnEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push_back(event);
+        }
+    }
+
+    fn drain(&self) -> Vec<ProviderTurnEvent> {
+        self.events
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut events| events.drain(..).collect())
+    }
 }
 
 impl RustPlugin for OpenAiCompatibleProviderPlugin {
@@ -44,7 +65,8 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
             OP_VALIDATE_CONFIG => json_response(&validate_config()),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
-            OP_CANCEL_TURN | OP_FINISH_TURN => json_response(&AckResponse::default()),
+            OP_CANCEL_TURN => self.cancel_turn(&context.request),
+            OP_FINISH_TURN => self.finish_turn(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported model provider operation",
@@ -61,36 +83,46 @@ impl OpenAiCompatibleProviderPlugin {
         };
         self.next_turn += 1;
         let provider_turn_id = format!("openai-compatible-turn-{}", self.next_turn);
-        let events = match call_chat_completion(&request) {
-            Ok(text) => vec![
-                ProviderTurnEvent::TurnStarted,
-                ProviderTurnEvent::TextDelta { text },
-                ProviderTurnEvent::TurnFinished {
-                    stop_reason: StopReason::EndTurn,
-                },
-            ],
-            Err(error) => vec![
-                ProviderTurnEvent::TurnStarted,
-                ProviderTurnEvent::Error { error },
-                ProviderTurnEvent::TurnFinished {
-                    stop_reason: StopReason::Error,
-                },
-            ],
-        };
-        self.turns.insert(provider_turn_id.clone(), events);
+        let turn = TurnState::default();
+        turn.push(ProviderTurnEvent::TurnStarted);
+        self.turns.insert(provider_turn_id.clone(), turn.clone());
+        std::thread::spawn(move || stream_chat_completion(&request, &turn));
         json_response(&StartTurnResponse { provider_turn_id })
     }
 
-    fn poll_turn_events(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn poll_turn_events(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<PollTurnEventsRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
         let events = self
             .turns
-            .remove(&request.provider_turn_id)
-            .unwrap_or_default();
+            .get(&request.provider_turn_id)
+            .map_or_else(Vec::new, TurnState::drain);
         json_response(&PollTurnEventsResponse { events })
+    }
+
+    fn cancel_turn(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<CancelTurnRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        if let Some(turn) = self.turns.get(&request.provider_turn_id) {
+            turn.push(ProviderTurnEvent::Cancelled);
+            turn.push(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Cancelled,
+            });
+        }
+        json_response(&AckResponse::default())
+    }
+
+    fn finish_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::FinishTurnRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        self.turns.remove(&request.provider_turn_id);
+        json_response(&AckResponse::default())
     }
 }
 
@@ -123,17 +155,18 @@ struct ChatMessage {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
+struct ChatCompletionChunk {
+    choices: Vec<ChatChunkChoice>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
+struct ChatChunkChoice {
+    delta: ChatChunkDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatChoiceMessage {
+struct ChatChunkDelta {
     content: Option<String>,
 }
 
@@ -151,7 +184,24 @@ struct OpenAiErrorBody {
     r#type: Option<String>,
 }
 
-fn call_chat_completion(request: &ModelTurnRequest) -> Result<String, ProviderError> {
+fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
+    match stream_chat_completion_inner(request, turn) {
+        Ok(()) => turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        }),
+        Err(error) => {
+            turn.push(ProviderTurnEvent::Error { error });
+            turn.push(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Error,
+            });
+        }
+    }
+}
+
+fn stream_chat_completion_inner(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> Result<(), ProviderError> {
     let settings = settings();
     let Some(api_key) = settings.api_key else {
         return Err(provider_error(
@@ -181,7 +231,7 @@ fn call_chat_completion(request: &ModelTurnRequest) -> Result<String, ProviderEr
             request.model_id.clone()
         },
         messages: model_messages_to_chat_messages(request),
-        stream: false,
+        stream: true,
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
@@ -208,19 +258,47 @@ fn call_chat_completion(request: &ModelTurnRequest) -> Result<String, ProviderEr
         let body = response.text().unwrap_or_default();
         return Err(error_from_status(status.as_u16(), &body));
     }
-    let response = response.json::<ChatCompletionResponse>().map_err(|error| {
-        provider_error(
-            "decode_failed",
-            ProviderErrorCategory::ProviderInternal,
-            error.to_string(),
-        )
-    })?;
-    Ok(response
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|choice| choice.message.content)
-        .unwrap_or_default())
+    read_stream_events(response, turn)
+}
+
+fn read_stream_events(
+    response: reqwest::blocking::Response,
+    turn: &TurnState,
+) -> Result<(), ProviderError> {
+    let reader = std::io::BufReader::new(response);
+    for line in reader.lines() {
+        let line = line.map_err(|error| {
+            provider_error(
+                "stream_read_failed",
+                ProviderErrorCategory::Network,
+                error.to_string(),
+            )
+        })?;
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        let chunk = serde_json::from_str::<ChatCompletionChunk>(data).map_err(|error| {
+            provider_error(
+                "stream_decode_failed",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?;
+        for choice in chunk.choices {
+            if let Some(content) = choice.delta.content
+                && !content.is_empty()
+            {
+                turn.push(ProviderTurnEvent::TextDelta { text: content });
+            }
+            if choice.finish_reason.is_some() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessage> {

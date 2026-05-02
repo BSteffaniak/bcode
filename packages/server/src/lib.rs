@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
 use tokio::sync::{Mutex, broadcast};
@@ -468,7 +469,8 @@ async fn run_model_turn(
 
     let mut assistant_text = String::new();
     let mut finished = false;
-    for _ in 0..100 {
+    let mut empty_polls = 0_u16;
+    for _ in 0..1_200 {
         let poll = PollTurnEventsRequest {
             provider_turn_id: start.provider_turn_id.clone(),
         };
@@ -489,8 +491,20 @@ async fn run_model_turn(
             }
         };
         if response.events.is_empty() {
-            break;
+            empty_polls += 1;
+            if empty_polls > 50 {
+                append_system_event(
+                    state,
+                    session_id,
+                    "model provider produced no events before timeout".to_string(),
+                )
+                .await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
         }
+        empty_polls = 0;
         for event in response.events {
             handle_provider_turn_event(
                 state,
