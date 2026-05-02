@@ -60,12 +60,26 @@ pub struct PermissionConfig {
     pub allow_tools: BTreeSet<String>,
     #[serde(default)]
     pub deny_tools: BTreeSet<String>,
+    #[serde(default)]
+    pub allow_shell_command_prefixes: BTreeSet<String>,
+    #[serde(default)]
+    pub deny_shell_command_prefixes: BTreeSet<String>,
+    #[serde(default)]
+    pub allow_path_prefixes: BTreeSet<String>,
+    #[serde(default)]
+    pub deny_path_prefixes: BTreeSet<String>,
 }
 
 impl PermissionConfig {
     fn merge(&mut self, next: Self) {
         self.allow_tools.extend(next.allow_tools);
         self.deny_tools.extend(next.deny_tools);
+        self.allow_shell_command_prefixes
+            .extend(next.allow_shell_command_prefixes);
+        self.deny_shell_command_prefixes
+            .extend(next.deny_shell_command_prefixes);
+        self.allow_path_prefixes.extend(next.allow_path_prefixes);
+        self.deny_path_prefixes.extend(next.deny_path_prefixes);
     }
 }
 
@@ -211,6 +225,10 @@ disabled = ["example.d"]
 [permissions]
 allow_tools = ["filesystem.read"]
 deny_tools = ["shell.run"]
+allow_shell_command_prefixes = ["git status"]
+deny_shell_command_prefixes = ["rm -rf"]
+allow_path_prefixes = ["/tmp/project"]
+deny_path_prefixes = ["/tmp/project/target"]
 "#,
         )
         .expect("project config should be written");
@@ -222,6 +240,30 @@ deny_tools = ["shell.run"]
         assert!(config.plugins.disabled.contains("example.d"));
         assert!(config.permissions.allow_tools.contains("filesystem.read"));
         assert!(config.permissions.deny_tools.contains("shell.run"));
+        assert!(
+            config
+                .permissions
+                .allow_shell_command_prefixes
+                .contains("git status")
+        );
+        assert!(
+            config
+                .permissions
+                .deny_shell_command_prefixes
+                .contains("rm -rf")
+        );
+        assert!(
+            config
+                .permissions
+                .allow_path_prefixes
+                .contains("/tmp/project")
+        );
+        assert!(
+            config
+                .permissions
+                .deny_path_prefixes
+                .contains("/tmp/project/target")
+        );
 
         std::fs::remove_dir_all(root).expect("temp root should clean up");
     }

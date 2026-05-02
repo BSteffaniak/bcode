@@ -85,7 +85,8 @@ provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 
 [permissions]
-allow_tools = ["shell.run"]
+allow_shell_command_prefixes = ["printf policy-allowed"]
+deny_shell_command_prefixes = ["printf policy-denied"]
 EOF
 
 cargo run --quiet -p bcode -- server start >"${workdir}/server.log" 2>&1 &
@@ -113,6 +114,23 @@ fi
 cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "permission requested"
 cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "permission resolved: .*approved=true"
 cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "policy-allowed-shell"
+
+blocked_session_id="$(cargo run --quiet -p bcode -- session create permission-policy-deny-smoke)"
+cargo run --quiet -p bcode -- send "${blocked_session_id}" "tool-shell printf policy-denied-shell" >/dev/null
+for _ in {1..50}; do
+    if cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission denied"; then
+        break
+    fi
+    sleep 0.1
+done
+if [[ -n "$(cargo run --quiet -p bcode -- permission list)" ]]; then
+    echo "deny policy should not leave a pending permission" >&2
+    cargo run --quiet -p bcode -- permission list >&2 || true
+    exit 1
+fi
+cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission requested"
+cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission resolved: .*approved=false"
+cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission denied"
 
 cargo run --quiet -p bcode -- server stop >/dev/null
 wait "${server_pid}"

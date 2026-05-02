@@ -88,17 +88,51 @@ struct PendingPermission {
 struct PermissionPolicy {
     allow_tools: BTreeSet<String>,
     deny_tools: BTreeSet<String>,
+    allow_shell_command_prefixes: BTreeSet<String>,
+    deny_shell_command_prefixes: BTreeSet<String>,
+    allow_path_prefixes: BTreeSet<String>,
+    deny_path_prefixes: BTreeSet<String>,
 }
 
 impl PermissionPolicy {
-    fn decision_for_tool(&self, tool_name: &str) -> Option<bool> {
-        if self.deny_tools.contains(tool_name) {
+    fn decision_for_call(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<bool> {
+        if self.deny_tools.contains(tool_name)
+            || self.denies_shell_command(tool_name, arguments)
+            || self.denies_path(tool_name, arguments)
+        {
             Some(false)
-        } else if self.allow_tools.contains(tool_name) {
+        } else if self.allow_tools.contains(tool_name)
+            || self.allows_shell_command(tool_name, arguments)
+            || self.allows_path(tool_name, arguments)
+        {
             Some(true)
         } else {
             None
         }
+    }
+
+    fn denies_shell_command(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        tool_name == "shell.run"
+            && string_argument(arguments, "command")
+                .is_some_and(|command| has_prefix(command, &self.deny_shell_command_prefixes))
+    }
+
+    fn allows_shell_command(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        tool_name == "shell.run"
+            && string_argument(arguments, "command")
+                .is_some_and(|command| has_prefix(command, &self.allow_shell_command_prefixes))
+    }
+
+    fn denies_path(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        tool_name.starts_with("filesystem.")
+            && string_argument(arguments, "path")
+                .is_some_and(|path| has_prefix(path, &self.deny_path_prefixes))
+    }
+
+    fn allows_path(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        tool_name.starts_with("filesystem.")
+            && string_argument(arguments, "path")
+                .is_some_and(|path| has_prefix(path, &self.allow_path_prefixes))
     }
 }
 
@@ -107,8 +141,20 @@ impl From<&bcode_config::PermissionConfig> for PermissionPolicy {
         Self {
             allow_tools: value.allow_tools.clone(),
             deny_tools: value.deny_tools.clone(),
+            allow_shell_command_prefixes: value.allow_shell_command_prefixes.clone(),
+            deny_shell_command_prefixes: value.deny_shell_command_prefixes.clone(),
+            allow_path_prefixes: value.allow_path_prefixes.clone(),
+            deny_path_prefixes: value.deny_path_prefixes.clone(),
         }
     }
+}
+
+fn string_argument<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    arguments.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn has_prefix(value: &str, prefixes: &BTreeSet<String>) -> bool {
+    prefixes.iter().any(|prefix| value.starts_with(prefix))
 }
 
 impl ServerState {
@@ -1052,7 +1098,10 @@ async fn request_tool_permission(
         arguments_json.clone(),
     )
     .await;
-    if let Some(decision) = state.permission_policy.decision_for_tool(&definition.name) {
+    if let Some(decision) = state
+        .permission_policy
+        .decision_for_call(&definition.name, &call.arguments)
+    {
         append_permission_resolved_event(state, session_id, permission_id, decision).await;
         return decision;
     }
