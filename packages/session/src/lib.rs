@@ -269,16 +269,135 @@ impl SessionManager {
         client_id: ClientId,
         text: String,
     ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::UserMessage { client_id, text },
+        )
+        .await
+    }
+
+    /// Append an assistant streaming delta to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_assistant_delta(
+        &self,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, SessionEventKind::AssistantDelta { text })
+            .await
+    }
+
+    /// Append a complete assistant message to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_assistant_message(
+        &self,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, SessionEventKind::AssistantMessage { text })
+            .await
+    }
+
+    /// Append a tool-call request event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_tool_call_requested(
+        &self,
+        session_id: SessionId,
+        tool_call_id: String,
+        tool_name: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+            },
+        )
+        .await
+    }
+
+    /// Append a tool-call finished event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_tool_call_finished(
+        &self,
+        session_id: SessionId,
+        tool_call_id: String,
+        result: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+            },
+        )
+        .await
+    }
+
+    /// Append a model-changed event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_model_changed(
+        &self,
+        session_id: SessionId,
+        provider: String,
+        model: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ModelChanged { provider, model },
+        )
+        .await
+    }
+
+    /// Append a system message to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_system_message(
+        &self,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, SessionEventKind::SystemMessage { text })
+            .await
+    }
+
+    /// Append an event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the session does not exist
+    /// * the event cannot be persisted
+    pub async fn append_event(
+        &self,
+        session_id: SessionId,
+        kind: SessionEventKind,
+    ) -> Result<SessionEvent, SessionError> {
         let event = {
             let mut inner = self.inner.lock().await;
             let state = inner
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
-            state.push_event(
-                SessionEventKind::UserMessage { client_id, text },
-                self.store.as_ref(),
-            )?
+            state.push_event(kind, self.store.as_ref())?
         };
         Ok(event)
     }
@@ -382,6 +501,30 @@ mod tests {
             .append_user_message(session.id, ClientId::new(), "hello".to_string())
             .await
             .expect("message should append");
+        manager
+            .append_assistant_delta(session.id, "partial".to_string())
+            .await
+            .expect("assistant delta should append");
+        manager
+            .append_assistant_message(session.id, "complete".to_string())
+            .await
+            .expect("assistant message should append");
+        manager
+            .append_tool_call_requested(session.id, "tool-1".to_string(), "read".to_string())
+            .await
+            .expect("tool request should append");
+        manager
+            .append_tool_call_finished(session.id, "tool-1".to_string(), "ok".to_string())
+            .await
+            .expect("tool result should append");
+        manager
+            .append_model_changed(session.id, "provider".to_string(), "model".to_string())
+            .await
+            .expect("model change should append");
+        manager
+            .append_system_message(session.id, "system".to_string())
+            .await
+            .expect("system message should append");
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
         let sessions = restored.list_sessions().await;
@@ -397,6 +540,33 @@ mod tests {
         assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::UserMessage { text, .. } if text == "hello"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantDelta { text } if text == "partial"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantMessage { text } if text == "complete"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolCallRequested { tool_call_id, tool_name }
+                if tool_call_id == "tool-1" && tool_name == "read"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolCallFinished { tool_call_id, result }
+                if tool_call_id == "tool-1" && result == "ok"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelChanged { provider, model }
+                if provider == "provider" && model == "model"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::SystemMessage { text } if text == "system"
         )));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
