@@ -261,6 +261,64 @@ pub fn filter_selected_plugins(
         .collect()
 }
 
+/// Loaded plugin host retaining activated plugins.
+#[derive(Debug, Default)]
+pub struct PluginHost {
+    loaded: Vec<LoadedPlugin>,
+}
+
+impl PluginHost {
+    /// Discover, load, and activate plugins from default roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery, loading, or activation fails.
+    pub fn load_defaults(selection: &PluginSelection) -> Result<Self, PluginLoadError> {
+        let plugins = filter_selected_plugins(discover_plugins()?, selection);
+        Self::load_registered_plugins(&plugins)
+    }
+
+    /// Load and activate registered plugins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when loading or activation fails.
+    pub fn load_registered_plugins(plugins: &[RegisteredPlugin]) -> Result<Self, PluginLoadError> {
+        let mut host = Self::default();
+        for plugin in plugins {
+            let loaded = load_registered_plugin(plugin)?;
+            loaded.activate()?;
+            host.loaded.push(loaded);
+        }
+        Ok(host)
+    }
+
+    /// Return loaded plugins.
+    #[must_use]
+    pub fn loaded_plugins(&self) -> &[LoadedPlugin] {
+        &self.loaded
+    }
+
+    /// Deactivate all loaded plugins in reverse load order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first deactivation error.
+    pub fn deactivate_all(&mut self) -> Result<(), PluginLoadError> {
+        for plugin in self.loaded.iter().rev() {
+            plugin.deactivate()?;
+        }
+        self.loaded.clear();
+        Ok(())
+    }
+}
+
+impl Drop for PluginHost {
+    fn drop(&mut self) {
+        let _ = self.deactivate_all();
+    }
+}
+
 /// Load a registered plugin.
 ///
 /// # Errors

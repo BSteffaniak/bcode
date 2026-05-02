@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_ipc = { workspace = true }
+bcode_plugin = { workspace = true }
 bcode_session = { workspace = true }
 bcode_session_models = { workspace = true }
 thiserror = { workspace = true }
