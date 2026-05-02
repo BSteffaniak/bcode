@@ -12,6 +12,8 @@ use bcode_ipc::{
 use bcode_session::SessionManager;
 use bcode_session_models::{ClientId, SessionId};
 use std::collections::BTreeSet;
+use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
@@ -27,6 +29,10 @@ pub enum ServerError {
     Transport(#[from] bcode_ipc::IpcTransportError),
     #[error("IPC codec error: {0}")]
     Codec(#[from] CodecError),
+    #[error("session error: {0}")]
+    Session(#[from] bcode_session::SessionError),
+    #[error("session event store error: {0}")]
+    SessionStore(#[from] bcode_session::SessionStoreError),
 }
 
 #[derive(Debug)]
@@ -36,18 +42,16 @@ struct ServerState {
     shutdown: broadcast::Sender<()>,
 }
 
-impl Default for ServerState {
-    fn default() -> Self {
+impl ServerState {
+    fn new(sessions: SessionManager) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
-            sessions: SessionManager::default(),
+            sessions,
             clients: Mutex::default(),
             shutdown,
         }
     }
-}
 
-impl ServerState {
     async fn register_client(&self, client_id: ClientId) {
         self.clients.lock().await.insert(client_id);
     }
@@ -79,7 +83,8 @@ impl ServerState {
 /// Returns an error when the server cannot bind or accept local IPC connections.
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let listener = LocalIpcListener::bind(&endpoint).await?;
-    let state = Arc::new(ServerState::default());
+    let sessions = SessionManager::persistent(default_session_store_dir())?;
+    let state = Arc::new(ServerState::new(sessions));
     let mut shutdown = state.subscribe_shutdown();
     loop {
         tokio::select! {
@@ -142,7 +147,7 @@ async fn handle_registered_client(
     }
 
     if let Some(session_id) = attached_session {
-        state.sessions.detach_session(session_id, client_id).await;
+        state.sessions.detach_session(session_id, client_id).await?;
     }
 
     Ok(())
@@ -235,7 +240,7 @@ async fn handle_create_session(
     writer: &SharedWriter,
     name: Option<String>,
 ) -> Result<(), ServerError> {
-    let session = state.sessions.create_session(name).await;
+    let session = state.sessions.create_session(name).await?;
     send_response(
         writer,
         request_id,
@@ -358,4 +363,21 @@ async fn send_response(
     send_envelope(&mut *writer, &envelope).await?;
     drop(writer);
     Ok(())
+}
+
+fn default_session_store_dir() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_STATE_DIR") {
+        return PathBuf::from(path).join("sessions");
+    }
+    if let Ok(path) = env::var("XDG_STATE_HOME") {
+        return PathBuf::from(path).join("bcode").join("sessions");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("bcode")
+            .join("sessions");
+    }
+    env::temp_dir().join("bcode").join("sessions")
 }

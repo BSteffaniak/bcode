@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_session_models = { workspace = true }
+bmux_codec           = { workspace = true }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["sync"] }
 

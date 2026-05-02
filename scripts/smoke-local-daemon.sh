@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workdir="$(mktemp -d)"
 export BCODE_SOCKET="$workdir/bcode.sock"
+export BCODE_STATE_DIR="$workdir/state"
 
 server_pid=""
 attach_pid=""
@@ -55,6 +56,26 @@ if ! grep -q "hello from smoke" "$workdir/attach.log"; then
     cat "$workdir/attach.log" >&2 || true
     echo "--- server log ---" >&2
     cat "$workdir/server.log" >&2 || true
+    exit 1
+fi
+
+cargo run --quiet -p bcode -- server stop
+wait "${server_pid}"
+server_pid=""
+
+cargo run --quiet -p bcode -- server start >"$workdir/server-restarted.log" 2>&1 &
+server_pid="$!"
+for _ in {1..50}; do
+    if cargo run --quiet -p bcode -- session list | grep -q "${session_id}"; then
+        break
+    fi
+    sleep 0.1
+done
+
+if ! cargo run --quiet -p bcode -- session list | grep -q "${session_id}"; then
+    echo "persisted session was not restored after server restart" >&2
+    echo "--- restarted server log ---" >&2
+    cat "$workdir/server-restarted.log" >&2 || true
     exit 1
 fi
 
