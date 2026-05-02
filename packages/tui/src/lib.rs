@@ -21,6 +21,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap,
 };
+use std::collections::BTreeMap;
 use std::io::{self, Stdout};
 use std::time::Duration;
 use thiserror::Error;
@@ -125,7 +126,7 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
 }
 
 async fn resolve_first_permission(client: &BcodeClient, app: &mut ChatApp, approved: bool) {
-    let Some(permission_id) = app.pending_permissions.first().cloned() else {
+    let Some(permission_id) = app.first_pending_permission_id() else {
         app.status = "no pending permission".to_string();
         return;
     };
@@ -257,7 +258,24 @@ struct ChatApp {
     lines: Vec<String>,
     input: String,
     status: String,
-    pending_permissions: Vec<String>,
+    pending_permissions: BTreeMap<String, PendingPermissionView>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPermissionView {
+    permission_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    arguments_json: String,
+}
+
+impl PendingPermissionView {
+    fn render_text(&self) -> String {
+        format!(
+            "permission: {}\ntool: {} ({})\narguments: {}\nctrl-a approve once, ctrl-d deny once",
+            self.permission_id, self.tool_name, self.tool_call_id, self.arguments_json
+        )
+    }
 }
 
 impl ChatApp {
@@ -267,7 +285,7 @@ impl ChatApp {
             lines: Vec::new(),
             input: String::new(),
             status: "enter sends, ctrl-a approves, ctrl-d denies, ctrl-x cancels".to_string(),
-            pending_permissions: Vec::new(),
+            pending_permissions: BTreeMap::new(),
         };
         for event in history {
             app.absorb_session_event(event);
@@ -283,10 +301,21 @@ impl ChatApp {
 
     fn absorb_session_event(&mut self, event: &SessionEvent) {
         match &event.kind {
-            SessionEventKind::PermissionRequested { permission_id, .. } => {
-                if !self.pending_permissions.contains(permission_id) {
-                    self.pending_permissions.push(permission_id.clone());
-                }
+            SessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => {
+                self.pending_permissions.insert(
+                    permission_id.clone(),
+                    PendingPermissionView {
+                        permission_id: permission_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        arguments_json: arguments_json.clone(),
+                    },
+                );
                 self.status = format!("permission pending: {permission_id}");
             }
             SessionEventKind::PermissionResolved { permission_id, .. } => {
@@ -298,8 +327,15 @@ impl ChatApp {
     }
 
     fn remove_pending_permission(&mut self, permission_id: &str) {
-        self.pending_permissions
-            .retain(|pending| pending != permission_id);
+        self.pending_permissions.remove(permission_id);
+    }
+
+    fn first_pending_permission_id(&self) -> Option<String> {
+        self.pending_permissions.keys().next().cloned()
+    }
+
+    fn first_pending_permission(&self) -> Option<&PendingPermissionView> {
+        self.pending_permissions.values().next()
     }
 
     fn take_input(&mut self) -> Option<String> {
@@ -314,14 +350,26 @@ impl ChatApp {
 
 impl ratatui::widgets::Widget for &ChatApp {
     fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let has_permission = self.first_pending_permission().is_some();
+        let constraints = if has_permission {
+            vec![
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(6),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ]
+        } else {
+            vec![
                 Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(3),
                 Constraint::Length(1),
-            ])
+            ]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
             .split(area);
 
         let header = Paragraph::new(format!("Bcode session {}", self.session_id));
@@ -335,12 +383,24 @@ impl ratatui::widgets::Widget for &ChatApp {
             .wrap(Wrap { trim: false });
         transcript.render(chunks[1], buf);
 
+        let input_index = self.first_pending_permission().map_or(2, |permission| {
+            let permission = Paragraph::new(permission.render_text())
+                .block(
+                    Block::new()
+                        .title("Permission Required")
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false });
+            permission.render(chunks[2], buf);
+            3
+        });
+
         let input = Paragraph::new(self.input.as_str())
             .block(Block::new().title("Input").borders(Borders::ALL))
             .wrap(Wrap { trim: false });
-        input.render(chunks[2], buf);
+        input.render(chunks[input_index], buf);
 
-        Paragraph::new(self.status.as_str()).render(chunks[3], buf);
+        Paragraph::new(self.status.as_str()).render(chunks[input_index + 1], buf);
     }
 }
 
