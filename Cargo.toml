@@ -6,6 +6,7 @@ members = [
     "packages/ipc",
     "packages/server",
     "packages/session",
+    "packages/tui",
     "packages/session/models",
 ]
 resolver = "2"
@@ -26,6 +27,7 @@ bcode_ipc            = { version = "0.0.1-alpha.0", default-features = false, pa
 bcode_server         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+bcode_tui            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 
 # BMUX reuse
 bmux_codec = { default-features = false, path = "../bmux/packages/codec" }
@@ -33,6 +35,8 @@ bmux_ipc   = { default-features = false, path = "../bmux/packages/ipc" }
 
 # External dependencies
 clap      = { version = "4.5.40", default-features = false }
+crossterm = { version = "0.29.0", default-features = false }
+ratatui   = { version = "0.30.0", default-features = false }
 serde     = { version = "1.0.219", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.12", default-features = false }
 tokio     = { version = "1.45.1", default-features = false }

@@ -15,6 +15,7 @@ bcode_client         = { workspace = true }
 bcode_ipc            = { workspace = true }
 bcode_server         = { workspace = true }
 bcode_session_models = { workspace = true }
+bcode_tui            = { workspace = true }
 clap                 = { workspace = true, features = ["derive", "help", "std", "usage"] }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["signal"] }

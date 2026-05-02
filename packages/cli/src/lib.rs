@@ -17,6 +17,8 @@ pub enum CliError {
     Client(#[from] ClientError),
     #[error("server error: {0}")]
     Server(#[from] bcode_server::ServerError),
+    #[error("TUI error: {0}")]
+    Tui(#[from] bcode_tui::TuiError),
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
 }
@@ -40,6 +42,7 @@ pub async fn run() -> Result<(), CliError> {
             SessionCommand::History { session_id } => session_history(session_id).await?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
+        Commands::Tui { session_id } => bcode_tui::run(session_id).await?,
         Commands::Send {
             session_id,
             message,
@@ -67,6 +70,9 @@ enum Commands {
     },
     Attach {
         session_id: SessionId,
+    },
+    Tui {
+        session_id: Option<SessionId>,
     },
     Send {
         session_id: SessionId,

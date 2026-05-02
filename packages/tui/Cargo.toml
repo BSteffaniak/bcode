@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Terminal user interface for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "tui"]
+license     = { workspace = true }
+name        = "bcode_tui"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_client = { workspace = true }
+bcode_ipc = { workspace = true }
+bcode_session_models = { workspace = true }
+crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
+ratatui = { workspace = true, features = [
+    "crossterm",
+    "crossterm_0_29",
+    "std",
+] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[features]
+default          = []
+fail-on-warnings = []
