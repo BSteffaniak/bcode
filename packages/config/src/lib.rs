@@ -19,11 +19,29 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 pub struct BcodeConfig {
     #[serde(default)]
     pub plugins: PluginConfig,
+    #[serde(default)]
+    pub model: ModelConfig,
 }
 
 impl BcodeConfig {
     fn merge(&mut self, next: Self) {
         self.plugins.merge(next.plugins);
+        self.model.merge(next.model);
+    }
+}
+
+/// Model selection configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+impl ModelConfig {
+    fn merge(&mut self, next: Self) {
+        if next.model_id.is_some() {
+            self.model_id = next.model_id;
+        }
     }
 }
 

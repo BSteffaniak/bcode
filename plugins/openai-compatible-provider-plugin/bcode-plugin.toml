@@ -1,0 +1,15 @@
+id      = "bcode.openai-compatible"
+name    = "Bcode OpenAI-Compatible Provider"
+version = "0.0.1"
+
+[[services]]
+description  = "OpenAI-compatible chat completions model provider"
+interface_id = "bcode.model-provider/v1"
+name         = "OpenAI-Compatible Model Provider"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_openai_compatible_provider_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

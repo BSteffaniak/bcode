@@ -54,16 +54,22 @@ pub enum ServerError {
 struct ServerState {
     sessions: SessionManager,
     plugins: Mutex<bcode_plugin::PluginHost>,
+    selected_model_id: Option<String>,
     clients: Mutex<BTreeSet<ClientId>>,
     shutdown: broadcast::Sender<()>,
 }
 
 impl ServerState {
-    fn new(sessions: SessionManager, plugins: bcode_plugin::PluginHost) -> Self {
+    fn new(
+        sessions: SessionManager,
+        plugins: bcode_plugin::PluginHost,
+        selected_model_id: Option<String>,
+    ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions,
             plugins: Mutex::new(plugins),
+            selected_model_id,
             clients: Mutex::default(),
             shutdown,
         }
@@ -104,7 +110,11 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
     let listener = LocalIpcListener::bind(&endpoint).await?;
     let sessions = SessionManager::persistent(default_session_store_dir())?;
-    let state = Arc::new(ServerState::new(sessions, plugins));
+    let state = Arc::new(ServerState::new(
+        sessions,
+        plugins,
+        config.model.model_id.clone(),
+    ));
     let mut shutdown = state.subscribe_shutdown();
     loop {
         tokio::select! {
@@ -574,7 +584,10 @@ async fn build_model_turn_request(
     Ok(ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}", session_id, trigger_event.sequence),
-        model_id: "fake-echo".to_string(),
+        model_id: state
+            .selected_model_id
+            .clone()
+            .unwrap_or_else(|| "fake-echo".to_string()),
         system_prompt: None,
         messages,
         tools: Vec::new(),

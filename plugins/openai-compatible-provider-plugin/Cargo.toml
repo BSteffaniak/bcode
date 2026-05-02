@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "OpenAI-compatible model provider plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "openai", "provider"]
+license     = { workspace = true }
+name        = "bcode_openai_compatible_provider_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_model      = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+reqwest          = { workspace = true }
+serde            = { workspace = true, features = ["derive", "std"] }
+serde_json       = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
