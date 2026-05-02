@@ -51,6 +51,7 @@ pub async fn run() -> Result<(), CliError> {
         },
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
+            PluginCommand::Services { root } => list_plugin_services(&root)?,
             PluginCommand::Check { root } => check_plugins(&root)?,
             PluginCommand::Invoke {
                 root,
@@ -59,6 +60,12 @@ pub async fn run() -> Result<(), CliError> {
                 operation,
                 payload,
             } => invoke_plugin_service(&root, &plugin_id, &interface_id, &operation, payload)?,
+            PluginCommand::Call {
+                root,
+                interface_id,
+                operation,
+                payload,
+            } => call_plugin_service(&root, &interface_id, &operation, payload)?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -132,6 +139,10 @@ enum PluginCommand {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
     },
+    Services {
+        #[arg(long = "root")]
+        root: Vec<std::path::PathBuf>,
+    },
     Check {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
@@ -140,6 +151,13 @@ enum PluginCommand {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
         plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Option<String>,
+    },
+    Call {
+        #[arg(long = "root")]
+        root: Vec<std::path::PathBuf>,
         interface_id: String,
         operation: String,
         payload: Option<String>,
@@ -165,6 +183,29 @@ fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
             plugin.manifest.name,
             plugin.manifest_path.display()
         );
+    }
+    Ok(())
+}
+
+fn list_plugin_services(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let selection = bcode_plugin::PluginSelection::from(&config);
+    let plugins =
+        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
+    let mut has_services = false;
+    for plugin in plugins {
+        for service in plugin.manifest.services {
+            has_services = true;
+            println!(
+                "{}\t{}\t{}",
+                service.interface_id,
+                plugin.manifest.id,
+                service.name.unwrap_or_else(|| "<unnamed>".to_string())
+            );
+        }
+    }
+    if !has_services {
+        println!("no plugin services discovered");
     }
     Ok(())
 }
@@ -207,12 +248,37 @@ fn invoke_plugin_service(
         payload.unwrap_or_default().into_bytes(),
     )?;
     host.deactivate_all()?;
+    print_service_response(response);
+    Ok(())
+}
+
+fn call_plugin_service(
+    roots: &[std::path::PathBuf],
+    interface_id: &str,
+    operation: &str,
+    payload: Option<String>,
+) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let selection = bcode_plugin::PluginSelection::from(&config);
+    let plugins =
+        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
+    let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
+    let response = host.invoke_service_by_interface(
+        interface_id,
+        operation,
+        payload.unwrap_or_default().into_bytes(),
+    )?;
+    host.deactivate_all()?;
+    print_service_response(response);
+    Ok(())
+}
+
+fn print_service_response(response: bcode_plugin::ServiceResponse) {
     if let Some(error) = response.error {
         println!("ERROR\t{}\t{}", error.code, error.message);
     } else {
         println!("{}", String::from_utf8_lossy(&response.payload));
     }
-    Ok(())
 }
 
 fn discover_plugins_for_cli(

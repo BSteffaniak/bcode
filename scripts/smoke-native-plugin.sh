@@ -40,6 +40,11 @@ id = "example.hello"
 name = "Hello Example Plugin"
 version = "0.0.1"
 
+[[services]]
+description = "Echo service used by smoke tests"
+interface_id = "example-hello/v1"
+name = "Hello Echo"
+
 [runtime]
 type = "native"
 abi_version = 1
@@ -64,7 +69,9 @@ enabled = ["example.hello"]
 EOF
 
 cargo run --quiet -p bcode -- plugin list --root "${workdir}/plugins" | grep -q "example.hello"
+cargo run --quiet -p bcode -- plugin services --root "${workdir}/plugins" | grep -q "example-hello/v1"
 cargo run --quiet -p bcode -- plugin check --root "${workdir}/plugins" | grep -q $'example.hello\tOK'
 cargo run --quiet -p bcode -- plugin invoke --root "${workdir}/plugins" example.hello example-hello/v1 echo "hello service" | grep -q "hello service"
+cargo run --quiet -p bcode -- plugin call --root "${workdir}/plugins" example-hello/v1 echo "hello routed service" | grep -q "hello routed service"
 
 echo "smoke-native-plugin: PASS"

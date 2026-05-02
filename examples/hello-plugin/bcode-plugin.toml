@@ -2,6 +2,11 @@ id      = "example.hello"
 name    = "Hello Example Plugin"
 version = "0.0.1"
 
+[[services]]
+description  = "Echo service used by smoke tests"
+interface_id = "example-hello/v1"
+name         = "Hello Echo"
+
 [runtime]
 abi_version    = 1
 library        = "libbcode_hello_plugin.dylib"

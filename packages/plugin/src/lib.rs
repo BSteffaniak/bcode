@@ -7,12 +7,13 @@
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, NativeServiceContext,
-    SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, ServiceRequest, ServiceResponse,
+    SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, ServiceRequest,
 };
+pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 use libloading::Library;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,19 @@ pub struct PluginManifest {
     pub id: String,
     pub name: String,
     pub version: Version,
+    #[serde(default)]
+    pub services: Vec<PluginService>,
     pub runtime: PluginRuntime,
+}
+
+/// Service interface declared by a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginService {
+    pub interface_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Runtime configuration for a plugin.
@@ -255,6 +268,13 @@ pub enum PluginLoadError {
     ManifestIdMismatch { file_id: String, library_id: String },
     #[error("plugin is not loaded: {0}")]
     PluginNotLoaded(String),
+    #[error("no loaded plugin declares service interface '{0}'")]
+    ServiceNotRegistered(String),
+    #[error("multiple loaded plugins declare service interface '{interface_id}': {plugin_ids:?}")]
+    AmbiguousService {
+        interface_id: String,
+        plugin_ids: Vec<String>,
+    },
     #[error("failed to encode service request: {0}")]
     ServiceEncode(#[source] serde_json::Error),
     #[error("failed to decode service response: {0}")]
@@ -330,6 +350,61 @@ pub fn filter_selected_plugins(
         .collect()
 }
 
+/// Registry of service interfaces declared by loaded plugins.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginServiceRegistry {
+    providers: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl PluginServiceRegistry {
+    /// Build a registry from loaded plugins.
+    #[must_use]
+    pub fn from_loaded_plugins(plugins: &[LoadedPlugin]) -> Self {
+        let mut registry = Self::default();
+        for plugin in plugins {
+            for service in &plugin.manifest.services {
+                registry
+                    .providers
+                    .entry(service.interface_id.clone())
+                    .or_default()
+                    .insert(plugin.manifest.id.clone());
+            }
+        }
+        registry
+    }
+
+    /// Return all service interface providers.
+    #[must_use]
+    pub const fn providers(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.providers
+    }
+
+    /// Return plugin IDs that provide a service interface.
+    #[must_use]
+    pub fn providers_for(&self, interface_id: &str) -> Option<&BTreeSet<String>> {
+        self.providers.get(interface_id)
+    }
+
+    fn unique_provider(&self, interface_id: &str) -> Result<&str, PluginLoadError> {
+        let Some(providers) = self.providers.get(interface_id) else {
+            return Err(PluginLoadError::ServiceNotRegistered(
+                interface_id.to_string(),
+            ));
+        };
+        if providers.len() != 1 {
+            return Err(PluginLoadError::AmbiguousService {
+                interface_id: interface_id.to_string(),
+                plugin_ids: providers.iter().cloned().collect(),
+            });
+        }
+        providers
+            .iter()
+            .next()
+            .map(String::as_str)
+            .ok_or_else(|| PluginLoadError::ServiceNotRegistered(interface_id.to_string()))
+    }
+}
+
 /// Loaded plugin host retaining activated plugins.
 #[derive(Debug, Default)]
 pub struct PluginHost {
@@ -368,6 +443,12 @@ impl PluginHost {
         &self.loaded
     }
 
+    /// Return the service registry for currently loaded plugins.
+    #[must_use]
+    pub fn service_registry(&self) -> PluginServiceRegistry {
+        PluginServiceRegistry::from_loaded_plugins(&self.loaded)
+    }
+
     /// Invoke a service operation on a loaded plugin by ID.
     ///
     /// # Errors
@@ -386,6 +467,23 @@ impl PluginHost {
             .find(|plugin| plugin.manifest.id == plugin_id)
             .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
         plugin.invoke_service(interface_id, operation, payload)
+    }
+
+    /// Invoke a service operation by service interface ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no loaded plugin provides the interface, more than one loaded plugin
+    /// provides the interface, or service invocation fails.
+    pub fn invoke_service_by_interface(
+        &self,
+        interface_id: &str,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let registry = self.service_registry();
+        let plugin_id = registry.unique_provider(interface_id)?;
+        self.invoke_service(plugin_id, interface_id, operation, payload)
     }
 
     /// Deactivate all loaded plugins in reverse load order.
