@@ -10,6 +10,9 @@ name         = "Hello Echo"
 [[event_subscriptions]]
 topic = "example.event"
 
+[[event_subscriptions]]
+topic = "bcode.session.event"
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"

@@ -39,7 +39,7 @@ impl RustPlugin for HelloPlugin {
     }
 
     fn handle_event(&mut self, context: NativeEventContext) -> Result<(), PluginError> {
-        if context.event.topic == "example.event" {
+        if context.event.topic == "example.event" || context.event.topic == "bcode.session.event" {
             self.event_count += 1;
         }
         Ok(())

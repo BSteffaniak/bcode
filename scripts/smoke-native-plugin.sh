@@ -53,6 +53,9 @@ name = "Hello Echo"
 [[event_subscriptions]]
 topic = "example.event"
 
+[[event_subscriptions]]
+topic = "bcode.session.event"
+
 [runtime]
 type = "native"
 abi_version = 1
@@ -99,6 +102,9 @@ done
 cargo run --quiet -p bcode -- plugin services --daemon | grep -q "example-hello/v1"
 cargo run --quiet -p bcode -- plugin invoke --daemon example.hello example-hello/v1 echo "hello daemon service" | grep -q "hello daemon service"
 cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 echo "hello daemon routed service" | grep -q "hello daemon routed service"
+session_id="$(cargo run --quiet -p bcode -- session create plugin-event-smoke)"
+cargo run --quiet -p bcode -- send "${session_id}" "plugin event smoke" >/dev/null
+cargo run --quiet -p bcode -- plugin call --daemon example-hello/v1 event-count | grep -q "1"
 cargo run --quiet -p bcode -- server stop >/dev/null
 wait "${server_pid}"
 server_pid=""

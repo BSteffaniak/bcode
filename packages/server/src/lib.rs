@@ -23,6 +23,9 @@ use tokio::sync::{Mutex, broadcast};
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
 
+/// Plugin event topic published for every session event appended by the server.
+pub const SESSION_EVENT_PLUGIN_TOPIC: &str = "bcode.session.event";
+
 /// Errors returned by the local server.
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -34,6 +37,8 @@ pub enum ServerError {
     Codec(#[from] CodecError),
     #[error("plugin error: {0}")]
     Plugin(#[from] bcode_plugin::PluginLoadError),
+    #[error("serialization error: {0}")]
+    Serialize(#[from] serde_json::Error),
     #[error("session error: {0}")]
     Session(#[from] bcode_session::SessionError),
     #[error("session event store error: {0}")]
@@ -381,7 +386,8 @@ async fn handle_user_message(
         .append_user_message(session_id, client_id, text)
         .await
     {
-        Ok(_) => {
+        Ok(event) => {
+            publish_session_event(state, &event).await;
             send_response(
                 writer,
                 request_id,
@@ -481,6 +487,20 @@ fn plugin_service_summaries(plugins: &bcode_plugin::PluginHost) -> Vec<PluginSer
         }
     }
     services
+}
+
+async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
+    let payload = match serde_json::to_vec(event) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("failed to encode plugin session event: {error}");
+            return;
+        }
+    };
+    let plugins = state.plugins.lock().await;
+    if let Err(error) = plugins.publish_event(SESSION_EVENT_PLUGIN_TOPIC, &payload) {
+        eprintln!("failed to publish plugin session event: {error}");
+    }
 }
 
 fn forward_session_events(
