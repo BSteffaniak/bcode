@@ -124,6 +124,7 @@ struct SessionState {
 #[derive(Debug)]
 pub struct SessionAttachment {
     pub history: Vec<SessionEvent>,
+    pub attached_event: SessionEvent,
     pub events: broadcast::Receiver<SessionEvent>,
 }
 
@@ -220,11 +221,15 @@ impl SessionManager {
             state.summary.client_count = state.clients.len();
             let history = state.events.clone();
             let events = state.sender.subscribe();
-            state.push_event(
+            let attached_event = state.push_event(
                 SessionEventKind::ClientAttached { client_id },
                 self.store.as_ref(),
             )?;
-            SessionAttachment { history, events }
+            SessionAttachment {
+                history,
+                attached_event,
+                events,
+            }
         };
         Ok(attachment)
     }
@@ -238,21 +243,19 @@ impl SessionManager {
         &self,
         session_id: SessionId,
         client_id: ClientId,
-    ) -> Result<(), SessionError> {
-        {
-            let mut inner = self.inner.lock().await;
-            let Some(state) = inner.sessions.get_mut(&session_id) else {
-                return Ok(());
-            };
-            if state.clients.remove(&client_id) {
-                state.summary.client_count = state.clients.len();
-                state.push_event(
-                    SessionEventKind::ClientDetached { client_id },
-                    self.store.as_ref(),
-                )?;
-            }
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        let mut inner = self.inner.lock().await;
+        let Some(state) = inner.sessions.get_mut(&session_id) else {
+            return Ok(None);
+        };
+        if state.clients.remove(&client_id) {
+            state.summary.client_count = state.clients.len();
+            return Ok(Some(state.push_event(
+                SessionEventKind::ClientDetached { client_id },
+                self.store.as_ref(),
+            )?));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Append a user message to a session.

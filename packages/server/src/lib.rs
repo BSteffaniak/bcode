@@ -162,8 +162,10 @@ async fn handle_registered_client(
         .await?;
     }
 
-    if let Some(session_id) = attached_session {
-        state.sessions.detach_session(session_id, client_id).await?;
+    if let Some(session_id) = attached_session
+        && let Some(event) = state.sessions.detach_session(session_id, client_id).await?
+    {
+        publish_session_event(state, &event).await;
     }
 
     Ok(())
@@ -286,6 +288,11 @@ async fn handle_create_session(
     name: Option<String>,
 ) -> Result<(), ServerError> {
     let session = state.sessions.create_session(name).await?;
+    if let Ok(history) = state.sessions.session_history(session.id).await
+        && let Some(event) = history.last()
+    {
+        publish_session_event(state, event).await;
+    }
     send_response(
         writer,
         request_id,
@@ -350,6 +357,7 @@ async fn handle_attach_session(
     match state.sessions.attach_session(session_id, client_id).await {
         Ok(attachment) => {
             *attached_session = Some(session_id);
+            publish_session_event(state, &attachment.attached_event).await;
             send_response(
                 writer,
                 request_id,
