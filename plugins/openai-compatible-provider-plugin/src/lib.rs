@@ -10,7 +10,7 @@ use bcode_model::{
     OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
     ProviderCapability, ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse,
-    StopReason, ValidateConfigResponse,
+    StopReason, ToolCall, ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use reqwest::Client;
@@ -147,6 +147,8 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,9 +160,40 @@ struct ChatCompletionRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct ChatTool {
+    r#type: &'static str,
+    function: ChatToolFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatToolFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
 struct ChatMessage {
     role: &'static str,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    tool_calls: Vec<ChatMessageToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessageToolCall {
+    id: String,
+    r#type: &'static str,
+    function: ChatMessageToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessageToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +210,25 @@ struct ChatChunkChoice {
 #[derive(Debug, Deserialize)]
 struct ChatChunkDelta {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatDeltaToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatDeltaToolCall {
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ChatDeltaToolCallFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatDeltaToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +248,16 @@ struct OpenAiErrorBody {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
     Finished,
+    ToolCall,
     Cancelled,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    started: bool,
 }
 
 struct TurnWorker {
@@ -234,6 +295,9 @@ async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
     match stream_chat_completion_inner(request, turn).await {
         Ok(StreamOutcome::Finished) => turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::EndTurn,
+        }),
+        Ok(StreamOutcome::ToolCall) => turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::ToolCall,
         }),
         Ok(StreamOutcome::Cancelled) => {
             turn.push(ProviderTurnEvent::Cancelled);
@@ -273,7 +337,7 @@ async fn stream_chat_completion_inner(
             )
         })?;
     let response = send_chat_completion_request(&client, &settings, api_key, request).await?;
-    read_stream_events(response, turn).await
+    read_stream_events(response, turn, request).await
 }
 
 async fn send_chat_completion_request(
@@ -294,6 +358,7 @@ async fn send_chat_completion_request(
         },
         messages: model_messages_to_chat_messages(request),
         stream: true,
+        tools: model_tools_to_chat_tools(request),
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
@@ -327,8 +392,10 @@ async fn send_chat_completion_request(
 async fn read_stream_events(
     mut response: reqwest::Response,
     turn: &TurnState,
+    request: &ModelTurnRequest,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut buffer = String::new();
+    let mut tool_calls = BTreeMap::new();
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -345,8 +412,9 @@ async fn read_stream_events(
                     return Ok(StreamOutcome::Finished);
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-                if process_stream_buffer(&mut buffer, turn)? == StreamOutcome::Finished {
-                    return Ok(StreamOutcome::Finished);
+                let outcome = process_stream_buffer(&mut buffer, turn, request, &mut tool_calls)?;
+                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+                    return Ok(outcome);
                 }
             }
             () = turn.cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
@@ -357,6 +425,8 @@ async fn read_stream_events(
 fn process_stream_buffer(
     buffer: &mut String,
     turn: &TurnState,
+    request: &ModelTurnRequest,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
 ) -> Result<StreamOutcome, ProviderError> {
     while let Some(position) = buffer.find('\n') {
         let mut line = buffer[..position].to_string();
@@ -364,14 +434,20 @@ fn process_stream_buffer(
             line.pop();
         }
         buffer.drain(..=position);
-        if process_stream_line(&line, turn)? == StreamOutcome::Finished {
-            return Ok(StreamOutcome::Finished);
+        let outcome = process_stream_line(&line, turn, request, tool_calls)?;
+        if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+            return Ok(outcome);
         }
     }
     Ok(StreamOutcome::Cancelled)
 }
 
-fn process_stream_line(line: &str, turn: &TurnState) -> Result<StreamOutcome, ProviderError> {
+fn process_stream_line(
+    line: &str,
+    turn: &TurnState,
+    request: &ModelTurnRequest,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+) -> Result<StreamOutcome, ProviderError> {
     let Some(data) = line.strip_prefix("data: ") else {
         return Ok(StreamOutcome::Cancelled);
     };
@@ -385,17 +461,96 @@ fn process_stream_line(line: &str, turn: &TurnState) -> Result<StreamOutcome, Pr
             error.to_string(),
         )
     })?;
+    let name_map = openai_tool_name_map(request);
     for choice in chunk.choices {
         if let Some(content) = choice.delta.content
             && !content.is_empty()
         {
             turn.push(ProviderTurnEvent::TextDelta { text: content });
         }
-        if choice.finish_reason.is_some() {
+        process_tool_call_deltas(turn, &choice.delta.tool_calls, tool_calls, &name_map);
+        if let Some(finish_reason) = choice.finish_reason {
+            if finish_reason == "tool_calls" {
+                finish_tool_calls(turn, tool_calls, &name_map)?;
+                return Ok(StreamOutcome::ToolCall);
+            }
             return Ok(StreamOutcome::Finished);
         }
     }
     Ok(StreamOutcome::Cancelled)
+}
+
+fn process_tool_call_deltas(
+    turn: &TurnState,
+    deltas: &[ChatDeltaToolCall],
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    name_map: &BTreeMap<String, String>,
+) {
+    for delta in deltas {
+        let entry = tool_calls.entry(delta.index).or_default();
+        if let Some(id) = &delta.id {
+            entry.id = Some(id.clone());
+        }
+        if let Some(function) = &delta.function {
+            if let Some(name) = &function.name {
+                entry.name = Some(name.clone());
+            }
+            if let Some(arguments) = &function.arguments {
+                entry.arguments.push_str(arguments);
+            }
+        }
+        if !entry.started
+            && let (Some(id), Some(name)) = (&entry.id, &entry.name)
+        {
+            turn.push(ProviderTurnEvent::ToolCallStarted {
+                call_id: id.clone(),
+                name: original_tool_name(name, name_map),
+            });
+            entry.started = true;
+        }
+    }
+}
+
+fn finish_tool_calls(
+    turn: &TurnState,
+    tool_calls: &BTreeMap<u32, ToolCallAccumulator>,
+    name_map: &BTreeMap<String, String>,
+) -> Result<(), ProviderError> {
+    for accumulator in tool_calls.values() {
+        let id = accumulator.id.clone().ok_or_else(|| {
+            provider_error(
+                "missing_tool_call_id",
+                ProviderErrorCategory::ProviderInternal,
+                "provider emitted a tool call without an id",
+            )
+        })?;
+        let name = accumulator.name.clone().ok_or_else(|| {
+            provider_error(
+                "missing_tool_call_name",
+                ProviderErrorCategory::ProviderInternal,
+                "provider emitted a tool call without a function name",
+            )
+        })?;
+        let arguments = if accumulator.arguments.trim().is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(&accumulator.arguments).map_err(|error| {
+                provider_error(
+                    "tool_arguments_decode_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    error.to_string(),
+                )
+            })?
+        };
+        turn.push(ProviderTurnEvent::ToolCallFinished {
+            call: ToolCall {
+                id,
+                name: original_tool_name(&name, name_map),
+                arguments,
+            },
+        });
+    }
+    Ok(())
 }
 
 fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessage> {
@@ -403,7 +558,9 @@ fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessag
     if let Some(system_prompt) = &request.system_prompt {
         messages.push(ChatMessage {
             role: "system",
-            content: system_prompt.clone(),
+            content: Some(system_prompt.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         });
     }
     messages.extend(
@@ -416,13 +573,71 @@ fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessag
 }
 
 fn model_message_to_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
+    match message.role {
+        MessageRole::System | MessageRole::User => text_chat_message(message),
+        MessageRole::Assistant => assistant_chat_message(message),
+        MessageRole::Tool => tool_chat_message(message),
+    }
+}
+
+fn text_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
     let role = match message.role {
         MessageRole::System => "system",
         MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::Tool => "tool",
+        _ => return None,
     };
-    let content = message
+    let content = joined_text_content(message);
+    (!content.is_empty()).then_some(ChatMessage {
+        role,
+        content: Some(content),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    })
+}
+
+fn assistant_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
+    let content = joined_text_content(message);
+    let tool_calls = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall { call } => Some(ChatMessageToolCall {
+                id: call.id.clone(),
+                r#type: "function",
+                function: ChatMessageToolCallFunction {
+                    name: openai_tool_name(&call.name),
+                    arguments: serde_json::to_string(&call.arguments).unwrap_or_default(),
+                },
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if content.is_empty() && tool_calls.is_empty() {
+        None
+    } else {
+        Some(ChatMessage {
+            role: "assistant",
+            content: (!content.is_empty()).then_some(content),
+            tool_calls,
+            tool_call_id: None,
+        })
+    }
+}
+
+fn tool_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
+    message.content.iter().find_map(|block| match block {
+        ContentBlock::ToolResult { result } => Some(ChatMessage {
+            role: "tool",
+            content: Some(result.output.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(result.call_id.clone()),
+        }),
+        _ => None,
+    })
+}
+
+fn joined_text_content(message: &ModelMessage) -> String {
+    message
         .content
         .iter()
         .filter_map(|block| match block {
@@ -430,12 +645,49 @@ fn model_message_to_chat_message(message: &ModelMessage) -> Option<ChatMessage> 
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    if content.is_empty() {
-        None
-    } else {
-        Some(ChatMessage { role, content })
-    }
+        .join("\n")
+}
+
+fn model_tools_to_chat_tools(request: &ModelTurnRequest) -> Vec<ChatTool> {
+    request
+        .tools
+        .iter()
+        .map(|tool| ChatTool {
+            r#type: "function",
+            function: ChatToolFunction {
+                name: openai_tool_name(&tool.name),
+                description: tool.description.clone(),
+                parameters: tool.input_schema.clone(),
+            },
+        })
+        .collect()
+}
+
+fn openai_tool_name_map(request: &ModelTurnRequest) -> BTreeMap<String, String> {
+    request
+        .tools
+        .iter()
+        .map(|tool| (openai_tool_name(&tool.name), tool.name.clone()))
+        .collect()
+}
+
+fn original_tool_name(name: &str, name_map: &BTreeMap<String, String>) -> String {
+    name_map
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn openai_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn capabilities() -> ProviderCapabilities {
@@ -445,6 +697,7 @@ fn capabilities() -> ProviderCapabilities {
         capabilities: [
             ProviderCapability::Streaming,
             ProviderCapability::Cancellation,
+            ProviderCapability::Tools,
         ]
         .into_iter()
         .collect(),
@@ -461,7 +714,9 @@ fn models() -> ModelList {
             is_default: true,
             context_window: None,
             max_output_tokens: None,
-            capabilities: std::iter::once(ModelCapability::StreamingText).collect(),
+            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
+                .into_iter()
+                .collect(),
         }],
     }
 }

@@ -5,7 +5,7 @@
 //! Programmatic client API for Bcode.
 
 use bcode_ipc::{
-    CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream,
+    CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream, PermissionSummary,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, decode,
     default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
@@ -160,6 +160,42 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::TurnCancellationRequested { cancelled } => Ok(cancelled),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List pending permission checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_permissions(&self) -> Result<Vec<PermissionSummary>, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::ListPermissions).await? {
+            ResponsePayload::PermissionList { permissions } => Ok(permissions),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve a pending permission checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn resolve_permission(
+        &self,
+        permission_id: String,
+        approved: bool,
+    ) -> Result<bool, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::ResolvePermission {
+                permission_id,
+                approved,
+            })
+            .await?
+        {
+            ResponsePayload::PermissionResolved { resolved } => Ok(resolved),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

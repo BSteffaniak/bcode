@@ -202,6 +202,20 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub side_effect: ToolSideEffect,
+    #[serde(default)]
+    pub requires_permission: bool,
+}
+
+/// Side-effect category for a model-callable tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSideEffect {
+    #[default]
+    ReadOnly,
+    WriteFiles,
+    ExecuteProcess,
 }
 
 /// Tool call emitted by a provider.

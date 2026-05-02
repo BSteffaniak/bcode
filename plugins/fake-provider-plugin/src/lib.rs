@@ -94,12 +94,16 @@ impl FakeProviderPlugin {
         self.next_turn += 1;
         let provider_turn_id = format!("fake-turn-{}", self.next_turn);
         let user_text = last_user_text(&request.messages);
-        let tool_call = user_text.strip_prefix("tool-read ").map(|path| ToolCall {
-            id: format!("fake-tool-{}", self.next_turn),
-            name: "filesystem.read".to_string(),
-            arguments: serde_json::json!({ "path": path }),
-        });
-        let text = format!("fake: {user_text}");
+        let tool_result = last_tool_result(&request.messages);
+        let tool_call = if tool_result.is_none() {
+            fake_tool_call(&user_text, self.next_turn)
+        } else {
+            None
+        };
+        let text = tool_result.map_or_else(
+            || format!("fake: {user_text}"),
+            |result| format!("fake tool result: {result}"),
+        );
         let turn = FakeTurn::default();
         turn.push(ProviderTurnEvent::TurnStarted);
         self.turns.insert(provider_turn_id.clone(), turn.clone());
@@ -196,6 +200,7 @@ fn capabilities() -> ProviderCapabilities {
         display_name: "Bcode Fake Provider".to_string(),
         capabilities: [
             ProviderCapability::Streaming,
+            ProviderCapability::Tools,
             ProviderCapability::Cancellation,
         ]
         .into_iter()
@@ -212,9 +217,30 @@ fn models() -> ModelList {
             is_default: true,
             context_window: Some(8_000),
             max_output_tokens: Some(1_000),
-            capabilities: std::iter::once(ModelCapability::StreamingText).collect(),
+            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
+                .into_iter()
+                .collect(),
         }],
     }
+}
+
+fn fake_tool_call(user_text: &str, next_turn: u64) -> Option<ToolCall> {
+    if let Some(path) = user_text.strip_prefix("tool-read ") {
+        return Some(ToolCall {
+            id: format!("fake-tool-{next_turn}"),
+            name: "filesystem.read".to_string(),
+            arguments: serde_json::json!({ "path": path }),
+        });
+    }
+    if let Some(rest) = user_text.strip_prefix("tool-write ") {
+        let (path, contents) = rest.split_once(' ').unwrap_or((rest, "fake write"));
+        return Some(ToolCall {
+            id: format!("fake-tool-{next_turn}"),
+            name: "filesystem.write".to_string(),
+            arguments: serde_json::json!({ "path": path, "contents": contents }),
+        });
+    }
+    None
 }
 
 fn last_user_text(messages: &[ModelMessage]) -> String {
@@ -229,6 +255,18 @@ fn last_user_text(messages: &[ModelMessage]) -> String {
             })
         })
         .unwrap_or_default()
+}
+
+fn last_tool_result(messages: &[ModelMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != MessageRole::Tool {
+            return None;
+        }
+        message.content.iter().find_map(|block| match block {
+            ContentBlock::ToolResult { result } => Some(result.output.clone()),
+            _ => None,
+        })
+    })
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {

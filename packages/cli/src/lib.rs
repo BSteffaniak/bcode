@@ -5,7 +5,7 @@
 //! Command-line interface for Bcode.
 
 use bcode_client::{BcodeClient, ClientError};
-use bcode_ipc::{Event, default_endpoint};
+use bcode_ipc::{Event, PermissionSummary, default_endpoint};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
 use clap::{Parser, Subcommand};
 use std::process::{Command, Stdio};
@@ -93,6 +93,15 @@ pub async fn run() -> Result<(), CliError> {
             ModelCommand::List => list_models().await?,
             ModelCommand::Capabilities => model_capabilities().await?,
         },
+        Commands::Permission { command } => match command {
+            PermissionCommand::List => list_permissions().await?,
+            PermissionCommand::Approve { permission_id } => {
+                resolve_permission(permission_id, true).await?;
+            }
+            PermissionCommand::Deny { permission_id } => {
+                resolve_permission(permission_id, false).await?;
+            }
+        },
         Commands::Cancel { session_id } => cancel_session_turn(session_id).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -131,6 +140,10 @@ enum Commands {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    Permission {
+        #[command(subcommand)]
+        command: PermissionCommand,
     },
     Cancel {
         session_id: SessionId,
@@ -171,6 +184,13 @@ enum SessionCommand {
 enum ModelCommand {
     List,
     Capabilities,
+}
+
+#[derive(Debug, Subcommand)]
+enum PermissionCommand {
+    List,
+    Approve { permission_id: String },
+    Deny { permission_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -584,6 +604,33 @@ async fn cancel_session_turn(session_id: SessionId) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn list_permissions() -> Result<(), CliError> {
+    let permissions = BcodeClient::default_endpoint().list_permissions().await?;
+    for permission in permissions {
+        print_permission(&permission);
+    }
+    Ok(())
+}
+
+async fn resolve_permission(permission_id: String, approved: bool) -> Result<(), CliError> {
+    let resolved = BcodeClient::default_endpoint()
+        .resolve_permission(permission_id, approved)
+        .await?;
+    println!("resolved: {resolved}");
+    Ok(())
+}
+
+fn print_permission(permission: &PermissionSummary) {
+    println!(
+        "{}\t{}\t{}\t{}\t{}",
+        permission.permission_id,
+        permission.session_id,
+        permission.tool_call_id,
+        permission.tool_name,
+        permission.arguments_json
+    );
+}
+
 async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let mut connection = client.connect("bcode-attach").await?;
@@ -639,18 +686,41 @@ fn print_session_event(event: &SessionEvent) {
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
+            arguments_json,
         } => {
             println!(
-                "#{} tool call requested: {tool_name} ({tool_call_id})",
-                event.sequence
+                "#{} tool call requested: {tool_name} ({tool_call_id}) {}",
+                event.sequence, arguments_json
             );
         }
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
+            is_error,
+        } => {
+            let status = if *is_error { "error" } else { "ok" };
+            println!(
+                "#{} tool call finished ({status}): {tool_call_id}: {result}",
+                event.sequence
+            );
+        }
+        SessionEventKind::PermissionRequested {
+            permission_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
         } => {
             println!(
-                "#{} tool call finished: {tool_call_id}: {result}",
+                "#{} permission requested: {permission_id} {tool_name} ({tool_call_id}) {}",
+                event.sequence, arguments_json
+            );
+        }
+        SessionEventKind::PermissionResolved {
+            permission_id,
+            approved,
+        } => {
+            println!(
+                "#{} permission resolved: {permission_id} approved={approved}",
                 event.sequence
             );
         }

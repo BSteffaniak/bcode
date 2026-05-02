@@ -317,12 +317,14 @@ impl SessionManager {
         session_id: SessionId,
         tool_call_id: String,
         tool_name: String,
+        arguments_json: String,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 tool_name,
+                arguments_json,
             },
         )
         .await
@@ -338,12 +340,60 @@ impl SessionManager {
         session_id: SessionId,
         tool_call_id: String,
         result: String,
+        is_error: bool,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
                 result,
+                is_error,
+            },
+        )
+        .await
+    }
+
+    /// Append a permission-requested event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_permission_requested(
+        &self,
+        session_id: SessionId,
+        permission_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            },
+        )
+        .await
+    }
+
+    /// Append a permission-resolved event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_permission_resolved(
+        &self,
+        session_id: SessionId,
+        permission_id: String,
+        approved: bool,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
             },
         )
         .await
@@ -513,11 +563,16 @@ mod tests {
             .await
             .expect("assistant message should append");
         manager
-            .append_tool_call_requested(session.id, "tool-1".to_string(), "read".to_string())
+            .append_tool_call_requested(
+                session.id,
+                "tool-1".to_string(),
+                "read".to_string(),
+                r#"{"path":"README.md"}"#.to_string(),
+            )
             .await
             .expect("tool request should append");
         manager
-            .append_tool_call_finished(session.id, "tool-1".to_string(), "ok".to_string())
+            .append_tool_call_finished(session.id, "tool-1".to_string(), "ok".to_string(), false)
             .await
             .expect("tool result should append");
         manager
@@ -539,7 +594,8 @@ mod tests {
             .session_history(session.id)
             .await
             .expect("history should load");
-        assert!(history.iter().all(|event| event.schema_version == 1));
+        assert!(history.iter().all(|event| event.schema_version
+            == bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::UserMessage { text, .. } if text == "hello"
@@ -554,13 +610,13 @@ mod tests {
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ToolCallRequested { tool_call_id, tool_name }
+            SessionEventKind::ToolCallRequested { tool_call_id, tool_name, .. }
                 if tool_call_id == "tool-1" && tool_name == "read"
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ToolCallFinished { tool_call_id, result }
-                if tool_call_id == "tool-1" && result == "ok"
+            SessionEventKind::ToolCallFinished { tool_call_id, result, is_error }
+                if tool_call_id == "tool-1" && result == "ok" && !is_error
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,

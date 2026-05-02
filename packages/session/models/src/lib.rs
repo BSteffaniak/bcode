@@ -10,7 +10,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 1;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 2;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -113,10 +113,23 @@ pub enum SessionEventKind {
     ToolCallRequested {
         tool_call_id: String,
         tool_name: String,
+        arguments_json: String,
     },
     ToolCallFinished {
         tool_call_id: String,
         result: String,
+        #[serde(default)]
+        is_error: bool,
+    },
+    PermissionRequested {
+        permission_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
+    PermissionResolved {
+        permission_id: String,
+        approved: bool,
     },
     ModelChanged {
         provider: String,

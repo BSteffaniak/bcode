@@ -95,6 +95,12 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                         Err(error) => app.status = format!("cancel failed: {error}"),
                     }
                 }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    resolve_first_permission(&client, &mut app, true).await;
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    resolve_first_permission(&client, &mut app, false).await;
+                }
                 KeyCode::Esc => break,
                 KeyCode::Enter => {
                     let Some(message) = app.take_input() else {
@@ -116,6 +122,25 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
     }
 
     Ok(())
+}
+
+async fn resolve_first_permission(client: &BcodeClient, app: &mut ChatApp, approved: bool) {
+    let Some(permission_id) = app.pending_permissions.first().cloned() else {
+        app.status = "no pending permission".to_string();
+        return;
+    };
+    match client
+        .resolve_permission(permission_id.clone(), approved)
+        .await
+    {
+        Ok(true) => {
+            let action = if approved { "approved" } else { "denied" };
+            app.status = format!("permission {permission_id} {action}");
+            app.remove_pending_permission(&permission_id);
+        }
+        Ok(false) => app.status = format!("permission {permission_id} was not pending"),
+        Err(error) => app.status = format!("permission resolve failed: {error}"),
+    }
 }
 
 async fn resolve_session(
@@ -232,23 +257,49 @@ struct ChatApp {
     lines: Vec<String>,
     input: String,
     status: String,
+    pending_permissions: Vec<String>,
 }
 
 impl ChatApp {
     fn new(session_id: SessionId, history: &[SessionEvent]) -> Self {
-        let lines = history.iter().map(format_session_event).collect();
-        Self {
+        let mut app = Self {
             session_id,
-            lines,
+            lines: Vec::new(),
             input: String::new(),
-            status: "enter sends, ctrl-x cancels, esc/ctrl-c quits".to_string(),
+            status: "enter sends, ctrl-a approves, ctrl-d denies, ctrl-x cancels".to_string(),
+            pending_permissions: Vec::new(),
+        };
+        for event in history {
+            app.absorb_session_event(event);
         }
+        app
     }
 
     fn push_event(&mut self, event: Event) {
         match event {
-            Event::Session(event) => self.lines.push(format_session_event(&event)),
+            Event::Session(event) => self.absorb_session_event(&event),
         }
+    }
+
+    fn absorb_session_event(&mut self, event: &SessionEvent) {
+        match &event.kind {
+            SessionEventKind::PermissionRequested { permission_id, .. } => {
+                if !self.pending_permissions.contains(permission_id) {
+                    self.pending_permissions.push(permission_id.clone());
+                }
+                self.status = format!("permission pending: {permission_id}");
+            }
+            SessionEventKind::PermissionResolved { permission_id, .. } => {
+                self.remove_pending_permission(permission_id);
+            }
+            _ => {}
+        }
+        self.lines.push(format_session_event(event));
+    }
+
+    fn remove_pending_permission(&mut self, permission_id: &str) {
+        self.pending_permissions
+            .retain(|pending| pending != permission_id);
     }
 
     fn take_input(&mut self) -> Option<String> {
@@ -349,15 +400,36 @@ fn format_session_event(event: &SessionEvent) -> String {
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
+            arguments_json,
         } => format!(
-            "#{} tool call requested: {tool_name} ({tool_call_id})",
+            "#{} tool call requested: {tool_name} ({tool_call_id}) {arguments_json}",
             event.sequence
         ),
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
+            is_error,
+        } => {
+            let status = if *is_error { "error" } else { "ok" };
+            format!(
+                "#{} tool call finished ({status}): {tool_call_id}: {result}",
+                event.sequence
+            )
+        }
+        SessionEventKind::PermissionRequested {
+            permission_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
         } => format!(
-            "#{} tool call finished: {tool_call_id}: {result}",
+            "#{} permission requested: {permission_id} {tool_name} ({tool_call_id}) {arguments_json}",
+            event.sequence
+        ),
+        SessionEventKind::PermissionResolved {
+            permission_id,
+            approved,
+        } => format!(
+            "#{} permission resolved: {permission_id} approved={approved}",
             event.sequence
         ),
         SessionEventKind::ModelChanged { provider, model } => {

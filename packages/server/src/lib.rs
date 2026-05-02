@@ -6,9 +6,9 @@
 
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcListener, LocalIpcStream,
-    PluginServiceError, PluginServiceResponse, PluginServiceSummary, Request, Response,
-    ResponsePayload, ServerStatus, decode, event_envelope, recv_envelope, response_envelope,
-    send_envelope,
+    PermissionSummary, PluginServiceError, PluginServiceResponse, PluginServiceSummary, Request,
+    Response, ResponsePayload, ServerStatus, decode, event_envelope, recv_envelope,
+    response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole,
@@ -20,7 +20,8 @@ use bcode_session::SessionManager;
 use bcode_session_models::{ClientId, SessionEventKind, SessionId};
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList,
+    ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolList,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -29,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
@@ -63,6 +64,8 @@ struct ServerState {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
+    pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
+    next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     shutdown: broadcast::Sender<()>,
 }
@@ -71,6 +74,13 @@ struct ServerState {
 struct ActiveModelTurn {
     provider_plugin_id: Option<String>,
     provider_turn_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPermission {
+    summary: PermissionSummary,
+    decision: Arc<Mutex<Option<bool>>>,
+    notify: Arc<Notify>,
 }
 
 impl ServerState {
@@ -87,6 +97,8 @@ impl ServerState {
             selected_provider_plugin_id,
             selected_model_id,
             active_turns: Mutex::default(),
+            pending_permissions: Mutex::default(),
+            next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
             shutdown,
         }
@@ -243,6 +255,11 @@ async fn handle_request(
         Request::CancelSessionTurn { session_id } => {
             handle_cancel_session_turn(request_id, state, writer, session_id).await
         }
+        Request::ListPermissions => handle_list_permissions(request_id, state, writer).await,
+        Request::ResolvePermission {
+            permission_id,
+            approved,
+        } => handle_resolve_permission(request_id, state, writer, &permission_id, approved).await,
         Request::ListPluginServices => handle_list_plugin_services(request_id, state, writer).await,
         Request::InvokePluginService {
             plugin_id,
@@ -509,6 +526,71 @@ async fn handle_cancel_session_turn(
     }
 }
 
+async fn handle_list_permissions(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let permissions = state
+        .pending_permissions
+        .lock()
+        .await
+        .values()
+        .map(|permission| permission.summary.clone())
+        .collect();
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PermissionList { permissions }),
+    )
+    .await
+}
+
+async fn handle_resolve_permission(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    permission_id: &str,
+    approved: bool,
+) -> Result<(), ServerError> {
+    let Some(permission) = state.pending_permissions.lock().await.remove(permission_id) else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::PermissionResolved { resolved: false }),
+        )
+        .await;
+    };
+    *permission.decision.lock().await = Some(approved);
+    permission.notify.notify_waiters();
+    match state
+        .sessions
+        .append_permission_resolved(
+            permission.summary.session_id,
+            permission.summary.permission_id,
+            approved,
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append permission result: {error}"),
+    }
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PermissionResolved { resolved: true }),
+    )
+    .await
+}
+
+const MAX_MODEL_TOOL_ROUNDS: u8 = 8;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelPollOutcome {
+    stop_reason: Option<bcode_model::StopReason>,
+    should_continue: bool,
+}
+
 async fn run_model_turn(
     state: &ServerState,
     session_id: SessionId,
@@ -518,44 +600,72 @@ async fn run_model_turn(
         return;
     }
 
-    let request = match build_model_turn_request(state, session_id, trigger_event).await {
-        Ok(request) => request,
-        Err(error) => {
-            append_system_event(state, session_id, format!("model request error: {error}")).await;
+    let provider_plugin_id = state.selected_provider_plugin_id.clone();
+    for round in 0..=MAX_MODEL_TOOL_ROUNDS {
+        let request = match build_model_turn_request(state, session_id, trigger_event, round).await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                append_system_event(state, session_id, format!("model request error: {error}"))
+                    .await;
+                return;
+            }
+        };
+        let Some(outcome) =
+            run_model_turn_round(state, session_id, provider_plugin_id.as_deref(), &request).await
+        else {
+            return;
+        };
+        if !outcome.should_continue {
             return;
         }
-    };
+        if round == MAX_MODEL_TOOL_ROUNDS {
+            append_system_event(
+                state,
+                session_id,
+                "model tool-call round limit reached".to_string(),
+            )
+            .await;
+            return;
+        }
+    }
+}
 
-    let provider_plugin_id = state.selected_provider_plugin_id.clone();
+async fn run_model_turn_round(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    request: &ModelTurnRequest,
+) -> Option<ModelPollOutcome> {
     let start = {
         let plugins = state.plugins.lock().await;
         invoke_model_provider_json::<_, StartTurnResponse>(
             &plugins,
-            provider_plugin_id.as_deref(),
+            provider_plugin_id,
             OP_START_TURN,
-            &request,
+            request,
         )
     };
     let start = match start {
         Ok(start) => start,
         Err(error) => {
             append_system_event(state, session_id, format!("model provider error: {error}")).await;
-            return;
+            return None;
         }
     };
 
     state.active_turns.lock().await.insert(
         session_id,
         ActiveModelTurn {
-            provider_plugin_id: provider_plugin_id.clone(),
+            provider_plugin_id: provider_plugin_id.map(ToString::to_string),
             provider_turn_id: start.provider_turn_id.clone(),
         },
     );
 
-    let assistant_text = poll_model_turn_events(
+    let (assistant_text, outcome) = poll_model_turn_events(
         state,
         session_id,
-        provider_plugin_id.as_deref(),
+        provider_plugin_id,
         &start.provider_turn_id,
     )
     .await;
@@ -565,7 +675,6 @@ async fn run_model_turn(
     }
 
     let active_turn = state.active_turns.lock().await.remove(&session_id);
-
     let finish = FinishTurnRequest {
         provider_turn_id: start.provider_turn_id,
     };
@@ -580,6 +689,7 @@ async fn run_model_turn(
             &finish,
         )
     };
+    Some(outcome)
 }
 
 async fn poll_model_turn_events(
@@ -587,9 +697,9 @@ async fn poll_model_turn_events(
     session_id: SessionId,
     provider_plugin_id: Option<&str>,
     provider_turn_id: &str,
-) -> String {
+) -> (String, ModelPollOutcome) {
     let mut assistant_text = String::new();
-    let mut finished = false;
+    let mut outcome = ModelPollOutcome::default();
     let mut empty_polls = 0_u16;
     for _ in 0..1_200 {
         let poll = PollTurnEventsRequest {
@@ -620,20 +730,14 @@ async fn poll_model_turn_events(
         }
         empty_polls = 0;
         for event in response.events {
-            handle_provider_turn_event(
-                state,
-                session_id,
-                event,
-                &mut assistant_text,
-                &mut finished,
-            )
-            .await;
+            handle_provider_turn_event(state, session_id, event, &mut assistant_text, &mut outcome)
+                .await;
         }
-        if finished {
+        if outcome.stop_reason.is_some() {
             break;
         }
     }
-    assistant_text
+    (assistant_text, outcome)
 }
 
 async fn poll_model_turn(
@@ -655,7 +759,7 @@ async fn handle_provider_turn_event(
     session_id: SessionId,
     event: ProviderTurnEvent,
     assistant_text: &mut String,
-    finished: &mut bool,
+    outcome: &mut ModelPollOutcome,
 ) {
     match event {
         ProviderTurnEvent::TextDelta { text } => {
@@ -669,25 +773,28 @@ async fn handle_provider_turn_event(
                 format!("model error {}: {}", error.code, error.message),
             )
             .await;
-            *finished = true;
+            outcome.stop_reason = Some(bcode_model::StopReason::Error);
         }
-        ProviderTurnEvent::TurnFinished { .. } => {
-            *finished = true;
+        ProviderTurnEvent::TurnFinished { stop_reason } => {
+            outcome.should_continue = stop_reason == bcode_model::StopReason::ToolCall;
+            outcome.stop_reason = Some(stop_reason);
         }
         ProviderTurnEvent::Cancelled => {
             append_system_event(state, session_id, "model turn cancelled".to_string()).await;
-            *finished = true;
-        }
-        ProviderTurnEvent::ToolCallStarted { call_id, name } => {
-            append_tool_request_event(state, session_id, call_id, name).await;
+            outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
         }
         ProviderTurnEvent::ToolCallFinished { call } => {
+            if !assistant_text.is_empty() {
+                append_assistant_message_event(state, session_id, std::mem::take(assistant_text))
+                    .await;
+            }
             execute_model_tool(state, session_id, call).await;
         }
         ProviderTurnEvent::Warning { message } => {
             append_system_event(state, session_id, format!("model warning: {message}")).await;
         }
         ProviderTurnEvent::TurnStarted
+        | ProviderTurnEvent::ToolCallStarted { .. }
         | ProviderTurnEvent::ReasoningDelta { .. }
         | ProviderTurnEvent::ToolCallDelta { .. }
         | ProviderTurnEvent::Usage { .. } => {}
@@ -745,6 +852,7 @@ async fn build_model_turn_request(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
+    round: u8,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.session_history(session_id).await?;
     let messages = history
@@ -753,7 +861,7 @@ async fn build_model_turn_request(
         .collect();
     Ok(ModelTurnRequest {
         session_id,
-        turn_id: format!("{}-{}", session_id, trigger_event.sequence),
+        turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id: state
             .selected_model_id
             .clone()
@@ -794,6 +902,18 @@ async fn collect_model_tools(state: &ServerState) -> Vec<bcode_model::ToolDefini
                             name: tool.name,
                             description: tool.description,
                             input_schema: tool.input_schema,
+                            side_effect: match tool.side_effect {
+                                bcode_tool::ToolSideEffect::ReadOnly => {
+                                    bcode_model::ToolSideEffect::ReadOnly
+                                }
+                                bcode_tool::ToolSideEffect::WriteFiles => {
+                                    bcode_model::ToolSideEffect::WriteFiles
+                                }
+                                bcode_tool::ToolSideEffect::ExecuteProcess => {
+                                    bcode_model::ToolSideEffect::ExecuteProcess
+                                }
+                            },
+                            requires_permission: tool.requires_permission,
                         }),
                 );
             }
@@ -811,28 +931,59 @@ async fn execute_model_tool(
     session_id: SessionId,
     call: bcode_model::ToolCall,
 ) {
-    append_tool_request_event(state, session_id, call.id.clone(), call.name.clone()).await;
-    let result = invoke_model_tool(state, &call)
+    append_tool_request_event(
+        state,
+        session_id,
+        call.id.clone(),
+        call.name.clone(),
+        serde_json::to_string(&call.arguments).unwrap_or_default(),
+    )
+    .await;
+    let result = invoke_model_tool(state, session_id, &call)
         .await
         .unwrap_or_else(|error| ToolInvocationResponse {
             output: error,
             is_error: true,
         });
-    let prefix = if result.is_error { "ERROR: " } else { "" };
-    append_tool_finished_event(
-        state,
-        session_id,
-        call.id,
-        format!("{prefix}{}", result.output),
-    )
-    .await;
+    append_tool_finished_event(state, session_id, call.id, result.output, result.is_error).await;
+}
+
+async fn invoke_model_tool(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+) -> Result<ToolInvocationResponse, String> {
+    let (plugin_id, definition) = find_tool_provider(state, &call.name)
+        .await?
+        .ok_or_else(|| format!("tool not found: {}", call.name))?;
+    if definition.requires_permission
+        && !request_tool_permission(state, session_id, call, &definition).await
+    {
+        return Ok(ToolInvocationResponse {
+            output: "permission denied".to_string(),
+            is_error: true,
+        });
+    }
+    let plugins = state.plugins.lock().await;
+    plugins
+        .invoke_service_json::<_, ToolInvocationResponse>(
+            &plugin_id,
+            TOOL_SERVICE_INTERFACE_ID,
+            OP_INVOKE_TOOL,
+            &ToolInvocationRequest {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::significant_drop_tightening)]
-async fn invoke_model_tool(
+async fn find_tool_provider(
     state: &ServerState,
-    call: &bcode_model::ToolCall,
-) -> Result<ToolInvocationResponse, String> {
+    tool_name: &str,
+) -> Result<Option<(String, ServiceToolDefinition)>, String> {
     let plugins = state.plugins.lock().await;
     for plugin in plugins.loaded_plugins() {
         if !plugin
@@ -851,22 +1002,62 @@ async fn invoke_model_tool(
                 &ListToolsRequest::default(),
             )
             .map_err(|error| error.to_string())?;
-        if list.tools.iter().any(|tool| tool.name == call.name) {
-            return plugins
-                .invoke_service_json::<_, ToolInvocationResponse>(
-                    &plugin.manifest().id,
-                    TOOL_SERVICE_INTERFACE_ID,
-                    OP_INVOKE_TOOL,
-                    &ToolInvocationRequest {
-                        tool_call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    },
-                )
-                .map_err(|error| error.to_string());
+        if let Some(tool) = list.tools.into_iter().find(|tool| tool.name == tool_name) {
+            return Ok(Some((plugin.manifest().id.clone(), tool)));
         }
     }
-    Err(format!("tool not found: {}", call.name))
+    Ok(None)
+}
+
+async fn request_tool_permission(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    definition: &ServiceToolDefinition,
+) -> bool {
+    let permission_id = {
+        let mut next = state.next_permission_id.lock().await;
+        let permission_id = format!("perm-{}", *next);
+        *next += 1;
+        permission_id
+    };
+    let pending = PendingPermission {
+        summary: PermissionSummary {
+            permission_id: permission_id.clone(),
+            session_id,
+            tool_call_id: call.id.clone(),
+            tool_name: definition.name.clone(),
+            arguments_json: serde_json::to_string(&call.arguments).unwrap_or_default(),
+        },
+        decision: Arc::new(Mutex::new(None)),
+        notify: Arc::new(Notify::new()),
+    };
+    match state
+        .sessions
+        .append_permission_requested(
+            session_id,
+            permission_id.clone(),
+            call.id.clone(),
+            definition.name.clone(),
+            serde_json::to_string(&call.arguments).unwrap_or_default(),
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append permission request: {error}"),
+    }
+    state
+        .pending_permissions
+        .lock()
+        .await
+        .insert(permission_id.clone(), pending.clone());
+    loop {
+        let decision = *pending.decision.lock().await;
+        if let Some(decision) = decision {
+            return decision;
+        }
+        pending.notify.notified().await;
+    }
 }
 
 fn session_event_to_model_message(
@@ -880,6 +1071,34 @@ fn session_event_to_model_message(
         SessionEventKind::AssistantMessage { text } => Some(ModelMessage {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::Text { text: text.clone() }],
+        }),
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        } => Some(ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolCall {
+                call: bcode_model::ToolCall {
+                    id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    arguments: serde_json::from_str(arguments_json).unwrap_or_default(),
+                },
+            }],
+        }),
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            result,
+            is_error,
+        } => Some(ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: tool_call_id.clone(),
+                    output: result.clone(),
+                    is_error: *is_error,
+                },
+            }],
         }),
         SessionEventKind::SystemMessage { text } => Some(ModelMessage {
             role: MessageRole::System,
@@ -916,10 +1135,11 @@ async fn append_tool_request_event(
     session_id: SessionId,
     tool_call_id: String,
     tool_name: String,
+    arguments_json: String,
 ) {
     match state
         .sessions
-        .append_tool_call_requested(session_id, tool_call_id, tool_name)
+        .append_tool_call_requested(session_id, tool_call_id, tool_name, arguments_json)
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
@@ -932,10 +1152,11 @@ async fn append_tool_finished_event(
     session_id: SessionId,
     tool_call_id: String,
     result: String,
+    is_error: bool,
 ) {
     match state
         .sessions
-        .append_tool_call_finished(session_id, tool_call_id, result)
+        .append_tool_call_finished(session_id, tool_call_id, result, is_error)
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,

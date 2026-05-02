@@ -7,7 +7,7 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList,
+    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -113,6 +113,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                     "required": ["path"],
                     "properties": { "path": { "type": "string" } }
                 }),
+                side_effect: ToolSideEffect::ReadOnly,
+                requires_permission: false,
             },
             ToolDefinition {
                 name: "filesystem.write".to_string(),
@@ -125,6 +127,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                         "contents": { "type": "string" }
                     }
                 }),
+                side_effect: ToolSideEffect::WriteFiles,
+                requires_permission: true,
             },
             ToolDefinition {
                 name: "filesystem.edit".to_string(),
@@ -138,6 +142,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                         "new_text": { "type": "string" }
                     }
                 }),
+                side_effect: ToolSideEffect::WriteFiles,
+                requires_permission: true,
             },
             ToolDefinition {
                 name: "filesystem.exists".to_string(),
@@ -147,6 +153,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                     "required": ["path"],
                     "properties": { "path": { "type": "string" } }
                 }),
+                side_effect: ToolSideEffect::ReadOnly,
+                requires_permission: false,
             },
         ],
     })

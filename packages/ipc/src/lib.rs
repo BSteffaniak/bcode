@@ -98,6 +98,11 @@ pub enum Request {
     CancelSessionTurn {
         session_id: SessionId,
     },
+    ListPermissions,
+    ResolvePermission {
+        permission_id: String,
+        approved: bool,
+    },
     ListPluginServices,
     InvokePluginService {
         plugin_id: String,
@@ -130,6 +135,16 @@ pub struct PluginServiceSummary {
     pub interface_id: String,
     pub name: Option<String>,
     pub description: Option<String>,
+}
+
+/// Pending permission checkpoint summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionSummary {
+    pub permission_id: String,
+    pub session_id: SessionId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_json: String,
 }
 
 /// Plugin service invocation result.
@@ -176,6 +191,12 @@ pub enum ResponsePayload {
     MessageSent,
     TurnCancellationRequested {
         cancelled: bool,
+    },
+    PermissionList {
+        permissions: Vec<PermissionSummary>,
+    },
+    PermissionResolved {
+        resolved: bool,
     },
     PluginServices {
         services: Vec<PluginServiceSummary>,
