@@ -66,13 +66,13 @@ server_pid=""
 cargo run --quiet -p bcode -- server start >"$workdir/server-restarted.log" 2>&1 &
 server_pid="$!"
 for _ in {1..300}; do
-    if cargo run --quiet -p bcode -- session list | grep -q "${session_id}"; then
+    if cargo run --quiet -p bcode -- session list 2>/dev/null | grep -q "${session_id}"; then
         break
     fi
     sleep 0.1
 done
 
-if ! cargo run --quiet -p bcode -- session list | grep -q "${session_id}"; then
+if ! cargo run --quiet -p bcode -- session list 2>/dev/null | grep -q "${session_id}"; then
     echo "persisted session was not restored after server restart" >&2
     echo "--- restarted server log ---" >&2
     cat "$workdir/server-restarted.log" >&2 || true

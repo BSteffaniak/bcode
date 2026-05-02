@@ -191,6 +191,33 @@ fn print_session_event(event: &SessionEvent) {
         SessionEventKind::UserMessage { client_id, text } => {
             println!("#{} {client_id}: {text}", event.sequence);
         }
+        SessionEventKind::AssistantDelta { text } => {
+            println!("#{} assistant delta: {text}", event.sequence);
+        }
+        SessionEventKind::AssistantMessage { text } => {
+            println!("#{} assistant: {text}", event.sequence);
+        }
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+        } => {
+            println!(
+                "#{} tool call requested: {tool_name} ({tool_call_id})",
+                event.sequence
+            );
+        }
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            result,
+        } => {
+            println!(
+                "#{} tool call finished: {tool_call_id}: {result}",
+                event.sequence
+            );
+        }
+        SessionEventKind::ModelChanged { provider, model } => {
+            println!("#{} model changed: {provider}/{model}", event.sequence);
+        }
         SessionEventKind::SystemMessage { text } => {
             println!("#{} system: {text}", event.sequence);
         }

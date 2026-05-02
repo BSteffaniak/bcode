@@ -8,7 +8,10 @@
 
 //! Session lifecycle, attachment management, and append-only event history.
 
-use bcode_session_models::{ClientId, SessionEvent, SessionEventKind, SessionId, SessionSummary};
+use bcode_session_models::{
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionEvent, SessionEventKind, SessionId,
+    SessionSummary,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -57,12 +60,6 @@ impl SessionEventStore {
         Self { root: root.into() }
     }
 
-    /// Load persisted sessions from the event store.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store directory cannot be read, a session file
-    /// has an invalid name, or a persisted event frame cannot be decoded.
     fn load_sessions(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
         let mut sessions = BTreeMap::new();
         if !self.root.exists() {
@@ -325,6 +322,7 @@ impl SessionState {
         store: Option<&SessionEventStore>,
     ) -> Result<SessionEvent, SessionStoreError> {
         let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: self.next_sequence,
             session_id: self.summary.id,
             kind,
@@ -364,4 +362,51 @@ fn read_events(path: &Path) -> Result<Vec<SessionEvent>, SessionStoreError> {
         events.push(bmux_codec::from_bytes(&payload).map_err(SessionStoreError::Decode)?);
     }
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionManager;
+    use bcode_session_models::{ClientId, SessionEventKind};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn persistent_manager_restores_session_history() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("test".to_string()))
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "hello".to_string())
+            .await
+            .expect("message should append");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let sessions = restored.list_sessions().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.id);
+        assert_eq!(sessions[0].name.as_deref(), Some("test"));
+
+        let history = restored
+            .session_history(session.id)
+            .await
+            .expect("history should load");
+        assert!(history.iter().all(|event| event.schema_version == 1));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "hello"
+        )));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    fn unique_temp_dir() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("bcode-session-test-{nanos}"))
+    }
 }

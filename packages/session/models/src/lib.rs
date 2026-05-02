@@ -9,6 +9,9 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use uuid::Uuid;
 
+/// Current persisted session event schema version.
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 1;
+
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -78,6 +81,7 @@ pub struct SessionSummary {
 /// Replayable event emitted by a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEvent {
+    pub schema_version: u16,
     pub sequence: u64,
     pub session_id: SessionId,
     pub kind: SessionEventKind,
@@ -87,9 +91,38 @@ pub struct SessionEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEventKind {
-    SessionCreated { name: Option<String> },
-    ClientAttached { client_id: ClientId },
-    ClientDetached { client_id: ClientId },
-    UserMessage { client_id: ClientId, text: String },
-    SystemMessage { text: String },
+    SessionCreated {
+        name: Option<String>,
+    },
+    ClientAttached {
+        client_id: ClientId,
+    },
+    ClientDetached {
+        client_id: ClientId,
+    },
+    UserMessage {
+        client_id: ClientId,
+        text: String,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    ToolCallRequested {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    ToolCallFinished {
+        tool_call_id: String,
+        result: String,
+    },
+    ModelChanged {
+        provider: String,
+        model: String,
+    },
+    SystemMessage {
+        text: String,
+    },
 }
