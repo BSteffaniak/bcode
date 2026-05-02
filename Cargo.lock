@@ -167,6 +167,7 @@ dependencies = [
  "bcode_plugin",
  "bcode_session",
  "bcode_session_models",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

@@ -34,11 +34,16 @@ impl BcodeConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelConfig {
     #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    #[serde(default)]
     pub model_id: Option<String>,
 }
 
 impl ModelConfig {
     fn merge(&mut self, next: Self) {
+        if next.provider_plugin_id.is_some() {
+            self.provider_plugin_id = next.provider_plugin_id;
+        }
         if next.model_id.is_some() {
             self.model_id = next.model_id;
         }

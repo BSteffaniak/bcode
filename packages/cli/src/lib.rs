@@ -430,13 +430,7 @@ async fn publish_plugin_event(
 }
 
 async fn list_models() -> Result<(), CliError> {
-    let response = BcodeClient::default_endpoint()
-        .call_plugin_service(
-            bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
-            bcode_model::OP_MODELS.to_string(),
-            Vec::new(),
-        )
-        .await?;
+    let response = call_model_provider_service(bcode_model::OP_MODELS).await?;
     if let Some(error) = response.error {
         println!("ERROR\t{}\t{}", error.code, error.message);
         return Ok(());
@@ -453,13 +447,7 @@ async fn list_models() -> Result<(), CliError> {
 }
 
 async fn model_capabilities() -> Result<(), CliError> {
-    let response = BcodeClient::default_endpoint()
-        .call_plugin_service(
-            bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
-            bcode_model::OP_CAPABILITIES.to_string(),
-            Vec::new(),
-        )
-        .await?;
+    let response = call_model_provider_service(bcode_model::OP_CAPABILITIES).await?;
     if let Some(error) = response.error {
         println!("ERROR\t{}\t{}", error.code, error.message);
         return Ok(());
@@ -474,6 +462,33 @@ async fn model_capabilities() -> Result<(), CliError> {
         println!("capability\t{capability:?}");
     }
     Ok(())
+}
+
+async fn call_model_provider_service(
+    operation: &str,
+) -> Result<bcode_ipc::PluginServiceResponse, CliError> {
+    let config = bcode_config::load_config()?;
+    let client = BcodeClient::default_endpoint();
+    if let Some(provider_plugin_id) = config.model.provider_plugin_id {
+        client
+            .invoke_plugin_service(
+                provider_plugin_id,
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                operation.to_string(),
+                Vec::new(),
+            )
+            .await
+            .map_err(CliError::from)
+    } else {
+        client
+            .call_plugin_service(
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                operation.to_string(),
+                Vec::new(),
+            )
+            .await
+            .map_err(CliError::from)
+    }
 }
 
 fn discover_plugins_for_cli(

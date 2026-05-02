@@ -56,6 +56,7 @@ pub enum ServerError {
 struct ServerState {
     sessions: SessionManager,
     plugins: Mutex<bcode_plugin::PluginHost>,
+    selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     clients: Mutex<BTreeSet<ClientId>>,
@@ -64,6 +65,7 @@ struct ServerState {
 
 #[derive(Debug, Clone)]
 struct ActiveModelTurn {
+    provider_plugin_id: Option<String>,
     provider_turn_id: String,
 }
 
@@ -71,12 +73,14 @@ impl ServerState {
     fn new(
         sessions: SessionManager,
         plugins: bcode_plugin::PluginHost,
+        selected_provider_plugin_id: Option<String>,
         selected_model_id: Option<String>,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions,
             plugins: Mutex::new(plugins),
+            selected_provider_plugin_id,
             selected_model_id,
             active_turns: Mutex::default(),
             clients: Mutex::default(),
@@ -122,6 +126,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
+        config.model.provider_plugin_id.clone(),
         config.model.model_id.clone(),
     ));
     let mut shutdown = state.subscribe_shutdown();
@@ -467,8 +472,9 @@ async fn handle_cancel_session_turn(
     };
     let cancel_result = {
         let plugins = state.plugins.lock().await;
-        plugins.invoke_service_by_interface_json::<_, bcode_model::AckResponse>(
-            MODEL_PROVIDER_INTERFACE_ID,
+        invoke_model_provider_json::<_, bcode_model::AckResponse>(
+            &plugins,
+            active_turn.provider_plugin_id.as_deref(),
             OP_CANCEL_TURN,
             &request,
         )
@@ -516,10 +522,12 @@ async fn run_model_turn(
         }
     };
 
+    let provider_plugin_id = state.selected_provider_plugin_id.clone();
     let start = {
         let plugins = state.plugins.lock().await;
-        plugins.invoke_service_by_interface_json::<_, StartTurnResponse>(
-            MODEL_PROVIDER_INTERFACE_ID,
+        invoke_model_provider_json::<_, StartTurnResponse>(
+            &plugins,
+            provider_plugin_id.as_deref(),
             OP_START_TURN,
             &request,
         )
@@ -535,25 +543,55 @@ async fn run_model_turn(
     state.active_turns.lock().await.insert(
         session_id,
         ActiveModelTurn {
+            provider_plugin_id: provider_plugin_id.clone(),
             provider_turn_id: start.provider_turn_id.clone(),
         },
     );
 
+    let assistant_text = poll_model_turn_events(
+        state,
+        session_id,
+        provider_plugin_id.as_deref(),
+        &start.provider_turn_id,
+    )
+    .await;
+
+    if !assistant_text.is_empty() {
+        append_assistant_message_event(state, session_id, assistant_text).await;
+    }
+
+    let active_turn = state.active_turns.lock().await.remove(&session_id);
+
+    let finish = FinishTurnRequest {
+        provider_turn_id: start.provider_turn_id,
+    };
+    let _ = {
+        let plugins = state.plugins.lock().await;
+        invoke_model_provider_json::<_, bcode_model::AckResponse>(
+            &plugins,
+            active_turn
+                .as_ref()
+                .and_then(|turn| turn.provider_plugin_id.as_deref()),
+            OP_FINISH_TURN,
+            &finish,
+        )
+    };
+}
+
+async fn poll_model_turn_events(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    provider_turn_id: &str,
+) -> String {
     let mut assistant_text = String::new();
     let mut finished = false;
     let mut empty_polls = 0_u16;
     for _ in 0..1_200 {
         let poll = PollTurnEventsRequest {
-            provider_turn_id: start.provider_turn_id.clone(),
+            provider_turn_id: provider_turn_id.to_string(),
         };
-        let response = {
-            let plugins = state.plugins.lock().await;
-            plugins.invoke_service_by_interface_json::<_, PollTurnEventsResponse>(
-                MODEL_PROVIDER_INTERFACE_ID,
-                OP_POLL_TURN_EVENTS,
-                &poll,
-            )
-        };
+        let response = poll_model_turn(state, provider_plugin_id, &poll).await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -591,24 +629,21 @@ async fn run_model_turn(
             break;
         }
     }
+    assistant_text
+}
 
-    if !assistant_text.is_empty() {
-        append_assistant_message_event(state, session_id, assistant_text).await;
-    }
-
-    state.active_turns.lock().await.remove(&session_id);
-
-    let finish = FinishTurnRequest {
-        provider_turn_id: start.provider_turn_id,
-    };
-    let _ = {
-        let plugins = state.plugins.lock().await;
-        plugins.invoke_service_by_interface_json::<_, bcode_model::AckResponse>(
-            MODEL_PROVIDER_INTERFACE_ID,
-            OP_FINISH_TURN,
-            &finish,
-        )
-    };
+async fn poll_model_turn(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    poll: &PollTurnEventsRequest,
+) -> Result<PollTurnEventsResponse, bcode_plugin::PluginServiceCallError> {
+    let plugins = state.plugins.lock().await;
+    invoke_model_provider_json::<_, PollTurnEventsResponse>(
+        &plugins,
+        provider_plugin_id,
+        OP_POLL_TURN_EVENTS,
+        poll,
+    )
 }
 
 async fn handle_provider_turn_event(
@@ -657,10 +692,49 @@ async fn handle_provider_turn_event(
 
 async fn has_model_provider(state: &ServerState) -> bool {
     let plugins = state.plugins.lock().await;
+    if let Some(provider_plugin_id) = &state.selected_provider_plugin_id {
+        return plugins.loaded_plugins().iter().any(|plugin| {
+            plugin.manifest().id == *provider_plugin_id
+                && plugin
+                    .manifest()
+                    .services
+                    .iter()
+                    .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID)
+        });
+    }
     plugins
         .service_registry()
         .providers_for(MODEL_PROVIDER_INTERFACE_ID)
         .is_some()
+}
+
+fn invoke_model_provider_json<Q, R>(
+    plugins: &bcode_plugin::PluginHost,
+    provider_plugin_id: Option<&str>,
+    operation: &str,
+    request: &Q,
+) -> Result<R, bcode_plugin::PluginServiceCallError>
+where
+    Q: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+{
+    provider_plugin_id.map_or_else(
+        || {
+            plugins.invoke_service_by_interface_json(
+                MODEL_PROVIDER_INTERFACE_ID,
+                operation,
+                request,
+            )
+        },
+        |provider_plugin_id| {
+            plugins.invoke_service_json(
+                provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                operation,
+                request,
+            )
+        },
+    )
 }
 
 async fn build_model_turn_request(

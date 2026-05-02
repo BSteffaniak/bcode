@@ -67,6 +67,7 @@ cat >"${BCODE_CONFIG}" <<EOF
 enabled = ["bcode.openai-compatible"]
 
 [model]
+provider_plugin_id = "bcode.openai-compatible"
 model_id = "${BCODE_OPENAI_MODEL:-${OPENAI_MODEL:-gpt-4.1-mini}}"
 EOF
 

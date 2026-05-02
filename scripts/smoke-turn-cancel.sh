@@ -61,6 +61,10 @@ export BCODE_FAKE_PROVIDER_DELAY_MS="5000"
 cat >"${BCODE_CONFIG}" <<EOF
 [plugins]
 enabled = ["bcode.fake-provider"]
+
+[model]
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-echo"
 EOF
 
 cargo run --quiet -p bcode -- server start >"${workdir}/server.log" 2>&1 &

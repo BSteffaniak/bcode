@@ -17,6 +17,7 @@ bcode_model = { workspace = true }
 bcode_plugin = { workspace = true }
 bcode_session = { workspace = true }
 bcode_session_models = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
