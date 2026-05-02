@@ -52,6 +52,13 @@ pub async fn run() -> Result<(), CliError> {
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
             PluginCommand::Check { root } => check_plugins(&root)?,
+            PluginCommand::Invoke {
+                root,
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+            } => invoke_plugin_service(&root, &plugin_id, &interface_id, &operation, payload)?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -129,6 +136,14 @@ enum PluginCommand {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
     },
+    Invoke {
+        #[arg(long = "root")]
+        root: Vec<std::path::PathBuf>,
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Option<String>,
+    },
 }
 
 fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
@@ -169,6 +184,33 @@ fn check_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
         loaded.activate()?;
         loaded.deactivate()?;
         println!("{}\tOK", loaded.manifest().id);
+    }
+    Ok(())
+}
+
+fn invoke_plugin_service(
+    roots: &[std::path::PathBuf],
+    plugin_id: &str,
+    interface_id: &str,
+    operation: &str,
+    payload: Option<String>,
+) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let selection = bcode_plugin::PluginSelection::from(&config);
+    let plugins =
+        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
+    let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
+    let response = host.invoke_service(
+        plugin_id,
+        interface_id,
+        operation,
+        payload.unwrap_or_default().into_bytes(),
+    )?;
+    host.deactivate_all()?;
+    if let Some(error) = response.error {
+        println!("ERROR\t{}\t{}", error.code, error.message);
+    } else {
+        println!("{}", String::from_utf8_lossy(&response.payload));
     }
     Ok(())
 }

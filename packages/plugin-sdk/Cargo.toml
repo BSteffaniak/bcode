@@ -11,6 +11,8 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
 
 [features]
 default          = []

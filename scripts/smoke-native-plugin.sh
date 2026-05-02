@@ -44,6 +44,7 @@ version = "0.0.1"
 type = "native"
 abi_version = 1
 library = "${dylib}"
+service_symbol = "bcode_plugin_invoke_service_v1"
 EOF
 
 export BCODE_CONFIG="${workdir}/bcode.toml"
@@ -64,5 +65,6 @@ EOF
 
 cargo run --quiet -p bcode -- plugin list --root "${workdir}/plugins" | grep -q "example.hello"
 cargo run --quiet -p bcode -- plugin check --root "${workdir}/plugins" | grep -q $'example.hello\tOK'
+cargo run --quiet -p bcode -- plugin invoke --root "${workdir}/plugins" example.hello example-hello/v1 echo "hello service" | grep -q "hello service"
 
 echo "smoke-native-plugin: PASS"

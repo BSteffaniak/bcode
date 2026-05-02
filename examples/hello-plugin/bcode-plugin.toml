@@ -3,6 +3,7 @@ name    = "Hello Example Plugin"
 version = "0.0.1"
 
 [runtime]
-abi_version = 1
-library     = "libbcode_hello_plugin.dylib"
-type        = "native"
+abi_version    = 1
+library        = "libbcode_hello_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

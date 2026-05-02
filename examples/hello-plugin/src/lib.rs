@@ -18,6 +18,17 @@ impl RustPlugin for HelloPlugin {
     fn deactivate(&mut self) -> Result<(), PluginError> {
         Ok(())
     }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == "example-hello/v1" && context.request.operation == "echo"
+        {
+            return ServiceResponse::ok(context.request.payload);
+        }
+        ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported hello service operation",
+        )
+    }
 }
 
 bcode_plugin_sdk::export_plugin!(HelloPlugin, include_str!("../bcode-plugin.toml"));

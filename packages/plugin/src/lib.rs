@@ -6,7 +6,8 @@
 
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_MANIFEST_SYMBOL,
+    DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, NativeServiceContext,
+    SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, ServiceRequest, ServiceResponse,
 };
 use libloading::Library;
 use semver::Version;
@@ -22,6 +23,7 @@ pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
 
 type ManifestFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
 type LifecycleFn = unsafe extern "C" fn() -> i32;
+type ServiceFn = unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 
 /// Plugin manifest loaded from `bcode-plugin.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +52,8 @@ pub struct NativePluginRuntime {
     pub activate_symbol: String,
     #[serde(default = "default_deactivate_symbol")]
     pub deactivate_symbol: String,
+    #[serde(default = "default_service_symbol")]
+    pub service_symbol: String,
 }
 
 impl NativePluginRuntime {
@@ -98,6 +102,7 @@ pub struct LoadedPlugin {
     library: Library,
     activate: LifecycleFn,
     deactivate: LifecycleFn,
+    invoke_service: ServiceFn,
 }
 
 impl LoadedPlugin {
@@ -141,6 +146,62 @@ impl LoadedPlugin {
                 code,
             })
         }
+    }
+
+    /// Invoke a service operation on this plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request encoding, FFI invocation, or response decoding fails.
+    pub fn invoke_service(
+        &self,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let context = NativeServiceContext {
+            plugin_id: self.manifest.id.clone(),
+            request: ServiceRequest {
+                interface_id: interface_id.into(),
+                operation: operation.into(),
+                payload,
+            },
+        };
+        let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
+        let mut output_len = 0_usize;
+        let status = unsafe {
+            (self.invoke_service)(
+                input.as_ptr(),
+                input.len(),
+                std::ptr::null_mut(),
+                0,
+                &raw mut output_len,
+            )
+        };
+        if status != SERVICE_STATUS_BUFFER_TOO_SMALL && status != SERVICE_STATUS_OK {
+            return Err(PluginLoadError::ServiceInvokeFailed {
+                plugin_id: self.manifest.id.clone(),
+                code: status,
+            });
+        }
+        let mut output = vec![0_u8; output_len];
+        let status = unsafe {
+            (self.invoke_service)(
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut output_len,
+            )
+        };
+        if status != SERVICE_STATUS_OK {
+            return Err(PluginLoadError::ServiceInvokeFailed {
+                plugin_id: self.manifest.id.clone(),
+                code: status,
+            });
+        }
+        output.truncate(output_len);
+        serde_json::from_slice(&output).map_err(PluginLoadError::ServiceDecode)
     }
 
     /// Return true while the dynamic library is retained by this loaded plugin.
@@ -192,6 +253,14 @@ pub enum PluginLoadError {
     },
     #[error("manifest ID mismatch: file declared '{file_id}', library exported '{library_id}'")]
     ManifestIdMismatch { file_id: String, library_id: String },
+    #[error("plugin is not loaded: {0}")]
+    PluginNotLoaded(String),
+    #[error("failed to encode service request: {0}")]
+    ServiceEncode(#[source] serde_json::Error),
+    #[error("failed to decode service response: {0}")]
+    ServiceDecode(#[source] serde_json::Error),
+    #[error("plugin '{plugin_id}' service invocation failed with code {code}")]
+    ServiceInvokeFailed { plugin_id: String, code: i32 },
     #[error("plugin '{plugin_id}' {hook} hook failed with code {code}")]
     LifecycleFailed {
         plugin_id: String,
@@ -299,6 +368,26 @@ impl PluginHost {
         &self.loaded
     }
 
+    /// Invoke a service operation on a loaded plugin by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded or service invocation fails.
+    pub fn invoke_service(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let plugin = self
+            .loaded
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id)
+            .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
+        plugin.invoke_service(interface_id, operation, payload)
+    }
+
     /// Deactivate all loaded plugins in reverse load order.
     ///
     /// # Errors
@@ -353,12 +442,14 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
 
     let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
     let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
+    let invoke_service = load_service_symbol(&library, &library_path, &runtime.service_symbol)?;
 
     Ok(LoadedPlugin {
         manifest: plugin.manifest.clone(),
         library,
         activate,
         deactivate,
+        invoke_service,
     })
 }
 
@@ -453,6 +544,21 @@ fn load_lifecycle_symbol(
     Ok(*loaded)
 }
 
+fn load_service_symbol(
+    library: &Library,
+    library_path: &Path,
+    symbol: &str,
+) -> Result<ServiceFn, PluginLoadError> {
+    let loaded = unsafe { library.get::<ServiceFn>(symbol.as_bytes()) }.map_err(|source| {
+        PluginLoadError::SymbolLoad {
+            library: library_path.to_path_buf(),
+            symbol: symbol.to_string(),
+            source,
+        }
+    })?;
+    Ok(*loaded)
+}
+
 fn default_manifest_symbol() -> String {
     DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string()
 }
@@ -463,6 +569,10 @@ fn default_activate_symbol() -> String {
 
 fn default_deactivate_symbol() -> String {
     DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string()
+}
+
+fn default_service_symbol() -> String {
+    DEFAULT_NATIVE_SERVICE_SYMBOL.to_string()
 }
 
 #[cfg(test)]

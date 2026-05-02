@@ -90,6 +90,7 @@ dependencies = [
  "libloading",
  "semver",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
 ]
@@ -97,6 +98,10 @@ dependencies = [
 [[package]]
 name = "bcode_plugin_sdk"
 version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "bcode_server"
