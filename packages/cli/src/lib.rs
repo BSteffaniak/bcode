@@ -8,6 +8,8 @@ use bcode_client::{BcodeClient, ClientError};
 use bcode_ipc::{Event, default_endpoint};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
 use clap::{Parser, Subcommand};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Errors returned by the CLI.
@@ -21,6 +23,8 @@ pub enum CliError {
     Tui(#[from] bcode_tui::TuiError),
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
+    #[error("daemon did not become ready after auto-start")]
+    DaemonStartTimeout,
 }
 
 /// Parse CLI arguments and run the requested command.
@@ -42,7 +46,10 @@ pub async fn run() -> Result<(), CliError> {
             SessionCommand::History { session_id } => session_history(session_id).await?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
-        Commands::Tui { session_id } => bcode_tui::run(session_id).await?,
+        Commands::Tui { session_id } => {
+            ensure_server_running().await?;
+            bcode_tui::run(session_id).await?;
+        }
         Commands::Send {
             session_id,
             message,
@@ -82,9 +89,7 @@ enum Commands {
 
 impl Default for Commands {
     fn default() -> Self {
-        Self::Session {
-            command: SessionCommand::List,
-        }
+        Self::Tui { session_id: None }
     }
 }
 
@@ -100,6 +105,30 @@ enum SessionCommand {
     Create { name: Option<String> },
     List,
     History { session_id: SessionId },
+}
+
+async fn ensure_server_running() -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    if client.server_status().await.is_ok() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()?;
+    Command::new(exe)
+        .args(["server", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    for _ in 0..50 {
+        if client.server_status().await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(CliError::DaemonStartTimeout)
 }
 
 async fn server_status() -> Result<(), CliError> {
