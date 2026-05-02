@@ -58,4 +58,8 @@ if ! grep -q "hello from smoke" "$workdir/attach.log"; then
     exit 1
 fi
 
+cargo run --quiet -p bcode -- server stop
+wait "${server_pid}"
+server_pid=""
+
 echo "smoke-local-daemon: PASS"

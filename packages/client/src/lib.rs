@@ -69,6 +69,19 @@ impl BcodeClient {
         }
     }
 
+    /// Request graceful local server shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn server_stop(&self) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::ServerStop).await? {
+            ResponsePayload::ServerStopping => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Create a session.
     ///
     /// # Errors

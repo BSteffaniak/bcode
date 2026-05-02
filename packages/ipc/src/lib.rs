@@ -78,6 +78,7 @@ pub enum Request {
     Hello { client_name: String },
     Ping,
     ServerStatus,
+    ServerStop,
     CreateSession { name: Option<String> },
     ListSessions,
     AttachSession { session_id: SessionId },
@@ -103,6 +104,7 @@ pub enum ResponsePayload {
     ServerStatus {
         status: ServerStatus,
     },
+    ServerStopping,
     SessionCreated {
         session: SessionSummary,
     },

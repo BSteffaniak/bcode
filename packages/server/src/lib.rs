@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
@@ -29,10 +29,22 @@ pub enum ServerError {
     Codec(#[from] CodecError),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ServerState {
     sessions: SessionManager,
     clients: Mutex<BTreeSet<ClientId>>,
+    shutdown: broadcast::Sender<()>,
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        let (shutdown, _) = broadcast::channel(1);
+        Self {
+            sessions: SessionManager::default(),
+            clients: Mutex::default(),
+            shutdown,
+        }
+    }
 }
 
 impl ServerState {
@@ -50,6 +62,14 @@ impl ServerState {
             sessions: self.sessions.list_sessions().await,
         }
     }
+
+    fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
+        self.shutdown.subscribe()
+    }
+
+    fn request_shutdown(&self) {
+        let _ = self.shutdown.send(());
+    }
 }
 
 /// Run the local Bcode server until interrupted.
@@ -60,15 +80,22 @@ impl ServerState {
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let listener = LocalIpcListener::bind(&endpoint).await?;
     let state = Arc::new(ServerState::default());
+    let mut shutdown = state.subscribe_shutdown();
     loop {
-        let stream = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, state).await {
-                eprintln!("client connection failed: {error}");
+        tokio::select! {
+            stream = listener.accept() => {
+                let stream = stream?;
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(error) = handle_client(stream, state).await {
+                        eprintln!("client connection failed: {error}");
+                    }
+                });
             }
-        });
+            _ = shutdown.recv() => break,
+        }
     }
+    Ok(())
 }
 
 async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Result<(), ServerError> {
@@ -135,6 +162,7 @@ async fn handle_request(
             send_response(writer, request_id, Response::Ok(ResponsePayload::Pong)).await
         }
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
+        Request::ServerStop => handle_server_stop(request_id, state, writer).await,
         Request::CreateSession { name } => {
             handle_create_session(request_id, state, writer, name).await
         }
@@ -184,6 +212,21 @@ async fn handle_server_status(
         Response::Ok(ResponsePayload::ServerStatus { status }),
     )
     .await
+}
+
+async fn handle_server_stop(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ServerStopping),
+    )
+    .await?;
+    state.request_shutdown();
+    Ok(())
 }
 
 async fn handle_create_session(

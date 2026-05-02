@@ -32,6 +32,7 @@ pub async fn run() -> Result<(), CliError> {
         Commands::Server { command } => match command {
             ServerCommand::Start => bcode_server::run(default_endpoint()).await?,
             ServerCommand::Status => server_status().await?,
+            ServerCommand::Stop => server_stop().await?,
         },
         Commands::Session { command } => match command {
             SessionCommand::Create { name } => create_session(name).await?,
@@ -84,6 +85,7 @@ impl Default for Commands {
 enum ServerCommand {
     Start,
     Status,
+    Stop,
 }
 
 #[derive(Debug, Subcommand)]
@@ -101,6 +103,13 @@ async fn server_status() -> Result<(), CliError> {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
         println!("{}\t{}\t{} clients", session.id, name, session.client_count);
     }
+    Ok(())
+}
+
+async fn server_stop() -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    client.server_stop().await?;
+    println!("server stopping");
     Ok(())
 }
 
