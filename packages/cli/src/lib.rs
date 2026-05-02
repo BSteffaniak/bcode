@@ -37,6 +37,7 @@ pub async fn run() -> Result<(), CliError> {
         Commands::Session { command } => match command {
             SessionCommand::Create { name } => create_session(name).await?,
             SessionCommand::List => list_sessions().await?,
+            SessionCommand::History { session_id } => session_history(session_id).await?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Send {
@@ -92,6 +93,7 @@ enum ServerCommand {
 enum SessionCommand {
     Create { name: Option<String> },
     List,
+    History { session_id: SessionId },
 }
 
 async fn server_status() -> Result<(), CliError> {
@@ -130,6 +132,15 @@ async fn list_sessions() -> Result<(), CliError> {
     for session in sessions {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
         println!("{}\t{}\t{} clients", session.id, name, session.client_count);
+    }
+    Ok(())
+}
+
+async fn session_history(session_id: SessionId) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let history = client.session_history(session_id).await?;
+    for event in history {
+        print_session_event(&event);
     }
     Ok(())
 }

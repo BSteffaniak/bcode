@@ -183,6 +183,23 @@ impl SessionManager {
         inner.sessions.values().map(SessionState::summary).collect()
     }
 
+    /// Return replayable history for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn session_history(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        let inner = self.inner.lock().await;
+        let state = inner
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(state.events.clone())
+    }
+
     /// Attach a client to an existing session.
     ///
     /// # Errors
@@ -204,15 +221,13 @@ impl SessionManager {
                 .ok_or(SessionError::NotFound(session_id))?;
             state.clients.insert(client_id);
             state.summary.client_count = state.clients.len();
+            let history = state.events.clone();
             let events = state.sender.subscribe();
             state.push_event(
                 SessionEventKind::ClientAttached { client_id },
                 self.store.as_ref(),
             )?;
-            SessionAttachment {
-                history: state.events.clone(),
-                events,
-            }
+            SessionAttachment { history, events }
         };
         Ok(attachment)
     }

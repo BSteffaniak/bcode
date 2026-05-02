@@ -81,6 +81,7 @@ pub enum Request {
     ServerStop,
     CreateSession { name: Option<String> },
     ListSessions,
+    SessionHistory { session_id: SessionId },
     AttachSession { session_id: SessionId },
     SendUserMessage { session_id: SessionId, text: String },
 }
@@ -110,6 +111,10 @@ pub enum ResponsePayload {
     },
     SessionList {
         sessions: Vec<SessionSummary>,
+    },
+    SessionHistory {
+        session_id: SessionId,
+        history: Vec<SessionEvent>,
     },
     Attached {
         session_id: SessionId,

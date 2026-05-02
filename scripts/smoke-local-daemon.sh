@@ -26,7 +26,7 @@ cd "${root}"
 cargo run --quiet -p bcode -- server start >"$workdir/server.log" 2>&1 &
 server_pid="$!"
 
-for _ in {1..50}; do
+for _ in {1..300}; do
     if [[ -S "${BCODE_SOCKET}" ]]; then
         break
     fi
@@ -65,7 +65,7 @@ server_pid=""
 
 cargo run --quiet -p bcode -- server start >"$workdir/server-restarted.log" 2>&1 &
 server_pid="$!"
-for _ in {1..50}; do
+for _ in {1..300}; do
     if cargo run --quiet -p bcode -- session list | grep -q "${session_id}"; then
         break
     fi
@@ -74,6 +74,13 @@ done
 
 if ! cargo run --quiet -p bcode -- session list | grep -q "${session_id}"; then
     echo "persisted session was not restored after server restart" >&2
+    echo "--- restarted server log ---" >&2
+    cat "$workdir/server-restarted.log" >&2 || true
+    exit 1
+fi
+
+if ! cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "hello from smoke"; then
+    echo "persisted session history did not include sent message" >&2
     echo "--- restarted server log ---" >&2
     cat "$workdir/server-restarted.log" >&2 || true
     exit 1

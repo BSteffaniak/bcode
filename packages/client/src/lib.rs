@@ -114,6 +114,25 @@ impl BcodeClient {
         }
     }
 
+    /// Return replayable session history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_history(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::SessionHistory { session_id })
+            .await?
+        {
+            ResponsePayload::SessionHistory { history, .. } => Ok(history),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Send a user message to a session.
     ///
     /// # Errors

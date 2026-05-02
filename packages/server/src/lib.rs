@@ -172,6 +172,9 @@ async fn handle_request(
             handle_create_session(request_id, state, writer, name).await
         }
         Request::ListSessions => handle_list_sessions(request_id, state, writer).await,
+        Request::SessionHistory { session_id } => {
+            handle_session_history(request_id, state, writer, session_id).await
+        }
         Request::AttachSession { session_id } => {
             handle_attach_session(
                 request_id,
@@ -263,6 +266,35 @@ async fn handle_list_sessions(
         }),
     )
     .await
+}
+
+async fn handle_session_history(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    match state.sessions.session_history(session_id).await {
+        Ok(history) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionHistory {
+                    session_id,
+                    history,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_attach_session(
