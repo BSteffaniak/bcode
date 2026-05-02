@@ -1,12 +1,15 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+// Small TUI state mutation helpers are clearer as regular functions even when
+// clippy can technically const-qualify them.
+#![allow(clippy::missing_const_for_fn)]
 
 //! Terminal user interface for Bcode.
 
 use bcode_client::{BcodeClient, ClientError};
 use bcode_ipc::Event;
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
+use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionSummary};
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -15,7 +18,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap,
+};
 use std::io::{self, Stdout};
 use std::time::Duration;
 use thiserror::Error;
@@ -28,6 +33,8 @@ pub enum TuiError {
     Client(#[from] ClientError),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("session selection canceled")]
+    Canceled,
 }
 
 /// Run the interactive terminal UI.
@@ -38,6 +45,10 @@ pub enum TuiError {
 pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
     let session_id = resolve_session(&client, session_id).await?;
+    run_chat(client, session_id).await
+}
+
+async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiError> {
     let mut connection = client.connect("bcode-tui").await?;
     let history = connection.attach_session(session_id).await?;
 
@@ -59,7 +70,7 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     });
 
     let mut terminal = TerminalGuard::enter()?;
-    let mut app = App::new(session_id, &history);
+    let mut app = ChatApp::new(session_id, &history);
 
     loop {
         while let Ok(event) = event_receiver.try_recv() {
@@ -103,27 +114,120 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
 async fn resolve_session(
     client: &BcodeClient,
     session_id: Option<SessionId>,
-) -> Result<SessionId, ClientError> {
+) -> Result<SessionId, TuiError> {
     if let Some(session_id) = session_id {
         return Ok(session_id);
     }
     let sessions = client.list_sessions().await?;
-    if let Some(session) = sessions.first() {
-        return Ok(session.id);
+    match sessions.len() {
+        0 => Ok(client.create_session(Some("default".to_string())).await?.id),
+        1 => Ok(sessions[0].id),
+        _ => pick_session(&sessions),
     }
-    let session = client.create_session(Some("default".to_string())).await?;
-    Ok(session.id)
+}
+
+fn pick_session(sessions: &[SessionSummary]) -> Result<SessionId, TuiError> {
+    let mut terminal = TerminalGuard::enter()?;
+    let mut app = SessionPickerApp::new(sessions);
+    loop {
+        terminal.draw(&app)?;
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        let CrosstermEvent::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Err(TuiError::Canceled);
+            }
+            KeyCode::Esc => return Err(TuiError::Canceled),
+            KeyCode::Up | KeyCode::Char('k') => app.previous(),
+            KeyCode::Down | KeyCode::Char('j') => app.next(),
+            KeyCode::Enter => return Ok(app.selected_session_id()),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug)]
-struct App {
+struct SessionPickerApp {
+    sessions: Vec<SessionSummary>,
+    selected: usize,
+}
+
+impl SessionPickerApp {
+    fn new(sessions: &[SessionSummary]) -> Self {
+        Self {
+            sessions: sessions.to_vec(),
+            selected: 0,
+        }
+    }
+
+    fn next(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.sessions.len();
+    }
+
+    fn previous(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .checked_sub(1)
+            .unwrap_or_else(|| self.sessions.len() - 1);
+    }
+
+    fn selected_session_id(&self) -> SessionId {
+        self.sessions[self.selected].id
+    }
+}
+
+impl ratatui::widgets::Widget for &SessionPickerApp {
+    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        Paragraph::new("Select a Bcode session").render(chunks[0], buf);
+
+        let items = self.sessions.iter().map(|session| {
+            let name = session.name.as_deref().unwrap_or("<unnamed>");
+            ListItem::new(format!(
+                "{}  {}  ({} clients)",
+                session.id, name, session.client_count
+            ))
+        });
+        let list = List::new(items)
+            .block(Block::new().title("Sessions").borders(Borders::ALL))
+            .highlight_symbol("> ");
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        StatefulWidget::render(list, chunks[1], buf, &mut state);
+
+        Paragraph::new("enter selects, up/down or j/k moves, esc quits").render(chunks[2], buf);
+    }
+}
+
+#[derive(Debug)]
+struct ChatApp {
     session_id: SessionId,
     lines: Vec<String>,
     input: String,
     status: String,
 }
 
-impl App {
+impl ChatApp {
     fn new(session_id: SessionId, history: &[SessionEvent]) -> Self {
         let lines = history.iter().map(format_session_event).collect();
         Self {
@@ -150,7 +254,7 @@ impl App {
     }
 }
 
-impl ratatui::widgets::Widget for &App {
+impl ratatui::widgets::Widget for &ChatApp {
     fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -196,9 +300,12 @@ impl TerminalGuard {
         Ok(Self { terminal })
     }
 
-    fn draw(&mut self, app: &App) -> Result<(), io::Error> {
+    fn draw<W>(&mut self, widget: W) -> Result<(), io::Error>
+    where
+        W: ratatui::widgets::Widget,
+    {
         self.terminal
-            .draw(|frame| frame.render_widget(app, frame.area()))?;
+            .draw(|frame| frame.render_widget(widget, frame.area()))?;
         Ok(())
     }
 }
