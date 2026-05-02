@@ -5,13 +5,13 @@ description = "Plugin author SDK for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "plugin", "sdk"]
 license     = { workspace = true }
-readme      = { workspace = true }
 name        = "bcode_plugin_sdk"
+readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
 
 [features]
-default = []
+default          = []
 fail-on-warnings = []

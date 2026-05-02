@@ -34,6 +34,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
  "bcode_ipc",
+ "bcode_plugin",
  "bcode_server",
  "bcode_session_models",
  "bcode_tui",

@@ -21,6 +21,8 @@ pub enum CliError {
     Server(#[from] bcode_server::ServerError),
     #[error("TUI error: {0}")]
     Tui(#[from] bcode_tui::TuiError),
+    #[error("plugin error: {0}")]
+    Plugin(#[from] bcode_plugin::PluginLoadError),
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
     #[error("daemon did not become ready after auto-start")]
@@ -44,6 +46,9 @@ pub async fn run() -> Result<(), CliError> {
             SessionCommand::Create { name } => create_session(name).await?,
             SessionCommand::List => list_sessions().await?,
             SessionCommand::History { session_id } => session_history(session_id).await?,
+        },
+        Commands::Plugin { command } => match command {
+            PluginCommand::List { root } => list_plugins(&root)?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -75,6 +80,10 @@ enum Commands {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     Attach {
         session_id: SessionId,
     },
@@ -105,6 +114,39 @@ enum SessionCommand {
     Create { name: Option<String> },
     List,
     History { session_id: SessionId },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    List {
+        #[arg(long = "root")]
+        root: Vec<std::path::PathBuf>,
+    },
+}
+
+fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
+    let plugins = if roots.is_empty() {
+        bcode_plugin::discover_plugins()
+    } else {
+        bcode_plugin::discover_plugins_in_roots(roots)
+    }
+    .map_err(CliError::Plugin)?;
+
+    if plugins.is_empty() {
+        println!("no plugins discovered");
+        return Ok(());
+    }
+
+    for plugin in plugins {
+        println!(
+            "{}\t{}\t{}\t{}",
+            plugin.manifest.id,
+            plugin.manifest.version,
+            plugin.manifest.name,
+            plugin.manifest_path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn ensure_server_running() -> Result<(), CliError> {

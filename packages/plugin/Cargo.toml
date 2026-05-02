@@ -5,8 +5,8 @@ description = "Host-side plugin loading and discovery for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "plugin"]
 license     = { workspace = true }
-readme      = { workspace = true }
 name        = "bcode_plugin"
+readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
@@ -19,5 +19,5 @@ thiserror        = { workspace = true }
 toml             = { workspace = true }
 
 [features]
-default = []
+default          = []
 fail-on-warnings = []

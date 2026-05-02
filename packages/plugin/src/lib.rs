@@ -11,6 +11,8 @@ use bcode_plugin_sdk::{
 use libloading::Library;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::env;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -55,6 +57,30 @@ impl NativePluginRuntime {
     #[must_use]
     pub const fn is_current_abi(&self) -> bool {
         self.abi_version == CURRENT_PLUGIN_ABI_VERSION
+    }
+}
+
+/// Plugin enable/disable selection policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginSelection {
+    pub enabled: BTreeSet<String>,
+    pub disabled: BTreeSet<String>,
+}
+
+impl PluginSelection {
+    /// Return a policy where all discovered plugins are enabled unless disabled.
+    #[must_use]
+    pub fn all_enabled() -> Self {
+        Self::default()
+    }
+
+    /// Return true when the plugin ID is enabled by this selection policy.
+    #[must_use]
+    pub fn is_enabled(&self, plugin_id: &str) -> bool {
+        if self.disabled.contains(plugin_id) {
+            return false;
+        }
+        self.enabled.is_empty() || self.enabled.contains(plugin_id)
     }
 }
 
@@ -174,6 +200,40 @@ pub enum PluginLoadError {
     },
 }
 
+/// Return default plugin discovery roots.
+#[must_use]
+pub fn default_plugin_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = env::current_dir() {
+        roots.push(current_dir.join(".bcode").join("plugins"));
+    }
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        roots.push(PathBuf::from(config_home).join("bcode").join("plugins"));
+    } else if let Ok(home) = env::var("HOME") {
+        roots.push(
+            PathBuf::from(home)
+                .join(".config")
+                .join("bcode")
+                .join("plugins"),
+        );
+    }
+    if let Ok(exe) = env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        roots.push(parent.join("plugins"));
+    }
+    roots
+}
+
+/// Discover plugin manifests in the default plugin roots.
+///
+/// # Errors
+///
+/// Returns an error when a root or manifest cannot be read.
+pub fn discover_plugins() -> Result<Vec<RegisteredPlugin>, PluginLoadError> {
+    discover_plugins_in_roots(&default_plugin_roots())
+}
+
 /// Discover plugin manifests in a set of roots.
 ///
 /// # Errors
@@ -187,6 +247,18 @@ pub fn discover_plugins_in_roots(
         discover_plugins_in_root(root, &mut plugins)?;
     }
     Ok(plugins)
+}
+
+/// Filter registered plugins according to an enable/disable policy.
+#[must_use]
+pub fn filter_selected_plugins(
+    plugins: Vec<RegisteredPlugin>,
+    selection: &PluginSelection,
+) -> Vec<RegisteredPlugin> {
+    plugins
+        .into_iter()
+        .filter(|plugin| selection.is_enabled(&plugin.manifest.id))
+        .collect()
 }
 
 /// Load a registered plugin.
