@@ -12,7 +12,7 @@ use bcode_plugin_sdk::{
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 use libloading::Library;
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::CStr;
@@ -217,6 +217,27 @@ impl LoadedPlugin {
         serde_json::from_slice(&output).map_err(PluginLoadError::ServiceDecode)
     }
 
+    /// Invoke a service operation on this plugin with JSON request and response payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed request cannot be encoded, invocation fails, the plugin
+    /// returns a service error, or the typed response cannot be decoded.
+    pub fn invoke_service_json<Q, R>(
+        &self,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize,
+        R: DeserializeOwned,
+    {
+        let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
+        let response = self.invoke_service(interface_id, operation, payload)?;
+        decode_service_response(response)
+    }
+
     /// Return true while the dynamic library is retained by this loaded plugin.
     #[must_use]
     pub const fn is_library_retained(&self) -> bool {
@@ -287,6 +308,31 @@ pub enum PluginLoadError {
         hook: &'static str,
         code: i32,
     },
+}
+
+/// Errors returned by typed plugin service calls.
+#[derive(Debug, Error)]
+pub enum PluginServiceCallError {
+    #[error("plugin invocation failed: {0}")]
+    Invoke(#[from] PluginLoadError),
+    #[error("service returned error {code}: {message}")]
+    Service { code: String, message: String },
+    #[error("failed to encode typed service request: {0}")]
+    RequestEncode(#[source] serde_json::Error),
+    #[error("failed to decode typed service response: {0}")]
+    ResponseDecode(#[source] serde_json::Error),
+}
+
+fn decode_service_response<R: DeserializeOwned>(
+    response: ServiceResponse,
+) -> Result<R, PluginServiceCallError> {
+    if let Some(error) = response.error {
+        return Err(PluginServiceCallError::Service {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    serde_json::from_slice(&response.payload).map_err(PluginServiceCallError::ResponseDecode)
 }
 
 /// Return default plugin discovery roots.
@@ -484,6 +530,52 @@ impl PluginHost {
         let registry = self.service_registry();
         let plugin_id = registry.unique_provider(interface_id)?;
         self.invoke_service(plugin_id, interface_id, operation, payload)
+    }
+
+    /// Invoke a service operation on a loaded plugin by ID with JSON payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed request cannot be encoded, invocation fails, the plugin
+    /// returns a service error, or the typed response cannot be decoded.
+    pub fn invoke_service_json<Q, R>(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize,
+        R: DeserializeOwned,
+    {
+        let plugin = self
+            .loaded
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id)
+            .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
+        plugin.invoke_service_json(interface_id, operation, request)
+    }
+
+    /// Invoke a service operation by service interface ID with JSON payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when routing fails, the typed request cannot be encoded, invocation fails,
+    /// the plugin returns a service error, or the typed response cannot be decoded.
+    pub fn invoke_service_by_interface_json<Q, R>(
+        &self,
+        interface_id: &str,
+        operation: impl Into<String>,
+        request: &Q,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize,
+        R: DeserializeOwned,
+    {
+        let registry = self.service_registry();
+        let plugin_id = registry.unique_provider(interface_id)?;
+        self.invoke_service_json(plugin_id, interface_id, operation, request)
     }
 
     /// Deactivate all loaded plugins in reverse load order.

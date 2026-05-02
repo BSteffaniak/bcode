@@ -4,7 +4,7 @@
 
 //! Plugin author SDK for Bcode native plugins.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::ffi::{CString, c_char};
 use std::sync::{Mutex, OnceLock};
 
@@ -121,6 +121,26 @@ pub struct ServiceRequest {
     pub payload: Vec<u8>,
 }
 
+impl ServiceRequest {
+    /// Decode the request payload from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is not valid JSON for the requested type.
+    pub fn payload_json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_slice(&self.payload)
+    }
+
+    /// Return the request payload as UTF-8 text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is not valid UTF-8.
+    pub fn payload_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.payload)
+    }
+}
+
 /// Service response returned by plugins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceResponse {
@@ -138,10 +158,43 @@ impl ServiceResponse {
         }
     }
 
+    /// Create a successful UTF-8 text service response.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::ok(text.into().into_bytes())
+    }
+
+    /// Create a successful JSON service response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be encoded as JSON.
+    pub fn json<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> {
+        serde_json::to_vec(value).map(Self::ok)
+    }
+
     /// Create an empty successful service response.
     #[must_use]
     pub const fn empty() -> Self {
         Self::ok(Vec::new())
+    }
+
+    /// Decode a successful response payload from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response payload is not valid JSON for the requested type.
+    pub fn payload_json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_slice(&self.payload)
+    }
+
+    /// Return a successful response payload as UTF-8 text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response payload is not valid UTF-8.
+    pub fn payload_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.payload)
     }
 
     /// Create an error service response.
@@ -332,4 +385,61 @@ pub mod prelude {
         SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceRequest, ServiceResponse,
         export_plugin,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServiceRequest, ServiceResponse};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct ExamplePayload {
+        value: String,
+    }
+
+    #[test]
+    fn service_request_decodes_json_payload() {
+        let request = ServiceRequest {
+            interface_id: "example/v1".to_string(),
+            operation: "read".to_string(),
+            payload: br#"{"value":"hello"}"#.to_vec(),
+        };
+
+        let payload = request
+            .payload_json::<ExamplePayload>()
+            .expect("payload should decode");
+        assert_eq!(
+            payload,
+            ExamplePayload {
+                value: "hello".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn service_response_encodes_json_payload() {
+        let response = ServiceResponse::json(&ExamplePayload {
+            value: "hello".to_string(),
+        })
+        .expect("payload should encode");
+
+        let payload = response
+            .payload_json::<ExamplePayload>()
+            .expect("payload should decode");
+        assert_eq!(
+            payload,
+            ExamplePayload {
+                value: "hello".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn service_response_round_trips_text_payload() {
+        let response = ServiceResponse::text("hello");
+        assert_eq!(
+            response.payload_text().expect("text should decode"),
+            "hello"
+        );
+    }
 }
