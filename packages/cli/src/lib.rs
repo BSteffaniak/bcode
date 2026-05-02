@@ -93,6 +93,7 @@ pub async fn run() -> Result<(), CliError> {
             ModelCommand::List => list_models().await?,
             ModelCommand::Capabilities => model_capabilities().await?,
         },
+        Commands::Cancel { session_id } => cancel_session_turn(session_id).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
             ensure_server_running().await?;
@@ -130,6 +131,9 @@ enum Commands {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    Cancel {
+        session_id: SessionId,
     },
     Attach {
         session_id: SessionId,
@@ -551,6 +555,16 @@ async fn session_history(session_id: SessionId) -> Result<(), CliError> {
     let history = client.session_history(session_id).await?;
     for event in history {
         print_session_event(&event);
+    }
+    Ok(())
+}
+
+async fn cancel_session_turn(session_id: SessionId) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    if client.cancel_session_turn(session_id).await? {
+        println!("turn cancellation requested");
+    } else {
+        println!("no active turn");
     }
     Ok(())
 }

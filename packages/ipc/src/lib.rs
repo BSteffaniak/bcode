@@ -95,6 +95,9 @@ pub enum Request {
         session_id: SessionId,
         text: String,
     },
+    CancelSessionTurn {
+        session_id: SessionId,
+    },
     ListPluginServices,
     InvokePluginService {
         plugin_id: String,
@@ -171,6 +174,9 @@ pub enum ResponsePayload {
         history: Vec<SessionEvent>,
     },
     MessageSent,
+    TurnCancellationRequested {
+        cancelled: bool,
+    },
     PluginServices {
         services: Vec<PluginServiceSummary>,
     },

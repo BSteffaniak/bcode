@@ -148,6 +148,22 @@ impl BcodeClient {
         connection.send_user_message(session_id, text).await
     }
 
+    /// Request cancellation of the active model turn for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn cancel_session_turn(&self, session_id: SessionId) -> Result<bool, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::CancelSessionTurn { session_id })
+            .await?
+        {
+            ResponsePayload::TurnCancellationRequested { cancelled } => Ok(cancelled),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List services provided by loaded daemon plugins.
     ///
     /// # Errors

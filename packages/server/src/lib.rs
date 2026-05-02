@@ -11,13 +11,14 @@ use bcode_ipc::{
     send_envelope,
 };
 use bcode_model::{
-    ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelMessage,
-    ModelParameters, ModelTurnRequest, OP_FINISH_TURN, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse,
+    CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole,
+    ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderTurnEvent, StartTurnResponse,
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{ClientId, SessionEventKind, SessionId};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,8 +57,14 @@ struct ServerState {
     sessions: SessionManager,
     plugins: Mutex<bcode_plugin::PluginHost>,
     selected_model_id: Option<String>,
+    active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     clients: Mutex<BTreeSet<ClientId>>,
     shutdown: broadcast::Sender<()>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveModelTurn {
+    provider_turn_id: String,
 }
 
 impl ServerState {
@@ -71,6 +78,7 @@ impl ServerState {
             sessions,
             plugins: Mutex::new(plugins),
             selected_model_id,
+            active_turns: Mutex::default(),
             clients: Mutex::default(),
             shutdown,
         }
@@ -222,6 +230,9 @@ async fn handle_request(
         }
         Request::SendUserMessage { session_id, text } => {
             handle_user_message(request_id, client_id, state, writer, session_id, text).await
+        }
+        Request::CancelSessionTurn { session_id } => {
+            handle_cancel_session_turn(request_id, state, writer, session_id).await
         }
         Request::ListPluginServices => handle_list_plugin_services(request_id, state, writer).await,
         Request::InvokePluginService {
@@ -403,7 +414,7 @@ async fn handle_attach_session(
 async fn handle_user_message(
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     session_id: SessionId,
     text: String,
@@ -415,7 +426,10 @@ async fn handle_user_message(
     {
         Ok(event) => {
             publish_session_event(state, &event).await;
-            run_model_turn(state, session_id, &event).await;
+            let state_for_turn = Arc::clone(state);
+            tokio::spawn(async move {
+                run_model_turn(&state_for_turn, session_id, &event).await;
+            });
             send_response(
                 writer,
                 request_id,
@@ -428,6 +442,57 @@ async fn handle_user_message(
                 writer,
                 request_id,
                 Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_cancel_session_turn(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let Some(active_turn) = state.active_turns.lock().await.get(&session_id).cloned() else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: false }),
+        )
+        .await;
+    };
+    let request = CancelTurnRequest {
+        provider_turn_id: active_turn.provider_turn_id,
+    };
+    let cancel_result = {
+        let plugins = state.plugins.lock().await;
+        plugins.invoke_service_by_interface_json::<_, bcode_model::AckResponse>(
+            MODEL_PROVIDER_INTERFACE_ID,
+            OP_CANCEL_TURN,
+            &request,
+        )
+    };
+    match cancel_result {
+        Ok(_) => {
+            append_system_event(
+                state,
+                session_id,
+                "model turn cancellation requested".to_string(),
+            )
+            .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("plugin_error", error.to_string())),
             )
             .await
         }
@@ -466,6 +531,13 @@ async fn run_model_turn(
             return;
         }
     };
+
+    state.active_turns.lock().await.insert(
+        session_id,
+        ActiveModelTurn {
+            provider_turn_id: start.provider_turn_id.clone(),
+        },
+    );
 
     let mut assistant_text = String::new();
     let mut finished = false;
@@ -524,6 +596,8 @@ async fn run_model_turn(
         append_assistant_message_event(state, session_id, assistant_text).await;
     }
 
+    state.active_turns.lock().await.remove(&session_id);
+
     let finish = FinishTurnRequest {
         provider_turn_id: start.provider_turn_id,
     };
@@ -558,7 +632,11 @@ async fn handle_provider_turn_event(
             .await;
             *finished = true;
         }
-        ProviderTurnEvent::TurnFinished { .. } | ProviderTurnEvent::Cancelled => {
+        ProviderTurnEvent::TurnFinished { .. } => {
+            *finished = true;
+        }
+        ProviderTurnEvent::Cancelled => {
+            append_system_event(state, session_id, "model turn cancelled".to_string()).await;
             *finished = true;
         }
         ProviderTurnEvent::ToolCallStarted { call_id, name } => {

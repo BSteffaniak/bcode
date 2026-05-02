@@ -88,6 +88,13 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
             }
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    match client.cancel_session_turn(session_id).await {
+                        Ok(true) => app.status = "turn cancellation requested".to_string(),
+                        Ok(false) => app.status = "no active turn".to_string(),
+                        Err(error) => app.status = format!("cancel failed: {error}"),
+                    }
+                }
                 KeyCode::Esc => break,
                 KeyCode::Enter => {
                     let Some(message) = app.take_input() else {
@@ -234,7 +241,7 @@ impl ChatApp {
             session_id,
             lines,
             input: String::new(),
-            status: "enter sends, esc/ctrl-c quits".to_string(),
+            status: "enter sends, ctrl-x cancels, esc/ctrl-c quits".to_string(),
         }
     }
 

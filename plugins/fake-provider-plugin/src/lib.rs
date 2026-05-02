@@ -5,20 +5,55 @@
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
 use bcode_model::{
-    AckResponse, ContentBlock, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability,
-    ModelInfo, ModelList, ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES,
-    OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
-    PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities, ProviderCapability,
-    ProviderTurnEvent, StartTurnResponse, StopReason, ValidateConfigResponse,
+    AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
+    MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
+    OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
+    ProviderCapability, ProviderTurnEvent, StartTurnResponse, StopReason, ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Deterministic fake model provider.
 #[derive(Default)]
 pub struct FakeProviderPlugin {
     next_turn: u64,
-    turns: BTreeMap<String, Vec<ProviderTurnEvent>>,
+    turns: BTreeMap<String, FakeTurn>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FakeTurn {
+    events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl FakeTurn {
+    fn push(&self, event: ProviderTurnEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push_back(event);
+        }
+    }
+
+    fn drain(&self) -> Vec<ProviderTurnEvent> {
+        self.events
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut events| events.drain(..).collect())
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.push(ProviderTurnEvent::Cancelled);
+        self.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::Cancelled,
+        });
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 impl RustPlugin for FakeProviderPlugin {
@@ -39,7 +74,8 @@ impl RustPlugin for FakeProviderPlugin {
             }),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
-            OP_CANCEL_TURN | OP_FINISH_TURN => json_response(&AckResponse::default()),
+            OP_CANCEL_TURN => self.cancel_turn(&context.request),
+            OP_FINISH_TURN => self.finish_turn(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported model provider operation",
@@ -57,29 +93,80 @@ impl FakeProviderPlugin {
         self.next_turn += 1;
         let provider_turn_id = format!("fake-turn-{}", self.next_turn);
         let text = format!("fake: {}", last_user_text(&request.messages));
-        self.turns.insert(
-            provider_turn_id.clone(),
-            vec![
-                ProviderTurnEvent::TurnStarted,
-                ProviderTurnEvent::TextDelta { text },
-                ProviderTurnEvent::TurnFinished {
-                    stop_reason: StopReason::EndTurn,
-                },
-            ],
-        );
+        let turn = FakeTurn::default();
+        turn.push(ProviderTurnEvent::TurnStarted);
+        self.turns.insert(provider_turn_id.clone(), turn.clone());
+        if let Some(delay) = fake_delay() {
+            std::thread::spawn(move || FakeTurnWorker { turn, text, delay }.run());
+        } else {
+            finish_fake_turn(&turn, text);
+        }
         json_response(&StartTurnResponse { provider_turn_id })
     }
 
-    fn poll_turn_events(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn poll_turn_events(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<PollTurnEventsRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
         let events = self
             .turns
-            .remove(&request.provider_turn_id)
-            .unwrap_or_default();
+            .get(&request.provider_turn_id)
+            .map_or_else(Vec::new, FakeTurn::drain);
         json_response(&PollTurnEventsResponse { events })
+    }
+
+    fn cancel_turn(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<CancelTurnRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        if let Some(turn) = self.turns.get(&request.provider_turn_id) {
+            turn.cancel();
+        }
+        json_response(&AckResponse::default())
+    }
+
+    fn finish_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<FinishTurnRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        self.turns.remove(&request.provider_turn_id);
+        json_response(&AckResponse::default())
+    }
+}
+
+struct FakeTurnWorker {
+    turn: FakeTurn,
+    text: String,
+    delay: Duration,
+}
+
+impl FakeTurnWorker {
+    fn run(self) {
+        std::thread::sleep(self.delay);
+        if !self.turn.is_cancelled() {
+            finish_fake_turn(&self.turn, self.text);
+        }
+    }
+}
+
+fn finish_fake_turn(turn: &FakeTurn, text: String) {
+    turn.push(ProviderTurnEvent::TextDelta { text });
+    turn.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::EndTurn,
+    });
+}
+
+fn fake_delay() -> Option<Duration> {
+    let millis = std::env::var("BCODE_FAKE_PROVIDER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())?;
+    if millis == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(millis))
     }
 }
 
