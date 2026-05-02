@@ -56,6 +56,19 @@ impl BcodeClient {
         Self { endpoint }
     }
 
+    /// Query local server status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn server_status(&self) -> Result<bcode_ipc::ServerStatus, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::ServerStatus).await? {
+            ResponsePayload::ServerStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Create a session.
     ///
     /// # Errors
@@ -86,6 +99,20 @@ impl BcodeClient {
             ResponsePayload::SessionList { sessions } => Ok(sessions),
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Send a user message to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn send_user_message(
+        &self,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        connection.send_user_message(session_id, text).await
     }
 
     /// Open a long-lived connection to the daemon.

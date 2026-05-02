@@ -31,12 +31,17 @@ pub async fn run() -> Result<(), CliError> {
     match cli.command.unwrap_or_default() {
         Commands::Server { command } => match command {
             ServerCommand::Start => bcode_server::run(default_endpoint()).await?,
+            ServerCommand::Status => server_status().await?,
         },
         Commands::Session { command } => match command {
             SessionCommand::Create { name } => create_session(name).await?,
             SessionCommand::List => list_sessions().await?,
         },
         Commands::Attach { session_id } => attach_session(session_id).await?,
+        Commands::Send {
+            session_id,
+            message,
+        } => send_message(session_id, message).await?,
     }
     Ok(())
 }
@@ -61,6 +66,10 @@ enum Commands {
     Attach {
         session_id: SessionId,
     },
+    Send {
+        session_id: SessionId,
+        message: String,
+    },
 }
 
 impl Default for Commands {
@@ -74,12 +83,25 @@ impl Default for Commands {
 #[derive(Debug, Subcommand)]
 enum ServerCommand {
     Start,
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     Create { name: Option<String> },
     List,
+}
+
+async fn server_status() -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let status = client.server_status().await?;
+    println!("connected clients: {}", status.connected_client_count);
+    println!("sessions: {}", status.sessions.len());
+    for session in status.sessions {
+        let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
+        println!("{}\t{}\t{} clients", session.id, name, session.client_count);
+    }
+    Ok(())
 }
 
 async fn create_session(name: Option<String>) -> Result<(), CliError> {
@@ -125,6 +147,12 @@ async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
         }
     }
 
+    Ok(())
+}
+
+async fn send_message(session_id: SessionId, message: String) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    client.send_user_message(session_id, message).await?;
     Ok(())
 }
 

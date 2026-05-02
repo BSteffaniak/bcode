@@ -6,11 +6,12 @@
 
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcListener, LocalIpcStream,
-    Request, Response, ResponsePayload, decode, event_envelope, recv_envelope, response_envelope,
-    send_envelope,
+    Request, Response, ResponsePayload, ServerStatus, decode, event_envelope, recv_envelope,
+    response_envelope, send_envelope,
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{ClientId, SessionId};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
@@ -28,6 +29,29 @@ pub enum ServerError {
     Codec(#[from] CodecError),
 }
 
+#[derive(Debug, Default)]
+struct ServerState {
+    sessions: SessionManager,
+    clients: Mutex<BTreeSet<ClientId>>,
+}
+
+impl ServerState {
+    async fn register_client(&self, client_id: ClientId) {
+        self.clients.lock().await.insert(client_id);
+    }
+
+    async fn unregister_client(&self, client_id: ClientId) {
+        self.clients.lock().await.remove(&client_id);
+    }
+
+    async fn status(&self) -> ServerStatus {
+        ServerStatus {
+            connected_client_count: self.clients.lock().await.len(),
+            sessions: self.sessions.list_sessions().await,
+        }
+    }
+}
+
 /// Run the local Bcode server until interrupted.
 ///
 /// # Errors
@@ -35,23 +59,32 @@ pub enum ServerError {
 /// Returns an error when the server cannot bind or accept local IPC connections.
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let listener = LocalIpcListener::bind(&endpoint).await?;
-    let sessions = Arc::new(SessionManager::default());
+    let state = Arc::new(ServerState::default());
     loop {
         let stream = listener.accept().await?;
-        let sessions = Arc::clone(&sessions);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, sessions).await {
+            if let Err(error) = handle_client(stream, state).await {
                 eprintln!("client connection failed: {error}");
             }
         });
     }
 }
 
-async fn handle_client(
-    stream: LocalIpcStream,
-    sessions: Arc<SessionManager>,
-) -> Result<(), ServerError> {
+async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Result<(), ServerError> {
     let client_id = ClientId::new();
+    state.register_client(client_id).await;
+
+    let result = handle_registered_client(stream, &state, client_id).await;
+    state.unregister_client(client_id).await;
+    result
+}
+
+async fn handle_registered_client(
+    stream: LocalIpcStream,
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+) -> Result<(), ServerError> {
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
     let mut attached_session = None;
@@ -74,7 +107,7 @@ async fn handle_client(
             request,
             envelope.request_id,
             client_id,
-            &sessions,
+            state,
             &writer,
             &mut attached_session,
         )
@@ -82,7 +115,7 @@ async fn handle_client(
     }
 
     if let Some(session_id) = attached_session {
-        sessions.detach_session(session_id, client_id).await;
+        state.sessions.detach_session(session_id, client_id).await;
     }
 
     Ok(())
@@ -92,7 +125,7 @@ async fn handle_request(
     request: Request,
     request_id: u64,
     client_id: ClientId,
-    sessions: &Arc<SessionManager>,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
@@ -101,15 +134,16 @@ async fn handle_request(
         Request::Ping => {
             send_response(writer, request_id, Response::Ok(ResponsePayload::Pong)).await
         }
+        Request::ServerStatus => handle_server_status(request_id, state, writer).await,
         Request::CreateSession { name } => {
-            handle_create_session(request_id, sessions, writer, name).await
+            handle_create_session(request_id, state, writer, name).await
         }
-        Request::ListSessions => handle_list_sessions(request_id, sessions, writer).await,
+        Request::ListSessions => handle_list_sessions(request_id, state, writer).await,
         Request::AttachSession { session_id } => {
             handle_attach_session(
                 request_id,
                 client_id,
-                sessions,
+                state,
                 writer,
                 attached_session,
                 session_id,
@@ -117,7 +151,7 @@ async fn handle_request(
             .await
         }
         Request::SendUserMessage { session_id, text } => {
-            handle_user_message(request_id, client_id, sessions, writer, session_id, text).await
+            handle_user_message(request_id, client_id, state, writer, session_id, text).await
         }
     }
 }
@@ -138,13 +172,27 @@ async fn handle_hello(
     .await
 }
 
+async fn handle_server_status(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let status = state.status().await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ServerStatus { status }),
+    )
+    .await
+}
+
 async fn handle_create_session(
     request_id: u64,
-    sessions: &SessionManager,
+    state: &ServerState,
     writer: &SharedWriter,
     name: Option<String>,
 ) -> Result<(), ServerError> {
-    let session = sessions.create_session(name).await;
+    let session = state.sessions.create_session(name).await;
     send_response(
         writer,
         request_id,
@@ -155,10 +203,10 @@ async fn handle_create_session(
 
 async fn handle_list_sessions(
     request_id: u64,
-    sessions: &SessionManager,
+    state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let session_list = sessions.list_sessions().await;
+    let session_list = state.sessions.list_sessions().await;
     send_response(
         writer,
         request_id,
@@ -172,12 +220,12 @@ async fn handle_list_sessions(
 async fn handle_attach_session(
     request_id: u64,
     client_id: ClientId,
-    sessions: &Arc<SessionManager>,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    match sessions.attach_session(session_id, client_id).await {
+    match state.sessions.attach_session(session_id, client_id).await {
         Ok(attachment) => {
             *attached_session = Some(session_id);
             send_response(
@@ -206,12 +254,13 @@ async fn handle_attach_session(
 async fn handle_user_message(
     request_id: u64,
     client_id: ClientId,
-    sessions: &SessionManager,
+    state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
     text: String,
 ) -> Result<(), ServerError> {
-    match sessions
+    match state
+        .sessions
         .append_user_message(session_id, client_id, text)
         .await
     {

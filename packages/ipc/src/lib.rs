@@ -77,10 +77,18 @@ impl Envelope {
 pub enum Request {
     Hello { client_name: String },
     Ping,
+    ServerStatus,
     CreateSession { name: Option<String> },
     ListSessions,
     AttachSession { session_id: SessionId },
     SendUserMessage { session_id: SessionId, text: String },
+}
+
+/// Local server status summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub connected_client_count: usize,
+    pub sessions: Vec<SessionSummary>,
 }
 
 /// Successful response payload variants.
@@ -92,6 +100,9 @@ pub enum ResponsePayload {
         client_id: ClientId,
     },
     Pong,
+    ServerStatus {
+        status: ServerStatus,
+    },
     SessionCreated {
         session: SessionSummary,
     },
