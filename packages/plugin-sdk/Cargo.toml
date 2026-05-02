@@ -1,0 +1,17 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Plugin author SDK for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "plugin", "sdk"]
+license     = { workspace = true }
+readme      = { workspace = true }
+name        = "bcode_plugin_sdk"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+
+[features]
+default = []
+fail-on-warnings = []
