@@ -50,10 +50,14 @@ description = "Echo service used by smoke tests"
 interface_id = "example-hello/v1"
 name = "Hello Echo"
 
+[[event_subscriptions]]
+topic = "example.event"
+
 [runtime]
 type = "native"
 abi_version = 1
 library = "${dylib}"
+event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
 EOF
 cp "${plugin_dir}/bcode-plugin.toml" "${daemon_plugin_dir}/bcode-plugin.toml"
@@ -79,6 +83,7 @@ cargo run --quiet -p bcode -- plugin services --root "${workdir}/plugins" | grep
 cargo run --quiet -p bcode -- plugin check --root "${workdir}/plugins" | grep -q $'example.hello\tOK'
 cargo run --quiet -p bcode -- plugin invoke --root "${workdir}/plugins" example.hello example-hello/v1 echo "hello service" | grep -q "hello service"
 cargo run --quiet -p bcode -- plugin call --root "${workdir}/plugins" example-hello/v1 echo "hello routed service" | grep -q "hello routed service"
+cargo run --quiet -p bcode -- plugin publish --root "${workdir}/plugins" example.event "hello event" | grep -q $'delivered\t1'
 
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_SOCKET="${workdir}/bcode.sock"

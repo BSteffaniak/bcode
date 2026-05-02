@@ -8,7 +8,9 @@ use bcode_plugin_sdk::prelude::*;
 
 /// Example plugin used by smoke tests.
 #[derive(Default)]
-pub struct HelloPlugin;
+pub struct HelloPlugin {
+    event_count: usize,
+}
 
 impl RustPlugin for HelloPlugin {
     fn activate(&mut self) -> Result<(), PluginError> {
@@ -20,14 +22,27 @@ impl RustPlugin for HelloPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        if context.request.interface_id == "example-hello/v1" && context.request.operation == "echo"
-        {
-            return ServiceResponse::ok(context.request.payload);
+        if context.request.interface_id != "example-hello/v1" {
+            return ServiceResponse::error(
+                "unsupported_interface",
+                "unsupported hello service interface",
+            );
         }
-        ServiceResponse::error(
-            "unsupported_operation",
-            "unsupported hello service operation",
-        )
+        match context.request.operation.as_str() {
+            "echo" => ServiceResponse::ok(context.request.payload),
+            "event-count" => ServiceResponse::text(self.event_count.to_string()),
+            _ => ServiceResponse::error(
+                "unsupported_operation",
+                "unsupported hello service operation",
+            ),
+        }
+    }
+
+    fn handle_event(&mut self, context: NativeEventContext) -> Result<(), PluginError> {
+        if context.event.topic == "example.event" {
+            self.event_count += 1;
+        }
+        Ok(())
     }
 }
 

@@ -23,6 +23,9 @@ pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bcode_plugin_deactivate_v1";
 /// Default service invocation export symbol for native plugins.
 pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bcode_plugin_invoke_service_v1";
 
+/// Default event handler export symbol for native plugins.
+pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bcode_plugin_handle_event_v1";
+
 /// Lifecycle hook completed successfully.
 pub const EXIT_OK: i32 = 0;
 
@@ -49,6 +52,18 @@ pub const SERVICE_STATUS_ENCODE_FAILED: i32 = 5;
 
 /// Native service invocation could not access the plugin instance.
 pub const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
+
+/// Native event handling completed successfully.
+pub const EVENT_STATUS_OK: i32 = 0;
+
+/// Native event handling received invalid arguments.
+pub const EVENT_STATUS_INVALID_ARGUMENT: i32 = 2;
+
+/// Native event handling failed to decode the event.
+pub const EVENT_STATUS_DECODE_FAILED: i32 = 3;
+
+/// Native event handler could not access the plugin instance.
+pub const EVENT_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 
 /// Error type returned by native plugin lifecycle hooks.
 #[derive(Debug, Clone)]
@@ -111,6 +126,40 @@ impl From<&str> for PluginError {
 pub struct NativeServiceContext {
     pub plugin_id: String,
     pub request: ServiceRequest,
+}
+
+/// Host event delivered to a native plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEventContext {
+    pub plugin_id: String,
+    pub event: PluginEvent,
+}
+
+/// Plugin event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginEvent {
+    pub topic: String,
+    pub payload: Vec<u8>,
+}
+
+impl PluginEvent {
+    /// Decode the event payload from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is not valid JSON for the requested type.
+    pub fn payload_json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_slice(&self.payload)
+    }
+
+    /// Return the event payload as UTF-8 text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is not valid UTF-8.
+    pub fn payload_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.payload)
+    }
 }
 
 /// Versioned service request.
@@ -247,6 +296,15 @@ pub trait RustPlugin: Default + Send + 'static {
             ),
         )
     }
+
+    /// Handle a subscribed host event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when event handling fails.
+    fn handle_event(&mut self, _context: NativeEventContext) -> Result<(), PluginError> {
+        Ok(())
+    }
 }
 
 #[doc(hidden)]
@@ -329,6 +387,28 @@ pub fn invoke_service_export<P: RustPlugin>(
     SERVICE_STATUS_OK
 }
 
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn handle_event_export<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+) -> i32 {
+    if input_ptr.is_null() {
+        return EVENT_STATUS_INVALID_ARGUMENT;
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let Ok(context) = serde_json::from_slice::<NativeEventContext>(input) else {
+        return EVENT_STATUS_DECODE_FAILED;
+    };
+    instance
+        .lock()
+        .map_or(EVENT_STATUS_PLUGIN_UNAVAILABLE, |mut plugin| {
+            result_to_exit_code(plugin.handle_event(context))
+        })
+}
+
 /// Export native plugin ABI symbols for a [`RustPlugin`] implementation.
 #[macro_export]
 macro_rules! export_plugin {
@@ -373,14 +453,25 @@ macro_rules! export_plugin {
                 output_len,
             )
         }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_handle_event_v1(
+            input_ptr: *const u8,
+            input_len: usize,
+        ) -> i32 {
+            let instance = $crate::plugin_instance::<$plugin>(&BCODE_PLUGIN_INSTANCE);
+            $crate::handle_event_export(instance, input_ptr, input_len)
+        }
     };
 }
 
 /// Common imports for plugin authors.
 pub mod prelude {
     pub use crate::{
-        CURRENT_PLUGIN_ABI_VERSION, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, NativeServiceContext,
-        PluginError, RustPlugin, SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
+        CURRENT_PLUGIN_ABI_VERSION, EVENT_STATUS_DECODE_FAILED, EVENT_STATUS_INVALID_ARGUMENT,
+        EVENT_STATUS_OK, EVENT_STATUS_PLUGIN_UNAVAILABLE, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE,
+        NativeEventContext, NativeServiceContext, PluginError, PluginEvent, RustPlugin,
+        SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
         SERVICE_STATUS_ENCODE_FAILED, SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK,
         SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceRequest, ServiceResponse,
         export_plugin,

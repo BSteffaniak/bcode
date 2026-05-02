@@ -6,7 +6,8 @@
 
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, NativeServiceContext,
+    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
+    EVENT_STATUS_OK, NativeEventContext, NativeServiceContext, PluginEvent,
     SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, ServiceRequest,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
@@ -25,6 +26,7 @@ pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
 type ManifestFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
 type LifecycleFn = unsafe extern "C" fn() -> i32;
 type ServiceFn = unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
+type EventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 
 /// Plugin manifest loaded from `bcode-plugin.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +36,8 @@ pub struct PluginManifest {
     pub version: Version,
     #[serde(default)]
     pub services: Vec<PluginService>,
+    #[serde(default)]
+    pub event_subscriptions: Vec<PluginEventSubscription>,
     pub runtime: PluginRuntime,
 }
 
@@ -45,6 +49,12 @@ pub struct PluginService {
     pub name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// Event subscription declared by a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginEventSubscription {
+    pub topic: String,
 }
 
 /// Runtime configuration for a plugin.
@@ -67,6 +77,8 @@ pub struct NativePluginRuntime {
     pub deactivate_symbol: String,
     #[serde(default = "default_service_symbol")]
     pub service_symbol: String,
+    #[serde(default = "default_event_symbol")]
+    pub event_symbol: String,
 }
 
 impl NativePluginRuntime {
@@ -116,6 +128,7 @@ pub struct LoadedPlugin {
     activate: LifecycleFn,
     deactivate: LifecycleFn,
     invoke_service: ServiceFn,
+    handle_event: EventFn,
 }
 
 impl LoadedPlugin {
@@ -217,6 +230,35 @@ impl LoadedPlugin {
         serde_json::from_slice(&output).map_err(PluginLoadError::ServiceDecode)
     }
 
+    /// Handle a host event for this plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when event encoding fails or the plugin handler returns a non-zero code.
+    pub fn handle_event(
+        &self,
+        topic: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<(), PluginLoadError> {
+        let context = NativeEventContext {
+            plugin_id: self.manifest.id.clone(),
+            event: PluginEvent {
+                topic: topic.into(),
+                payload,
+            },
+        };
+        let input = serde_json::to_vec(&context).map_err(PluginLoadError::EventEncode)?;
+        let status = unsafe { (self.handle_event)(input.as_ptr(), input.len()) };
+        if status == EVENT_STATUS_OK {
+            Ok(())
+        } else {
+            Err(PluginLoadError::EventHandlerFailed {
+                plugin_id: self.manifest.id.clone(),
+                code: status,
+            })
+        }
+    }
+
     /// Invoke a service operation on this plugin with JSON request and response payloads.
     ///
     /// # Errors
@@ -302,6 +344,10 @@ pub enum PluginLoadError {
     ServiceDecode(#[source] serde_json::Error),
     #[error("plugin '{plugin_id}' service invocation failed with code {code}")]
     ServiceInvokeFailed { plugin_id: String, code: i32 },
+    #[error("failed to encode plugin event: {0}")]
+    EventEncode(#[source] serde_json::Error),
+    #[error("plugin '{plugin_id}' event handler failed with code {code}")]
+    EventHandlerFailed { plugin_id: String, code: i32 },
     #[error("plugin '{plugin_id}' {hook} hook failed with code {code}")]
     LifecycleFailed {
         plugin_id: String,
@@ -578,6 +624,27 @@ impl PluginHost {
         self.invoke_service_json(plugin_id, interface_id, operation, request)
     }
 
+    /// Publish an event to loaded plugins that subscribed to the event topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first event encoding or handler error.
+    pub fn publish_event(
+        &self,
+        topic: impl Into<String>,
+        payload: &[u8],
+    ) -> Result<usize, PluginLoadError> {
+        let topic = topic.into();
+        let mut delivered = 0;
+        for plugin in &self.loaded {
+            if plugin_subscribes_to(plugin, &topic) {
+                plugin.handle_event(topic.clone(), payload.to_vec())?;
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
+    }
+
     /// Deactivate all loaded plugins in reverse load order.
     ///
     /// # Errors
@@ -633,6 +700,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
     let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
     let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
     let invoke_service = load_service_symbol(&library, &library_path, &runtime.service_symbol)?;
+    let handle_event = load_event_symbol(&library, &library_path, &runtime.event_symbol)?;
 
     Ok(LoadedPlugin {
         manifest: plugin.manifest.clone(),
@@ -640,6 +708,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
         activate,
         deactivate,
         invoke_service,
+        handle_event,
     })
 }
 
@@ -749,6 +818,29 @@ fn load_service_symbol(
     Ok(*loaded)
 }
 
+fn load_event_symbol(
+    library: &Library,
+    library_path: &Path,
+    symbol: &str,
+) -> Result<EventFn, PluginLoadError> {
+    let loaded = unsafe { library.get::<EventFn>(symbol.as_bytes()) }.map_err(|source| {
+        PluginLoadError::SymbolLoad {
+            library: library_path.to_path_buf(),
+            symbol: symbol.to_string(),
+            source,
+        }
+    })?;
+    Ok(*loaded)
+}
+
+fn plugin_subscribes_to(plugin: &LoadedPlugin, topic: &str) -> bool {
+    plugin
+        .manifest
+        .event_subscriptions
+        .iter()
+        .any(|subscription| subscription.topic == topic)
+}
+
 fn default_manifest_symbol() -> String {
     DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string()
 }
@@ -763,6 +855,10 @@ fn default_deactivate_symbol() -> String {
 
 fn default_service_symbol() -> String {
     DEFAULT_NATIVE_SERVICE_SYMBOL.to_string()
+}
+
+fn default_event_symbol() -> String {
+    DEFAULT_NATIVE_EVENT_SYMBOL.to_string()
 }
 
 #[cfg(test)]
