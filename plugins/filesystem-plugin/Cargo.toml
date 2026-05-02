@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_plugin_sdk = { workspace = true }
+bcode_tool       = { workspace = true }
 serde            = { workspace = true, features = ["derive", "std"] }
 serde_json       = { workspace = true }
 

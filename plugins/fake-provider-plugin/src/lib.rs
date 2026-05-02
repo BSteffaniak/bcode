@@ -9,7 +9,8 @@ use bcode_model::{
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
     OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
-    ProviderCapability, ProviderTurnEvent, StartTurnResponse, StopReason, ValidateConfigResponse,
+    ProviderCapability, ProviderTurnEvent, StartTurnResponse, StopReason, ToolCall,
+    ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use std::collections::{BTreeMap, VecDeque};
@@ -92,11 +93,19 @@ impl FakeProviderPlugin {
         };
         self.next_turn += 1;
         let provider_turn_id = format!("fake-turn-{}", self.next_turn);
-        let text = format!("fake: {}", last_user_text(&request.messages));
+        let user_text = last_user_text(&request.messages);
+        let tool_call = user_text.strip_prefix("tool-read ").map(|path| ToolCall {
+            id: format!("fake-tool-{}", self.next_turn),
+            name: "filesystem.read".to_string(),
+            arguments: serde_json::json!({ "path": path }),
+        });
+        let text = format!("fake: {user_text}");
         let turn = FakeTurn::default();
         turn.push(ProviderTurnEvent::TurnStarted);
         self.turns.insert(provider_turn_id.clone(), turn.clone());
-        if let Some(delay) = fake_delay() {
+        if let Some(tool_call) = tool_call {
+            finish_fake_tool_turn(&turn, tool_call);
+        } else if let Some(delay) = fake_delay() {
             std::thread::spawn(move || FakeTurnWorker { turn, text, delay }.run());
         } else {
             finish_fake_turn(&turn, text);
@@ -156,6 +165,17 @@ fn finish_fake_turn(turn: &FakeTurn, text: String) {
     turn.push(ProviderTurnEvent::TextDelta { text });
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::EndTurn,
+    });
+}
+
+fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {
+    turn.push(ProviderTurnEvent::ToolCallStarted {
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+    });
+    turn.push(ProviderTurnEvent::ToolCallFinished { call });
+    turn.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::ToolCall,
     });
 }
 

@@ -14,6 +14,7 @@ members = [
     "packages/plugin-sdk",
     "packages/server",
     "packages/session",
+    "packages/tool",
     "packages/tui",
     "packages/session/models",
 ]
@@ -39,6 +40,7 @@ bcode_plugin_sdk     = { version = "0.0.1-alpha.0", default-features = false, pa
 bcode_server         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+bcode_tool           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
 bcode_tui            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 
 # BMUX reuse

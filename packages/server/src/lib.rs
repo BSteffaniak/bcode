@@ -18,6 +18,10 @@ use bcode_model::{
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{ClientId, SessionEventKind, SessionId};
+use bcode_tool::{
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
+    ToolInvocationRequest, ToolInvocationResponse, ToolList,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::PathBuf;
@@ -678,7 +682,7 @@ async fn handle_provider_turn_event(
             append_tool_request_event(state, session_id, call_id, name).await;
         }
         ProviderTurnEvent::ToolCallFinished { call } => {
-            append_tool_request_event(state, session_id, call.id, call.name).await;
+            execute_model_tool(state, session_id, call).await;
         }
         ProviderTurnEvent::Warning { message } => {
             append_system_event(state, session_id, format!("model warning: {message}")).await;
@@ -756,10 +760,113 @@ async fn build_model_turn_request(
             .unwrap_or_else(|| "fake-echo".to_string()),
         system_prompt: None,
         messages,
-        tools: Vec::new(),
+        tools: collect_model_tools(state).await,
         parameters: ModelParameters::default(),
         metadata: std::collections::BTreeMap::new(),
     })
+}
+
+#[allow(clippy::significant_drop_tightening)]
+async fn collect_model_tools(state: &ServerState) -> Vec<bcode_model::ToolDefinition> {
+    let plugins = state.plugins.lock().await;
+    let mut tools = Vec::new();
+    for plugin in plugins.loaded_plugins() {
+        if !plugin
+            .manifest()
+            .services
+            .iter()
+            .any(|service| service.interface_id == TOOL_SERVICE_INTERFACE_ID)
+        {
+            continue;
+        }
+        let response = plugins.invoke_service_json::<_, ToolList>(
+            &plugin.manifest().id,
+            TOOL_SERVICE_INTERFACE_ID,
+            OP_LIST_TOOLS,
+            &ListToolsRequest::default(),
+        );
+        match response {
+            Ok(list) => {
+                tools.extend(
+                    list.tools
+                        .into_iter()
+                        .map(|tool| bcode_model::ToolDefinition {
+                            name: tool.name,
+                            description: tool.description,
+                            input_schema: tool.input_schema,
+                        }),
+                );
+            }
+            Err(error) => eprintln!(
+                "failed to list tools from {}: {error}",
+                plugin.manifest().id
+            ),
+        }
+    }
+    tools
+}
+
+async fn execute_model_tool(
+    state: &ServerState,
+    session_id: SessionId,
+    call: bcode_model::ToolCall,
+) {
+    append_tool_request_event(state, session_id, call.id.clone(), call.name.clone()).await;
+    let result = invoke_model_tool(state, &call)
+        .await
+        .unwrap_or_else(|error| ToolInvocationResponse {
+            output: error,
+            is_error: true,
+        });
+    let prefix = if result.is_error { "ERROR: " } else { "" };
+    append_tool_finished_event(
+        state,
+        session_id,
+        call.id,
+        format!("{prefix}{}", result.output),
+    )
+    .await;
+}
+
+#[allow(clippy::significant_drop_tightening)]
+async fn invoke_model_tool(
+    state: &ServerState,
+    call: &bcode_model::ToolCall,
+) -> Result<ToolInvocationResponse, String> {
+    let plugins = state.plugins.lock().await;
+    for plugin in plugins.loaded_plugins() {
+        if !plugin
+            .manifest()
+            .services
+            .iter()
+            .any(|service| service.interface_id == TOOL_SERVICE_INTERFACE_ID)
+        {
+            continue;
+        }
+        let list = plugins
+            .invoke_service_json::<_, ToolList>(
+                &plugin.manifest().id,
+                TOOL_SERVICE_INTERFACE_ID,
+                OP_LIST_TOOLS,
+                &ListToolsRequest::default(),
+            )
+            .map_err(|error| error.to_string())?;
+        if list.tools.iter().any(|tool| tool.name == call.name) {
+            return plugins
+                .invoke_service_json::<_, ToolInvocationResponse>(
+                    &plugin.manifest().id,
+                    TOOL_SERVICE_INTERFACE_ID,
+                    OP_INVOKE_TOOL,
+                    &ToolInvocationRequest {
+                        tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string());
+        }
+    }
+    Err(format!("tool not found: {}", call.name))
 }
 
 fn session_event_to_model_message(
@@ -817,6 +924,22 @@ async fn append_tool_request_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append tool request: {error}"),
+    }
+}
+
+async fn append_tool_finished_event(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: String,
+    result: String,
+) {
+    match state
+        .sessions
+        .append_tool_call_finished(session_id, tool_call_id, result)
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append tool result: {error}"),
     }
 }
 

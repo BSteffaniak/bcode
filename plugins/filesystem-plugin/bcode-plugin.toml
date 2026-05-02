@@ -7,6 +7,11 @@ description  = "Filesystem read/write utility service"
 interface_id = "bcode.filesystem/v1"
 name         = "Filesystem"
 
+[[services]]
+description  = "Model-callable filesystem tools"
+interface_id = "bcode.tool/v1"
+name         = "Filesystem Tools"
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"
