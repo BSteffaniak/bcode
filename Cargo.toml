@@ -4,6 +4,7 @@ members = [
     "plugins/filesystem-plugin",
     "plugins/fake-provider-plugin",
     "plugins/openai-compatible-provider-plugin",
+    "plugins/shell-plugin",
     "packages/bcode",
     "packages/cli",
     "packages/client",

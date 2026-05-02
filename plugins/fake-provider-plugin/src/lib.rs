@@ -240,6 +240,13 @@ fn fake_tool_call(user_text: &str, next_turn: u64) -> Option<ToolCall> {
             arguments: serde_json::json!({ "path": path, "contents": contents }),
         });
     }
+    if let Some(command) = user_text.strip_prefix("tool-shell ") {
+        return Some(ToolCall {
+            id: format!("fake-tool-{next_turn}"),
+            name: "shell.run".to_string(),
+            arguments: serde_json::json!({ "command": command }),
+        });
+    }
     None
 }
 
