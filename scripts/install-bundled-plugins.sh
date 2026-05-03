@@ -6,20 +6,26 @@ install_root="${1:-${root}/target/debug/plugins}"
 
 cd "${root}"
 
-cargo build --quiet -p bcode_filesystem_plugin -p bcode_shell_plugin
+cargo build --quiet \
+    -p bcode_filesystem_plugin \
+    -p bcode_shell_plugin \
+    -p bcode_openai_compatible_provider_plugin
 
 case "$(uname -s)" in
     Darwin)
         fs_dylib_name="libbcode_filesystem_plugin.dylib"
         shell_dylib_name="libbcode_shell_plugin.dylib"
+        openai_dylib_name="libbcode_openai_compatible_provider_plugin.dylib"
         ;;
     Linux)
         fs_dylib_name="libbcode_filesystem_plugin.so"
         shell_dylib_name="libbcode_shell_plugin.so"
+        openai_dylib_name="libbcode_openai_compatible_provider_plugin.so"
         ;;
     MINGW*|MSYS*|CYGWIN*)
         fs_dylib_name="bcode_filesystem_plugin.dll"
         shell_dylib_name="bcode_shell_plugin.dll"
+        openai_dylib_name="bcode_openai_compatible_provider_plugin.dll"
         ;;
     *)
         echo "unsupported platform: $(uname -s)" >&2
@@ -60,6 +66,26 @@ name = "Filesystem Tools"
 type = "native"
 abi_version = 1
 library = "${fs_dylib_name}"
+event_symbol = "bcode_plugin_handle_event_v1"
+service_symbol = "bcode_plugin_invoke_service_v1"
+EOF
+
+openai_plugin_dir="${install_root}/bcode.openai-compatible"
+install_plugin_library "${openai_plugin_dir}" "${openai_dylib_name}"
+cat >"${openai_plugin_dir}/bcode-plugin.toml" <<EOF
+id = "bcode.openai-compatible"
+name = "Bcode OpenAI-Compatible Provider"
+version = "0.0.1"
+
+[[services]]
+description = "OpenAI-compatible chat-completions model provider"
+interface_id = "bcode.model-provider/v1"
+name = "OpenAI-Compatible Model Provider"
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "${openai_dylib_name}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
 EOF
