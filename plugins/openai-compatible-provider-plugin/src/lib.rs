@@ -15,7 +15,7 @@ use bcode_model::{
 use bcode_plugin_sdk::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -141,6 +141,7 @@ struct Settings {
     base_url: String,
     default_model: String,
     model_ids: Vec<String>,
+    model_ids_are_explicit: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,6 +231,16 @@ struct ChatDeltaToolCallFunction {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponseBody {
+    data: Vec<ModelResponseItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelResponseItem {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,22 +719,113 @@ fn capabilities() -> ProviderCapabilities {
 
 fn models() -> ModelList {
     let settings = settings();
-    ModelList {
-        models: settings
-            .model_ids
-            .iter()
-            .map(|model_id| ModelInfo {
-                model_id: model_id.clone(),
-                display_name: model_id.clone(),
-                is_default: *model_id == settings.default_model,
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
-                    .into_iter()
-                    .collect(),
-            })
-            .collect(),
+    if !settings.model_ids_are_explicit
+        && let Some(discovered_models) = discover_models(&settings)
+    {
+        return ModelList {
+            models: discovered_models,
+        };
     }
+    ModelList {
+        models: model_infos_from_ids(&settings.model_ids, &settings.default_model),
+    }
+}
+
+fn model_infos_from_ids(model_ids: &[String], default_model: &str) -> Vec<ModelInfo> {
+    model_ids
+        .iter()
+        .map(|model_id| ModelInfo {
+            model_id: model_id.clone(),
+            display_name: model_id.clone(),
+            is_default: model_id == default_model,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
+                .into_iter()
+                .collect(),
+        })
+        .collect()
+}
+
+fn discover_models(settings: &Settings) -> Option<Vec<ModelInfo>> {
+    let api_key = settings.api_key.clone()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .ok()?;
+    runtime
+        .block_on(discover_models_async(settings, &api_key))
+        .ok()
+}
+
+async fn discover_models_async(
+    settings: &Settings,
+    api_key: &str,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| {
+            provider_error(
+                "client_build_failed",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?;
+    let url = format!("{}/models", settings.base_url.trim_end_matches('/'));
+    let response = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| {
+            provider_error(
+                "models_request_failed",
+                if error.is_timeout() {
+                    ProviderErrorCategory::Timeout
+                } else {
+                    ProviderErrorCategory::Network
+                },
+                error.to_string(),
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        provider_error(
+            "models_response_read_failed",
+            ProviderErrorCategory::Network,
+            error.to_string(),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(error_from_status(status.as_u16(), &body));
+    }
+    let body = serde_json::from_str::<ModelsResponseBody>(&body).map_err(|error| {
+        provider_error(
+            "models_response_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    Ok(model_infos_from_ids(
+        &model_ids_with_default(body.data, &settings.default_model),
+        &settings.default_model,
+    ))
+}
+
+fn model_ids_with_default(models: Vec<ModelResponseItem>, default_model: &str) -> Vec<String> {
+    let mut model_ids = models
+        .into_iter()
+        .map(|model| model.id)
+        .filter(|model_id| !model_id.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !model_ids.iter().any(|model_id| model_id == default_model) {
+        model_ids.insert(0, default_model.to_string());
+    }
+    model_ids
 }
 
 fn validate_config() -> ValidateConfigResponse {
@@ -744,8 +846,10 @@ fn validate_config() -> ValidateConfigResponse {
 fn settings() -> Settings {
     let default_model = first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"])
         .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-    let mut model_ids = first_env(["BCODE_OPENAI_MODELS", "OPENAI_MODELS"])
-        .map_or_else(Vec::new, |models| parse_model_list(&models));
+    let model_ids_env = first_env(["BCODE_OPENAI_MODELS", "OPENAI_MODELS"]);
+    let mut model_ids = model_ids_env
+        .as_deref()
+        .map_or_else(Vec::new, parse_model_list);
     if !model_ids.contains(&default_model) {
         model_ids.insert(0, default_model.clone());
     }
@@ -755,6 +859,7 @@ fn settings() -> Settings {
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
         default_model,
         model_ids,
+        model_ids_are_explicit: model_ids_env.is_some(),
     }
 }
 
@@ -830,6 +935,77 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_ids_with_default_sorts_deduplicates_and_inserts_default() {
+        let model_ids = model_ids_with_default(
+            vec![
+                ModelResponseItem {
+                    id: "z-model".to_string(),
+                },
+                ModelResponseItem {
+                    id: "a-model".to_string(),
+                },
+                ModelResponseItem {
+                    id: "z-model".to_string(),
+                },
+            ],
+            "default-model",
+        );
+
+        assert_eq!(
+            model_ids,
+            vec![
+                "default-model".to_string(),
+                "a-model".to_string(),
+                "z-model".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_ids_with_default_does_not_duplicate_existing_default() {
+        let model_ids = model_ids_with_default(
+            vec![ModelResponseItem {
+                id: "default-model".to_string(),
+            }],
+            "default-model",
+        );
+
+        assert_eq!(model_ids, vec!["default-model".to_string()]);
+    }
+
+    #[test]
+    fn model_infos_mark_default_and_tool_capability() {
+        let model_infos = model_infos_from_ids(
+            &["default-model".to_string(), "other-model".to_string()],
+            "default-model",
+        );
+
+        assert!(model_infos[0].is_default);
+        assert!(!model_infos[1].is_default);
+        assert!(
+            model_infos[0]
+                .capabilities
+                .contains(&ModelCapability::ToolCalls)
+        );
+    }
+
+    #[test]
+    fn models_response_body_decodes_openai_models_payload() {
+        let body = serde_json::from_str::<ModelsResponseBody>(
+            r#"{"data":[{"id":"model-a"},{"id":"model-b"}]}"#,
+        )
+        .expect("models response body");
+
+        assert_eq!(body.data.len(), 2);
+        assert_eq!(body.data[0].id, "model-a");
+    }
 }
 
 bcode_plugin_sdk::export_plugin!(
