@@ -132,6 +132,19 @@ cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q 
 cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission resolved: .*approved=false"
 cargo run --quiet -p bcode -- session history "${blocked_session_id}" | grep -q "permission denied"
 
+cargo run --quiet -p bcode -- permission allow-shell-prefix "printf cli-added" | grep -q "permission rule added"
+grep -q "printf cli-added" "${BCODE_CONFIG}"
+cli_rule_session_id="$(cargo run --quiet -p bcode -- session create permission-policy-cli-rule-smoke)"
+cargo run --quiet -p bcode -- send "${cli_rule_session_id}" "tool-shell printf cli-added-rule" >/dev/null
+for _ in {1..50}; do
+    if cargo run --quiet -p bcode -- session history "${cli_rule_session_id}" | grep -q "cli-added-rule"; then
+        break
+    fi
+    sleep 0.1
+done
+cargo run --quiet -p bcode -- session history "${cli_rule_session_id}" | grep -q "permission resolved: .*approved=true"
+cargo run --quiet -p bcode -- session history "${cli_rule_session_id}" | grep -q "cli-added-rule"
+
 cargo run --quiet -p bcode -- server stop >/dev/null
 wait "${server_pid}"
 server_pid=""

@@ -101,6 +101,24 @@ pub async fn run() -> Result<(), CliError> {
             PermissionCommand::Deny { permission_id } => {
                 resolve_permission(permission_id, false).await?;
             }
+            PermissionCommand::AllowTool { tool_name } => {
+                add_permission_rule("allow_tool", tool_name).await?;
+            }
+            PermissionCommand::DenyTool { tool_name } => {
+                add_permission_rule("deny_tool", tool_name).await?;
+            }
+            PermissionCommand::AllowShellPrefix { prefix } => {
+                add_permission_rule("allow_shell_command_prefix", prefix).await?;
+            }
+            PermissionCommand::DenyShellPrefix { prefix } => {
+                add_permission_rule("deny_shell_command_prefix", prefix).await?;
+            }
+            PermissionCommand::AllowPathPrefix { prefix } => {
+                add_permission_rule("allow_path_prefix", prefix).await?;
+            }
+            PermissionCommand::DenyPathPrefix { prefix } => {
+                add_permission_rule("deny_path_prefix", prefix).await?;
+            }
         },
         Commands::Cancel { session_id } => cancel_session_turn(session_id).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
@@ -191,6 +209,12 @@ enum PermissionCommand {
     List,
     Approve { permission_id: String },
     Deny { permission_id: String },
+    AllowTool { tool_name: String },
+    DenyTool { tool_name: String },
+    AllowShellPrefix { prefix: String },
+    DenyShellPrefix { prefix: String },
+    AllowPathPrefix { prefix: String },
+    DenyPathPrefix { prefix: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -617,6 +641,14 @@ async fn resolve_permission(permission_id: String, approved: bool) -> Result<(),
         .resolve_permission(permission_id, approved)
         .await?;
     println!("resolved: {resolved}");
+    Ok(())
+}
+
+async fn add_permission_rule(kind: &str, value: String) -> Result<(), CliError> {
+    let config_path = BcodeClient::default_endpoint()
+        .add_permission_rule(kind.to_string(), value)
+        .await?;
+    println!("permission rule added: {config_path}");
     Ok(())
 }
 

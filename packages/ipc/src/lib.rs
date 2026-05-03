@@ -103,6 +103,10 @@ pub enum Request {
         permission_id: String,
         approved: bool,
     },
+    AddPermissionRule {
+        kind: String,
+        value: String,
+    },
     ListPluginServices,
     InvokePluginService {
         plugin_id: String,
@@ -197,6 +201,9 @@ pub enum ResponsePayload {
     },
     PermissionResolved {
         resolved: bool,
+    },
+    PermissionRuleAdded {
+        config_path: String,
     },
     PluginServices {
         services: Vec<PluginServiceSummary>,

@@ -200,6 +200,26 @@ impl BcodeClient {
         }
     }
 
+    /// Persist and activate a permission policy rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn add_permission_rule(
+        &self,
+        kind: String,
+        value: String,
+    ) -> Result<String, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::AddPermissionRule { kind, value })
+            .await?
+        {
+            ResponsePayload::PermissionRuleAdded { config_path } => Ok(config_path),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List services provided by loaded daemon plugins.
     ///
     /// # Errors

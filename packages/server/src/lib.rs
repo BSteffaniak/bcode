@@ -63,7 +63,7 @@ struct ServerState {
     plugins: Mutex<bcode_plugin::PluginHost>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
-    permission_policy: PermissionPolicy,
+    permission_policy: Mutex<PermissionPolicy>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
@@ -95,6 +95,19 @@ struct PermissionPolicy {
 }
 
 impl PermissionPolicy {
+    fn add_rule(&mut self, kind: &str, value: String) -> Result<(), String> {
+        match kind {
+            "allow_tool" => self.allow_tools.insert(value),
+            "deny_tool" => self.deny_tools.insert(value),
+            "allow_shell_command_prefix" => self.allow_shell_command_prefixes.insert(value),
+            "deny_shell_command_prefix" => self.deny_shell_command_prefixes.insert(value),
+            "allow_path_prefix" => self.allow_path_prefixes.insert(value),
+            "deny_path_prefix" => self.deny_path_prefixes.insert(value),
+            _ => return Err(format!("unknown permission rule kind: {kind}")),
+        };
+        Ok(())
+    }
+
     fn decision_for_call(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<bool> {
         if self.deny_tools.contains(tool_name)
             || self.denies_shell_command(tool_name, arguments)
@@ -171,7 +184,7 @@ impl ServerState {
             plugins: Mutex::new(plugins),
             selected_provider_plugin_id,
             selected_model_id,
-            permission_policy,
+            permission_policy: Mutex::new(permission_policy),
             active_turns: Mutex::default(),
             pending_permissions: Mutex::default(),
             next_permission_id: Mutex::new(1),
@@ -337,6 +350,9 @@ async fn handle_request(
             permission_id,
             approved,
         } => handle_resolve_permission(request_id, state, writer, &permission_id, approved).await,
+        Request::AddPermissionRule { kind, value } => {
+            handle_add_permission_rule(request_id, state, writer, &kind, value).await
+        }
         Request::ListPluginServices => handle_list_plugin_services(request_id, state, writer).await,
         Request::InvokePluginService {
             plugin_id,
@@ -621,6 +637,44 @@ async fn handle_list_permissions(
         Response::Ok(ResponsePayload::PermissionList { permissions }),
     )
     .await
+}
+
+async fn handle_add_permission_rule(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    kind: &str,
+    value: String,
+) -> Result<(), ServerError> {
+    match bcode_config::add_permission_rule(kind, value.clone()) {
+        Ok(path) => {
+            let add_result = state.permission_policy.lock().await.add_rule(kind, value);
+            if let Err(error) = add_result {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new("invalid_permission_rule", error)),
+                )
+                .await;
+            }
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PermissionRuleAdded {
+                    config_path: path.display().to_string(),
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("config_error", error.to_string())),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_resolve_permission(
@@ -1098,10 +1152,12 @@ async fn request_tool_permission(
         arguments_json.clone(),
     )
     .await;
-    if let Some(decision) = state
+    let policy_decision = state
         .permission_policy
-        .decision_for_call(&definition.name, &call.arguments)
-    {
+        .lock()
+        .await
+        .decision_for_call(&definition.name, &call.arguments);
+    if let Some(decision) = policy_decision {
         append_permission_resolved_event(state, session_id, permission_id, decision).await;
         return decision;
     }

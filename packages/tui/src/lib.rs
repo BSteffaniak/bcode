@@ -102,6 +102,12 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     resolve_first_permission(&client, &mut app, false).await;
                 }
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    persist_first_permission_rule(&client, &mut app, true).await;
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    persist_first_permission_rule(&client, &mut app, false).await;
+                }
                 KeyCode::Esc => break,
                 KeyCode::Enter => {
                     let Some(message) = app.take_input() else {
@@ -141,6 +147,25 @@ async fn resolve_first_permission(client: &BcodeClient, app: &mut ChatApp, appro
         }
         Ok(false) => app.status = format!("permission {permission_id} was not pending"),
         Err(error) => app.status = format!("permission resolve failed: {error}"),
+    }
+}
+
+async fn persist_first_permission_rule(client: &BcodeClient, app: &mut ChatApp, approved: bool) {
+    let Some(permission) = app.first_pending_permission().cloned() else {
+        app.status = "no pending permission".to_string();
+        return;
+    };
+    let (kind, value) = permission.policy_rule(approved);
+    match client
+        .add_permission_rule(kind.to_string(), value.clone())
+        .await
+    {
+        Ok(_) => {
+            resolve_first_permission(client, app, approved).await;
+            let action = if approved { "allow" } else { "deny" };
+            app.status = format!("persisted {action} rule {kind}={value}");
+        }
+        Err(error) => app.status = format!("persist rule failed: {error}"),
     }
 }
 
@@ -272,9 +297,46 @@ struct PendingPermissionView {
 impl PendingPermissionView {
     fn render_text(&self) -> String {
         format!(
-            "permission: {}\ntool: {} ({})\narguments: {}\nctrl-a approve once, ctrl-d deny once",
+            "permission: {}\ntool: {} ({})\narguments: {}\nctrl-a approve once, ctrl-d deny once, ctrl-y always allow, ctrl-n always deny",
             self.permission_id, self.tool_name, self.tool_call_id, self.arguments_json
         )
+    }
+
+    fn policy_rule(&self, approved: bool) -> (&'static str, String) {
+        if self.tool_name == "shell.run"
+            && let Some(command) = self.string_argument("command")
+        {
+            return if approved {
+                ("allow_shell_command_prefix", command)
+            } else {
+                ("deny_shell_command_prefix", command)
+            };
+        }
+        if self.tool_name.starts_with("filesystem.")
+            && let Some(path) = self.string_argument("path")
+        {
+            return if approved {
+                ("allow_path_prefix", path)
+            } else {
+                ("deny_path_prefix", path)
+            };
+        }
+        if approved {
+            ("allow_tool", self.tool_name.clone())
+        } else {
+            ("deny_tool", self.tool_name.clone())
+        }
+    }
+
+    fn string_argument(&self, key: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(&self.arguments_json)
+            .ok()
+            .and_then(|arguments| {
+                arguments
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
     }
 }
 

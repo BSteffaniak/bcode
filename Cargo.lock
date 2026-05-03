@@ -220,6 +220,7 @@ dependencies = [
  "bcode_session_models",
  "crossterm",
  "ratatui",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

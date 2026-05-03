@@ -8,6 +8,7 @@ use bcode_plugin::PluginSelection;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -127,6 +128,152 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("unknown permission rule kind: {0}")]
+    UnknownPermissionRule(String),
+}
+
+/// Add a permission rule to the default writable config file.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, updated, or written.
+pub fn add_permission_rule(kind: &str, value: String) -> Result<PathBuf, ConfigError> {
+    let path = writable_config_path();
+    let mut config = if path.exists() {
+        read_config(&path)?
+    } else {
+        BcodeConfig::default()
+    };
+    insert_permission_rule(&mut config.permissions, kind, value)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, config_to_toml(&config)).map_err(|source| ConfigError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+fn insert_permission_rule(
+    permissions: &mut PermissionConfig,
+    kind: &str,
+    value: String,
+) -> Result<(), ConfigError> {
+    match kind {
+        "allow_tool" => permissions.allow_tools.insert(value),
+        "deny_tool" => permissions.deny_tools.insert(value),
+        "allow_shell_command_prefix" => permissions.allow_shell_command_prefixes.insert(value),
+        "deny_shell_command_prefix" => permissions.deny_shell_command_prefixes.insert(value),
+        "allow_path_prefix" => permissions.allow_path_prefixes.insert(value),
+        "deny_path_prefix" => permissions.deny_path_prefixes.insert(value),
+        _ => return Err(ConfigError::UnknownPermissionRule(kind.to_string())),
+    };
+    Ok(())
+}
+
+fn writable_config_path() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_CONFIG") {
+        return PathBuf::from(path);
+    }
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(config_home)
+            .join("bcode")
+            .join(DEFAULT_CONFIG_FILE_NAME);
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("bcode")
+            .join(DEFAULT_CONFIG_FILE_NAME);
+    }
+    env::temp_dir().join(DEFAULT_CONFIG_FILE_NAME)
+}
+
+fn config_to_toml(config: &BcodeConfig) -> String {
+    let mut output = String::new();
+    write_plugins_toml(&mut output, &config.plugins);
+    if config.model.provider_plugin_id.is_some() || config.model.model_id.is_some() {
+        output.push_str("[model]\n");
+        if let Some(provider_plugin_id) = &config.model.provider_plugin_id {
+            writeln!(
+                output,
+                "provider_plugin_id = {}",
+                toml_string(provider_plugin_id)
+            )
+            .expect("writing to string should not fail");
+        }
+        if let Some(model_id) = &config.model.model_id {
+            writeln!(output, "model_id = {}", toml_string(model_id))
+                .expect("writing to string should not fail");
+        }
+        output.push('\n');
+    }
+    write_permissions_toml(&mut output, &config.permissions);
+    output
+}
+
+fn write_permissions_toml(output: &mut String, permissions: &PermissionConfig) {
+    if permissions == &PermissionConfig::default() {
+        return;
+    }
+    output.push_str("[permissions]\n");
+    write_string_set(output, "allow_tools", &permissions.allow_tools);
+    write_string_set(output, "deny_tools", &permissions.deny_tools);
+    write_string_set(
+        output,
+        "allow_shell_command_prefixes",
+        &permissions.allow_shell_command_prefixes,
+    );
+    write_string_set(
+        output,
+        "deny_shell_command_prefixes",
+        &permissions.deny_shell_command_prefixes,
+    );
+    write_string_set(
+        output,
+        "allow_path_prefixes",
+        &permissions.allow_path_prefixes,
+    );
+    write_string_set(
+        output,
+        "deny_path_prefixes",
+        &permissions.deny_path_prefixes,
+    );
+    output.push('\n');
+}
+
+fn write_plugins_toml(output: &mut String, plugins: &PluginConfig) {
+    if plugins == &PluginConfig::default() {
+        return;
+    }
+    output.push_str("[plugins]\n");
+    write_string_set(output, "enabled", &plugins.enabled);
+    write_string_set(output, "disabled", &plugins.disabled);
+    output.push('\n');
+}
+
+fn write_string_set(output: &mut String, key: &str, values: &BTreeSet<String>) {
+    if values.is_empty() {
+        return;
+    }
+    let values = values
+        .iter()
+        .map(|value| toml_string(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(output, "{key} = [{values}]").expect("writing to string should not fail");
+}
+
+fn toml_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
 }
 
 /// Return default config paths in merge order.
