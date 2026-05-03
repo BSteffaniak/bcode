@@ -19,7 +19,7 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -545,11 +545,7 @@ fn login_openai_chatgpt(
 }
 
 fn run_openai_codex_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
-    let listener = TcpListener::bind(("localhost", OPENAI_CODEX_OAUTH_PORT)).map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!(
-            "failed to bind OpenAI OAuth callback server on localhost:{OPENAI_CODEX_OAUTH_PORT}: {error}"
-        ))
-    })?;
+    let listeners = open_oauth_listeners()?;
     let redirect_uri = format!("http://localhost:{OPENAI_CODEX_OAUTH_PORT}/auth/callback");
     let state = random_urlsafe(32)?;
     let verifier = random_pkce_verifier(43)?;
@@ -558,7 +554,7 @@ fn run_openai_codex_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
     println!("OpenAI ChatGPT subscription login");
     println!("Open this URL if your browser does not open automatically:\n{authorize_url}\n");
     open_browser(&authorize_url);
-    let code = wait_for_oauth_code(&listener, &state)?;
+    let code = wait_for_oauth_code(&listeners, &state)?;
     exchange_openai_codex_code(&redirect_uri, &verifier, &code)
 }
 
@@ -620,17 +616,91 @@ fn exchange_openai_codex_code(
     })
 }
 
-fn wait_for_oauth_code(listener: &TcpListener, expected_state: &str) -> Result<String, CliError> {
-    let (mut stream, _) = listener.accept()?;
+fn open_oauth_listeners() -> Result<Vec<TcpListener>, CliError> {
+    let mut listeners = Vec::new();
+    let mut errors = Vec::new();
+    for address in ["127.0.0.1", "::1"] {
+        match TcpListener::bind((address, OPENAI_CODEX_OAUTH_PORT)) {
+            Ok(listener) => {
+                listener.set_nonblocking(true)?;
+                listeners.push(listener);
+            }
+            Err(error) => errors.push(format!("{address}: {error}")),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(CliError::BundledPluginInstallFailed(format!(
+            "failed to bind OpenAI OAuth callback server on localhost:{OPENAI_CODEX_OAUTH_PORT}: {}",
+            errors.join("; ")
+        )));
+    }
+    Ok(listeners)
+}
+
+fn wait_for_oauth_code(
+    listeners: &[TcpListener],
+    expected_state: &str,
+) -> Result<String, CliError> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(CliError::BundledPluginInstallFailed(
+                "OpenAI OAuth callback timed out".to_string(),
+            ));
+        }
+        for listener in listeners {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    match handle_oauth_callback_stream(&mut stream, expected_state)? {
+                        OAuthCallback::Code(code) => return Ok(code),
+                        OAuthCallback::Ignored => {}
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn handle_oauth_callback_stream(
+    stream: &mut std::net::TcpStream,
+    expected_state: &str,
+) -> Result<OAuthCallback, CliError> {
     let mut request = [0_u8; 8192];
     let size = stream.read(&mut request)?;
     let request = String::from_utf8_lossy(&request[..size]);
     let first_line = request.lines().next().unwrap_or_default();
-    let code_and_state = parse_oauth_callback(first_line);
-    let response_body = if code_and_state.is_some() {
+    match parse_oauth_callback(first_line) {
+        OAuthCallbackParse::Code { code, state } if state == expected_state => {
+            write_oauth_response(stream, true)?;
+            Ok(OAuthCallback::Code(code))
+        }
+        OAuthCallbackParse::Code { .. } => {
+            write_oauth_response(stream, false)?;
+            Err(CliError::BundledPluginInstallFailed(
+                "OpenAI OAuth callback state did not match".to_string(),
+            ))
+        }
+        OAuthCallbackParse::Error(error) => {
+            write_oauth_response(stream, false)?;
+            Err(CliError::BundledPluginInstallFailed(format!(
+                "OpenAI OAuth failed: {error}"
+            )))
+        }
+        OAuthCallbackParse::Ignored => {
+            write_oauth_response(stream, false)?;
+            Ok(OAuthCallback::Ignored)
+        }
+    }
+}
+
+fn write_oauth_response(stream: &mut std::net::TcpStream, success: bool) -> Result<(), CliError> {
+    let response_body = if success {
         "Bcode OpenAI login complete. You can close this tab."
     } else {
-        "Bcode OpenAI login failed. Return to your terminal."
+        "Bcode OpenAI login did not complete. Return to your terminal."
     };
     write!(
         stream,
@@ -638,33 +708,55 @@ fn wait_for_oauth_code(listener: &TcpListener, expected_state: &str) -> Result<S
         response_body.len(),
         response_body
     )?;
-    let Some((code, state)) = code_and_state else {
-        return Err(CliError::BundledPluginInstallFailed(
-            "OpenAI OAuth callback did not include a code".to_string(),
-        ));
-    };
-    if state != expected_state {
-        return Err(CliError::BundledPluginInstallFailed(
-            "OpenAI OAuth callback state did not match".to_string(),
-        ));
-    }
-    Ok(code)
+    Ok(())
 }
 
-fn parse_oauth_callback(first_line: &str) -> Option<(String, String)> {
-    let path = first_line.split_whitespace().nth(1)?;
-    let query = path.split_once('?')?.1;
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthCallback {
+    Code(String),
+    Ignored,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthCallbackParse {
+    Code { code: String, state: String },
+    Error(String),
+    Ignored,
+}
+
+fn parse_oauth_callback(first_line: &str) -> OAuthCallbackParse {
+    let Some(path) = first_line.split_whitespace().nth(1) else {
+        return OAuthCallbackParse::Ignored;
+    };
+    if !path.starts_with("/auth/callback") {
+        return OAuthCallbackParse::Ignored;
+    }
+    let Some(query) = path.split_once('?').map(|(_, query)| query) else {
+        return OAuthCallbackParse::Ignored;
+    };
     let mut code = None;
     let mut state = None;
+    let mut error = None;
+    let mut error_description = None;
     for pair in query.split('&') {
-        let (key, value) = pair.split_once('=')?;
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
         match pct_decode(key).as_deref() {
             Some("code") => code = pct_decode(value),
             Some("state") => state = pct_decode(value),
+            Some("error") => error = pct_decode(value),
+            Some("error_description") => error_description = pct_decode(value),
             _ => {}
         }
     }
-    Some((code?, state?))
+    if let Some(error) = error_description.or(error) {
+        return OAuthCallbackParse::Error(error);
+    }
+    match (code, state) {
+        (Some(code), Some(state)) => OAuthCallbackParse::Code { code, state },
+        _ => OAuthCallbackParse::Ignored,
+    }
 }
 
 fn random_urlsafe(bytes: usize) -> Result<String, CliError> {
