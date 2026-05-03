@@ -140,6 +140,7 @@ struct Settings {
     api_key: Option<String>,
     base_url: String,
     default_model: String,
+    model_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -708,16 +709,20 @@ fn capabilities() -> ProviderCapabilities {
 fn models() -> ModelList {
     let settings = settings();
     ModelList {
-        models: vec![ModelInfo {
-            model_id: settings.default_model.clone(),
-            display_name: settings.default_model,
-            is_default: true,
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
-                .into_iter()
-                .collect(),
-        }],
+        models: settings
+            .model_ids
+            .iter()
+            .map(|model_id| ModelInfo {
+                model_id: model_id.clone(),
+                display_name: model_id.clone(),
+                is_default: *model_id == settings.default_model,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
+                    .into_iter()
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -737,13 +742,29 @@ fn validate_config() -> ValidateConfigResponse {
 }
 
 fn settings() -> Settings {
+    let default_model = first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"])
+        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+    let mut model_ids = first_env(["BCODE_OPENAI_MODELS", "OPENAI_MODELS"])
+        .map_or_else(Vec::new, |models| parse_model_list(&models));
+    if !model_ids.contains(&default_model) {
+        model_ids.insert(0, default_model.clone());
+    }
     Settings {
         api_key: first_env(["BCODE_OPENAI_API_KEY", "OPENAI_API_KEY"]),
         base_url: first_env(["BCODE_OPENAI_BASE_URL", "OPENAI_BASE_URL"])
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-        default_model: first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"])
-            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+        default_model,
+        model_ids,
     }
+}
+
+fn parse_model_list(models: &str) -> Vec<String> {
+    models
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn first_env<const N: usize>(names: [&str; N]) -> Option<String> {
