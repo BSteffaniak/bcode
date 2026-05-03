@@ -28,6 +28,8 @@ use zeroize::Zeroizing;
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL_ID: &str = "gpt-4.1-mini";
 const DEFAULT_CODEX_MODEL_ID: &str = "gpt-5.5";
+const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
+const DEFAULT_XAI_MODEL_ID: &str = "grok-4.3"; // from https://docs.x.ai/developers/models/grok-4.3
 const PROVIDER_ID: &str = "bcode.openai-compatible";
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -423,7 +425,7 @@ async fn stream_chat_completion_inner(
         return Err(provider_error(
             "missing_openai_auth",
             ProviderErrorCategory::Auth,
-            "run `bcode login openai` for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY for API-key auth",
+            "run `bcode login openai` (or `bcode login xai`) for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY) for API-key auth",
         ));
     }
     let client = Client::builder()
@@ -1139,7 +1141,7 @@ fn capabilities() -> ProviderCapabilities {
     let settings = settings();
     ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
-        display_name: "OpenAI-Compatible".to_string(),
+        display_name: "OpenAI-Compatible (xAI, Grok, OpenAI, Groq, ...)".to_string(),
         capabilities: [
             ProviderCapability::Streaming,
             ProviderCapability::Cancellation,
@@ -1276,7 +1278,7 @@ fn validate_config() -> ValidateConfigResponse {
         ValidateConfigResponse {
             valid: true,
             message: Some(format!(
-                "OpenAI provider authentication is configured ({})",
+                "OpenAI-compatible provider authentication is configured ({}) (supports xAI/Grok, OpenAI, etc.)",
                 settings.auth_diagnostics.detail
             )),
             metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
@@ -1299,12 +1301,12 @@ fn validation_failure_message(
 ) -> String {
     if let Some(error) = refresh_error {
         return format!(
-            "OpenAI provider authentication refresh failed ({}: {:?}); {}",
+            "OpenAI-compatible provider authentication refresh failed ({}: {:?}); {}",
             error.code, error.category, error.message
         );
     }
     format!(
-        "OpenAI provider authentication is not configured ({}); run `bcode login openai` or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY",
+        "OpenAI-compatible provider authentication is not configured ({}); run `bcode login openai` (or `bcode login xai`) or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY)",
         settings.auth_diagnostics.detail
     )
 }
@@ -1365,15 +1367,29 @@ fn diagnostics_metadata(
 
 fn settings() -> Settings {
     let saved = saved_openai_auth();
-    let chatgpt_mode = saved_openai_auth_is_chatgpt(&saved);
-    let default_model = first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"]).unwrap_or_else(|| {
-        if chatgpt_mode {
+    let xai_mode = saved_has_xai_keys(&saved) || env_has_xai_keys();
+    let chatgpt_mode = saved_openai_auth_is_chatgpt(&saved) && !xai_mode;
+    let default_model = first_env([
+        "BCODE_XAI_MODEL",
+        "XAI_MODEL",
+        "BCODE_OPENAI_MODEL",
+        "OPENAI_MODEL",
+    ])
+    .unwrap_or_else(|| {
+        if xai_mode {
+            DEFAULT_XAI_MODEL_ID.to_string()
+        } else if chatgpt_mode {
             DEFAULT_CODEX_MODEL_ID.to_string()
         } else {
             DEFAULT_MODEL_ID.to_string()
         }
     });
-    let model_ids_env = first_env(["BCODE_OPENAI_MODELS", "OPENAI_MODELS"]);
+    let model_ids_env = first_env([
+        "BCODE_XAI_MODELS",
+        "XAI_MODELS",
+        "BCODE_OPENAI_MODELS",
+        "OPENAI_MODELS",
+    ]);
     let mut model_ids = model_ids_env
         .as_deref()
         .map_or_else(|| default_model_ids(chatgpt_mode), parse_model_list);
@@ -1381,13 +1397,27 @@ fn settings() -> Settings {
         model_ids.insert(0, default_model.clone());
     }
     let (auth, auth_diagnostics) = openai_auth_settings(&saved);
+    let base_url = first_env([
+        "BCODE_XAI_BASE_URL",
+        "XAI_BASE_URL",
+        "BCODE_OPENAI_BASE_URL",
+        "OPENAI_BASE_URL",
+    ])
+    .or_else(|| saved.values.get("BCODE_XAI_BASE_URL").cloned())
+    .or_else(|| saved.values.get("XAI_BASE_URL").cloned())
+    .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
+    .or_else(|| saved.values.get("OPENAI_BASE_URL").cloned())
+    .unwrap_or_else(|| {
+        if xai_mode {
+            DEFAULT_XAI_BASE_URL.to_string()
+        } else {
+            DEFAULT_BASE_URL.to_string()
+        }
+    });
     Settings {
         auth,
         auth_diagnostics,
-        base_url: first_env(["BCODE_OPENAI_BASE_URL", "OPENAI_BASE_URL"])
-            .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
-            .or_else(|| saved.values.get("OPENAI_BASE_URL").cloned())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+        base_url,
         default_model,
         model_ids,
         model_ids_are_explicit: model_ids_env.is_some(),
@@ -1445,7 +1475,54 @@ fn saved_openai_auth_is_chatgpt(saved: &SavedOpenAiAuth) -> bool {
         || saved.values.contains_key("BCODE_OPENAI_CODEX_ACCESS_TOKEN")
 }
 
+fn saved_has_xai_keys(saved: &SavedOpenAiAuth) -> bool {
+    saved.values.contains_key("BCODE_XAI_API_KEY")
+        || saved.values.contains_key("XAI_API_KEY")
+        || saved.values.contains_key("BCODE_XAI_CODEX_ACCESS_TOKEN") // unlikely but for symmetry
+}
+
+fn env_has_xai_keys() -> bool {
+    env_value("BCODE_XAI_API_KEY").is_some() || env_value("XAI_API_KEY").is_some()
+}
+
 fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnostics) {
+    // XAI takes precedence for generic OpenAI-compatible usage (xAI, Grok, etc.)
+    if let Some(api_key) = env_value("BCODE_XAI_API_KEY") {
+        return (
+            AuthSettings::ApiKey(api_key),
+            AuthDiagnostics {
+                source: "environment".to_string(),
+                mode: "api_key (xai)".to_string(),
+                detail: "environment variable BCODE_XAI_API_KEY".to_string(),
+            },
+        );
+    }
+    if let Some(api_key) = env_value("XAI_API_KEY") {
+        return (
+            AuthSettings::ApiKey(api_key),
+            AuthDiagnostics {
+                source: "environment".to_string(),
+                mode: "api_key (xai)".to_string(),
+                detail: "environment variable XAI_API_KEY".to_string(),
+            },
+        );
+    }
+    if let Some(api_key) = saved.values.get("BCODE_XAI_API_KEY").cloned() {
+        return (
+            AuthSettings::ApiKey(api_key),
+            saved_auth_diagnostics(
+                saved,
+                "api_key (xai)",
+                "saved sshenv API key BCODE_XAI_API_KEY",
+            ),
+        );
+    }
+    if let Some(api_key) = saved.values.get("XAI_API_KEY").cloned() {
+        return (
+            AuthSettings::ApiKey(api_key),
+            saved_auth_diagnostics(saved, "api_key (xai)", "saved sshenv API key XAI_API_KEY"),
+        );
+    }
     if let Some(api_key) = env_value("BCODE_OPENAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
@@ -1502,7 +1579,10 @@ fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnosti
                 })
                 .to_string(),
             detail: saved.profile.as_ref().map_or_else(
-                || "no saved OpenAI auth profile and no API key environment variable".to_string(),
+                || {
+                    "no saved OpenAI-compatible auth profile and no API key environment variable"
+                        .to_string()
+                },
                 |profile| format!("saved profile '{profile}' did not contain usable credentials"),
             ),
         },

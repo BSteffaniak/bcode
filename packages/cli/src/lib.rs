@@ -270,6 +270,23 @@ enum LoginCommand {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Login for xAI (Grok) using the OpenAI-compatible provider.
+    Xai {
+        /// Store an xAI API key.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Store an xAI-compatible API base URL (defaults to https://api.x.ai/v1).
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value = "bcode-xai")]
+        profile: String,
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        #[arg(long)]
+        recipient_key: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -423,6 +440,23 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
             })
             .await?;
         }
+        LoginCommand::Xai {
+            api_key,
+            base_url,
+            profile,
+            vault,
+            recipient_key,
+            model,
+        } => {
+            login_xai(XaiLoginOptions {
+                api_key,
+                base_url,
+                profile,
+                vault,
+                recipient_key,
+                model,
+            })?;
+        }
     }
     Ok(())
 }
@@ -433,6 +467,15 @@ struct OpenAiLoginOptions {
     chatgpt: bool,
     browser: bool,
     headless: bool,
+    profile: String,
+    vault: Option<PathBuf>,
+    recipient_key: Option<String>,
+    model: Option<String>,
+}
+
+struct XaiLoginOptions {
+    api_key: Option<String>,
+    base_url: Option<String>,
     profile: String,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
@@ -481,6 +524,65 @@ fn open_auth_store(
     Ok(store)
 }
 
+/// Generic helper for storing API-key auth for any OpenAI-compatible provider (OpenAI, xAI, etc.).
+/// `prefix` is "OPENAI" or "XAI" (used for env-style secret keys stored in the vault).
+fn login_compatible_api_key(
+    store: &sshenv_vault::SshenvStore,
+    profile: String,
+    vault_path: PathBuf,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    prefix: &str,
+) -> Result<(), CliError> {
+    let prompt = format!("{} API key: ", prefix);
+    let api_key = match api_key {
+        Some(api_key) => api_key,
+        None => rpassword::prompt_password(&prompt)?,
+    };
+    let auth_mode_key = format!("BCODE_{}_AUTH_MODE", prefix);
+    let api_key_key = format!("BCODE_{}_API_KEY", prefix);
+    let base_url_key = format!("BCODE_{}_BASE_URL", prefix);
+
+    store
+        .set_secret(
+            &profile,
+            &auth_mode_key,
+            Zeroizing::new("api_key".to_string()),
+        )
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
+        })?;
+    store
+        .set_secret(&profile, &api_key_key, Zeroizing::new(api_key))
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!(
+                "failed to store {} API key: {error}",
+                prefix
+            ))
+        })?;
+    if let Some(base_url) = base_url {
+        store
+            .set_secret(&profile, &base_url_key, Zeroizing::new(base_url))
+            .map_err(|error| {
+                CliError::BundledPluginInstallFailed(format!(
+                    "failed to store {} base URL: {error}",
+                    prefix
+                ))
+            })?;
+    }
+
+    // Always route through the shared OpenAI-compatible provider plugin
+    let config_path =
+        bcode_config::set_openai_sshenv_auth_mode(profile, vault_path, model, AuthMode::ApiKey)?;
+    println!(
+        "{} API credentials saved; config updated: {}",
+        prefix,
+        config_path.display()
+    );
+    Ok(())
+}
+
 fn login_openai_api_key(
     store: &sshenv_vault::SshenvStore,
     profile: String,
@@ -489,41 +591,25 @@ fn login_openai_api_key(
     base_url: Option<String>,
     model: Option<String>,
 ) -> Result<(), CliError> {
-    let api_key = match api_key {
-        Some(api_key) => api_key,
-        None => rpassword::prompt_password("OpenAI API key: ")?,
-    };
-    store
-        .set_secret(
-            &profile,
-            "BCODE_OPENAI_AUTH_MODE",
-            Zeroizing::new("api_key".to_string()),
-        )
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
-        })?;
-    store
-        .set_secret(&profile, "BCODE_OPENAI_API_KEY", Zeroizing::new(api_key))
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!("failed to store OpenAI API key: {error}"))
-        })?;
-    if let Some(base_url) = base_url {
-        store
-            .set_secret(&profile, "BCODE_OPENAI_BASE_URL", Zeroizing::new(base_url))
-            .map_err(|error| {
-                CliError::BundledPluginInstallFailed(format!(
-                    "failed to store OpenAI base URL: {error}"
-                ))
-            })?;
-    }
+    login_compatible_api_key(
+        store, profile, vault_path, api_key, base_url, model, "OPENAI",
+    )
+}
 
-    let config_path =
-        bcode_config::set_openai_sshenv_auth_mode(profile, vault_path, model, AuthMode::ApiKey)?;
-    println!(
-        "OpenAI API credentials saved; config updated: {}",
-        config_path.display()
-    );
-    Ok(())
+fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
+    let vault_path = options
+        .vault
+        .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let store = open_auth_store(&vault_path, options.recipient_key)?;
+    login_compatible_api_key(
+        &store,
+        options.profile,
+        vault_path,
+        options.api_key,
+        options.base_url,
+        options.model,
+        "XAI",
+    )
 }
 
 async fn login_openai_chatgpt(

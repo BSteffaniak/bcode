@@ -294,7 +294,8 @@ pub fn add_permission_rule(kind: &str, value: String) -> Result<PathBuf, ConfigE
     update_writable_config(|config| insert_permission_rule(&mut config.permissions, kind, value))
 }
 
-/// Configure `OpenAI` authentication backed by an `sshenv` vault.
+/// Configure OpenAI-compatible provider (OpenAI, xAI/Grok, etc.) authentication
+/// backed by an `sshenv` vault.
 ///
 /// # Errors
 ///
@@ -307,7 +308,7 @@ pub fn set_openai_sshenv_auth(
     set_openai_sshenv_auth_mode(profile, vault, model_id, AuthMode::ApiKey)
 }
 
-/// Configure `OpenAI` authentication mode backed by an `sshenv` vault.
+/// Configure OpenAI-compatible provider authentication mode backed by an `sshenv` vault.
 ///
 /// # Errors
 ///
@@ -324,6 +325,7 @@ pub fn set_openai_sshenv_auth_mode(
             .enabled
             .insert("bcode.openai-compatible".to_string());
         config.model.provider_plugin_id = Some("bcode.openai-compatible".to_string());
+        // xAI and other OpenAI-compatibles reuse the same plugin ID + service
         if let Some(model_id) = model_id {
             config.model.model_id = Some(model_id);
         }
