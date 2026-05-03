@@ -1274,7 +1274,7 @@ fn validate_config() -> ValidateConfigResponse {
 
 fn settings() -> Settings {
     let saved = saved_openai_auth();
-    let chatgpt_mode = matches!(saved.mode, Some(AuthMode::ChatGpt));
+    let chatgpt_mode = saved_openai_auth_is_chatgpt(&saved);
     let default_model = first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"]).unwrap_or_else(|| {
         if chatgpt_mode {
             DEFAULT_CODEX_MODEL_ID.to_string()
@@ -1343,6 +1343,15 @@ fn saved_openai_auth() -> SavedOpenAiAuth {
     }
 }
 
+fn saved_openai_auth_is_chatgpt(saved: &SavedOpenAiAuth) -> bool {
+    matches!(saved.mode, Some(AuthMode::ChatGpt))
+        || saved
+            .values
+            .get("BCODE_OPENAI_AUTH_MODE")
+            .is_some_and(|mode| mode == "chatgpt")
+        || saved.values.contains_key("BCODE_OPENAI_CODEX_ACCESS_TOKEN")
+}
+
 fn openai_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
     if let Some(api_key) = first_env(["BCODE_OPENAI_API_KEY", "OPENAI_API_KEY"])
         .or_else(|| saved.values.get("BCODE_OPENAI_API_KEY").cloned())
@@ -1354,7 +1363,7 @@ fn openai_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
         .values
         .get("BCODE_OPENAI_AUTH_MODE")
         .map(String::as_str);
-    if matches!(saved.mode, Some(AuthMode::ChatGpt)) || saved_mode == Some("chatgpt") {
+    if saved_openai_auth_is_chatgpt(saved) || saved_mode == Some("chatgpt") {
         return saved_chatgpt_auth_settings(saved);
     }
     AuthSettings::Missing

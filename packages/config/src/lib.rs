@@ -367,6 +367,12 @@ fn write_auth_toml(output: &mut String, auth: &AuthConfig) {
     output.push_str("[auth.openai]\n");
     writeln!(output, "backend = {}", toml_string(&openai.backend))
         .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "mode = {}",
+        toml_string(auth_mode_name(&openai.mode))
+    )
+    .expect("writing to string should not fail");
     writeln!(output, "profile = {}", toml_string(&openai.profile))
         .expect("writing to string should not fail");
     if let Some(vault) = &openai.vault {
@@ -378,6 +384,13 @@ fn write_auth_toml(output: &mut String, auth: &AuthConfig) {
         .expect("writing to string should not fail");
     }
     output.push('\n');
+}
+
+const fn auth_mode_name(mode: &AuthMode) -> &'static str {
+    match mode {
+        AuthMode::ApiKey => "api_key",
+        AuthMode::ChatGpt => "chatgpt",
+    }
 }
 
 fn write_plugins_toml(output: &mut String, plugins: &PluginConfig) {

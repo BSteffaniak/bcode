@@ -1506,7 +1506,7 @@ fn executable_dir() -> Result<PathBuf, CliError> {
 }
 
 fn build_missing_bundled_plugin_libraries(executable_dir: &Path) -> Result<(), CliError> {
-    if bundled_plugin_libraries_exist(executable_dir) {
+    if bundled_plugin_libraries_current(executable_dir) {
         return Ok(());
     }
     let Some(workspace_root) = workspace_root_from_executable_dir(executable_dir) else {
@@ -1543,15 +1543,100 @@ fn bundled_plugin_libraries_exist(executable_dir: &Path) -> bool {
     })
 }
 
+fn bundled_plugin_libraries_current(executable_dir: &Path) -> bool {
+    let Some(workspace_root) = workspace_root_from_executable_dir(executable_dir) else {
+        return bundled_plugin_libraries_exist(executable_dir);
+    };
+    BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
+        let library = executable_dir.join(dynamic_library_name(spec.library_stem));
+        library.exists() && library_is_newer_than_package_sources(&library, &workspace_root, spec)
+    })
+}
+
 fn bundled_plugins_installed(executable_dir: &Path) -> bool {
     BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
         let library_name = dynamic_library_name(spec.library_stem);
+        let source_library = executable_dir.join(&library_name);
         let plugin_dir = executable_dir.join("plugins").join(spec.id);
+        let installed_library = plugin_dir.join(library_name);
         plugin_dir
             .join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE)
             .exists()
-            && plugin_dir.join(library_name).exists()
+            && installed_library.exists()
+            && installed_library_is_current(&source_library, &installed_library)
+            && workspace_root_from_executable_dir(executable_dir).is_none_or(|workspace_root| {
+                library_is_newer_than_package_sources(&installed_library, &workspace_root, spec)
+            })
     })
+}
+
+fn library_is_newer_than_package_sources(
+    library: &Path,
+    workspace_root: &Path,
+    spec: &BundledPluginSpec,
+) -> bool {
+    let Ok(library_modified) = std::fs::metadata(library).and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    let package_dir = workspace_root.join(package_relative_dir(spec));
+    newest_source_modified(&package_dir)
+        .is_none_or(|source_modified| library_modified >= source_modified)
+}
+
+fn package_relative_dir(spec: &BundledPluginSpec) -> &'static str {
+    match spec.id {
+        "bcode.filesystem" => "plugins/filesystem-plugin",
+        "bcode.shell" => "plugins/shell-plugin",
+        "bcode.openai-compatible" => "plugins/openai-compatible-provider-plugin",
+        _ => ".",
+    }
+}
+
+fn newest_source_modified(path: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    newest_source_modified_inner(path, &mut newest);
+    newest
+}
+
+fn newest_source_modified_inner(path: &Path, newest: &mut Option<std::time::SystemTime>) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_file() {
+        if path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| matches!(extension, "rs" | "toml"))
+            && let Ok(modified) = metadata.modified()
+            && newest.is_none_or(|current| modified > current)
+        {
+            *newest = Some(modified);
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        newest_source_modified_inner(&entry.path(), newest);
+    }
+}
+
+fn installed_library_is_current(source_library: &Path, installed_library: &Path) -> bool {
+    let Ok(source_metadata) = std::fs::metadata(source_library) else {
+        return false;
+    };
+    let Ok(installed_metadata) = std::fs::metadata(installed_library) else {
+        return false;
+    };
+    if source_metadata.len() != installed_metadata.len() {
+        return false;
+    }
+    match (source_metadata.modified(), installed_metadata.modified()) {
+        (Ok(source_modified), Ok(installed_modified)) => installed_modified >= source_modified,
+        _ => true,
+    }
 }
 
 fn workspace_root_from_executable_dir(executable_dir: &Path) -> Option<PathBuf> {
