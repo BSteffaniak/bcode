@@ -373,6 +373,7 @@ name = "bcode_tui"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
+ "bcode_config",
  "bcode_ipc",
  "bcode_session_models",
  "crossterm",

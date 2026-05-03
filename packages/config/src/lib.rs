@@ -6,7 +6,7 @@
 
 use bcode_plugin::PluginSelection;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,8 @@ pub struct BcodeConfig {
     pub permissions: PermissionConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 impl BcodeConfig {
@@ -34,6 +36,21 @@ impl BcodeConfig {
         self.model.merge(next.model);
         self.permissions.merge(next.permissions);
         self.auth.merge(next.auth);
+        self.tui.merge(next.tui);
+    }
+}
+
+/// Terminal UI configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiConfig {
+    /// Keybindings keyed by action ID. Empty arrays unbind an action.
+    #[serde(default)]
+    pub keybindings: BTreeMap<String, Vec<String>>,
+}
+
+impl TuiConfig {
+    fn merge(&mut self, next: Self) {
+        self.keybindings.extend(next.keybindings);
     }
 }
 
@@ -331,7 +348,25 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     }
     write_permissions_toml(&mut output, &config.permissions);
     write_auth_toml(&mut output, &config.auth);
+    write_tui_toml(&mut output, &config.tui);
     output
+}
+
+fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
+    if tui.keybindings.is_empty() {
+        return;
+    }
+    output.push_str("[tui.keybindings]\n");
+    for (action, keys) in &tui.keybindings {
+        let keys = keys
+            .iter()
+            .map(|key| toml_string(key))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(output, "{} = [{keys}]", toml_string(action))
+            .expect("writing to string should not fail");
+    }
+    output.push('\n');
 }
 
 fn write_permissions_toml(output: &mut String, permissions: &PermissionConfig) {
@@ -527,6 +562,10 @@ allow_shell_command_prefixes = ["git status"]
 deny_shell_command_prefixes = ["rm -rf"]
 allow_path_prefixes = ["/tmp/project"]
 deny_path_prefixes = ["/tmp/project/target"]
+
+[tui.keybindings]
+"app.exit" = ["ctrl+d"]
+"app.permission.approve" = []
 "#,
         )
         .expect("project config should be written");
@@ -561,6 +600,14 @@ deny_path_prefixes = ["/tmp/project/target"]
                 .permissions
                 .deny_path_prefixes
                 .contains("/tmp/project/target")
+        );
+        assert_eq!(
+            config.tui.keybindings.get("app.exit"),
+            Some(&vec!["ctrl+d".to_string()])
+        );
+        assert_eq!(
+            config.tui.keybindings.get("app.permission.approve"),
+            Some(&Vec::new())
         );
 
         std::fs::remove_dir_all(root).expect("temp root should clean up");
