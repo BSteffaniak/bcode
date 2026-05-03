@@ -49,6 +49,7 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     run_chat(client, session_id).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiError> {
     let mut connection = client.connect("bcode-tui").await?;
     let history = connection.attach_session(session_id).await?;
@@ -114,6 +115,12 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                     persist_first_permission_rule(&client, &mut app, false).await;
                 }
                 KeyCode::Esc => break,
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.start_search();
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.find_next();
+                }
                 KeyCode::PageUp => app.scroll_page_up(),
                 KeyCode::PageDown => app.scroll_page_down(),
                 KeyCode::Home => app.scroll_top(),
@@ -125,6 +132,10 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                     app.scroll_line_down();
                 }
                 KeyCode::Enter => {
+                    if app.search_mode {
+                        app.finish_search();
+                        continue;
+                    }
                     let Some(message) = app.take_input() else {
                         continue;
                     };
@@ -134,9 +145,15 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                 }
                 KeyCode::Backspace => {
                     app.input.pop();
+                    if app.search_mode {
+                        app.update_search();
+                    }
                 }
                 KeyCode::Char(ch) => {
                     app.input.push(ch);
+                    if app.search_mode {
+                        app.update_search();
+                    }
                 }
                 _ => {}
             }
@@ -302,6 +319,8 @@ struct ChatApp {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     scroll_from_bottom: usize,
+    search_mode: bool,
+    search_query: String,
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +391,8 @@ impl ChatApp {
             selected_provider_plugin_id: None,
             selected_model_id: None,
             scroll_from_bottom: 0,
+            search_mode: false,
+            search_query: String::new(),
         };
         for event in history {
             app.absorb_session_event(event);
@@ -383,6 +404,85 @@ impl ChatApp {
         match event {
             Event::Session(event) => self.absorb_session_event(&event),
         }
+    }
+
+    fn start_search(&mut self) {
+        self.search_mode = true;
+        self.search_query.clear();
+        self.input.clear();
+        self.status = "search: type query, enter accepts, ctrl-g next".to_string();
+    }
+
+    fn finish_search(&mut self) {
+        self.search_mode = false;
+        self.search_query = self.input.clone();
+        self.input.clear();
+        self.find_next();
+    }
+
+    fn update_search(&mut self) {
+        self.search_query = self.input.clone();
+        if self.search_query.is_empty() {
+            self.status = "search: type query, enter accepts, ctrl-g next".to_string();
+        } else {
+            self.find_previous_match();
+        }
+    }
+
+    fn find_next(&mut self) {
+        if self.search_query.is_empty() {
+            self.status = "no search query".to_string();
+            return;
+        }
+        let Some(index) = self.next_match_index() else {
+            self.status = format!("no match: {}", self.search_query);
+            return;
+        };
+        self.scroll_to_line(index);
+        self.status = format!("match: {}", self.search_query);
+    }
+
+    fn find_previous_match(&mut self) {
+        let Some(index) = self.previous_match_index() else {
+            self.status = format!("no match: {}", self.search_query);
+            return;
+        };
+        self.scroll_to_line(index);
+        self.status = format!("match: {}", self.search_query);
+    }
+
+    fn next_match_index(&self) -> Option<usize> {
+        let current = self.top_visible_line_index();
+        self.lines
+            .iter()
+            .enumerate()
+            .skip(current.saturating_add(1))
+            .chain(
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .take(current.saturating_add(1)),
+            )
+            .find_map(|(index, line)| line.contains(&self.search_query).then_some(index))
+    }
+
+    fn previous_match_index(&self) -> Option<usize> {
+        self.lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, line)| line.contains(&self.search_query).then_some(index))
+    }
+
+    fn top_visible_line_index(&self) -> usize {
+        self.lines
+            .len()
+            .saturating_sub(self.scroll_from_bottom)
+            .saturating_sub(1)
+    }
+
+    fn scroll_to_line(&mut self, index: usize) {
+        self.scroll_from_bottom = self.lines.len().saturating_sub(index.saturating_add(1));
     }
 
     fn scroll_line_up(&mut self) {
@@ -584,12 +684,16 @@ impl ratatui::widgets::Widget for &ChatApp {
             3
         });
 
+        let input_title = if self.search_mode { "Search" } else { "Input" };
         let input = Paragraph::new(self.input.as_str())
-            .block(Block::new().title("Input").borders(Borders::ALL))
+            .block(Block::new().title(input_title).borders(Borders::ALL))
             .wrap(Wrap { trim: false });
         input.render(chunks[input_index], buf);
 
-        let status = format!("{} | pgup/pgdn scroll, home/end jump", self.status);
+        let status = format!(
+            "{} | ctrl-f search, ctrl-g next, pgup/pgdn scroll, home/end jump",
+            self.status
+        );
         Paragraph::new(status).render(chunks[input_index + 1], buf);
     }
 }
