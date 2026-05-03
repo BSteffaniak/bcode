@@ -110,6 +110,7 @@ pub struct ValidateConfigResponse {
 pub struct ModelTurnRequest {
     pub session_id: SessionId,
     pub turn_id: String,
+    /// Selected model ID. Empty means the provider should use its configured default.
     pub model_id: String,
     #[serde(default)]
     pub system_prompt: Option<String>,

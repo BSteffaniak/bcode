@@ -611,7 +611,7 @@ async fn handle_set_session_model(
         Ok(event) => {
             let selection = SessionModelSelection {
                 provider_plugin_id: provider_to_selection(&provider),
-                model_id: Some(model_id),
+                model_id: model_to_selection(&model_id),
             };
             state
                 .session_model_selections
@@ -1112,13 +1112,17 @@ async fn build_model_turn_request(
     Ok(ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
-        model_id: selected_model_id.map_or_else(|| "fake-echo".to_string(), ToString::to_string),
+        model_id: model_id_for_provider_request(selected_model_id),
         system_prompt: Some(build_coding_system_prompt()),
         messages,
         tools: collect_model_tools(state).await,
         parameters: ModelParameters::default(),
         metadata: std::collections::BTreeMap::new(),
     })
+}
+
+fn model_id_for_provider_request(selected_model_id: Option<&str>) -> String {
+    selected_model_id.map_or_else(String::new, ToString::to_string)
 }
 
 const DEFAULT_CODING_SYSTEM_PROMPT: &str = r"You are Bcode, a terminal-native coding agent running on the user's machine.
@@ -1804,6 +1808,19 @@ fn default_session_store_dir() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
+
+    #[test]
+    fn unspecified_model_selection_lets_provider_choose_default() {
+        assert_eq!(model_id_for_provider_request(None), "");
+    }
+
+    #[test]
+    fn explicit_model_selection_is_sent_to_provider() {
+        assert_eq!(
+            model_id_for_provider_request(Some("fake-echo")),
+            "fake-echo"
+        );
+    }
 
     #[test]
     fn tool_result_for_model_preserves_small_output() {
