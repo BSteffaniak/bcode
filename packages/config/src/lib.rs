@@ -56,9 +56,23 @@ impl AuthConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProviderConfig {
     pub backend: String,
+    #[serde(default)]
+    pub mode: AuthMode,
     pub profile: String,
     #[serde(default)]
     pub vault: Option<PathBuf>,
+}
+
+/// Authentication mode for a provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// `OpenAI` platform API key authentication.
+    #[default]
+    ApiKey,
+    /// `ChatGPT` subscription authentication for `Codex` models.
+    #[serde(rename = "chatgpt", alias = "chat_gpt")]
+    ChatGpt,
 }
 
 /// Model selection configuration.
@@ -178,6 +192,20 @@ pub fn set_openai_sshenv_auth(
     vault: PathBuf,
     model_id: Option<String>,
 ) -> Result<PathBuf, ConfigError> {
+    set_openai_sshenv_auth_mode(profile, vault, model_id, AuthMode::ApiKey)
+}
+
+/// Configure `OpenAI` authentication mode backed by an `sshenv` vault.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, updated, or written.
+pub fn set_openai_sshenv_auth_mode(
+    profile: String,
+    vault: PathBuf,
+    model_id: Option<String>,
+    mode: AuthMode,
+) -> Result<PathBuf, ConfigError> {
     update_writable_config(|config| {
         config
             .plugins
@@ -189,6 +217,7 @@ pub fn set_openai_sshenv_auth(
         }
         config.auth.openai = Some(AuthProviderConfig {
             backend: "sshenv".to_string(),
+            mode,
             profile,
             vault: Some(vault),
         });

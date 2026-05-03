@@ -189,6 +189,7 @@ dependencies = [
 name = "bcode_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "base64 0.22.1",
  "bcode_client",
  "bcode_config",
  "bcode_ipc",
@@ -198,8 +199,12 @@ dependencies = [
  "bcode_session_models",
  "bcode_tui",
  "clap",
+ "rand 0.9.4",
+ "reqwest",
  "rpassword",
+ "serde",
  "serde_json",
+ "sha2",
  "sshenv_vault",
  "thiserror 2.0.18",
  "tokio",
@@ -277,6 +282,7 @@ dependencies = [
 name = "bcode_openai_compatible_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "base64 0.22.1",
  "bcode_config",
  "bcode_model",
  "bcode_plugin_sdk",
@@ -285,6 +291,7 @@ dependencies = [
  "serde_json",
  "sshenv_vault",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

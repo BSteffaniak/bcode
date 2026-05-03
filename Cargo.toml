@@ -49,9 +49,14 @@ bmux_codec = { default-features = false, path = "../bmux/packages/codec" }
 bmux_ipc   = { default-features = false, path = "../bmux/packages/ipc" }
 
 # External dependencies
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 clap = { version = "4.5.40", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 libloading = { version = "0.9.0", default-features = false }
+rand = { version = "0.9.4", default-features = false, features = [
+    "os_rng",
+    "std",
+] }
 ratatui = { version = "0.30.0", default-features = false }
 reqwest = { version = "0.12.24", default-features = false, features = [
     "json",
@@ -63,6 +68,7 @@ serde = { version = "1.0.219", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
 ] }
+sha2 = { version = "0.10.9", default-features = false }
 sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", rev = "87973bb7681c68cb9c787931b0ab402468adb517", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }

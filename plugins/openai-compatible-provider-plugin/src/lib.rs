@@ -4,6 +4,9 @@
 
 //! OpenAI-compatible model provider plugin for Bcode.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bcode_config::AuthMode;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
@@ -20,10 +23,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
+use zeroize::Zeroizing;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL_ID: &str = "gpt-4.1-mini";
+const DEFAULT_CODEX_MODEL_ID: &str = "gpt-5.5";
 const PROVIDER_ID: &str = "bcode.openai-compatible";
+const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73fw0CkXAXp7hrann";
+const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 /// OpenAI-compatible model provider plugin.
 #[derive(Default)]
@@ -137,11 +144,31 @@ impl OpenAiCompatibleProviderPlugin {
 
 #[derive(Debug, Clone)]
 struct Settings {
-    api_key: Option<String>,
+    auth: AuthSettings,
     base_url: String,
     default_model: String,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
+}
+
+#[derive(Debug, Clone)]
+enum AuthSettings {
+    Missing,
+    ApiKey(String),
+    ChatGpt {
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_at: Option<u64>,
+        account_id: Option<String>,
+        profile: Option<String>,
+        vault: Option<std::path::PathBuf>,
+    },
+}
+
+impl AuthSettings {
+    const fn is_configured(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +186,57 @@ struct ChatCompletionRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesRequest {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    input: Vec<ResponsesInputItem>,
+    stream: bool,
+    store: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ResponsesTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesInputItem {
+    Message {
+        role: &'static str,
+        content: Vec<ResponsesContent>,
+    },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesContent {
+    InputText { text: String },
+    OutputText { text: String },
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesTool {
+    r#type: &'static str,
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -330,14 +408,15 @@ async fn stream_chat_completion_inner(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
-    let settings = settings();
-    let Some(api_key) = settings.api_key.clone() else {
+    let mut settings = settings();
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    if matches!(settings.auth, AuthSettings::Missing) {
         return Err(provider_error(
-            "missing_api_key",
+            "missing_openai_auth",
             ProviderErrorCategory::Auth,
-            "set BCODE_OPENAI_API_KEY or OPENAI_API_KEY",
+            "run `bcode login openai` for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY for API-key auth",
         ));
-    };
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -348,14 +427,25 @@ async fn stream_chat_completion_inner(
                 error.to_string(),
             )
         })?;
-    let response = send_chat_completion_request(&client, &settings, api_key, request).await?;
-    read_stream_events(response, turn, request).await
+    match &settings.auth {
+        AuthSettings::ApiKey(api_key) => {
+            let response =
+                send_chat_completion_request(&client, &settings, api_key, request).await?;
+            read_stream_events(response, turn, request).await
+        }
+        AuthSettings::ChatGpt { access_token, .. } => {
+            let response =
+                send_responses_request(&client, &settings, access_token, request).await?;
+            read_responses_stream_events(response, turn, request).await
+        }
+        AuthSettings::Missing => unreachable!("missing auth handled above"),
+    }
 }
 
 async fn send_chat_completion_request(
     client: &Client,
     settings: &Settings,
-    api_key: String,
+    api_key: &str,
     request: &ModelTurnRequest,
 ) -> Result<reqwest::Response, ProviderError> {
     let url = format!(
@@ -401,6 +491,59 @@ async fn send_chat_completion_request(
     Ok(response)
 }
 
+async fn send_responses_request(
+    client: &Client,
+    settings: &Settings,
+    access_token: &str,
+    request: &ModelTurnRequest,
+) -> Result<reqwest::Response, ProviderError> {
+    let url = format!("{}/responses", settings.base_url.trim_end_matches('/'));
+    let request_body = ResponsesRequest {
+        model: if request.model_id.is_empty() {
+            settings.default_model.clone()
+        } else {
+            request.model_id.clone()
+        },
+        instructions: request.system_prompt.clone(),
+        input: model_messages_to_responses_input(request),
+        stream: true,
+        store: false,
+        tools: model_tools_to_responses_tools(request),
+        temperature: request.parameters.temperature,
+        max_output_tokens: request.parameters.max_output_tokens,
+        top_p: request.parameters.top_p,
+    };
+    let mut builder = client
+        .post(url)
+        .bearer_auth(access_token)
+        .header("OpenAI-Beta", "responses=v1")
+        .json(&request_body);
+    if let AuthSettings::ChatGpt {
+        account_id: Some(account_id),
+        ..
+    } = &settings.auth
+    {
+        builder = builder.header("chatgpt-account-id", account_id);
+    }
+    let response = builder.send().await.map_err(|error| {
+        provider_error(
+            "request_failed",
+            if error.is_timeout() {
+                ProviderErrorCategory::Timeout
+            } else {
+                ProviderErrorCategory::Network
+            },
+            error.to_string(),
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(error_from_status(status.as_u16(), &body));
+    }
+    Ok(response)
+}
+
 async fn read_stream_events(
     mut response: reqwest::Response,
     turn: &TurnState,
@@ -431,6 +574,208 @@ async fn read_stream_events(
             }
             () = turn.cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
         }
+    }
+}
+
+async fn read_responses_stream_events(
+    mut response: reqwest::Response,
+    turn: &TurnState,
+    request: &ModelTurnRequest,
+) -> Result<StreamOutcome, ProviderError> {
+    let mut buffer = String::new();
+    let mut tool_calls = BTreeMap::new();
+    let mut saw_tool_call = false;
+    loop {
+        if turn.is_cancelled() {
+            return Ok(StreamOutcome::Cancelled);
+        }
+        tokio::select! {
+            chunk = response.chunk() => {
+                let Some(chunk) = chunk.map_err(|error| {
+                    provider_error(
+                        "stream_read_failed",
+                        ProviderErrorCategory::Network,
+                        error.to_string(),
+                    )
+                })? else {
+                    return Ok(if saw_tool_call { StreamOutcome::ToolCall } else { StreamOutcome::Finished });
+                };
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                let outcome = process_responses_stream_buffer(
+                    &mut buffer,
+                    turn,
+                    request,
+                    &mut tool_calls,
+                    &mut saw_tool_call,
+                )?;
+                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+                    return Ok(outcome);
+                }
+            }
+            () = turn.cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+        }
+    }
+}
+
+fn process_responses_stream_buffer(
+    buffer: &mut String,
+    turn: &TurnState,
+    request: &ModelTurnRequest,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    saw_tool_call: &mut bool,
+) -> Result<StreamOutcome, ProviderError> {
+    while let Some(position) = buffer.find('\n') {
+        let mut line = buffer[..position].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        buffer.drain(..=position);
+        let outcome =
+            process_responses_stream_line(line.trim(), turn, request, tool_calls, saw_tool_call)?;
+        if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+            return Ok(outcome);
+        }
+    }
+    Ok(StreamOutcome::Cancelled)
+}
+
+fn process_responses_stream_line(
+    line: &str,
+    turn: &TurnState,
+    request: &ModelTurnRequest,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    saw_tool_call: &mut bool,
+) -> Result<StreamOutcome, ProviderError> {
+    let Some(data) = line.strip_prefix("data: ") else {
+        return Ok(StreamOutcome::Cancelled);
+    };
+    if data == "[DONE]" {
+        return Ok(if *saw_tool_call {
+            StreamOutcome::ToolCall
+        } else {
+            StreamOutcome::Finished
+        });
+    }
+    let event = serde_json::from_str::<serde_json::Value>(data).map_err(|error| {
+        provider_error(
+            "stream_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    let event_type = event
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "response.output_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
+                && !delta.is_empty()
+            {
+                turn.push(ProviderTurnEvent::TextDelta {
+                    text: delta.to_string(),
+                });
+            }
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
+                && !delta.is_empty()
+            {
+                turn.push(ProviderTurnEvent::ReasoningDelta {
+                    text: delta.to_string(),
+                });
+            }
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            process_responses_output_item(&event, turn, request, tool_calls, saw_tool_call);
+        }
+        "response.function_call_arguments.delta" => {
+            process_responses_function_arguments_delta(&event, tool_calls);
+        }
+        "response.completed" => {
+            return Ok(if *saw_tool_call {
+                finish_tool_calls(turn, tool_calls, &openai_tool_name_map(request))?;
+                StreamOutcome::ToolCall
+            } else {
+                StreamOutcome::Finished
+            });
+        }
+        "response.failed" | "error" => {
+            let message = event
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
+                .unwrap_or("OpenAI Responses stream failed");
+            return Err(provider_error(
+                "responses_stream_failed",
+                ProviderErrorCategory::ProviderInternal,
+                message,
+            ));
+        }
+        _ => {}
+    }
+    Ok(StreamOutcome::Cancelled)
+}
+
+fn process_responses_output_item(
+    event: &serde_json::Value,
+    turn: &TurnState,
+    request: &ModelTurnRequest,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    saw_tool_call: &mut bool,
+) {
+    let Some(item) = event.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+        return;
+    }
+    *saw_tool_call = true;
+    let output_index = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or_else(|| u32::try_from(tool_calls.len()).unwrap_or(u32::MAX));
+    let name_map = openai_tool_name_map(request);
+    let entry = tool_calls.entry(output_index).or_default();
+    if let Some(call_id) = item.get("call_id").and_then(serde_json::Value::as_str) {
+        entry.id = Some(call_id.to_string());
+    }
+    if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+        entry.name = Some(name.to_string());
+    }
+    if let Some(arguments) = item.get("arguments").and_then(serde_json::Value::as_str)
+        && !arguments.is_empty()
+    {
+        entry.arguments = arguments.to_string();
+    }
+    if !entry.started
+        && let (Some(id), Some(name)) = (&entry.id, &entry.name)
+    {
+        turn.push(ProviderTurnEvent::ToolCallStarted {
+            call_id: id.clone(),
+            name: original_tool_name(name, &name_map),
+        });
+        entry.started = true;
+    }
+}
+
+fn process_responses_function_arguments_delta(
+    event: &serde_json::Value,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+) {
+    let output_index = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(0);
+    if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
+        tool_calls
+            .entry(output_index)
+            .or_default()
+            .arguments
+            .push_str(delta);
     }
 }
 
@@ -565,6 +910,70 @@ fn finish_tool_calls(
     Ok(())
 }
 
+fn model_messages_to_responses_input(request: &ModelTurnRequest) -> Vec<ResponsesInputItem> {
+    request
+        .messages
+        .iter()
+        .flat_map(model_message_to_responses_input)
+        .collect()
+}
+
+fn model_message_to_responses_input(message: &ModelMessage) -> Vec<ResponsesInputItem> {
+    match message.role {
+        MessageRole::System => Vec::new(),
+        MessageRole::User => responses_text_message("user", message, true),
+        MessageRole::Assistant => responses_assistant_items(message),
+        MessageRole::Tool => responses_tool_items(message),
+    }
+}
+
+fn responses_text_message(
+    role: &'static str,
+    message: &ModelMessage,
+    input_text: bool,
+) -> Vec<ResponsesInputItem> {
+    let text = joined_text_content(message);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let content = if input_text {
+        ResponsesContent::InputText { text }
+    } else {
+        ResponsesContent::OutputText { text }
+    };
+    vec![ResponsesInputItem::Message {
+        role,
+        content: vec![content],
+    }]
+}
+
+fn responses_assistant_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
+    let mut items = responses_text_message("assistant", message, false);
+    items.extend(message.content.iter().filter_map(|block| match block {
+        ContentBlock::ToolCall { call } => Some(ResponsesInputItem::FunctionCall {
+            call_id: call.id.clone(),
+            name: openai_tool_name(&call.name),
+            arguments: serde_json::to_string(&call.arguments).unwrap_or_default(),
+        }),
+        _ => None,
+    }));
+    items
+}
+
+fn responses_tool_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { result } => Some(ResponsesInputItem::FunctionCallOutput {
+                call_id: result.call_id.clone(),
+                output: result.output.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = &request.system_prompt {
@@ -660,6 +1069,19 @@ fn joined_text_content(message: &ModelMessage) -> String {
         .join("\n")
 }
 
+fn model_tools_to_responses_tools(request: &ModelTurnRequest) -> Vec<ResponsesTool> {
+    request
+        .tools
+        .iter()
+        .map(|tool| ResponsesTool {
+            r#type: "function",
+            name: openai_tool_name(&tool.name),
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+        })
+        .collect()
+}
+
 fn model_tools_to_chat_tools(request: &ModelTurnRequest) -> Vec<ChatTool> {
     request
         .tools
@@ -748,7 +1170,9 @@ fn model_infos_from_ids(model_ids: &[String], default_model: &str) -> Vec<ModelI
 }
 
 fn discover_models(settings: &Settings) -> Option<Vec<ModelInfo>> {
-    let api_key = settings.api_key.clone()?;
+    let AuthSettings::ApiKey(api_key) = settings.auth.clone() else {
+        return None;
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -830,37 +1254,43 @@ fn model_ids_with_default(models: Vec<ModelResponseItem>, default_model: &str) -
 
 fn validate_config() -> ValidateConfigResponse {
     let settings = settings();
-    if settings.api_key.is_some() {
+    if settings.auth.is_configured() {
         ValidateConfigResponse {
             valid: true,
-            message: Some("OpenAI-compatible provider API key is configured".to_string()),
+            message: Some("OpenAI provider authentication is configured".to_string()),
         }
     } else {
         ValidateConfigResponse {
             valid: false,
-            message: Some("set BCODE_OPENAI_API_KEY or OPENAI_API_KEY".to_string()),
+            message: Some(
+                "run `bcode login openai` or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY".to_string(),
+            ),
         }
     }
 }
 
 fn settings() -> Settings {
-    let auth = saved_openai_auth();
-    let default_model = first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"])
-        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+    let saved = saved_openai_auth();
+    let chatgpt_mode = matches!(saved.mode, Some(AuthMode::ChatGpt));
+    let default_model = first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"]).unwrap_or_else(|| {
+        if chatgpt_mode {
+            DEFAULT_CODEX_MODEL_ID.to_string()
+        } else {
+            DEFAULT_MODEL_ID.to_string()
+        }
+    });
     let model_ids_env = first_env(["BCODE_OPENAI_MODELS", "OPENAI_MODELS"]);
     let mut model_ids = model_ids_env
         .as_deref()
-        .map_or_else(Vec::new, parse_model_list);
+        .map_or_else(|| default_model_ids(chatgpt_mode), parse_model_list);
     if !model_ids.contains(&default_model) {
         model_ids.insert(0, default_model.clone());
     }
     Settings {
-        api_key: first_env(["BCODE_OPENAI_API_KEY", "OPENAI_API_KEY"])
-            .or_else(|| auth.get("BCODE_OPENAI_API_KEY").cloned())
-            .or_else(|| auth.get("OPENAI_API_KEY").cloned()),
+        auth: openai_auth_settings(&saved),
         base_url: first_env(["BCODE_OPENAI_BASE_URL", "OPENAI_BASE_URL"])
-            .or_else(|| auth.get("BCODE_OPENAI_BASE_URL").cloned())
-            .or_else(|| auth.get("OPENAI_BASE_URL").cloned())
+            .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
+            .or_else(|| saved.values.get("OPENAI_BASE_URL").cloned())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
         default_model,
         model_ids,
@@ -868,27 +1298,264 @@ fn settings() -> Settings {
     }
 }
 
-fn saved_openai_auth() -> BTreeMap<String, String> {
+#[derive(Debug, Default)]
+struct SavedOpenAiAuth {
+    values: BTreeMap<String, String>,
+    mode: Option<AuthMode>,
+    profile: Option<String>,
+    vault: Option<std::path::PathBuf>,
+}
+
+fn saved_openai_auth() -> SavedOpenAiAuth {
     let Ok(config) = bcode_config::load_config() else {
-        return BTreeMap::new();
+        return SavedOpenAiAuth::default();
     };
     let Some(auth) = config.auth.openai else {
-        return BTreeMap::new();
+        return SavedOpenAiAuth::default();
     };
     if auth.backend != "sshenv" {
-        return BTreeMap::new();
+        return SavedOpenAiAuth::default();
     }
     let vault = auth
         .vault
+        .clone()
         .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault.clone()));
     let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
-        return BTreeMap::new();
+        return SavedOpenAiAuth {
+            values: BTreeMap::new(),
+            mode: Some(auth.mode),
+            profile: Some(auth.profile),
+            vault: Some(vault),
+        };
     };
-    profile
+    SavedOpenAiAuth {
+        values: profile
+            .into_iter()
+            .map(|(key, value)| (key, value.to_string()))
+            .collect(),
+        mode: Some(auth.mode),
+        profile: Some(auth.profile),
+        vault: Some(vault),
+    }
+}
+
+fn openai_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
+    if let Some(api_key) = first_env(["BCODE_OPENAI_API_KEY", "OPENAI_API_KEY"])
+        .or_else(|| saved.values.get("BCODE_OPENAI_API_KEY").cloned())
+        .or_else(|| saved.values.get("OPENAI_API_KEY").cloned())
+    {
+        return AuthSettings::ApiKey(api_key);
+    }
+    let saved_mode = saved
+        .values
+        .get("BCODE_OPENAI_AUTH_MODE")
+        .map(String::as_str);
+    if matches!(saved.mode, Some(AuthMode::ChatGpt)) || saved_mode == Some("chatgpt") {
+        return saved_chatgpt_auth_settings(saved);
+    }
+    AuthSettings::Missing
+}
+
+fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
+    let Some(access_token) = saved.values.get("BCODE_OPENAI_CODEX_ACCESS_TOKEN").cloned() else {
+        return AuthSettings::Missing;
+    };
+    let account_id = saved
+        .values
+        .get("BCODE_OPENAI_CODEX_ACCOUNT_ID")
+        .cloned()
+        .or_else(|| chatgpt_account_id_from_access_token(&access_token));
+    AuthSettings::ChatGpt {
+        access_token,
+        refresh_token: saved
+            .values
+            .get("BCODE_OPENAI_CODEX_REFRESH_TOKEN")
+            .cloned(),
+        expires_at: saved
+            .values
+            .get("BCODE_OPENAI_CODEX_EXPIRES_AT")
+            .and_then(|value| value.parse().ok()),
+        account_id,
+        profile: saved.profile.clone(),
+        vault: saved.vault.clone(),
+    }
+}
+
+fn default_model_ids(chatgpt_mode: bool) -> Vec<String> {
+    if chatgpt_mode {
+        return [
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5.2-codex",
+            "gpt-5.1-codex-mini",
+        ]
         .into_iter()
-        .map(|(key, value)| (key, value.to_string()))
-        .collect()
+        .map(ToString::to_string)
+        .collect();
+    }
+    Vec::new()
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiOauthTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), ProviderError> {
+    let AuthSettings::ChatGpt {
+        refresh_token: Some(refresh_token),
+        expires_at,
+        profile,
+        vault,
+        ..
+    } = &settings.auth
+    else {
+        return Ok(());
+    };
+    let Some(expires_at) = expires_at else {
+        return Ok(());
+    };
+    if *expires_at > unix_timestamp() + 60 {
+        return Ok(());
+    }
+    let refreshed = refresh_openai_codex_token(refresh_token).await?;
+    let next_refresh_token = refreshed
+        .refresh_token
+        .clone()
+        .unwrap_or_else(|| refresh_token.clone());
+    let next_expires_at =
+        unix_timestamp() + refreshed.expires_in.unwrap_or(3600).saturating_sub(60);
+    let account_id = chatgpt_account_id_from_access_token(&refreshed.access_token);
+    if let (Some(profile), Some(vault)) = (profile, vault) {
+        let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+        store
+            .set_secret(
+                profile,
+                "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
+                Zeroizing::new(refreshed.access_token.clone()),
+            )
+            .map_err(|error| {
+                provider_error(
+                    "token_store_failed",
+                    ProviderErrorCategory::Auth,
+                    error.to_string(),
+                )
+            })?;
+        store
+            .set_secret(
+                profile,
+                "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
+                Zeroizing::new(next_refresh_token.clone()),
+            )
+            .map_err(|error| {
+                provider_error(
+                    "token_store_failed",
+                    ProviderErrorCategory::Auth,
+                    error.to_string(),
+                )
+            })?;
+        store
+            .set_secret(
+                profile,
+                "BCODE_OPENAI_CODEX_EXPIRES_AT",
+                Zeroizing::new(next_expires_at.to_string()),
+            )
+            .map_err(|error| {
+                provider_error(
+                    "token_store_failed",
+                    ProviderErrorCategory::Auth,
+                    error.to_string(),
+                )
+            })?;
+        if let Some(account_id) = &account_id {
+            store
+                .set_secret(
+                    profile,
+                    "BCODE_OPENAI_CODEX_ACCOUNT_ID",
+                    Zeroizing::new(account_id.clone()),
+                )
+                .map_err(|error| {
+                    provider_error(
+                        "token_store_failed",
+                        ProviderErrorCategory::Auth,
+                        error.to_string(),
+                    )
+                })?;
+        }
+    }
+    settings.auth = AuthSettings::ChatGpt {
+        access_token: refreshed.access_token,
+        refresh_token: Some(next_refresh_token),
+        expires_at: Some(next_expires_at),
+        account_id,
+        profile: profile.clone(),
+        vault: vault.clone(),
+    };
+    Ok(())
+}
+
+async fn refresh_openai_codex_token(
+    refresh_token: &str,
+) -> Result<OpenAiOauthTokenResponse, ProviderError> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("client_id", OPENAI_CODEX_CLIENT_ID),
+        ("refresh_token", refresh_token),
+    ];
+    let response = Client::new()
+        .post(OPENAI_CODEX_TOKEN_URL)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|error| {
+            provider_error(
+                "token_refresh_failed",
+                ProviderErrorCategory::Network,
+                error.to_string(),
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        provider_error(
+            "token_refresh_response_failed",
+            ProviderErrorCategory::Network,
+            error.to_string(),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(error_from_status(status.as_u16(), &body));
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        provider_error(
+            "token_refresh_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })
+}
+
+fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn parse_model_list(models: &str) -> Vec<String> {

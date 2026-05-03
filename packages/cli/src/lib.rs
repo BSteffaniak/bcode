@@ -4,14 +4,22 @@
 
 //! Command-line interface for Bcode.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_client::{BcodeClient, ClientError};
+use bcode_config::AuthMode;
 use bcode_ipc::{Event, PermissionSummary, default_endpoint};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
 use clap::{Parser, Subcommand};
+use rand::TryRngCore as _;
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
+use std::io::{Read as _, Write as _};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -220,10 +228,15 @@ enum ModelCommand {
 #[derive(Debug, Subcommand)]
 enum LoginCommand {
     Openai {
+        /// Store an `OpenAI` platform API key instead of using `ChatGPT` subscription OAuth.
         #[arg(long)]
         api_key: Option<String>,
+        /// Store an OpenAI-compatible API base URL for API-key mode.
         #[arg(long)]
         base_url: Option<String>,
+        /// Force `ChatGPT` subscription OAuth mode.
+        #[arg(long)]
+        chatgpt: bool,
         #[arg(long, default_value = "bcode-openai")]
         profile: String,
         #[arg(long)]
@@ -233,6 +246,21 @@ enum LoginCommand {
         #[arg(long)]
         model: Option<String>,
     },
+}
+
+const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73fw0CkXAXp7hrann";
+const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_AUDIENCE: &str = "https://api.openai.com/v1";
+const OPENAI_CODEX_SCOPE: &str = "openid profile email offline_access";
+
+#[derive(Debug, Deserialize)]
+struct OpenAiOauthTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -328,11 +356,20 @@ fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
         LoginCommand::Openai {
             api_key,
             base_url,
+            chatgpt,
             profile,
             vault,
             recipient_key,
             model,
-        } => login_openai(api_key, base_url, profile, vault, recipient_key, model)?,
+        } => login_openai(
+            api_key,
+            base_url,
+            chatgpt,
+            profile,
+            vault,
+            recipient_key,
+            model,
+        )?,
     }
     Ok(())
 }
@@ -340,14 +377,28 @@ fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
 fn login_openai(
     api_key: Option<String>,
     base_url: Option<String>,
+    chatgpt: bool,
     profile: String,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
     model: Option<String>,
 ) -> Result<(), CliError> {
     let vault_path = vault.unwrap_or_else(bcode_config::default_auth_vault_path);
-    let store =
-        sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault_path.clone()));
+    let store = open_auth_store(&vault_path, recipient_key)?;
+    if api_key.is_some() || (base_url.is_some() && !chatgpt) {
+        login_openai_api_key(&store, profile, vault_path, api_key, base_url, model)
+    } else {
+        login_openai_chatgpt(&store, profile, vault_path, model)
+    }
+}
+
+fn open_auth_store(
+    vault_path: &Path,
+    recipient_key: Option<String>,
+) -> Result<sshenv_vault::SshenvStore, CliError> {
+    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(
+        vault_path.to_path_buf(),
+    ));
     if !vault_path.exists() {
         let recipient_key = resolve_recipient_key(recipient_key)?;
         store.init(&recipient_key).map_err(|error| {
@@ -356,11 +407,30 @@ fn login_openai(
             ))
         })?;
     }
+    Ok(store)
+}
 
+fn login_openai_api_key(
+    store: &sshenv_vault::SshenvStore,
+    profile: String,
+    vault_path: PathBuf,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Result<(), CliError> {
     let api_key = match api_key {
         Some(api_key) => api_key,
         None => rpassword::prompt_password("OpenAI API key: ")?,
     };
+    store
+        .set_secret(
+            &profile,
+            "BCODE_OPENAI_AUTH_MODE",
+            Zeroizing::new("api_key".to_string()),
+        )
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
+        })?;
     store
         .set_secret(&profile, "BCODE_OPENAI_API_KEY", Zeroizing::new(api_key))
         .map_err(|error| {
@@ -376,12 +446,294 @@ fn login_openai(
             })?;
     }
 
-    let config_path = bcode_config::set_openai_sshenv_auth(profile, vault_path, model)?;
+    let config_path =
+        bcode_config::set_openai_sshenv_auth_mode(profile, vault_path, model, AuthMode::ApiKey)?;
     println!(
-        "OpenAI credentials saved; config updated: {}",
+        "OpenAI API credentials saved; config updated: {}",
         config_path.display()
     );
     Ok(())
+}
+
+fn login_openai_chatgpt(
+    store: &sshenv_vault::SshenvStore,
+    profile: String,
+    vault_path: PathBuf,
+    model: Option<String>,
+) -> Result<(), CliError> {
+    let oauth = run_openai_codex_oauth()?;
+    let expires_at = unix_timestamp() + oauth.expires_in.unwrap_or(3600).saturating_sub(60);
+    let account_id = chatgpt_account_id_from_access_token(&oauth.access_token);
+    store
+        .set_secret(
+            &profile,
+            "BCODE_OPENAI_AUTH_MODE",
+            Zeroizing::new("chatgpt".to_string()),
+        )
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
+        })?;
+    store
+        .set_secret(
+            &profile,
+            "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
+            Zeroizing::new(oauth.access_token),
+        )
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to store access token: {error}"))
+        })?;
+    if let Some(refresh_token) = oauth.refresh_token {
+        store
+            .set_secret(
+                &profile,
+                "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
+                Zeroizing::new(refresh_token),
+            )
+            .map_err(|error| {
+                CliError::BundledPluginInstallFailed(format!(
+                    "failed to store refresh token: {error}"
+                ))
+            })?;
+    }
+    store
+        .set_secret(
+            &profile,
+            "BCODE_OPENAI_CODEX_EXPIRES_AT",
+            Zeroizing::new(expires_at.to_string()),
+        )
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to store token expiry: {error}"))
+        })?;
+    if let Some(account_id) = account_id {
+        store
+            .set_secret(
+                &profile,
+                "BCODE_OPENAI_CODEX_ACCOUNT_ID",
+                Zeroizing::new(account_id),
+            )
+            .map_err(|error| {
+                CliError::BundledPluginInstallFailed(format!(
+                    "failed to store ChatGPT account id: {error}"
+                ))
+            })?;
+    }
+
+    let config_path =
+        bcode_config::set_openai_sshenv_auth_mode(profile, vault_path, model, AuthMode::ChatGpt)?;
+    println!(
+        "OpenAI ChatGPT subscription login saved; config updated: {}",
+        config_path.display()
+    );
+    Ok(())
+}
+
+fn run_openai_codex_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}/auth/callback",
+        listener.local_addr()?.port()
+    );
+    let state = random_urlsafe(32)?;
+    let verifier = random_urlsafe(64)?;
+    let challenge = pkce_challenge(&verifier);
+    let authorize_url = openai_codex_authorize_url(&redirect_uri, &state, &challenge);
+    println!("OpenAI ChatGPT subscription login");
+    println!("Open this URL if your browser does not open automatically:\n{authorize_url}\n");
+    open_browser(&authorize_url);
+    let code = wait_for_oauth_code(&listener, &state)?;
+    exchange_openai_codex_code(&redirect_uri, &verifier, &code)
+}
+
+fn openai_codex_authorize_url(redirect_uri: &str, state: &str, challenge: &str) -> String {
+    let params = [
+        ("response_type", "code"),
+        ("client_id", OPENAI_CODEX_CLIENT_ID),
+        ("redirect_uri", redirect_uri),
+        ("scope", OPENAI_CODEX_SCOPE),
+        ("audience", OPENAI_CODEX_AUDIENCE),
+        ("state", state),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+    ];
+    let query = params
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", pct_encode(key), pct_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{OPENAI_CODEX_AUTHORIZE_URL}?{query}")
+}
+
+fn exchange_openai_codex_code(
+    redirect_uri: &str,
+    verifier: &str,
+    code: &str,
+) -> Result<OpenAiOauthTokenResponse, CliError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async move {
+        let params = [
+            ("grant_type", "authorization_code"),
+            ("client_id", OPENAI_CODEX_CLIENT_ID),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier),
+            ("audience", OPENAI_CODEX_AUDIENCE),
+        ];
+        let response = reqwest::Client::new()
+            .post(OPENAI_CODEX_TOKEN_URL)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+        if !status.is_success() {
+            return Err(CliError::BundledPluginInstallFailed(format!(
+                "OpenAI OAuth token exchange failed with HTTP {status}: {body}"
+            )));
+        }
+        serde_json::from_str(&body).map_err(CliError::Json)
+    })
+}
+
+fn wait_for_oauth_code(listener: &TcpListener, expected_state: &str) -> Result<String, CliError> {
+    let (mut stream, _) = listener.accept()?;
+    let mut request = [0_u8; 8192];
+    let size = stream.read(&mut request)?;
+    let request = String::from_utf8_lossy(&request[..size]);
+    let first_line = request.lines().next().unwrap_or_default();
+    let code_and_state = parse_oauth_callback(first_line);
+    let response_body = if code_and_state.is_some() {
+        "Bcode OpenAI login complete. You can close this tab."
+    } else {
+        "Bcode OpenAI login failed. Return to your terminal."
+    };
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    )?;
+    let Some((code, state)) = code_and_state else {
+        return Err(CliError::BundledPluginInstallFailed(
+            "OpenAI OAuth callback did not include a code".to_string(),
+        ));
+    };
+    if state != expected_state {
+        return Err(CliError::BundledPluginInstallFailed(
+            "OpenAI OAuth callback state did not match".to_string(),
+        ));
+    }
+    Ok(code)
+}
+
+fn parse_oauth_callback(first_line: &str) -> Option<(String, String)> {
+    let path = first_line.split_whitespace().nth(1)?;
+    let query = path.split_once('?')?.1;
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        match pct_decode(key).as_deref() {
+            Some("code") => code = pct_decode(value),
+            Some("state") => state = pct_decode(value),
+            _ => {}
+        }
+    }
+    Some((code?, state?))
+}
+
+fn random_urlsafe(bytes: usize) -> Result<String, CliError> {
+    let mut data = vec![0_u8; bytes];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut data)
+        .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(data))
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn pct_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn pct_decode(value: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut iter = value.as_bytes().iter().copied();
+    while let Some(byte) = iter.next() {
+        if byte == b'%' {
+            let high = iter.next()?;
+            let low = iter.next()?;
+            bytes.push(hex_byte(high, low)?);
+        } else if byte == b'+' {
+            bytes.push(b' ');
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_byte(high: u8, low: u8) -> Option<u8> {
+    const fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    Some(digit(high)? << 4 | digit(low)?)
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let command = ("open", vec![url]);
+    #[cfg(target_os = "windows")]
+    let command = ("cmd", vec!["/C", "start", url]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let command = ("xdg-open", vec![url]);
+    let _ = Command::new(command.0)
+        .args(command.1)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn resolve_recipient_key(recipient_key: Option<String>) -> Result<String, CliError> {
