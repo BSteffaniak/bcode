@@ -26,6 +26,7 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap,
 };
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::time::Duration;
 use thiserror::Error;
@@ -691,10 +692,46 @@ impl ratatui::widgets::Widget for &SessionPickerApp {
     }
 }
 
+#[derive(Debug, Clone)]
+enum TranscriptBlock {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+        streaming: bool,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments_json: String,
+    },
+    ToolResult {
+        id: String,
+        result: String,
+        is_error: bool,
+    },
+    PermissionRequest {
+        id: String,
+        tool_call_id: String,
+        name: String,
+        arguments_json: String,
+    },
+    PermissionResult {
+        approved: bool,
+    },
+    Meta {
+        text: String,
+    },
+    System {
+        text: String,
+    },
+}
+
 #[derive(Debug)]
 struct ChatApp {
     session_id: SessionId,
-    lines: Vec<String>,
+    blocks: Vec<TranscriptBlock>,
     input: String,
     status: String,
     pending_permissions: BTreeMap<String, PendingPermissionView>,
@@ -705,8 +742,6 @@ struct ChatApp {
     search_query: String,
     key_hints: String,
     permission_hints: String,
-    assistant_stream_start: Option<usize>,
-    assistant_stream_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -767,19 +802,11 @@ impl PendingPermissionView {
     }
 }
 
-const STREAMING_ASSISTANT_PREFIX: &str = "Bcode … ";
-const FINAL_ASSISTANT_PREFIX: &str = "Bcode: ";
-const USER_PREFIX: &str = "You: ";
-const TOOL_PREFIX: &str = "Tool: ";
-const PERMISSION_PREFIX: &str = "Permission: ";
-const META_PREFIX: &str = "· ";
-const CONTINUATION_PREFIX: &str = "  ";
-
 impl ChatApp {
     fn new(session_id: SessionId, history: &[SessionEvent], keymap: &KeyMap) -> Self {
         let mut app = Self {
             session_id,
-            lines: Vec::new(),
+            blocks: Vec::new(),
             input: String::new(),
             status: keymap
                 .warnings
@@ -800,8 +827,6 @@ impl ChatApp {
                 keymap.primary(TuiAction::PermissionAlwaysAllow),
                 keymap.primary(TuiAction::PermissionAlwaysDeny),
             ),
-            assistant_stream_start: None,
-            assistant_stream_text: String::new(),
         };
         for event in history {
             app.absorb_session_event(event);
@@ -875,40 +900,38 @@ impl ChatApp {
     }
 
     fn next_match_index(&self) -> Option<usize> {
+        let lines = self.rendered_line_texts();
         let current = self.top_visible_line_index();
-        self.lines
+        lines
             .iter()
             .enumerate()
             .skip(current.saturating_add(1))
-            .chain(
-                self.lines
-                    .iter()
-                    .enumerate()
-                    .take(current.saturating_add(1)),
-            )
+            .chain(lines.iter().enumerate().take(current.saturating_add(1)))
             .find_map(|(index, line)| line.contains(&self.search_query).then_some(index))
     }
 
     fn previous_match_index(&self) -> Option<usize> {
+        let lines = self.rendered_line_texts();
         let current = self.top_visible_line_index();
-        self.lines
+        lines
             .iter()
             .enumerate()
             .take(current)
             .rev()
-            .chain(self.lines.iter().enumerate().skip(current).rev())
+            .chain(lines.iter().enumerate().skip(current).rev())
             .find_map(|(index, line)| line.contains(&self.search_query).then_some(index))
     }
 
     fn top_visible_line_index(&self) -> usize {
-        self.lines
-            .len()
+        self.rendered_line_count()
             .saturating_sub(self.scroll_from_bottom)
             .saturating_sub(1)
     }
 
     fn scroll_to_line(&mut self, index: usize) {
-        self.scroll_from_bottom = self.lines.len().saturating_sub(index.saturating_add(1));
+        self.scroll_from_bottom = self
+            .rendered_line_count()
+            .saturating_sub(index.saturating_add(1));
     }
 
     fn scroll_line_up(&mut self) {
@@ -928,7 +951,7 @@ impl ChatApp {
     }
 
     fn scroll_top(&mut self) {
-        self.scroll_from_bottom = self.lines.len();
+        self.scroll_from_bottom = self.rendered_line_count();
     }
 
     fn scroll_bottom(&mut self) {
@@ -977,40 +1000,68 @@ impl ChatApp {
 
     fn push_session_event(&mut self, event: &SessionEvent) {
         self.finish_streaming_block_if_needed();
-        self.lines.extend(format_session_event_lines(event));
+        self.blocks.extend(transcript_blocks_from_event(event));
     }
 
     fn push_assistant_delta(&mut self, text: &str) {
-        let start = *self.assistant_stream_start.get_or_insert(self.lines.len());
-        self.assistant_stream_text.push_str(text);
-        self.lines.truncate(start);
-        push_prefixed_multiline(
-            &mut self.lines,
-            STREAMING_ASSISTANT_PREFIX,
-            &self.assistant_stream_text,
-        );
+        match self.blocks.last_mut() {
+            Some(TranscriptBlock::Assistant {
+                text: current,
+                streaming: true,
+            }) => {
+                current.push_str(text);
+            }
+            _ => self.blocks.push(TranscriptBlock::Assistant {
+                text: text.to_string(),
+                streaming: true,
+            }),
+        }
         self.clamp_scroll();
     }
 
     fn finish_assistant_message(&mut self, text: &str) {
-        if let Some(start) = self.assistant_stream_start.take() {
-            self.lines.truncate(start);
-            self.assistant_stream_text.clear();
+        match self.blocks.last_mut() {
+            Some(TranscriptBlock::Assistant {
+                text: current,
+                streaming,
+            }) if *streaming => {
+                *current = text.to_string();
+                *streaming = false;
+            }
+            _ => self.blocks.push(TranscriptBlock::Assistant {
+                text: text.to_string(),
+                streaming: false,
+            }),
         }
-        push_prefixed_multiline(&mut self.lines, FINAL_ASSISTANT_PREFIX, text);
         self.clamp_scroll();
     }
 
     fn finish_streaming_block_if_needed(&mut self) {
-        if let Some(start) = self.assistant_stream_start.take() {
-            let text = std::mem::take(&mut self.assistant_stream_text);
-            self.lines.truncate(start);
-            push_prefixed_multiline(&mut self.lines, FINAL_ASSISTANT_PREFIX, &text);
+        if let Some(TranscriptBlock::Assistant { streaming, .. }) = self.blocks.last_mut() {
+            *streaming = false;
         }
     }
 
     fn clamp_scroll(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.min(self.lines.len());
+        self.scroll_from_bottom = self.scroll_from_bottom.min(self.rendered_line_count());
+    }
+
+    fn rendered_line_count(&self) -> usize {
+        self.rendered_line_texts().len()
+    }
+
+    fn rendered_line_texts(&self) -> Vec<String> {
+        self.blocks
+            .iter()
+            .flat_map(TranscriptBlock::plain_lines)
+            .collect()
+    }
+
+    fn rendered_transcript_lines(&self) -> Vec<Line<'static>> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.render_lines(&self.search_query))
+            .collect()
     }
 
     fn remove_pending_permission(&mut self, permission_id: &str) {
@@ -1087,21 +1138,18 @@ impl ratatui::widgets::Widget for &ChatApp {
         header.render(chunks[0], buf);
 
         let transcript_height = usize::from(chunks[1].height.saturating_sub(2));
-        let visible_end = self
-            .lines
+        let rendered_lines = self.rendered_transcript_lines();
+        let visible_end = rendered_lines
             .len()
             .saturating_sub(self.scroll_from_bottom)
-            .max(transcript_height.min(self.lines.len()));
+            .max(transcript_height.min(rendered_lines.len()));
         let start = visible_end.saturating_sub(transcript_height);
         let title = if self.scroll_from_bottom == 0 {
             "Chat".to_string()
         } else {
             format!("Chat ({} from bottom)", self.scroll_from_bottom)
         };
-        let transcript_lines = self.lines[start..visible_end]
-            .iter()
-            .map(|line| render_transcript_line(line, &self.search_query))
-            .collect::<Vec<_>>();
+        let transcript_lines = rendered_lines[start..visible_end].to_vec();
         let transcript = Paragraph::new(Text::from(transcript_lines))
             .block(Block::new().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false });
@@ -1134,52 +1182,188 @@ impl ratatui::widgets::Widget for &ChatApp {
     }
 }
 
-fn render_transcript_line(line: &str, search_query: &str) -> Line<'static> {
-    let (prefix, body, prefix_style, body_style) = classify_transcript_line(line);
-    let mut spans = Vec::new();
-    if !prefix.is_empty() {
-        push_highlighted_spans(&mut spans, prefix, search_query, prefix_style);
-    }
-    if !body.is_empty() {
-        push_highlighted_spans(&mut spans, body, search_query, body_style);
-    }
-    Line::from(spans)
-}
-
-fn classify_transcript_line(line: &str) -> (&str, &str, Style, Style) {
-    let assistant_style = Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD);
-    let streaming_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let tool_style = Style::default().fg(Color::Yellow);
-    let permission_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-    let metadata_style = Style::default().fg(Color::DarkGray);
-    let body_style = Style::default();
-
-    for (prefix, style) in [
-        (STREAMING_ASSISTANT_PREFIX, streaming_style),
-        (FINAL_ASSISTANT_PREFIX, assistant_style),
-        (
-            USER_PREFIX,
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (TOOL_PREFIX, tool_style),
-        (PERMISSION_PREFIX, permission_style),
-        (META_PREFIX, metadata_style),
-    ] {
-        if let Some(body) = line.strip_prefix(prefix) {
-            return (prefix, body, style, body_style);
+impl TranscriptBlock {
+    fn plain_lines(&self) -> Vec<String> {
+        match self {
+            Self::User { text } => block_plain_lines("You", text),
+            Self::Assistant { text, streaming } => {
+                block_plain_lines(if *streaming { "Bcode…" } else { "Bcode" }, text)
+            }
+            Self::ToolCall {
+                name,
+                arguments_json,
+                ..
+            } => block_plain_lines(&format!("Tool · {name}"), &pretty_jsonish(arguments_json)),
+            Self::ToolResult {
+                id,
+                result,
+                is_error,
+            } => block_plain_lines(
+                &format!(
+                    "Tool result · {id} · {}",
+                    if *is_error { "failed" } else { "ok" }
+                ),
+                &tool_result_preview(result),
+            ),
+            Self::PermissionRequest {
+                name,
+                arguments_json,
+                ..
+            } => block_plain_lines(
+                &format!("Permission required · {name}"),
+                &pretty_jsonish(arguments_json),
+            ),
+            Self::PermissionResult { approved } => {
+                block_plain_lines("Permission", if *approved { "allowed" } else { "denied" })
+            }
+            Self::Meta { text } => vec![format!("· {text}"), String::new()],
+            Self::System { text } => block_plain_lines("System", text),
         }
     }
 
-    line.strip_prefix(CONTINUATION_PREFIX)
-        .map_or(("", line, body_style, body_style), |body| {
-            (CONTINUATION_PREFIX, body, metadata_style, body_style)
-        })
+    fn render_lines(&self, search_query: &str) -> Vec<Line<'static>> {
+        match self {
+            Self::User { text } => render_message_block("You", text, Color::Blue, search_query),
+            Self::Assistant { text, streaming } => render_message_block(
+                if *streaming { "Bcode …" } else { "Bcode" },
+                text,
+                if *streaming {
+                    Color::Cyan
+                } else {
+                    Color::Green
+                },
+                search_query,
+            ),
+            Self::ToolCall {
+                id,
+                name,
+                arguments_json,
+            } => render_detail_block(
+                &format!("Tool · {name}"),
+                &format!("id: {id}\n{}", pretty_jsonish(arguments_json)),
+                Color::Yellow,
+                search_query,
+            ),
+            Self::ToolResult {
+                id,
+                result,
+                is_error,
+            } => render_detail_block(
+                &format!(
+                    "Tool result · {id} · {}",
+                    if *is_error { "failed" } else { "ok" }
+                ),
+                &tool_result_preview(result),
+                if *is_error { Color::Red } else { Color::Yellow },
+                search_query,
+            ),
+            Self::PermissionRequest {
+                id,
+                tool_call_id,
+                name,
+                arguments_json,
+            } => render_detail_block(
+                &format!("Permission required · {name}"),
+                &format!(
+                    "permission: {id}\ntool call: {tool_call_id}\n{}",
+                    pretty_jsonish(arguments_json)
+                ),
+                Color::Red,
+                search_query,
+            ),
+            Self::PermissionResult { approved } => render_detail_block(
+                "Permission",
+                if *approved { "allowed" } else { "denied" },
+                if *approved { Color::Green } else { Color::Red },
+                search_query,
+            ),
+            Self::Meta { text } => vec![highlighted_line(
+                "· ",
+                text,
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::DarkGray),
+                search_query,
+            )],
+            Self::System { text } => {
+                render_detail_block("System", text, Color::DarkGray, search_query)
+            }
+        }
+    }
+}
+
+fn block_plain_lines(title: &str, body: &str) -> Vec<String> {
+    let mut lines = vec![format!("{title}:")];
+    lines.extend(body.lines().map(|line| format!("  {line}")));
+    lines.push(String::new());
+    lines
+}
+
+fn render_message_block(
+    title: &str,
+    body: &str,
+    color: Color,
+    search_query: &str,
+) -> Vec<Line<'static>> {
+    render_block(title, body, color, true, search_query)
+}
+
+fn render_detail_block(
+    title: &str,
+    body: &str,
+    color: Color,
+    search_query: &str,
+) -> Vec<Line<'static>> {
+    render_block(title, body, color, false, search_query)
+}
+
+fn render_block(
+    title: &str,
+    body: &str,
+    color: Color,
+    prominent: bool,
+    search_query: &str,
+) -> Vec<Line<'static>> {
+    let border_style = Style::default().fg(color);
+    let title_style = if prominent {
+        border_style.add_modifier(Modifier::BOLD)
+    } else {
+        border_style
+    };
+    let mut lines = vec![highlighted_line(
+        "╭─ ",
+        title,
+        border_style,
+        title_style,
+        search_query,
+    )];
+    for line in body.lines() {
+        lines.push(highlighted_line(
+            "│ ",
+            line,
+            border_style,
+            Style::default(),
+            search_query,
+        ));
+    }
+    if body.is_empty() {
+        lines.push(Line::from(Span::styled("│", border_style)));
+    }
+    lines.push(Line::from(Span::styled("╰", border_style)));
+    lines.push(Line::default());
+    lines
+}
+
+fn highlighted_line(
+    prefix: &str,
+    body: &str,
+    prefix_style: Style,
+    body_style: Style,
+    search_query: &str,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    push_highlighted_spans(&mut spans, prefix, search_query, prefix_style);
+    push_highlighted_spans(&mut spans, body, search_query, body_style);
+    Line::from(spans)
 }
 
 fn push_highlighted_spans(
@@ -1244,86 +1428,82 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn format_session_event_lines(event: &SessionEvent) -> Vec<String> {
-    let mut lines = Vec::new();
+fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
     match &event.kind {
-        SessionEventKind::SessionCreated { name } => {
-            let name = name.as_deref().unwrap_or("untitled");
-            lines.push(format!("{META_PREFIX}session started: {name}"));
+        SessionEventKind::SessionCreated { name } => vec![TranscriptBlock::Meta {
+            text: format!("session started: {}", name.as_deref().unwrap_or("untitled")),
+        }],
+        SessionEventKind::ClientAttached { .. } | SessionEventKind::ClientDetached { .. } => {
+            Vec::new()
         }
-        SessionEventKind::ClientAttached { .. } | SessionEventKind::ClientDetached { .. } => {}
         SessionEventKind::UserMessage { text, .. } => {
-            push_prefixed_multiline(&mut lines, USER_PREFIX, text);
+            vec![TranscriptBlock::User { text: text.clone() }]
         }
-        SessionEventKind::AssistantDelta { text } => {
-            push_prefixed_multiline(&mut lines, STREAMING_ASSISTANT_PREFIX, text);
-        }
-        SessionEventKind::AssistantMessage { text } => {
-            push_prefixed_multiline(&mut lines, FINAL_ASSISTANT_PREFIX, text);
-        }
+        SessionEventKind::AssistantDelta { text } => vec![TranscriptBlock::Assistant {
+            text: text.clone(),
+            streaming: true,
+        }],
+        SessionEventKind::AssistantMessage { text } => vec![TranscriptBlock::Assistant {
+            text: text.clone(),
+            streaming: false,
+        }],
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
             arguments_json,
-        } => {
-            lines.push(format!(
-                "{TOOL_PREFIX}{tool_name} requested ({tool_call_id})"
-            ));
-            push_plain_multiline(&mut lines, &pretty_jsonish(arguments_json));
-        }
+        } => vec![TranscriptBlock::ToolCall {
+            id: tool_call_id.clone(),
+            name: tool_name.clone(),
+            arguments_json: arguments_json.clone(),
+        }],
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
             is_error,
-        } => {
-            let status = if *is_error { "failed" } else { "completed" };
-            lines.push(format!("{TOOL_PREFIX}{tool_call_id} {status}"));
-            push_plain_multiline(&mut lines, result);
-        }
+        } => vec![TranscriptBlock::ToolResult {
+            id: tool_call_id.clone(),
+            result: result.clone(),
+            is_error: *is_error,
+        }],
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,
             tool_name,
             arguments_json,
-        } => {
-            lines.push(format!(
-                "{PERMISSION_PREFIX}{tool_name} needs approval ({permission_id}, {tool_call_id})"
-            ));
-            push_plain_multiline(&mut lines, &pretty_jsonish(arguments_json));
-        }
+        } => vec![TranscriptBlock::PermissionRequest {
+            id: permission_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            name: tool_name.clone(),
+            arguments_json: arguments_json.clone(),
+        }],
         SessionEventKind::PermissionResolved { approved, .. } => {
-            let decision = if *approved { "allowed" } else { "denied" };
-            lines.push(format!("{PERMISSION_PREFIX}{decision}"));
+            vec![TranscriptBlock::PermissionResult {
+                approved: *approved,
+            }]
         }
-        SessionEventKind::ModelChanged { provider, model } => {
-            lines.push(format!("{META_PREFIX}model changed: {provider}/{model}"));
-        }
+        SessionEventKind::ModelChanged { provider, model } => vec![TranscriptBlock::Meta {
+            text: format!("model changed: {provider}/{model}"),
+        }],
         SessionEventKind::SystemMessage { text } => {
-            push_prefixed_multiline(&mut lines, META_PREFIX, text);
+            vec![TranscriptBlock::System { text: text.clone() }]
         }
-    }
-    lines
-}
-
-fn push_prefixed_multiline(lines: &mut Vec<String>, prefix: &str, text: &str) {
-    let mut text_lines = text.lines();
-    if let Some(first) = text_lines.next() {
-        lines.push(format!("{prefix}{first}"));
-        for line in text_lines {
-            lines.push(format!("{CONTINUATION_PREFIX}{line}"));
-        }
-    } else {
-        lines.push(prefix.trim_end().to_string());
     }
 }
 
-fn push_plain_multiline(lines: &mut Vec<String>, text: &str) {
-    for line in text.lines().take(80) {
-        lines.push(format!("{CONTINUATION_PREFIX}{line}"));
+fn tool_result_preview(result: &str) -> String {
+    let lines = result.lines().collect::<Vec<_>>();
+    if lines.len() <= 24 {
+        return result.to_string();
     }
-    if text.lines().count() > 80 {
-        lines.push(format!("{CONTINUATION_PREFIX}… output truncated in TUI"));
-    }
+    let mut preview = lines
+        .iter()
+        .take(20)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    write!(preview, "\n… {} more lines", lines.len().saturating_sub(20))
+        .expect("writing to string should not fail");
+    preview
 }
 
 fn pretty_jsonish(value: &str) -> String {
