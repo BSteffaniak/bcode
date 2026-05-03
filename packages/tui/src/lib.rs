@@ -114,6 +114,16 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                     persist_first_permission_rule(&client, &mut app, false).await;
                 }
                 KeyCode::Esc => break,
+                KeyCode::PageUp => app.scroll_page_up(),
+                KeyCode::PageDown => app.scroll_page_down(),
+                KeyCode::Home => app.scroll_top(),
+                KeyCode::End => app.scroll_bottom(),
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_line_up();
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_line_down();
+                }
                 KeyCode::Enter => {
                     let Some(message) = app.take_input() else {
                         continue;
@@ -291,6 +301,7 @@ struct ChatApp {
     pending_permissions: BTreeMap<String, PendingPermissionView>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
+    scroll_from_bottom: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +371,7 @@ impl ChatApp {
             pending_permissions: BTreeMap::new(),
             selected_provider_plugin_id: None,
             selected_model_id: None,
+            scroll_from_bottom: 0,
         };
         for event in history {
             app.absorb_session_event(event);
@@ -371,6 +383,30 @@ impl ChatApp {
         match event {
             Event::Session(event) => self.absorb_session_event(&event),
         }
+    }
+
+    fn scroll_line_up(&mut self) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(1);
+    }
+
+    fn scroll_line_down(&mut self) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1);
+    }
+
+    fn scroll_page_up(&mut self) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(10);
+    }
+
+    fn scroll_page_down(&mut self) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(10);
+    }
+
+    fn scroll_top(&mut self) {
+        self.scroll_from_bottom = self.lines.len();
+    }
+
+    fn scroll_bottom(&mut self) {
+        self.scroll_from_bottom = 0;
     }
 
     fn absorb_session_event(&mut self, event: &SessionEvent) {
@@ -410,6 +446,7 @@ impl ChatApp {
             _ => {}
         }
         self.lines.push(format_session_event(event));
+        self.clamp_scroll();
     }
 
     fn push_assistant_delta(&mut self, text: &str) {
@@ -423,6 +460,7 @@ impl ChatApp {
             self.lines
                 .push(format!("{STREAMING_ASSISTANT_PREFIX}{text}"));
         }
+        self.clamp_scroll();
     }
 
     fn finish_assistant_message(&mut self, text: &str) {
@@ -436,6 +474,11 @@ impl ChatApp {
         } else {
             self.lines.push(final_message);
         }
+        self.clamp_scroll();
+    }
+
+    fn clamp_scroll(&mut self) {
+        self.scroll_from_bottom = self.scroll_from_bottom.min(self.lines.len());
     }
 
     fn remove_pending_permission(&mut self, permission_id: &str) {
@@ -512,10 +555,20 @@ impl ratatui::widgets::Widget for &ChatApp {
         header.render(chunks[0], buf);
 
         let transcript_height = usize::from(chunks[1].height.saturating_sub(2));
-        let start = self.lines.len().saturating_sub(transcript_height);
-        let transcript = self.lines[start..].join("\n");
+        let visible_end = self
+            .lines
+            .len()
+            .saturating_sub(self.scroll_from_bottom)
+            .max(transcript_height.min(self.lines.len()));
+        let start = visible_end.saturating_sub(transcript_height);
+        let title = if self.scroll_from_bottom == 0 {
+            "Transcript".to_string()
+        } else {
+            format!("Transcript ({} from bottom)", self.scroll_from_bottom)
+        };
+        let transcript = self.lines[start..visible_end].join("\n");
         let transcript = Paragraph::new(transcript)
-            .block(Block::new().title("Transcript").borders(Borders::ALL))
+            .block(Block::new().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false });
         transcript.render(chunks[1], buf);
 
@@ -536,7 +589,8 @@ impl ratatui::widgets::Widget for &ChatApp {
             .wrap(Wrap { trim: false });
         input.render(chunks[input_index], buf);
 
-        Paragraph::new(self.status.as_str()).render(chunks[input_index + 1], buf);
+        let status = format!("{} | pgup/pgdn scroll, home/end jump", self.status);
+        Paragraph::new(status).render(chunks[input_index + 1], buf);
     }
 }
 
