@@ -1339,14 +1339,37 @@ async fn list_models() -> Result<(), CliError> {
         return Ok(());
     }
     let models: bcode_model::ModelList = serde_json::from_slice(&response.payload)?;
-    for model in models.models {
-        let default_marker = if model.is_default { "\tdefault" } else { "" };
-        println!(
-            "{}\t{}{}",
-            model.model_id, model.display_name, default_marker
-        );
-    }
+    print_model_list(&models.models);
     Ok(())
+}
+
+fn print_model_list(models: &[bcode_model::ModelInfo]) {
+    let model_width = models
+        .iter()
+        .map(|model| model.model_id.len())
+        .max()
+        .unwrap_or("MODEL".len())
+        .max("MODEL".len());
+    let display_name_width = models
+        .iter()
+        .map(|model| model.display_name.len())
+        .max()
+        .unwrap_or("DISPLAY NAME".len())
+        .max("DISPLAY NAME".len());
+    println!(
+        "{:<model_width$}  {:<display_name_width$}  DEFAULT",
+        "MODEL", "DISPLAY NAME"
+    );
+    for model in models {
+        if model.is_default {
+            println!(
+                "{:<model_width$}  {:<display_name_width$}  yes",
+                model.model_id, model.display_name
+            );
+        } else {
+            println!("{:<model_width$}  {}", model.model_id, model.display_name);
+        }
+    }
 }
 
 async fn set_session_model(
