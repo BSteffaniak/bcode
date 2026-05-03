@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -41,8 +41,24 @@ pub enum CliError {
     Plugin(#[from] bcode_plugin::PluginLoadError),
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
-    #[error("daemon did not become ready after auto-start")]
-    DaemonStartTimeout,
+    #[error("daemon did not become ready after auto-start; log: {log_path}\n{recent_log}")]
+    DaemonStartTimeout {
+        log_path: String,
+        recent_log: String,
+    },
+    #[error("daemon exited before becoming ready ({status}); log: {log_path}\n{recent_log}")]
+    DaemonExited {
+        status: String,
+        log_path: String,
+        recent_log: String,
+    },
+    #[error(
+        "daemon became ready but failed a follow-up health check; log: {log_path}\n{recent_log}"
+    )]
+    DaemonHealthCheckFailed {
+        log_path: String,
+        recent_log: String,
+    },
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
 }
@@ -1734,36 +1750,103 @@ async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     if client.server_status().await.is_ok() {
         if !quiet {
             println!("server already running");
+            println!("log: {}", daemon_log_path().display());
         }
         return Ok(());
     }
 
     ensure_bundled_plugins_installed()?;
 
+    let log_path = daemon_log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    writeln!(log_file, "\n--- bcode daemon start ---")?;
+    let stderr_log = log_file.try_clone()?;
+
     let exe = std::env::current_exe()?;
-    Command::new(exe)
+    let mut child = Command::new(exe)
         .args(["server", "run"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_log))
         .spawn()?;
 
-    wait_for_server_ready(&client).await?;
+    wait_for_server_ready(&client, &mut child, &log_path).await?;
     if !quiet {
         println!("server started");
+        println!("log: {}", log_path.display());
     }
     Ok(())
 }
 
-async fn wait_for_server_ready(client: &BcodeClient) -> Result<(), CliError> {
+fn daemon_log_path() -> PathBuf {
+    std::env::var_os("BCODE_DAEMON_LOG").map_or_else(
+        || {
+            bcode_config::default_state_dir()
+                .join("logs")
+                .join("daemon.log")
+        },
+        PathBuf::from,
+    )
+}
+
+async fn wait_for_server_ready(
+    client: &BcodeClient,
+    child: &mut Child,
+    log_path: &Path,
+) -> Result<(), CliError> {
     for _ in 0..50 {
         if client.server_status().await.is_ok() {
-            return Ok(());
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Some(status) = child.try_wait()? {
+                return Err(CliError::DaemonExited {
+                    status: status.to_string(),
+                    log_path: log_path.display().to_string(),
+                    recent_log: recent_log_excerpt(log_path),
+                });
+            }
+            if client.server_status().await.is_ok() {
+                return Ok(());
+            }
+            return Err(CliError::DaemonHealthCheckFailed {
+                log_path: log_path.display().to_string(),
+                recent_log: recent_log_excerpt(log_path),
+            });
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(CliError::DaemonExited {
+                status: status.to_string(),
+                log_path: log_path.display().to_string(),
+                recent_log: recent_log_excerpt(log_path),
+            });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    Err(CliError::DaemonStartTimeout)
+    Err(CliError::DaemonStartTimeout {
+        log_path: log_path.display().to_string(),
+        recent_log: recent_log_excerpt(log_path),
+    })
+}
+
+fn recent_log_excerpt(log_path: &Path) -> String {
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return "daemon log could not be read".to_string();
+    };
+    let lines = contents.lines().rev().take(30).collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "daemon log is empty".to_string();
+    }
+    let mut excerpt = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    if !excerpt.ends_with('\n') {
+        excerpt.push('\n');
+    }
+    excerpt
 }
 
 async fn server_status() -> Result<(), CliError> {
@@ -1782,6 +1865,7 @@ async fn server_status() -> Result<(), CliError> {
         status.selected_model_id.as_deref().unwrap_or("<default>")
     );
     println!("sessions: {}", status.sessions.len());
+    println!("log: {}", daemon_log_path().display());
     for session in status.sessions {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
         println!("{}\t{}\t{} clients", session.id, name, session.client_count);

@@ -1797,20 +1797,7 @@ async fn send_response(
 }
 
 fn default_session_store_dir() -> PathBuf {
-    if let Ok(path) = env::var("BCODE_STATE_DIR") {
-        return PathBuf::from(path).join("sessions");
-    }
-    if let Ok(path) = env::var("XDG_STATE_HOME") {
-        return PathBuf::from(path).join("bcode").join("sessions");
-    }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("bcode")
-            .join("sessions");
-    }
-    env::temp_dir().join("bcode").join("sessions")
+    bcode_config::default_state_dir().join("sessions")
 }
 
 #[cfg(test)]

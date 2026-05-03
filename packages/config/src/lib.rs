@@ -248,27 +248,31 @@ fn update_writable_config(
     Ok(path)
 }
 
+/// Return the default Bcode state directory.
+#[must_use]
+pub fn default_state_dir() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home).join("bcode");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("bcode");
+    }
+    env::temp_dir().join("bcode")
+}
+
 /// Return the default Bcode auth vault path.
 #[must_use]
 pub fn default_auth_vault_path() -> PathBuf {
     if let Ok(path) = env::var("BCODE_AUTH_VAULT") {
         return PathBuf::from(path);
     }
-    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state_home)
-            .join("bcode")
-            .join("auth")
-            .join("vault");
-    }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("bcode")
-            .join("auth")
-            .join("vault");
-    }
-    env::temp_dir().join("bcode").join("auth").join("vault")
+    default_state_dir().join("auth").join("vault")
 }
 
 fn insert_permission_rule(
