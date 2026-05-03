@@ -70,8 +70,13 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
         }
     });
 
+    let status = client.server_status().await.ok();
     let mut terminal = TerminalGuard::enter()?;
     let mut app = ChatApp::new(session_id, &history);
+    if let Some(status) = status {
+        app.selected_provider_plugin_id = status.selected_provider_plugin_id;
+        app.selected_model_id = status.selected_model_id;
+    }
 
     loop {
         while let Ok(event) = event_receiver.try_recv() {
@@ -284,6 +289,8 @@ struct ChatApp {
     input: String,
     status: String,
     pending_permissions: BTreeMap<String, PendingPermissionView>,
+    selected_provider_plugin_id: Option<String>,
+    selected_model_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +355,8 @@ impl ChatApp {
             input: String::new(),
             status: "enter sends, ctrl-a approves, ctrl-d denies, ctrl-x cancels".to_string(),
             pending_permissions: BTreeMap::new(),
+            selected_provider_plugin_id: None,
+            selected_model_id: None,
         };
         for event in history {
             app.absorb_session_event(event);
@@ -434,7 +443,15 @@ impl ratatui::widgets::Widget for &ChatApp {
             .constraints(constraints)
             .split(area);
 
-        let header = Paragraph::new(format!("Bcode session {}", self.session_id));
+        let provider = self
+            .selected_provider_plugin_id
+            .as_deref()
+            .unwrap_or("<auto>");
+        let model = self.selected_model_id.as_deref().unwrap_or("<default>");
+        let header = Paragraph::new(format!(
+            "Bcode session {} | provider: {provider} | model: {model}",
+            self.session_id
+        ));
         header.render(chunks[0], buf);
 
         let transcript_height = usize::from(chunks[1].height.saturating_sub(2));

@@ -205,6 +205,8 @@ impl ServerState {
         ServerStatus {
             connected_client_count: self.clients.lock().await.len(),
             sessions: self.sessions.list_sessions().await,
+            selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
+            selected_model_id: self.selected_model_id.clone(),
         }
     }
 

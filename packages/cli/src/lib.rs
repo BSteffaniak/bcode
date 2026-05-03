@@ -573,6 +573,17 @@ async fn server_status() -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let status = client.server_status().await?;
     println!("connected clients: {}", status.connected_client_count);
+    println!(
+        "model provider: {}",
+        status
+            .selected_provider_plugin_id
+            .as_deref()
+            .unwrap_or("<auto>")
+    );
+    println!(
+        "model: {}",
+        status.selected_model_id.as_deref().unwrap_or("<default>")
+    );
     println!("sessions: {}", status.sessions.len());
     for session in status.sessions {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());

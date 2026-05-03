@@ -81,6 +81,8 @@ for _ in {1..100}; do
 done
 
 cargo run --quiet -p bcode -- plugin services --daemon | grep -q "bcode.model-provider/v1"
+cargo run --quiet -p bcode -- server status | grep -q "model provider: bcode.fake-provider"
+cargo run --quiet -p bcode -- server status | grep -q "model: fake-echo"
 cargo run --quiet -p bcode -- model list | grep -q "fake-echo"
 cargo run --quiet -p bcode -- model capabilities | grep -q "bcode.fake-provider"
 session_id="$(cargo run --quiet -p bcode -- session create model-provider-smoke)"
