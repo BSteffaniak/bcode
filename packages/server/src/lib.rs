@@ -25,7 +25,9 @@ use bcode_tool::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -1111,12 +1113,161 @@ async fn build_model_turn_request(
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id: selected_model_id.map_or_else(|| "fake-echo".to_string(), ToString::to_string),
-        system_prompt: None,
+        system_prompt: Some(build_coding_system_prompt()),
         messages,
         tools: collect_model_tools(state).await,
         parameters: ModelParameters::default(),
         metadata: std::collections::BTreeMap::new(),
     })
+}
+
+const DEFAULT_CODING_SYSTEM_PROMPT: &str = r"You are Bcode, a terminal-native coding agent running on the user's machine.
+
+Operate like a careful pair programmer:
+* Understand the user's goal before changing files.
+* Prefer inspecting relevant files before editing them.
+* Use filesystem tools for file reads/writes/edits instead of guessing file contents.
+* Use shell tools for focused validation, discovery, and tests when useful.
+* Keep edits minimal, domain-driven, and consistent with existing project conventions.
+* Do not create speculative crates, packages, or placeholder files.
+* Respect project instructions from AGENTS.md or similar repository guidance when provided.
+* Before finishing a coding task, run the most relevant formatting, check, or test command when practical.
+* If validation cannot be run, explain why.
+* Summarize what changed and exactly what validation ran.
+
+Tool and safety rules:
+* File writes, edits, and shell commands may require user permission. Ask through tools normally; do not claim a side effect happened unless a tool result confirms it.
+* Prefer small, reviewable tool calls over broad destructive commands.
+* Never run destructive commands such as deleting broad directories unless explicitly requested and permissioned.
+* Treat tool output as potentially partial or truncated.
+";
+
+const MAX_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
+const MAX_CONTEXT_FILE_CHARS: usize = 6_000;
+const MAX_GIT_STATUS_CHARS: usize = 4_000;
+
+fn build_coding_system_prompt() -> String {
+    format!(
+        "{DEFAULT_CODING_SYSTEM_PROMPT}\n\n{}",
+        truncate_text(&build_repository_context(), MAX_REPOSITORY_CONTEXT_CHARS)
+    )
+}
+
+fn build_repository_context() -> String {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repo_root = discover_git_root(&cwd);
+    let context_root = repo_root.as_deref().unwrap_or(cwd.as_path());
+
+    let mut lines = vec![
+        "Repository context:".to_string(),
+        format!("* Current directory: {}", cwd.display()),
+    ];
+    if let Some(repo_root) = &repo_root {
+        lines.push(format!("* Git root: {}", repo_root.display()));
+    }
+    if let Some(branch) = run_command(context_root, "git", &["branch", "--show-current"])
+        && !branch.is_empty()
+    {
+        lines.push(format!("* Git branch: {branch}"));
+    }
+    if let Some(status) = run_command(context_root, "git", &["status", "--short"]) {
+        lines.push(format!(
+            "* Git status:\n{}",
+            format_block_or_placeholder(&status, "clean")
+        ));
+    }
+    lines.push(format!(
+        "* Detected project files: {}",
+        detected_project_files(context_root).join(", ")
+    ));
+    if let Some(instructions) = read_nearest_agent_instructions(&cwd, context_root) {
+        lines.push(format!("* Project instructions excerpt:\n{instructions}"));
+    }
+    lines.join("\n")
+}
+
+fn discover_git_root(cwd: &Path) -> Option<PathBuf> {
+    run_command(cwd, "git", &["rev-parse", "--show-toplevel"])
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+}
+
+fn run_command(cwd: &Path, program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| truncate_text(value.trim(), MAX_GIT_STATUS_CHARS))
+}
+
+fn detected_project_files(root: &Path) -> Vec<String> {
+    let candidates = [
+        "AGENTS.md",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "Makefile",
+        "justfile",
+        "README.md",
+    ];
+    let detected = candidates
+        .into_iter()
+        .filter(|candidate| root.join(candidate).exists())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if detected.is_empty() {
+        vec!["<none detected>".to_string()]
+    } else {
+        detected
+    }
+}
+
+fn read_nearest_agent_instructions(cwd: &Path, stop_at: &Path) -> Option<String> {
+    let mut current = Some(cwd);
+    while let Some(directory) = current {
+        let candidate = directory.join("AGENTS.md");
+        if candidate.exists() {
+            return read_file_excerpt(&candidate, MAX_CONTEXT_FILE_CHARS);
+        }
+        if directory == stop_at {
+            break;
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+fn read_file_excerpt(path: &Path, max_chars: usize) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| truncate_text(text.trim(), max_chars))
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        truncated.push_str("\n[truncated]");
+    }
+    truncated
+}
+
+fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
+    if value.is_empty() {
+        format!("  {placeholder}")
+    } else {
+        value
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[allow(clippy::significant_drop_tightening)]
