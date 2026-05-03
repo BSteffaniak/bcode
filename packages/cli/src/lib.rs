@@ -238,10 +238,10 @@ enum LoginCommand {
         /// Force `ChatGPT` subscription OAuth mode.
         #[arg(long)]
         chatgpt: bool,
-        /// Use browser OAuth with a localhost callback instead of device-code login.
+        /// Use browser OAuth with a localhost callback. This is the default.
         #[arg(long)]
         browser: bool,
-        /// Use device-code login that does not require localhost callbacks.
+        /// Use device-code login. Requires `Codex` device authorization enabled in `ChatGPT` settings.
         #[arg(long)]
         headless: bool,
         #[arg(long, default_value = "bcode-openai")]
@@ -436,10 +436,10 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
             options.model,
         )
     } else {
-        let flow = if options.browser && !options.headless {
-            OpenAiLoginFlow::Browser
-        } else {
+        let flow = if options.headless && !options.browser {
             OpenAiLoginFlow::DeviceCode
+        } else {
+            OpenAiLoginFlow::Browser
         };
         login_openai_chatgpt(&store, options.profile, vault_path, options.model, flow).await
     }
