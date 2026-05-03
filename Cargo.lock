@@ -215,8 +215,20 @@ dependencies = [
 name = "bcode_client"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_command",
  "bcode_ipc",
+ "bcode_model",
  "bcode_session_models",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bcode_command"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -224,6 +236,8 @@ dependencies = [
 name = "bcode_config"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_command",
+ "bcode_model",
  "bcode_plugin",
  "serde",
  "thiserror 2.0.18",
@@ -261,6 +275,8 @@ dependencies = [
 name = "bcode_ipc"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_command",
+ "bcode_model",
  "bcode_session_models",
  "bmux_codec",
  "bmux_ipc",
@@ -319,6 +335,7 @@ dependencies = [
 name = "bcode_server"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_command",
  "bcode_config",
  "bcode_ipc",
  "bcode_model",
@@ -373,8 +390,10 @@ name = "bcode_tui"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
+ "bcode_command",
  "bcode_config",
  "bcode_ipc",
+ "bcode_model",
  "bcode_session_models",
  "crossterm",
  "ratatui",

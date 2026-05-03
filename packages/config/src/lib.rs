@@ -194,6 +194,8 @@ pub struct ModelConfig {
     pub provider_plugin_id: Option<String>,
     #[serde(default)]
     pub model_id: Option<String>,
+    #[serde(default)]
+    pub default_thinking_level: Option<bcode_model::ReasoningEffort>,
 }
 
 impl ModelConfig {
@@ -203,6 +205,9 @@ impl ModelConfig {
         }
         if next.model_id.is_some() {
             self.model_id = next.model_id;
+        }
+        if next.default_thinking_level.is_some() {
+            self.default_thinking_level = next.default_thinking_level;
         }
     }
 }
@@ -294,7 +299,7 @@ pub fn add_permission_rule(kind: &str, value: String) -> Result<PathBuf, ConfigE
     update_writable_config(|config| insert_permission_rule(&mut config.permissions, kind, value))
 }
 
-/// Configure OpenAI-compatible provider (OpenAI, xAI/Grok, etc.) authentication
+/// Configure OpenAI-compatible provider (`OpenAI`, xAI/Grok, etc.) authentication
 /// backed by an `sshenv` vault.
 ///
 /// # Errors
@@ -439,6 +444,10 @@ fn config_to_toml(config: &BcodeConfig) -> String {
         }
         if let Some(model_id) = &config.model.model_id {
             writeln!(output, "model_id = {}", toml_string(model_id))
+                .expect("writing to string should not fail");
+        }
+        if let Some(level) = &config.model.default_thinking_level {
+            writeln!(output, "default_thinking_level = \"{level:?}\"")
                 .expect("writing to string should not fail");
         }
         output.push('\n');

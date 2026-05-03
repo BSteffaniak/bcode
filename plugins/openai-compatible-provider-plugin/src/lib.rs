@@ -197,6 +197,8 @@ struct ChatCompletionRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -476,6 +478,11 @@ async fn send_chat_completion_request(
         max_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
         stop: request.parameters.stop_sequences.clone(),
+        reasoning_effort: request.parameters.reasoning_effort.map(|e| match e {
+            bcode_model::ReasoningEffort::Low => "low".to_string(),
+            bcode_model::ReasoningEffort::Medium => "medium".to_string(),
+            bcode_model::ReasoningEffort::High => "high".to_string(),
+        }),
     };
     let response = client
         .post(url)
@@ -824,6 +831,21 @@ fn process_stream_line(
     if data == "[DONE]" {
         return Ok(StreamOutcome::Finished);
     }
+
+    // Some providers (including certain error cases on xAI/OpenAI-compatible)
+    // return error payloads as the first data chunk even on 2xx.
+    if let Ok(err_body) = serde_json::from_str::<ErrorResponseBody>(data)
+        && let Some(err) = err_body.error
+    {
+        return Err(provider_error(
+            err.code
+                .or(err.r#type)
+                .unwrap_or_else(|| "api_error".to_string()),
+            category_from_status(400),
+            err.message,
+        ));
+    }
+
     let chunk = serde_json::from_str::<ChatCompletionChunk>(data).map_err(|error| {
         provider_error(
             "stream_decode_failed",

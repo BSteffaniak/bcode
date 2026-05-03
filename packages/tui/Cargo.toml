@@ -12,8 +12,10 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_client = { workspace = true }
+bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_ipc = { workspace = true }
+bcode_model = { workspace = true }
 bcode_session_models = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
 ratatui = { workspace = true, features = [

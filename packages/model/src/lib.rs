@@ -86,6 +86,16 @@ pub enum ModelCapability {
     ImageInput,
 }
 
+/// User-facing thinking / reasoning effort level for models that support it.
+/// Maps to provider-specific parameters (e.g. `reasoning_effort` or budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
 /// Provider configuration validation request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateConfigRequest {
@@ -197,6 +207,8 @@ pub struct ModelParameters {
     pub stop_sequences: Vec<String>,
     #[serde(default)]
     pub reasoning_budget_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Tool definition supplied to a provider.

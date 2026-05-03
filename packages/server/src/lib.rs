@@ -14,7 +14,7 @@ use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole,
     ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN,
     OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderTurnEvent, StartTurnResponse,
+    ProviderTurnEvent, ReasoningEffort, StartTurnResponse,
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{ClientId, SessionEventKind, SessionId};
@@ -84,6 +84,7 @@ struct ActiveModelTurn {
 struct SessionModelSelection {
     provider_plugin_id: Option<String>,
     model_id: Option<String>,
+    thinking_level: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone)]
@@ -612,6 +613,7 @@ async fn handle_set_session_model(
             let selection = SessionModelSelection {
                 provider_plugin_id: provider_to_selection(&provider),
                 model_id: model_to_selection(&model_id),
+                thinking_level: None,
             };
             state
                 .session_model_selections
@@ -1015,6 +1017,7 @@ async fn session_model_selection(
     let mut selection = SessionModelSelection {
         provider_plugin_id: state.selected_provider_plugin_id.clone(),
         model_id: state.selected_model_id.clone(),
+        thinking_level: None,
     };
     if let Ok(history) = state.sessions.session_history(session_id).await {
         for event in history {
@@ -1022,6 +1025,7 @@ async fn session_model_selection(
                 selection = SessionModelSelection {
                     provider_plugin_id: provider_to_selection(&provider),
                     model_id: model_to_selection(&model),
+                    thinking_level: None,
                 };
             }
         }
@@ -1109,6 +1113,7 @@ async fn build_model_turn_request(
         .iter()
         .filter_map(session_event_to_model_message)
         .collect();
+    let selection = session_model_selection(state, session_id).await;
     Ok(ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -1116,7 +1121,13 @@ async fn build_model_turn_request(
         system_prompt: Some(build_coding_system_prompt()),
         messages,
         tools: collect_model_tools(state).await,
-        parameters: ModelParameters::default(),
+        parameters: {
+            let mut p = ModelParameters::default();
+            if let Some(level) = &selection.thinking_level {
+                p.reasoning_effort = Some(*level);
+            }
+            p
+        },
         metadata: std::collections::BTreeMap::new(),
     })
 }

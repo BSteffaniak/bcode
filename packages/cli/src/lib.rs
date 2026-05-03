@@ -275,7 +275,7 @@ enum LoginCommand {
         /// Store an xAI API key.
         #[arg(long)]
         api_key: Option<String>,
-        /// Store an xAI-compatible API base URL (defaults to https://api.x.ai/v1).
+        /// Store an xAI-compatible API base URL (defaults to <https://api.x.ai/v1>).
         #[arg(long)]
         base_url: Option<String>,
         #[arg(long, default_value = "bcode-xai")]
@@ -524,7 +524,7 @@ fn open_auth_store(
     Ok(store)
 }
 
-/// Generic helper for storing API-key auth for any OpenAI-compatible provider (OpenAI, xAI, etc.).
+/// Generic helper for storing API-key auth for any OpenAI-compatible provider (`OpenAI`, xAI, etc.).
 /// `prefix` is "OPENAI" or "XAI" (used for env-style secret keys stored in the vault).
 fn login_compatible_api_key(
     store: &sshenv_vault::SshenvStore,
@@ -535,14 +535,14 @@ fn login_compatible_api_key(
     model: Option<String>,
     prefix: &str,
 ) -> Result<(), CliError> {
-    let prompt = format!("{} API key: ", prefix);
+    let prompt = format!("{prefix} API key: ");
     let api_key = match api_key {
         Some(api_key) => api_key,
         None => rpassword::prompt_password(&prompt)?,
     };
-    let auth_mode_key = format!("BCODE_{}_AUTH_MODE", prefix);
-    let api_key_key = format!("BCODE_{}_API_KEY", prefix);
-    let base_url_key = format!("BCODE_{}_BASE_URL", prefix);
+    let auth_mode_key = format!("BCODE_{prefix}_AUTH_MODE");
+    let api_key_key = format!("BCODE_{prefix}_API_KEY");
+    let base_url_key = format!("BCODE_{prefix}_BASE_URL");
 
     store
         .set_secret(
@@ -557,8 +557,7 @@ fn login_compatible_api_key(
         .set_secret(&profile, &api_key_key, Zeroizing::new(api_key))
         .map_err(|error| {
             CliError::BundledPluginInstallFailed(format!(
-                "failed to store {} API key: {error}",
-                prefix
+                "failed to store {prefix} API key: {error}"
             ))
         })?;
     if let Some(base_url) = base_url {
@@ -566,8 +565,7 @@ fn login_compatible_api_key(
             .set_secret(&profile, &base_url_key, Zeroizing::new(base_url))
             .map_err(|error| {
                 CliError::BundledPluginInstallFailed(format!(
-                    "failed to store {} base URL: {error}",
-                    prefix
+                    "failed to store {prefix} base URL: {error}"
                 ))
             })?;
     }

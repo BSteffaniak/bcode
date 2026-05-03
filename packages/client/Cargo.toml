@@ -11,7 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_command        = { workspace = true }
 bcode_ipc            = { workspace = true }
+bcode_model          = { workspace = true }
 bcode_session_models = { workspace = true }
 thiserror            = { workspace = true }
 
