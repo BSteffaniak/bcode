@@ -19,6 +19,7 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -553,6 +554,9 @@ fn run_openai_codex_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
     let authorize_url = openai_codex_authorize_url(&redirect_uri, &state, &challenge);
     println!("OpenAI ChatGPT subscription login");
     println!("Open this URL if your browser does not open automatically:\n{authorize_url}\n");
+    println!(
+        "If your browser says localhost refused to connect, copy the full redirected localhost URL, paste it here, and press Enter."
+    );
     open_browser(&authorize_url);
     let code = wait_for_oauth_code(&listeners, &state)?;
     exchange_openai_codex_code(&redirect_uri, &verifier, &code)
@@ -641,26 +645,81 @@ fn wait_for_oauth_code(
     listeners: &[TcpListener],
     expected_state: &str,
 ) -> Result<String, CliError> {
+    let manual_callback = spawn_manual_oauth_callback_reader();
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
+        if let Some(code) = poll_manual_oauth_callback(&manual_callback, expected_state)? {
+            return Ok(code);
+        }
         if Instant::now() >= deadline {
             return Err(CliError::BundledPluginInstallFailed(
                 "OpenAI OAuth callback timed out".to_string(),
             ));
         }
-        for listener in listeners {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    match handle_oauth_callback_stream(&mut stream, expected_state)? {
-                        OAuthCallback::Code(code) => return Ok(code),
-                        OAuthCallback::Ignored => {}
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
+        if let Some(code) = poll_oauth_listeners(listeners, expected_state)? {
+            return Ok(code);
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn poll_oauth_listeners(
+    listeners: &[TcpListener],
+    expected_state: &str,
+) -> Result<Option<String>, CliError> {
+    for listener in listeners {
+        match listener.accept() {
+            Ok((mut stream, _)) => match handle_oauth_callback_stream(&mut stream, expected_state)?
+            {
+                OAuthCallback::Code(code) => return Ok(Some(code)),
+                OAuthCallback::Ignored => {}
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
+
+fn spawn_manual_oauth_callback_reader() -> Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            let _ = sender.send(line);
+        }
+    });
+    receiver
+}
+
+fn poll_manual_oauth_callback(
+    receiver: &Receiver<String>,
+    expected_state: &str,
+) -> Result<Option<String>, CliError> {
+    match receiver.try_recv() {
+        Ok(input) => manual_oauth_callback_code(&input, expected_state),
+        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => Ok(None),
+    }
+}
+
+fn manual_oauth_callback_code(
+    input: &str,
+    expected_state: &str,
+) -> Result<Option<String>, CliError> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    match parse_oauth_callback(input.trim()) {
+        OAuthCallbackParse::Code { code, state } if state == expected_state => Ok(Some(code)),
+        OAuthCallbackParse::Code { .. } => Err(CliError::BundledPluginInstallFailed(
+            "pasted OpenAI OAuth callback state did not match".to_string(),
+        )),
+        OAuthCallbackParse::Error(error) => Err(CliError::BundledPluginInstallFailed(format!(
+            "OpenAI OAuth failed: {error}"
+        ))),
+        OAuthCallbackParse::Ignored => Err(CliError::BundledPluginInstallFailed(
+            "pasted text was not an OpenAI OAuth callback URL".to_string(),
+        )),
     }
 }
 
@@ -724,8 +783,8 @@ enum OAuthCallbackParse {
     Ignored,
 }
 
-fn parse_oauth_callback(first_line: &str) -> OAuthCallbackParse {
-    let Some(path) = first_line.split_whitespace().nth(1) else {
+fn parse_oauth_callback(input: &str) -> OAuthCallbackParse {
+    let Some(path) = oauth_callback_path(input) else {
         return OAuthCallbackParse::Ignored;
     };
     if !path.starts_with("/auth/callback") {
@@ -757,6 +816,20 @@ fn parse_oauth_callback(first_line: &str) -> OAuthCallbackParse {
         (Some(code), Some(state)) => OAuthCallbackParse::Code { code, state },
         _ => OAuthCallbackParse::Ignored,
     }
+}
+
+fn oauth_callback_path(input: &str) -> Option<&str> {
+    let candidate = if input.starts_with("GET ") || input.starts_with("POST ") {
+        input.split_whitespace().nth(1)?
+    } else {
+        input.trim()
+    };
+    if candidate.starts_with("/auth/callback") {
+        return Some(candidate);
+    }
+    let (_, without_scheme) = candidate.split_once("://")?;
+    let path_start = without_scheme.find('/')?;
+    Some(&without_scheme[path_start..])
 }
 
 fn random_urlsafe(bytes: usize) -> Result<String, CliError> {
