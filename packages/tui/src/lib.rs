@@ -192,13 +192,11 @@ impl KeyMap {
 
     fn chat_hints(&self) -> String {
         format!(
-            "{} send · {} interrupt · {} exit · {} search · {} approve · {} deny",
+            "{} send · {} interrupt · {} exit · {} search",
             self.primary(TuiAction::InputSubmit),
             self.primary(TuiAction::AppInterrupt),
             self.primary(TuiAction::AppExit),
             self.primary(TuiAction::SearchStart),
-            self.primary(TuiAction::PermissionApprove),
-            self.primary(TuiAction::PermissionDeny),
         )
     }
 }
@@ -231,10 +229,10 @@ fn default_keybindings() -> Vec<(TuiAction, &'static [&'static str])> {
         (TuiAction::SearchStart, &["ctrl+f"]),
         (TuiAction::SearchNext, &["ctrl+g"]),
         (TuiAction::SearchPrevious, &["ctrl+r"]),
-        (TuiAction::PermissionApprove, &["alt+y"]),
-        (TuiAction::PermissionDeny, &["alt+n"]),
-        (TuiAction::PermissionAlwaysAllow, &["alt+shift+y"]),
-        (TuiAction::PermissionAlwaysDeny, &["alt+shift+n"]),
+        (TuiAction::PermissionApprove, &[]),
+        (TuiAction::PermissionDeny, &[]),
+        (TuiAction::PermissionAlwaysAllow, &[]),
+        (TuiAction::PermissionAlwaysDeny, &[]),
         (TuiAction::TranscriptPageUp, &["pageUp"]),
         (TuiAction::TranscriptPageDown, &["pageDown"]),
         (TuiAction::TranscriptTop, &["home"]),
@@ -459,6 +457,12 @@ async fn run_chat(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            if app.first_pending_permission().is_some()
+                && !app.search_mode
+                && handle_permission_prompt_key(&client, &mut app, &key).await
+            {
+                continue;
+            }
             if let Some(action) = keymap.action_for_key(&key) {
                 if handle_chat_action(&client, &mut app, session_id, action).await {
                     break;
@@ -466,6 +470,10 @@ async fn run_chat(
                 continue;
             }
             if let Some(character) = key_is_text_input(&key) {
+                if app.first_pending_permission().is_some() && !app.search_mode {
+                    app.status = "permission prompt active; choose an option or deny".to_string();
+                    continue;
+                }
                 app.input.push(character);
                 if app.search_mode {
                     app.update_search();
@@ -475,6 +483,53 @@ async fn run_chat(
     }
 
     Ok(())
+}
+
+async fn handle_permission_prompt_key(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    key: &KeyEvent,
+) -> bool {
+    let (code, modifiers) = normalized_key(key);
+    if !modifiers.is_empty() {
+        return false;
+    }
+    match code {
+        KeyCode::Char('y') => {
+            execute_permission_choice(client, app, PermissionChoice::AllowOnce).await;
+        }
+        KeyCode::Char('a') => {
+            execute_permission_choice(client, app, PermissionChoice::AlwaysAllow).await;
+        }
+        KeyCode::Char('d') => {
+            execute_permission_choice(client, app, PermissionChoice::AlwaysDeny).await;
+        }
+        KeyCode::Enter => execute_selected_permission_choice(client, app).await,
+        KeyCode::Char('n') | KeyCode::Esc => {
+            execute_permission_choice(client, app, PermissionChoice::DenyOnce).await;
+        }
+        KeyCode::Left | KeyCode::Up => app.previous_permission_choice(),
+        KeyCode::Right | KeyCode::Down | KeyCode::Tab => app.next_permission_choice(),
+        _ => return false,
+    }
+    true
+}
+
+async fn execute_selected_permission_choice(client: &BcodeClient, app: &mut ChatApp) {
+    execute_permission_choice(client, app, app.selected_permission_choice).await;
+}
+
+async fn execute_permission_choice(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    choice: PermissionChoice,
+) {
+    match choice {
+        PermissionChoice::AllowOnce => resolve_first_permission(client, app, true).await,
+        PermissionChoice::DenyOnce => resolve_first_permission(client, app, false).await,
+        PermissionChoice::AlwaysAllow => persist_first_permission_rule(client, app, true).await,
+        PermissionChoice::AlwaysDeny => persist_first_permission_rule(client, app, false).await,
+    }
 }
 
 async fn handle_chat_action(
@@ -742,6 +797,44 @@ struct ChatApp {
     search_query: String,
     key_hints: String,
     permission_hints: String,
+    selected_permission_choice: PermissionChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionChoice {
+    AllowOnce,
+    DenyOnce,
+    AlwaysAllow,
+    AlwaysDeny,
+}
+
+impl PermissionChoice {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow once",
+            Self::DenyOnce => "deny",
+            Self::AlwaysAllow => "always allow",
+            Self::AlwaysDeny => "always deny",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::AllowOnce => Self::DenyOnce,
+            Self::DenyOnce => Self::AlwaysAllow,
+            Self::AlwaysAllow => Self::AlwaysDeny,
+            Self::AlwaysDeny => Self::AllowOnce,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::AllowOnce => Self::AlwaysDeny,
+            Self::DenyOnce => Self::AllowOnce,
+            Self::AlwaysAllow => Self::DenyOnce,
+            Self::AlwaysDeny => Self::AlwaysAllow,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -753,14 +846,15 @@ struct PendingPermissionView {
 }
 
 impl PendingPermissionView {
-    fn render_text(&self, key_hints: &str) -> String {
+    fn render_text(&self, key_hints: &str, selected: PermissionChoice) -> String {
         format!(
-            "Tool wants permission\n{} ({})\npermission {}\n{}\n{}",
+            "Tool wants permission\n{} ({})\npermission {}\n{}\n{}\nselected: {}",
             self.tool_name,
             self.tool_call_id,
             self.permission_id,
             pretty_jsonish(&self.arguments_json),
-            key_hints
+            key_hints,
+            selected.label()
         )
     }
 
@@ -820,13 +914,10 @@ impl ChatApp {
             search_mode: false,
             search_query: String::new(),
             key_hints: keymap.chat_hints(),
-            permission_hints: format!(
-                "{} allow once · {} deny · {} always allow · {} always deny",
-                keymap.primary(TuiAction::PermissionApprove),
-                keymap.primary(TuiAction::PermissionDeny),
-                keymap.primary(TuiAction::PermissionAlwaysAllow),
-                keymap.primary(TuiAction::PermissionAlwaysDeny),
-            ),
+            permission_hints:
+                "y allow once · n deny · a always allow · d always deny · ←/→ choose · enter confirm"
+                    .to_string(),
+            selected_permission_choice: PermissionChoice::AllowOnce,
         };
         for event in history {
             app.absorb_session_event(event);
@@ -983,6 +1074,7 @@ impl ChatApp {
                         arguments_json: arguments_json.clone(),
                     },
                 );
+                self.selected_permission_choice = PermissionChoice::AllowOnce;
                 self.status = format!("permission pending: {permission_id}");
             }
             SessionEventKind::PermissionResolved { permission_id, .. } => {
@@ -1066,6 +1158,23 @@ impl ChatApp {
 
     fn remove_pending_permission(&mut self, permission_id: &str) {
         self.pending_permissions.remove(permission_id);
+        self.selected_permission_choice = PermissionChoice::AllowOnce;
+    }
+
+    fn next_permission_choice(&mut self) {
+        self.selected_permission_choice = self.selected_permission_choice.next();
+        self.status = format!(
+            "permission choice: {}",
+            self.selected_permission_choice.label()
+        );
+    }
+
+    fn previous_permission_choice(&mut self) {
+        self.selected_permission_choice = self.selected_permission_choice.previous();
+        self.status = format!(
+            "permission choice: {}",
+            self.selected_permission_choice.label()
+        );
     }
 
     fn first_pending_permission_id(&self) -> Option<String> {
@@ -1109,7 +1218,7 @@ impl ratatui::widgets::Widget for &ChatApp {
             vec![
                 Constraint::Length(1),
                 Constraint::Min(3),
-                Constraint::Length(6),
+                Constraint::Length(8),
                 Constraint::Length(3),
                 Constraint::Length(1),
             ]
@@ -1156,13 +1265,15 @@ impl ratatui::widgets::Widget for &ChatApp {
         transcript.render(chunks[1], buf);
 
         let input_index = self.first_pending_permission().map_or(2, |permission| {
-            let permission = Paragraph::new(permission.render_text(&self.permission_hints))
-                .block(
-                    Block::new()
-                        .title("Permission Required")
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: false });
+            let permission = Paragraph::new(
+                permission.render_text(&self.permission_hints, self.selected_permission_choice),
+            )
+            .block(
+                Block::new()
+                    .title("Permission Required")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false });
             permission.render(chunks[2], buf);
             3
         });
@@ -1530,10 +1641,7 @@ mod tests {
     fn keymap_user_config_overrides_and_unbinds_defaults() {
         let config = bcode_config::TuiConfig {
             keybindings: [
-                (
-                    "app.permission.approve".to_string(),
-                    vec!["ctrl+y".to_string()],
-                ),
+                ("app.search".to_string(), vec!["ctrl+s".to_string()]),
                 ("app.exit".to_string(), Vec::new()),
             ]
             .into_iter()
@@ -1542,11 +1650,25 @@ mod tests {
         let keymap = KeyMap::from_config(&config);
 
         assert_eq!(
-            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
-            Some(TuiAction::PermissionApprove)
+            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(TuiAction::SearchStart)
         );
         assert_eq!(
             keymap.action_for_key(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn permission_actions_are_unbound_by_default() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+
+        assert_eq!(
+            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(
+            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)),
             None
         );
     }

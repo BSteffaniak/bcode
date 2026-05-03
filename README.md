@@ -13,12 +13,14 @@ TUI keybindings are configurable in `bcode.toml` under `[tui.keybindings]`. Each
 "app.interrupt" = ["escape"]
 "app.exit" = ["ctrl+d"]
 "app.clear" = ["ctrl+c"]
-"app.permission.approve" = ["alt+y"]
-"app.permission.deny" = ["alt+n"]
-"app.permission.alwaysAllow" = ["alt+shift+y"]
-"app.permission.alwaysDeny" = ["alt+shift+n"]
+"app.permission.approve" = []
+"app.permission.deny" = []
+"app.permission.alwaysAllow" = []
+"app.permission.alwaysDeny" = []
 "transcript.pageUp" = ["pageUp"]
 "transcript.pageDown" = ["pageDown"]
 ```
 
-Key format follows `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples: `ctrl+d`, `alt+shift+y`, `pageUp`, `escape`, `enter`.
+Key format follows `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples: `ctrl+d`, `pageUp`, `escape`, `enter`.
+
+Permission prompts are modal by default instead of global keybindings: `y` allows once, `n` denies, `a` always allows, `d` always denies, arrow keys choose an option, and `enter` confirms.
