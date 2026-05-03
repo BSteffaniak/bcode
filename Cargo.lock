@@ -435,8 +435,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_attach_image_protocol"
+version = "0.0.1-alpha.0"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#d37dbea486cda8185a3e118bece239effb779c92"
+dependencies = [
+ "bmux_codec",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.0"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#d37dbea486cda8185a3e118bece239effb779c92"
 dependencies = [
  "serde",
 ]
@@ -444,9 +455,12 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.0"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#d37dbea486cda8185a3e118bece239effb779c92"
 dependencies = [
+ "bmux_attach_image_protocol",
  "bmux_codec",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "uuid",

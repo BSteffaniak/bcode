@@ -45,8 +45,8 @@ bcode_tool           = { version = "0.0.1-alpha.0", default-features = false, pa
 bcode_tui            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 
 # BMUX reuse
-bmux_codec = { default-features = false, path = "../bmux/packages/codec" }
-bmux_ipc   = { default-features = false, path = "../bmux/packages/ipc" }
+bmux_codec = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_ipc   = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
