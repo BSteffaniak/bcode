@@ -100,7 +100,7 @@ pub async fn run() -> Result<(), CliError> {
             } => publish_plugin_event(&root, &topic, payload, daemon).await?,
         },
         Commands::Model { command } => handle_model_command(command).await?,
-        Commands::Login { command } => handle_login_command(command)?,
+        Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => match command {
             PermissionCommand::List => list_permissions().await?,
             PermissionCommand::Approve { permission_id } => {
@@ -238,6 +238,12 @@ enum LoginCommand {
         /// Force `ChatGPT` subscription OAuth mode.
         #[arg(long)]
         chatgpt: bool,
+        /// Use browser OAuth with a localhost callback instead of device-code login.
+        #[arg(long)]
+        browser: bool,
+        /// Use device-code login that does not require localhost callbacks.
+        #[arg(long)]
+        headless: bool,
         #[arg(long, default_value = "bcode-openai")]
         profile: String,
         #[arg(long)]
@@ -264,6 +270,25 @@ struct OpenAiOauthTokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiDeviceUserCodeResponse {
+    device_auth_id: String,
+    user_code: String,
+    interval: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiDeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiLoginFlow {
+    Browser,
+    DeviceCode,
 }
 
 #[derive(Debug, Subcommand)]
@@ -354,44 +379,69 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
+async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
     match command {
         LoginCommand::Openai {
             api_key,
             base_url,
             chatgpt,
+            browser,
+            headless,
             profile,
             vault,
             recipient_key,
             model,
-        } => login_openai(
-            api_key,
-            base_url,
-            chatgpt,
-            profile,
-            vault,
-            recipient_key,
-            model,
-        )?,
+        } => {
+            login_openai(OpenAiLoginOptions {
+                api_key,
+                base_url,
+                chatgpt,
+                browser,
+                headless,
+                profile,
+                vault,
+                recipient_key,
+                model,
+            })
+            .await?;
+        }
     }
     Ok(())
 }
 
-fn login_openai(
+struct OpenAiLoginOptions {
     api_key: Option<String>,
     base_url: Option<String>,
     chatgpt: bool,
+    browser: bool,
+    headless: bool,
     profile: String,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
     model: Option<String>,
-) -> Result<(), CliError> {
-    let vault_path = vault.unwrap_or_else(bcode_config::default_auth_vault_path);
-    let store = open_auth_store(&vault_path, recipient_key)?;
-    if api_key.is_some() || (base_url.is_some() && !chatgpt) {
-        login_openai_api_key(&store, profile, vault_path, api_key, base_url, model)
+}
+
+async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
+    let vault_path = options
+        .vault
+        .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let store = open_auth_store(&vault_path, options.recipient_key)?;
+    if options.api_key.is_some() || (options.base_url.is_some() && !options.chatgpt) {
+        login_openai_api_key(
+            &store,
+            options.profile,
+            vault_path,
+            options.api_key,
+            options.base_url,
+            options.model,
+        )
     } else {
-        login_openai_chatgpt(&store, profile, vault_path, model)
+        let flow = if options.browser && !options.headless {
+            OpenAiLoginFlow::Browser
+        } else {
+            OpenAiLoginFlow::DeviceCode
+        };
+        login_openai_chatgpt(&store, options.profile, vault_path, options.model, flow).await
     }
 }
 
@@ -458,13 +508,14 @@ fn login_openai_api_key(
     Ok(())
 }
 
-fn login_openai_chatgpt(
+async fn login_openai_chatgpt(
     store: &sshenv_vault::SshenvStore,
     profile: String,
     vault_path: PathBuf,
     model: Option<String>,
+    flow: OpenAiLoginFlow,
 ) -> Result<(), CliError> {
-    let oauth = run_openai_codex_oauth()?;
+    let oauth = run_openai_codex_oauth(flow).await?;
     let expires_at = unix_timestamp() + oauth.expires_in.unwrap_or(3600).saturating_sub(60);
     let account_id = oauth
         .id_token
@@ -545,21 +596,46 @@ fn login_openai_chatgpt(
     Ok(())
 }
 
-fn run_openai_codex_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
+async fn run_openai_codex_oauth(
+    flow: OpenAiLoginFlow,
+) -> Result<OpenAiOauthTokenResponse, CliError> {
+    match flow {
+        OpenAiLoginFlow::Browser => run_openai_codex_browser_oauth().await,
+        OpenAiLoginFlow::DeviceCode => run_openai_codex_device_oauth().await,
+    }
+}
+
+async fn run_openai_codex_browser_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
     let listeners = open_oauth_listeners()?;
     let redirect_uri = format!("http://localhost:{OPENAI_CODEX_OAUTH_PORT}/auth/callback");
     let state = random_urlsafe(32)?;
     let verifier = random_pkce_verifier(43)?;
     let challenge = pkce_challenge(&verifier);
     let authorize_url = openai_codex_authorize_url(&redirect_uri, &state, &challenge);
-    println!("OpenAI ChatGPT subscription login");
+    println!("OpenAI ChatGPT subscription browser login");
     println!("Open this URL if your browser does not open automatically:\n{authorize_url}\n");
     println!(
         "If your browser says localhost refused to connect, copy the full redirected localhost URL, paste it here, and press Enter."
     );
     open_browser(&authorize_url);
     let code = wait_for_oauth_code(&listeners, &state)?;
-    exchange_openai_codex_code(&redirect_uri, &verifier, &code)
+    exchange_openai_codex_code_async(&redirect_uri, &verifier, &code).await
+}
+
+async fn run_openai_codex_device_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
+    let device = start_openai_codex_device_auth().await?;
+    println!("OpenAI ChatGPT subscription device login");
+    println!("Open this URL:\nhttps://auth.openai.com/codex/device\n");
+    println!("Enter this code: {}", device.user_code);
+    open_browser("https://auth.openai.com/codex/device");
+    let interval = device.interval.parse::<u64>().unwrap_or(5).max(1);
+    let token = poll_openai_codex_device_auth(&device, interval).await?;
+    exchange_openai_codex_code_async(
+        "https://auth.openai.com/deviceauth/callback",
+        &token.code_verifier,
+        &token.authorization_code,
+    )
+    .await
 }
 
 fn openai_codex_authorize_url(redirect_uri: &str, state: &str, challenge: &str) -> String {
@@ -583,41 +659,89 @@ fn openai_codex_authorize_url(redirect_uri: &str, state: &str, challenge: &str) 
     format!("{OPENAI_CODEX_AUTHORIZE_URL}?{query}")
 }
 
-fn exchange_openai_codex_code(
+async fn exchange_openai_codex_code_async(
     redirect_uri: &str,
     verifier: &str,
     code: &str,
 ) -> Result<OpenAiOauthTokenResponse, CliError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
-    runtime.block_on(async move {
-        let params = [
-            ("grant_type", "authorization_code"),
-            ("client_id", OPENAI_CODEX_CLIENT_ID),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", verifier),
-        ];
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("client_id", OPENAI_CODEX_CLIENT_ID),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", verifier),
+    ];
+    let response = reqwest::Client::new()
+        .post(OPENAI_CODEX_TOKEN_URL)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+    if !status.is_success() {
+        return Err(CliError::BundledPluginInstallFailed(format!(
+            "OpenAI OAuth token exchange failed with HTTP {status}: {body}"
+        )));
+    }
+    serde_json::from_str(&body).map_err(CliError::Json)
+}
+
+async fn start_openai_codex_device_auth() -> Result<OpenAiDeviceUserCodeResponse, CliError> {
+    let response = reqwest::Client::new()
+        .post("https://auth.openai.com/api/accounts/deviceauth/usercode")
+        .header("User-Agent", format!("bcode/{}", env!("CARGO_PKG_VERSION")))
+        .json(&serde_json::json!({ "client_id": OPENAI_CODEX_CLIENT_ID }))
+        .send()
+        .await
+        .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+    if !status.is_success() {
+        return Err(CliError::BundledPluginInstallFailed(format!(
+            "OpenAI device authorization failed with HTTP {status}: {body}"
+        )));
+    }
+    serde_json::from_str(&body).map_err(CliError::Json)
+}
+
+async fn poll_openai_codex_device_auth(
+    device: &OpenAiDeviceUserCodeResponse,
+    interval_seconds: u64,
+) -> Result<OpenAiDeviceTokenResponse, CliError> {
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval_seconds + 3)).await;
         let response = reqwest::Client::new()
-            .post(OPENAI_CODEX_TOKEN_URL)
-            .form(&params)
+            .post("https://auth.openai.com/api/accounts/deviceauth/token")
+            .header("User-Agent", format!("bcode/{}", env!("CARGO_PKG_VERSION")))
+            .json(&serde_json::json!({
+                "device_auth_id": device.device_auth_id,
+                "user_code": device.user_code,
+            }))
             .send()
             .await
             .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
-        if !status.is_success() {
+        if response.status().is_success() {
+            let body = response
+                .text()
+                .await
+                .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+            return serde_json::from_str(&body).map_err(CliError::Json);
+        }
+        if !matches!(response.status().as_u16(), 403 | 404) {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(CliError::BundledPluginInstallFailed(format!(
-                "OpenAI OAuth token exchange failed with HTTP {status}: {body}"
+                "OpenAI device authorization polling failed with HTTP {status}: {body}"
             )));
         }
-        serde_json::from_str(&body).map_err(CliError::Json)
-    })
+    }
 }
 
 fn open_oauth_listeners() -> Result<Vec<TcpListener>, CliError> {
@@ -684,9 +808,14 @@ fn poll_oauth_listeners(
 fn spawn_manual_oauth_callback_reader() -> Receiver<String> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_ok() {
-            let _ = sender.send(line);
+        loop {
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                break;
+            }
+            if sender.send(line).is_err() {
+                break;
+            }
         }
     });
     receiver
@@ -711,15 +840,21 @@ fn manual_oauth_callback_code(
     }
     match parse_oauth_callback(input.trim()) {
         OAuthCallbackParse::Code { code, state } if state == expected_state => Ok(Some(code)),
-        OAuthCallbackParse::Code { .. } => Err(CliError::BundledPluginInstallFailed(
-            "pasted OpenAI OAuth callback state did not match".to_string(),
-        )),
+        OAuthCallbackParse::Code { .. } => {
+            eprintln!(
+                "Pasted OpenAI OAuth callback state did not match; paste the newest redirected URL from this login attempt."
+            );
+            Ok(None)
+        }
         OAuthCallbackParse::Error(error) => Err(CliError::BundledPluginInstallFailed(format!(
             "OpenAI OAuth failed: {error}"
         ))),
-        OAuthCallbackParse::Ignored => Err(CliError::BundledPluginInstallFailed(
-            "pasted text was not an OpenAI OAuth callback URL".to_string(),
-        )),
+        OAuthCallbackParse::Ignored => {
+            eprintln!(
+                "Pasted text was not an OpenAI OAuth callback URL; paste the full localhost callback URL."
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -822,7 +957,7 @@ fn oauth_callback_path(input: &str) -> Option<&str> {
     let candidate = if input.starts_with("GET ") || input.starts_with("POST ") {
         input.split_whitespace().nth(1)?
     } else {
-        input.trim()
+        oauth_callback_url_from_text(input.trim())?
     };
     if candidate.starts_with("/auth/callback") {
         return Some(candidate);
@@ -830,6 +965,19 @@ fn oauth_callback_path(input: &str) -> Option<&str> {
     let (_, without_scheme) = candidate.split_once("://")?;
     let path_start = without_scheme.find('/')?;
     Some(&without_scheme[path_start..])
+}
+
+fn oauth_callback_url_from_text(input: &str) -> Option<&str> {
+    if input.starts_with("/auth/callback") {
+        return Some(input);
+    }
+    let start = input
+        .find("http://localhost:")
+        .or_else(|| input.find("http://127.0.0.1:"))
+        .or_else(|| input.find("http://[::1]:"))?;
+    let rest = &input[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(&rest[..end])
 }
 
 fn random_urlsafe(bytes: usize) -> Result<String, CliError> {
