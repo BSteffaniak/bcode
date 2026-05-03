@@ -238,7 +238,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let config = bcode_config::load_config()?;
     let plugin_selection = bcode_plugin::PluginSelection::from(&config);
     let plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
-    let listener = LocalIpcListener::bind(&endpoint).await?;
+    let listener = LocalIpcListener::bind(&endpoint)?;
     let sessions = SessionManager::persistent(default_session_store_dir())?;
     let state = Arc::new(ServerState::new(
         sessions,
