@@ -146,10 +146,18 @@ impl OpenAiCompatibleProviderPlugin {
 #[derive(Debug, Clone)]
 struct Settings {
     auth: AuthSettings,
+    auth_diagnostics: AuthDiagnostics,
     base_url: String,
     default_model: String,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AuthDiagnostics {
+    source: String,
+    mode: String,
+    detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1128,6 +1136,7 @@ fn openai_tool_name(name: &str) -> String {
 }
 
 fn capabilities() -> ProviderCapabilities {
+    let settings = settings();
     ProviderCapabilities {
         provider_id: PROVIDER_ID.to_string(),
         display_name: "OpenAI-Compatible".to_string(),
@@ -1138,7 +1147,7 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
-        metadata: BTreeMap::new(),
+        metadata: diagnostics_metadata(&settings),
     }
 }
 
@@ -1260,16 +1269,66 @@ fn validate_config() -> ValidateConfigResponse {
     if settings.auth.is_configured() {
         ValidateConfigResponse {
             valid: true,
-            message: Some("OpenAI provider authentication is configured".to_string()),
+            message: Some(format!(
+                "OpenAI provider authentication is configured ({})",
+                settings.auth_diagnostics.detail
+            )),
+            metadata: diagnostics_metadata(&settings),
         }
     } else {
         ValidateConfigResponse {
             valid: false,
-            message: Some(
-                "run `bcode login openai` or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY".to_string(),
-            ),
+            message: Some(format!(
+                "OpenAI provider authentication is not configured ({}); run `bcode login openai` or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY",
+                settings.auth_diagnostics.detail
+            )),
+            metadata: diagnostics_metadata(&settings),
         }
     }
+}
+
+fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
+    [
+        (
+            "auth_configured".to_string(),
+            settings.auth.is_configured().to_string(),
+        ),
+        (
+            "auth_source".to_string(),
+            settings.auth_diagnostics.source.clone(),
+        ),
+        (
+            "auth_mode".to_string(),
+            settings.auth_diagnostics.mode.clone(),
+        ),
+        (
+            "auth_detail".to_string(),
+            settings.auth_diagnostics.detail.clone(),
+        ),
+        (
+            "endpoint".to_string(),
+            if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
+                OPENAI_CODEX_API_ENDPOINT.to_string()
+            } else {
+                settings.base_url.clone()
+            },
+        ),
+        ("api_base_url".to_string(), settings.base_url.clone()),
+        ("default_model".to_string(), settings.default_model.clone()),
+        (
+            "model_list_source".to_string(),
+            if settings.model_ids_are_explicit {
+                "environment"
+            } else if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
+                "bundled_chatgpt_codex_defaults"
+            } else {
+                "provider_or_defaults"
+            }
+            .to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn settings() -> Settings {
@@ -1289,8 +1348,10 @@ fn settings() -> Settings {
     if !model_ids.contains(&default_model) {
         model_ids.insert(0, default_model.clone());
     }
+    let (auth, auth_diagnostics) = openai_auth_settings(&saved);
     Settings {
-        auth: openai_auth_settings(&saved),
+        auth,
+        auth_diagnostics,
         base_url: first_env(["BCODE_OPENAI_BASE_URL", "OPENAI_BASE_URL"])
             .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
             .or_else(|| saved.values.get("OPENAI_BASE_URL").cloned())
@@ -1352,12 +1413,42 @@ fn saved_openai_auth_is_chatgpt(saved: &SavedOpenAiAuth) -> bool {
         || saved.values.contains_key("BCODE_OPENAI_CODEX_ACCESS_TOKEN")
 }
 
-fn openai_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
-    if let Some(api_key) = first_env(["BCODE_OPENAI_API_KEY", "OPENAI_API_KEY"])
-        .or_else(|| saved.values.get("BCODE_OPENAI_API_KEY").cloned())
-        .or_else(|| saved.values.get("OPENAI_API_KEY").cloned())
-    {
-        return AuthSettings::ApiKey(api_key);
+fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnostics) {
+    if let Some(api_key) = env_value("BCODE_OPENAI_API_KEY") {
+        return (
+            AuthSettings::ApiKey(api_key),
+            AuthDiagnostics {
+                source: "environment".to_string(),
+                mode: "api_key".to_string(),
+                detail: "environment variable BCODE_OPENAI_API_KEY".to_string(),
+            },
+        );
+    }
+    if let Some(api_key) = env_value("OPENAI_API_KEY") {
+        return (
+            AuthSettings::ApiKey(api_key),
+            AuthDiagnostics {
+                source: "environment".to_string(),
+                mode: "api_key".to_string(),
+                detail: "environment variable OPENAI_API_KEY".to_string(),
+            },
+        );
+    }
+    if let Some(api_key) = saved.values.get("BCODE_OPENAI_API_KEY").cloned() {
+        return (
+            AuthSettings::ApiKey(api_key),
+            saved_auth_diagnostics(
+                saved,
+                "api_key",
+                "saved sshenv API key BCODE_OPENAI_API_KEY",
+            ),
+        );
+    }
+    if let Some(api_key) = saved.values.get("OPENAI_API_KEY").cloned() {
+        return (
+            AuthSettings::ApiKey(api_key),
+            saved_auth_diagnostics(saved, "api_key", "saved sshenv API key OPENAI_API_KEY"),
+        );
     }
     let saved_mode = saved
         .values
@@ -1366,12 +1457,66 @@ fn openai_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
     if saved_openai_auth_is_chatgpt(saved) || saved_mode == Some("chatgpt") {
         return saved_chatgpt_auth_settings(saved);
     }
-    AuthSettings::Missing
+    (
+        AuthSettings::Missing,
+        AuthDiagnostics {
+            source: "missing".to_string(),
+            mode: saved
+                .mode
+                .as_ref()
+                .map_or("unknown", |mode| match mode {
+                    AuthMode::ApiKey => "api_key",
+                    AuthMode::ChatGpt => "chatgpt",
+                })
+                .to_string(),
+            detail: saved.profile.as_ref().map_or_else(
+                || "no saved OpenAI auth profile and no API key environment variable".to_string(),
+                |profile| format!("saved profile '{profile}' did not contain usable credentials"),
+            ),
+        },
+    )
 }
 
-fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
+fn env_value(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+fn saved_auth_diagnostics(
+    saved: &SavedOpenAiAuth,
+    mode: &str,
+    credential_description: &str,
+) -> AuthDiagnostics {
+    let location = match (&saved.profile, &saved.vault) {
+        (Some(profile), Some(vault)) => format!(
+            "{credential_description} from profile '{profile}' in vault {}",
+            vault.display()
+        ),
+        (Some(profile), None) => {
+            format!("{credential_description} from profile '{profile}'")
+        }
+        (None, Some(vault)) => format!("{credential_description} from vault {}", vault.display()),
+        (None, None) => credential_description.to_string(),
+    };
+    AuthDiagnostics {
+        source: "sshenv".to_string(),
+        mode: mode.to_string(),
+        detail: location,
+    }
+}
+
+fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnostics) {
     let Some(access_token) = saved.values.get("BCODE_OPENAI_CODEX_ACCESS_TOKEN").cloned() else {
-        return AuthSettings::Missing;
+        return (
+            AuthSettings::Missing,
+            saved_auth_diagnostics(
+                saved,
+                "chatgpt",
+                "saved sshenv ChatGPT/Codex auth without an access token",
+            ),
+        );
     };
     let account_id = saved
         .values
@@ -1384,20 +1529,23 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
                 .and_then(|token| chatgpt_account_id_from_access_token(token))
         })
         .or_else(|| chatgpt_account_id_from_access_token(&access_token));
-    AuthSettings::ChatGpt {
-        access_token,
-        refresh_token: saved
-            .values
-            .get("BCODE_OPENAI_CODEX_REFRESH_TOKEN")
-            .cloned(),
-        expires_at: saved
-            .values
-            .get("BCODE_OPENAI_CODEX_EXPIRES_AT")
-            .and_then(|value| value.parse().ok()),
-        account_id,
-        profile: saved.profile.clone(),
-        vault: saved.vault.clone(),
-    }
+    (
+        AuthSettings::ChatGpt {
+            access_token,
+            refresh_token: saved
+                .values
+                .get("BCODE_OPENAI_CODEX_REFRESH_TOKEN")
+                .cloned(),
+            expires_at: saved
+                .values
+                .get("BCODE_OPENAI_CODEX_EXPIRES_AT")
+                .and_then(|value| value.parse().ok()),
+            account_id,
+            profile: saved.profile.clone(),
+            vault: saved.vault.clone(),
+        },
+        saved_auth_diagnostics(saved, "chatgpt", "saved sshenv ChatGPT/Codex auth"),
+    )
 }
 
 fn default_model_ids(chatgpt_mode: bool) -> Vec<String> {
@@ -1751,6 +1899,27 @@ mod tests {
 
         assert_eq!(body.data.len(), 2);
         assert_eq!(body.data[0].id, "model-a");
+    }
+
+    #[test]
+    fn saved_chatgpt_auth_reports_sshenv_diagnostics() {
+        let saved = SavedOpenAiAuth {
+            values: std::iter::once((
+                "BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_string(),
+                "token".to_string(),
+            ))
+            .collect(),
+            mode: Some(AuthMode::ChatGpt),
+            profile: Some("bcode-openai".to_string()),
+            vault: Some(std::path::PathBuf::from("/tmp/bcode-auth-vault")),
+        };
+
+        let (auth, diagnostics) = saved_chatgpt_auth_settings(&saved);
+
+        assert!(auth.is_configured());
+        assert_eq!(diagnostics.source, "sshenv");
+        assert_eq!(diagnostics.mode, "chatgpt");
+        assert!(diagnostics.detail.contains("bcode-openai"));
     }
 }
 

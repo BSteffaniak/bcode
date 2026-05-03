@@ -234,6 +234,7 @@ enum SessionCommand {
 enum ModelCommand {
     List,
     Capabilities,
+    Validate,
     Set {
         session_id: SessionId,
         model_id: String,
@@ -386,6 +387,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
     match command {
         ModelCommand::List => list_models().await?,
         ModelCommand::Capabilities => model_capabilities().await?,
+        ModelCommand::Validate => model_validate_config().await?,
         ModelCommand::Set {
             session_id,
             provider,
@@ -1414,6 +1416,27 @@ async fn model_capabilities() -> Result<(), CliError> {
     );
     for capability in capabilities.capabilities {
         println!("capability\t{capability:?}");
+    }
+    for (key, value) in capabilities.metadata {
+        println!("metadata\t{key}\t{value}");
+    }
+    Ok(())
+}
+
+async fn model_validate_config() -> Result<(), CliError> {
+    let response = call_model_provider_service(bcode_model::OP_VALIDATE_CONFIG).await?;
+    if let Some(error) = response.error {
+        println!("ERROR\t{}\t{}", error.code, error.message);
+        return Ok(());
+    }
+    let validation: bcode_model::ValidateConfigResponse =
+        serde_json::from_slice(&response.payload)?;
+    println!("valid\t{}", validation.valid);
+    if let Some(message) = validation.message {
+        println!("message\t{message}");
+    }
+    for (key, value) in validation.metadata {
+        println!("metadata\t{key}\t{value}");
     }
     Ok(())
 }

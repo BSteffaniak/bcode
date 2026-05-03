@@ -101,6 +101,8 @@ pub struct ValidateConfigResponse {
     pub valid: bool,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Start a provider model turn.

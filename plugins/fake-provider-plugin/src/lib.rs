@@ -72,6 +72,7 @@ impl RustPlugin for FakeProviderPlugin {
             OP_VALIDATE_CONFIG => json_response(&ValidateConfigResponse {
                 valid: true,
                 message: Some("fake provider is always valid".to_string()),
+                metadata: std::collections::BTreeMap::new(),
             }),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
