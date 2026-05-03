@@ -1147,7 +1147,7 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
-        metadata: diagnostics_metadata(&settings),
+        metadata: diagnostics_metadata(&settings, None),
     }
 }
 
@@ -1265,30 +1265,55 @@ fn model_ids_with_default(models: Vec<ModelResponseItem>, default_model: &str) -
 }
 
 fn validate_config() -> ValidateConfigResponse {
-    let settings = settings();
-    if settings.auth.is_configured() {
+    let mut settings = settings();
+    let refresh_status = validate_chatgpt_refresh(&mut settings);
+    let valid = settings.auth.is_configured() && refresh_status.is_ok();
+    let refresh_metadata = match &refresh_status {
+        Ok(status) => status.clone(),
+        Err(error) => format!("failed:{}:{:?}", error.code, error.category),
+    };
+    if valid {
         ValidateConfigResponse {
             valid: true,
             message: Some(format!(
                 "OpenAI provider authentication is configured ({})",
                 settings.auth_diagnostics.detail
             )),
-            metadata: diagnostics_metadata(&settings),
+            metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
         }
     } else {
         ValidateConfigResponse {
             valid: false,
-            message: Some(format!(
-                "OpenAI provider authentication is not configured ({}); run `bcode login openai` or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY",
-                settings.auth_diagnostics.detail
+            message: Some(validation_failure_message(
+                &settings,
+                refresh_status.as_ref().err(),
             )),
-            metadata: diagnostics_metadata(&settings),
+            metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
         }
     }
 }
 
-fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
-    [
+fn validation_failure_message(
+    settings: &Settings,
+    refresh_error: Option<&ProviderError>,
+) -> String {
+    if let Some(error) = refresh_error {
+        return format!(
+            "OpenAI provider authentication refresh failed ({}: {:?}); {}",
+            error.code, error.category, error.message
+        );
+    }
+    format!(
+        "OpenAI provider authentication is not configured ({}); run `bcode login openai` or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY",
+        settings.auth_diagnostics.detail
+    )
+}
+
+fn diagnostics_metadata(
+    settings: &Settings,
+    token_refresh_status: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut metadata = [
         (
             "auth_configured".to_string(),
             settings.auth.is_configured().to_string(),
@@ -1328,7 +1353,14 @@ fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
         ),
     ]
     .into_iter()
-    .collect()
+    .collect::<BTreeMap<_, _>>();
+    if let Some(token_refresh_status) = token_refresh_status {
+        metadata.insert(
+            "token_refresh_status".to_string(),
+            token_refresh_status.to_string(),
+        );
+    }
+    metadata
 }
 
 fn settings() -> Settings {
@@ -1574,6 +1606,45 @@ struct OpenAiOauthTokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+}
+
+fn validate_chatgpt_refresh(settings: &mut Settings) -> Result<String, ProviderError> {
+    match &settings.auth {
+        AuthSettings::Missing | AuthSettings::ApiKey(_) => Ok("not_applicable".to_string()),
+        AuthSettings::ChatGpt {
+            expires_at: None, ..
+        } => Ok("not_checked_no_expiry".to_string()),
+        AuthSettings::ChatGpt {
+            expires_at: Some(expires_at),
+            refresh_token,
+            ..
+        } => {
+            let now = unix_timestamp();
+            if *expires_at > now + 60 {
+                return Ok(format!("not_needed_expires_in_{}s", expires_at - now));
+            }
+            if refresh_token.is_none() {
+                return Err(provider_error(
+                    "missing_refresh_token",
+                    ProviderErrorCategory::Auth,
+                    "saved ChatGPT/Codex access token is expired or expiring soon and no refresh token is saved; run `bcode login openai` again",
+                ));
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(|error| {
+                    provider_error(
+                        "runtime_build_failed",
+                        ProviderErrorCategory::ProviderInternal,
+                        error.to_string(),
+                    )
+                })?;
+            runtime.block_on(refresh_chatgpt_auth_if_needed(settings))?;
+            Ok("refreshed".to_string())
+        }
+    }
 }
 
 async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), ProviderError> {
