@@ -705,6 +705,8 @@ struct ChatApp {
     search_query: String,
     key_hints: String,
     permission_hints: String,
+    assistant_stream_start: Option<usize>,
+    assistant_stream_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -718,8 +720,12 @@ struct PendingPermissionView {
 impl PendingPermissionView {
     fn render_text(&self, key_hints: &str) -> String {
         format!(
-            "permission: {}\ntool: {} ({})\narguments: {}\n{}",
-            self.permission_id, self.tool_name, self.tool_call_id, self.arguments_json, key_hints
+            "Tool wants permission\n{} ({})\npermission {}\n{}\n{}",
+            self.tool_name,
+            self.tool_call_id,
+            self.permission_id,
+            pretty_jsonish(&self.arguments_json),
+            key_hints
         )
     }
 
@@ -761,8 +767,13 @@ impl PendingPermissionView {
     }
 }
 
-const STREAMING_ASSISTANT_PREFIX: &str = "assistant (streaming): ";
-const FINAL_ASSISTANT_PREFIX: &str = "assistant: ";
+const STREAMING_ASSISTANT_PREFIX: &str = "Bcode … ";
+const FINAL_ASSISTANT_PREFIX: &str = "Bcode: ";
+const USER_PREFIX: &str = "You: ";
+const TOOL_PREFIX: &str = "Tool: ";
+const PERMISSION_PREFIX: &str = "Permission: ";
+const META_PREFIX: &str = "· ";
+const CONTINUATION_PREFIX: &str = "  ";
 
 impl ChatApp {
     fn new(session_id: SessionId, history: &[SessionEvent], keymap: &KeyMap) -> Self {
@@ -783,12 +794,14 @@ impl ChatApp {
             search_query: String::new(),
             key_hints: keymap.chat_hints(),
             permission_hints: format!(
-                "{} approve once, {} deny once, {} always allow, {} always deny",
+                "{} allow once · {} deny · {} always allow · {} always deny",
                 keymap.primary(TuiAction::PermissionApprove),
                 keymap.primary(TuiAction::PermissionDeny),
                 keymap.primary(TuiAction::PermissionAlwaysAllow),
                 keymap.primary(TuiAction::PermissionAlwaysDeny),
             ),
+            assistant_stream_start: None,
+            assistant_stream_text: String::new(),
         };
         for event in history {
             app.absorb_session_event(event);
@@ -958,36 +971,42 @@ impl ChatApp {
             }
             _ => {}
         }
-        self.lines.push(format_session_event(event));
+        self.push_session_event(event);
         self.clamp_scroll();
     }
 
+    fn push_session_event(&mut self, event: &SessionEvent) {
+        self.finish_streaming_block_if_needed();
+        self.lines.extend(format_session_event_lines(event));
+    }
+
     fn push_assistant_delta(&mut self, text: &str) {
-        if let Some(last) = self
-            .lines
-            .last_mut()
-            .filter(|line| line.starts_with(STREAMING_ASSISTANT_PREFIX))
-        {
-            last.push_str(text);
-        } else {
-            self.lines
-                .push(format!("{STREAMING_ASSISTANT_PREFIX}{text}"));
-        }
+        let start = *self.assistant_stream_start.get_or_insert(self.lines.len());
+        self.assistant_stream_text.push_str(text);
+        self.lines.truncate(start);
+        push_prefixed_multiline(
+            &mut self.lines,
+            STREAMING_ASSISTANT_PREFIX,
+            &self.assistant_stream_text,
+        );
         self.clamp_scroll();
     }
 
     fn finish_assistant_message(&mut self, text: &str) {
-        let final_message = format!("{FINAL_ASSISTANT_PREFIX}{text}");
-        if let Some(last) = self
-            .lines
-            .last_mut()
-            .filter(|line| line.starts_with(STREAMING_ASSISTANT_PREFIX))
-        {
-            *last = final_message;
-        } else {
-            self.lines.push(final_message);
+        if let Some(start) = self.assistant_stream_start.take() {
+            self.lines.truncate(start);
+            self.assistant_stream_text.clear();
         }
+        push_prefixed_multiline(&mut self.lines, FINAL_ASSISTANT_PREFIX, text);
         self.clamp_scroll();
+    }
+
+    fn finish_streaming_block_if_needed(&mut self) {
+        if let Some(start) = self.assistant_stream_start.take() {
+            let text = std::mem::take(&mut self.assistant_stream_text);
+            self.lines.truncate(start);
+            push_prefixed_multiline(&mut self.lines, FINAL_ASSISTANT_PREFIX, &text);
+        }
     }
 
     fn clamp_scroll(&mut self) {
@@ -1059,10 +1078,10 @@ impl ratatui::widgets::Widget for &ChatApp {
         let provider = self
             .selected_provider_plugin_id
             .as_deref()
-            .unwrap_or("<auto>");
-        let model = self.selected_model_id.as_deref().unwrap_or("<default>");
+            .unwrap_or("auto");
+        let model = self.selected_model_id.as_deref().unwrap_or("default");
         let header = Paragraph::new(format!(
-            "Bcode session {} | provider: {provider} | model: {model}",
+            "Bcode  {}  provider: {provider}  model: {model}",
             self.session_id
         ));
         header.render(chunks[0], buf);
@@ -1075,9 +1094,9 @@ impl ratatui::widgets::Widget for &ChatApp {
             .max(transcript_height.min(self.lines.len()));
         let start = visible_end.saturating_sub(transcript_height);
         let title = if self.scroll_from_bottom == 0 {
-            "Transcript".to_string()
+            "Chat".to_string()
         } else {
-            format!("Transcript ({} from bottom)", self.scroll_from_bottom)
+            format!("Chat ({} from bottom)", self.scroll_from_bottom)
         };
         let transcript_lines = self.lines[start..visible_end]
             .iter()
@@ -1100,7 +1119,11 @@ impl ratatui::widgets::Widget for &ChatApp {
             3
         });
 
-        let input_title = if self.search_mode { "Search" } else { "Input" };
+        let input_title = if self.search_mode {
+            "Search"
+        } else {
+            "Message"
+        };
         let input = Paragraph::new(self.input.as_str())
             .block(Block::new().title(input_title).borders(Borders::ALL))
             .wrap(Wrap { trim: false });
@@ -1138,21 +1161,25 @@ fn classify_transcript_line(line: &str) -> (&str, &str, Style, Style) {
     for (prefix, style) in [
         (STREAMING_ASSISTANT_PREFIX, streaming_style),
         (FINAL_ASSISTANT_PREFIX, assistant_style),
-        ("↳ tool requested: ", tool_style),
-        ("↳ tool result", tool_style),
-        ("⚠ permission requested: ", permission_style),
-        ("permission resolved: ", permission_style),
+        (
+            USER_PREFIX,
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (TOOL_PREFIX, tool_style),
+        (PERMISSION_PREFIX, permission_style),
+        (META_PREFIX, metadata_style),
     ] {
         if let Some(body) = line.strip_prefix(prefix) {
             return (prefix, body, style, body_style);
         }
     }
 
-    if line.starts_with('#') {
-        (line, "", metadata_style, body_style)
-    } else {
-        ("", line, body_style, body_style)
-    }
+    line.strip_prefix(CONTINUATION_PREFIX)
+        .map_or(("", line, body_style, body_style), |body| {
+            (CONTINUATION_PREFIX, body, metadata_style, body_style)
+        })
 }
 
 fn push_highlighted_spans(
@@ -1217,57 +1244,93 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn format_session_event(event: &SessionEvent) -> String {
+fn format_session_event_lines(event: &SessionEvent) -> Vec<String> {
+    let mut lines = Vec::new();
     match &event.kind {
         SessionEventKind::SessionCreated { name } => {
-            let name = name.as_deref().unwrap_or("<unnamed>");
-            format!("#{} session created: {name}", event.sequence)
+            let name = name.as_deref().unwrap_or("untitled");
+            lines.push(format!("{META_PREFIX}session started: {name}"));
         }
-        SessionEventKind::ClientAttached { client_id } => {
-            format!("#{} client attached: {client_id}", event.sequence)
-        }
-        SessionEventKind::ClientDetached { client_id } => {
-            format!("#{} client detached: {client_id}", event.sequence)
-        }
-        SessionEventKind::UserMessage { client_id, text } => {
-            format!("#{} {client_id}: {text}", event.sequence)
+        SessionEventKind::ClientAttached { .. } | SessionEventKind::ClientDetached { .. } => {}
+        SessionEventKind::UserMessage { text, .. } => {
+            push_prefixed_multiline(&mut lines, USER_PREFIX, text);
         }
         SessionEventKind::AssistantDelta { text } => {
-            format!("{STREAMING_ASSISTANT_PREFIX}{text}")
+            push_prefixed_multiline(&mut lines, STREAMING_ASSISTANT_PREFIX, text);
         }
         SessionEventKind::AssistantMessage { text } => {
-            format!("{FINAL_ASSISTANT_PREFIX}{text}")
+            push_prefixed_multiline(&mut lines, FINAL_ASSISTANT_PREFIX, text);
         }
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
             arguments_json,
-        } => format!("↳ tool requested: {tool_name} ({tool_call_id}) {arguments_json}"),
+        } => {
+            lines.push(format!(
+                "{TOOL_PREFIX}{tool_name} requested ({tool_call_id})"
+            ));
+            push_plain_multiline(&mut lines, &pretty_jsonish(arguments_json));
+        }
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
             is_error,
         } => {
-            let status = if *is_error { "error" } else { "ok" };
-            format!("↳ tool result ({status}) for {tool_call_id}:\n{result}")
+            let status = if *is_error { "failed" } else { "completed" };
+            lines.push(format!("{TOOL_PREFIX}{tool_call_id} {status}"));
+            push_plain_multiline(&mut lines, result);
         }
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,
             tool_name,
             arguments_json,
-        } => format!(
-            "⚠ permission requested: {permission_id} {tool_name} ({tool_call_id}) {arguments_json}"
-        ),
-        SessionEventKind::PermissionResolved {
-            permission_id,
-            approved,
-        } => format!("permission resolved: {permission_id} approved={approved}"),
-        SessionEventKind::ModelChanged { provider, model } => {
-            format!("#{} model changed: {provider}/{model}", event.sequence)
+        } => {
+            lines.push(format!(
+                "{PERMISSION_PREFIX}{tool_name} needs approval ({permission_id}, {tool_call_id})"
+            ));
+            push_plain_multiline(&mut lines, &pretty_jsonish(arguments_json));
         }
-        SessionEventKind::SystemMessage { text } => format!("#{} system: {text}", event.sequence),
+        SessionEventKind::PermissionResolved { approved, .. } => {
+            let decision = if *approved { "allowed" } else { "denied" };
+            lines.push(format!("{PERMISSION_PREFIX}{decision}"));
+        }
+        SessionEventKind::ModelChanged { provider, model } => {
+            lines.push(format!("{META_PREFIX}model changed: {provider}/{model}"));
+        }
+        SessionEventKind::SystemMessage { text } => {
+            push_prefixed_multiline(&mut lines, META_PREFIX, text);
+        }
     }
+    lines
+}
+
+fn push_prefixed_multiline(lines: &mut Vec<String>, prefix: &str, text: &str) {
+    let mut text_lines = text.lines();
+    if let Some(first) = text_lines.next() {
+        lines.push(format!("{prefix}{first}"));
+        for line in text_lines {
+            lines.push(format!("{CONTINUATION_PREFIX}{line}"));
+        }
+    } else {
+        lines.push(prefix.trim_end().to_string());
+    }
+}
+
+fn push_plain_multiline(lines: &mut Vec<String>, text: &str) {
+    for line in text.lines().take(80) {
+        lines.push(format!("{CONTINUATION_PREFIX}{line}"));
+    }
+    if text.lines().count() > 80 {
+        lines.push(format!("{CONTINUATION_PREFIX}… output truncated in TUI"));
+    }
+}
+
+fn pretty_jsonish(value: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|json| serde_json::to_string_pretty(&json).ok())
+        .unwrap_or_else(|| value.to_string())
 }
 
 #[cfg(test)]
