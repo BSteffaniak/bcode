@@ -248,15 +248,17 @@ enum LoginCommand {
     },
 }
 
-const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73fw0CkXAXp7hrann";
+const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const OPENAI_CODEX_AUDIENCE: &str = "https://api.openai.com/v1";
 const OPENAI_CODEX_SCOPE: &str = "openid profile email offline_access";
+const OPENAI_CODEX_OAUTH_PORT: u16 = 1455;
 
 #[derive(Debug, Deserialize)]
 struct OpenAiOauthTokenResponse {
     access_token: String,
+    #[serde(default)]
+    id_token: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
@@ -463,7 +465,11 @@ fn login_openai_chatgpt(
 ) -> Result<(), CliError> {
     let oauth = run_openai_codex_oauth()?;
     let expires_at = unix_timestamp() + oauth.expires_in.unwrap_or(3600).saturating_sub(60);
-    let account_id = chatgpt_account_id_from_access_token(&oauth.access_token);
+    let account_id = oauth
+        .id_token
+        .as_deref()
+        .and_then(chatgpt_account_id_from_access_token)
+        .or_else(|| chatgpt_account_id_from_access_token(&oauth.access_token));
     store
         .set_secret(
             &profile,
@@ -482,6 +488,17 @@ fn login_openai_chatgpt(
         .map_err(|error| {
             CliError::BundledPluginInstallFailed(format!("failed to store access token: {error}"))
         })?;
+    if let Some(id_token) = oauth.id_token {
+        store
+            .set_secret(
+                &profile,
+                "BCODE_OPENAI_CODEX_ID_TOKEN",
+                Zeroizing::new(id_token),
+            )
+            .map_err(|error| {
+                CliError::BundledPluginInstallFailed(format!("failed to store ID token: {error}"))
+            })?;
+    }
     if let Some(refresh_token) = oauth.refresh_token {
         store
             .set_secret(
@@ -528,13 +545,14 @@ fn login_openai_chatgpt(
 }
 
 fn run_openai_codex_oauth() -> Result<OpenAiOauthTokenResponse, CliError> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}/auth/callback",
-        listener.local_addr()?.port()
-    );
+    let listener = TcpListener::bind(("localhost", OPENAI_CODEX_OAUTH_PORT)).map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!(
+            "failed to bind OpenAI OAuth callback server on localhost:{OPENAI_CODEX_OAUTH_PORT}: {error}"
+        ))
+    })?;
+    let redirect_uri = format!("http://localhost:{OPENAI_CODEX_OAUTH_PORT}/auth/callback");
     let state = random_urlsafe(32)?;
-    let verifier = random_urlsafe(64)?;
+    let verifier = random_pkce_verifier(43)?;
     let challenge = pkce_challenge(&verifier);
     let authorize_url = openai_codex_authorize_url(&redirect_uri, &state, &challenge);
     println!("OpenAI ChatGPT subscription login");
@@ -550,10 +568,12 @@ fn openai_codex_authorize_url(redirect_uri: &str, state: &str, challenge: &str) 
         ("client_id", OPENAI_CODEX_CLIENT_ID),
         ("redirect_uri", redirect_uri),
         ("scope", OPENAI_CODEX_SCOPE),
-        ("audience", OPENAI_CODEX_AUDIENCE),
-        ("state", state),
         ("code_challenge", challenge),
         ("code_challenge_method", "S256"),
+        ("id_token_add_organizations", "true"),
+        ("codex_cli_simplified_flow", "true"),
+        ("state", state),
+        ("originator", "bcode"),
     ];
     let query = params
         .into_iter()
@@ -579,7 +599,6 @@ fn exchange_openai_codex_code(
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("code_verifier", verifier),
-            ("audience", OPENAI_CODEX_AUDIENCE),
         ];
         let response = reqwest::Client::new()
             .post(OPENAI_CODEX_TOKEN_URL)
@@ -656,6 +675,18 @@ fn random_urlsafe(bytes: usize) -> Result<String, CliError> {
     Ok(URL_SAFE_NO_PAD.encode(data))
 }
 
+fn random_pkce_verifier(length: usize) -> Result<String, CliError> {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut data = vec![0_u8; length];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut data)
+        .map_err(|error| CliError::BundledPluginInstallFailed(error.to_string()))?;
+    Ok(data
+        .into_iter()
+        .map(|byte| char::from(CHARS[usize::from(byte) % CHARS.len()]))
+        .collect())
+}
+
 fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
@@ -665,8 +696,19 @@ fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
     claims
-        .get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .get("chatgpt_account_id")
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+        })
+        .or_else(|| {
+            claims
+                .get("organizations")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|organizations| organizations.first())
+                .and_then(|organization| organization.get("id"))
+        })
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string)
 }

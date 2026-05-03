@@ -29,8 +29,9 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL_ID: &str = "gpt-4.1-mini";
 const DEFAULT_CODEX_MODEL_ID: &str = "gpt-5.5";
 const PROVIDER_ID: &str = "bcode.openai-compatible";
-const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73fw0CkXAXp7hrann";
+const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 /// OpenAI-compatible model provider plugin.
 #[derive(Default)]
@@ -497,7 +498,7 @@ async fn send_responses_request(
     access_token: &str,
     request: &ModelTurnRequest,
 ) -> Result<reqwest::Response, ProviderError> {
-    let url = format!("{}/responses", settings.base_url.trim_end_matches('/'));
+    let url = OPENAI_CODEX_API_ENDPOINT;
     let request_body = ResponsesRequest {
         model: if request.model_id.is_empty() {
             settings.default_model.clone()
@@ -516,14 +517,16 @@ async fn send_responses_request(
     let mut builder = client
         .post(url)
         .bearer_auth(access_token)
-        .header("OpenAI-Beta", "responses=v1")
+        .header("originator", "bcode")
+        .header("User-Agent", "bcode/0.0.1")
+        .header("session_id", request.session_id.to_string())
         .json(&request_body);
     if let AuthSettings::ChatGpt {
         account_id: Some(account_id),
         ..
     } = &settings.auth
     {
-        builder = builder.header("chatgpt-account-id", account_id);
+        builder = builder.header("ChatGPT-Account-Id", account_id);
     }
     let response = builder.send().await.map_err(|error| {
         provider_error(
@@ -1365,6 +1368,12 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> AuthSettings {
         .values
         .get("BCODE_OPENAI_CODEX_ACCOUNT_ID")
         .cloned()
+        .or_else(|| {
+            saved
+                .values
+                .get("BCODE_OPENAI_CODEX_ID_TOKEN")
+                .and_then(|token| chatgpt_account_id_from_access_token(token))
+        })
         .or_else(|| chatgpt_account_id_from_access_token(&access_token));
     AuthSettings::ChatGpt {
         access_token,
@@ -1403,6 +1412,8 @@ fn default_model_ids(chatgpt_mode: bool) -> Vec<String> {
 struct OpenAiOauthTokenResponse {
     access_token: String,
     #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
@@ -1432,63 +1443,20 @@ async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), P
         .unwrap_or_else(|| refresh_token.clone());
     let next_expires_at =
         unix_timestamp() + refreshed.expires_in.unwrap_or(3600).saturating_sub(60);
-    let account_id = chatgpt_account_id_from_access_token(&refreshed.access_token);
+    let account_id = refreshed
+        .id_token
+        .as_deref()
+        .and_then(chatgpt_account_id_from_access_token)
+        .or_else(|| chatgpt_account_id_from_access_token(&refreshed.access_token));
     if let (Some(profile), Some(vault)) = (profile, vault) {
-        let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
-        store
-            .set_secret(
-                profile,
-                "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
-                Zeroizing::new(refreshed.access_token.clone()),
-            )
-            .map_err(|error| {
-                provider_error(
-                    "token_store_failed",
-                    ProviderErrorCategory::Auth,
-                    error.to_string(),
-                )
-            })?;
-        store
-            .set_secret(
-                profile,
-                "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
-                Zeroizing::new(next_refresh_token.clone()),
-            )
-            .map_err(|error| {
-                provider_error(
-                    "token_store_failed",
-                    ProviderErrorCategory::Auth,
-                    error.to_string(),
-                )
-            })?;
-        store
-            .set_secret(
-                profile,
-                "BCODE_OPENAI_CODEX_EXPIRES_AT",
-                Zeroizing::new(next_expires_at.to_string()),
-            )
-            .map_err(|error| {
-                provider_error(
-                    "token_store_failed",
-                    ProviderErrorCategory::Auth,
-                    error.to_string(),
-                )
-            })?;
-        if let Some(account_id) = &account_id {
-            store
-                .set_secret(
-                    profile,
-                    "BCODE_OPENAI_CODEX_ACCOUNT_ID",
-                    Zeroizing::new(account_id.clone()),
-                )
-                .map_err(|error| {
-                    provider_error(
-                        "token_store_failed",
-                        ProviderErrorCategory::Auth,
-                        error.to_string(),
-                    )
-                })?;
-        }
+        store_refreshed_chatgpt_auth(
+            profile,
+            vault,
+            &refreshed,
+            &next_refresh_token,
+            next_expires_at,
+            account_id.as_deref(),
+        )?;
     }
     settings.auth = AuthSettings::ChatGpt {
         access_token: refreshed.access_token,
@@ -1499,6 +1467,69 @@ async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), P
         vault: vault.clone(),
     };
     Ok(())
+}
+
+fn store_refreshed_chatgpt_auth(
+    profile: &str,
+    vault: &std::path::Path,
+    refreshed: &OpenAiOauthTokenResponse,
+    next_refresh_token: &str,
+    next_expires_at: u64,
+    account_id: Option<&str>,
+) -> Result<(), ProviderError> {
+    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    set_codex_secret(
+        &store,
+        profile,
+        "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
+        refreshed.access_token.clone(),
+    )?;
+    if let Some(id_token) = &refreshed.id_token {
+        set_codex_secret(
+            &store,
+            profile,
+            "BCODE_OPENAI_CODEX_ID_TOKEN",
+            id_token.clone(),
+        )?;
+    }
+    set_codex_secret(
+        &store,
+        profile,
+        "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
+        next_refresh_token.to_string(),
+    )?;
+    set_codex_secret(
+        &store,
+        profile,
+        "BCODE_OPENAI_CODEX_EXPIRES_AT",
+        next_expires_at.to_string(),
+    )?;
+    if let Some(account_id) = account_id {
+        set_codex_secret(
+            &store,
+            profile,
+            "BCODE_OPENAI_CODEX_ACCOUNT_ID",
+            account_id.to_string(),
+        )?;
+    }
+    Ok(())
+}
+
+fn set_codex_secret(
+    store: &sshenv_vault::SshenvStore,
+    profile: &str,
+    key: &str,
+    value: String,
+) -> Result<(), ProviderError> {
+    store
+        .set_secret(profile, key, Zeroizing::new(value))
+        .map_err(|error| {
+            provider_error(
+                "token_store_failed",
+                ProviderErrorCategory::Auth,
+                error.to_string(),
+            )
+        })
 }
 
 async fn refresh_openai_codex_token(
@@ -1546,8 +1577,19 @@ fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
     claims
-        .get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .get("chatgpt_account_id")
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+        })
+        .or_else(|| {
+            claims
+                .get("organizations")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|organizations| organizations.first())
+                .and_then(|organization| organization.get("id"))
+        })
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string)
 }
