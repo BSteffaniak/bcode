@@ -1145,6 +1145,8 @@ Tool and safety rules:
 const MAX_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
 const MAX_CONTEXT_FILE_CHARS: usize = 6_000;
 const MAX_GIT_STATUS_CHARS: usize = 4_000;
+const MAX_MODEL_TOOL_RESULT_CHARS: usize = 16_000;
+const MODEL_TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 
 fn build_coding_system_prompt() -> String {
     format!(
@@ -1256,6 +1258,24 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
         truncated.push_str("\n[truncated]");
     }
     truncated
+}
+
+fn tool_result_for_model(result: &str) -> String {
+    let char_count = result.chars().count();
+    if char_count <= MAX_MODEL_TOOL_RESULT_CHARS {
+        return result.to_string();
+    }
+
+    let marker = "\n\n[tool output truncated before model continuation; full output is preserved in session history]\n\n";
+    let marker_chars = marker.chars().count();
+    let tail_chars = MODEL_TOOL_RESULT_TAIL_CHARS.min(MAX_MODEL_TOOL_RESULT_CHARS / 4);
+    let head_chars = MAX_MODEL_TOOL_RESULT_CHARS
+        .saturating_sub(marker_chars)
+        .saturating_sub(tail_chars);
+    let head = result.chars().take(head_chars).collect::<String>();
+    let mut tail = result.chars().rev().take(tail_chars).collect::<Vec<_>>();
+    tail.reverse();
+    format!("{head}{marker}{}", tail.into_iter().collect::<String>())
 }
 
 fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
@@ -1538,7 +1558,7 @@ fn session_event_to_model_message(
             content: vec![ContentBlock::ToolResult {
                 result: bcode_model::ToolResult {
                     call_id: tool_call_id.clone(),
-                    output: result.clone(),
+                    output: tool_result_for_model(result),
                     is_error: *is_error,
                 },
             }],
@@ -1791,4 +1811,57 @@ fn default_session_store_dir() -> PathBuf {
             .join("sessions");
     }
     env::temp_dir().join("bcode").join("sessions")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
+
+    #[test]
+    fn tool_result_for_model_preserves_small_output() {
+        let output = "short tool output";
+
+        assert_eq!(tool_result_for_model(output), output);
+    }
+
+    #[test]
+    fn tool_result_for_model_truncates_large_output_with_head_and_tail() {
+        let output = format!(
+            "{}middle{}",
+            "a".repeat(MAX_MODEL_TOOL_RESULT_CHARS),
+            "z".repeat(MAX_MODEL_TOOL_RESULT_CHARS),
+        );
+
+        let truncated = tool_result_for_model(&output);
+
+        assert!(truncated.chars().count() <= MAX_MODEL_TOOL_RESULT_CHARS);
+        assert!(truncated.starts_with('a'));
+        assert!(truncated.ends_with('z'));
+        assert!(truncated.contains("tool output truncated"));
+    }
+
+    #[test]
+    fn tool_result_model_message_uses_truncated_output() {
+        let session_id = SessionId::new();
+        let output = "x".repeat(MAX_MODEL_TOOL_RESULT_CHARS + 1);
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            session_id,
+            kind: SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-1".to_string(),
+                result: output,
+                is_error: false,
+            },
+        };
+
+        let message = session_event_to_model_message(&event).expect("tool result message");
+        let ContentBlock::ToolResult { result } = &message.content[0] else {
+            panic!("expected tool result content block");
+        };
+
+        assert!(result.output.chars().count() <= MAX_MODEL_TOOL_RESULT_CHARS);
+        assert!(result.output.contains("tool output truncated"));
+    }
 }
