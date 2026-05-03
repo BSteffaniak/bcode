@@ -18,6 +18,8 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap,
 };
@@ -114,7 +116,13 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     persist_first_permission_rule(&client, &mut app, false).await;
                 }
-                KeyCode::Esc => break,
+                KeyCode::Esc => {
+                    if app.search_mode {
+                        app.cancel_search();
+                    } else {
+                        break;
+                    }
+                }
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.start_search();
                 }
@@ -420,6 +428,12 @@ impl ChatApp {
         self.find_next();
     }
 
+    fn cancel_search(&mut self) {
+        self.search_mode = false;
+        self.input.clear();
+        self.status = "search canceled".to_string();
+    }
+
     fn update_search(&mut self) {
         self.search_query = self.input.clone();
         if self.search_query.is_empty() {
@@ -666,8 +680,11 @@ impl ratatui::widgets::Widget for &ChatApp {
         } else {
             format!("Transcript ({} from bottom)", self.scroll_from_bottom)
         };
-        let transcript = self.lines[start..visible_end].join("\n");
-        let transcript = Paragraph::new(transcript)
+        let transcript_lines = self.lines[start..visible_end]
+            .iter()
+            .map(|line| render_transcript_line(line, &self.search_query))
+            .collect::<Vec<_>>();
+        let transcript = Paragraph::new(Text::from(transcript_lines))
             .block(Block::new().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false });
         transcript.render(chunks[1], buf);
@@ -695,6 +712,80 @@ impl ratatui::widgets::Widget for &ChatApp {
             self.status
         );
         Paragraph::new(status).render(chunks[input_index + 1], buf);
+    }
+}
+
+fn render_transcript_line(line: &str, search_query: &str) -> Line<'static> {
+    let (prefix, body, prefix_style, body_style) = classify_transcript_line(line);
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        push_highlighted_spans(&mut spans, prefix, search_query, prefix_style);
+    }
+    if !body.is_empty() {
+        push_highlighted_spans(&mut spans, body, search_query, body_style);
+    }
+    Line::from(spans)
+}
+
+fn classify_transcript_line(line: &str) -> (&str, &str, Style, Style) {
+    let assistant_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let streaming_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let tool_style = Style::default().fg(Color::Yellow);
+    let permission_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let metadata_style = Style::default().fg(Color::DarkGray);
+    let body_style = Style::default();
+
+    for (prefix, style) in [
+        (STREAMING_ASSISTANT_PREFIX, streaming_style),
+        (FINAL_ASSISTANT_PREFIX, assistant_style),
+        ("↳ tool requested: ", tool_style),
+        ("↳ tool result", tool_style),
+        ("⚠ permission requested: ", permission_style),
+        ("permission resolved: ", permission_style),
+    ] {
+        if let Some(body) = line.strip_prefix(prefix) {
+            return (prefix, body, style, body_style);
+        }
+    }
+
+    if line.starts_with('#') {
+        (line, "", metadata_style, body_style)
+    } else {
+        ("", line, body_style, body_style)
+    }
+}
+
+fn push_highlighted_spans(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    search_query: &str,
+    style: Style,
+) {
+    if search_query.is_empty() {
+        spans.push(Span::styled(text.to_string(), style));
+        return;
+    }
+
+    let mut remainder = text;
+    let highlight_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    while let Some(match_start) = remainder.find(search_query) {
+        let (before, matched_and_after) = remainder.split_at(match_start);
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), style));
+        }
+        let (matched, after) = matched_and_after.split_at(search_query.len());
+        spans.push(Span::styled(matched.to_string(), highlight_style));
+        remainder = after;
+    }
+    if !remainder.is_empty() {
+        spans.push(Span::styled(remainder.to_string(), style));
     }
 }
 
