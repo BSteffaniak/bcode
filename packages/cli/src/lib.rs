@@ -8,9 +8,12 @@ use bcode_client::{BcodeClient, ClientError};
 use bcode_ipc::{Event, PermissionSummary, default_endpoint};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
 use clap::{Parser, Subcommand};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Errors returned by the CLI.
 #[derive(Debug, Error)]
@@ -31,6 +34,8 @@ pub enum CliError {
     Signal(#[from] std::io::Error),
     #[error("daemon did not become ready after auto-start")]
     DaemonStartTimeout,
+    #[error("bundled plugin install failed: {0}")]
+    BundledPluginInstallFailed(String),
 }
 
 /// Parse CLI arguments and run the requested command.
@@ -86,6 +91,7 @@ pub async fn run() -> Result<(), CliError> {
             } => publish_plugin_event(&root, &topic, payload, daemon).await?,
         },
         Commands::Model { command } => handle_model_command(command).await?,
+        Commands::Login { command } => handle_login_command(command)?,
         Commands::Permission { command } => match command {
             PermissionCommand::List => list_permissions().await?,
             PermissionCommand::Approve { permission_id } => {
@@ -152,6 +158,10 @@ enum Commands {
         #[command(subcommand)]
         command: ModelCommand,
     },
+    Login {
+        #[command(subcommand)]
+        command: LoginCommand,
+    },
     Permission {
         #[command(subcommand)]
         command: PermissionCommand,
@@ -204,6 +214,24 @@ enum ModelCommand {
         model_id: String,
         #[arg(long)]
         provider: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LoginCommand {
+    Openai {
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value = "bcode-openai")]
+        profile: String,
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        #[arg(long)]
+        recipient_key: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -269,12 +297,12 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
     match command {
         ServerCommand::Start { foreground } => {
             if foreground {
-                bcode_server::run(default_endpoint()).await?;
+                run_server_foreground().await?;
             } else {
                 start_server_daemon(false).await?;
             }
         }
-        ServerCommand::Run => bcode_server::run(default_endpoint()).await?,
+        ServerCommand::Run => run_server_foreground().await?,
         ServerCommand::Status => server_status().await?,
         ServerCommand::Stop => server_stop().await?,
     }
@@ -293,6 +321,97 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
         } => set_session_model(session_id, provider, model_id).await?,
     }
     Ok(())
+}
+
+fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
+    match command {
+        LoginCommand::Openai {
+            api_key,
+            base_url,
+            profile,
+            vault,
+            recipient_key,
+            model,
+        } => login_openai(api_key, base_url, profile, vault, recipient_key, model)?,
+    }
+    Ok(())
+}
+
+fn login_openai(
+    api_key: Option<String>,
+    base_url: Option<String>,
+    profile: String,
+    vault: Option<PathBuf>,
+    recipient_key: Option<String>,
+    model: Option<String>,
+) -> Result<(), CliError> {
+    let vault_path = vault.unwrap_or_else(bcode_config::default_auth_vault_path);
+    let store =
+        sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault_path.clone()));
+    if !vault_path.exists() {
+        let recipient_key = resolve_recipient_key(recipient_key)?;
+        store.init(&recipient_key).map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!(
+                "failed to initialize auth vault: {error}"
+            ))
+        })?;
+    }
+
+    let api_key = match api_key {
+        Some(api_key) => api_key,
+        None => rpassword::prompt_password("OpenAI API key: ")?,
+    };
+    store
+        .set_secret(&profile, "BCODE_OPENAI_API_KEY", Zeroizing::new(api_key))
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to store OpenAI API key: {error}"))
+        })?;
+    if let Some(base_url) = base_url {
+        store
+            .set_secret(&profile, "BCODE_OPENAI_BASE_URL", Zeroizing::new(base_url))
+            .map_err(|error| {
+                CliError::BundledPluginInstallFailed(format!(
+                    "failed to store OpenAI base URL: {error}"
+                ))
+            })?;
+    }
+
+    let config_path = bcode_config::set_openai_sshenv_auth(profile, vault_path, model)?;
+    println!(
+        "OpenAI credentials saved; config updated: {}",
+        config_path.display()
+    );
+    Ok(())
+}
+
+fn resolve_recipient_key(recipient_key: Option<String>) -> Result<String, CliError> {
+    if let Some(recipient_key) = recipient_key {
+        return public_key_line_from_path_or_literal(&recipient_key);
+    }
+    let Some(path) = sshenv_vault::identity::discover_public_key_paths()
+        .into_iter()
+        .next()
+    else {
+        return Err(CliError::BundledPluginInstallFailed(
+            "no SSH public key found; pass --recipient-key <path-or-public-key>".to_string(),
+        ));
+    };
+    public_key_line_from_path_or_literal(&path.display().to_string())
+}
+
+fn public_key_line_from_path_or_literal(value: &str) -> Result<String, CliError> {
+    if value.starts_with("ssh-") {
+        return Ok(value.to_string());
+    }
+    let contents = std::fs::read_to_string(value)?;
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            CliError::BundledPluginInstallFailed(format!("no public key line found in {value}"))
+        })
 }
 
 fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
@@ -584,14 +703,215 @@ fn discover_plugins_for_cli(
     roots: &[std::path::PathBuf],
 ) -> Result<Vec<bcode_plugin::RegisteredPlugin>, CliError> {
     if roots.is_empty() {
+        ensure_bundled_plugins_installed()?;
         bcode_plugin::discover_plugins().map_err(CliError::Plugin)
     } else {
         bcode_plugin::discover_plugins_in_roots(roots).map_err(CliError::Plugin)
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BundledPluginSpec {
+    id: &'static str,
+    package: &'static str,
+    library_stem: &'static str,
+    name: &'static str,
+    services: &'static [BundledPluginServiceSpec],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BundledPluginServiceSpec {
+    interface_id: &'static str,
+    name: &'static str,
+    description: &'static str,
+}
+
+const BUNDLED_FILESYSTEM_SERVICES: &[BundledPluginServiceSpec] = &[
+    BundledPluginServiceSpec {
+        interface_id: "bcode.filesystem/v1",
+        name: "Filesystem",
+        description: "Filesystem read/write utility service",
+    },
+    BundledPluginServiceSpec {
+        interface_id: "bcode.tool/v1",
+        name: "Filesystem Tools",
+        description: "Model-callable filesystem tools",
+    },
+];
+const BUNDLED_SHELL_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
+    interface_id: "bcode.tool/v1",
+    name: "Shell Tools",
+    description: "Permissioned model-callable shell execution tools",
+}];
+const BUNDLED_OPENAI_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
+    interface_id: "bcode.model-provider/v1",
+    name: "OpenAI-Compatible Model Provider",
+    description: "OpenAI-compatible chat-completions model provider",
+}];
+const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
+    BundledPluginSpec {
+        id: "bcode.filesystem",
+        package: "bcode_filesystem_plugin",
+        library_stem: "bcode_filesystem_plugin",
+        name: "Bcode Filesystem Plugin",
+        services: BUNDLED_FILESYSTEM_SERVICES,
+    },
+    BundledPluginSpec {
+        id: "bcode.shell",
+        package: "bcode_shell_plugin",
+        library_stem: "bcode_shell_plugin",
+        name: "Bcode Shell Plugin",
+        services: BUNDLED_SHELL_SERVICES,
+    },
+    BundledPluginSpec {
+        id: "bcode.openai-compatible",
+        package: "bcode_openai_compatible_provider_plugin",
+        library_stem: "bcode_openai_compatible_provider_plugin",
+        name: "Bcode OpenAI-Compatible Provider",
+        services: BUNDLED_OPENAI_SERVICES,
+    },
+];
+
+fn ensure_bundled_plugins_installed() -> Result<(), CliError> {
+    if std::env::var_os("BCODE_SKIP_BUNDLED_PLUGIN_INSTALL").is_some() {
+        return Ok(());
+    }
+    let executable_dir = executable_dir()?;
+    if bundled_plugins_installed(&executable_dir) {
+        return Ok(());
+    }
+    build_missing_bundled_plugin_libraries(&executable_dir)?;
+    for spec in BUNDLED_PLUGIN_SPECS {
+        install_bundled_plugin(&executable_dir, spec)?;
+    }
+    Ok(())
+}
+
+fn executable_dir() -> Result<PathBuf, CliError> {
+    std::env::current_exe()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            CliError::BundledPluginInstallFailed(
+                "current executable has no parent directory".to_string(),
+            )
+        })
+}
+
+fn build_missing_bundled_plugin_libraries(executable_dir: &Path) -> Result<(), CliError> {
+    if bundled_plugin_libraries_exist(executable_dir) {
+        return Ok(());
+    }
+    let Some(workspace_root) = workspace_root_from_executable_dir(executable_dir) else {
+        return Err(CliError::BundledPluginInstallFailed(format!(
+            "bundled plugin libraries are missing from {} and no workspace root was found",
+            executable_dir.display()
+        )));
+    };
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--quiet")
+        .args(
+            BUNDLED_PLUGIN_SPECS
+                .iter()
+                .flat_map(|spec| ["-p", spec.package]),
+        )
+        .current_dir(&workspace_root)
+        .status()?;
+    if status.success() && bundled_plugin_libraries_exist(executable_dir) {
+        Ok(())
+    } else {
+        Err(CliError::BundledPluginInstallFailed(format!(
+            "cargo build did not produce all bundled plugin libraries in {}",
+            executable_dir.display()
+        )))
+    }
+}
+
+fn bundled_plugin_libraries_exist(executable_dir: &Path) -> bool {
+    BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
+        executable_dir
+            .join(dynamic_library_name(spec.library_stem))
+            .exists()
+    })
+}
+
+fn bundled_plugins_installed(executable_dir: &Path) -> bool {
+    BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
+        let library_name = dynamic_library_name(spec.library_stem);
+        let plugin_dir = executable_dir.join("plugins").join(spec.id);
+        plugin_dir
+            .join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE)
+            .exists()
+            && plugin_dir.join(library_name).exists()
+    })
+}
+
+fn workspace_root_from_executable_dir(executable_dir: &Path) -> Option<PathBuf> {
+    let target_dir = executable_dir.parent()?;
+    let workspace_root = target_dir.parent()?;
+    workspace_root
+        .join("Cargo.toml")
+        .exists()
+        .then(|| workspace_root.to_path_buf())
+}
+
+fn install_bundled_plugin(executable_dir: &Path, spec: &BundledPluginSpec) -> Result<(), CliError> {
+    let library_name = dynamic_library_name(spec.library_stem);
+    let source_library = executable_dir.join(&library_name);
+    if !source_library.exists() {
+        return Err(CliError::BundledPluginInstallFailed(format!(
+            "bundled plugin library is missing: {}",
+            source_library.display()
+        )));
+    }
+    let plugin_dir = executable_dir.join("plugins").join(spec.id);
+    std::fs::create_dir_all(&plugin_dir)?;
+    std::fs::copy(&source_library, plugin_dir.join(&library_name))?;
+    std::fs::write(
+        plugin_dir.join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE),
+        bundled_plugin_manifest(spec, &library_name),
+    )?;
+    Ok(())
+}
+
+fn bundled_plugin_manifest(spec: &BundledPluginSpec, library_name: &str) -> String {
+    let mut manifest = format!(
+        "id = \"{}\"\nname = \"{}\"\nversion = \"0.0.1\"\n\n",
+        spec.id, spec.name
+    );
+    for service in spec.services {
+        let _ = write!(
+            manifest,
+            "[[services]]\ndescription = \"{}\"\ninterface_id = \"{}\"\nname = \"{}\"\n\n",
+            service.description, service.interface_id, service.name
+        );
+    }
+    let _ = write!(
+        manifest,
+        "[runtime]\ntype = \"native\"\nabi_version = 1\nlibrary = \"{library_name}\"\nevent_symbol = \"bcode_plugin_handle_event_v1\"\nservice_symbol = \"bcode_plugin_invoke_service_v1\"\n"
+    );
+    manifest
+}
+
+fn dynamic_library_name(library_stem: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{library_stem}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{library_stem}.dylib")
+    } else {
+        format!("lib{library_stem}.so")
+    }
+}
+
 async fn ensure_server_running() -> Result<(), CliError> {
     start_server_daemon(true).await
+}
+
+async fn run_server_foreground() -> Result<(), CliError> {
+    ensure_bundled_plugins_installed()?;
+    bcode_server::run(default_endpoint()).await?;
+    Ok(())
 }
 
 async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
@@ -602,6 +922,8 @@ async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
         }
         return Ok(());
     }
+
+    ensure_bundled_plugins_installed()?;
 
     let exe = std::env::current_exe()?;
     Command::new(exe)

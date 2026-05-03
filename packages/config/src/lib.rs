@@ -24,6 +24,8 @@ pub struct BcodeConfig {
     pub model: ModelConfig,
     #[serde(default)]
     pub permissions: PermissionConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl BcodeConfig {
@@ -31,7 +33,32 @@ impl BcodeConfig {
         self.plugins.merge(next.plugins);
         self.model.merge(next.model);
         self.permissions.merge(next.permissions);
+        self.auth.merge(next.auth);
     }
+}
+
+/// Authentication configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub openai: Option<AuthProviderConfig>,
+}
+
+impl AuthConfig {
+    fn merge(&mut self, next: Self) {
+        if next.openai.is_some() {
+            self.openai = next.openai;
+        }
+    }
+}
+
+/// Per-provider authentication configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthProviderConfig {
+    pub backend: String,
+    pub profile: String,
+    #[serde(default)]
+    pub vault: Option<PathBuf>,
 }
 
 /// Model selection configuration.
@@ -138,13 +165,47 @@ pub enum ConfigError {
 ///
 /// Returns an error when the config cannot be read, updated, or written.
 pub fn add_permission_rule(kind: &str, value: String) -> Result<PathBuf, ConfigError> {
+    update_writable_config(|config| insert_permission_rule(&mut config.permissions, kind, value))
+}
+
+/// Configure `OpenAI` authentication backed by an `sshenv` vault.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, updated, or written.
+pub fn set_openai_sshenv_auth(
+    profile: String,
+    vault: PathBuf,
+    model_id: Option<String>,
+) -> Result<PathBuf, ConfigError> {
+    update_writable_config(|config| {
+        config
+            .plugins
+            .enabled
+            .insert("bcode.openai-compatible".to_string());
+        config.model.provider_plugin_id = Some("bcode.openai-compatible".to_string());
+        if let Some(model_id) = model_id {
+            config.model.model_id = Some(model_id);
+        }
+        config.auth.openai = Some(AuthProviderConfig {
+            backend: "sshenv".to_string(),
+            profile,
+            vault: Some(vault),
+        });
+        Ok(())
+    })
+}
+
+fn update_writable_config(
+    update: impl FnOnce(&mut BcodeConfig) -> Result<(), ConfigError>,
+) -> Result<PathBuf, ConfigError> {
     let path = writable_config_path();
     let mut config = if path.exists() {
         read_config(&path)?
     } else {
         BcodeConfig::default()
     };
-    insert_permission_rule(&mut config.permissions, kind, value)?;
+    update(&mut config)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
             path: parent.to_path_buf(),
@@ -156,6 +217,29 @@ pub fn add_permission_rule(kind: &str, value: String) -> Result<PathBuf, ConfigE
         source,
     })?;
     Ok(path)
+}
+
+/// Return the default Bcode auth vault path.
+#[must_use]
+pub fn default_auth_vault_path() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_AUTH_VAULT") {
+        return PathBuf::from(path);
+    }
+    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home)
+            .join("bcode")
+            .join("auth")
+            .join("vault");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("bcode")
+            .join("auth")
+            .join("vault");
+    }
+    env::temp_dir().join("bcode").join("auth").join("vault")
 }
 
 fn insert_permission_rule(
@@ -213,6 +297,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
         output.push('\n');
     }
     write_permissions_toml(&mut output, &config.permissions);
+    write_auth_toml(&mut output, &config.auth);
     output
 }
 
@@ -243,6 +328,26 @@ fn write_permissions_toml(output: &mut String, permissions: &PermissionConfig) {
         "deny_path_prefixes",
         &permissions.deny_path_prefixes,
     );
+    output.push('\n');
+}
+
+fn write_auth_toml(output: &mut String, auth: &AuthConfig) {
+    let Some(openai) = &auth.openai else {
+        return;
+    };
+    output.push_str("[auth.openai]\n");
+    writeln!(output, "backend = {}", toml_string(&openai.backend))
+        .expect("writing to string should not fail");
+    writeln!(output, "profile = {}", toml_string(&openai.profile))
+        .expect("writing to string should not fail");
+    if let Some(vault) = &openai.vault {
+        writeln!(
+            output,
+            "vault = {}",
+            toml_string(&vault.display().to_string())
+        )
+        .expect("writing to string should not fail");
+    }
     output.push('\n');
 }
 

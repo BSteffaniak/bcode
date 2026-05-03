@@ -20,9 +20,12 @@ bcode_server         = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tui            = { workspace = true }
 clap                 = { workspace = true, features = ["derive", "help", "std", "usage"] }
+rpassword            = { workspace = true }
 serde_json           = { workspace = true }
+sshenv_vault         = { workspace = true }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["signal", "time"] }
+zeroize              = { workspace = true }
 
 [features]
 default          = []

@@ -57,11 +57,13 @@ reqwest = { version = "0.12.24", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
+rpassword = { version = "7.4.0", default-features = false }
 semver = { version = "1.0.28", default-features = false, features = ["std"] }
 serde = { version = "1.0.219", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
 ] }
+sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", rev = "87973bb7681c68cb9c787931b0ab402468adb517", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
 toml = { version = "1.1.2", default-features = false, features = [
@@ -70,6 +72,7 @@ toml = { version = "1.1.2", default-features = false, features = [
     "std",
 ] }
 uuid = { version = "1.21.0", default-features = false }
+zeroize = { version = "1.8.2", default-features = false, features = ["std"] }
 
 [profile.release]
 codegen-units = 1

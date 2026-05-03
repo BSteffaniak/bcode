@@ -844,6 +844,7 @@ fn validate_config() -> ValidateConfigResponse {
 }
 
 fn settings() -> Settings {
+    let auth = saved_openai_auth();
     let default_model = first_env(["BCODE_OPENAI_MODEL", "OPENAI_MODEL"])
         .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
     let model_ids_env = first_env(["BCODE_OPENAI_MODELS", "OPENAI_MODELS"]);
@@ -854,13 +855,40 @@ fn settings() -> Settings {
         model_ids.insert(0, default_model.clone());
     }
     Settings {
-        api_key: first_env(["BCODE_OPENAI_API_KEY", "OPENAI_API_KEY"]),
+        api_key: first_env(["BCODE_OPENAI_API_KEY", "OPENAI_API_KEY"])
+            .or_else(|| auth.get("BCODE_OPENAI_API_KEY").cloned())
+            .or_else(|| auth.get("OPENAI_API_KEY").cloned()),
         base_url: first_env(["BCODE_OPENAI_BASE_URL", "OPENAI_BASE_URL"])
+            .or_else(|| auth.get("BCODE_OPENAI_BASE_URL").cloned())
+            .or_else(|| auth.get("OPENAI_BASE_URL").cloned())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
         default_model,
         model_ids,
         model_ids_are_explicit: model_ids_env.is_some(),
     }
+}
+
+fn saved_openai_auth() -> BTreeMap<String, String> {
+    let Ok(config) = bcode_config::load_config() else {
+        return BTreeMap::new();
+    };
+    let Some(auth) = config.auth.openai else {
+        return BTreeMap::new();
+    };
+    if auth.backend != "sshenv" {
+        return BTreeMap::new();
+    }
+    let vault = auth
+        .vault
+        .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
+        return BTreeMap::new();
+    };
+    profile
+        .into_iter()
+        .map(|(key, value)| (key, value.to_string()))
+        .collect()
 }
 
 fn parse_model_list(models: &str) -> Vec<String> {
