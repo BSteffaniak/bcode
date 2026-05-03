@@ -41,11 +41,7 @@ pub enum CliError {
 pub async fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     match cli.command.unwrap_or_default() {
-        Commands::Server { command } => match command {
-            ServerCommand::Start => bcode_server::run(default_endpoint()).await?,
-            ServerCommand::Status => server_status().await?,
-            ServerCommand::Stop => server_stop().await?,
-        },
+        Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => match command {
             SessionCommand::Create { name } => create_session(name).await?,
             SessionCommand::List => list_sessions().await?,
@@ -89,15 +85,7 @@ pub async fn run() -> Result<(), CliError> {
                 payload,
             } => publish_plugin_event(&root, &topic, payload, daemon).await?,
         },
-        Commands::Model { command } => match command {
-            ModelCommand::List => list_models().await?,
-            ModelCommand::Capabilities => model_capabilities().await?,
-            ModelCommand::Set {
-                session_id,
-                provider,
-                model_id,
-            } => set_session_model(session_id, provider, model_id).await?,
-        },
+        Commands::Model { command } => handle_model_command(command).await?,
         Commands::Permission { command } => match command {
             PermissionCommand::List => list_permissions().await?,
             PermissionCommand::Approve { permission_id } => {
@@ -191,7 +179,11 @@ impl Default for Commands {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommand {
-    Start,
+    Start {
+        #[arg(long)]
+        foreground: bool,
+    },
+    Run,
     Status,
     Stop,
 }
@@ -271,6 +263,36 @@ enum PluginCommand {
         topic: String,
         payload: Option<String>,
     },
+}
+
+async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
+    match command {
+        ServerCommand::Start { foreground } => {
+            if foreground {
+                bcode_server::run(default_endpoint()).await?;
+            } else {
+                start_server_daemon(false).await?;
+            }
+        }
+        ServerCommand::Run => bcode_server::run(default_endpoint()).await?,
+        ServerCommand::Status => server_status().await?,
+        ServerCommand::Stop => server_stop().await?,
+    }
+    Ok(())
+}
+
+async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    match command {
+        ModelCommand::List => list_models().await?,
+        ModelCommand::Capabilities => model_capabilities().await?,
+        ModelCommand::Set {
+            session_id,
+            provider,
+            model_id,
+        } => set_session_model(session_id, provider, model_id).await?,
+    }
+    Ok(())
 }
 
 fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
@@ -569,19 +591,34 @@ fn discover_plugins_for_cli(
 }
 
 async fn ensure_server_running() -> Result<(), CliError> {
+    start_server_daemon(true).await
+}
+
+async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     if client.server_status().await.is_ok() {
+        if !quiet {
+            println!("server already running");
+        }
         return Ok(());
     }
 
     let exe = std::env::current_exe()?;
     Command::new(exe)
-        .args(["server", "start"])
+        .args(["server", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
 
+    wait_for_server_ready(&client).await?;
+    if !quiet {
+        println!("server started");
+    }
+    Ok(())
+}
+
+async fn wait_for_server_ready(client: &BcodeClient) -> Result<(), CliError> {
     for _ in 0..50 {
         if client.server_status().await.is_ok() {
             return Ok(());

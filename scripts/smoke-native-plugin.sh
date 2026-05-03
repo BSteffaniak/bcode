@@ -91,7 +91,7 @@ cargo run --quiet -p bcode -- plugin publish --root "${workdir}/plugins" example
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_SOCKET="${workdir}/bcode.sock"
 export BCODE_STATE_DIR="${workdir}/state"
-cargo run --quiet -p bcode -- server start >"${workdir}/server.log" 2>&1 &
+cargo run --quiet -p bcode -- server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
 for _ in {1..50}; do
     if cargo run --quiet -p bcode -- server status >/dev/null 2>&1; then

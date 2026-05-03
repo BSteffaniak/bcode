@@ -23,7 +23,7 @@ trap cleanup EXIT
 
 cd "${root}"
 
-cargo run --quiet -p bcode -- server start >"$workdir/server.log" 2>&1 &
+cargo run --quiet -p bcode -- server run >"$workdir/server.log" 2>&1 &
 server_pid="$!"
 
 for _ in {1..300}; do
@@ -63,7 +63,7 @@ cargo run --quiet -p bcode -- server stop
 wait "${server_pid}"
 server_pid=""
 
-cargo run --quiet -p bcode -- server start >"$workdir/server-restarted.log" 2>&1 &
+cargo run --quiet -p bcode -- server run >"$workdir/server-restarted.log" 2>&1 &
 server_pid="$!"
 for _ in {1..300}; do
     if cargo run --quiet -p bcode -- session list 2>/dev/null | grep -q "${session_id}"; then
