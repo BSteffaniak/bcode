@@ -98,6 +98,11 @@ pub enum Request {
     CancelSessionTurn {
         session_id: SessionId,
     },
+    SetSessionModel {
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+    },
     ListPermissions,
     ResolvePermission {
         permission_id: String,
@@ -200,6 +205,7 @@ pub enum ResponsePayload {
     TurnCancellationRequested {
         cancelled: bool,
     },
+    SessionModelSet,
     PermissionList {
         permissions: Vec<PermissionSummary>,
     },

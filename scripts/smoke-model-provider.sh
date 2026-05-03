@@ -86,6 +86,8 @@ cargo run --quiet -p bcode -- server status | grep -q "model: fake-echo"
 cargo run --quiet -p bcode -- model list | grep -q "fake-echo"
 cargo run --quiet -p bcode -- model capabilities | grep -q "bcode.fake-provider"
 session_id="$(cargo run --quiet -p bcode -- session create model-provider-smoke)"
+cargo run --quiet -p bcode -- model set "${session_id}" --provider bcode.fake-provider fake-echo | grep -q "session model set"
+cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "model changed: bcode.fake-provider/fake-echo"
 cargo run --quiet -p bcode -- send "${session_id}" "hello model" >/dev/null
 if ! cargo run --quiet -p bcode -- session history "${session_id}" | grep -q "fake: hello model"; then
     echo "model provider response was not recorded" >&2

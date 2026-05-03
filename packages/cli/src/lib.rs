@@ -92,6 +92,11 @@ pub async fn run() -> Result<(), CliError> {
         Commands::Model { command } => match command {
             ModelCommand::List => list_models().await?,
             ModelCommand::Capabilities => model_capabilities().await?,
+            ModelCommand::Set {
+                session_id,
+                provider,
+                model_id,
+            } => set_session_model(session_id, provider, model_id).await?,
         },
         Commands::Permission { command } => match command {
             PermissionCommand::List => list_permissions().await?,
@@ -202,6 +207,12 @@ enum SessionCommand {
 enum ModelCommand {
     List,
     Capabilities,
+    Set {
+        session_id: SessionId,
+        model_id: String,
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -487,6 +498,18 @@ async fn list_models() -> Result<(), CliError> {
             model.model_id, model.display_name, default_marker
         );
     }
+    Ok(())
+}
+
+async fn set_session_model(
+    session_id: SessionId,
+    provider_plugin_id: Option<String>,
+    model_id: String,
+) -> Result<(), CliError> {
+    BcodeClient::default_endpoint()
+        .set_session_model(session_id, provider_plugin_id, model_id)
+        .await?;
+    println!("session model set");
     Ok(())
 }
 

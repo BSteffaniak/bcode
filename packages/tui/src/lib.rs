@@ -392,6 +392,10 @@ impl ChatApp {
             SessionEventKind::PermissionResolved { permission_id, .. } => {
                 self.remove_pending_permission(permission_id);
             }
+            SessionEventKind::ModelChanged { provider, model } => {
+                self.selected_provider_plugin_id = provider_to_display_selection(provider);
+                self.selected_model_id = model_to_display_selection(model);
+            }
             _ => {}
         }
         self.lines.push(format_session_event(event));
@@ -416,6 +420,22 @@ impl ChatApp {
         }
         self.input.clear();
         Some(input)
+    }
+}
+
+fn provider_to_display_selection(provider: &str) -> Option<String> {
+    if provider == "<auto>" || provider.is_empty() {
+        None
+    } else {
+        Some(provider.to_string())
+    }
+}
+
+fn model_to_display_selection(model: &str) -> Option<String> {
+    if model == "<default>" || model.is_empty() {
+        None
+    } else {
+        Some(model.to_string())
     }
 }
 

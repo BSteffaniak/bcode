@@ -148,6 +148,31 @@ impl BcodeClient {
         connection.send_user_message(session_id, text).await
     }
 
+    /// Set a session-specific model selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn set_session_model(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::SetSessionModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+            })
+            .await?
+        {
+            ResponsePayload::SessionModelSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Request cancellation of the active model turn for a session.
     ///
     /// # Errors

@@ -65,6 +65,7 @@ struct ServerState {
     selected_model_id: Option<String>,
     permission_policy: Mutex<PermissionPolicy>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
+    session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
@@ -75,6 +76,12 @@ struct ServerState {
 struct ActiveModelTurn {
     provider_plugin_id: Option<String>,
     provider_turn_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionModelSelection {
+    provider_plugin_id: Option<String>,
+    model_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +193,7 @@ impl ServerState {
             selected_model_id,
             permission_policy: Mutex::new(permission_policy),
             active_turns: Mutex::default(),
+            session_model_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
@@ -346,6 +354,21 @@ async fn handle_request(
         }
         Request::CancelSessionTurn { session_id } => {
             handle_cancel_session_turn(request_id, state, writer, session_id).await
+        }
+        Request::SetSessionModel {
+            session_id,
+            provider_plugin_id,
+            model_id,
+        } => {
+            handle_set_session_model(
+                request_id,
+                state,
+                writer,
+                session_id,
+                provider_plugin_id,
+                model_id,
+            )
+            .await
         }
         Request::ListPermissions => handle_list_permissions(request_id, state, writer).await,
         Request::ResolvePermission {
@@ -569,6 +592,49 @@ async fn handle_user_message(
     }
 }
 
+async fn handle_set_session_model(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    provider_plugin_id: Option<String>,
+    model_id: String,
+) -> Result<(), ServerError> {
+    let provider = provider_plugin_id.unwrap_or_else(|| "<auto>".to_string());
+    match state
+        .sessions
+        .append_model_changed(session_id, provider.clone(), model_id.clone())
+        .await
+    {
+        Ok(event) => {
+            let selection = SessionModelSelection {
+                provider_plugin_id: provider_to_selection(&provider),
+                model_id: Some(model_id),
+            };
+            state
+                .session_model_selections
+                .lock()
+                .await
+                .insert(session_id, selection);
+            publish_session_event(state, &event).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionModelSet),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+    }
+}
+
 async fn handle_cancel_session_turn(
     request_id: u64,
     state: &ServerState,
@@ -724,13 +790,21 @@ async fn run_model_turn(
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
 ) {
-    if !has_model_provider(state).await {
+    let selection = session_model_selection(state, session_id).await;
+    if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
         return;
     }
 
-    let provider_plugin_id = state.selected_provider_plugin_id.clone();
+    let provider_plugin_id = selection.provider_plugin_id.clone();
     for round in 0..=MAX_MODEL_TOOL_ROUNDS {
-        let request = match build_model_turn_request(state, session_id, trigger_event, round).await
+        let request = match build_model_turn_request(
+            state,
+            session_id,
+            trigger_event,
+            round,
+            selection.model_id.as_deref(),
+        )
+        .await
         {
             Ok(request) => request,
             Err(error) => {
@@ -929,11 +1003,56 @@ async fn handle_provider_turn_event(
     }
 }
 
-async fn has_model_provider(state: &ServerState) -> bool {
+async fn session_model_selection(
+    state: &ServerState,
+    session_id: SessionId,
+) -> SessionModelSelection {
+    if let Some(selection) = state.session_model_selections.lock().await.get(&session_id) {
+        return selection.clone();
+    }
+    let mut selection = SessionModelSelection {
+        provider_plugin_id: state.selected_provider_plugin_id.clone(),
+        model_id: state.selected_model_id.clone(),
+    };
+    if let Ok(history) = state.sessions.session_history(session_id).await {
+        for event in history {
+            if let SessionEventKind::ModelChanged { provider, model } = event.kind {
+                selection = SessionModelSelection {
+                    provider_plugin_id: provider_to_selection(&provider),
+                    model_id: model_to_selection(&model),
+                };
+            }
+        }
+    }
+    state
+        .session_model_selections
+        .lock()
+        .await
+        .insert(session_id, selection.clone());
+    selection
+}
+
+fn provider_to_selection(provider: &str) -> Option<String> {
+    if provider == "<auto>" || provider.is_empty() {
+        None
+    } else {
+        Some(provider.to_string())
+    }
+}
+
+fn model_to_selection(model: &str) -> Option<String> {
+    if model == "<default>" || model.is_empty() {
+        None
+    } else {
+        Some(model.to_string())
+    }
+}
+
+async fn has_model_provider(state: &ServerState, provider_plugin_id: Option<&str>) -> bool {
     let plugins = state.plugins.lock().await;
-    if let Some(provider_plugin_id) = &state.selected_provider_plugin_id {
+    if let Some(provider_plugin_id) = provider_plugin_id {
         return plugins.loaded_plugins().iter().any(|plugin| {
-            plugin.manifest().id == *provider_plugin_id
+            plugin.manifest().id == provider_plugin_id
                 && plugin
                     .manifest()
                     .services
@@ -981,6 +1100,7 @@ async fn build_model_turn_request(
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
     round: u8,
+    selected_model_id: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.session_history(session_id).await?;
     let messages = history
@@ -990,10 +1110,7 @@ async fn build_model_turn_request(
     Ok(ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
-        model_id: state
-            .selected_model_id
-            .clone()
-            .unwrap_or_else(|| "fake-echo".to_string()),
+        model_id: selected_model_id.map_or_else(|| "fake-echo".to_string(), ToString::to_string),
         system_prompt: None,
         messages,
         tools: collect_model_tools(state).await,
