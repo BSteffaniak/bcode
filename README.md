@@ -4,23 +4,36 @@ Bcode is a Rust-native, TUI-first, plugin-driven coding agent with a local clien
 
 ## TUI keybindings
 
-TUI keybindings are configurable in `bcode.toml` under `[tui.keybindings]`. Each action maps to an array of key strings. Multiple keys can trigger the same action; an empty array unbinds it.
+TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.*]` tables. Each scope maps `key = "action.id"`, matching bmux-style key-to-action configuration. Set a key to `""`, `"none"`, or `"unbind"` to remove a default binding for that key.
 
 ```toml
-[tui.keybindings]
-"tui.input.submit" = ["enter"]
-"tui.input.newLine" = ["shift+enter"]
-"app.interrupt" = ["escape"]
-"app.exit" = ["ctrl+d"]
-"app.clear" = ["ctrl+c"]
-"app.permission.approve" = []
-"app.permission.deny" = []
-"app.permission.alwaysAllow" = []
-"app.permission.alwaysDeny" = []
-"transcript.pageUp" = ["pageUp"]
-"transcript.pageDown" = ["pageDown"]
+[tui.keybindings.chat]
+"enter" = "tui.input.submit"
+"shift+enter" = "tui.input.newLine"
+"escape" = "app.interrupt"
+"ctrl+d" = "app.exit"
+"ctrl+c" = "app.clear"
+"ctrl+f" = "app.search"
+"pageUp" = "transcript.pageUp"
+"pageDown" = "transcript.pageDown"
+
+[tui.keybindings.permission]
+"y" = "app.permission.approve"
+"n" = "app.permission.deny"
+"a" = "app.permission.alwaysAllow"
+"d" = "app.permission.alwaysDeny"
+"left" = "tui.select.previous"
+"right" = "tui.select.next"
+"enter" = "tui.select.confirm"
+"escape" = "tui.select.cancel"
+
+[tui.keybindings.session_picker]
+"up" = "tui.select.previous"
+"down" = "tui.select.next"
+"enter" = "tui.select.confirm"
+"escape" = "tui.select.cancel"
 ```
 
 Key format follows `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples: `ctrl+d`, `pageUp`, `escape`, `enter`.
 
-Permission prompts are modal by default instead of global keybindings: `y` allows once, `n` denies, `a` always allows, `d` always denies, arrow keys choose an option, and `enter` confirms.
+Permission prompts are modal by default: permission actions only apply in the permission scope, and hints are generated from the configured permission keymap.

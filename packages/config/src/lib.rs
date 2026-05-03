@@ -43,15 +43,110 @@ impl BcodeConfig {
 /// Terminal UI configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
-    /// Keybindings keyed by action ID. Empty arrays unbind an action.
+    /// Scoped keybindings keyed by key stroke. Values are action IDs.
     #[serde(default)]
-    pub keybindings: BTreeMap<String, Vec<String>>,
+    pub keybindings: TuiKeyBindingConfig,
 }
 
 impl TuiConfig {
     fn merge(&mut self, next: Self) {
-        self.keybindings.extend(next.keybindings);
+        self.keybindings.merge(next.keybindings);
     }
+}
+
+/// Scoped terminal UI keybindings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TuiKeyBindingConfig {
+    /// Main chat view bindings.
+    pub chat: BTreeMap<String, String>,
+    /// Permission prompt bindings.
+    pub permission: BTreeMap<String, String>,
+    /// Session picker bindings.
+    pub session_picker: BTreeMap<String, String>,
+    /// Legacy `[tui.keybindings]` action-to-keys entries loaded for compatibility.
+    #[serde(skip)]
+    pub legacy_actions: BTreeMap<String, Vec<String>>,
+}
+
+impl TuiKeyBindingConfig {
+    fn merge(&mut self, next: Self) {
+        self.chat.extend(next.chat);
+        self.permission.extend(next.permission);
+        self.session_picker.extend(next.session_picker);
+        self.legacy_actions.extend(next.legacy_actions);
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chat.is_empty()
+            && self.permission.is_empty()
+            && self.session_picker.is_empty()
+            && self.legacy_actions.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for TuiKeyBindingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let raw = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+        let mut config = Self::default();
+        for (key, value) in raw {
+            match key.as_str() {
+                "chat" => config.chat = parse_tui_keybinding_section(value, "chat")?,
+                "permission" => {
+                    config.permission = parse_tui_keybinding_section(value, "permission")?;
+                }
+                "session_picker" | "sessionPicker" => {
+                    config.session_picker = parse_tui_keybinding_section(value, "session_picker")?;
+                }
+                legacy_action => {
+                    if let toml::Value::Array(values) = value {
+                        let mut keys = Vec::new();
+                        for item in values {
+                            let toml::Value::String(key) = item else {
+                                return Err(D::Error::custom(format!(
+                                    "legacy tui keybinding '{legacy_action}' must be an array of strings"
+                                )));
+                            };
+                            keys.push(key);
+                        }
+                        config
+                            .legacy_actions
+                            .insert(legacy_action.to_string(), keys);
+                    }
+                }
+            }
+        }
+        Ok(config)
+    }
+}
+
+fn parse_tui_keybinding_section<E>(
+    value: toml::Value,
+    section: &str,
+) -> Result<BTreeMap<String, String>, E>
+where
+    E: serde::de::Error,
+{
+    let toml::Value::Table(table) = value else {
+        return Err(E::custom(format!(
+            "tui.keybindings.{section} must be a table of key = action entries"
+        )));
+    };
+    let mut bindings = BTreeMap::new();
+    for (key, value) in table {
+        let toml::Value::String(action) = value else {
+            return Err(E::custom(format!(
+                "tui.keybindings.{section}.{key} must be a string action ID"
+            )));
+        };
+        bindings.insert(key, action);
+    }
+    Ok(bindings)
 }
 
 /// Authentication configuration.
@@ -356,14 +451,22 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
     if tui.keybindings.is_empty() {
         return;
     }
-    output.push_str("[tui.keybindings]\n");
-    for (action, keys) in &tui.keybindings {
-        let keys = keys
-            .iter()
-            .map(|key| toml_string(key))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(output, "{} = [{keys}]", toml_string(action))
+    write_tui_keybinding_section(output, "chat", &tui.keybindings.chat);
+    write_tui_keybinding_section(output, "permission", &tui.keybindings.permission);
+    write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
+}
+
+fn write_tui_keybinding_section(
+    output: &mut String,
+    section: &str,
+    bindings: &BTreeMap<String, String>,
+) {
+    if bindings.is_empty() {
+        return;
+    }
+    writeln!(output, "[tui.keybindings.{section}]").expect("writing to string should not fail");
+    for (key, action) in bindings {
+        writeln!(output, "{} = {}", toml_string(key), toml_string(action))
             .expect("writing to string should not fail");
     }
     output.push('\n');
@@ -563,6 +666,13 @@ deny_shell_command_prefixes = ["rm -rf"]
 allow_path_prefixes = ["/tmp/project"]
 deny_path_prefixes = ["/tmp/project/target"]
 
+[tui.keybindings.chat]
+"ctrl+x" = "app.exit"
+
+[tui.keybindings.permission]
+"y" = "app.permission.approve"
+"escape" = "tui.select.cancel"
+
 [tui.keybindings]
 "app.exit" = ["ctrl+d"]
 "app.permission.approve" = []
@@ -602,11 +712,23 @@ deny_path_prefixes = ["/tmp/project/target"]
                 .contains("/tmp/project/target")
         );
         assert_eq!(
-            config.tui.keybindings.get("app.exit"),
+            config.tui.keybindings.chat.get("ctrl+x"),
+            Some(&"app.exit".to_string())
+        );
+        assert_eq!(
+            config.tui.keybindings.permission.get("y"),
+            Some(&"app.permission.approve".to_string())
+        );
+        assert_eq!(
+            config.tui.keybindings.legacy_actions.get("app.exit"),
             Some(&vec!["ctrl+d".to_string()])
         );
         assert_eq!(
-            config.tui.keybindings.get("app.permission.approve"),
+            config
+                .tui
+                .keybindings
+                .legacy_actions
+                .get("app.permission.approve"),
             Some(&Vec::new())
         );
 

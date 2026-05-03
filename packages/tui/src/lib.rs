@@ -73,34 +73,6 @@ enum TuiAction {
 }
 
 impl TuiAction {
-    const fn id(self) -> &'static str {
-        match self {
-            Self::InputSubmit => "tui.input.submit",
-            Self::InputNewLine => "tui.input.newLine",
-            Self::DeleteCharBackward => "tui.editor.deleteCharBackward",
-            Self::AppInterrupt => "app.interrupt",
-            Self::AppExit => "app.exit",
-            Self::AppClear => "app.clear",
-            Self::SearchStart => "app.search",
-            Self::SearchNext => "app.search.next",
-            Self::SearchPrevious => "app.search.previous",
-            Self::PermissionApprove => "app.permission.approve",
-            Self::PermissionDeny => "app.permission.deny",
-            Self::PermissionAlwaysAllow => "app.permission.alwaysAllow",
-            Self::PermissionAlwaysDeny => "app.permission.alwaysDeny",
-            Self::TranscriptPageUp => "transcript.pageUp",
-            Self::TranscriptPageDown => "transcript.pageDown",
-            Self::TranscriptTop => "transcript.top",
-            Self::TranscriptBottom => "transcript.bottom",
-            Self::TranscriptLineUp => "transcript.lineUp",
-            Self::TranscriptLineDown => "transcript.lineDown",
-            Self::SelectUp => "tui.select.up",
-            Self::SelectDown => "tui.select.down",
-            Self::SelectConfirm => "tui.select.confirm",
-            Self::SelectCancel => "tui.select.cancel",
-        }
-    }
-
     fn from_id(id: &str) -> Option<Self> {
         Some(match id {
             "tui.input.submit" => Self::InputSubmit,
@@ -122,8 +94,8 @@ impl TuiAction {
             "transcript.bottom" => Self::TranscriptBottom,
             "transcript.lineUp" => Self::TranscriptLineUp,
             "transcript.lineDown" => Self::TranscriptLineDown,
-            "tui.select.up" => Self::SelectUp,
-            "tui.select.down" => Self::SelectDown,
+            "tui.select.up" | "tui.select.previous" => Self::SelectUp,
+            "tui.select.down" | "tui.select.next" => Self::SelectDown,
             "tui.select.confirm" => Self::SelectConfirm,
             "tui.select.cancel" => Self::SelectCancel,
             _ => return None,
@@ -131,10 +103,24 @@ impl TuiAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TuiScope {
+    Chat,
+    Permission,
+    SessionPicker,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyBinding {
     code: KeyCode,
     modifiers: KeyModifiers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyMapEntry {
+    key: String,
+    binding: KeyBinding,
+    action: TuiAction,
 }
 
 impl KeyBinding {
@@ -146,112 +132,228 @@ impl KeyBinding {
 
 #[derive(Debug, Clone)]
 struct KeyMap {
-    bindings: BTreeMap<TuiAction, Vec<KeyBinding>>,
+    bindings: BTreeMap<TuiScope, Vec<KeyMapEntry>>,
     warnings: Vec<String>,
 }
 
 impl KeyMap {
     fn from_config(config: &bcode_config::TuiConfig) -> Self {
         let mut warnings = Vec::new();
-        let mut bindings = default_keybindings()
+        let mut bindings = default_keybindings();
+        apply_legacy_keybindings(
+            &mut bindings,
+            &mut warnings,
+            &config.keybindings.legacy_actions,
+        );
+        apply_scoped_keybindings(
+            &mut bindings,
+            &mut warnings,
+            TuiScope::Chat,
+            &config.keybindings.chat,
+        );
+        apply_scoped_keybindings(
+            &mut bindings,
+            &mut warnings,
+            TuiScope::Permission,
+            &config.keybindings.permission,
+        );
+        apply_scoped_keybindings(
+            &mut bindings,
+            &mut warnings,
+            TuiScope::SessionPicker,
+            &config.keybindings.session_picker,
+        );
+        let bindings = bindings
             .into_iter()
-            .map(|(action, keys)| (action, parse_default_keybindings(action, keys)))
-            .collect::<BTreeMap<_, _>>();
-        for (id, keys) in &config.keybindings {
-            let Some(action) = TuiAction::from_id(id) else {
-                warnings.push(format!("unknown keybinding action: {id}"));
-                continue;
-            };
-            let mut parsed = Vec::new();
-            for key in keys {
-                match parse_key_binding(key) {
-                    Ok(binding) => parsed.push(binding),
-                    Err(error) => warnings.push(format!("invalid keybinding {id}={key}: {error}")),
-                }
-            }
-            bindings.insert(action, parsed);
-        }
+            .map(|(scope, bindings)| {
+                (
+                    scope,
+                    compile_keybinding_scope(scope, bindings, &mut warnings),
+                )
+            })
+            .collect();
         Self { bindings, warnings }
     }
 
-    fn action_for_key(&self, key: &KeyEvent) -> Option<TuiAction> {
-        self.bindings.iter().find_map(|(action, bindings)| {
+    fn action_for_key(&self, scope: TuiScope, key: &KeyEvent) -> Option<TuiAction> {
+        self.bindings.get(&scope).and_then(|bindings| {
             bindings
                 .iter()
-                .any(|binding| binding.matches(key))
-                .then_some(*action)
+                .find(|entry| entry.binding.matches(key))
+                .map(|entry| entry.action)
         })
     }
 
-    fn primary(&self, action: TuiAction) -> String {
+    fn primary(&self, scope: TuiScope, action: TuiAction) -> String {
         self.bindings
-            .get(&action)
-            .and_then(|bindings| bindings.first())
-            .map_or_else(|| "unbound".to_string(), KeyBinding::display)
+            .get(&scope)
+            .and_then(|bindings| bindings.iter().find(|entry| entry.action == action))
+            .map_or_else(|| "unbound".to_string(), |entry| entry.key.clone())
     }
 
     fn chat_hints(&self) -> String {
         format!(
             "{} send · {} interrupt · {} exit · {} search",
-            self.primary(TuiAction::InputSubmit),
-            self.primary(TuiAction::AppInterrupt),
-            self.primary(TuiAction::AppExit),
-            self.primary(TuiAction::SearchStart),
+            self.primary(TuiScope::Chat, TuiAction::InputSubmit),
+            self.primary(TuiScope::Chat, TuiAction::AppInterrupt),
+            self.primary(TuiScope::Chat, TuiAction::AppExit),
+            self.primary(TuiScope::Chat, TuiAction::SearchStart),
+        )
+    }
+
+    fn permission_hints(&self) -> String {
+        format!(
+            "{} allow once · {} deny · {} always allow · {} always deny · {}/{} choose · {} confirm · {} cancel",
+            self.primary(TuiScope::Permission, TuiAction::PermissionApprove),
+            self.primary(TuiScope::Permission, TuiAction::PermissionDeny),
+            self.primary(TuiScope::Permission, TuiAction::PermissionAlwaysAllow),
+            self.primary(TuiScope::Permission, TuiAction::PermissionAlwaysDeny),
+            self.primary(TuiScope::Permission, TuiAction::SelectUp),
+            self.primary(TuiScope::Permission, TuiAction::SelectDown),
+            self.primary(TuiScope::Permission, TuiAction::SelectConfirm),
+            self.primary(TuiScope::Permission, TuiAction::SelectCancel),
         )
     }
 }
 
-impl KeyBinding {
-    fn display(&self) -> String {
-        let mut parts = Vec::new();
-        if self.modifiers.contains(KeyModifiers::CONTROL) {
-            parts.push("ctrl".to_string());
+fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
+    BTreeMap::from([
+        (
+            TuiScope::Chat,
+            action_bindings(&[
+                ("enter", TuiAction::InputSubmit),
+                ("shift+enter", TuiAction::InputNewLine),
+                ("backspace", TuiAction::DeleteCharBackward),
+                ("escape", TuiAction::AppInterrupt),
+                ("ctrl+d", TuiAction::AppExit),
+                ("ctrl+c", TuiAction::AppClear),
+                ("ctrl+f", TuiAction::SearchStart),
+                ("ctrl+g", TuiAction::SearchNext),
+                ("ctrl+r", TuiAction::SearchPrevious),
+                ("pageUp", TuiAction::TranscriptPageUp),
+                ("pageDown", TuiAction::TranscriptPageDown),
+                ("home", TuiAction::TranscriptTop),
+                ("end", TuiAction::TranscriptBottom),
+                ("alt+up", TuiAction::TranscriptLineUp),
+                ("alt+down", TuiAction::TranscriptLineDown),
+            ]),
+        ),
+        (
+            TuiScope::Permission,
+            action_bindings(&[
+                ("y", TuiAction::PermissionApprove),
+                ("n", TuiAction::PermissionDeny),
+                ("a", TuiAction::PermissionAlwaysAllow),
+                ("d", TuiAction::PermissionAlwaysDeny),
+                ("left", TuiAction::SelectUp),
+                ("up", TuiAction::SelectUp),
+                ("right", TuiAction::SelectDown),
+                ("down", TuiAction::SelectDown),
+                ("tab", TuiAction::SelectDown),
+                ("enter", TuiAction::SelectConfirm),
+                ("escape", TuiAction::SelectCancel),
+                ("ctrl+c", TuiAction::SelectCancel),
+            ]),
+        ),
+        (
+            TuiScope::SessionPicker,
+            action_bindings(&[
+                ("up", TuiAction::SelectUp),
+                ("k", TuiAction::SelectUp),
+                ("down", TuiAction::SelectDown),
+                ("j", TuiAction::SelectDown),
+                ("enter", TuiAction::SelectConfirm),
+                ("escape", TuiAction::SelectCancel),
+                ("ctrl+c", TuiAction::SelectCancel),
+            ]),
+        ),
+    ])
+}
+
+fn action_bindings(bindings: &[(&str, TuiAction)]) -> BTreeMap<String, TuiAction> {
+    bindings
+        .iter()
+        .map(|(key, action)| ((*key).to_string(), *action))
+        .collect()
+}
+
+fn apply_legacy_keybindings(
+    bindings: &mut BTreeMap<TuiScope, BTreeMap<String, TuiAction>>,
+    warnings: &mut Vec<String>,
+    legacy_actions: &BTreeMap<String, Vec<String>>,
+) {
+    for (id, keys) in legacy_actions {
+        let Some(action) = TuiAction::from_id(id) else {
+            warnings.push(format!("unknown legacy keybinding action: {id}"));
+            continue;
+        };
+        for scope in legacy_scopes_for_action(action) {
+            let scope_bindings = bindings.entry(*scope).or_default();
+            scope_bindings.retain(|_, existing_action| *existing_action != action);
+            for key in keys {
+                scope_bindings.insert(key.clone(), action);
+            }
         }
-        if self.modifiers.contains(KeyModifiers::ALT) {
-            parts.push("alt".to_string());
-        }
-        if self.modifiers.contains(KeyModifiers::SHIFT) {
-            parts.push("shift".to_string());
-        }
-        parts.push(key_code_name(self.code));
-        parts.join("+")
     }
 }
 
-fn default_keybindings() -> Vec<(TuiAction, &'static [&'static str])> {
-    vec![
-        (TuiAction::InputSubmit, &["enter"]),
-        (TuiAction::InputNewLine, &["shift+enter"]),
-        (TuiAction::DeleteCharBackward, &["backspace"]),
-        (TuiAction::AppInterrupt, &["escape"]),
-        (TuiAction::AppExit, &["ctrl+d"]),
-        (TuiAction::AppClear, &["ctrl+c"]),
-        (TuiAction::SearchStart, &["ctrl+f"]),
-        (TuiAction::SearchNext, &["ctrl+g"]),
-        (TuiAction::SearchPrevious, &["ctrl+r"]),
-        (TuiAction::PermissionApprove, &[]),
-        (TuiAction::PermissionDeny, &[]),
-        (TuiAction::PermissionAlwaysAllow, &[]),
-        (TuiAction::PermissionAlwaysDeny, &[]),
-        (TuiAction::TranscriptPageUp, &["pageUp"]),
-        (TuiAction::TranscriptPageDown, &["pageDown"]),
-        (TuiAction::TranscriptTop, &["home"]),
-        (TuiAction::TranscriptBottom, &["end"]),
-        (TuiAction::TranscriptLineUp, &["alt+up"]),
-        (TuiAction::TranscriptLineDown, &["alt+down"]),
-        (TuiAction::SelectUp, &["up", "k"]),
-        (TuiAction::SelectDown, &["down", "j"]),
-        (TuiAction::SelectConfirm, &["enter"]),
-        (TuiAction::SelectCancel, &["escape", "ctrl+c"]),
-    ]
+fn legacy_scopes_for_action(action: TuiAction) -> &'static [TuiScope] {
+    match action {
+        TuiAction::PermissionApprove
+        | TuiAction::PermissionDeny
+        | TuiAction::PermissionAlwaysAllow
+        | TuiAction::PermissionAlwaysDeny => &[TuiScope::Permission],
+        TuiAction::SelectUp
+        | TuiAction::SelectDown
+        | TuiAction::SelectConfirm
+        | TuiAction::SelectCancel => &[TuiScope::Permission, TuiScope::SessionPicker],
+        _ => &[TuiScope::Chat],
+    }
 }
 
-fn parse_default_keybindings(action: TuiAction, keys: &[&'static str]) -> Vec<KeyBinding> {
-    keys.iter()
-        .map(|key| {
-            parse_key_binding(key).unwrap_or_else(|error| {
-                panic!("invalid default keybinding {}={key}: {error}", action.id())
-            })
+fn apply_scoped_keybindings(
+    bindings: &mut BTreeMap<TuiScope, BTreeMap<String, TuiAction>>,
+    warnings: &mut Vec<String>,
+    scope: TuiScope,
+    configured: &BTreeMap<String, String>,
+) {
+    let scope_bindings = bindings.entry(scope).or_default();
+    for (key, action_id) in configured {
+        if action_id.trim().is_empty()
+            || action_id.eq_ignore_ascii_case("none")
+            || action_id.eq_ignore_ascii_case("unbind")
+        {
+            scope_bindings.remove(key);
+            continue;
+        }
+        let Some(action) = TuiAction::from_id(action_id) else {
+            warnings.push(format!(
+                "unknown keybinding action in {scope:?}: {key} -> {action_id}"
+            ));
+            scope_bindings.remove(key);
+            continue;
+        };
+        scope_bindings.insert(key.clone(), action);
+    }
+}
+
+fn compile_keybinding_scope(
+    scope: TuiScope,
+    bindings: BTreeMap<String, TuiAction>,
+    warnings: &mut Vec<String>,
+) -> Vec<KeyMapEntry> {
+    bindings
+        .into_iter()
+        .filter_map(|(key, action)| match parse_key_binding(&key) {
+            Ok(binding) => Some(KeyMapEntry {
+                key,
+                binding,
+                action,
+            }),
+            Err(error) => {
+                warnings.push(format!("invalid keybinding in {scope:?}: {key}: {error}"));
+                None
+            }
         })
         .collect()
 }
@@ -353,39 +455,6 @@ fn normalized_modifiers(modifiers: KeyModifiers) -> KeyModifiers {
     normalized
 }
 
-fn key_code_name(code: KeyCode) -> String {
-    match code {
-        KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Enter => "enter".to_string(),
-        KeyCode::Left => "left".to_string(),
-        KeyCode::Right => "right".to_string(),
-        KeyCode::Up => "up".to_string(),
-        KeyCode::Down => "down".to_string(),
-        KeyCode::Home => "home".to_string(),
-        KeyCode::End => "end".to_string(),
-        KeyCode::PageUp => "pageUp".to_string(),
-        KeyCode::PageDown => "pageDown".to_string(),
-        KeyCode::Tab => "tab".to_string(),
-        KeyCode::BackTab => "shift+tab".to_string(),
-        KeyCode::Delete => "delete".to_string(),
-        KeyCode::Insert => "insert".to_string(),
-        KeyCode::F(number) => format!("f{number}"),
-        KeyCode::Char(' ') => "space".to_string(),
-        KeyCode::Char(character) => character.to_string(),
-        KeyCode::Null => "null".to_string(),
-        KeyCode::Esc => "escape".to_string(),
-        KeyCode::CapsLock => "capsLock".to_string(),
-        KeyCode::ScrollLock => "scrollLock".to_string(),
-        KeyCode::NumLock => "numLock".to_string(),
-        KeyCode::PrintScreen => "printScreen".to_string(),
-        KeyCode::Pause => "pause".to_string(),
-        KeyCode::Menu => "menu".to_string(),
-        KeyCode::KeypadBegin => "keypadBegin".to_string(),
-        KeyCode::Media(media_key) => format!("media:{media_key:?}"),
-        KeyCode::Modifier(modifier_key) => format!("modifier:{modifier_key:?}"),
-    }
-}
-
 fn key_is_text_input(key: &KeyEvent) -> Option<char> {
     let (code, modifiers) = normalized_key(key);
     match code {
@@ -457,23 +526,18 @@ async fn run_chat(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if app.first_pending_permission().is_some()
-                && !app.search_mode
-                && handle_permission_prompt_key(&client, &mut app, &key).await
-            {
-                continue;
-            }
-            if let Some(action) = keymap.action_for_key(&key) {
-                if handle_chat_action(&client, &mut app, session_id, action).await {
+            let scope = app.current_scope();
+            if let Some(action) = keymap.action_for_key(scope, &key) {
+                if handle_tui_action(&client, &mut app, session_id, scope, action).await {
                     break;
                 }
                 continue;
             }
+            if scope == TuiScope::Permission {
+                app.status = "permission prompt active; use configured prompt bindings".to_string();
+                continue;
+            }
             if let Some(character) = key_is_text_input(&key) {
-                if app.first_pending_permission().is_some() && !app.search_mode {
-                    app.status = "permission prompt active; choose an option or deny".to_string();
-                    continue;
-                }
                 app.input.push(character);
                 if app.search_mode {
                     app.update_search();
@@ -483,36 +547,6 @@ async fn run_chat(
     }
 
     Ok(())
-}
-
-async fn handle_permission_prompt_key(
-    client: &BcodeClient,
-    app: &mut ChatApp,
-    key: &KeyEvent,
-) -> bool {
-    let (code, modifiers) = normalized_key(key);
-    if !modifiers.is_empty() {
-        return false;
-    }
-    match code {
-        KeyCode::Char('y') => {
-            execute_permission_choice(client, app, PermissionChoice::AllowOnce).await;
-        }
-        KeyCode::Char('a') => {
-            execute_permission_choice(client, app, PermissionChoice::AlwaysAllow).await;
-        }
-        KeyCode::Char('d') => {
-            execute_permission_choice(client, app, PermissionChoice::AlwaysDeny).await;
-        }
-        KeyCode::Enter => execute_selected_permission_choice(client, app).await,
-        KeyCode::Char('n') | KeyCode::Esc => {
-            execute_permission_choice(client, app, PermissionChoice::DenyOnce).await;
-        }
-        KeyCode::Left | KeyCode::Up => app.previous_permission_choice(),
-        KeyCode::Right | KeyCode::Down | KeyCode::Tab => app.next_permission_choice(),
-        _ => return false,
-    }
-    true
 }
 
 async fn execute_selected_permission_choice(client: &BcodeClient, app: &mut ChatApp) {
@@ -532,10 +566,11 @@ async fn execute_permission_choice(
     }
 }
 
-async fn handle_chat_action(
+async fn handle_tui_action(
     client: &BcodeClient,
     app: &mut ChatApp,
     session_id: SessionId,
+    scope: TuiScope,
     action: TuiAction,
 ) -> bool {
     match action {
@@ -595,10 +630,26 @@ async fn handle_chat_action(
                 app.update_search();
             }
         }
-        TuiAction::SelectUp
-        | TuiAction::SelectDown
-        | TuiAction::SelectConfirm
-        | TuiAction::SelectCancel => {}
+        TuiAction::SelectUp => {
+            if scope == TuiScope::Permission {
+                app.previous_permission_choice();
+            }
+        }
+        TuiAction::SelectDown => {
+            if scope == TuiScope::Permission {
+                app.next_permission_choice();
+            }
+        }
+        TuiAction::SelectConfirm => {
+            if scope == TuiScope::Permission {
+                execute_selected_permission_choice(client, app).await;
+            }
+        }
+        TuiAction::SelectCancel => {
+            if scope == TuiScope::Permission {
+                execute_permission_choice(client, app, PermissionChoice::DenyOnce).await;
+            }
+        }
     }
     false
 }
@@ -671,7 +722,7 @@ fn pick_session(sessions: &[SessionSummary], keymap: &KeyMap) -> Result<SessionI
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match keymap.action_for_key(&key) {
+        match keymap.action_for_key(TuiScope::SessionPicker, &key) {
             Some(TuiAction::SelectCancel) => return Err(TuiError::Canceled),
             Some(TuiAction::SelectUp) => app.previous(),
             Some(TuiAction::SelectDown) => app.next(),
@@ -914,9 +965,7 @@ impl ChatApp {
             search_mode: false,
             search_query: String::new(),
             key_hints: keymap.chat_hints(),
-            permission_hints:
-                "y allow once · n deny · a always allow · d always deny · ←/→ choose · enter confirm"
-                    .to_string(),
+            permission_hints: keymap.permission_hints(),
             selected_permission_choice: PermissionChoice::AllowOnce,
         };
         for event in history {
@@ -1183,6 +1232,14 @@ impl ChatApp {
 
     fn first_pending_permission(&self) -> Option<&PendingPermissionView> {
         self.pending_permissions.values().next()
+    }
+
+    fn current_scope(&self) -> TuiScope {
+        if self.first_pending_permission().is_some() && !self.search_mode {
+            TuiScope::Permission
+        } else {
+            TuiScope::Chat
+        }
     }
 
     fn take_input(&mut self) -> Option<String> {
@@ -1640,35 +1697,128 @@ mod tests {
     #[test]
     fn keymap_user_config_overrides_and_unbinds_defaults() {
         let config = bcode_config::TuiConfig {
-            keybindings: [
-                ("app.search".to_string(), vec!["ctrl+s".to_string()]),
-                ("app.exit".to_string(), Vec::new()),
-            ]
-            .into_iter()
-            .collect(),
+            keybindings: bcode_config::TuiKeyBindingConfig {
+                chat: [
+                    ("ctrl+s".to_string(), "app.search".to_string()),
+                    ("ctrl+d".to_string(), String::new()),
+                ]
+                .into_iter()
+                .collect(),
+                ..bcode_config::TuiKeyBindingConfig::default()
+            },
         };
         let keymap = KeyMap::from_config(&config);
 
         assert_eq!(
-            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            keymap.action_for_key(
+                TuiScope::Chat,
+                &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            ),
             Some(TuiAction::SearchStart)
         );
         assert_eq!(
-            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            keymap.action_for_key(
+                TuiScope::Chat,
+                &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            ),
             None
         );
     }
 
     #[test]
-    fn permission_actions_are_unbound_by_default() {
+    fn permission_defaults_are_scoped_not_global() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
 
         assert_eq!(
-            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT)),
+            keymap.action_for_key(
+                TuiScope::Permission,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            Some(TuiAction::PermissionApprove)
+        );
+        assert_eq!(
+            keymap.action_for_key(
+                TuiScope::Chat,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn permission_prompt_uses_configured_keys() {
+        let config = bcode_config::TuiConfig {
+            keybindings: bcode_config::TuiKeyBindingConfig {
+                permission: [
+                    ("y".to_string(), String::new()),
+                    ("ctrl+y".to_string(), "app.permission.approve".to_string()),
+                    ("escape".to_string(), String::new()),
+                    ("ctrl+x".to_string(), "tui.select.cancel".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                ..bcode_config::TuiKeyBindingConfig::default()
+            },
+        };
+        let keymap = KeyMap::from_config(&config);
+
+        assert_eq!(
+            keymap.action_for_key(
+                TuiScope::Permission,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
             None
         );
         assert_eq!(
-            keymap.action_for_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)),
+            keymap.action_for_key(
+                TuiScope::Permission,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiAction::PermissionApprove)
+        );
+        assert_eq!(
+            keymap.action_for_key(
+                TuiScope::Permission,
+                &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            None
+        );
+        assert_eq!(
+            keymap.action_for_key(
+                TuiScope::Permission,
+                &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiAction::SelectCancel)
+        );
+    }
+
+    #[test]
+    fn legacy_action_array_config_still_applies() {
+        let config = bcode_config::TuiConfig {
+            keybindings: bcode_config::TuiKeyBindingConfig {
+                legacy_actions: [
+                    ("app.search".to_string(), vec!["ctrl+s".to_string()]),
+                    ("app.exit".to_string(), Vec::new()),
+                ]
+                .into_iter()
+                .collect(),
+                ..bcode_config::TuiKeyBindingConfig::default()
+            },
+        };
+        let keymap = KeyMap::from_config(&config);
+
+        assert_eq!(
+            keymap.action_for_key(
+                TuiScope::Chat,
+                &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiAction::SearchStart)
+        );
+        assert_eq!(
+            keymap.action_for_key(
+                TuiScope::Chat,
+                &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            ),
             None
         );
     }
