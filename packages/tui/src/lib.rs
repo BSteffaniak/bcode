@@ -347,6 +347,9 @@ impl PendingPermissionView {
     }
 }
 
+const STREAMING_ASSISTANT_PREFIX: &str = "assistant (streaming): ";
+const FINAL_ASSISTANT_PREFIX: &str = "assistant: ";
+
 impl ChatApp {
     fn new(session_id: SessionId, history: &[SessionEvent]) -> Self {
         let mut app = Self {
@@ -372,6 +375,14 @@ impl ChatApp {
 
     fn absorb_session_event(&mut self, event: &SessionEvent) {
         match &event.kind {
+            SessionEventKind::AssistantDelta { text } => {
+                self.push_assistant_delta(text);
+                return;
+            }
+            SessionEventKind::AssistantMessage { text } => {
+                self.finish_assistant_message(text);
+                return;
+            }
             SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
@@ -399,6 +410,32 @@ impl ChatApp {
             _ => {}
         }
         self.lines.push(format_session_event(event));
+    }
+
+    fn push_assistant_delta(&mut self, text: &str) {
+        if let Some(last) = self
+            .lines
+            .last_mut()
+            .filter(|line| line.starts_with(STREAMING_ASSISTANT_PREFIX))
+        {
+            last.push_str(text);
+        } else {
+            self.lines
+                .push(format!("{STREAMING_ASSISTANT_PREFIX}{text}"));
+        }
+    }
+
+    fn finish_assistant_message(&mut self, text: &str) {
+        let final_message = format!("{FINAL_ASSISTANT_PREFIX}{text}");
+        if let Some(last) = self
+            .lines
+            .last_mut()
+            .filter(|line| line.starts_with(STREAMING_ASSISTANT_PREFIX))
+        {
+            *last = final_message;
+        } else {
+            self.lines.push(final_message);
+        }
     }
 
     fn remove_pending_permission(&mut self, permission_id: &str) {
@@ -551,29 +588,23 @@ fn format_session_event(event: &SessionEvent) -> String {
             format!("#{} {client_id}: {text}", event.sequence)
         }
         SessionEventKind::AssistantDelta { text } => {
-            format!("#{} assistant delta: {text}", event.sequence)
+            format!("{STREAMING_ASSISTANT_PREFIX}{text}")
         }
         SessionEventKind::AssistantMessage { text } => {
-            format!("#{} assistant: {text}", event.sequence)
+            format!("{FINAL_ASSISTANT_PREFIX}{text}")
         }
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
             arguments_json,
-        } => format!(
-            "#{} tool call requested: {tool_name} ({tool_call_id}) {arguments_json}",
-            event.sequence
-        ),
+        } => format!("↳ tool requested: {tool_name} ({tool_call_id}) {arguments_json}"),
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
             is_error,
         } => {
             let status = if *is_error { "error" } else { "ok" };
-            format!(
-                "#{} tool call finished ({status}): {tool_call_id}: {result}",
-                event.sequence
-            )
+            format!("↳ tool result ({status}) for {tool_call_id}:\n{result}")
         }
         SessionEventKind::PermissionRequested {
             permission_id,
@@ -581,16 +612,12 @@ fn format_session_event(event: &SessionEvent) -> String {
             tool_name,
             arguments_json,
         } => format!(
-            "#{} permission requested: {permission_id} {tool_name} ({tool_call_id}) {arguments_json}",
-            event.sequence
+            "⚠ permission requested: {permission_id} {tool_name} ({tool_call_id}) {arguments_json}"
         ),
         SessionEventKind::PermissionResolved {
             permission_id,
             approved,
-        } => format!(
-            "#{} permission resolved: {permission_id} approved={approved}",
-            event.sequence
-        ),
+        } => format!("permission resolved: {permission_id} approved={approved}"),
         SessionEventKind::ModelChanged { provider, model } => {
             format!("#{} model changed: {provider}/{model}", event.sequence)
         }
