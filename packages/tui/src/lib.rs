@@ -129,6 +129,9 @@ async fn run_chat(client: BcodeClient, session_id: SessionId) -> Result<(), TuiE
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.find_next();
                 }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.find_previous();
+                }
                 KeyCode::PageUp => app.scroll_page_up(),
                 KeyCode::PageDown => app.scroll_page_down(),
                 KeyCode::Home => app.scroll_top(),
@@ -418,7 +421,7 @@ impl ChatApp {
         self.search_mode = true;
         self.search_query.clear();
         self.input.clear();
-        self.status = "search: type query, enter accepts, ctrl-g next".to_string();
+        self.status = "search: type query, enter accepts, ctrl-g next, ctrl-r previous".to_string();
     }
 
     fn finish_search(&mut self) {
@@ -437,7 +440,8 @@ impl ChatApp {
     fn update_search(&mut self) {
         self.search_query = self.input.clone();
         if self.search_query.is_empty() {
-            self.status = "search: type query, enter accepts, ctrl-g next".to_string();
+            self.status =
+                "search: type query, enter accepts, ctrl-g next, ctrl-r previous".to_string();
         } else {
             self.find_previous_match();
         }
@@ -454,6 +458,14 @@ impl ChatApp {
         };
         self.scroll_to_line(index);
         self.status = format!("match: {}", self.search_query);
+    }
+
+    fn find_previous(&mut self) {
+        if self.search_query.is_empty() {
+            self.status = "no search query".to_string();
+            return;
+        }
+        self.find_previous_match();
     }
 
     fn find_previous_match(&mut self) {
@@ -481,10 +493,13 @@ impl ChatApp {
     }
 
     fn previous_match_index(&self) -> Option<usize> {
+        let current = self.top_visible_line_index();
         self.lines
             .iter()
             .enumerate()
+            .take(current)
             .rev()
+            .chain(self.lines.iter().enumerate().skip(current).rev())
             .find_map(|(index, line)| line.contains(&self.search_query).then_some(index))
     }
 
@@ -708,7 +723,7 @@ impl ratatui::widgets::Widget for &ChatApp {
         input.render(chunks[input_index], buf);
 
         let status = format!(
-            "{} | ctrl-f search, ctrl-g next, pgup/pgdn scroll, home/end jump",
+            "{} | ctrl-f search, ctrl-g next, ctrl-r prev, pgup/pgdn scroll, home/end jump",
             self.status
         );
         Paragraph::new(status).render(chunks[input_index + 1], buf);
