@@ -59,11 +59,68 @@ impl BcodeConfig {
             selection.auth_profile = profile.auth_profile.clone();
             selection.settings = profile.settings.clone();
         }
-        if selection.provider_plugin_id.is_none() && bedrock_environment_is_configured() {
-            selection.provider_plugin_id = Some("bcode.bedrock".to_string());
+        if let Some(env_provider) = provider_plugin_id_from_environment() {
+            let provider_changed =
+                selection.provider_plugin_id.as_deref() != Some(env_provider.as_str());
+            selection.provider_plugin_id = Some(env_provider.clone());
+            if let Some(model_id) = model_id_from_environment(&env_provider) {
+                selection.model_id = Some(model_id);
+            } else if provider_changed {
+                // Do not pass a persisted model ID for a different provider. Let the selected
+                // provider use its own default model when no provider-specific env model exists.
+                selection.model_id = None;
+            }
+            if provider_changed {
+                selection.model_profile = None;
+                selection.auth_profile = None;
+                selection.settings.clear();
+            }
         }
         selection
     }
+}
+
+/// Return a provider plugin ID explicitly or implicitly selected by environment variables.
+#[must_use]
+pub fn provider_plugin_id_from_environment() -> Option<String> {
+    first_env_value(["BCODE_MODEL_PROVIDER", "BCODE_PROVIDER"])
+        .and_then(|value| normalize_provider_plugin_id(&value))
+        .or_else(|| bedrock_environment_is_configured().then(|| "bcode.bedrock".to_string()))
+}
+
+fn normalize_provider_plugin_id(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "bedrock" | "aws-bedrock" | "aws_bedrock" | "bcode.bedrock" => {
+            Some("bcode.bedrock".to_string())
+        }
+        "openai"
+        | "openai-compatible"
+        | "openai_compatible"
+        | "xai"
+        | "grok"
+        | "bcode.openai-compatible" => Some("bcode.openai-compatible".to_string()),
+        _ => None,
+    }
+}
+
+fn model_id_from_environment(provider_plugin_id: &str) -> Option<String> {
+    match provider_plugin_id {
+        "bcode.bedrock" => first_env_value(["BCODE_BEDROCK_MODEL", "BEDROCK_MODEL"]),
+        "bcode.openai-compatible" => first_env_value([
+            "BCODE_XAI_MODEL",
+            "XAI_MODEL",
+            "BCODE_OPENAI_MODEL",
+            "OPENAI_MODEL",
+        ]),
+        _ => None,
+    }
+}
+
+fn first_env_value<const N: usize>(names: [&str; N]) -> Option<String> {
+    names.into_iter().find_map(|name| match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    })
 }
 
 /// Return true when environment variables imply Bedrock should be selected.
@@ -355,24 +412,34 @@ impl From<&PluginConfig> for PluginSelection {
 impl From<&BcodeConfig> for PluginSelection {
     fn from(value: &BcodeConfig) -> Self {
         let mut selection = Self::from(&value.plugins);
-        let provider = value
-            .resolved_model_selection()
-            .provider_plugin_id
-            .unwrap_or_else(|| "bcode.openai-compatible".to_string());
+        let env_provider = provider_plugin_id_from_environment();
+        let provider = env_provider.clone().unwrap_or_else(|| {
+            value
+                .resolved_model_selection()
+                .provider_plugin_id
+                .unwrap_or_else(|| "bcode.openai-compatible".to_string())
+        });
         if selection.enabled.is_empty() {
             for plugin_id in ["bcode.filesystem", "bcode.shell", provider.as_str()] {
                 if !selection.disabled.contains(plugin_id) {
                     selection.enabled.insert(plugin_id.to_string());
                 }
             }
-        } else if value.model.provider_plugin_id.is_none()
-            && value.model.profile.is_none()
-            && bedrock_environment_is_configured()
-            && !selection.disabled.contains("bcode.bedrock")
+        } else if let Some(env_provider) = env_provider
+            && !selection.disabled.contains(&env_provider)
         {
-            selection.enabled.insert("bcode.bedrock".to_string());
+            selection.enabled.insert(env_provider.clone());
+            remove_other_model_providers(&mut selection.enabled, &env_provider);
         }
         selection
+    }
+}
+
+fn remove_other_model_providers(enabled: &mut BTreeSet<String>, selected_provider: &str) {
+    for provider in ["bcode.bedrock", "bcode.openai-compatible"] {
+        if provider != selected_provider {
+            enabled.remove(provider);
+        }
     }
 }
 
@@ -873,8 +940,11 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BcodeConfig, load_config_from_paths};
+    use super::{BcodeConfig, PluginSelection, load_config_from_paths};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn merges_plugin_selection_from_existing_files() {
@@ -1013,6 +1083,51 @@ profile = "work"
             selection.settings.get("region"),
             Some(&"us-east-1".to_string())
         );
+    }
+
+    #[test]
+    fn bedrock_env_overrides_persisted_openai_provider() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_token = std::env::var_os("AWS_BEARER_TOKEN_BEDROCK");
+        let previous_model = std::env::var_os("BCODE_BEDROCK_MODEL");
+        unsafe {
+            std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", "test-token");
+            std::env::remove_var("BCODE_BEDROCK_MODEL");
+        }
+
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+enabled = ["bcode.openai-compatible"]
+
+[model]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-4.1-mini"
+"#,
+        )
+        .expect("config should parse");
+        let selection = config.resolved_model_selection();
+        assert_eq!(
+            selection.provider_plugin_id,
+            Some("bcode.bedrock".to_string())
+        );
+        assert_eq!(selection.model_id, None);
+
+        let plugin_selection = PluginSelection::from(&config);
+        assert!(plugin_selection.enabled.contains("bcode.bedrock"));
+        assert!(!plugin_selection.enabled.contains("bcode.openai-compatible"));
+
+        restore_env("AWS_BEARER_TOKEN_BEDROCK", previous_token);
+        restore_env("BCODE_BEDROCK_MODEL", previous_model);
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {
