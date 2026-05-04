@@ -15,13 +15,14 @@ use rand::TryRngCore as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
-use std::io::{Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use zeroize::Zeroizing;
 
 /// Errors returned by the CLI.
@@ -73,6 +74,7 @@ pub enum CliError {
 ///
 /// Returns an error when the requested command fails.
 pub async fn run() -> Result<(), CliError> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command.unwrap_or_default() {
         Commands::Server { command } => handle_server_command(command).await?,
@@ -161,6 +163,29 @@ pub async fn run() -> Result<(), CliError> {
         } => send_message(session_id, message).await?,
     }
     Ok(())
+}
+
+fn init_tracing() {
+    let filter = std::env::var("BCODE_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .unwrap_or_else(|| {
+            if std::env::var_os("BCODE_STARTUP_TRACE").is_some() {
+                "bcode_server::startup=debug,bcode_plugin::startup=debug".to_string()
+            } else {
+                "off".to_string()
+            }
+        });
+    let env_filter = tracing_subscriber::EnvFilter::try_new(filter).unwrap_or_else(|error| {
+        eprintln!("bcode warning: invalid log filter; logging disabled: {error}");
+        tracing_subscriber::EnvFilter::new("off")
+    });
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr)
+        .finish();
+    let _ = subscriber.try_init();
 }
 
 #[derive(Debug, Parser)]

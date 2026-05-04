@@ -93,6 +93,13 @@ toml = { version = "1.1.2", default-features = false, features = [
     "serde",
     "std",
 ] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "ansi",
+    "env-filter",
+    "fmt",
+    "std",
+] }
 uuid = { version = "1.21.0", default-features = false }
 zeroize = { version = "1.8.2", default-features = false, features = ["std"] }
 

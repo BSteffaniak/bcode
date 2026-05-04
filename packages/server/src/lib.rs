@@ -240,28 +240,32 @@ impl ServerState {
 ///
 /// Returns an error when the server cannot bind or accept local IPC connections.
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
-    startup_trace("loading config");
+    tracing::debug!(target: "bcode_server::startup", "loading config");
     let config = bcode_config::load_config()?;
-    startup_trace("config loaded");
+    tracing::debug!(target: "bcode_server::startup", "config loaded");
     let plugin_selection = bcode_plugin::PluginSelection::from(&config);
-    startup_trace(format!(
-        "plugin selection enabled={:?} disabled={:?}",
-        plugin_selection.enabled, plugin_selection.disabled
-    ));
-    startup_trace("loading plugins");
+    tracing::debug!(
+        target: "bcode_server::startup",
+        enabled = ?plugin_selection.enabled,
+        disabled = ?plugin_selection.disabled,
+        "plugin selection resolved"
+    );
+    tracing::debug!(target: "bcode_server::startup", "loading plugins");
     let plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
-    startup_trace("plugins loaded");
-    startup_trace(format!("binding IPC endpoint {endpoint:?}"));
+    tracing::debug!(target: "bcode_server::startup", "plugins loaded");
+    tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
-    startup_trace("IPC endpoint bound");
-    startup_trace("opening session store");
+    tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
+    tracing::debug!(target: "bcode_server::startup", "opening session store");
     let sessions = SessionManager::persistent(default_session_store_dir())?;
-    startup_trace("session store ready");
+    tracing::debug!(target: "bcode_server::startup", "session store ready");
     let resolved_model = config.resolved_model_selection();
-    startup_trace(format!(
-        "resolved model provider={:?} model={:?}",
-        resolved_model.provider_plugin_id, resolved_model.model_id
-    ));
+    tracing::debug!(
+        target: "bcode_server::startup",
+        provider = ?resolved_model.provider_plugin_id,
+        model = ?resolved_model.model_id,
+        "model selection resolved"
+    );
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
@@ -275,7 +279,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         PermissionPolicy::from(&config.permissions),
     ));
     let mut shutdown = state.subscribe_shutdown();
-    startup_trace("server ready; accepting clients");
+    tracing::info!(target: "bcode_server::startup", "server ready; accepting clients");
     loop {
         tokio::select! {
             stream = listener.accept() => {
@@ -290,16 +294,10 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             _ = shutdown.recv() => break,
         }
     }
-    startup_trace("shutdown requested; deactivating plugins");
+    tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
     state.plugins.lock().await.deactivate_all()?;
-    startup_trace("shutdown complete");
+    tracing::debug!(target: "bcode_server::startup", "shutdown complete");
     Ok(())
-}
-
-fn startup_trace(message: impl AsRef<str>) {
-    if std::env::var_os("BCODE_STARTUP_TRACE").is_some() {
-        eprintln!("bcode startup: {}", message.as_ref());
-    }
 }
 
 async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Result<(), ServerError> {

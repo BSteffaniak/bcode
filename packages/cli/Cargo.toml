@@ -30,6 +30,7 @@ sha2                 = { workspace = true }
 sshenv_vault         = { workspace = true }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["signal", "time"] }
+tracing-subscriber   = { workspace = true }
 zeroize              = { workspace = true }
 
 [features]
