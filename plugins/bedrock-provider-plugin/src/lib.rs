@@ -28,7 +28,7 @@ use bcode_model_provider_runtime::{
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -195,26 +195,54 @@ async fn stream_bedrock_turn_inner(
     let settings = Settings::resolve(Some(request));
     settings.validate()?;
     let client = bedrock_client(&settings).await;
-    let model_id = resolve_turn_model_id(request, &settings, turn, &discovery).await?;
-    let bedrock_request = build_converse_request(request, model_id)?;
-    let mut builder = client
-        .converse_stream()
-        .model_id(bedrock_request.model_id)
-        .set_messages(Some(bedrock_request.messages));
-    if !bedrock_request.system.is_empty() {
-        builder = builder.set_system(Some(bedrock_request.system));
+    let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
+    let name_map = bedrock_tool_name_map(&request.tools);
+    let mut last_error = None;
+    for model_id in &selection.model_ids {
+        let bedrock_request = build_converse_request(request, model_id.clone())?;
+        let mut builder = client
+            .converse_stream()
+            .model_id(bedrock_request.model_id)
+            .set_messages(Some(bedrock_request.messages));
+        if !bedrock_request.system.is_empty() {
+            builder = builder.set_system(Some(bedrock_request.system));
+        }
+        if let Some(tool_config) = bedrock_request.tool_config {
+            builder = builder.tool_config(tool_config);
+        }
+        if let Some(inference_config) = bedrock_request.inference_config {
+            builder = builder.inference_config(inference_config);
+        }
+        match builder.send().await {
+            Ok(response) => {
+                return read_bedrock_stream(response.stream, turn, name_map.clone()).await;
+            }
+            Err(error) => {
+                let error = bedrock_sdk_error(&error);
+                if !selection.explicit
+                    && streaming_tool_use_unsupported(&error)
+                    && selection.model_ids.last() != Some(model_id)
+                {
+                    mark_streaming_tool_unsupported(&discovery, &selection.cache_key, model_id);
+                    turn.push(ProviderTurnEvent::Warning {
+                        message: format!(
+                            "Bedrock model {model_id} does not support streaming tool use; retrying another discovered model"
+                        ),
+                    });
+                    last_error = Some(error);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
     }
-    if let Some(tool_config) = bedrock_request.tool_config {
-        builder = builder.tool_config(tool_config);
-    }
-    if let Some(inference_config) = bedrock_request.inference_config {
-        builder = builder.inference_config(inference_config);
-    }
-    let response = builder
-        .send()
-        .await
-        .map_err(|error| bedrock_sdk_error(&error))?;
-    read_bedrock_stream(response.stream, turn, bedrock_tool_name_map(&request.tools)).await
+    Err(last_error.unwrap_or_else(|| {
+        provider_error(
+            "bedrock_model_discovery_empty",
+            ProviderErrorCategory::Config,
+            "Bedrock model discovery returned no usable streaming tool-use models; set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
+        )
+    }))
 }
 
 async fn bedrock_client(settings: &Settings) -> Client {
@@ -853,19 +881,34 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
         .collect()
 }
 
-async fn resolve_turn_model_id(
+#[derive(Debug, Clone)]
+struct ModelSelection {
+    model_ids: Vec<String>,
+    explicit: bool,
+    cache_key: Option<DiscoveryCacheKey>,
+}
+
+async fn resolve_turn_model_selection(
     request: &ModelTurnRequest,
     settings: &Settings,
     turn: &TurnState,
     cache: &Arc<Mutex<DiscoveryCache>>,
-) -> Result<String, ProviderError> {
+) -> Result<ModelSelection, ProviderError> {
     if !request.model_id.trim().is_empty() {
-        return Ok(request.model_id.clone());
+        return Ok(ModelSelection {
+            model_ids: vec![request.model_id.clone()],
+            explicit: true,
+            cache_key: None,
+        });
     }
     if let Some(model_id) = &settings.default_model
         && !model_id.trim().is_empty()
     {
-        return Ok(model_id.clone());
+        return Ok(ModelSelection {
+            model_ids: vec![model_id.clone()],
+            explicit: true,
+            cache_key: None,
+        });
     }
     let key = discovery_cache_key(settings).await;
     let discovery = if let Some(discovery) = cached_discovery(cache, &key) {
@@ -875,15 +918,25 @@ async fn resolve_turn_model_id(
             message: "discovering available Bedrock models".to_string(),
         });
         let discovery = discover_models(settings).await?;
-        store_discovery(cache, key, discovery.clone());
+        store_discovery(cache, key.clone(), discovery.clone());
         discovery
     };
-    discovery.default_model_id.ok_or_else(|| {
-        provider_error(
+    let model_ids = discovery
+        .models
+        .iter()
+        .map(|model| model.model_id.clone())
+        .collect::<Vec<_>>();
+    if model_ids.is_empty() {
+        return Err(provider_error(
             "bedrock_model_discovery_empty",
             ProviderErrorCategory::Config,
             "Bedrock model discovery returned no usable text/streaming models; set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
-        )
+        ));
+    }
+    Ok(ModelSelection {
+        model_ids,
+        explicit: false,
+        cache_key: Some(key),
     })
 }
 
@@ -909,6 +962,7 @@ struct DiscoveryCacheKey {
 struct CachedDiscovery {
     discovered_at: Instant,
     discovery: ModelDiscovery,
+    unsupported_streaming_tool_models: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -972,7 +1026,25 @@ fn cached_discovery(
 ) -> Option<ModelDiscovery> {
     let cache = cache.lock().ok()?;
     let cached = cache.entries.get(key)?;
-    (cached.discovered_at.elapsed() < MODEL_DISCOVERY_TTL).then(|| cached.discovery.clone())
+    (cached.discovered_at.elapsed() < MODEL_DISCOVERY_TTL)
+        .then(|| filtered_discovery(&cached.discovery, &cached.unsupported_streaming_tool_models))
+}
+
+fn filtered_discovery(
+    discovery: &ModelDiscovery,
+    unsupported_streaming_tool_models: &BTreeSet<String>,
+) -> ModelDiscovery {
+    let models = discovery
+        .models
+        .iter()
+        .filter(|model| !unsupported_streaming_tool_models.contains(&model.model_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_model_id = models.first().map(|model| model.model_id.clone());
+    ModelDiscovery {
+        models,
+        default_model_id,
+    }
 }
 
 fn store_discovery(
@@ -981,14 +1053,44 @@ fn store_discovery(
     discovery: ModelDiscovery,
 ) {
     if let Ok(mut cache) = cache.lock() {
+        let unsupported_streaming_tool_models = cache
+            .entries
+            .get(&key)
+            .map(|cached| cached.unsupported_streaming_tool_models.clone())
+            .unwrap_or_default();
         cache.entries.insert(
             key,
             CachedDiscovery {
                 discovered_at: Instant::now(),
                 discovery,
+                unsupported_streaming_tool_models,
             },
         );
     }
+}
+
+fn mark_streaming_tool_unsupported(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: &Option<DiscoveryCacheKey>,
+    model_id: &str,
+) {
+    let Some(key) = key else {
+        return;
+    };
+    if let Ok(mut cache) = cache.lock()
+        && let Some(cached) = cache.entries.get_mut(key)
+    {
+        cached
+            .unsupported_streaming_tool_models
+            .insert(model_id.to_string());
+    }
+}
+
+fn streaming_tool_use_unsupported(error: &ProviderError) -> bool {
+    error.category == ProviderErrorCategory::InvalidRequest
+        && error
+            .message
+            .contains("doesn't support tool use in streaming mode")
 }
 
 async fn discovery_cache_key(settings: &Settings) -> DiscoveryCacheKey {
