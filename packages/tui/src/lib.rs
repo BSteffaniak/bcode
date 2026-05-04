@@ -37,6 +37,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap,
 };
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
@@ -56,6 +57,11 @@ pub enum TuiError {
     #[error("session selection canceled")]
     Canceled,
 }
+
+const TRANSCRIPT_WRAP: Wrap = Wrap { trim: false };
+const DEFAULT_TRANSCRIPT_WIDTH: u16 = 80;
+const DEFAULT_TRANSCRIPT_HEIGHT: u16 = 20;
+const TRANSCRIPT_WINDOW_OVERSCAN_LINES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TuiAction {
@@ -932,7 +938,9 @@ struct ChatApp {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     current_thinking_level: Option<ReasoningEffort>,
-    scroll_from_bottom: usize,
+    scroll_rows_from_bottom: usize,
+    last_transcript_width: Cell<u16>,
+    last_transcript_height: Cell<u16>,
     search_mode: bool,
     search_query: String,
     key_hints: String,
@@ -1094,7 +1102,9 @@ impl ChatApp {
             selected_provider_plugin_id: None,
             selected_model_id: None,
             current_thinking_level: None,
-            scroll_from_bottom: 0,
+            scroll_rows_from_bottom: 0,
+            last_transcript_width: Cell::new(DEFAULT_TRANSCRIPT_WIDTH),
+            last_transcript_height: Cell::new(DEFAULT_TRANSCRIPT_HEIGHT),
             search_mode: false,
             search_query: String::new(),
             key_hints: keymap.chat_hints(),
@@ -1197,39 +1207,73 @@ impl ChatApp {
     }
 
     fn top_visible_line_index(&self) -> usize {
-        self.rendered_line_count()
-            .saturating_sub(self.scroll_from_bottom)
-            .saturating_sub(1)
+        let lines = self.rendered_transcript_lines();
+        let (metrics, total_rows) = visual_line_metrics(&lines, self.last_transcript_width.get());
+        let Some(last_metric) = metrics.last() else {
+            return 0;
+        };
+        let viewport_rows = usize::from(self.last_transcript_height.get());
+        let max_scroll_rows_from_bottom = total_rows.saturating_sub(viewport_rows);
+        let effective_scroll_rows_from_bottom = self
+            .scroll_rows_from_bottom
+            .min(max_scroll_rows_from_bottom);
+        let top_visual_row =
+            max_scroll_rows_from_bottom.saturating_sub(effective_scroll_rows_from_bottom);
+        metrics
+            .iter()
+            .find(|metric| metric.end_row > top_visual_row)
+            .map_or(last_metric.logical_index, |metric| metric.logical_index)
     }
 
     fn scroll_to_line(&mut self, index: usize) {
-        self.scroll_from_bottom = self
-            .rendered_line_count()
-            .saturating_sub(index.saturating_add(1));
+        let lines = self.rendered_transcript_lines();
+        let (metrics, total_rows) = visual_line_metrics(&lines, self.last_transcript_width.get());
+        if let Some(metric) = metrics.get(index) {
+            self.scroll_rows_from_bottom = total_rows.saturating_sub(metric.end_row);
+        }
+        self.clamp_scroll();
     }
 
     fn scroll_line_up(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(1);
+        self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_add(1);
+        self.clamp_scroll();
     }
 
     fn scroll_line_down(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1);
+        self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_sub(1);
     }
 
     fn scroll_page_up(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(10);
+        self.scroll_rows_from_bottom = self
+            .scroll_rows_from_bottom
+            .saturating_add(self.page_scroll_rows());
+        self.clamp_scroll();
     }
 
     fn scroll_page_down(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(10);
+        self.scroll_rows_from_bottom = self
+            .scroll_rows_from_bottom
+            .saturating_sub(self.page_scroll_rows());
     }
 
     fn scroll_top(&mut self) {
-        self.scroll_from_bottom = self.rendered_line_count();
+        self.scroll_rows_from_bottom = self.max_scroll_rows_from_bottom();
     }
 
     fn scroll_bottom(&mut self) {
-        self.scroll_from_bottom = 0;
+        self.scroll_rows_from_bottom = 0;
+    }
+
+    fn page_scroll_rows(&self) -> usize {
+        usize::from(self.last_transcript_height.get())
+            .saturating_sub(1)
+            .max(1)
+    }
+
+    fn max_scroll_rows_from_bottom(&self) -> usize {
+        let lines = self.rendered_transcript_lines();
+        let (_, total_rows) = visual_line_metrics(&lines, self.last_transcript_width.get());
+        total_rows.saturating_sub(usize::from(self.last_transcript_height.get()))
     }
 
     fn absorb_session_event(&mut self, event: &SessionEvent) {
@@ -1318,17 +1362,15 @@ impl ChatApp {
     }
 
     fn clamp_scroll(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.min(self.rendered_line_count());
-    }
-
-    fn rendered_line_count(&self) -> usize {
-        self.rendered_line_texts().len()
+        self.scroll_rows_from_bottom = self
+            .scroll_rows_from_bottom
+            .min(self.max_scroll_rows_from_bottom());
     }
 
     fn rendered_line_texts(&self) -> Vec<String> {
-        self.blocks
+        self.rendered_transcript_lines()
             .iter()
-            .flat_map(TranscriptBlock::plain_lines)
+            .map(line_plain_text)
             .collect()
     }
 
@@ -1589,22 +1631,30 @@ impl ratatui::widgets::Widget for &ChatApp {
         ));
         header.render(chunks[0], buf);
 
-        let transcript_height = usize::from(chunks[1].height.saturating_sub(2));
+        let transcript_width = chunks[1].width.saturating_sub(2);
+        let transcript_height = chunks[1].height.saturating_sub(2);
+        self.last_transcript_width.set(transcript_width);
+        self.last_transcript_height.set(transcript_height);
+
         let rendered_lines = self.rendered_transcript_lines();
-        let visible_end = rendered_lines
-            .len()
-            .saturating_sub(self.scroll_from_bottom)
-            .max(transcript_height.min(rendered_lines.len()));
-        let start = visible_end.saturating_sub(transcript_height);
-        let title = if self.scroll_from_bottom == 0 {
+        let viewport = transcript_viewport(
+            &rendered_lines,
+            transcript_width,
+            transcript_height,
+            self.scroll_rows_from_bottom,
+        );
+        let title = if viewport.effective_scroll_rows_from_bottom == 0 {
             "Chat".to_string()
         } else {
-            format!("Chat ({} from bottom)", self.scroll_from_bottom)
+            format!(
+                "Chat ({} rows from bottom)",
+                viewport.effective_scroll_rows_from_bottom
+            )
         };
-        let transcript_lines = rendered_lines[start..visible_end].to_vec();
-        let transcript = Paragraph::new(Text::from(transcript_lines))
+        let transcript = Paragraph::new(Text::from(viewport.lines))
             .block(Block::new().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false });
+            .wrap(TRANSCRIPT_WRAP)
+            .scroll((usize_to_u16_saturating(viewport.local_scroll_y), 0));
         transcript.render(chunks[1], buf);
 
         let input_index = if let Some(palette) = &self.command_palette {
@@ -1658,45 +1708,103 @@ impl ratatui::widgets::Widget for &ChatApp {
     }
 }
 
-impl TranscriptBlock {
-    fn plain_lines(&self) -> Vec<String> {
-        match self {
-            Self::User { text } => block_plain_lines("You", text),
-            Self::Assistant { text, streaming } => {
-                block_plain_lines(if *streaming { "Bcode…" } else { "Bcode" }, text)
-            }
-            Self::ToolCall {
-                name,
-                arguments_json,
-                ..
-            } => block_plain_lines(&format!("Tool · {name}"), &pretty_jsonish(arguments_json)),
-            Self::ToolResult {
-                id,
-                result,
-                is_error,
-            } => block_plain_lines(
-                &format!(
-                    "Tool result · {id} · {}",
-                    if *is_error { "failed" } else { "ok" }
-                ),
-                &tool_result_preview(result),
-            ),
-            Self::PermissionRequest {
-                name,
-                arguments_json,
-                ..
-            } => block_plain_lines(
-                &format!("Permission required · {name}"),
-                &pretty_jsonish(arguments_json),
-            ),
-            Self::PermissionResult { approved } => {
-                block_plain_lines("Permission", if *approved { "allowed" } else { "denied" })
-            }
-            Self::Meta { text } => vec![format!("· {text}"), String::new()],
-            Self::System { text } => block_plain_lines("System", text),
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualLineMetric {
+    logical_index: usize,
+    start_row: usize,
+    end_row: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptViewport {
+    lines: Vec<Line<'static>>,
+    effective_scroll_rows_from_bottom: usize,
+    local_scroll_y: usize,
+}
+
+fn transcript_viewport(
+    lines: &[Line<'static>],
+    width: u16,
+    height: u16,
+    scroll_rows_from_bottom: usize,
+) -> TranscriptViewport {
+    if lines.is_empty() || width == 0 || height == 0 {
+        return TranscriptViewport {
+            lines: Vec::new(),
+            effective_scroll_rows_from_bottom: 0,
+            local_scroll_y: 0,
+        };
     }
 
+    let viewport_rows = usize::from(height);
+    let (metrics, total_rows) = visual_line_metrics(lines, width);
+    let max_scroll_rows_from_bottom = total_rows.saturating_sub(viewport_rows);
+    let effective_scroll_rows_from_bottom =
+        scroll_rows_from_bottom.min(max_scroll_rows_from_bottom);
+    let target_start_row =
+        max_scroll_rows_from_bottom.saturating_sub(effective_scroll_rows_from_bottom);
+    let target_end_row = target_start_row.saturating_add(viewport_rows);
+
+    let first_visible_index = metrics
+        .iter()
+        .position(|metric| metric.end_row > target_start_row)
+        .unwrap_or(0);
+    let last_visible_index = metrics
+        .iter()
+        .rposition(|metric| metric.start_row < target_end_row)
+        .unwrap_or(first_visible_index);
+    let window_start = first_visible_index.saturating_sub(TRANSCRIPT_WINDOW_OVERSCAN_LINES);
+    let window_end = last_visible_index
+        .saturating_add(1)
+        .saturating_add(TRANSCRIPT_WINDOW_OVERSCAN_LINES)
+        .min(lines.len());
+    let window_start_row = metrics[window_start].start_row;
+
+    TranscriptViewport {
+        lines: lines[window_start..window_end].to_vec(),
+        effective_scroll_rows_from_bottom,
+        local_scroll_y: target_start_row.saturating_sub(window_start_row),
+    }
+}
+
+fn visual_line_metrics(lines: &[Line<'static>], width: u16) -> (Vec<VisualLineMetric>, usize) {
+    let width = width.max(1);
+    let mut next_row = 0usize;
+    let metrics = lines
+        .iter()
+        .enumerate()
+        .map(|(logical_index, line)| {
+            let start_row = next_row;
+            next_row = next_row.saturating_add(visual_line_count(line, width));
+            VisualLineMetric {
+                logical_index,
+                start_row,
+                end_row: next_row,
+            }
+        })
+        .collect();
+    (metrics, next_row)
+}
+
+fn visual_line_count(line: &Line<'static>, width: u16) -> usize {
+    Paragraph::new(Text::from(vec![line.clone()]))
+        .wrap(TRANSCRIPT_WRAP)
+        .line_count(width)
+        .max(1)
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn usize_to_u16_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+impl TranscriptBlock {
     fn render_lines(&self, search_query: &str) -> Vec<Line<'static>> {
         match self {
             Self::User { text } => render_message_block("You", text, Color::Blue, search_query),
@@ -1765,13 +1873,6 @@ impl TranscriptBlock {
             }
         }
     }
-}
-
-fn block_plain_lines(title: &str, body: &str) -> Vec<String> {
-    let mut lines = vec![format!("{title}:")];
-    lines.extend(body.lines().map(|line| format!("  {line}")));
-    lines.push(String::new());
-    lines
 }
 
 fn render_message_block(
@@ -2129,5 +2230,78 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn transcript_viewport_bottom_anchors_after_wrapped_lines() {
+        let lines = vec![
+            Line::from("header"),
+            Line::from("wrapped ".repeat(20)),
+            Line::from("FINAL"),
+        ];
+
+        let rows = render_viewport_rows(&lines, 10, 3, 0);
+
+        assert!(
+            rows.last().is_some_and(|row| row.contains("FINAL")),
+            "expected final line at bottom after wrapping, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn scroll_to_line_uses_wrapped_visual_rows() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.blocks.push(TranscriptBlock::System {
+            text: format!("{}\nNEEDLE", "wrapped ".repeat(20)),
+        });
+        app.last_transcript_width.set(10);
+        app.last_transcript_height.set(3);
+        let needle_index = app
+            .rendered_line_texts()
+            .iter()
+            .position(|line| line.contains("NEEDLE"))
+            .expect("needle line should render");
+
+        app.scroll_to_line(needle_index);
+        let rows = render_viewport_rows(
+            &app.rendered_transcript_lines(),
+            10,
+            3,
+            app.scroll_rows_from_bottom,
+        );
+
+        assert!(
+            rows.iter().any(|row| row.contains("NEEDLE")),
+            "expected scroll target to be visible, got {rows:?}"
+        );
+    }
+
+    fn render_viewport_rows(
+        lines: &[Line<'static>],
+        width: u16,
+        height: u16,
+        scroll_rows_from_bottom: usize,
+    ) -> Vec<String> {
+        let viewport = transcript_viewport(lines, width, height, scroll_rows_from_bottom);
+        let area = ratatui::layout::Rect::new(0, 0, width, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let paragraph = Paragraph::new(Text::from(viewport.lines))
+            .wrap(TRANSCRIPT_WRAP)
+            .scroll((usize_to_u16_saturating(viewport.local_scroll_y), 0));
+        ratatui::widgets::Widget::render(paragraph, area, &mut buffer);
+        buffer_rows(&buffer)
+    }
+
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                let mut row = String::new();
+                for x in 0..buffer.area.width {
+                    row.push_str(buffer[(x, y)].symbol());
+                }
+                row
+            })
+            .collect()
     }
 }

@@ -22,6 +22,7 @@ ratatui = { workspace = true, features = [
     "crossterm",
     "crossterm_0_29",
     "std",
+    "unstable-rendered-line-info",
 ] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
