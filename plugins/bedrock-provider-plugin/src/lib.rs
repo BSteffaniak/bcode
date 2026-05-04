@@ -27,14 +27,18 @@ use bcode_model_provider_runtime::{
     StreamOutcome, TurnState, TurnStore, current_thread_runtime, provider_error,
 };
 use bcode_plugin_sdk::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
 const MODEL_DISCOVERY_TTL: Duration = Duration::from_secs(10 * 60);
+const COMPATIBILITY_CACHE_VERSION: u8 = 1;
+const COMPATIBILITY_CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const STREAMING_TOOL_UNSUPPORTED_REASON: &str = "streaming_tool_use_unsupported";
 
 /// Amazon Bedrock model provider plugin.
 pub struct BedrockProviderPlugin {
@@ -53,6 +57,20 @@ impl Default for BedrockProviderPlugin {
 
 impl RustPlugin for BedrockProviderPlugin {
     fn activate(&mut self) -> Result<(), PluginError> {
+        match load_compatibility_cache() {
+            Ok(compatibility) => {
+                if let Ok(mut discovery) = self.discovery.lock() {
+                    discovery.compatibility = compatibility;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "bcode_bedrock::compatibility",
+                    error = %error.message,
+                    "failed to load Bedrock compatibility cache"
+                );
+            }
+        }
         warm_discovery_cache(self.discovery.clone(), Settings::resolve(None));
         Ok(())
     }
@@ -223,7 +241,12 @@ async fn stream_bedrock_turn_inner(
                     && streaming_tool_use_unsupported(&error)
                     && selection.model_ids.last() != Some(model_id)
                 {
-                    mark_streaming_tool_unsupported(&discovery, &selection.cache_key, model_id);
+                    mark_streaming_tool_unsupported(
+                        &discovery,
+                        &selection.cache_key,
+                        model_id,
+                        &error.message,
+                    );
                     turn.push(ProviderTurnEvent::Warning {
                         message: format!(
                             "Bedrock model {model_id} does not support streaming tool use; retrying another discovered model"
@@ -949,13 +972,44 @@ struct ModelDiscovery {
 #[derive(Debug, Default)]
 struct DiscoveryCache {
     entries: BTreeMap<DiscoveryCacheKey, CachedDiscovery>,
+    compatibility: PersistedCompatibilityCache,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct DiscoveryCacheKey {
     region: String,
     aws_profile: Option<String>,
     endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCompatibilityCache {
+    version: u8,
+    entries: Vec<PersistedCompatibilityEntry>,
+}
+
+impl Default for PersistedCompatibilityCache {
+    fn default() -> Self {
+        Self {
+            version: COMPATIBILITY_CACHE_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCompatibilityEntry {
+    key: DiscoveryCacheKey,
+    #[serde(default)]
+    unsupported_streaming_tool_models: BTreeMap<String, PersistedModelIncompatibility>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedModelIncompatibility {
+    reason: String,
+    message: String,
+    first_seen_unix_seconds: u64,
+    last_seen_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1016,8 +1070,8 @@ async fn get_or_refresh_discovery(
         return Ok(discovery);
     }
     let discovery = discover_models(settings).await?;
-    store_discovery(cache, key, discovery.clone());
-    Ok(discovery)
+    store_discovery(cache, key.clone(), discovery.clone());
+    Ok(cached_discovery(cache, &key).unwrap_or(discovery))
 }
 
 fn cached_discovery(
@@ -1053,11 +1107,12 @@ fn store_discovery(
     discovery: ModelDiscovery,
 ) {
     if let Ok(mut cache) = cache.lock() {
-        let unsupported_streaming_tool_models = cache
+        let mut unsupported_streaming_tool_models = cache
             .entries
             .get(&key)
             .map(|cached| cached.unsupported_streaming_tool_models.clone())
             .unwrap_or_default();
+        unsupported_streaming_tool_models.extend(cache.compatibility.unsupported_for(&key));
         cache.entries.insert(
             key,
             CachedDiscovery {
@@ -1073,16 +1128,36 @@ fn mark_streaming_tool_unsupported(
     cache: &Arc<Mutex<DiscoveryCache>>,
     key: &Option<DiscoveryCacheKey>,
     model_id: &str,
+    message: &str,
 ) {
     let Some(key) = key else {
         return;
     };
-    if let Ok(mut cache) = cache.lock()
-        && let Some(cached) = cache.entries.get_mut(key)
+    let compatibility = if let Ok(mut cache) = cache.lock() {
+        if let Some(cached) = cache.entries.get_mut(key) {
+            cached
+                .unsupported_streaming_tool_models
+                .insert(model_id.to_string());
+        }
+        cache.compatibility.mark_unsupported(
+            key,
+            model_id,
+            STREAMING_TOOL_UNSUPPORTED_REASON,
+            message,
+            now_unix_seconds(),
+        );
+        Some(cache.compatibility.clone())
+    } else {
+        None
+    };
+    if let Some(compatibility) = compatibility
+        && let Err(error) = save_compatibility_cache(&compatibility)
     {
-        cached
-            .unsupported_streaming_tool_models
-            .insert(model_id.to_string());
+        tracing::warn!(
+            target: "bcode_bedrock::compatibility",
+            error = %error.message,
+            "failed to save Bedrock compatibility cache"
+        );
     }
 }
 
@@ -1091,6 +1166,154 @@ fn streaming_tool_use_unsupported(error: &ProviderError) -> bool {
         && error
             .message
             .contains("doesn't support tool use in streaming mode")
+}
+
+impl PersistedCompatibilityCache {
+    fn unsupported_for(&self, key: &DiscoveryCacheKey) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.key == key)
+            .map(|entry| {
+                entry
+                    .unsupported_streaming_tool_models
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn mark_unsupported(
+        &mut self,
+        key: &DiscoveryCacheKey,
+        model_id: &str,
+        reason: &str,
+        message: &str,
+        now: u64,
+    ) {
+        let entry = self.entry_mut(key.clone());
+        entry
+            .unsupported_streaming_tool_models
+            .entry(model_id.to_string())
+            .and_modify(|model| {
+                model.message = message.to_string();
+                model.last_seen_unix_seconds = now;
+            })
+            .or_insert_with(|| PersistedModelIncompatibility {
+                reason: reason.to_string(),
+                message: message.to_string(),
+                first_seen_unix_seconds: now,
+                last_seen_unix_seconds: now,
+            });
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        for entry in &mut self.entries {
+            entry.unsupported_streaming_tool_models.retain(|_, model| {
+                now.saturating_sub(model.last_seen_unix_seconds) <= COMPATIBILITY_CACHE_TTL_SECONDS
+            });
+        }
+        self.entries
+            .retain(|entry| !entry.unsupported_streaming_tool_models.is_empty());
+    }
+
+    fn entry_mut(&mut self, key: DiscoveryCacheKey) -> &mut PersistedCompatibilityEntry {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            return &mut self.entries[index];
+        }
+        self.entries.push(PersistedCompatibilityEntry {
+            key,
+            unsupported_streaming_tool_models: BTreeMap::new(),
+        });
+        self.entries.last_mut().expect("entry was just inserted")
+    }
+}
+
+fn load_compatibility_cache() -> Result<PersistedCompatibilityCache, ProviderError> {
+    load_compatibility_cache_from_path(&compatibility_cache_path())
+}
+
+fn load_compatibility_cache_from_path(
+    path: &Path,
+) -> Result<PersistedCompatibilityCache, ProviderError> {
+    if !path.exists() {
+        return Ok(PersistedCompatibilityCache::default());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        provider_error(
+            "bedrock_compatibility_cache_read_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    let mut cache =
+        serde_json::from_str::<PersistedCompatibilityCache>(&contents).map_err(|error| {
+            provider_error(
+                "bedrock_compatibility_cache_decode_failed",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?;
+    if cache.version != COMPATIBILITY_CACHE_VERSION {
+        return Ok(PersistedCompatibilityCache::default());
+    }
+    cache.prune_expired(now_unix_seconds());
+    Ok(cache)
+}
+
+fn save_compatibility_cache(cache: &PersistedCompatibilityCache) -> Result<(), ProviderError> {
+    save_compatibility_cache_to_path(&compatibility_cache_path(), cache)
+}
+
+fn save_compatibility_cache_to_path(
+    path: &Path,
+    cache: &PersistedCompatibilityCache,
+) -> Result<(), ProviderError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            provider_error(
+                "bedrock_compatibility_cache_dir_failed",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?;
+    }
+    let temp_path = path.with_extension("json.tmp");
+    let contents = serde_json::to_vec_pretty(cache).map_err(|error| {
+        provider_error(
+            "bedrock_compatibility_cache_encode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    std::fs::write(&temp_path, contents).map_err(|error| {
+        provider_error(
+            "bedrock_compatibility_cache_write_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    std::fs::rename(&temp_path, path).map_err(|error| {
+        provider_error(
+            "bedrock_compatibility_cache_rename_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+fn compatibility_cache_path() -> PathBuf {
+    bcode_config::default_state_dir()
+        .join("providers")
+        .join("bedrock")
+        .join("compatibility-cache-v1.json")
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 async fn discovery_cache_key(settings: &Settings) -> DiscoveryCacheKey {
@@ -1464,5 +1687,97 @@ mod tests {
         settings.model_ids = vec!["model-b".to_string(), "model-a".to_string()];
         let metadata = diagnostics_metadata(&settings);
         assert_eq!(metadata.get("default_model"), Some(&"model-b".to_string()));
+    }
+
+    #[test]
+    fn persisted_compatibility_filters_discovery() {
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".to_string(),
+            aws_profile: Some("work".to_string()),
+            endpoint_url: None,
+        };
+        let mut compatibility = PersistedCompatibilityCache::default();
+        compatibility.mark_unsupported(
+            &key,
+            "bad-model",
+            STREAMING_TOOL_UNSUPPORTED_REASON,
+            "unsupported",
+            10,
+        );
+        let discovery = ModelDiscovery {
+            models: model_infos_from_ids(
+                &["bad-model".to_string(), "good-model".to_string()],
+                None,
+            ),
+            default_model_id: Some("bad-model".to_string()),
+        };
+        let filtered = filtered_discovery(&discovery, &compatibility.unsupported_for(&key));
+        assert_eq!(filtered.default_model_id, Some("good-model".to_string()));
+    }
+
+    #[test]
+    fn persisted_compatibility_updates_timestamps() {
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".to_string(),
+            aws_profile: None,
+            endpoint_url: None,
+        };
+        let mut compatibility = PersistedCompatibilityCache::default();
+        compatibility.mark_unsupported(&key, "model", "reason", "first", 10);
+        compatibility.mark_unsupported(&key, "model", "reason", "second", 20);
+        let record = compatibility.entries[0]
+            .unsupported_streaming_tool_models
+            .get("model")
+            .expect("model should be recorded");
+        assert_eq!(record.first_seen_unix_seconds, 10);
+        assert_eq!(record.last_seen_unix_seconds, 20);
+        assert_eq!(record.message, "second");
+    }
+
+    #[test]
+    fn persisted_compatibility_prunes_expired_records() {
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".to_string(),
+            aws_profile: None,
+            endpoint_url: None,
+        };
+        let mut compatibility = PersistedCompatibilityCache::default();
+        compatibility.mark_unsupported(&key, "stale", "reason", "old", 1);
+        compatibility.mark_unsupported(
+            &key,
+            "fresh",
+            "reason",
+            "new",
+            COMPATIBILITY_CACHE_TTL_SECONDS + 1,
+        );
+        compatibility.prune_expired(COMPATIBILITY_CACHE_TTL_SECONDS + 2);
+        let unsupported = compatibility.unsupported_for(&key);
+        assert!(!unsupported.contains("stale"));
+        assert!(unsupported.contains("fresh"));
+    }
+
+    #[test]
+    fn persisted_compatibility_save_load_round_trip() {
+        let root = unique_temp_dir();
+        let path = root.join("compatibility-cache-v1.json");
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".to_string(),
+            aws_profile: None,
+            endpoint_url: Some("https://example.com".to_string()),
+        };
+        let mut compatibility = PersistedCompatibilityCache::default();
+        compatibility.mark_unsupported(&key, "model", "reason", "message", now_unix_seconds());
+        save_compatibility_cache_to_path(&path, &compatibility).expect("cache should save");
+        let loaded = load_compatibility_cache_from_path(&path).expect("cache should load");
+        assert!(loaded.unsupported_for(&key).contains("model"));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("bcode-bedrock-test-{nanos}"))
     }
 }
