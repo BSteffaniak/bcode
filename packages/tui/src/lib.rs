@@ -23,7 +23,8 @@ use bcode_ipc::Event;
 use bcode_model::ReasoningEffort;
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionSummary};
 use crossterm::event::{
-    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -63,6 +64,7 @@ const TRANSCRIPT_WRAP: Wrap = Wrap { trim: false };
 const DEFAULT_TRANSCRIPT_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_HEIGHT: u16 = 20;
 const TRANSCRIPT_WINDOW_OVERSCAN_LINES: usize = 2;
+const MOUSE_SCROLL_ROWS: usize = 3;
 const MAX_COMPOSER_ROWS: u16 = 6;
 const MODAL_MARGIN_X: u16 = 4;
 const MODAL_MARGIN_Y: u16 = 2;
@@ -585,33 +587,37 @@ async fn run_chat(
         terminal.draw(&app)?;
 
         if event::poll(Duration::from_millis(50))? {
-            let CrosstermEvent::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            let scope = app.current_scope();
-            if let Some(action) = keymap.action_for_key(scope, &key) {
-                if handle_tui_action(&client, &mut app, session_id, scope, action).await {
-                    break;
-                }
-                continue;
-            }
-            if scope == TuiScope::Permission {
-                app.status = "permission prompt active; use configured prompt bindings".to_string();
-                continue;
-            }
-            if let Some(character) = key_is_text_input(&key) {
-                if let Some(palette) = &mut app.command_palette {
-                    palette.filter.push(character);
-                    palette.selected = 0;
-                } else {
-                    app.input.push(character);
-                    if app.search_mode {
-                        app.update_search();
+            match event::read()? {
+                CrosstermEvent::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    let scope = app.current_scope();
+                    if let Some(action) = keymap.action_for_key(scope, &key) {
+                        if handle_tui_action(&client, &mut app, session_id, scope, action).await {
+                            break;
+                        }
+                        continue;
+                    }
+                    if scope == TuiScope::Permission {
+                        app.status =
+                            "permission prompt active; use configured prompt bindings".to_string();
+                        continue;
+                    }
+                    if let Some(character) = key_is_text_input(&key) {
+                        if let Some(palette) = &mut app.command_palette {
+                            palette.filter.push(character);
+                            palette.selected = 0;
+                        } else {
+                            app.input.push(character);
+                            if app.search_mode {
+                                app.update_search();
+                            }
+                        }
                     }
                 }
+                CrosstermEvent::Mouse(mouse) => handle_mouse_event(&mut app, mouse),
+                _ => {}
             }
         }
     }
@@ -761,6 +767,27 @@ async fn handle_tui_action(
         }
     }
     false
+}
+
+fn handle_mouse_event(app: &mut ChatApp, mouse: MouseEvent) {
+    if app.command_palette.is_some() || app.first_pending_permission().is_some() {
+        return;
+    }
+    if !rect_contains(app.last_transcript_area.get(), mouse.column, mouse.row) {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_rows_up(MOUSE_SCROLL_ROWS),
+        MouseEventKind::ScrollDown => app.scroll_rows_down(MOUSE_SCROLL_ROWS),
+        _ => {}
+    }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 async fn resolve_first_permission(client: &BcodeClient, app: &mut ChatApp, approved: bool) {
@@ -988,6 +1015,7 @@ struct ChatApp {
     scroll_rows_from_bottom: usize,
     last_transcript_width: Cell<u16>,
     last_transcript_height: Cell<u16>,
+    last_transcript_area: Cell<Rect>,
     search_mode: bool,
     search_query: String,
     key_hints: String,
@@ -1140,6 +1168,12 @@ impl ChatApp {
             scroll_rows_from_bottom: 0,
             last_transcript_width: Cell::new(DEFAULT_TRANSCRIPT_WIDTH),
             last_transcript_height: Cell::new(DEFAULT_TRANSCRIPT_HEIGHT),
+            last_transcript_area: Cell::new(Rect::new(
+                0,
+                0,
+                DEFAULT_TRANSCRIPT_WIDTH,
+                DEFAULT_TRANSCRIPT_HEIGHT,
+            )),
             search_mode: false,
             search_query: String::new(),
             key_hints: keymap.chat_hints(),
@@ -1269,26 +1303,29 @@ impl ChatApp {
         self.clamp_scroll();
     }
 
-    fn scroll_line_up(&mut self) {
-        self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_add(1);
+    fn scroll_rows_up(&mut self, rows: usize) {
+        self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_add(rows);
         self.clamp_scroll();
+    }
+
+    fn scroll_rows_down(&mut self, rows: usize) {
+        self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_sub(rows);
+    }
+
+    fn scroll_line_up(&mut self) {
+        self.scroll_rows_up(1);
     }
 
     fn scroll_line_down(&mut self) {
-        self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_sub(1);
+        self.scroll_rows_down(1);
     }
 
     fn scroll_page_up(&mut self) {
-        self.scroll_rows_from_bottom = self
-            .scroll_rows_from_bottom
-            .saturating_add(self.page_scroll_rows());
-        self.clamp_scroll();
+        self.scroll_rows_up(self.page_scroll_rows());
     }
 
     fn scroll_page_down(&mut self) {
-        self.scroll_rows_from_bottom = self
-            .scroll_rows_from_bottom
-            .saturating_sub(self.page_scroll_rows());
+        self.scroll_rows_down(self.page_scroll_rows());
     }
 
     fn scroll_top(&mut self) {
@@ -1645,6 +1682,7 @@ impl ratatui::widgets::Widget for &ChatApp {
         let transcript_height = chunks[1].height;
         self.last_transcript_width.set(transcript_width);
         self.last_transcript_height.set(transcript_height);
+        self.last_transcript_area.set(chunks[1]);
 
         let rendered_lines = self.rendered_transcript_lines();
         let viewport = transcript_viewport(
@@ -2446,7 +2484,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self, io::Error> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -2465,7 +2503,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -2809,6 +2851,91 @@ mod tests {
 
         assert!(rendered.contains("Command Palette"));
         assert!(rendered.contains("No commands match"));
+    }
+
+    #[test]
+    fn rect_contains_excludes_right_and_bottom_edges() {
+        let rect = Rect::new(4, 3, 10, 5);
+
+        assert!(rect_contains(rect, 4, 3));
+        assert!(rect_contains(rect, 13, 7));
+        assert!(!rect_contains(rect, 14, 7));
+        assert!(!rect_contains(rect, 13, 8));
+        assert!(!rect_contains(rect, 3, 3));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_inside_transcript_area() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.blocks.push(TranscriptBlock::Assistant {
+            text: (0..20)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            streaming: false,
+        });
+        app.last_transcript_width.set(40);
+        app.last_transcript_height.set(4);
+        app.last_transcript_area.set(Rect::new(0, 1, 40, 10));
+
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.scroll_rows_from_bottom, MOUSE_SCROLL_ROWS);
+
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.scroll_rows_from_bottom, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_ignores_outside_transcript_and_open_modals() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.blocks.push(TranscriptBlock::Assistant {
+            text: "line\n".repeat(20),
+            streaming: false,
+        });
+        app.last_transcript_width.set(40);
+        app.last_transcript_height.set(4);
+        app.last_transcript_area.set(Rect::new(0, 1, 40, 10));
+
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 41,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.scroll_rows_from_bottom, 0);
+
+        app.open_command_palette();
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.scroll_rows_from_bottom, 0);
     }
 
     #[test]
