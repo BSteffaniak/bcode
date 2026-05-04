@@ -523,9 +523,10 @@ fn normalized_modifiers(modifiers: KeyModifiers) -> KeyModifiers {
 }
 
 fn key_is_text_input(key: &KeyEvent) -> Option<char> {
-    let (code, modifiers) = normalized_key(key);
-    match code {
-        KeyCode::Char(character) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+    match key.code {
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
             Some(character)
         }
         _ => None,
@@ -2789,6 +2790,30 @@ mod tests {
         assert_eq!(binding.code, KeyCode::Char('y'));
         assert!(binding.modifiers.contains(KeyModifiers::ALT));
         assert!(binding.modifiers.contains(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn text_input_preserves_printable_characters() {
+        assert_eq!(
+            key_is_text_input(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Some('A')
+        );
+        assert_eq!(
+            key_is_text_input(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE)),
+            Some('A')
+        );
+        assert_eq!(
+            key_is_text_input(&KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT)),
+            Some('!')
+        );
+        assert_eq!(
+            key_is_text_input(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            key_is_text_input(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+            None
+        );
     }
 
     #[test]
