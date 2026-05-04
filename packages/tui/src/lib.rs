@@ -829,8 +829,12 @@ async fn handle_slash_command(
                         .map(|agent| agent.id.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
+                    let policy = client.agent_policy_status().await.map_or_else(
+                        |_| "policy: unavailable".to_string(),
+                        |status| format!("policy: {}", status.source),
+                    );
                     app.status = format!(
-                        "current agent: {}; available: {names}",
+                        "current agent: {}; available: {names}; {policy}",
                         app.current_agent_id
                     );
                 }

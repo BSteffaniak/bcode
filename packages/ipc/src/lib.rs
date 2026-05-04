@@ -4,7 +4,7 @@
 
 //! Client/server IPC protocol for bcode.
 
-use bcode_agent_profile::AgentInfo;
+use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_session_models::{ClientId, SessionEvent, SessionId, SessionSummary};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::env;
@@ -105,6 +105,7 @@ pub enum Request {
         model_id: String,
     },
     ListAgents,
+    AgentPolicyStatus,
     SetSessionAgent {
         session_id: SessionId,
         agent_id: String,
@@ -214,6 +215,9 @@ pub enum ResponsePayload {
     SessionModelSet,
     AgentList {
         agents: Vec<AgentInfo>,
+    },
+    AgentPolicyStatus {
+        status: PolicyStatusResponse,
     },
     SessionAgentSet,
     PermissionList {

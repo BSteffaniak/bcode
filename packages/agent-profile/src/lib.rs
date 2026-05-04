@@ -24,6 +24,9 @@ pub const OP_AGENT_CONTEXT: &str = "agent_context";
 /// Operation for evaluating a tool call against an agent profile.
 pub const OP_EVALUATE_TOOL_CALL: &str = "evaluate_tool_call";
 
+/// Operation for reporting the active policy config source/status.
+pub const OP_POLICY_STATUS: &str = "policy_status";
+
 /// Agent profile metadata shown in the TUI and command palette.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -84,6 +87,9 @@ pub struct EvaluateToolCallRequest {
     pub side_effect: ToolSideEffect,
     /// Tool arguments.
     pub arguments: serde_json::Value,
+    /// Host current working directory for path-boundary policy checks.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// Agent policy decision for a tool call.
@@ -106,4 +112,13 @@ pub struct EvaluateToolCallResponse {
     /// Optional user/model-facing reason.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Agent policy provider status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyStatusResponse {
+    /// Human-readable source label.
+    pub source: String,
+    /// True when the provider is using built-in fallback policy.
+    pub using_default: bool,
 }

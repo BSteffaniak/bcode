@@ -647,6 +647,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_agent_policy"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_agent_profile",
+ "bcode_session_models",
+ "bcode_tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_agent_profile"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -739,6 +750,7 @@ dependencies = [
 name = "bcode_default_agents_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_policy",
  "bcode_agent_profile",
  "bcode_plugin_sdk",
  "bcode_session_models",

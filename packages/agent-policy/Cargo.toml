@@ -1,22 +1,17 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Default agent profile policy plugin for bcode"
+description = "Pi/OpenCode-style agent policy evaluation for bcode"
 edition     = { workspace = true }
-keywords    = ["agent", "bcode", "plugin", "policy"]
+keywords    = ["agent", "bcode", "opencode", "policy"]
 license     = { workspace = true }
-name        = "bcode_default_agents_plugin"
+name        = "bcode_agent_policy"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
-bcode_agent_policy   = { workspace = true }
 bcode_agent_profile  = { workspace = true }
-bcode_plugin_sdk     = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool           = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }

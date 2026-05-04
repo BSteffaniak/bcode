@@ -4,7 +4,7 @@
 
 //! Programmatic client API for Bcode.
 
-use bcode_agent_profile::AgentInfo;
+use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream, PermissionSummary,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, decode,
@@ -199,6 +199,19 @@ impl BcodeClient {
         let mut connection = self.connect("bcode-cli").await?;
         match connection.send_request(Request::ListAgents).await? {
             ResponsePayload::AgentList { agents } => Ok(agents),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return agent policy provider status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn agent_policy_status(&self) -> Result<PolicyStatusResponse, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::AgentPolicyStatus).await? {
+            ResponsePayload::AgentPolicyStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

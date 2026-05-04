@@ -7,7 +7,7 @@
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
     AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
-    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS,
+    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
 };
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcListener, LocalIpcStream,
@@ -416,6 +416,7 @@ async fn handle_request(
             .await
         }
         Request::ListAgents => handle_list_agents(request_id, state, writer).await,
+        Request::AgentPolicyStatus => handle_agent_policy_status(request_id, state, writer).await,
         Request::SetSessionAgent {
             session_id,
             agent_id,
@@ -697,6 +698,25 @@ async fn handle_list_agents(
         writer,
         request_id,
         Response::Ok(ResponsePayload::AgentList { agents }),
+    )
+    .await
+}
+
+async fn handle_agent_policy_status(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let status = agent_policy_status(state)
+        .await
+        .unwrap_or_else(|| PolicyStatusResponse {
+            source: "agent profile provider not loaded".to_string(),
+            using_default: true,
+        });
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AgentPolicyStatus { status }),
     )
     .await
 }
@@ -1112,6 +1132,19 @@ async fn handle_provider_turn_event(
         | ProviderTurnEvent::ToolCallDelta { .. }
         | ProviderTurnEvent::Usage { .. } => {}
     }
+}
+
+async fn agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse> {
+    with_plugins_blocking(state, |plugins| {
+        plugins.invoke_service_by_interface_json::<_, PolicyStatusResponse>(
+            AGENT_PROFILE_INTERFACE_ID,
+            OP_POLICY_STATUS,
+            &serde_json::json!({}),
+        )
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
 }
 
 async fn list_agent_profiles(state: &ServerState) -> Vec<AgentInfo> {
@@ -1705,6 +1738,9 @@ async fn evaluate_agent_tool_policy(
         tool_name: definition.name.clone(),
         side_effect: definition.side_effect,
         arguments: call.arguments.clone(),
+        cwd: env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string()),
     };
     with_plugins_blocking(state, move |plugins| {
         plugins.invoke_service_by_interface_json::<_, EvaluateToolCallResponse>(
