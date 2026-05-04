@@ -59,8 +59,29 @@ impl BcodeConfig {
             selection.auth_profile = profile.auth_profile.clone();
             selection.settings = profile.settings.clone();
         }
+        if selection.provider_plugin_id.is_none() && bedrock_environment_is_configured() {
+            selection.provider_plugin_id = Some("bcode.bedrock".to_string());
+        }
         selection
     }
+}
+
+/// Return true when environment variables imply Bedrock should be selected.
+#[must_use]
+pub fn bedrock_environment_is_configured() -> bool {
+    [
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "BCODE_BEDROCK_MODEL",
+        "BCODE_BEDROCK_MODELS",
+        "BCODE_BEDROCK_REGION",
+        "BCODE_BEDROCK_AWS_PROFILE",
+        "BCODE_BEDROCK_ENDPOINT_URL",
+        "BEDROCK_MODEL",
+        "BEDROCK_MODELS",
+        "BEDROCK_ENDPOINT_URL",
+    ]
+    .into_iter()
+    .any(|name| env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
 
 /// Terminal UI configuration.
@@ -333,7 +354,25 @@ impl From<&PluginConfig> for PluginSelection {
 
 impl From<&BcodeConfig> for PluginSelection {
     fn from(value: &BcodeConfig) -> Self {
-        Self::from(&value.plugins)
+        let mut selection = Self::from(&value.plugins);
+        let provider = value
+            .resolved_model_selection()
+            .provider_plugin_id
+            .unwrap_or_else(|| "bcode.openai-compatible".to_string());
+        if selection.enabled.is_empty() {
+            for plugin_id in ["bcode.filesystem", "bcode.shell", provider.as_str()] {
+                if !selection.disabled.contains(plugin_id) {
+                    selection.enabled.insert(plugin_id.to_string());
+                }
+            }
+        } else if value.model.provider_plugin_id.is_none()
+            && value.model.profile.is_none()
+            && bedrock_environment_is_configured()
+            && !selection.disabled.contains("bcode.bedrock")
+        {
+            selection.enabled.insert("bcode.bedrock".to_string());
+        }
+        selection
     }
 }
 

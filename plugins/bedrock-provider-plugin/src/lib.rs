@@ -177,6 +177,11 @@ async fn stream_bedrock_turn_inner(
 }
 
 async fn bedrock_client(settings: &Settings) -> Client {
+    let config = bedrock_sdk_config(settings).await;
+    Client::new(&config)
+}
+
+async fn bedrock_sdk_config(settings: &Settings) -> aws_config::SdkConfig {
     let mut loader = aws_config::defaults(BehaviorVersion::latest());
     if let Some(region) = &settings.region {
         loader = loader.region(Region::new(region.clone()));
@@ -187,8 +192,7 @@ async fn bedrock_client(settings: &Settings) -> Client {
     if let Some(endpoint_url) = &settings.endpoint_url {
         loader = loader.endpoint_url(endpoint_url.clone());
     }
-    let config = loader.load().await;
-    Client::new(&config)
+    loader.load().await
 }
 
 async fn read_bedrock_stream(
@@ -654,13 +658,6 @@ impl Settings {
                 "set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
             ));
         }
-        if self.region.is_none() {
-            return Err(provider_error(
-                "missing_bedrock_region",
-                ProviderErrorCategory::Config,
-                "set BCODE_BEDROCK_REGION/AWS_REGION or configure a Bedrock model profile region",
-            ));
-        }
         Ok(())
     }
 }
@@ -704,14 +701,33 @@ fn models() -> ModelList {
 fn validate_config() -> ValidateConfigResponse {
     let settings = Settings::resolve(None);
     let validation = settings.validate();
+    let mut metadata = diagnostics_metadata(&settings);
+    let effective_region = validation
+        .as_ref()
+        .ok()
+        .and_then(|()| resolved_sdk_region(&settings));
+    if let Some(region) = &effective_region {
+        metadata.insert("effective_region".to_string(), region.clone());
+    }
     ValidateConfigResponse {
         valid: validation.is_ok(),
         message: Some(match validation {
-            Ok(()) => "Bedrock configuration is usable; credentials will be resolved through AWS's default credential chain".to_string(),
+            Ok(()) => effective_region.map_or_else(
+                || "Bedrock configuration is usable; AWS SDK will resolve region/credentials at request time".to_string(),
+                |region| format!(
+                    "Bedrock configuration is usable; AWS SDK resolved region '{region}' and will resolve credentials at request time"
+                ),
+            ),
             Err(error) => format!("Bedrock configuration is not usable: {}", error.message),
         }),
-        metadata: diagnostics_metadata(&settings),
+        metadata,
     }
+}
+
+fn resolved_sdk_region(settings: &Settings) -> Option<String> {
+    let runtime = current_thread_runtime().ok()?;
+    let config = runtime.block_on(bedrock_sdk_config(settings));
+    config.region().map(ToString::to_string)
 }
 
 fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
@@ -727,17 +743,23 @@ fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     metadata.insert(
-        "region".to_string(),
+        "configured_region".to_string(),
         settings
             .region
             .clone()
-            .unwrap_or_else(|| "<missing>".to_string()),
+            .unwrap_or_else(|| "<aws-sdk-default-chain>".to_string()),
     );
     if let Some(profile) = &settings.aws_profile {
         metadata.insert("aws_profile".to_string(), profile.clone());
     }
     if let Some(endpoint_url) = &settings.endpoint_url {
         metadata.insert("endpoint_url".to_string(), endpoint_url.clone());
+    }
+    if std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok_and(|value| !value.trim().is_empty()) {
+        metadata.insert(
+            "bearer_token_source".to_string(),
+            "AWS_BEARER_TOKEN_BEDROCK".to_string(),
+        );
     }
     metadata.insert("config_source".to_string(), settings.config_source.clone());
     metadata

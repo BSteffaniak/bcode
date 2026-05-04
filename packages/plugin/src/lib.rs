@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::CStr;
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -124,7 +125,7 @@ pub struct RegisteredPlugin {
 #[derive(Debug)]
 pub struct LoadedPlugin {
     manifest: PluginManifest,
-    library: Library,
+    library: ManuallyDrop<Library>,
     activate: LifecycleFn,
     deactivate: LifecycleFn,
     invoke_service: ServiceFn,
@@ -701,7 +702,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
 
     Ok(LoadedPlugin {
         manifest: plugin.manifest.clone(),
-        library,
+        library: ManuallyDrop::new(library),
         activate,
         deactivate,
         invoke_service,
