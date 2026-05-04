@@ -29,17 +29,34 @@ use bcode_model_provider_runtime::{
 use bcode_plugin_sdk::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
+const MODEL_DISCOVERY_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Amazon Bedrock model provider plugin.
-#[derive(Default)]
 pub struct BedrockProviderPlugin {
     turns: TurnStore,
+    discovery: Arc<Mutex<DiscoveryCache>>,
+}
+
+impl Default for BedrockProviderPlugin {
+    fn default() -> Self {
+        Self {
+            turns: TurnStore::default(),
+            discovery: Arc::default(),
+        }
+    }
 }
 
 impl RustPlugin for BedrockProviderPlugin {
+    fn activate(&mut self) -> Result<(), PluginError> {
+        warm_discovery_cache(self.discovery.clone(), Settings::resolve(None));
+        Ok(())
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
             return ServiceResponse::error(
@@ -49,8 +66,8 @@ impl RustPlugin for BedrockProviderPlugin {
         }
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
-            OP_MODELS => json_response(&models()),
-            OP_VALIDATE_CONFIG => json_response(&validate_config()),
+            OP_MODELS => json_response(&self.models()),
+            OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
@@ -70,7 +87,15 @@ impl BedrockProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let (provider_turn_id, turn) = self.turns.insert_started("bedrock-turn");
-        std::thread::spawn(move || TurnWorker { request, turn }.run());
+        let discovery = self.discovery.clone();
+        std::thread::spawn(move || {
+            TurnWorker {
+                request,
+                turn,
+                discovery,
+            }
+            .run();
+        });
         json_response(&StartTurnResponse { provider_turn_id })
     }
 
@@ -106,6 +131,7 @@ impl BedrockProviderPlugin {
 struct TurnWorker {
     request: ModelTurnRequest,
     turn: TurnState,
+    discovery: Arc<Mutex<DiscoveryCache>>,
 }
 
 impl TurnWorker {
@@ -126,12 +152,20 @@ impl TurnWorker {
                 return;
             }
         };
-        runtime.block_on(stream_bedrock_turn(&self.request, &self.turn));
+        runtime.block_on(stream_bedrock_turn(
+            &self.request,
+            &self.turn,
+            self.discovery.clone(),
+        ));
     }
 }
 
-async fn stream_bedrock_turn(request: &ModelTurnRequest, turn: &TurnState) {
-    match stream_bedrock_turn_inner(request, turn).await {
+async fn stream_bedrock_turn(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+    discovery: Arc<Mutex<DiscoveryCache>>,
+) {
+    match stream_bedrock_turn_inner(request, turn, discovery).await {
         Ok(StreamOutcome::Finished) => turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::EndTurn,
         }),
@@ -156,11 +190,12 @@ async fn stream_bedrock_turn(request: &ModelTurnRequest, turn: &TurnState) {
 async fn stream_bedrock_turn_inner(
     request: &ModelTurnRequest,
     turn: &TurnState,
+    discovery: Arc<Mutex<DiscoveryCache>>,
 ) -> Result<StreamOutcome, ProviderError> {
     let settings = Settings::resolve(Some(request));
     settings.validate()?;
     let client = bedrock_client(&settings).await;
-    let model_id = resolve_turn_model_id(request, &settings).await?;
+    let model_id = resolve_turn_model_id(request, &settings, turn, &discovery).await?;
     let bedrock_request = build_converse_request(request, model_id)?;
     let mut builder = client
         .converse_stream()
@@ -724,23 +759,81 @@ fn capabilities() -> ProviderCapabilities {
     }
 }
 
-fn models() -> ModelList {
-    let settings = Settings::resolve(None);
-    if settings.model_ids_are_explicit || settings.default_model.is_some() {
-        return ModelList {
-            models: model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
-        };
+impl BedrockProviderPlugin {
+    fn models(&self) -> ModelList {
+        let settings = Settings::resolve(None);
+        if settings.model_ids_are_explicit || settings.default_model.is_some() {
+            return ModelList {
+                models: model_infos_from_ids(
+                    &settings.model_ids,
+                    settings.default_model.as_deref(),
+                ),
+            };
+        }
+        let discovered =
+            get_or_refresh_discovery_sync(&self.discovery, &settings).unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "bcode_bedrock::discovery",
+                    error = %error.message,
+                    "Bedrock model discovery failed"
+                );
+                ModelDiscovery::default()
+            });
+        ModelList {
+            models: discovered.models,
+        }
     }
-    let discovered = discover_models_sync(&settings).unwrap_or_else(|error| {
-        tracing::warn!(
-            target: "bcode_bedrock::discovery",
-            error = %error.message,
-            "Bedrock model discovery failed"
-        );
-        ModelDiscovery::default()
-    });
-    ModelList {
-        models: discovered.models,
+
+    fn validate_config(&self) -> ValidateConfigResponse {
+        let settings = Settings::resolve(None);
+        let validation = settings.validate();
+        let mut metadata = diagnostics_metadata(&settings);
+        let effective_region = validation
+            .as_ref()
+            .ok()
+            .and_then(|()| resolved_sdk_region(&settings));
+        if let Some((region, source)) = &effective_region {
+            metadata.insert("effective_region".to_string(), region.clone());
+            metadata.insert(
+                "effective_region_source".to_string(),
+                source.as_str().to_string(),
+            );
+        }
+        if validation.is_ok()
+            && !settings.model_ids_are_explicit
+            && settings.default_model.is_none()
+        {
+            match get_or_refresh_discovery_sync(&self.discovery, &settings) {
+                Ok(discovery) => {
+                    metadata.insert(
+                        "discovered_model_count".to_string(),
+                        discovery.models.len().to_string(),
+                    );
+                    if let Some(model_id) = discovery.default_model_id {
+                        metadata.insert("discovered_default_model".to_string(), model_id);
+                    }
+                }
+                Err(error) => {
+                    metadata.insert("model_discovery_error".to_string(), error.message);
+                }
+            }
+        }
+        ValidateConfigResponse {
+            valid: validation.is_ok(),
+            message: Some(match validation {
+                Ok(()) => effective_region.map_or_else(
+                    || format!(
+                        "Bedrock configuration is usable; region will fall back to '{DEFAULT_REGION}' if the AWS SDK chain is empty and credentials will be resolved at request time"
+                    ),
+                    |(region, source)| format!(
+                        "Bedrock configuration is usable; region '{region}' resolved from {} and credentials will be resolved at request time",
+                        source.as_str()
+                    ),
+                ),
+                Err(error) => format!("Bedrock configuration is not usable: {}", error.message),
+            }),
+            metadata,
+        }
     }
 }
 
@@ -763,6 +856,8 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
 async fn resolve_turn_model_id(
     request: &ModelTurnRequest,
     settings: &Settings,
+    turn: &TurnState,
+    cache: &Arc<Mutex<DiscoveryCache>>,
 ) -> Result<String, ProviderError> {
     if !request.model_id.trim().is_empty() {
         return Ok(request.model_id.clone());
@@ -772,7 +867,17 @@ async fn resolve_turn_model_id(
     {
         return Ok(model_id.clone());
     }
-    let discovery = discover_models(settings).await?;
+    let key = discovery_cache_key(settings).await;
+    let discovery = if let Some(discovery) = cached_discovery(cache, &key) {
+        discovery
+    } else {
+        turn.push(ProviderTurnEvent::Warning {
+            message: "discovering available Bedrock models".to_string(),
+        });
+        let discovery = discover_models(settings).await?;
+        store_discovery(cache, key, discovery.clone());
+        discovery
+    };
     discovery.default_model_id.ok_or_else(|| {
         provider_error(
             "bedrock_model_discovery_empty",
@@ -788,6 +893,24 @@ struct ModelDiscovery {
     default_model_id: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct DiscoveryCache {
+    entries: BTreeMap<DiscoveryCacheKey, CachedDiscovery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DiscoveryCacheKey {
+    region: String,
+    aws_profile: Option<String>,
+    endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDiscovery {
+    discovered_at: Instant,
+    discovery: ModelDiscovery,
+}
+
 #[derive(Debug, Clone)]
 struct CandidateModel {
     model_id: String,
@@ -798,7 +921,28 @@ struct CandidateModel {
     date_key: i64,
 }
 
-fn discover_models_sync(settings: &Settings) -> Result<ModelDiscovery, ProviderError> {
+fn warm_discovery_cache(cache: Arc<Mutex<DiscoveryCache>>, settings: Settings) {
+    if settings.model_ids_are_explicit || settings.default_model.is_some() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Ok(runtime) = current_thread_runtime() else {
+            return;
+        };
+        if let Err(error) = runtime.block_on(get_or_refresh_discovery(&cache, &settings)) {
+            tracing::debug!(
+                target: "bcode_bedrock::discovery",
+                error = %error.message,
+                "background Bedrock model discovery failed"
+            );
+        }
+    });
+}
+
+fn get_or_refresh_discovery_sync(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    settings: &Settings,
+) -> Result<ModelDiscovery, ProviderError> {
     let runtime = current_thread_runtime().map_err(|error| {
         provider_error(
             "runtime_build_failed",
@@ -806,7 +950,56 @@ fn discover_models_sync(settings: &Settings) -> Result<ModelDiscovery, ProviderE
             error.to_string(),
         )
     })?;
-    runtime.block_on(discover_models(settings))
+    runtime.block_on(get_or_refresh_discovery(cache, settings))
+}
+
+async fn get_or_refresh_discovery(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    settings: &Settings,
+) -> Result<ModelDiscovery, ProviderError> {
+    let key = discovery_cache_key(settings).await;
+    if let Some(discovery) = cached_discovery(cache, &key) {
+        return Ok(discovery);
+    }
+    let discovery = discover_models(settings).await?;
+    store_discovery(cache, key, discovery.clone());
+    Ok(discovery)
+}
+
+fn cached_discovery(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: &DiscoveryCacheKey,
+) -> Option<ModelDiscovery> {
+    let cache = cache.lock().ok()?;
+    let cached = cache.entries.get(key)?;
+    (cached.discovered_at.elapsed() < MODEL_DISCOVERY_TTL).then(|| cached.discovery.clone())
+}
+
+fn store_discovery(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: DiscoveryCacheKey,
+    discovery: ModelDiscovery,
+) {
+    if let Ok(mut cache) = cache.lock() {
+        cache.entries.insert(
+            key,
+            CachedDiscovery {
+                discovered_at: Instant::now(),
+                discovery,
+            },
+        );
+    }
+}
+
+async fn discovery_cache_key(settings: &Settings) -> DiscoveryCacheKey {
+    let config = bedrock_sdk_config(settings).await;
+    DiscoveryCacheKey {
+        region: config
+            .region()
+            .map_or_else(|| DEFAULT_REGION.to_string(), ToString::to_string),
+        aws_profile: settings.aws_profile.clone(),
+        endpoint_url: settings.endpoint_url.clone(),
+    }
 }
 
 async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, ProviderError> {
@@ -931,39 +1124,6 @@ async fn discover_foundation_models(
         });
     }
     Ok(candidates)
-}
-
-fn validate_config() -> ValidateConfigResponse {
-    let settings = Settings::resolve(None);
-    let validation = settings.validate();
-    let mut metadata = diagnostics_metadata(&settings);
-    let effective_region = validation
-        .as_ref()
-        .ok()
-        .and_then(|()| resolved_sdk_region(&settings));
-    if let Some((region, source)) = &effective_region {
-        metadata.insert("effective_region".to_string(), region.clone());
-        metadata.insert(
-            "effective_region_source".to_string(),
-            source.as_str().to_string(),
-        );
-    }
-    ValidateConfigResponse {
-        valid: validation.is_ok(),
-        message: Some(match validation {
-            Ok(()) => effective_region.map_or_else(
-                || format!(
-                    "Bedrock configuration is usable; region will fall back to '{DEFAULT_REGION}' if the AWS SDK chain is empty and credentials will be resolved at request time"
-                ),
-                |(region, source)| format!(
-                    "Bedrock configuration is usable; region '{region}' resolved from {} and credentials will be resolved at request time",
-                    source.as_str()
-                ),
-            ),
-            Err(error) => format!("Bedrock configuration is not usable: {}", error.message),
-        }),
-        metadata,
-    }
 }
 
 fn resolved_sdk_region(settings: &Settings) -> Option<(String, RegionSource)> {

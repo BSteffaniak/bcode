@@ -816,6 +816,8 @@ async fn handle_resolve_permission(
 }
 
 const MAX_MODEL_TOOL_ROUNDS: u8 = 8;
+const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ModelPollOutcome {
@@ -940,7 +942,7 @@ async fn poll_model_turn_events(
 ) -> (String, ModelPollOutcome) {
     let mut assistant_text = String::new();
     let mut outcome = ModelPollOutcome::default();
-    let mut empty_polls = 0_u16;
+    let mut idle_for = Duration::ZERO;
     for _ in 0..1_200 {
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
@@ -955,20 +957,23 @@ async fn poll_model_turn_events(
             }
         };
         if response.events.is_empty() {
-            empty_polls += 1;
-            if empty_polls > 50 {
+            idle_for += MODEL_POLL_INTERVAL;
+            if idle_for > MODEL_IDLE_TIMEOUT {
                 append_system_event(
                     state,
                     session_id,
-                    "model provider produced no events before timeout".to_string(),
+                    format!(
+                        "model provider was idle for {} seconds before timeout",
+                        MODEL_IDLE_TIMEOUT.as_secs()
+                    ),
                 )
                 .await;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(MODEL_POLL_INTERVAL).await;
             continue;
         }
-        empty_polls = 0;
+        idle_for = Duration::ZERO;
         for event in response.events {
             handle_provider_turn_event(state, session_id, event, &mut assistant_text, &mut outcome)
                 .await;
