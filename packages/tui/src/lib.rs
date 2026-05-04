@@ -31,11 +31,12 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, StatefulWidget,
+    Widget, Wrap,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -62,6 +63,17 @@ const TRANSCRIPT_WRAP: Wrap = Wrap { trim: false };
 const DEFAULT_TRANSCRIPT_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_HEIGHT: u16 = 20;
 const TRANSCRIPT_WINDOW_OVERSCAN_LINES: usize = 2;
+const MAX_COMPOSER_ROWS: u16 = 6;
+const MODAL_MARGIN_X: u16 = 4;
+const MODAL_MARGIN_Y: u16 = 2;
+const COLOR_TEXT: Color = Color::Gray;
+const COLOR_MUTED: Color = Color::DarkGray;
+const COLOR_BORDER: Color = Color::DarkGray;
+const COLOR_ACCENT: Color = Color::Cyan;
+const COLOR_SUCCESS: Color = Color::Green;
+const COLOR_WARNING: Color = Color::Yellow;
+const COLOR_DANGER: Color = Color::Red;
+const COLOR_SELECTED_BG: Color = Color::Rgb(38, 52, 64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TuiAction {
@@ -591,13 +603,14 @@ async fn run_chat(
                 continue;
             }
             if let Some(character) = key_is_text_input(&key) {
-                app.input.push(character);
-                if app.search_mode {
-                    app.update_search();
-                } else if let Some(p) = &mut app.command_palette {
-                    p.filter.push(character);
-                    p.selected = 0;
-                    // trigger async list load if needed
+                if let Some(palette) = &mut app.command_palette {
+                    palette.filter.push(character);
+                    palette.selected = 0;
+                } else {
+                    app.input.push(character);
+                    if app.search_mode {
+                        app.update_search();
+                    }
                 }
             }
         }
@@ -686,12 +699,14 @@ async fn handle_tui_action(
             }
         }
         TuiAction::DeleteCharBackward => {
-            app.input.pop();
-            if app.search_mode {
-                app.update_search();
-            } else if let Some(p) = &mut app.command_palette {
-                p.filter.pop();
-                p.selected = 0;
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.pop();
+                palette.selected = 0;
+            } else {
+                app.input.pop();
+                if app.search_mode {
+                    app.update_search();
+                }
             }
         }
         TuiAction::SelectUp => {
@@ -863,32 +878,64 @@ impl SessionPickerApp {
 }
 
 impl ratatui::widgets::Widget for &SessionPickerApp {
-    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        let panel = centered_rect(area, area.width.min(92), area.height.min(24));
+        ratatui::widgets::Widget::render(Clear, panel, buf);
+        let block = Block::new()
+            .title(Line::from(vec![
+                Span::styled(" bcode ", accent_bold_style()),
+                Span::styled("sessions ", muted_style()),
+            ]))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border_style());
+        let inner = inset(panel, 2, 1);
+        ratatui::widgets::Widget::render(block, panel, buf);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
-            .split(area);
+            .split(inner);
 
-        Paragraph::new("Select a Bcode session").render(chunks[0], buf);
+        Paragraph::new(Text::from(vec![
+            Line::from(vec![Span::styled("Select a session", title_style())]),
+            Line::from(vec![Span::styled(
+                "Attach to an existing Bcode conversation",
+                muted_style(),
+            )]),
+        ]))
+        .render(chunks[0], buf);
 
         let items = self.sessions.iter().map(|session| {
-            let name = session.name.as_deref().unwrap_or("<unnamed>");
-            ListItem::new(format!(
-                "{}  {}  ({} clients)",
-                session.id, name, session.client_count
-            ))
+            let name = session.name.as_deref().unwrap_or("untitled");
+            let id = truncate_middle(&session.id.to_string(), 12);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{id:<12}"), muted_style()),
+                Span::raw("  "),
+                Span::styled(truncate_end(name, 44), normal_style()),
+                Span::raw("  "),
+                Span::styled(format!("{} clients", session.client_count), muted_style()),
+            ]))
         });
         let list = List::new(items)
-            .block(Block::new().title("Sessions").borders(Borders::ALL))
-            .highlight_symbol("> ");
+            .highlight_symbol("  ")
+            .highlight_style(selected_style());
         let mut state = ListState::default().with_selected(Some(self.selected));
         StatefulWidget::render(list, chunks[1], buf, &mut state);
 
-        Paragraph::new("enter selects, up/down or j/k moves, esc quits").render(chunks[2], buf);
+        Paragraph::new(Line::from(vec![
+            Span::styled("enter", key_style()),
+            Span::styled(" select · ", muted_style()),
+            Span::styled("j/k", key_style()),
+            Span::styled(" move · ", muted_style()),
+            Span::styled("esc", key_style()),
+            Span::styled(" quit", muted_style()),
+        ]))
+        .render(chunks[2], buf);
     }
 }
 
@@ -1037,18 +1084,6 @@ struct PendingPermissionView {
 }
 
 impl PendingPermissionView {
-    fn render_text(&self, key_hints: &str, selected: PermissionChoice) -> String {
-        format!(
-            "Tool wants permission\n{} ({})\npermission {}\n{}\n{}\nselected: {}",
-            self.tool_name,
-            self.tool_call_id,
-            self.permission_id,
-            pretty_jsonish(&self.arguments_json),
-            key_hints,
-            selected.label()
-        )
-    }
-
     fn policy_rule(&self, approved: bool) -> (&'static str, String) {
         if self.tool_name == "shell.run"
             && let Some(command) = self.string_argument("command")
@@ -1592,47 +1627,22 @@ fn model_to_display_selection(model: &str) -> Option<String> {
 }
 
 impl ratatui::widgets::Widget for &ChatApp {
-    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        let has_permission = self.first_pending_permission().is_some();
-        let has_palette = self.command_palette.is_some();
-        let constraints = if has_permission || has_palette {
-            vec![
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(8),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ]
-        } else {
-            vec![
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ]
-        };
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        let composer_height = composer_height(&self.input, self.search_mode, area.height);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(composer_height),
+                Constraint::Length(1),
+            ])
             .split(area);
 
-        let provider = self
-            .selected_provider_plugin_id
-            .as_deref()
-            .unwrap_or("auto");
-        let model = self.selected_model_id.as_deref().unwrap_or("default");
-        let thinking = self
-            .current_thinking_level
-            .map(|l| format!("{:?}", l))
-            .unwrap_or_else(|| "default".to_string());
-        let header = Paragraph::new(format!(
-            "Bcode  {}  provider: {provider}  model: {model}  thinking: {thinking}",
-            self.session_id
-        ));
-        header.render(chunks[0], buf);
+        render_chat_header(self, chunks[0], buf);
 
-        let transcript_width = chunks[1].width.saturating_sub(2);
-        let transcript_height = chunks[1].height.saturating_sub(2);
+        let transcript_width = chunks[1].width;
+        let transcript_height = chunks[1].height;
         self.last_transcript_width.set(transcript_width);
         self.last_transcript_height.set(transcript_height);
 
@@ -1643,69 +1653,520 @@ impl ratatui::widgets::Widget for &ChatApp {
             transcript_height,
             self.scroll_rows_from_bottom,
         );
-        let title = if viewport.effective_scroll_rows_from_bottom == 0 {
-            "Chat".to_string()
+        let transcript = if viewport.lines.is_empty() {
+            Paragraph::new(Text::from(vec![Line::from(vec![Span::styled(
+                "Start a conversation with Bcode.",
+                muted_style(),
+            )])]))
         } else {
-            format!(
-                "Chat ({} rows from bottom)",
-                viewport.effective_scroll_rows_from_bottom
-            )
+            Paragraph::new(Text::from(viewport.lines))
+                .wrap(TRANSCRIPT_WRAP)
+                .scroll((usize_to_u16_saturating(viewport.local_scroll_y), 0))
         };
-        let transcript = Paragraph::new(Text::from(viewport.lines))
-            .block(Block::new().title(title).borders(Borders::ALL))
-            .wrap(TRANSCRIPT_WRAP)
-            .scroll((usize_to_u16_saturating(viewport.local_scroll_y), 0));
         transcript.render(chunks[1], buf);
 
-        let input_index = if let Some(palette) = &self.command_palette {
-            let filtered = palette.filtered_commands();
-            let items: Vec<ListItem> = filtered
-                .iter()
-                .enumerate()
-                .map(|(_i, c)| {
-                    let desc = c.description.as_deref().unwrap_or("");
-                    ListItem::new(format!("{}: {} {}", c.id, c.name, desc))
-                })
-                .collect();
-            let list = List::new(items)
-                .block(
-                    Block::new()
-                        .title("Command Palette (ctrl+p close, type filter)")
-                        .borders(Borders::ALL),
-                )
-                .highlight_symbol("> ");
-            let mut state = ListState::default().with_selected(Some(palette.selected));
-            StatefulWidget::render(list, chunks[2], buf, &mut state);
-            3
-        } else if let Some(permission) = self.first_pending_permission() {
-            let permission = Paragraph::new(
-                permission.render_text(&self.permission_hints, self.selected_permission_choice),
-            )
+        let input_title = if self.search_mode {
+            " Search "
+        } else {
+            " Message "
+        };
+        let input = Paragraph::new(composer_text(&self.input, self.search_mode))
             .block(
                 Block::new()
-                    .title("Permission Required")
-                    .borders(Borders::ALL),
+                    .title(input_title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(if self.search_mode {
+                        accent_style()
+                    } else {
+                        border_style()
+                    }),
             )
             .wrap(Wrap { trim: false });
-            permission.render(chunks[2], buf);
-            3
-        } else {
-            2
-        };
+        input.render(chunks[2], buf);
 
-        let input_title = if self.search_mode {
-            "Search"
-        } else {
-            "Message"
-        };
-        let input = Paragraph::new(self.input.as_str())
-            .block(Block::new().title(input_title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false });
-        input.render(chunks[input_index], buf);
+        render_chat_status(
+            self,
+            chunks[3],
+            buf,
+            viewport.effective_scroll_rows_from_bottom,
+        );
 
-        let status = format!("{} | {}", self.status, self.key_hints);
-        Paragraph::new(status).render(chunks[input_index + 1], buf);
+        if let Some(permission) = self.first_pending_permission() {
+            render_permission_modal(
+                area,
+                buf,
+                permission,
+                &self.permission_hints,
+                self.selected_permission_choice,
+                self.pending_permissions.len(),
+            );
+        }
+        if let Some(palette) = &self.command_palette {
+            render_command_palette(area, buf, palette);
+        }
     }
+}
+
+fn render_chat_header(app: &ChatApp, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    let provider = truncate_middle(
+        app.selected_provider_plugin_id.as_deref().unwrap_or("auto"),
+        22,
+    );
+    let model = truncate_middle(app.selected_model_id.as_deref().unwrap_or("default"), 30);
+    let thinking = app
+        .current_thinking_level
+        .map(|level| format!("{:?}", level))
+        .unwrap_or_else(|| "default".to_string());
+    let session = truncate_middle(&app.session_id.to_string(), 12);
+    let mut spans = vec![
+        Span::styled(" bcode ", title_style()),
+        Span::styled("session ", muted_style()),
+        Span::styled(session, normal_style()),
+        Span::raw("  "),
+    ];
+    push_label_value(&mut spans, "provider", &provider, accent_style());
+    spans.push(Span::raw("  "));
+    push_label_value(&mut spans, "model", &model, normal_style());
+    spans.push(Span::raw("  "));
+    push_label_value(&mut spans, "thinking", &thinking, muted_style());
+    Paragraph::new(Line::from(spans)).render(area, buf);
+}
+
+fn render_chat_status(
+    app: &ChatApp,
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    scroll_rows_from_bottom: usize,
+) {
+    let mut spans = vec![Span::styled(app.status.clone(), status_style(&app.status))];
+    if scroll_rows_from_bottom > 0 {
+        spans.push(Span::styled(
+            format!("  ·  {scroll_rows_from_bottom} rows from bottom"),
+            muted_style(),
+        ));
+    }
+    spans.push(Span::styled("  ·  ", muted_style()));
+    spans.extend(key_hint_spans(&app.key_hints));
+    Paragraph::new(Line::from(spans)).render(area, buf);
+}
+
+fn render_command_palette(
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    palette: &CommandPaletteState,
+) {
+    let modal = centered_rect(area, area.width.min(86), area.height.min(18));
+    ratatui::widgets::Widget::render(Clear, modal, buf);
+    let block = Block::new()
+        .title(Line::from(vec![
+            Span::styled(" Command Palette ", title_style()),
+            Span::styled("ctrl+p closes ", muted_style()),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(accent_style());
+    let inner = inset(modal, 2, 1);
+    ratatui::widgets::Widget::render(block, modal, buf);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let search = if palette.filter.is_empty() {
+        Line::from(vec![
+            Span::styled("› ", accent_style()),
+            Span::styled("Type to filter commands", muted_style()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("› ", accent_style()),
+            Span::styled(palette.filter.clone(), normal_style()),
+        ])
+    };
+    Paragraph::new(Text::from(vec![
+        search,
+        Line::from(vec![Span::styled(
+            "Run common actions without leaving the keyboard",
+            muted_style(),
+        )]),
+    ]))
+    .render(chunks[0], buf);
+
+    let filtered = palette.filtered_commands();
+    if filtered.is_empty() {
+        Paragraph::new(Line::from(vec![Span::styled(
+            "No commands match",
+            muted_style(),
+        )]))
+        .alignment(Alignment::Center)
+        .render(chunks[1], buf);
+    } else {
+        let items = filtered
+            .iter()
+            .copied()
+            .map(command_palette_item)
+            .collect::<Vec<_>>();
+        let selected = palette.selected.min(filtered.len().saturating_sub(1));
+        let list = List::new(items)
+            .highlight_symbol("  ")
+            .highlight_style(selected_style());
+        let mut state = ListState::default().with_selected(Some(selected));
+        StatefulWidget::render(list, chunks[1], buf, &mut state);
+    }
+
+    Paragraph::new(Line::from(vec![
+        Span::styled("enter", key_style()),
+        Span::styled(" run · ", muted_style()),
+        Span::styled("esc", key_style()),
+        Span::styled(" close · ", muted_style()),
+        Span::styled("type", key_style()),
+        Span::styled(" filter", muted_style()),
+    ]))
+    .render(chunks[2], buf);
+}
+
+fn render_permission_modal(
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    permission: &PendingPermissionView,
+    key_hints: &str,
+    selected: PermissionChoice,
+    pending_count: usize,
+) {
+    let modal = centered_rect(area, area.width.min(84), area.height.min(16));
+    ratatui::widgets::Widget::render(Clear, modal, buf);
+    let count_label = if pending_count > 1 {
+        format!("{pending_count} pending ")
+    } else {
+        String::new()
+    };
+    let block = Block::new()
+        .title(Line::from(vec![
+            Span::styled(" Permission required ", danger_bold_style()),
+            Span::styled(count_label, muted_style()),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(danger_style());
+    let inner = inset(modal, 2, 1);
+    ratatui::widgets::Widget::render(block, modal, buf);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    Paragraph::new(Text::from(vec![
+        Line::from(vec![
+            Span::styled(permission.tool_name.clone(), title_style()),
+            Span::styled(" wants to run", normal_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("tool call ", muted_style()),
+            Span::styled(truncate_middle(&permission.tool_call_id, 18), muted_style()),
+            Span::styled(" · permission ", muted_style()),
+            Span::styled(
+                truncate_middle(&permission.permission_id, 18),
+                muted_style(),
+            ),
+        ]),
+    ]))
+    .render(chunks[0], buf);
+
+    Paragraph::new(Text::from(permission_summary_lines(permission)))
+        .wrap(Wrap { trim: false })
+        .render(chunks[1], buf);
+
+    Paragraph::new(Text::from(vec![
+        permission_choice_line(selected),
+        Line::from(key_hint_spans(key_hints)),
+    ]))
+    .render(chunks[2], buf);
+
+    Paragraph::new(Line::from(vec![Span::styled(
+        "Selected choice is highlighted. Enter confirms; escape denies once.",
+        muted_style(),
+    )]))
+    .render(chunks[3], buf);
+}
+
+fn command_palette_item(command: &CommandInfo) -> ListItem<'static> {
+    let category = command.category.as_deref().unwrap_or("general");
+    let description = command.description.as_deref().unwrap_or("");
+    ListItem::new(Line::from(vec![
+        Span::styled(format!(" {:<8} ", truncate_end(category, 8)), badge_style()),
+        Span::raw("  "),
+        Span::styled(truncate_end(&command.name, 24), normal_bold_style()),
+        Span::raw("  "),
+        Span::styled(truncate_end(description, 42), muted_style()),
+    ]))
+}
+
+fn permission_summary_lines(permission: &PendingPermissionView) -> Vec<Line<'static>> {
+    if permission.tool_name == "shell.run"
+        && let Some(command) = permission.string_argument("command")
+    {
+        return vec![
+            Line::from(vec![Span::styled("command", muted_style())]),
+            Line::from(vec![Span::styled(command, code_style())]),
+        ];
+    }
+    if permission.tool_name.starts_with("filesystem.")
+        && let Some(path) = permission.string_argument("path")
+    {
+        return vec![
+            Line::from(vec![Span::styled("path", muted_style())]),
+            Line::from(vec![Span::styled(path, code_style())]),
+        ];
+    }
+    let mut lines = vec![Line::from(vec![Span::styled("arguments", muted_style())])];
+    lines.extend(
+        pretty_jsonish(&permission.arguments_json)
+            .lines()
+            .take(8)
+            .map(|line| Line::from(vec![Span::styled(line.to_string(), code_style())])),
+    );
+    lines
+}
+
+fn permission_choice_line(selected: PermissionChoice) -> Line<'static> {
+    Line::from(vec![
+        permission_choice_span(PermissionChoice::AllowOnce, selected),
+        Span::raw("  "),
+        permission_choice_span(PermissionChoice::DenyOnce, selected),
+        Span::raw("  "),
+        permission_choice_span(PermissionChoice::AlwaysAllow, selected),
+        Span::raw("  "),
+        permission_choice_span(PermissionChoice::AlwaysDeny, selected),
+    ])
+}
+
+fn permission_choice_span(choice: PermissionChoice, selected: PermissionChoice) -> Span<'static> {
+    let label = format!(" {} ", choice.label());
+    if choice == selected {
+        Span::styled(label, selected_button_style())
+    } else {
+        Span::styled(label, muted_style())
+    }
+}
+
+fn composer_height(input: &str, search_mode: bool, terminal_height: u16) -> u16 {
+    if search_mode {
+        return 3.min(terminal_height.max(1));
+    }
+    let rows = if input.is_empty() {
+        1
+    } else {
+        u16::try_from(input.split('\n').count()).unwrap_or(MAX_COMPOSER_ROWS)
+    };
+    rows.min(MAX_COMPOSER_ROWS)
+        .saturating_add(2)
+        .min(terminal_height.saturating_sub(2).max(3))
+}
+
+fn composer_text(input: &str, search_mode: bool) -> Text<'static> {
+    if input.is_empty() {
+        let placeholder = if search_mode {
+            "Search transcript…"
+        } else {
+            "Ask Bcode…"
+        };
+        return Text::from(vec![Line::from(vec![Span::styled(
+            placeholder,
+            muted_style(),
+        )])]);
+    }
+    Text::from(
+        input
+            .split('\n')
+            .map(|line| Line::from(vec![Span::styled(line.to_string(), normal_style())]))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn push_label_value(spans: &mut Vec<Span<'static>>, label: &str, value: &str, value_style: Style) {
+    spans.push(Span::styled(label.to_string(), muted_style()));
+    spans.push(Span::styled(":", muted_style()));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(value.to_string(), value_style));
+}
+
+fn key_hint_spans(hints: &str) -> Vec<Span<'static>> {
+    hints
+        .split('·')
+        .enumerate()
+        .flat_map(|(index, segment)| {
+            let trimmed = segment.trim();
+            let mut parts = trimmed.splitn(2, ' ');
+            let key = parts.next().unwrap_or_default();
+            let label = parts.next().unwrap_or_default();
+            let mut spans = Vec::new();
+            if index > 0 {
+                spans.push(Span::styled(" · ", muted_style()));
+            }
+            spans.push(Span::styled(key.to_string(), key_style()));
+            if !label.is_empty() {
+                spans.push(Span::styled(format!(" {label}"), muted_style()));
+            }
+            spans
+        })
+        .collect()
+}
+
+fn centered_rect(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let max_width = area
+        .width
+        .saturating_sub(MODAL_MARGIN_X.saturating_mul(2))
+        .max(1)
+        .min(area.width);
+    let max_height = area
+        .height
+        .saturating_sub(MODAL_MARGIN_Y.saturating_mul(2))
+        .max(1)
+        .min(area.height);
+    let width = desired_width.min(max_width).max(1).min(area.width);
+    let height = desired_height.min(max_height).max(1).min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
+    let x_margin = horizontal.min(area.width / 2);
+    let y_margin = vertical.min(area.height / 2);
+    Rect::new(
+        area.x + x_margin,
+        area.y + y_margin,
+        area.width.saturating_sub(x_margin.saturating_mul(2)),
+        area.height.saturating_sub(y_margin.saturating_mul(2)),
+    )
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let left = max_chars / 2;
+    let right = max_chars.saturating_sub(left).saturating_sub(1);
+    let prefix = value.chars().take(left).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn normal_style() -> Style {
+    Style::default().fg(COLOR_TEXT)
+}
+
+fn normal_bold_style() -> Style {
+    normal_style().add_modifier(Modifier::BOLD)
+}
+
+fn muted_style() -> Style {
+    Style::default().fg(COLOR_MUTED)
+}
+
+fn accent_style() -> Style {
+    Style::default().fg(COLOR_ACCENT)
+}
+
+fn accent_bold_style() -> Style {
+    accent_style().add_modifier(Modifier::BOLD)
+}
+
+fn danger_style() -> Style {
+    Style::default().fg(COLOR_DANGER)
+}
+
+fn danger_bold_style() -> Style {
+    danger_style().add_modifier(Modifier::BOLD)
+}
+
+fn border_style() -> Style {
+    Style::default().fg(COLOR_BORDER)
+}
+
+fn title_style() -> Style {
+    accent_bold_style()
+}
+
+fn key_style() -> Style {
+    accent_style().add_modifier(Modifier::BOLD)
+}
+
+fn code_style() -> Style {
+    Style::default().fg(COLOR_WARNING)
+}
+
+fn status_style(status: &str) -> Style {
+    let lower = status.to_lowercase();
+    if lower.contains("failed") || lower.contains("error") || lower.contains("denied") {
+        danger_style()
+    } else if lower.contains("approved") || lower.contains("ready") || lower.contains("set") {
+        Style::default().fg(COLOR_SUCCESS)
+    } else {
+        normal_style()
+    }
+}
+
+fn selected_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .bg(COLOR_SELECTED_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn selected_button_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(COLOR_ACCENT)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn badge_style() -> Style {
+    Style::default().fg(Color::Black).bg(COLOR_ACCENT)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1900,32 +2361,36 @@ fn render_block(
     prominent: bool,
     search_query: &str,
 ) -> Vec<Line<'static>> {
-    let border_style = Style::default().fg(color);
-    let title_style = if prominent {
-        border_style.add_modifier(Modifier::BOLD)
+    let heading_style = if prominent {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
     } else {
-        border_style
+        Style::default().fg(color)
+    };
+    let body_style = if prominent {
+        normal_style()
+    } else {
+        muted_style()
     };
     let mut lines = vec![highlighted_line(
-        "╭─ ",
+        "",
         title,
-        border_style,
-        title_style,
+        Style::default(),
+        heading_style,
         search_query,
     )];
-    for line in body.lines() {
-        lines.push(highlighted_line(
-            "│ ",
-            line,
-            border_style,
-            Style::default(),
-            search_query,
-        ));
-    }
     if body.is_empty() {
-        lines.push(Line::from(Span::styled("│", border_style)));
+        lines.push(Line::from(vec![Span::styled("  ·", muted_style())]));
+    } else {
+        for line in body.lines() {
+            lines.push(highlighted_line(
+                "  ",
+                line,
+                muted_style(),
+                body_style,
+                search_query,
+            ));
+        }
     }
-    lines.push(Line::from(Span::styled("╰", border_style)));
     lines.push(Line::default());
     lines
 }
@@ -2275,6 +2740,102 @@ mod tests {
             rows.iter().any(|row| row.contains("NEEDLE")),
             "expected scroll target to be visible, got {rows:?}"
         );
+    }
+
+    #[test]
+    fn transcript_messages_do_not_render_nested_box_art() {
+        let lines = TranscriptBlock::User {
+            text: "hello".to_string(),
+        }
+        .render_lines("");
+        let rendered = lines
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("You"));
+        assert!(rendered.contains("hello"));
+        assert!(!rendered.contains('╭'));
+        assert!(!rendered.contains('│'));
+        assert!(!rendered.contains('╰'));
+    }
+
+    #[test]
+    fn search_highlighting_survives_polished_transcript_rendering() {
+        let lines = TranscriptBlock::Assistant {
+            text: "find the needle".to_string(),
+            streaming: false,
+        }
+        .render_lines("needle");
+
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content.as_ref() == "needle" && span.style.bg == Some(Color::Yellow)
+            })
+        }));
+    }
+
+    #[test]
+    fn command_palette_filter_is_separate_from_composer_input() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = "draft message".to_string();
+        app.open_command_palette();
+        if let Some(palette) = &mut app.command_palette {
+            palette.filter.push('m');
+        }
+
+        assert_eq!(app.input, "draft message");
+        assert_eq!(
+            app.command_palette
+                .as_ref()
+                .map(|palette| palette.filter.as_str()),
+            Some("m")
+        );
+    }
+
+    #[test]
+    fn command_palette_renders_empty_state() {
+        let mut palette = CommandPaletteState::new();
+        palette.filter = "missing".to_string();
+        palette.commands = Vec::new();
+        palette.is_loading = false;
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        render_command_palette(area, &mut buffer, &palette);
+        let rendered = buffer_rows(&buffer).join("\n");
+
+        assert!(rendered.contains("Command Palette"));
+        assert!(rendered.contains("No commands match"));
+    }
+
+    #[test]
+    fn permission_modal_renders_action_summary_and_selected_choice() {
+        let permission = PendingPermissionView {
+            permission_id: "permission-123".to_string(),
+            tool_call_id: "tool-call-456".to_string(),
+            tool_name: "shell.run".to_string(),
+            arguments_json: r#"{"command":"cargo check -p bcode_tui"}"#.to_string(),
+        };
+        let area = Rect::new(0, 0, 96, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        render_permission_modal(
+            area,
+            &mut buffer,
+            &permission,
+            "y allow once · n deny",
+            PermissionChoice::AllowOnce,
+            1,
+        );
+        let rendered = buffer_rows(&buffer).join("\n");
+
+        assert!(rendered.contains("Permission required"));
+        assert!(rendered.contains("shell.run"));
+        assert!(rendered.contains("cargo check -p bcode_tui"));
+        assert!(rendered.contains("allow once"));
     }
 
     fn render_viewport_rows(
