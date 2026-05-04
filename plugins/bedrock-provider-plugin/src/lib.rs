@@ -24,7 +24,7 @@ use bcode_model::{
     StopReason, TokenUsage, ToolCall, ToolDefinition, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
-    StreamOutcome, TurnState, TurnStore, current_thread_runtime, provider_error,
+    ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ const STREAMING_TOOL_UNSUPPORTED_REASON: &str = "streaming_tool_use_unsupported"
 pub struct BedrockProviderPlugin {
     turns: TurnStore,
     discovery: Arc<Mutex<DiscoveryCache>>,
+    runtime: Result<ProviderRuntime, String>,
 }
 
 impl Default for BedrockProviderPlugin {
@@ -51,6 +52,7 @@ impl Default for BedrockProviderPlugin {
         Self {
             turns: TurnStore::default(),
             discovery: Arc::default(),
+            runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
         }
     }
 }
@@ -71,7 +73,9 @@ impl RustPlugin for BedrockProviderPlugin {
                 );
             }
         }
-        warm_discovery_cache(self.discovery.clone(), Settings::resolve(None));
+        if let Ok(runtime) = &self.runtime {
+            warm_discovery_cache(runtime, self.discovery.clone(), Settings::resolve(None));
+        }
         Ok(())
     }
 
@@ -105,15 +109,15 @@ impl BedrockProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let (provider_turn_id, turn) = self.turns.insert_started("bedrock-turn");
-        let discovery = self.discovery.clone();
-        std::thread::spawn(move || {
-            TurnWorker {
-                request,
-                turn,
-                discovery,
+        match &self.runtime {
+            Ok(runtime) => {
+                let discovery = self.discovery.clone();
+                runtime.spawn(async move {
+                    stream_bedrock_turn(&request, &turn, discovery).await;
+                });
             }
-            .run();
-        });
+            Err(error) => push_runtime_error(&turn, error),
+        }
         json_response(&StartTurnResponse { provider_turn_id })
     }
 
@@ -146,36 +150,17 @@ impl BedrockProviderPlugin {
     }
 }
 
-struct TurnWorker {
-    request: ModelTurnRequest,
-    turn: TurnState,
-    discovery: Arc<Mutex<DiscoveryCache>>,
-}
-
-impl TurnWorker {
-    fn run(self) {
-        let runtime = match current_thread_runtime() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                self.turn.push(ProviderTurnEvent::Error {
-                    error: provider_error(
-                        "runtime_build_failed",
-                        ProviderErrorCategory::ProviderInternal,
-                        error.to_string(),
-                    ),
-                });
-                self.turn.push(ProviderTurnEvent::TurnFinished {
-                    stop_reason: StopReason::Error,
-                });
-                return;
-            }
-        };
-        runtime.block_on(stream_bedrock_turn(
-            &self.request,
-            &self.turn,
-            self.discovery.clone(),
-        ));
-    }
+fn push_runtime_error(turn: &TurnState, error: &str) {
+    turn.push(ProviderTurnEvent::Error {
+        error: provider_error(
+            "runtime_unavailable",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        ),
+    });
+    turn.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::Error,
+    });
 }
 
 async fn stream_bedrock_turn(
@@ -211,7 +196,6 @@ async fn stream_bedrock_turn_inner(
     discovery: Arc<Mutex<DiscoveryCache>>,
 ) -> Result<StreamOutcome, ProviderError> {
     let settings = Settings::resolve(Some(request));
-    settings.validate()?;
     let client = bedrock_client(&settings).await;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
     let name_map = bedrock_tool_name_map(&request.tools);
@@ -243,7 +227,7 @@ async fn stream_bedrock_turn_inner(
                 {
                     mark_streaming_tool_unsupported(
                         &discovery,
-                        &selection.cache_key,
+                        selection.cache_key.as_ref(),
                         model_id,
                         &error.message,
                     );
@@ -773,10 +757,6 @@ impl Settings {
             },
         }
     }
-
-    const fn validate(&self) -> Result<(), ProviderError> {
-        Ok(())
-    }
 }
 
 fn resolve_configured_region(
@@ -821,8 +801,18 @@ impl BedrockProviderPlugin {
                 ),
             };
         }
-        let discovered =
-            get_or_refresh_discovery_sync(&self.discovery, &settings).unwrap_or_else(|error| {
+        let discovered = self
+            .runtime
+            .as_ref()
+            .map_err(|error| {
+                provider_error(
+                    "runtime_unavailable",
+                    ProviderErrorCategory::ProviderInternal,
+                    error.clone(),
+                )
+            })
+            .and_then(|runtime| get_or_refresh_discovery_sync(runtime, &self.discovery, &settings))
+            .unwrap_or_else(|error| {
                 tracing::warn!(
                     target: "bcode_bedrock::discovery",
                     error = %error.message,
@@ -837,12 +827,14 @@ impl BedrockProviderPlugin {
 
     fn validate_config(&self) -> ValidateConfigResponse {
         let settings = Settings::resolve(None);
-        let validation = settings.validate();
+        let validation: Result<(), ProviderError> = Ok(());
         let mut metadata = diagnostics_metadata(&settings);
-        let effective_region = validation
-            .as_ref()
-            .ok()
-            .and_then(|()| resolved_sdk_region(&settings));
+        let effective_region = validation.as_ref().ok().and_then(|()| {
+            self.runtime
+                .as_ref()
+                .ok()
+                .and_then(|runtime| resolved_sdk_region(runtime, &settings))
+        });
         if let Some((region, source)) = &effective_region {
             metadata.insert("effective_region".to_string(), region.clone());
             metadata.insert(
@@ -854,7 +846,19 @@ impl BedrockProviderPlugin {
             && !settings.model_ids_are_explicit
             && settings.default_model.is_none()
         {
-            match get_or_refresh_discovery_sync(&self.discovery, &settings) {
+            match self
+                .runtime
+                .as_ref()
+                .map_err(|error| {
+                    provider_error(
+                        "runtime_unavailable",
+                        ProviderErrorCategory::ProviderInternal,
+                        error.clone(),
+                    )
+                })
+                .and_then(|runtime| {
+                    get_or_refresh_discovery_sync(runtime, &self.discovery, &settings)
+                }) {
                 Ok(discovery) => {
                     metadata.insert(
                         "discovered_model_count".to_string(),
@@ -1029,15 +1033,16 @@ struct CandidateModel {
     date_key: i64,
 }
 
-fn warm_discovery_cache(cache: Arc<Mutex<DiscoveryCache>>, settings: Settings) {
+fn warm_discovery_cache(
+    runtime: &ProviderRuntime,
+    cache: Arc<Mutex<DiscoveryCache>>,
+    settings: Settings,
+) {
     if settings.model_ids_are_explicit || settings.default_model.is_some() {
         return;
     }
-    std::thread::spawn(move || {
-        let Ok(runtime) = current_thread_runtime() else {
-            return;
-        };
-        if let Err(error) = runtime.block_on(get_or_refresh_discovery(&cache, &settings)) {
+    runtime.spawn(async move {
+        if let Err(error) = get_or_refresh_discovery(&cache, &settings).await {
             tracing::debug!(
                 target: "bcode_bedrock::discovery",
                 error = %error.message,
@@ -1048,17 +1053,21 @@ fn warm_discovery_cache(cache: Arc<Mutex<DiscoveryCache>>, settings: Settings) {
 }
 
 fn get_or_refresh_discovery_sync(
+    runtime: &ProviderRuntime,
     cache: &Arc<Mutex<DiscoveryCache>>,
     settings: &Settings,
 ) -> Result<ModelDiscovery, ProviderError> {
-    let runtime = current_thread_runtime().map_err(|error| {
-        provider_error(
-            "runtime_build_failed",
-            ProviderErrorCategory::ProviderInternal,
-            error.to_string(),
-        )
-    })?;
-    runtime.block_on(get_or_refresh_discovery(cache, settings))
+    let cache = Arc::clone(cache);
+    let settings = settings.clone();
+    runtime
+        .block_on(async move { get_or_refresh_discovery(&cache, &settings).await })
+        .map_err(|error| {
+            provider_error(
+                "runtime_unavailable",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?
 }
 
 async fn get_or_refresh_discovery(
@@ -1078,8 +1087,7 @@ fn cached_discovery(
     cache: &Arc<Mutex<DiscoveryCache>>,
     key: &DiscoveryCacheKey,
 ) -> Option<ModelDiscovery> {
-    let cache = cache.lock().ok()?;
-    let cached = cache.entries.get(key)?;
+    let cached = cache.lock().ok()?.entries.get(key).cloned()?;
     (cached.discovered_at.elapsed() < MODEL_DISCOVERY_TTL)
         .then(|| filtered_discovery(&cached.discovery, &cached.unsupported_streaming_tool_models))
 }
@@ -1126,14 +1134,14 @@ fn store_discovery(
 
 fn mark_streaming_tool_unsupported(
     cache: &Arc<Mutex<DiscoveryCache>>,
-    key: &Option<DiscoveryCacheKey>,
+    key: Option<&DiscoveryCacheKey>,
     model_id: &str,
     message: &str,
 ) {
     let Some(key) = key else {
         return;
     };
-    let compatibility = if let Ok(mut cache) = cache.lock() {
+    let compatibility = cache.lock().ok().map(|mut cache| {
         if let Some(cached) = cache.entries.get_mut(key) {
             cached
                 .unsupported_streaming_tool_models
@@ -1146,10 +1154,8 @@ fn mark_streaming_tool_unsupported(
             message,
             now_unix_seconds(),
         );
-        Some(cache.compatibility.clone())
-    } else {
-        None
-    };
+        cache.compatibility.clone()
+    });
     if let Some(compatibility) = compatibility
         && let Err(error) = save_compatibility_cache(&compatibility)
     {
@@ -1384,7 +1390,7 @@ async fn discover_inference_profiles(
             .set_next_token(next_token)
             .send()
             .await
-            .map_err(bedrock_discovery_error)?;
+            .map_err(|error| bedrock_discovery_error(&error))?;
         for profile in response.inference_profile_summaries() {
             if profile.status().as_str() != "ACTIVE" {
                 continue;
@@ -1417,7 +1423,7 @@ async fn discover_foundation_models(
         .list_foundation_models()
         .send()
         .await
-        .map_err(bedrock_discovery_error)?;
+        .map_err(|error| bedrock_discovery_error(&error))?;
     let mut candidates = Vec::new();
     for model in response.model_summaries() {
         let supports_text_output = model
@@ -1451,9 +1457,14 @@ async fn discover_foundation_models(
     Ok(candidates)
 }
 
-fn resolved_sdk_region(settings: &Settings) -> Option<(String, RegionSource)> {
-    let runtime = current_thread_runtime().ok()?;
-    let config = runtime.block_on(bedrock_sdk_config(settings));
+fn resolved_sdk_region(
+    runtime: &ProviderRuntime,
+    settings: &Settings,
+) -> Option<(String, RegionSource)> {
+    let settings_for_config = settings.clone();
+    let config = runtime
+        .block_on(async move { bedrock_sdk_config(&settings_for_config).await })
+        .ok()?;
     let region = config.region().map(ToString::to_string)?;
     let source = if settings.region.is_some() {
         settings.region_source
@@ -1629,7 +1640,7 @@ fn bedrock_sdk_error(
     provider_error("bedrock_request_failed", category, message)
 }
 
-fn bedrock_discovery_error(error: impl std::fmt::Debug + ToString) -> ProviderError {
+fn bedrock_discovery_error(error: &(impl std::fmt::Debug + ToString + ?Sized)) -> ProviderError {
     let message = format!("{} ({error:?})", error.to_string());
     let category = if message.contains("AccessDenied") || message.contains("credentials") {
         ProviderErrorCategory::Auth

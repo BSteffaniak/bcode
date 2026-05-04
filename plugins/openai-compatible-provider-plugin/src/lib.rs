@@ -15,6 +15,7 @@ use bcode_model::{
     ProviderCapability, ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse,
     StopReason, ToolCall, ValidateConfigResponse,
 };
+use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -36,10 +37,20 @@ const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 /// OpenAI-compatible model provider plugin.
-#[derive(Default)]
 pub struct OpenAiCompatibleProviderPlugin {
     next_turn: u64,
     turns: BTreeMap<String, TurnState>,
+    runtime: Result<ProviderRuntime, String>,
+}
+
+impl Default for OpenAiCompatibleProviderPlugin {
+    fn default() -> Self {
+        Self {
+            next_turn: 0,
+            turns: BTreeMap::new(),
+            runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,8 +94,8 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
 
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
-            OP_MODELS => json_response(&models()),
-            OP_VALIDATE_CONFIG => json_response(&validate_config()),
+            OP_MODELS => json_response(&self.models()),
+            OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
@@ -108,7 +119,14 @@ impl OpenAiCompatibleProviderPlugin {
         let turn = TurnState::default();
         turn.push(ProviderTurnEvent::TurnStarted);
         self.turns.insert(provider_turn_id.clone(), turn.clone());
-        std::thread::spawn(move || TurnWorker { request, turn }.run());
+        match &self.runtime {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    stream_chat_completion(&request, &turn).await;
+                });
+            }
+            Err(error) => push_runtime_error(&turn, error),
+        }
         json_response(&StartTurnResponse { provider_turn_id })
     }
 
@@ -363,35 +381,17 @@ struct ToolCallAccumulator {
     started: bool,
 }
 
-struct TurnWorker {
-    request: ModelTurnRequest,
-    turn: TurnState,
-}
-
-impl TurnWorker {
-    fn run(self) {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                self.turn.push(ProviderTurnEvent::Error {
-                    error: provider_error(
-                        "runtime_build_failed",
-                        ProviderErrorCategory::ProviderInternal,
-                        error.to_string(),
-                    ),
-                });
-                self.turn.push(ProviderTurnEvent::TurnFinished {
-                    stop_reason: StopReason::Error,
-                });
-                return;
-            }
-        };
-        runtime.block_on(stream_chat_completion(&self.request, &self.turn));
-    }
+fn push_runtime_error(turn: &TurnState, error: &str) {
+    turn.push(ProviderTurnEvent::Error {
+        error: provider_error(
+            "runtime_unavailable",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        ),
+    });
+    turn.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::Error,
+    });
 }
 
 async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
@@ -1175,17 +1175,19 @@ fn capabilities() -> ProviderCapabilities {
     }
 }
 
-fn models() -> ModelList {
-    let settings = settings();
-    if !settings.model_ids_are_explicit
-        && let Some(discovered_models) = discover_models(&settings)
-    {
-        return ModelList {
-            models: discovered_models,
-        };
-    }
-    ModelList {
-        models: model_infos_from_ids(&settings.model_ids, &settings.default_model),
+impl OpenAiCompatibleProviderPlugin {
+    fn models(&self) -> ModelList {
+        let settings = settings();
+        if !settings.model_ids_are_explicit
+            && let Some(discovered_models) = self.discover_models(&settings)
+        {
+            return ModelList {
+                models: discovered_models,
+            };
+        }
+        ModelList {
+            models: model_infos_from_ids(&settings.model_ids, &settings.default_model),
+        }
     }
 }
 
@@ -1205,18 +1207,18 @@ fn model_infos_from_ids(model_ids: &[String], default_model: &str) -> Vec<ModelI
         .collect()
 }
 
-fn discover_models(settings: &Settings) -> Option<Vec<ModelInfo>> {
-    let AuthSettings::ApiKey(api_key) = settings.auth.clone() else {
-        return None;
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .ok()?;
-    runtime
-        .block_on(discover_models_async(settings, &api_key))
-        .ok()
+impl OpenAiCompatibleProviderPlugin {
+    fn discover_models(&self, settings: &Settings) -> Option<Vec<ModelInfo>> {
+        let AuthSettings::ApiKey(api_key) = settings.auth.clone() else {
+            return None;
+        };
+        let runtime = self.runtime.as_ref().ok()?;
+        let settings = settings.clone();
+        runtime
+            .block_on(async move { discover_models_async(&settings, &api_key).await })
+            .ok()
+            .and_then(Result::ok)
+    }
 }
 
 async fn discover_models_async(
@@ -1288,31 +1290,33 @@ fn model_ids_with_default(models: Vec<ModelResponseItem>, default_model: &str) -
     model_ids
 }
 
-fn validate_config() -> ValidateConfigResponse {
-    let mut settings = settings();
-    let refresh_status = validate_chatgpt_refresh(&mut settings);
-    let valid = settings.auth.is_configured() && refresh_status.is_ok();
-    let refresh_metadata = match &refresh_status {
-        Ok(status) => status.clone(),
-        Err(error) => format!("failed:{}:{:?}", error.code, error.category),
-    };
-    if valid {
-        ValidateConfigResponse {
-            valid: true,
-            message: Some(format!(
-                "OpenAI-compatible provider authentication is configured ({}) (supports xAI/Grok, OpenAI, etc.)",
-                settings.auth_diagnostics.detail
-            )),
-            metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
-        }
-    } else {
-        ValidateConfigResponse {
-            valid: false,
-            message: Some(validation_failure_message(
-                &settings,
-                refresh_status.as_ref().err(),
-            )),
-            metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
+impl OpenAiCompatibleProviderPlugin {
+    fn validate_config(&self) -> ValidateConfigResponse {
+        let mut settings = settings();
+        let refresh_status = self.validate_chatgpt_refresh(&mut settings);
+        let valid = settings.auth.is_configured() && refresh_status.is_ok();
+        let refresh_metadata = match &refresh_status {
+            Ok(status) => status.clone(),
+            Err(error) => format!("failed:{}:{:?}", error.code, error.category),
+        };
+        if valid {
+            ValidateConfigResponse {
+                valid: true,
+                message: Some(format!(
+                    "OpenAI-compatible provider authentication is configured ({}) (supports xAI/Grok, OpenAI, etc.)",
+                    settings.auth_diagnostics.detail
+                )),
+                metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
+            }
+        } else {
+            ValidateConfigResponse {
+                valid: false,
+                message: Some(validation_failure_message(
+                    &settings,
+                    refresh_status.as_ref().err(),
+                )),
+                metadata: diagnostics_metadata(&settings, Some(&refresh_metadata)),
+            }
         }
     }
 }
@@ -1710,41 +1714,53 @@ struct OpenAiOauthTokenResponse {
     expires_in: Option<u64>,
 }
 
-fn validate_chatgpt_refresh(settings: &mut Settings) -> Result<String, ProviderError> {
-    match &settings.auth {
-        AuthSettings::Missing | AuthSettings::ApiKey(_) => Ok("not_applicable".to_string()),
-        AuthSettings::ChatGpt {
-            expires_at: None, ..
-        } => Ok("not_checked_no_expiry".to_string()),
-        AuthSettings::ChatGpt {
-            expires_at: Some(expires_at),
-            refresh_token,
-            ..
-        } => {
-            let now = unix_timestamp();
-            if *expires_at > now + 60 {
-                return Ok(format!("not_needed_expires_in_{}s", expires_at - now));
-            }
-            if refresh_token.is_none() {
-                return Err(provider_error(
-                    "missing_refresh_token",
-                    ProviderErrorCategory::Auth,
-                    "saved ChatGPT/Codex access token is expired or expiring soon and no refresh token is saved; run `bcode login openai` again",
-                ));
-            }
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .enable_time()
-                .build()
-                .map_err(|error| {
+impl OpenAiCompatibleProviderPlugin {
+    fn validate_chatgpt_refresh(&self, settings: &mut Settings) -> Result<String, ProviderError> {
+        match &settings.auth {
+            AuthSettings::Missing | AuthSettings::ApiKey(_) => Ok("not_applicable".to_string()),
+            AuthSettings::ChatGpt {
+                expires_at: None, ..
+            } => Ok("not_checked_no_expiry".to_string()),
+            AuthSettings::ChatGpt {
+                expires_at: Some(expires_at),
+                refresh_token,
+                ..
+            } => {
+                let now = unix_timestamp();
+                if *expires_at > now + 60 {
+                    return Ok(format!("not_needed_expires_in_{}s", expires_at - now));
+                }
+                if refresh_token.is_none() {
+                    return Err(provider_error(
+                        "missing_refresh_token",
+                        ProviderErrorCategory::Auth,
+                        "saved ChatGPT/Codex access token is expired or expiring soon and no refresh token is saved; run `bcode login openai` again",
+                    ));
+                }
+                let runtime = self.runtime.as_ref().map_err(|error| {
                     provider_error(
-                        "runtime_build_failed",
+                        "runtime_unavailable",
                         ProviderErrorCategory::ProviderInternal,
-                        error.to_string(),
+                        error.clone(),
                     )
                 })?;
-            runtime.block_on(refresh_chatgpt_auth_if_needed(settings))?;
-            Ok("refreshed".to_string())
+                let mut refreshed_settings = settings.clone();
+                refreshed_settings = runtime
+                    .block_on(async move {
+                        refresh_chatgpt_auth_if_needed(&mut refreshed_settings)
+                            .await
+                            .map(|()| refreshed_settings)
+                    })
+                    .map_err(|error| {
+                        provider_error(
+                            "runtime_unavailable",
+                            ProviderErrorCategory::ProviderInternal,
+                            error.to_string(),
+                        )
+                    })??;
+                *settings = refreshed_settings;
+                Ok("refreshed".to_string())
+            }
         }
     }
 }

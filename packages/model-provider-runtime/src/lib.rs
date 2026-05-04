@@ -6,9 +6,11 @@
 
 use bcode_model::{ProviderError, ProviderErrorCategory, ProviderTurnEvent};
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use tokio::sync::{Notify, oneshot};
 
 /// Outcome from a provider streaming turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,14 +127,141 @@ pub fn provider_error(
     }
 }
 
-/// Build a current-thread Tokio runtime suitable for native plugin worker threads.
+/// Shared Tokio runtime for native model provider plugins.
 ///
-/// # Errors
-///
-/// Returns an error if Tokio cannot build the runtime.
-pub fn current_thread_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
+/// The plugin service ABI is synchronous, but providers need async networking for
+/// streaming turns, model discovery, and token refresh. This runtime keeps one
+/// current-thread Tokio runtime alive on a dedicated background thread so plugins
+/// can spawn long-lived async work without creating a new runtime per operation.
+pub struct ProviderRuntime {
+    handle: tokio::runtime::Handle,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
 }
+
+impl std::fmt::Debug for ProviderRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderRuntime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderRuntime {
+    /// Start a reusable provider runtime on a dedicated thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the background thread or Tokio runtime cannot be
+    /// created, or when the runtime thread exits before startup completes.
+    pub fn new() -> Result<Self, ProviderRuntimeError> {
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let thread = thread::Builder::new()
+            .name("bcode-provider-runtime".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                        return;
+                    }
+                };
+                let handle = runtime.handle().clone();
+                if ready_sender.send(Ok(handle)).is_err() {
+                    return;
+                }
+                runtime.block_on(async {
+                    let _ = shutdown_receiver.await;
+                });
+            })
+            .map_err(ProviderRuntimeError::ThreadSpawn)?;
+        let handle = ready_receiver
+            .recv()
+            .map_err(|_| ProviderRuntimeError::StartupDropped)?
+            .map_err(ProviderRuntimeError::RuntimeBuild)?;
+        Ok(Self {
+            handle,
+            shutdown: Some(shutdown_sender),
+            thread: Some(thread),
+        })
+    }
+
+    /// Spawn async provider work onto the shared runtime.
+    ///
+    /// The returned handle may be dropped when the caller does not need the task
+    /// result, such as provider turn streaming where completion is reported via
+    /// queued provider events.
+    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle.spawn(future)
+    }
+
+    /// Run an async operation to completion from synchronous plugin code.
+    ///
+    /// This schedules the future on the background runtime and waits for its
+    /// result without constructing a throwaway runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the background runtime stops before the operation
+    /// returns its result.
+    pub fn block_on<F>(&self, future: F) -> Result<F::Output, ProviderRuntimeError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.handle.spawn(async move {
+            let output = future.await;
+            let _ = sender.send(output);
+        });
+        receiver
+            .recv()
+            .map_err(|_| ProviderRuntimeError::TaskDropped)
+    }
+}
+
+impl Drop for ProviderRuntime {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Errors returned by [`ProviderRuntime`].
+#[derive(Debug)]
+pub enum ProviderRuntimeError {
+    /// Tokio runtime construction failed on the background thread.
+    RuntimeBuild(std::io::Error),
+    /// Runtime thread creation failed.
+    ThreadSpawn(std::io::Error),
+    /// Runtime thread exited before reporting startup success or failure.
+    StartupDropped,
+    /// A scheduled operation did not return a result before the runtime stopped.
+    TaskDropped,
+}
+
+impl std::fmt::Display for ProviderRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RuntimeBuild(error) => write!(formatter, "runtime build failed: {error}"),
+            Self::ThreadSpawn(error) => write!(formatter, "runtime thread spawn failed: {error}"),
+            Self::StartupDropped => write!(formatter, "runtime thread exited during startup"),
+            Self::TaskDropped => write!(formatter, "runtime task ended without returning a result"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderRuntimeError {}

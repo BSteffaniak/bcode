@@ -789,6 +789,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_config",
  "bcode_model",
+ "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "reqwest",
  "serde",
