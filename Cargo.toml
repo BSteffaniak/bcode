@@ -3,9 +3,11 @@ members = [
     "examples/hello-plugin",
     "plugins/filesystem-plugin",
     "plugins/bedrock-provider-plugin",
+    "plugins/default-agents-plugin",
     "plugins/fake-provider-plugin",
     "plugins/openai-compatible-provider-plugin",
     "plugins/shell-plugin",
+    "packages/agent-profile",
     "packages/bcode",
     "packages/cli",
     "packages/client",
@@ -34,6 +36,7 @@ version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
 # Internal bcode packages
+bcode_agent_profile          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-profile" }
 bcode_cli                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bcode_client                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
 bcode_command                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }

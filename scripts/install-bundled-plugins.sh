@@ -9,23 +9,27 @@ cd "${root}"
 cargo build --quiet \
     -p bcode_filesystem_plugin \
     -p bcode_shell_plugin \
-    -p bcode_openai_compatible_provider_plugin
+    -p bcode_openai_compatible_provider_plugin \
+    -p bcode_default_agents_plugin
 
 case "$(uname -s)" in
     Darwin)
         fs_dylib_name="libbcode_filesystem_plugin.dylib"
         shell_dylib_name="libbcode_shell_plugin.dylib"
         openai_dylib_name="libbcode_openai_compatible_provider_plugin.dylib"
+        default_agents_dylib_name="libbcode_default_agents_plugin.dylib"
         ;;
     Linux)
         fs_dylib_name="libbcode_filesystem_plugin.so"
         shell_dylib_name="libbcode_shell_plugin.so"
         openai_dylib_name="libbcode_openai_compatible_provider_plugin.so"
+        default_agents_dylib_name="libbcode_default_agents_plugin.so"
         ;;
     MINGW*|MSYS*|CYGWIN*)
         fs_dylib_name="bcode_filesystem_plugin.dll"
         shell_dylib_name="bcode_shell_plugin.dll"
         openai_dylib_name="bcode_openai_compatible_provider_plugin.dll"
+        default_agents_dylib_name="bcode_default_agents_plugin.dll"
         ;;
     *)
         echo "unsupported platform: $(uname -s)" >&2
@@ -86,6 +90,26 @@ name = "OpenAI-Compatible Model Provider"
 type = "native"
 abi_version = 1
 library = "${openai_dylib_name}"
+event_symbol = "bcode_plugin_handle_event_v1"
+service_symbol = "bcode_plugin_invoke_service_v1"
+EOF
+
+default_agents_plugin_dir="${install_root}/bcode.default-agents"
+install_plugin_library "${default_agents_plugin_dir}" "${default_agents_dylib_name}"
+cat >"${default_agents_plugin_dir}/bcode-plugin.toml" <<EOF
+id = "bcode.default-agents"
+name = "Bcode Default Agents"
+version = "0.0.1"
+
+[[services]]
+description = "Default plan/build agent profile policy provider"
+interface_id = "bcode.agent-profile/v1"
+name = "Default Agent Profiles"
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "${default_agents_dylib_name}"
 event_symbol = "bcode_plugin_handle_event_v1"
 service_symbol = "bcode_plugin_invoke_service_v1"
 EOF

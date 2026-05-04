@@ -1,22 +1,25 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Programmatic client API for bcode"
+description = "Default agent profile policy plugin for bcode"
 edition     = { workspace = true }
-keywords    = ["bcode", "client"]
+keywords    = ["agent", "bcode", "plugin", "policy"]
 license     = { workspace = true }
-name        = "bcode_client"
+name        = "bcode_default_agents_plugin"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 bcode_agent_profile  = { workspace = true }
-bcode_command        = { workspace = true }
-bcode_ipc            = { workspace = true }
-bcode_model          = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
 bcode_session_models = { workspace = true }
-thiserror            = { workspace = true }
+bcode_tool           = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
 
 [features]
 default          = []

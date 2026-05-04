@@ -1,22 +1,20 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Programmatic client API for bcode"
+description = "Agent profile policy contract types for bcode"
 edition     = { workspace = true }
-keywords    = ["bcode", "client"]
+keywords    = ["agent", "bcode", "policy", "profile"]
 license     = { workspace = true }
-name        = "bcode_client"
+name        = "bcode_agent_profile"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_profile  = { workspace = true }
-bcode_command        = { workspace = true }
-bcode_ipc            = { workspace = true }
-bcode_model          = { workspace = true }
 bcode_session_models = { workspace = true }
-thiserror            = { workspace = true }
+bcode_tool           = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
 
 [features]
 default          = []

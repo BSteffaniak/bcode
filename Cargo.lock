@@ -647,6 +647,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_agent_profile"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "bcode_tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_bedrock_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -695,6 +705,7 @@ dependencies = [
 name = "bcode_client"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_profile",
  "bcode_command",
  "bcode_ipc",
  "bcode_model",
@@ -722,6 +733,18 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "bcode_default_agents_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_agent_profile",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_tool",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -755,6 +778,7 @@ dependencies = [
 name = "bcode_ipc"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_profile",
  "bcode_command",
  "bcode_model",
  "bcode_session_models",
@@ -825,6 +849,7 @@ dependencies = [
 name = "bcode_server"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_profile",
  "bcode_command",
  "bcode_config",
  "bcode_ipc",

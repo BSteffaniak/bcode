@@ -1707,6 +1707,11 @@ const BUNDLED_BEDROCK_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginSer
     name: "Amazon Bedrock Model Provider",
     description: "Amazon Bedrock ConverseStream model provider",
 }];
+const BUNDLED_DEFAULT_AGENT_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
+    interface_id: "bcode.agent-profile/v1",
+    name: "Default Agent Profiles",
+    description: "Default plan/build agent profile policy provider",
+}];
 const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
     BundledPluginSpec {
         id: "bcode.filesystem",
@@ -1735,6 +1740,13 @@ const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
         library_stem: "bcode_bedrock_provider_plugin",
         name: "Bcode Bedrock Provider",
         services: BUNDLED_BEDROCK_SERVICES,
+    },
+    BundledPluginSpec {
+        id: "bcode.default-agents",
+        package: "bcode_default_agents_plugin",
+        library_stem: "bcode_default_agents_plugin",
+        name: "Bcode Default Agents",
+        services: BUNDLED_DEFAULT_AGENT_SERVICES,
     },
 ];
 
@@ -1855,6 +1867,7 @@ fn package_relative_dir(spec: &BundledPluginSpec) -> &'static str {
         "bcode.shell" => "plugins/shell-plugin",
         "bcode.openai-compatible" => "plugins/openai-compatible-provider-plugin",
         "bcode.bedrock" => "plugins/bedrock-provider-plugin",
+        "bcode.default-agents" => "plugins/default-agents-plugin",
         _ => ".",
     }
 }
@@ -2284,6 +2297,9 @@ fn print_session_event(event: &SessionEvent) {
         }
         SessionEventKind::ModelChanged { provider, model } => {
             println!("#{} model changed: {provider}/{model}", event.sequence);
+        }
+        SessionEventKind::AgentChanged { agent_id } => {
+            println!("#{} agent changed: {agent_id}", event.sequence);
         }
         SessionEventKind::SystemMessage { text } => {
             println!("#{} system: {text}", event.sequence);

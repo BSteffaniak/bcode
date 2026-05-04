@@ -15,6 +15,8 @@ use thiserror::Error;
 /// Default Bcode config file name.
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 
+const DEFAULT_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
+
 /// Top-level Bcode configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BcodeConfig {
@@ -420,18 +422,30 @@ impl From<&BcodeConfig> for PluginSelection {
                 .unwrap_or_else(|| "bcode.openai-compatible".to_string())
         });
         if selection.enabled.is_empty() {
-            for plugin_id in ["bcode.filesystem", "bcode.shell", provider.as_str()] {
-                if !selection.disabled.contains(plugin_id) {
-                    selection.enabled.insert(plugin_id.to_string());
-                }
+            for plugin_id in [
+                "bcode.filesystem",
+                "bcode.shell",
+                DEFAULT_AGENT_PROFILE_PLUGIN_ID,
+                provider.as_str(),
+            ] {
+                enable_plugin_unless_disabled(&mut selection, plugin_id);
             }
-        } else if let Some(env_provider) = env_provider
-            && !selection.disabled.contains(&env_provider)
-        {
-            selection.enabled.insert(env_provider.clone());
-            remove_other_model_providers(&mut selection.enabled, &env_provider);
+        } else {
+            enable_plugin_unless_disabled(&mut selection, DEFAULT_AGENT_PROFILE_PLUGIN_ID);
+            if let Some(env_provider) = env_provider
+                && !selection.disabled.contains(&env_provider)
+            {
+                selection.enabled.insert(env_provider.clone());
+                remove_other_model_providers(&mut selection.enabled, &env_provider);
+            }
         }
         selection
+    }
+}
+
+fn enable_plugin_unless_disabled(selection: &mut PluginSelection, plugin_id: &str) {
+    if !selection.disabled.contains(plugin_id) {
+        selection.enabled.insert(plugin_id.to_string());
     }
 }
 
@@ -940,7 +954,9 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BcodeConfig, PluginSelection, load_config_from_paths};
+    use super::{
+        BcodeConfig, DEFAULT_AGENT_PROFILE_PLUGIN_ID, PluginSelection, load_config_from_paths,
+    };
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1086,6 +1102,55 @@ profile = "work"
     }
 
     #[test]
+    fn default_plugin_selection_includes_default_agent_profiles() {
+        let config = BcodeConfig::default();
+        let plugin_selection = PluginSelection::from(&config);
+
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn explicit_plugin_selection_still_includes_default_agent_profiles() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+enabled = ["bcode.bedrock"]
+"#,
+        )
+        .expect("config should parse");
+        let plugin_selection = PluginSelection::from(&config);
+
+        assert!(plugin_selection.enabled.contains("bcode.bedrock"));
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn default_agent_profiles_can_be_disabled() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+disabled = ["bcode.default-agents"]
+"#,
+        )
+        .expect("config should parse");
+        let plugin_selection = PluginSelection::from(&config);
+
+        assert!(
+            !plugin_selection
+                .enabled
+                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+        );
+    }
+
+    #[test]
     fn bedrock_env_overrides_persisted_openai_provider() {
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let previous_token = std::env::var_os("AWS_BEARER_TOKEN_BEDROCK");
@@ -1115,6 +1180,11 @@ model_id = "gpt-4.1-mini"
 
         let plugin_selection = PluginSelection::from(&config);
         assert!(plugin_selection.enabled.contains("bcode.bedrock"));
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+        );
         assert!(!plugin_selection.enabled.contains("bcode.openai-compatible"));
 
         restore_env("AWS_BEARER_TOKEN_BEDROCK", previous_token);

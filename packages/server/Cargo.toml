@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_agent_profile = { workspace = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_ipc = { workspace = true }
@@ -28,6 +29,7 @@ tokio = { workspace = true, features = [
     "net",
     "rt",
     "sync",
+    "time",
 ] }
 tracing = { workspace = true }
 

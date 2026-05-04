@@ -4,6 +4,11 @@
 
 //! Local Bcode daemon runtime.
 
+use bcode_agent_profile::{
+    AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
+    AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
+    OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS,
+};
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcListener, LocalIpcStream,
     PermissionSummary, PluginServiceError, PluginServiceResponse, PluginServiceSummary, Request,
@@ -71,6 +76,7 @@ struct ServerState {
     permission_policy: Mutex<PermissionPolicy>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
+    session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
@@ -203,6 +209,7 @@ impl ServerState {
             permission_policy: Mutex::new(permission_policy),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
+            session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
@@ -408,6 +415,11 @@ async fn handle_request(
             )
             .await
         }
+        Request::ListAgents => handle_list_agents(request_id, state, writer).await,
+        Request::SetSessionAgent {
+            session_id,
+            agent_id,
+        } => handle_set_session_agent(request_id, state, writer, session_id, agent_id).await,
         Request::ListPermissions => handle_list_permissions(request_id, state, writer).await,
         Request::ResolvePermission {
             permission_id,
@@ -661,6 +673,68 @@ async fn handle_set_session_model(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::SessionModelSet),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_list_agents(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let agents = list_agent_profiles(state).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AgentList { agents }),
+    )
+    .await
+}
+
+async fn handle_set_session_agent(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    agent_id: String,
+) -> Result<(), ServerError> {
+    let Some(resolved_agent_id) = resolve_agent_id(state, &agent_id).await else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "unknown_agent",
+                format!("unknown agent profile: {agent_id}"),
+            )),
+        )
+        .await;
+    };
+    match state
+        .sessions
+        .append_agent_changed(session_id, resolved_agent_id.clone())
+        .await
+    {
+        Ok(event) => {
+            state
+                .session_agent_selections
+                .lock()
+                .await
+                .insert(session_id, resolved_agent_id);
+            publish_session_event(state, &event).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionAgentSet),
             )
             .await
         }
@@ -1040,6 +1114,90 @@ async fn handle_provider_turn_event(
     }
 }
 
+async fn list_agent_profiles(state: &ServerState) -> Vec<AgentInfo> {
+    with_plugins_blocking(state, |plugins| {
+        plugins.invoke_service_by_interface_json::<_, AgentList>(
+            AGENT_PROFILE_INTERFACE_ID,
+            OP_LIST_AGENTS,
+            &serde_json::json!({}),
+        )
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map_or_else(default_agent_profiles, |list| list.agents)
+}
+
+fn default_agent_profiles() -> Vec<AgentInfo> {
+    vec![AgentInfo {
+        id: "build".to_string(),
+        name: "Build".to_string(),
+        description: "Default implementation agent".to_string(),
+        badge: Some("build".to_string()),
+        aliases: vec!["build".to_string()],
+        is_default: true,
+    }]
+}
+
+async fn resolve_agent_id(state: &ServerState, agent_id: &str) -> Option<String> {
+    list_agent_profiles(state)
+        .await
+        .into_iter()
+        .find_map(|agent| {
+            (agent.id == agent_id || agent.aliases.iter().any(|alias| alias == agent_id))
+                .then_some(agent.id)
+        })
+}
+
+async fn session_agent_selection(state: &ServerState, session_id: SessionId) -> String {
+    if let Some(agent_id) = state.session_agent_selections.lock().await.get(&session_id) {
+        return agent_id.clone();
+    }
+    let mut selected = default_agent_id(&list_agent_profiles(state).await);
+    if let Ok(history) = state.sessions.session_history(session_id).await {
+        for event in history {
+            if let SessionEventKind::AgentChanged { agent_id } = event.kind {
+                selected = agent_id;
+            }
+        }
+    }
+    state
+        .session_agent_selections
+        .lock()
+        .await
+        .insert(session_id, selected.clone());
+    selected
+}
+
+fn default_agent_id(agents: &[AgentInfo]) -> String {
+    agents
+        .iter()
+        .find(|agent| agent.is_default)
+        .or_else(|| agents.first())
+        .map_or_else(|| "build".to_string(), |agent| agent.id.clone())
+}
+
+async fn agent_context(
+    state: &ServerState,
+    session_id: SessionId,
+    agent_id: &str,
+) -> Option<AgentContextResponse> {
+    let request = AgentContextRequest {
+        session_id,
+        agent_id: agent_id.to_string(),
+    };
+    with_plugins_blocking(state, move |plugins| {
+        plugins.invoke_service_by_interface_json::<_, AgentContextResponse>(
+            AGENT_PROFILE_INTERFACE_ID,
+            OP_AGENT_CONTEXT,
+            &request,
+        )
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+}
+
 async fn session_model_selection(
     state: &ServerState,
     session_id: SessionId,
@@ -1192,14 +1350,23 @@ async fn build_model_turn_request(
         .filter_map(session_event_to_model_message)
         .collect();
     let selection = session_model_selection(state, session_id).await;
+    let agent_id = session_agent_selection(state, session_id).await;
+    let agent_context = agent_context(state, session_id, &agent_id).await;
+    let enabled_tools = agent_context
+        .as_ref()
+        .and_then(|context| context.enabled_tools.clone());
     Ok(ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id: model_id_for_provider_request(selected_model_id),
         provider_context: selection.provider_context,
-        system_prompt: Some(build_coding_system_prompt()),
+        system_prompt: Some(build_coding_system_prompt(
+            agent_context
+                .as_ref()
+                .and_then(|context| context.system_prompt_suffix.as_deref()),
+        )),
         messages,
-        tools: collect_model_tools(state).await,
+        tools: collect_model_tools(state, enabled_tools).await,
         parameters: {
             let mut p = ModelParameters::default();
             if let Some(level) = &selection.thinking_level {
@@ -1242,11 +1409,18 @@ const MAX_GIT_STATUS_CHARS: usize = 4_000;
 const MAX_MODEL_TOOL_RESULT_CHARS: usize = 16_000;
 const MODEL_TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 
-fn build_coding_system_prompt() -> String {
-    format!(
+fn build_coding_system_prompt(agent_prompt_suffix: Option<&str>) -> String {
+    let mut prompt = format!(
         "{DEFAULT_CODING_SYSTEM_PROMPT}\n\n{}",
         truncate_text(&build_repository_context(), MAX_REPOSITORY_CONTEXT_CHARS)
-    )
+    );
+    if let Some(suffix) = agent_prompt_suffix
+        && !suffix.trim().is_empty()
+    {
+        prompt.push_str("\n\n");
+        prompt.push_str(suffix.trim());
+    }
+    prompt
 }
 
 fn build_repository_context() -> String {
@@ -1384,8 +1558,12 @@ fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
     }
 }
 
-async fn collect_model_tools(state: &ServerState) -> Vec<bcode_model::ToolDefinition> {
-    with_plugins_blocking(state, |plugins| {
+async fn collect_model_tools(
+    state: &ServerState,
+    enabled_tools: Option<Vec<String>>,
+) -> Vec<bcode_model::ToolDefinition> {
+    let enabled_tools = enabled_tools.map(|tools| tools.into_iter().collect::<BTreeSet<_>>());
+    with_plugins_blocking(state, move |plugins| {
         let mut tools = Vec::new();
         for plugin in plugins.loaded_plugins() {
             if !plugin
@@ -1407,6 +1585,11 @@ async fn collect_model_tools(state: &ServerState) -> Vec<bcode_model::ToolDefini
                     tools.extend(
                         list.tools
                             .into_iter()
+                            .filter(|tool| {
+                                enabled_tools
+                                    .as_ref()
+                                    .is_none_or(|enabled| enabled.contains(&tool.name))
+                            })
                             .map(|tool| bcode_model::ToolDefinition {
                                 name: tool.name,
                                 description: tool.description,
@@ -1471,13 +1654,25 @@ async fn invoke_model_tool(
     let (plugin_id, definition) = find_tool_provider(state, &call.name)
         .await?
         .ok_or_else(|| format!("tool not found: {}", call.name))?;
-    if definition.requires_permission
-        && !request_tool_permission(state, session_id, call, &definition).await
-    {
-        return Ok(ToolInvocationResponse {
-            output: "permission denied".to_string(),
-            is_error: true,
-        });
+    let agent_decision = evaluate_agent_tool_policy(state, session_id, call, &definition).await;
+    match agent_decision.decision {
+        AgentDecision::Deny => {
+            return Ok(ToolInvocationResponse {
+                output: agent_decision
+                    .reason
+                    .unwrap_or_else(|| "tool denied by active agent policy".to_string()),
+                is_error: true,
+            });
+        }
+        AgentDecision::Ask => {
+            if !request_tool_permission(state, session_id, call, &definition).await {
+                return Ok(ToolInvocationResponse {
+                    output: "permission denied".to_string(),
+                    is_error: true,
+                });
+            }
+        }
+        AgentDecision::Allow => {}
     }
     let request = ToolInvocationRequest {
         tool_call_id: call.id.clone(),
@@ -1495,6 +1690,40 @@ async fn invoke_model_tool(
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+}
+
+async fn evaluate_agent_tool_policy(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    definition: &ServiceToolDefinition,
+) -> EvaluateToolCallResponse {
+    let agent_id = session_agent_selection(state, session_id).await;
+    let request = EvaluateToolCallRequest {
+        session_id,
+        agent_id,
+        tool_name: definition.name.clone(),
+        side_effect: definition.side_effect,
+        arguments: call.arguments.clone(),
+    };
+    with_plugins_blocking(state, move |plugins| {
+        plugins.invoke_service_by_interface_json::<_, EvaluateToolCallResponse>(
+            AGENT_PROFILE_INTERFACE_ID,
+            OP_EVALUATE_TOOL_CALL,
+            &request,
+        )
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(EvaluateToolCallResponse {
+        decision: if definition.requires_permission {
+            AgentDecision::Ask
+        } else {
+            AgentDecision::Allow
+        },
+        reason: None,
+    })
 }
 
 async fn find_tool_provider(

@@ -701,7 +701,7 @@ async fn handle_tui_action(
                 app.finish_search();
             } else if let Some(message) = app.take_input() {
                 if message.starts_with('/') {
-                    if !app.parse_and_execute_slash(&message, client) {
+                    if !handle_slash_command(client, app, session_id, &message).await {
                         app.status = format!("unknown slash command: {}", message);
                     }
                 } else if let Err(error) = client.send_user_message(session_id, message).await {
@@ -803,6 +803,62 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
+}
+
+async fn handle_slash_command(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+    message: &str,
+) -> bool {
+    let parts = message.split_whitespace().collect::<Vec<_>>();
+    let Some(command) = parts.first().map(|part| part.trim_start_matches('/')) else {
+        return false;
+    };
+    match command {
+        "plan" => set_session_agent_from_tui(client, app, session_id, "plan").await,
+        "build" => set_session_agent_from_tui(client, app, session_id, "build").await,
+        "agent" if parts.len() > 1 => {
+            set_session_agent_from_tui(client, app, session_id, parts[1]).await
+        }
+        "agent" => {
+            match client.list_agents().await {
+                Ok(agents) => {
+                    let names = agents
+                        .iter()
+                        .map(|agent| agent.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    app.status = format!(
+                        "current agent: {}; available: {names}",
+                        app.current_agent_id
+                    );
+                }
+                Err(error) => app.status = format!("agent list failed: {error}"),
+            }
+            true
+        }
+        _ => app.parse_and_execute_slash(message, client),
+    }
+}
+
+async fn set_session_agent_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+    agent_id: &str,
+) -> bool {
+    match client
+        .set_session_agent(session_id, agent_id.to_string())
+        .await
+    {
+        Ok(()) => {
+            app.current_agent_id = agent_id.to_string();
+            app.status = format!("agent set to {agent_id}");
+        }
+        Err(error) => app.status = format!("agent switch failed: {error}"),
+    }
+    true
 }
 
 async fn resolve_first_permission(client: &BcodeClient, app: &mut ChatApp, approved: bool) {
@@ -1042,6 +1098,7 @@ struct ChatApp {
     pending_permissions: BTreeMap<String, PendingPermissionView>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
+    current_agent_id: String,
     current_thinking_level: Option<ReasoningEffort>,
     activity: ActivityState,
     activity_started_at: Option<Instant>,
@@ -1198,6 +1255,7 @@ impl ChatApp {
             pending_permissions: BTreeMap::new(),
             selected_provider_plugin_id: None,
             selected_model_id: None,
+            current_agent_id: "build".to_string(),
             current_thinking_level: None,
             activity: ActivityState::Idle,
             activity_started_at: None,
@@ -1291,6 +1349,7 @@ impl ChatApp {
             | SessionEventKind::ClientAttached { .. }
             | SessionEventKind::ClientDetached { .. }
             | SessionEventKind::ModelChanged { .. }
+            | SessionEventKind::AgentChanged { .. }
             | SessionEventKind::SystemMessage { .. } => {}
         }
     }
@@ -1484,6 +1543,9 @@ impl ChatApp {
             SessionEventKind::ModelChanged { provider, model } => {
                 self.selected_provider_plugin_id = provider_to_display_selection(provider);
                 self.selected_model_id = model_to_display_selection(model);
+            }
+            SessionEventKind::AgentChanged { agent_id } => {
+                self.current_agent_id.clone_from(agent_id);
             }
             _ => {}
         }
@@ -1871,6 +1933,7 @@ fn render_chat_header(app: &ChatApp, area: Rect, buf: &mut ratatui::buffer::Buff
         .current_thinking_level
         .map(|level| format!("{:?}", level))
         .unwrap_or_else(|| "default".to_string());
+    let agent = truncate_middle(&app.current_agent_id, 18);
     let session = truncate_middle(&app.session_id.to_string(), 12);
     let mut spans = vec![
         Span::styled(" bcode ", title_style()),
@@ -1881,6 +1944,8 @@ fn render_chat_header(app: &ChatApp, area: Rect, buf: &mut ratatui::buffer::Buff
     push_label_value(&mut spans, "provider", &provider, accent_style());
     spans.push(Span::raw("  "));
     push_label_value(&mut spans, "model", &model, normal_style());
+    spans.push(Span::raw("  "));
+    push_label_value(&mut spans, "agent", &agent, accent_style());
     spans.push(Span::raw("  "));
     push_label_value(&mut spans, "thinking", &thinking, muted_style());
     Paragraph::new(Line::from(spans)).render(area, buf);
@@ -2749,6 +2814,9 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         }
         SessionEventKind::ModelChanged { provider, model } => vec![TranscriptBlock::Meta {
             text: format!("model changed: {provider}/{model}"),
+        }],
+        SessionEventKind::AgentChanged { agent_id } => vec![TranscriptBlock::Meta {
+            text: format!("agent changed: {agent_id}"),
         }],
         SessionEventKind::SystemMessage { text } => {
             vec![TranscriptBlock::System { text: text.clone() }]

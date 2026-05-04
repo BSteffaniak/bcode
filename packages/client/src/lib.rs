@@ -4,6 +4,7 @@
 
 //! Programmatic client API for Bcode.
 
+use bcode_agent_profile::AgentInfo;
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream, PermissionSummary,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, decode,
@@ -185,6 +186,42 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::TurnCancellationRequested { cancelled } => Ok(cancelled),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List available agent profiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_agents(&self) -> Result<Vec<AgentInfo>, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::ListAgents).await? {
+            ResponsePayload::AgentList { agents } => Ok(agents),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Set a session-specific active agent profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn set_session_agent(
+        &self,
+        session_id: SessionId,
+        agent_id: String,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::SetSessionAgent {
+                session_id,
+                agent_id,
+            })
+            .await?
+        {
+            ResponsePayload::SessionAgentSet => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

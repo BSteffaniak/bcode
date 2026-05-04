@@ -1,0 +1,109 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! Agent profile service contract types for Bcode.
+//!
+//! Agent profiles are generic session-scoped operating profiles. Plugins can
+//! provide profiles such as `plan`, `build`, `review`, or project-specific
+//! agents, along with prompt context and tool-call policy decisions.
+
+use bcode_session_models::SessionId;
+use bcode_tool::ToolSideEffect;
+use serde::{Deserialize, Serialize};
+
+/// Plugin service interface for agent profile providers.
+pub const AGENT_PROFILE_INTERFACE_ID: &str = "bcode.agent-profile/v1";
+
+/// Operation for listing available agent profiles.
+pub const OP_LIST_AGENTS: &str = "list_agents";
+
+/// Operation for retrieving prompt/tool context for the active agent profile.
+pub const OP_AGENT_CONTEXT: &str = "agent_context";
+
+/// Operation for evaluating a tool call against an agent profile.
+pub const OP_EVALUATE_TOOL_CALL: &str = "evaluate_tool_call";
+
+/// Agent profile metadata shown in the TUI and command palette.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    /// Stable profile identifier, e.g. `plan` or `build`.
+    pub id: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Optional compact UI badge.
+    #[serde(default)]
+    pub badge: Option<String>,
+    /// Optional slash-command aliases.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Whether this profile is the provider's default.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// Response returned by [`OP_LIST_AGENTS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentList {
+    /// Available agent profiles.
+    pub agents: Vec<AgentInfo>,
+}
+
+/// Request for [`OP_AGENT_CONTEXT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextRequest {
+    /// Session ID using the active agent.
+    pub session_id: SessionId,
+    /// Active agent profile ID.
+    pub agent_id: String,
+}
+
+/// Response returned by [`OP_AGENT_CONTEXT`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextResponse {
+    /// Optional system-prompt suffix contributed by the active agent.
+    #[serde(default)]
+    pub system_prompt_suffix: Option<String>,
+    /// Optional exact list of tool names exposed to the model.
+    #[serde(default)]
+    pub enabled_tools: Option<Vec<String>>,
+}
+
+/// Request for [`OP_EVALUATE_TOOL_CALL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluateToolCallRequest {
+    /// Session ID executing the call.
+    pub session_id: SessionId,
+    /// Active agent profile ID.
+    pub agent_id: String,
+    /// Tool name requested by the model.
+    pub tool_name: String,
+    /// Declared side-effect category for the tool.
+    pub side_effect: ToolSideEffect,
+    /// Tool arguments.
+    pub arguments: serde_json::Value,
+}
+
+/// Agent policy decision for a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDecision {
+    /// Run the tool without an extra prompt.
+    Allow,
+    /// Ask via Bcode's normal permission prompt path.
+    Ask,
+    /// Deny the tool call and return the reason to the model.
+    Deny,
+}
+
+/// Response returned by [`OP_EVALUATE_TOOL_CALL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluateToolCallResponse {
+    /// Policy decision.
+    pub decision: AgentDecision,
+    /// Optional user/model-facing reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}

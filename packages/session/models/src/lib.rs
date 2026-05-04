@@ -10,7 +10,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 2;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 3;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -137,5 +137,8 @@ pub enum SessionEventKind {
     },
     SystemMessage {
         text: String,
+    },
+    AgentChanged {
+        agent_id: String,
     },
 }

@@ -417,6 +417,20 @@ impl SessionManager {
         .await
     }
 
+    /// Append an agent-changed event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_agent_changed(
+        &self,
+        session_id: SessionId,
+        agent_id: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, SessionEventKind::AgentChanged { agent_id })
+            .await
+    }
+
     /// Append a system message to a session.
     ///
     /// # Errors
@@ -580,6 +594,10 @@ mod tests {
             .await
             .expect("model change should append");
         manager
+            .append_agent_changed(session.id, "plan".to_string())
+            .await
+            .expect("agent change should append");
+        manager
             .append_system_message(session.id, "system".to_string())
             .await
             .expect("system message should append");
@@ -622,6 +640,10 @@ mod tests {
             &event.kind,
             SessionEventKind::ModelChanged { provider, model }
                 if provider == "provider" && model == "model"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AgentChanged { agent_id } if agent_id == "plan"
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
