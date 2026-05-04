@@ -6,6 +6,7 @@
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_bedrockruntime::Client;
+use aws_sdk_bedrockruntime::error::DisplayErrorContext;
 use aws_sdk_bedrockruntime::types::{
     ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
     ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage,
@@ -861,8 +862,12 @@ fn build_error(error: impl ToString) -> ProviderError {
     )
 }
 
-fn bedrock_sdk_error(error: impl ToString) -> ProviderError {
-    let message = error.to_string();
+fn bedrock_sdk_error(
+    error: aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
+    >,
+) -> ProviderError {
+    let message = DisplayErrorContext(&error).to_string();
     let category = if message.contains("UnrecognizedClient")
         || message.contains("AccessDenied")
         || message.contains("ExpiredToken")
