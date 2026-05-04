@@ -54,9 +54,9 @@ impl BcodeConfig {
         {
             selection.provider_plugin_id = Some(profile.provider_plugin_id.clone());
             if profile.model_id.is_some() {
-                selection.model_id = profile.model_id.clone();
+                selection.model_id.clone_from(&profile.model_id);
             }
-            selection.auth_profile = profile.auth_profile.clone();
+            selection.auth_profile.clone_from(&profile.auth_profile);
             selection.settings = profile.settings.clone();
         }
         if let Some(env_provider) = provider_plugin_id_from_environment() {
@@ -520,16 +520,16 @@ pub fn set_openai_sshenv_auth_mode(
 ///
 /// Returns an error when the config cannot be read, updated, or written.
 pub fn set_bedrock_model_profile(
-    profile: String,
+    profile: &str,
     model_id: String,
     aws_profile: Option<String>,
     region: Option<String>,
-    endpoint_url: Option<String>,
-    model_ids: Vec<String>,
+    endpoint_url: Option<&str>,
+    model_ids: &[String],
 ) -> Result<PathBuf, ConfigError> {
     update_writable_config(|config| {
         config.plugins.enabled.insert("bcode.bedrock".to_string());
-        config.model.profile = Some(profile.clone());
+        config.model.profile = Some(profile.to_string());
         config.model.provider_plugin_id = Some("bcode.bedrock".to_string());
         config.model.model_id = Some(model_id.clone());
         let auth_profile = format!("{profile}-aws");
@@ -537,14 +537,14 @@ pub fn set_bedrock_model_profile(
         if let Some(region) = region.clone() {
             settings.insert("region".to_string(), region);
         }
-        if let Some(endpoint_url) = endpoint_url.clone() {
-            settings.insert("endpoint_url".to_string(), endpoint_url);
+        if let Some(endpoint_url) = endpoint_url {
+            settings.insert("endpoint_url".to_string(), endpoint_url.to_string());
         }
         if !model_ids.is_empty() {
             settings.insert("models".to_string(), model_ids.join(","));
         }
         config.model.profiles.insert(
-            profile.clone(),
+            profile.to_string(),
             ModelProfileConfig {
                 provider_plugin_id: "bcode.bedrock".to_string(),
                 model_id: Some(model_id),

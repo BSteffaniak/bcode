@@ -174,7 +174,10 @@ async fn stream_bedrock_turn_inner(
     if let Some(inference_config) = bedrock_request.inference_config {
         builder = builder.inference_config(inference_config);
     }
-    let response = builder.send().await.map_err(bedrock_sdk_error)?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| bedrock_sdk_error(&error))?;
     read_bedrock_stream(response.stream, turn, bedrock_tool_name_map(&request.tools)).await
 }
 
@@ -229,7 +232,7 @@ async fn read_bedrock_stream(
         let cancel_notify = turn.cancel_notify();
         tokio::select! {
             event = stream.recv() => {
-                let Some(event) = event.map_err(bedrock_stream_error)? else {
+                let Some(event) = event.map_err(|error| bedrock_stream_error(&error))? else {
                     return Ok(accumulator.finish_outcome());
                 };
                 if let Some(outcome) = accumulator.process_event(event, turn)? {
@@ -250,7 +253,7 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
-    fn new(name_map: BTreeMap<String, String>) -> Self {
+    const fn new(name_map: BTreeMap<String, String>) -> Self {
         Self {
             tool_calls: BTreeMap::new(),
             saw_tool_call: false,
@@ -298,8 +301,6 @@ impl StreamAccumulator {
                 }
                 _ => {}
             },
-            ConverseStreamOutput::ContentBlockStop(_) => {}
-            ConverseStreamOutput::MessageStart(_) => {}
             ConverseStreamOutput::Metadata(event) => {
                 if let Some(usage) = event.usage() {
                     turn.push(ProviderTurnEvent::Usage {
@@ -453,7 +454,7 @@ fn model_message_to_bedrock_message(
             .role(role)
             .set_content(Some(content))
             .build()
-            .map_err(build_error),
+            .map_err(|error| build_error(&error)),
     )
 }
 
@@ -467,7 +468,6 @@ fn bedrock_content_blocks(
     }
     for block in &message.content {
         match block {
-            ContentBlock::Text { .. } => {}
             ContentBlock::ToolCall { call } => {
                 blocks.push(BedrockContentBlock::ToolUse(
                     ToolUseBlock::builder()
@@ -475,7 +475,7 @@ fn bedrock_content_blocks(
                         .name(call.name.clone())
                         .input(json_value_to_document(&call.arguments))
                         .build()
-                        .map_err(build_error)?,
+                        .map_err(|error| build_error(&error))?,
                 ));
             }
             ContentBlock::ToolResult { result } => {
@@ -486,10 +486,10 @@ fn bedrock_content_blocks(
                     builder = builder.status(ToolResultStatus::Error);
                 }
                 blocks.push(BedrockContentBlock::ToolResult(
-                    builder.build().map_err(build_error)?,
+                    builder.build().map_err(|error| build_error(&error))?,
                 ));
             }
-            ContentBlock::ProviderExtension { .. } => {}
+            ContentBlock::Text { .. } | ContentBlock::ProviderExtension { .. } => {}
         }
     }
     Ok(blocks)
@@ -524,14 +524,14 @@ fn model_tools_to_bedrock_tool_config(
                 )))
                 .build()
                 .map(Tool::ToolSpec)
-                .map_err(build_error)
+                .map_err(|error| build_error(&error))
         })
         .collect::<Result<Vec<_>, _>>()?;
     ToolConfiguration::builder()
         .set_tools(Some(tools))
         .build()
         .map(Some)
-        .map_err(build_error)
+        .map_err(|error| build_error(&error))
 }
 
 fn bedrock_tool_name_map(tools: &[ToolDefinition]) -> BTreeMap<String, String> {
@@ -872,8 +872,7 @@ fn json_value_to_document(value: &serde_json::Value) -> Document {
             .map(Number::PosInt)
             .or_else(|| value.as_i64().map(Number::NegInt))
             .or_else(|| value.as_f64().map(Number::Float))
-            .map(Document::Number)
-            .unwrap_or(Document::Null),
+            .map_or(Document::Null, Document::Number),
         serde_json::Value::String(value) => Document::String(value.clone()),
         serde_json::Value::Array(values) => {
             Document::Array(values.iter().map(json_value_to_document).collect())
@@ -911,9 +910,8 @@ fn document_to_json_value(document: &Document) -> serde_json::Value {
     }
 }
 
-fn map_stop_reason(reason: &BedrockStopReason) -> StopReason {
+const fn map_stop_reason(reason: &BedrockStopReason) -> StopReason {
     match reason {
-        BedrockStopReason::EndTurn => StopReason::EndTurn,
         BedrockStopReason::ToolUse => StopReason::ToolCall,
         BedrockStopReason::MaxTokens => StopReason::MaxTokens,
         BedrockStopReason::StopSequence => StopReason::StopSequence,
@@ -929,7 +927,7 @@ fn nonnegative_i32_to_u32(value: i32) -> Option<u32> {
     u32::try_from(value).ok()
 }
 
-fn build_error(error: impl ToString) -> ProviderError {
+fn build_error(error: &(impl ToString + ?Sized)) -> ProviderError {
     provider_error(
         "bedrock_request_build_failed",
         ProviderErrorCategory::InvalidRequest,
@@ -938,11 +936,11 @@ fn build_error(error: impl ToString) -> ProviderError {
 }
 
 fn bedrock_sdk_error(
-    error: aws_sdk_bedrockruntime::error::SdkError<
+    error: &aws_sdk_bedrockruntime::error::SdkError<
         aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
     >,
 ) -> ProviderError {
-    let message = DisplayErrorContext(&error).to_string();
+    let message = DisplayErrorContext(error).to_string();
     let category = if message.contains("UnrecognizedClient")
         || message.contains("AccessDenied")
         || message.contains("ExpiredToken")
@@ -961,7 +959,7 @@ fn bedrock_sdk_error(
     provider_error("bedrock_request_failed", category, message)
 }
 
-fn bedrock_stream_error(error: impl ToString) -> ProviderError {
+fn bedrock_stream_error(error: &(impl ToString + ?Sized)) -> ProviderError {
     provider_error(
         "bedrock_stream_failed",
         ProviderErrorCategory::ProviderInternal,

@@ -498,12 +498,12 @@ fn handle_provider_command(command: ProviderCommand) -> Result<(), CliError> {
                 model_ids.insert(0, model.clone());
             }
             let config_path = bcode_config::set_bedrock_model_profile(
-                profile.clone(),
+                &profile,
                 model,
                 aws_profile,
                 region,
-                endpoint_url,
-                model_ids,
+                endpoint_url.as_deref(),
+                &model_ids,
             )?;
             println!(
                 "Bedrock provider profile '{profile}' configured; config updated: {}",
