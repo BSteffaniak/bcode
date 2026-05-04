@@ -43,7 +43,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -66,6 +66,7 @@ const DEFAULT_TRANSCRIPT_HEIGHT: u16 = 20;
 const TRANSCRIPT_WINDOW_OVERSCAN_LINES: usize = 2;
 const MOUSE_SCROLL_ROWS: usize = 3;
 const MAX_COMPOSER_ROWS: u16 = 6;
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MODAL_MARGIN_X: u16 = 4;
 const MODAL_MARGIN_Y: u16 = 2;
 const COLOR_TEXT: Color = Color::Gray;
@@ -662,9 +663,18 @@ async fn handle_tui_action(
                 app.cancel_search();
             } else {
                 match client.cancel_session_turn(session_id).await {
-                    Ok(true) => app.status = "turn cancellation requested".to_string(),
-                    Ok(false) => app.status = "no active turn".to_string(),
-                    Err(error) => app.status = format!("cancel failed: {error}"),
+                    Ok(true) => {
+                        app.set_activity(ActivityState::Cancelling);
+                        app.status = "turn cancellation requested".to_string();
+                    }
+                    Ok(false) => {
+                        app.set_activity(ActivityState::Idle);
+                        app.status = "no active turn".to_string();
+                    }
+                    Err(error) => {
+                        app.set_activity(ActivityState::Idle);
+                        app.status = format!("cancel failed: {error}");
+                    }
                 }
             }
         }
@@ -694,7 +704,11 @@ async fn handle_tui_action(
                         app.status = format!("unknown slash command: {}", message);
                     }
                 } else if let Err(error) = client.send_user_message(session_id, message).await {
+                    app.set_activity(ActivityState::Idle);
                     app.status = format!("send failed: {error}");
+                } else {
+                    app.set_activity(ActivityState::Thinking);
+                    app.status = "sent".to_string();
                 }
             }
         }
@@ -1002,6 +1016,22 @@ enum TranscriptBlock {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivityState {
+    Idle,
+    Thinking,
+    Streaming { chars: usize },
+    RunningTool { name: String },
+    WaitingPermission { name: String },
+    Cancelling,
+}
+
+impl ActivityState {
+    const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+}
+
 #[derive(Debug)]
 struct ChatApp {
     session_id: SessionId,
@@ -1012,6 +1042,9 @@ struct ChatApp {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     current_thinking_level: Option<ReasoningEffort>,
+    activity: ActivityState,
+    activity_started_at: Option<Instant>,
+    render_tick: Cell<u64>,
     scroll_rows_from_bottom: usize,
     last_transcript_width: Cell<u16>,
     last_transcript_height: Cell<u16>,
@@ -1165,6 +1198,9 @@ impl ChatApp {
             selected_provider_plugin_id: None,
             selected_model_id: None,
             current_thinking_level: None,
+            activity: ActivityState::Idle,
+            activity_started_at: None,
+            render_tick: Cell::new(0),
             scroll_rows_from_bottom: 0,
             last_transcript_width: Cell::new(DEFAULT_TRANSCRIPT_WIDTH),
             last_transcript_height: Cell::new(DEFAULT_TRANSCRIPT_HEIGHT),
@@ -1189,7 +1225,72 @@ impl ChatApp {
 
     fn push_event(&mut self, event: Event) {
         match event {
-            Event::Session(event) => self.absorb_session_event(&event),
+            Event::Session(event) => {
+                self.update_activity_from_live_event(&event);
+                self.absorb_session_event(&event);
+            }
+        }
+    }
+
+    fn set_activity(&mut self, activity: ActivityState) {
+        if self.activity == activity {
+            return;
+        }
+        self.activity = activity;
+        self.activity_started_at = (!self.activity.is_idle()).then(Instant::now);
+    }
+
+    fn update_activity_from_live_event(&mut self, event: &SessionEvent) {
+        match &event.kind {
+            SessionEventKind::UserMessage { .. } | SessionEventKind::ToolCallFinished { .. } => {
+                self.set_activity(ActivityState::Thinking);
+            }
+            SessionEventKind::AssistantDelta { text } => {
+                let delta_chars = text.chars().count();
+                if let ActivityState::Streaming { chars } = &mut self.activity {
+                    *chars = chars.saturating_add(delta_chars);
+                } else {
+                    self.set_activity(ActivityState::Streaming { chars: delta_chars });
+                }
+            }
+            SessionEventKind::AssistantMessage { .. } => {
+                self.set_activity(ActivityState::Idle);
+                self.status = "ready".to_string();
+            }
+            SessionEventKind::ToolCallRequested { tool_name, .. } => {
+                self.set_activity(ActivityState::RunningTool {
+                    name: tool_name.clone(),
+                });
+            }
+            SessionEventKind::PermissionRequested { tool_name, .. } => {
+                self.set_activity(ActivityState::WaitingPermission {
+                    name: tool_name.clone(),
+                });
+            }
+            SessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+            } => {
+                let tool_name = self
+                    .pending_permissions
+                    .get(permission_id)
+                    .map(|permission| permission.tool_name.clone());
+                if *approved {
+                    self.set_activity(ActivityState::RunningTool {
+                        name: tool_name.unwrap_or_else(|| "tool".to_string()),
+                    });
+                } else {
+                    self.set_activity(ActivityState::Thinking);
+                }
+            }
+            SessionEventKind::SystemMessage { text } if system_message_finishes_activity(text) => {
+                self.set_activity(ActivityState::Idle);
+            }
+            SessionEventKind::SessionCreated { .. }
+            | SessionEventKind::ClientAttached { .. }
+            | SessionEventKind::ClientDetached { .. }
+            | SessionEventKind::ModelChanged { .. }
+            | SessionEventKind::SystemMessage { .. } => {}
         }
     }
 
@@ -1663,6 +1764,16 @@ fn model_to_display_selection(model: &str) -> Option<String> {
     }
 }
 
+fn system_message_finishes_activity(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("cancelled")
+        || lower.contains("canceled")
+        || lower.contains("model error")
+        || lower.contains("model provider error")
+        || lower.contains("model request error")
+        || lower.contains("timeout")
+}
+
 impl ratatui::widgets::Widget for &ChatApp {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         let composer_height = composer_height(&self.input, self.search_mode, area.height);
@@ -1723,11 +1834,14 @@ impl ratatui::widgets::Widget for &ChatApp {
             .wrap(Wrap { trim: false });
         input.render(chunks[2], buf);
 
+        let tick = self.render_tick.get().wrapping_add(1);
+        self.render_tick.set(tick);
         render_chat_status(
             self,
             chunks[3],
             buf,
             viewport.effective_scroll_rows_from_bottom,
+            tick,
         );
 
         if let Some(permission) = self.first_pending_permission() {
@@ -1776,8 +1890,13 @@ fn render_chat_status(
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
     scroll_rows_from_bottom: usize,
+    tick: u64,
 ) {
-    let mut spans = vec![Span::styled(app.status.clone(), status_style(&app.status))];
+    let mut spans = if app.activity.is_idle() {
+        vec![Span::styled(app.status.clone(), status_style(&app.status))]
+    } else {
+        activity_spans(&app.activity, tick, app.activity_started_at)
+    };
     if scroll_rows_from_bottom > 0 {
         spans.push(Span::styled(
             format!("  ·  {scroll_rows_from_bottom} rows from bottom"),
@@ -1787,6 +1906,68 @@ fn render_chat_status(
     spans.push(Span::styled("  ·  ", muted_style()));
     spans.extend(key_hint_spans(&app.key_hints));
     Paragraph::new(Line::from(spans)).render(area, buf);
+}
+
+fn activity_spans(
+    activity: &ActivityState,
+    tick: u64,
+    started_at: Option<Instant>,
+) -> Vec<Span<'static>> {
+    if activity.is_idle() {
+        return vec![Span::styled("ready", status_style("ready"))];
+    }
+    let spinner =
+        SPINNER_FRAMES[usize::try_from(tick / 2).unwrap_or_default() % SPINNER_FRAMES.len()];
+    let elapsed = started_at.map_or(Duration::ZERO, |started| started.elapsed());
+    let label = activity_label(activity);
+    vec![
+        Span::styled(spinner.to_string(), accent_bold_style()),
+        Span::raw(" "),
+        Span::styled(label, accent_style()),
+        Span::styled(format!(" · {}", format_elapsed(elapsed)), muted_style()),
+    ]
+}
+
+fn activity_label(activity: &ActivityState) -> String {
+    match activity {
+        ActivityState::Idle => "ready".to_string(),
+        ActivityState::Thinking => "thinking".to_string(),
+        ActivityState::Streaming { chars } => {
+            format!("streaming · {} chars", compact_count(*chars))
+        }
+        ActivityState::RunningTool { name } => {
+            format!("running tool · {}", truncate_middle(name, 24))
+        }
+        ActivityState::WaitingPermission { name } => {
+            format!("permission required · {}", truncate_middle(name, 24))
+        }
+        ActivityState::Cancelling => "cancelling".to_string(),
+    }
+}
+
+fn compact_count(value: usize) -> String {
+    if value >= 1_000_000 {
+        let whole = value / 1_000_000;
+        let decimal = (value % 1_000_000) / 100_000;
+        format!("{whole}.{decimal}m")
+    } else if value >= 1_000 {
+        let whole = value / 1_000;
+        let decimal = (value % 1_000) / 100;
+        format!("{whole}.{decimal}k")
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 1 {
+        "<1s".to_string()
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
 }
 
 fn render_command_palette(
@@ -2785,6 +2966,164 @@ mod tests {
     }
 
     #[test]
+    fn history_replay_does_not_leave_activity_active() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let history = vec![session_event(
+            session_id,
+            SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "hello".to_string(),
+            },
+        )];
+
+        let app = ChatApp::new(session_id, &history, &keymap);
+
+        assert_eq!(app.activity, ActivityState::Idle);
+    }
+
+    #[test]
+    fn live_user_message_starts_thinking_activity() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "hello".to_string(),
+            },
+        )));
+
+        assert_eq!(app.activity, ActivityState::Thinking);
+    }
+
+    #[test]
+    fn assistant_delta_sets_streaming_and_counts_chars() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::AssistantDelta {
+                text: "hello".to_string(),
+            },
+        )));
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::AssistantDelta {
+                text: "世界".to_string(),
+            },
+        )));
+
+        assert_eq!(app.activity, ActivityState::Streaming { chars: 7 });
+    }
+
+    #[test]
+    fn activity_tracks_tool_permission_and_finish() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "tool-1".to_string(),
+                tool_name: "shell.run".to_string(),
+                arguments_json: r#"{"command":"cargo check"}"#.to_string(),
+            },
+        )));
+        assert_eq!(
+            app.activity,
+            ActivityState::RunningTool {
+                name: "shell.run".to_string()
+            }
+        );
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::PermissionRequested {
+                permission_id: "permission-1".to_string(),
+                tool_call_id: "tool-1".to_string(),
+                tool_name: "shell.run".to_string(),
+                arguments_json: r#"{"command":"cargo check"}"#.to_string(),
+            },
+        )));
+        assert_eq!(
+            app.activity,
+            ActivityState::WaitingPermission {
+                name: "shell.run".to_string()
+            }
+        );
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::PermissionResolved {
+                permission_id: "permission-1".to_string(),
+                approved: true,
+            },
+        )));
+        assert_eq!(
+            app.activity,
+            ActivityState::RunningTool {
+                name: "shell.run".to_string()
+            }
+        );
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "tool-1".to_string(),
+                result: "ok".to_string(),
+                is_error: false,
+            },
+        )));
+        assert_eq!(app.activity, ActivityState::Thinking);
+    }
+
+    #[test]
+    fn assistant_message_and_model_error_clear_activity() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+        app.set_activity(ActivityState::Thinking);
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::AssistantMessage {
+                text: "done".to_string(),
+            },
+        )));
+        assert_eq!(app.activity, ActivityState::Idle);
+
+        app.set_activity(ActivityState::Thinking);
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::SystemMessage {
+                text: "model error provider failed".to_string(),
+            },
+        )));
+        assert_eq!(app.activity, ActivityState::Idle);
+    }
+
+    #[test]
+    fn active_status_line_includes_spinner_and_label() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+        app.set_activity(ActivityState::Thinking);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        render_chat_status(&app, area, &mut buffer, 0, 0);
+        let rendered = buffer_rows(&buffer).join("\n");
+
+        assert!(rendered.contains("thinking"));
+    }
+
+    #[test]
     fn transcript_messages_do_not_render_nested_box_art() {
         let lines = TranscriptBlock::User {
             text: "hello".to_string(),
@@ -2963,6 +3302,15 @@ mod tests {
         assert!(rendered.contains("shell.run"));
         assert!(rendered.contains("cargo check -p bcode_tui"));
         assert!(rendered.contains("allow once"));
+    }
+
+    fn session_event(session_id: SessionId, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            session_id,
+            kind,
+        }
     }
 
     fn render_viewport_rows(
