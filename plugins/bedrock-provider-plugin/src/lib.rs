@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
 const DEFAULT_MODEL_ID: &str = "anthropic.claude-3-5-sonnet-20241022-v2:0";
+const DEFAULT_REGION: &str = "us-east-1";
 
 /// Amazon Bedrock model provider plugin.
 #[derive(Default)]
@@ -183,9 +184,25 @@ async fn bedrock_client(settings: &Settings) -> Client {
 }
 
 async fn bedrock_sdk_config(settings: &Settings) -> aws_config::SdkConfig {
+    let mut config = bedrock_sdk_config_with_region(settings, settings.region.clone()).await;
+    if config.region().is_none() {
+        tracing::debug!(
+            target: "bcode_bedrock::config",
+            fallback_region = DEFAULT_REGION,
+            "AWS SDK region chain did not resolve a region; using Bedrock fallback region"
+        );
+        config = bedrock_sdk_config_with_region(settings, Some(DEFAULT_REGION.to_string())).await;
+    }
+    config
+}
+
+async fn bedrock_sdk_config_with_region(
+    settings: &Settings,
+    region: Option<String>,
+) -> aws_config::SdkConfig {
     let mut loader = aws_config::defaults(BehaviorVersion::latest());
-    if let Some(region) = &settings.region {
-        loader = loader.region(Region::new(region.clone()));
+    if let Some(region) = region {
+        loader = loader.region(Region::new(region));
     }
     if let Some(profile) = &settings.aws_profile {
         loader = loader.profile_name(profile.clone());
@@ -575,9 +592,31 @@ struct Settings {
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
     region: Option<String>,
+    region_source: RegionSource,
     aws_profile: Option<String>,
     endpoint_url: Option<String>,
     config_source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionSource {
+    BcodeEnv,
+    AwsEnv,
+    Profile,
+    AwsSdkDefaultChain,
+    Fallback,
+}
+
+impl RegionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BcodeEnv => "bcode_env",
+            Self::AwsEnv => "aws_env",
+            Self::Profile => "profile",
+            Self::AwsSdkDefaultChain => "aws_sdk_default_chain",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 impl Settings {
@@ -633,12 +672,13 @@ impl Settings {
         if !model_ids.contains(&default_model) {
             model_ids.insert(0, default_model.clone());
         }
+        let (region, region_source) = resolve_configured_region(&value);
         Self {
             default_model,
             model_ids,
             model_ids_are_explicit: model_ids_value.is_some(),
-            region: first_env(["BCODE_BEDROCK_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"])
-                .or_else(|| value(&["region"])),
+            region,
+            region_source,
             aws_profile: first_env(["BCODE_BEDROCK_AWS_PROFILE", "AWS_PROFILE"])
                 .or_else(|| value(&["profile", "aws_profile"])),
             endpoint_url: first_env(["BCODE_BEDROCK_ENDPOINT_URL", "BEDROCK_ENDPOINT_URL"])
@@ -661,6 +701,21 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+fn resolve_configured_region(
+    value: &impl Fn(&[&str]) -> Option<String>,
+) -> (Option<String>, RegionSource) {
+    if let Some(region) = first_env(["BCODE_BEDROCK_REGION"]) {
+        return (Some(region), RegionSource::BcodeEnv);
+    }
+    if let Some(region) = first_env(["AWS_REGION", "AWS_DEFAULT_REGION"]) {
+        return (Some(region), RegionSource::AwsEnv);
+    }
+    if let Some(region) = value(&["region"]) {
+        return (Some(region), RegionSource::Profile);
+    }
+    (None, RegionSource::AwsSdkDefaultChain)
 }
 
 fn capabilities() -> ProviderCapabilities {
@@ -707,16 +762,23 @@ fn validate_config() -> ValidateConfigResponse {
         .as_ref()
         .ok()
         .and_then(|()| resolved_sdk_region(&settings));
-    if let Some(region) = &effective_region {
+    if let Some((region, source)) = &effective_region {
         metadata.insert("effective_region".to_string(), region.clone());
+        metadata.insert(
+            "effective_region_source".to_string(),
+            source.as_str().to_string(),
+        );
     }
     ValidateConfigResponse {
         valid: validation.is_ok(),
         message: Some(match validation {
             Ok(()) => effective_region.map_or_else(
-                || "Bedrock configuration is usable; AWS SDK will resolve region/credentials at request time".to_string(),
-                |region| format!(
-                    "Bedrock configuration is usable; AWS SDK resolved region '{region}' and will resolve credentials at request time"
+                || format!(
+                    "Bedrock configuration is usable; region will fall back to '{DEFAULT_REGION}' if the AWS SDK chain is empty and credentials will be resolved at request time"
+                ),
+                |(region, source)| format!(
+                    "Bedrock configuration is usable; region '{region}' resolved from {} and credentials will be resolved at request time",
+                    source.as_str()
                 ),
             ),
             Err(error) => format!("Bedrock configuration is not usable: {}", error.message),
@@ -725,10 +787,18 @@ fn validate_config() -> ValidateConfigResponse {
     }
 }
 
-fn resolved_sdk_region(settings: &Settings) -> Option<String> {
+fn resolved_sdk_region(settings: &Settings) -> Option<(String, RegionSource)> {
     let runtime = current_thread_runtime().ok()?;
     let config = runtime.block_on(bedrock_sdk_config(settings));
-    config.region().map(ToString::to_string)
+    let region = config.region().map(ToString::to_string)?;
+    let source = if settings.region.is_some() {
+        settings.region_source
+    } else if region == DEFAULT_REGION {
+        RegionSource::Fallback
+    } else {
+        RegionSource::AwsSdkDefaultChain
+    };
+    Some((region, source))
 }
 
 fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
@@ -748,8 +818,13 @@ fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
         settings
             .region
             .clone()
-            .unwrap_or_else(|| "<aws-sdk-default-chain>".to_string()),
+            .unwrap_or_else(|| "<aws-sdk-default-chain-or-fallback>".to_string()),
     );
+    metadata.insert(
+        "configured_region_source".to_string(),
+        settings.region_source.as_str().to_string(),
+    );
+    metadata.insert("fallback_region".to_string(), DEFAULT_REGION.to_string());
     if let Some(profile) = &settings.aws_profile {
         metadata.insert("aws_profile".to_string(), profile.clone());
     }
