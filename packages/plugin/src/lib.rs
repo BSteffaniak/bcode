@@ -508,7 +508,15 @@ impl PluginHost {
     ///
     /// Returns an error when discovery, loading, or activation fails.
     pub fn load_defaults(selection: &PluginSelection) -> Result<Self, PluginLoadError> {
+        plugin_startup_trace("discovering plugins");
         let plugins = filter_selected_plugins(discover_plugins()?, selection);
+        plugin_startup_trace(format!(
+            "selected plugins: {:?}",
+            plugins
+                .iter()
+                .map(|plugin| plugin.manifest.id.as_str())
+                .collect::<Vec<_>>()
+        ));
         Self::load_registered_plugins(&plugins)
     }
 
@@ -520,8 +528,11 @@ impl PluginHost {
     pub fn load_registered_plugins(plugins: &[RegisteredPlugin]) -> Result<Self, PluginLoadError> {
         let mut host = Self::default();
         for plugin in plugins {
+            plugin_startup_trace(format!("loading plugin {}", plugin.manifest.id));
             let loaded = load_registered_plugin(plugin)?;
+            plugin_startup_trace(format!("activating plugin {}", loaded.manifest().id));
             loaded.activate()?;
+            plugin_startup_trace(format!("activated plugin {}", loaded.manifest().id));
             host.loaded.push(loaded);
         }
         Ok(host)
@@ -670,6 +681,10 @@ impl Drop for PluginHost {
 /// Returns an error if the plugin cannot be loaded or exports invalid metadata.
 pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin, PluginLoadError> {
     let PluginRuntime::Native(runtime) = &plugin.manifest.runtime;
+    plugin_startup_trace(format!(
+        "validating plugin {} ABI {}",
+        plugin.manifest.id, runtime.abi_version
+    ));
     if !runtime.is_current_abi() {
         return Err(PluginLoadError::UnsupportedAbi {
             plugin_id: plugin.manifest.id.clone(),
@@ -679,6 +694,11 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
     }
 
     let library_path = resolve_library_path(&plugin.manifest_path, &runtime.library);
+    plugin_startup_trace(format!(
+        "loading native library for {} from {}",
+        plugin.manifest.id,
+        library_path.display()
+    ));
     let library =
         unsafe { Library::new(library_path.to_string_lossy().as_ref()) }.map_err(|source| {
             PluginLoadError::LibraryLoad {
@@ -687,7 +707,12 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
             }
         })?;
 
+    plugin_startup_trace(format!("loaded native library for {}", plugin.manifest.id));
     let exported_manifest = load_exported_manifest(&library, &library_path, runtime)?;
+    plugin_startup_trace(format!(
+        "loaded exported manifest for {}",
+        plugin.manifest.id
+    ));
     if exported_manifest.id != plugin.manifest.id {
         return Err(PluginLoadError::ManifestIdMismatch {
             file_id: plugin.manifest.id.clone(),
@@ -695,10 +720,12 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
         });
     }
 
+    plugin_startup_trace(format!("loading native symbols for {}", plugin.manifest.id));
     let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
     let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
     let invoke_service = load_service_symbol(&library, &library_path, &runtime.service_symbol)?;
     let handle_event = load_event_symbol(&library, &library_path, &runtime.event_symbol)?;
+    plugin_startup_trace(format!("loaded native symbols for {}", plugin.manifest.id));
 
     Ok(LoadedPlugin {
         manifest: plugin.manifest.clone(),
@@ -784,6 +811,12 @@ fn load_exported_manifest(
         library: library_path.to_path_buf(),
         source,
     })
+}
+
+fn plugin_startup_trace(message: impl AsRef<str>) {
+    if std::env::var_os("BCODE_STARTUP_TRACE").is_some() {
+        eprintln!("bcode plugin: {}", message.as_ref());
+    }
 }
 
 fn load_lifecycle_symbol(

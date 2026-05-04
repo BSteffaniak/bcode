@@ -41,19 +41,23 @@ pub enum CliError {
     Plugin(#[from] bcode_plugin::PluginLoadError),
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
-    #[error("daemon did not become ready after auto-start; log: {log_path}\n{recent_log}")]
+    #[error(
+        "daemon did not become ready after auto-start; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
+    )]
     DaemonStartTimeout {
         log_path: String,
         recent_log: String,
     },
-    #[error("daemon exited before becoming ready ({status}); log: {log_path}\n{recent_log}")]
+    #[error(
+        "daemon exited before becoming ready ({status}); log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
+    )]
     DaemonExited {
         status: String,
         log_path: String,
         recent_log: String,
     },
     #[error(
-        "daemon became ready but failed a follow-up health check; log: {log_path}\n{recent_log}"
+        "daemon became ready but failed a follow-up health check; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
     )]
     DaemonHealthCheckFailed {
         log_path: String,
@@ -1787,17 +1791,23 @@ fn bundled_plugins_installed(executable_dir: &Path) -> bool {
     BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
         let library_name = dynamic_library_name(spec.library_stem);
         let source_library = executable_dir.join(&library_name);
-        let plugin_dir = executable_dir.join("plugins").join(spec.id);
-        let installed_library = plugin_dir.join(library_name);
-        plugin_dir
-            .join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE)
-            .exists()
-            && installed_library.exists()
-            && installed_library_is_current(&source_library, &installed_library)
+        let manifest_path = executable_dir
+            .join("plugins")
+            .join(spec.id)
+            .join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE);
+        source_library.exists()
+            && bundled_manifest_is_current(&manifest_path, spec, &library_name)
             && workspace_root_from_executable_dir(executable_dir).is_none_or(|workspace_root| {
-                library_is_newer_than_package_sources(&installed_library, &workspace_root, spec)
+                library_is_newer_than_package_sources(&source_library, &workspace_root, spec)
             })
     })
+}
+
+fn bundled_manifest_is_current(path: &Path, spec: &BundledPluginSpec, library_name: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    contents == bundled_plugin_manifest(spec, &bundled_runtime_library_path(library_name))
 }
 
 fn library_is_newer_than_package_sources(
@@ -1854,22 +1864,6 @@ fn newest_source_modified_inner(path: &Path, newest: &mut Option<std::time::Syst
     }
 }
 
-fn installed_library_is_current(source_library: &Path, installed_library: &Path) -> bool {
-    let Ok(source_metadata) = std::fs::metadata(source_library) else {
-        return false;
-    };
-    let Ok(installed_metadata) = std::fs::metadata(installed_library) else {
-        return false;
-    };
-    if source_metadata.len() != installed_metadata.len() {
-        return false;
-    }
-    match (source_metadata.modified(), installed_metadata.modified()) {
-        (Ok(source_modified), Ok(installed_modified)) => installed_modified >= source_modified,
-        _ => true,
-    }
-}
-
 fn workspace_root_from_executable_dir(executable_dir: &Path) -> Option<PathBuf> {
     let target_dir = executable_dir.parent()?;
     let workspace_root = target_dir.parent()?;
@@ -1890,12 +1884,15 @@ fn install_bundled_plugin(executable_dir: &Path, spec: &BundledPluginSpec) -> Re
     }
     let plugin_dir = executable_dir.join("plugins").join(spec.id);
     std::fs::create_dir_all(&plugin_dir)?;
-    std::fs::copy(&source_library, plugin_dir.join(&library_name))?;
     std::fs::write(
         plugin_dir.join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE),
-        bundled_plugin_manifest(spec, &library_name),
+        bundled_plugin_manifest(spec, &bundled_runtime_library_path(&library_name)),
     )?;
     Ok(())
+}
+
+fn bundled_runtime_library_path(library_name: &str) -> String {
+    format!("../../{library_name}")
 }
 
 fn bundled_plugin_manifest(spec: &BundledPluginSpec, library_name: &str) -> String {
@@ -1955,9 +1952,10 @@ async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     }
     let mut log_file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&log_path)?;
-    writeln!(log_file, "\n--- bcode daemon start ---")?;
+    writeln!(log_file, "--- bcode daemon start ---")?;
     let stderr_log = log_file.try_clone()?;
 
     let exe = std::env::current_exe()?;
@@ -2067,9 +2065,28 @@ async fn server_status() -> Result<(), CliError> {
 
 async fn server_stop() -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    client.server_stop().await?;
-    println!("server stopping");
+    match client.server_stop().await {
+        Ok(()) => println!("server stopping"),
+        Err(error) if server_is_unreachable(&error) => println!("server not running"),
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
+}
+
+fn server_is_unreachable(error: &ClientError) -> bool {
+    match error {
+        ClientError::Transport(bcode_ipc::IpcTransportError::Io(error)) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ),
+        ClientError::Codec(bcode_ipc::CodecError::Io(error)) => matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 async fn create_session(name: Option<String>) -> Result<(), CliError> {
