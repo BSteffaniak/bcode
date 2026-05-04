@@ -65,6 +65,7 @@ struct ServerState {
     plugins: Mutex<bcode_plugin::PluginHost>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
+    selected_provider_context: bcode_model::ProviderRequestContext,
     permission_policy: Mutex<PermissionPolicy>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -85,6 +86,7 @@ struct SessionModelSelection {
     provider_plugin_id: Option<String>,
     model_id: Option<String>,
     thinking_level: Option<ReasoningEffort>,
+    provider_context: bcode_model::ProviderRequestContext,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +188,7 @@ impl ServerState {
         plugins: bcode_plugin::PluginHost,
         selected_provider_plugin_id: Option<String>,
         selected_model_id: Option<String>,
+        selected_provider_context: bcode_model::ProviderRequestContext,
         permission_policy: PermissionPolicy,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
@@ -194,6 +197,7 @@ impl ServerState {
             plugins: Mutex::new(plugins),
             selected_provider_plugin_id,
             selected_model_id,
+            selected_provider_context,
             permission_policy: Mutex::new(permission_policy),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
@@ -241,11 +245,17 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
     let listener = LocalIpcListener::bind(&endpoint)?;
     let sessions = SessionManager::persistent(default_session_store_dir())?;
+    let resolved_model = config.resolved_model_selection();
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
-        config.model.provider_plugin_id.clone(),
-        config.model.model_id.clone(),
+        resolved_model.provider_plugin_id,
+        resolved_model.model_id,
+        bcode_model::ProviderRequestContext {
+            model_profile: resolved_model.model_profile,
+            auth_profile: resolved_model.auth_profile,
+            settings: resolved_model.settings,
+        },
         PermissionPolicy::from(&config.permissions),
     ));
     let mut shutdown = state.subscribe_shutdown();
@@ -614,6 +624,7 @@ async fn handle_set_session_model(
                 provider_plugin_id: provider_to_selection(&provider),
                 model_id: model_to_selection(&model_id),
                 thinking_level: None,
+                provider_context: state.selected_provider_context.clone(),
             };
             state
                 .session_model_selections
@@ -1018,6 +1029,7 @@ async fn session_model_selection(
         provider_plugin_id: state.selected_provider_plugin_id.clone(),
         model_id: state.selected_model_id.clone(),
         thinking_level: None,
+        provider_context: state.selected_provider_context.clone(),
     };
     if let Ok(history) = state.sessions.session_history(session_id).await {
         for event in history {
@@ -1026,6 +1038,7 @@ async fn session_model_selection(
                     provider_plugin_id: provider_to_selection(&provider),
                     model_id: model_to_selection(&model),
                     thinking_level: None,
+                    provider_context: state.selected_provider_context.clone(),
                 };
             }
         }
@@ -1118,6 +1131,7 @@ async fn build_model_turn_request(
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id: model_id_for_provider_request(selected_model_id),
+        provider_context: selection.provider_context,
         system_prompt: Some(build_coding_system_prompt()),
         messages,
         tools: collect_model_tools(state).await,

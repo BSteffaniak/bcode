@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Reusable model provider plugin turn runtime for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "provider", "runtime"]
+license     = { workspace = true }
+name        = "bcode_model_provider_runtime"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_model = { workspace = true }
+tokio       = { workspace = true, features = ["rt", "sync", "time"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -105,6 +105,17 @@ pub struct ValidateConfigRequest {
     pub config: BTreeMap<String, String>,
 }
 
+/// Provider-neutral request context resolved by the host from model/provider profiles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRequestContext {
+    #[serde(default)]
+    pub model_profile: Option<String>,
+    #[serde(default)]
+    pub auth_profile: Option<String>,
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+}
+
 /// Provider configuration validation response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateConfigResponse {
@@ -122,6 +133,8 @@ pub struct ModelTurnRequest {
     pub turn_id: String,
     /// Selected model ID. Empty means the provider should use its configured default.
     pub model_id: String,
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
     #[serde(default)]
     pub system_prompt: Option<String>,
     pub messages: Vec<ModelMessage>,

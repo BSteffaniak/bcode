@@ -38,6 +38,29 @@ impl BcodeConfig {
         self.auth.merge(next.auth);
         self.tui.merge(next.tui);
     }
+
+    /// Resolve the active model profile to a concrete provider/model selection.
+    #[must_use]
+    pub fn resolved_model_selection(&self) -> ResolvedModelSelection {
+        let mut selection = ResolvedModelSelection {
+            provider_plugin_id: self.model.provider_plugin_id.clone(),
+            model_id: self.model.model_id.clone(),
+            model_profile: self.model.profile.clone(),
+            auth_profile: None,
+            settings: BTreeMap::new(),
+        };
+        if let Some(profile_name) = &self.model.profile
+            && let Some(profile) = self.model.profiles.get(profile_name)
+        {
+            selection.provider_plugin_id = Some(profile.provider_plugin_id.clone());
+            if profile.model_id.is_some() {
+                selection.model_id = profile.model_id.clone();
+            }
+            selection.auth_profile = profile.auth_profile.clone();
+            selection.settings = profile.settings.clone();
+        }
+        selection
+    }
 }
 
 /// Terminal UI configuration.
@@ -154,6 +177,8 @@ where
 pub struct AuthConfig {
     #[serde(default)]
     pub openai: Option<AuthProviderConfig>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, AuthProfileConfig>,
 }
 
 impl AuthConfig {
@@ -161,7 +186,16 @@ impl AuthConfig {
         if next.openai.is_some() {
             self.openai = next.openai;
         }
+        self.profiles.extend(next.profiles);
     }
+}
+
+/// Generic authentication profile configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthProfileConfig {
+    pub backend: String,
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
 }
 
 /// Per-provider authentication configuration.
@@ -196,6 +230,10 @@ pub struct ModelConfig {
     pub model_id: Option<String>,
     #[serde(default)]
     pub default_thinking_level: Option<bcode_model::ReasoningEffort>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ModelProfileConfig>,
 }
 
 impl ModelConfig {
@@ -209,7 +247,33 @@ impl ModelConfig {
         if next.default_thinking_level.is_some() {
             self.default_thinking_level = next.default_thinking_level;
         }
+        if next.profile.is_some() {
+            self.profile = next.profile;
+        }
+        self.profiles.extend(next.profiles);
     }
+}
+
+/// Generic model provider profile configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelProfileConfig {
+    pub provider_plugin_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub auth_profile: Option<String>,
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+}
+
+/// Resolved model selection after applying the active model profile, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedModelSelection {
+    pub provider_plugin_id: Option<String>,
+    pub model_id: Option<String>,
+    pub model_profile: Option<String>,
+    pub auth_profile: Option<String>,
+    pub settings: BTreeMap<String, String>,
 }
 
 /// Permission policy configuration.
@@ -344,6 +408,62 @@ pub fn set_openai_sshenv_auth_mode(
     })
 }
 
+/// Configure a generic Bedrock model profile using AWS's default credential chain.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, updated, or written.
+pub fn set_bedrock_model_profile(
+    profile: String,
+    model_id: String,
+    aws_profile: Option<String>,
+    region: Option<String>,
+    endpoint_url: Option<String>,
+    model_ids: Vec<String>,
+) -> Result<PathBuf, ConfigError> {
+    update_writable_config(|config| {
+        config.plugins.enabled.insert("bcode.bedrock".to_string());
+        config.model.profile = Some(profile.clone());
+        config.model.provider_plugin_id = Some("bcode.bedrock".to_string());
+        config.model.model_id = Some(model_id.clone());
+        let auth_profile = format!("{profile}-aws");
+        let mut settings = BTreeMap::new();
+        if let Some(region) = region.clone() {
+            settings.insert("region".to_string(), region);
+        }
+        if let Some(endpoint_url) = endpoint_url.clone() {
+            settings.insert("endpoint_url".to_string(), endpoint_url);
+        }
+        if !model_ids.is_empty() {
+            settings.insert("models".to_string(), model_ids.join(","));
+        }
+        config.model.profiles.insert(
+            profile.clone(),
+            ModelProfileConfig {
+                provider_plugin_id: "bcode.bedrock".to_string(),
+                model_id: Some(model_id),
+                auth_profile: Some(auth_profile.clone()),
+                settings,
+            },
+        );
+        let mut auth_settings = BTreeMap::new();
+        if let Some(aws_profile) = aws_profile {
+            auth_settings.insert("profile".to_string(), aws_profile);
+        }
+        if let Some(region) = region {
+            auth_settings.insert("region".to_string(), region);
+        }
+        config.auth.profiles.insert(
+            auth_profile,
+            AuthProfileConfig {
+                backend: "aws_default_chain".to_string(),
+                settings: auth_settings,
+            },
+        );
+        Ok(())
+    })
+}
+
 fn update_writable_config(
     update: impl FnOnce(&mut BcodeConfig) -> Result<(), ConfigError>,
 ) -> Result<PathBuf, ConfigError> {
@@ -432,9 +552,25 @@ fn writable_config_path() -> PathBuf {
 fn config_to_toml(config: &BcodeConfig) -> String {
     let mut output = String::new();
     write_plugins_toml(&mut output, &config.plugins);
-    if config.model.provider_plugin_id.is_some() || config.model.model_id.is_some() {
+    write_model_toml(&mut output, &config.model);
+    write_permissions_toml(&mut output, &config.permissions);
+    write_auth_toml(&mut output, &config.auth);
+    write_tui_toml(&mut output, &config.tui);
+    output
+}
+
+fn write_model_toml(output: &mut String, model: &ModelConfig) {
+    if model.provider_plugin_id.is_some()
+        || model.model_id.is_some()
+        || model.default_thinking_level.is_some()
+        || model.profile.is_some()
+    {
         output.push_str("[model]\n");
-        if let Some(provider_plugin_id) = &config.model.provider_plugin_id {
+        if let Some(profile) = &model.profile {
+            writeln!(output, "profile = {}", toml_string(profile))
+                .expect("writing to string should not fail");
+        }
+        if let Some(provider_plugin_id) = &model.provider_plugin_id {
             writeln!(
                 output,
                 "provider_plugin_id = {}",
@@ -442,20 +578,40 @@ fn config_to_toml(config: &BcodeConfig) -> String {
             )
             .expect("writing to string should not fail");
         }
-        if let Some(model_id) = &config.model.model_id {
+        if let Some(model_id) = &model.model_id {
             writeln!(output, "model_id = {}", toml_string(model_id))
                 .expect("writing to string should not fail");
         }
-        if let Some(level) = &config.model.default_thinking_level {
+        if let Some(level) = &model.default_thinking_level {
             writeln!(output, "default_thinking_level = \"{level:?}\"")
                 .expect("writing to string should not fail");
         }
         output.push('\n');
     }
-    write_permissions_toml(&mut output, &config.permissions);
-    write_auth_toml(&mut output, &config.auth);
-    write_tui_toml(&mut output, &config.tui);
-    output
+    for (profile_name, profile) in &model.profiles {
+        writeln!(output, "[model.profiles.{}]", toml_key(profile_name))
+            .expect("writing to string should not fail");
+        writeln!(
+            output,
+            "provider_plugin_id = {}",
+            toml_string(&profile.provider_plugin_id)
+        )
+        .expect("writing to string should not fail");
+        if let Some(model_id) = &profile.model_id {
+            writeln!(output, "model_id = {}", toml_string(model_id))
+                .expect("writing to string should not fail");
+        }
+        if let Some(auth_profile) = &profile.auth_profile {
+            writeln!(output, "auth_profile = {}", toml_string(auth_profile))
+                .expect("writing to string should not fail");
+        }
+        output.push('\n');
+        write_string_map_table(
+            output,
+            &format!("model.profiles.{}.settings", toml_key(profile_name)),
+            &profile.settings,
+        );
+    }
 }
 
 fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
@@ -514,29 +670,40 @@ fn write_permissions_toml(output: &mut String, permissions: &PermissionConfig) {
 }
 
 fn write_auth_toml(output: &mut String, auth: &AuthConfig) {
-    let Some(openai) = &auth.openai else {
-        return;
-    };
-    output.push_str("[auth.openai]\n");
-    writeln!(output, "backend = {}", toml_string(&openai.backend))
-        .expect("writing to string should not fail");
-    writeln!(
-        output,
-        "mode = {}",
-        toml_string(auth_mode_name(&openai.mode))
-    )
-    .expect("writing to string should not fail");
-    writeln!(output, "profile = {}", toml_string(&openai.profile))
-        .expect("writing to string should not fail");
-    if let Some(vault) = &openai.vault {
+    if let Some(openai) = &auth.openai {
+        output.push_str("[auth.openai]\n");
+        writeln!(output, "backend = {}", toml_string(&openai.backend))
+            .expect("writing to string should not fail");
         writeln!(
             output,
-            "vault = {}",
-            toml_string(&vault.display().to_string())
+            "mode = {}",
+            toml_string(auth_mode_name(&openai.mode))
         )
         .expect("writing to string should not fail");
+        writeln!(output, "profile = {}", toml_string(&openai.profile))
+            .expect("writing to string should not fail");
+        if let Some(vault) = &openai.vault {
+            writeln!(
+                output,
+                "vault = {}",
+                toml_string(&vault.display().to_string())
+            )
+            .expect("writing to string should not fail");
+        }
+        output.push('\n');
     }
-    output.push('\n');
+    for (profile_name, profile) in &auth.profiles {
+        writeln!(output, "[auth.profiles.{}]", toml_key(profile_name))
+            .expect("writing to string should not fail");
+        writeln!(output, "backend = {}", toml_string(&profile.backend))
+            .expect("writing to string should not fail");
+        output.push('\n');
+        write_string_map_table(
+            output,
+            &format!("auth.profiles.{}.settings", toml_key(profile_name)),
+            &profile.settings,
+        );
+    }
 }
 
 const fn auth_mode_name(mode: &AuthMode) -> &'static str {
@@ -566,6 +733,29 @@ fn write_string_set(output: &mut String, key: &str, values: &BTreeSet<String>) {
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(output, "{key} = [{values}]").expect("writing to string should not fail");
+}
+
+fn write_string_map_table(output: &mut String, table: &str, values: &BTreeMap<String, String>) {
+    if values.is_empty() {
+        return;
+    }
+    writeln!(output, "[{table}]").expect("writing to string should not fail");
+    for (key, value) in values {
+        writeln!(output, "{} = {}", toml_key(key), toml_string(value))
+            .expect("writing to string should not fail");
+    }
+    output.push('\n');
+}
+
+fn toml_key(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        value.to_string()
+    } else {
+        toml_string(value)
+    }
 }
 
 fn toml_string(value: &str) -> String {
@@ -644,7 +834,7 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_config_from_paths;
+    use super::{BcodeConfig, load_config_from_paths};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -744,6 +934,46 @@ deny_path_prefixes = ["/tmp/project/target"]
         );
 
         std::fs::remove_dir_all(root).expect("temp root should clean up");
+    }
+
+    #[test]
+    fn resolves_active_model_profile() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model]
+profile = "bedrock-work"
+
+[model.profiles.bedrock-work]
+provider_plugin_id = "bcode.bedrock"
+model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+auth_profile = "aws-work"
+
+[model.profiles.bedrock-work.settings]
+region = "us-east-1"
+
+[auth.profiles.aws-work]
+backend = "aws_default_chain"
+
+[auth.profiles.aws-work.settings]
+profile = "work"
+"#,
+        )
+        .expect("profile config should parse");
+
+        let selection = config.resolved_model_selection();
+        assert_eq!(
+            selection.provider_plugin_id,
+            Some("bcode.bedrock".to_string())
+        );
+        assert_eq!(
+            selection.model_id,
+            Some("anthropic.claude-3-5-sonnet-20241022-v2:0".to_string())
+        );
+        assert_eq!(selection.auth_profile, Some("aws-work".to_string()));
+        assert_eq!(
+            selection.settings.get("region"),
+            Some(&"us-east-1".to_string())
+        );
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

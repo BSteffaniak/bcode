@@ -1,0 +1,36 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Amazon Bedrock model provider plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["aws", "bcode", "bedrock", "model", "provider"]
+license     = { workspace = true }
+name        = "bcode_bedrock_provider_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aws-config = { workspace = true }
+aws-sdk-bedrockruntime = { workspace = true }
+aws-smithy-types = { workspace = true }
+bcode_config = { workspace = true }
+bcode_model = { workspace = true }
+bcode_model_provider_runtime = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+    "time",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -117,6 +117,7 @@ pub async fn run() -> Result<(), CliError> {
         },
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Login { command } => handle_login_command(command).await?,
+        Commands::Provider { command } => handle_provider_command(command)?,
         Commands::Permission { command } => match command {
             PermissionCommand::List => list_permissions().await?,
             PermissionCommand::Approve { permission_id } => {
@@ -187,6 +188,10 @@ enum Commands {
         #[command(subcommand)]
         command: LoginCommand,
     },
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     Permission {
         #[command(subcommand)]
         command: PermissionCommand,
@@ -240,6 +245,39 @@ enum ModelCommand {
         model_id: String,
         #[arg(long)]
         provider: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    Configure {
+        #[command(subcommand)]
+        command: ProviderConfigureCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderConfigureCommand {
+    /// Configure Amazon Bedrock using AWS's default credential chain.
+    Bedrock {
+        /// Bcode model profile name to create and select.
+        #[arg(long, default_value = "bedrock")]
+        profile: String,
+        /// AWS shared-config profile name to use for credentials/region.
+        #[arg(long)]
+        aws_profile: Option<String>,
+        /// AWS region for Bedrock Runtime.
+        #[arg(long)]
+        region: Option<String>,
+        /// Optional Bedrock Runtime endpoint override.
+        #[arg(long)]
+        endpoint_url: Option<String>,
+        /// Bedrock model ID or inference profile ID to use by default.
+        #[arg(long)]
+        model: String,
+        /// Additional model IDs to show in `bcode model list`.
+        #[arg(long = "model-id")]
+        model_ids: Vec<String>,
     },
 }
 
@@ -410,6 +448,39 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             provider,
             model_id,
         } => set_session_model(session_id, provider, model_id).await?,
+    }
+    Ok(())
+}
+
+fn handle_provider_command(command: ProviderCommand) -> Result<(), CliError> {
+    match command {
+        ProviderCommand::Configure {
+            command:
+                ProviderConfigureCommand::Bedrock {
+                    profile,
+                    aws_profile,
+                    region,
+                    endpoint_url,
+                    model,
+                    mut model_ids,
+                },
+        } => {
+            if !model_ids.contains(&model) {
+                model_ids.insert(0, model.clone());
+            }
+            let config_path = bcode_config::set_bedrock_model_profile(
+                profile.clone(),
+                model,
+                aws_profile,
+                region,
+                endpoint_url,
+                model_ids,
+            )?;
+            println!(
+                "Bedrock provider profile '{profile}' configured; config updated: {}",
+                config_path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1530,7 +1601,8 @@ async fn call_model_provider_service(
 ) -> Result<bcode_ipc::PluginServiceResponse, CliError> {
     let config = bcode_config::load_config()?;
     let client = BcodeClient::default_endpoint();
-    if let Some(provider_plugin_id) = config.model.provider_plugin_id {
+    let resolved_model = config.resolved_model_selection();
+    if let Some(provider_plugin_id) = resolved_model.provider_plugin_id {
         client
             .invoke_plugin_service(
                 provider_plugin_id,
@@ -1601,6 +1673,11 @@ const BUNDLED_OPENAI_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServ
     name: "OpenAI-Compatible Model Provider",
     description: "OpenAI-compatible chat-completions model provider",
 }];
+const BUNDLED_BEDROCK_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
+    interface_id: "bcode.model-provider/v1",
+    name: "Amazon Bedrock Model Provider",
+    description: "Amazon Bedrock ConverseStream model provider",
+}];
 const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
     BundledPluginSpec {
         id: "bcode.filesystem",
@@ -1622,6 +1699,13 @@ const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
         library_stem: "bcode_openai_compatible_provider_plugin",
         name: "Bcode OpenAI-Compatible Provider",
         services: BUNDLED_OPENAI_SERVICES,
+    },
+    BundledPluginSpec {
+        id: "bcode.bedrock",
+        package: "bcode_bedrock_provider_plugin",
+        library_stem: "bcode_bedrock_provider_plugin",
+        name: "Bcode Bedrock Provider",
+        services: BUNDLED_BEDROCK_SERVICES,
     },
 ];
 
@@ -1735,6 +1819,7 @@ fn package_relative_dir(spec: &BundledPluginSpec) -> &'static str {
         "bcode.filesystem" => "plugins/filesystem-plugin",
         "bcode.shell" => "plugins/shell-plugin",
         "bcode.openai-compatible" => "plugins/openai-compatible-provider-plugin",
+        "bcode.bedrock" => "plugins/bedrock-provider-plugin",
         _ => ".",
     }
 }
