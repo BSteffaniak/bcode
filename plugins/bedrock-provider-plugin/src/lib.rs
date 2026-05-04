@@ -5,6 +5,7 @@
 //! Amazon Bedrock model provider plugin for Bcode.
 
 use aws_config::{BehaviorVersion, Region};
+use aws_sdk_bedrock as bedrock;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::DisplayErrorContext;
 use aws_sdk_bedrockruntime::types::{
@@ -30,7 +31,6 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
-const DEFAULT_MODEL_ID: &str = "anthropic.claude-3-5-sonnet-20241022-v2:0";
 const DEFAULT_REGION: &str = "us-east-1";
 
 /// Amazon Bedrock model provider plugin.
@@ -160,7 +160,8 @@ async fn stream_bedrock_turn_inner(
     let settings = Settings::resolve(Some(request));
     settings.validate()?;
     let client = bedrock_client(&settings).await;
-    let bedrock_request = build_converse_request(request, &settings)?;
+    let model_id = resolve_turn_model_id(request, &settings).await?;
+    let bedrock_request = build_converse_request(request, model_id)?;
     let mut builder = client
         .converse_stream()
         .model_id(bedrock_request.model_id)
@@ -391,13 +392,8 @@ struct BedrockConverseRequest {
 
 fn build_converse_request(
     request: &ModelTurnRequest,
-    settings: &Settings,
+    model_id: String,
 ) -> Result<BedrockConverseRequest, ProviderError> {
-    let model_id = if request.model_id.is_empty() {
-        settings.default_model.clone()
-    } else {
-        request.model_id.clone()
-    };
     Ok(BedrockConverseRequest {
         model_id,
         messages: model_messages_to_bedrock_messages(request)?,
@@ -588,7 +584,7 @@ fn model_parameters_to_inference_config(
 
 #[derive(Debug, Clone)]
 struct Settings {
-    default_model: String,
+    default_model: Option<String>,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
     region: Option<String>,
@@ -662,14 +658,15 @@ impl Settings {
         };
         let default_model = first_env(["BCODE_BEDROCK_MODEL", "BEDROCK_MODEL"])
             .or_else(|| value(&["model", "model_id"]))
-            .or_else(|| resolved.and_then(|selection| selection.model_id))
-            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+            .or_else(|| resolved.and_then(|selection| selection.model_id));
         let model_ids_value = first_env(["BCODE_BEDROCK_MODELS", "BEDROCK_MODELS"])
             .or_else(|| value(&["models", "model_ids"]));
         let mut model_ids = model_ids_value
             .as_deref()
-            .map_or_else(|| vec![default_model.clone()], parse_model_list);
-        if !model_ids.contains(&default_model) {
+            .map_or_else(Vec::new, parse_model_list);
+        if let Some(default_model) = &default_model
+            && !model_ids.contains(default_model)
+        {
             model_ids.insert(0, default_model.clone());
         }
         let (region, region_source) = resolve_configured_region(&value);
@@ -691,14 +688,7 @@ impl Settings {
         }
     }
 
-    fn validate(&self) -> Result<(), ProviderError> {
-        if self.default_model.trim().is_empty() {
-            return Err(provider_error(
-                "missing_bedrock_model",
-                ProviderErrorCategory::Config,
-                "set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
-            ));
-        }
+    const fn validate(&self) -> Result<(), ProviderError> {
         Ok(())
     }
 }
@@ -736,22 +726,211 @@ fn capabilities() -> ProviderCapabilities {
 
 fn models() -> ModelList {
     let settings = Settings::resolve(None);
-    ModelList {
-        models: settings
-            .model_ids
-            .iter()
-            .map(|model_id| ModelInfo {
-                model_id: model_id.clone(),
-                display_name: model_id.clone(),
-                is_default: model_id == &settings.default_model,
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
-                    .into_iter()
-                    .collect(),
-            })
-            .collect(),
+    if settings.model_ids_are_explicit || settings.default_model.is_some() {
+        return ModelList {
+            models: model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
+        };
     }
+    let discovered = discover_models_sync(&settings).unwrap_or_else(|error| {
+        tracing::warn!(
+            target: "bcode_bedrock::discovery",
+            error = %error.message,
+            "Bedrock model discovery failed"
+        );
+        ModelDiscovery::default()
+    });
+    ModelList {
+        models: discovered.models,
+    }
+}
+
+fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
+    model_ids
+        .iter()
+        .map(|model_id| ModelInfo {
+            model_id: model_id.clone(),
+            display_name: model_id.clone(),
+            is_default: default_model == Some(model_id.as_str()),
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
+                .into_iter()
+                .collect(),
+        })
+        .collect()
+}
+
+async fn resolve_turn_model_id(
+    request: &ModelTurnRequest,
+    settings: &Settings,
+) -> Result<String, ProviderError> {
+    if !request.model_id.trim().is_empty() {
+        return Ok(request.model_id.clone());
+    }
+    if let Some(model_id) = &settings.default_model
+        && !model_id.trim().is_empty()
+    {
+        return Ok(model_id.clone());
+    }
+    let discovery = discover_models(settings).await?;
+    discovery.default_model_id.ok_or_else(|| {
+        provider_error(
+            "bedrock_model_discovery_empty",
+            ProviderErrorCategory::Config,
+            "Bedrock model discovery returned no usable text/streaming models; set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
+        )
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelDiscovery {
+    models: Vec<ModelInfo>,
+    default_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateModel {
+    model_id: String,
+    display_name: String,
+    /// Higher values are preferred. This is based on Bedrock resource shape, not model family.
+    priority: i32,
+    /// Service-provided recency timestamp when available.
+    date_key: i64,
+}
+
+fn discover_models_sync(settings: &Settings) -> Result<ModelDiscovery, ProviderError> {
+    let runtime = current_thread_runtime().map_err(|error| {
+        provider_error(
+            "runtime_build_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    runtime.block_on(discover_models(settings))
+}
+
+async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, ProviderError> {
+    let client = bedrock_control_client(settings).await;
+    let mut candidates = BTreeMap::<String, CandidateModel>::new();
+    for profile in discover_inference_profiles(&client).await? {
+        candidates
+            .entry(profile.model_id.clone())
+            .or_insert(profile);
+    }
+    for model in discover_foundation_models(&client).await? {
+        candidates.entry(model.model_id.clone()).or_insert(model);
+    }
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| right.date_key.cmp(&left.date_key))
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+    let default_model_id = candidates
+        .first()
+        .map(|candidate| candidate.model_id.clone());
+    let models = candidates
+        .into_iter()
+        .map(|candidate| ModelInfo {
+            is_default: default_model_id.as_deref() == Some(candidate.model_id.as_str()),
+            model_id: candidate.model_id,
+            display_name: candidate.display_name,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
+                .into_iter()
+                .collect(),
+        })
+        .collect();
+    Ok(ModelDiscovery {
+        models,
+        default_model_id,
+    })
+}
+
+async fn bedrock_control_client(settings: &Settings) -> bedrock::Client {
+    let config = bedrock_sdk_config(settings).await;
+    bedrock::Client::new(&config)
+}
+
+async fn discover_inference_profiles(
+    client: &bedrock::Client,
+) -> Result<Vec<CandidateModel>, ProviderError> {
+    let mut next_token = None;
+    let mut candidates = Vec::new();
+    loop {
+        let response = client
+            .list_inference_profiles()
+            .set_next_token(next_token)
+            .send()
+            .await
+            .map_err(bedrock_discovery_error)?;
+        for profile in response.inference_profile_summaries() {
+            if profile.status().as_str() != "ACTIVE" {
+                continue;
+            }
+            let model_id = profile.inference_profile_id().to_string();
+            let display_name = profile.inference_profile_name().to_string();
+            let date_key = profile
+                .updated_at()
+                .or_else(|| profile.created_at())
+                .map_or(0, aws_smithy_types::DateTime::secs);
+            candidates.push(CandidateModel {
+                model_id,
+                display_name,
+                priority: 2,
+                date_key,
+            });
+        }
+        next_token = response.next_token().map(ToString::to_string);
+        if next_token.is_none() {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
+async fn discover_foundation_models(
+    client: &bedrock::Client,
+) -> Result<Vec<CandidateModel>, ProviderError> {
+    let response = client
+        .list_foundation_models()
+        .send()
+        .await
+        .map_err(bedrock_discovery_error)?;
+    let mut candidates = Vec::new();
+    for model in response.model_summaries() {
+        let supports_text_output = model
+            .output_modalities()
+            .iter()
+            .any(|modality| modality.as_str() == "TEXT");
+        if !supports_text_output || model.response_streaming_supported() != Some(true) {
+            continue;
+        }
+        let legacy = model
+            .model_lifecycle()
+            .is_some_and(|lifecycle| lifecycle.status().as_str() == "LEGACY");
+        if legacy {
+            continue;
+        }
+        let model_id = model.model_id().to_string();
+        let display_name = model
+            .model_name()
+            .map_or_else(|| model_id.clone(), ToString::to_string);
+        let date_key = model
+            .model_lifecycle()
+            .and_then(|lifecycle| lifecycle.start_of_life_time())
+            .map_or(0, aws_smithy_types::DateTime::secs);
+        candidates.push(CandidateModel {
+            model_id,
+            display_name,
+            priority: 1,
+            date_key,
+        });
+    }
+    Ok(candidates)
 }
 
 fn validate_config() -> ValidateConfigResponse {
@@ -804,7 +983,13 @@ fn resolved_sdk_region(settings: &Settings) -> Option<(String, RegionSource)> {
 fn diagnostics_metadata(settings: &Settings) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("provider".to_string(), PROVIDER_ID.to_string());
-    metadata.insert("default_model".to_string(), settings.default_model.clone());
+    metadata.insert(
+        "default_model".to_string(),
+        settings
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "<bedrock-discovery>".to_string()),
+    );
     metadata.insert(
         "model_list_source".to_string(),
         if settings.model_ids_are_explicit {
@@ -959,6 +1144,20 @@ fn bedrock_sdk_error(
     provider_error("bedrock_request_failed", category, message)
 }
 
+fn bedrock_discovery_error(error: impl std::fmt::Debug + ToString) -> ProviderError {
+    let message = format!("{} ({error:?})", error.to_string());
+    let category = if message.contains("AccessDenied") || message.contains("credentials") {
+        ProviderErrorCategory::Auth
+    } else if message.contains("Throttl") || message.contains("TooManyRequests") {
+        ProviderErrorCategory::RateLimit
+    } else if message.contains("ValidationException") {
+        ProviderErrorCategory::InvalidRequest
+    } else {
+        ProviderErrorCategory::ProviderInternal
+    };
+    provider_error("bedrock_model_discovery_failed", category, message)
+}
+
 fn bedrock_stream_error(error: &(impl ToString + ?Sized)) -> ProviderError {
     provider_error(
         "bedrock_stream_failed",
@@ -999,7 +1198,7 @@ mod tests {
     #[test]
     fn model_list_includes_default_first() {
         let mut settings = Settings::resolve(None);
-        settings.default_model = "model-b".to_string();
+        settings.default_model = Some("model-b".to_string());
         settings.model_ids = vec!["model-b".to_string(), "model-a".to_string()];
         let metadata = diagnostics_metadata(&settings);
         assert_eq!(metadata.get("default_model"), Some(&"model-b".to_string()));
