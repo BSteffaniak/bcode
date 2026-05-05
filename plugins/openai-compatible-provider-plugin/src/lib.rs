@@ -614,21 +614,7 @@ async fn send_responses_request(
     model_id: &str,
 ) -> Result<reqwest::Response, ProviderError> {
     let url = OPENAI_CODEX_API_ENDPOINT;
-    let request_body = ResponsesRequest {
-        model: model_id.to_string(),
-        instructions: responses_instructions(request),
-        input: model_messages_to_responses_input_for_reuse(request),
-        stream: true,
-        store: request.conversation_reuse.mode.is_enabled(),
-        previous_response_id: request
-            .conversation_reuse
-            .previous_provider_response_id
-            .clone(),
-        tools: model_tools_to_responses_tools(request),
-        temperature: request.parameters.temperature,
-        max_output_tokens: request.parameters.max_output_tokens,
-        top_p: request.parameters.top_p,
-    };
+    let request_body = build_responses_request(settings, request, model_id);
     let mut builder = client
         .post(url)
         .bearer_auth(access_token)
@@ -1099,7 +1085,69 @@ fn finish_tool_calls(
     Ok(())
 }
 
-fn responses_instructions(request: &ModelTurnRequest) -> Option<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesInstructionStrategy {
+    TopLevelInstructions,
+    UserPreamble,
+}
+
+struct ResponsesProjection {
+    instructions: Option<String>,
+    input: Vec<ResponsesInputItem>,
+}
+
+fn build_responses_request(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+    model_id: &str,
+) -> ResponsesRequest {
+    let projection = responses_projection(request, responses_instruction_strategy(settings));
+    ResponsesRequest {
+        model: model_id.to_string(),
+        instructions: projection.instructions,
+        input: projection.input,
+        stream: true,
+        store: request.conversation_reuse.mode.is_enabled(),
+        previous_response_id: request
+            .conversation_reuse
+            .previous_provider_response_id
+            .clone(),
+        tools: model_tools_to_responses_tools(request),
+        temperature: request.parameters.temperature,
+        max_output_tokens: request.parameters.max_output_tokens,
+        top_p: request.parameters.top_p,
+    }
+}
+
+const fn responses_instruction_strategy(settings: &Settings) -> ResponsesInstructionStrategy {
+    if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
+        ResponsesInstructionStrategy::UserPreamble
+    } else {
+        ResponsesInstructionStrategy::TopLevelInstructions
+    }
+}
+
+fn responses_projection(
+    request: &ModelTurnRequest,
+    strategy: ResponsesInstructionStrategy,
+) -> ResponsesProjection {
+    let instruction_bundle = response_instruction_bundle(request);
+    let mut input = model_messages_to_responses_input_for_reuse(request);
+    let instructions = match (strategy, instruction_bundle) {
+        (ResponsesInstructionStrategy::TopLevelInstructions, instructions) => instructions,
+        (ResponsesInstructionStrategy::UserPreamble, Some(instructions)) => {
+            input.insert(0, responses_user_preamble(&instructions));
+            None
+        }
+        (ResponsesInstructionStrategy::UserPreamble, None) => None,
+    };
+    ResponsesProjection {
+        instructions,
+        input,
+    }
+}
+
+fn response_instruction_bundle(request: &ModelTurnRequest) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(system_prompt) = &request.system_prompt
         && !system_prompt.trim().is_empty()
@@ -1115,6 +1163,17 @@ fn responses_instructions(request: &ModelTurnRequest) -> Option<String> {
             .filter(|text| !text.trim().is_empty()),
     );
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn responses_user_preamble(instructions: &str) -> ResponsesInputItem {
+    ResponsesInputItem::Message {
+        role: "user",
+        content: vec![ResponsesContent::InputText {
+            text: format!(
+                "Bcode operating instructions for this turn. Follow these instructions exactly; they are not part of the user's request.\n\n{instructions}"
+            ),
+        }],
+    }
 }
 
 fn model_messages_to_responses_input_for_reuse(
@@ -2438,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_omits_system_messages_and_instructions_include_them() {
+    fn responses_top_level_strategy_omits_system_messages_and_uses_instructions() {
         let request = ModelTurnRequest {
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
@@ -2468,14 +2527,58 @@ mod tests {
             metadata: BTreeMap::new(),
         };
 
-        let instructions = responses_instructions(&request).expect("instructions should exist");
-        let items = model_messages_to_responses_input_for_reuse(&request);
-        let encoded_items = serde_json::to_value(&items).expect("input should serialize");
+        let projection =
+            responses_projection(&request, ResponsesInstructionStrategy::TopLevelInstructions);
+        let instructions = projection.instructions.expect("instructions should exist");
+        let encoded_items =
+            serde_json::to_value(&projection.input).expect("input should serialize");
 
         assert!(instructions.contains("top-level"));
         assert!(instructions.contains("dynamic system"));
-        assert_eq!(items.len(), 1);
+        assert_eq!(projection.input.len(), 1);
         assert!(!encoded_items.to_string().contains(r#""role":"system""#));
+    }
+
+    #[test]
+    fn responses_chatgpt_strategy_uses_user_preamble_without_system_shape() {
+        let request = ModelTurnRequest {
+            session_id: "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("static nil UUID should parse"),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: Some("top-level".to_string()),
+            messages: vec![
+                ModelMessage {
+                    role: MessageRole::System,
+                    content: vec![ContentBlock::Text {
+                        text: "dynamic system".to_string(),
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "hello".to_string(),
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            parameters: bcode_model::ModelParameters::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        };
+
+        let projection = responses_projection(&request, ResponsesInstructionStrategy::UserPreamble);
+        let encoded = serde_json::to_value(&projection.input).expect("input should serialize");
+        let encoded_text = encoded.to_string();
+
+        assert!(projection.instructions.is_none());
+        assert_eq!(projection.input.len(), 2);
+        assert!(!encoded_text.contains(r#""role":"system""#));
+        assert!(encoded_text.contains("top-level"));
+        assert!(encoded_text.contains("dynamic system"));
     }
 
     #[test]
