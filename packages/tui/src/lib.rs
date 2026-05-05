@@ -30,15 +30,15 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, StatefulWidget,
     Widget, Wrap,
 };
+use ratatui::{Frame, Terminal};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -586,7 +586,7 @@ async fn run_chat(
             app.push_event(event);
         }
 
-        terminal.draw(&app)?;
+        terminal.draw_frame(|frame| render_chat_frame(frame, &app))?;
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
@@ -1660,6 +1660,17 @@ impl ChatApp {
         }
     }
 
+    fn cursor_position(&self, area: Rect) -> Option<Position> {
+        match self.current_scope() {
+            TuiScope::Chat => composer_cursor_position(area, &self.input, self.search_mode),
+            TuiScope::CommandPalette => self
+                .command_palette
+                .as_ref()
+                .and_then(|palette| command_palette_cursor_position(area, palette)),
+            TuiScope::Permission | TuiScope::SessionPicker => None,
+        }
+    }
+
     fn take_input(&mut self) -> Option<String> {
         let input = self.input.trim().to_string();
         if input.is_empty() {
@@ -1841,18 +1852,35 @@ fn system_message_finishes_activity(text: &str) -> bool {
         || lower.contains("timeout")
 }
 
+fn render_chat_frame(frame: &mut Frame<'_>, app: &ChatApp) {
+    let area = frame.area();
+    frame.render_widget(app, area);
+    if let Some(position) = app.cursor_position(area) {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn chat_layout(area: Rect, input: &str, search_mode: bool) -> [Rect; 4] {
+    let composer_height = composer_height(
+        input,
+        search_mode,
+        area.height,
+        area.width.saturating_sub(2),
+    );
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(composer_height),
+            Constraint::Length(1),
+        ])
+        .areas(area)
+}
+
 impl ratatui::widgets::Widget for &ChatApp {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let composer_height = composer_height(&self.input, self.search_mode, area.height);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(composer_height),
-                Constraint::Length(1),
-            ])
-            .split(area);
+        let chunks = chat_layout(area, &self.input, self.search_mode);
 
         render_chat_header(self, chunks[0], buf);
 
@@ -2040,12 +2068,39 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+fn command_palette_layout(area: Rect) -> (Rect, [Rect; 3]) {
+    let modal = centered_rect(area, area.width.min(86), area.height.min(18));
+    let inner = inset(modal, 2, 1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+    (modal, chunks)
+}
+
+fn command_palette_cursor_position(area: Rect, palette: &CommandPaletteState) -> Option<Position> {
+    let (_, chunks) = command_palette_layout(area);
+    let search_area = chunks[0];
+    if search_area.width == 0 || search_area.height == 0 {
+        return None;
+    }
+    let column = line_width("› ").saturating_add(line_width(&palette.filter));
+    Some(Position::new(
+        search_area.x + usize_to_u16_saturating(column).min(search_area.width.saturating_sub(1)),
+        search_area.y,
+    ))
+}
+
 fn render_command_palette(
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
     palette: &CommandPaletteState,
 ) {
-    let modal = centered_rect(area, area.width.min(86), area.height.min(18));
+    let (modal, chunks) = command_palette_layout(area);
     ratatui::widgets::Widget::render(Clear, modal, buf);
     let block = Block::new()
         .title(Line::from(vec![
@@ -2055,17 +2110,7 @@ fn render_command_palette(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(accent_style());
-    let inner = inset(modal, 2, 1);
     ratatui::widgets::Widget::render(block, modal, buf);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(inner);
 
     let search = if palette.filter.is_empty() {
         Line::from(vec![
@@ -2250,18 +2295,69 @@ fn permission_choice_span(choice: PermissionChoice, selected: PermissionChoice) 
     }
 }
 
-fn composer_height(input: &str, search_mode: bool, terminal_height: u16) -> u16 {
+fn composer_height(
+    input: &str,
+    search_mode: bool,
+    terminal_height: u16,
+    content_width: u16,
+) -> u16 {
     if search_mode {
         return 3.min(terminal_height.max(1));
     }
-    let rows = if input.is_empty() {
-        1
-    } else {
-        u16::try_from(input.split('\n').count()).unwrap_or(MAX_COMPOSER_ROWS)
-    };
-    rows.min(MAX_COMPOSER_ROWS)
+    composer_visual_rows(input, content_width)
+        .min(MAX_COMPOSER_ROWS)
         .saturating_add(2)
         .min(terminal_height.saturating_sub(2).max(3))
+}
+
+fn composer_visual_rows(input: &str, content_width: u16) -> u16 {
+    if input.is_empty() {
+        return 1;
+    }
+    input
+        .split('\n')
+        .map(|line| visual_rows_for_width(line_width(line), content_width))
+        .fold(0_u16, u16::saturating_add)
+        .max(1)
+}
+
+fn visual_rows_for_width(visual_width: usize, content_width: u16) -> u16 {
+    let content_width = usize::from(content_width.max(1));
+    let rows = visual_width.div_ceil(content_width).max(1);
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+fn composer_cursor_position(area: Rect, input: &str, search_mode: bool) -> Option<Position> {
+    let chunks = chat_layout(area, input, search_mode);
+    let content = inset(chunks[2], 1, 1);
+    cursor_position_in_wrapped_text(content, input)
+}
+
+fn cursor_position_in_wrapped_text(area: Rect, text: &str) -> Option<Position> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let mut row = 0_u16;
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        if lines.peek().is_none() {
+            let line_width = line_width(line);
+            row = row.saturating_add(usize_to_u16_saturating(
+                line_width / usize::from(area.width.max(1)),
+            ));
+            let column = usize_to_u16_saturating(line_width % usize::from(area.width.max(1)));
+            return Some(Position::new(
+                area.x + column.min(area.width.saturating_sub(1)),
+                area.y + row.min(area.height.saturating_sub(1)),
+            ));
+        }
+        row = row.saturating_add(visual_rows_for_width(line_width(line), area.width));
+    }
+    Some(Position::new(area.x, area.y))
+}
+
+fn line_width(line: &str) -> usize {
+    Line::from(line.to_string()).width()
 }
 
 fn composer_text(input: &str, search_mode: bool) -> Text<'static> {
@@ -2745,8 +2841,14 @@ impl TerminalGuard {
     where
         W: ratatui::widgets::Widget,
     {
-        self.terminal
-            .draw(|frame| frame.render_widget(widget, frame.area()))?;
+        self.draw_frame(|frame| frame.render_widget(widget, frame.area()))
+    }
+
+    fn draw_frame<F>(&mut self, render: F) -> Result<(), io::Error>
+    where
+        F: FnOnce(&mut Frame<'_>),
+    {
+        self.terminal.draw(render)?;
         Ok(())
     }
 }
@@ -3271,6 +3373,73 @@ mod tests {
                 .map(|palette| palette.filter.as_str()),
             Some("m")
         );
+    }
+
+    #[test]
+    fn chat_frame_sets_cursor_at_composer_insert_position() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        terminal
+            .draw(|frame| render_chat_frame(frame, &app))
+            .expect("frame should render");
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(1, 17));
+
+        app.input = "Hello".to_string();
+        terminal
+            .draw(|frame| render_chat_frame(frame, &app))
+            .expect("frame should render");
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(6, 17));
+    }
+
+    #[test]
+    fn composer_cursor_tracks_multiline_input() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = "one\ntwo".to_string();
+
+        assert_eq!(
+            app.cursor_position(Rect::new(0, 0, 80, 20)),
+            Some(Position::new(4, 17))
+        );
+    }
+
+    #[test]
+    fn command_palette_cursor_tracks_filter_input() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.open_command_palette();
+        if let Some(palette) = &mut app.command_palette {
+            palette.filter = "mo".to_string();
+        }
+
+        assert_eq!(
+            app.cursor_position(Rect::new(0, 0, 100, 30)),
+            Some(Position::new(13, 7))
+        );
+    }
+
+    #[test]
+    fn permission_prompt_does_not_show_text_cursor() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.pending_permissions.insert(
+            "permission-123".to_string(),
+            PendingPermissionView {
+                permission_id: "permission-123".to_string(),
+                tool_call_id: "tool-call-456".to_string(),
+                tool_name: "shell.run".to_string(),
+                arguments_json: r#"{"command":"cargo check -p bcode_tui"}"#.to_string(),
+            },
+        );
+
+        assert_eq!(app.cursor_position(Rect::new(0, 0, 80, 20)), None);
     }
 
     #[test]
