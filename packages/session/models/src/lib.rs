@@ -114,6 +114,9 @@ pub struct SessionTokenUsage {
     /// Input tokens served from a provider cache, when available.
     #[serde(default)]
     pub cached_input_tokens: Option<u32>,
+    /// Input tokens written to a provider prompt cache, when available.
+    #[serde(default)]
+    pub cache_write_input_tokens: Option<u32>,
     /// Reasoning tokens reported separately by a provider, when available.
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
@@ -135,6 +138,15 @@ impl SessionTokenUsage {
     #[must_use]
     pub const fn context_input_tokens(&self) -> Option<u32> {
         self.input_tokens
+    }
+
+    /// Return uncached input tokens when both input and cached counts are known.
+    #[must_use]
+    pub const fn uncached_input_tokens(&self) -> Option<u32> {
+        match (self.input_tokens, self.cached_input_tokens) {
+            (Some(input), Some(cached)) => Some(input.saturating_sub(cached)),
+            _ => self.input_tokens,
+        }
     }
 }
 

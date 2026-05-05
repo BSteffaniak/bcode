@@ -2334,12 +2334,13 @@ fn print_session_event(event: &SessionEvent) {
         }
         SessionEventKind::ModelUsage { turn_id, usage } => {
             println!(
-                "#{} model usage: {turn_id} input={:?} output={:?} total={:?} cached={:?} reasoning={:?}",
+                "#{} model usage: {turn_id} input={:?} output={:?} total={:?} cached={:?} cache_write={:?} reasoning={:?}",
                 event.sequence,
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.metered_total_tokens(),
                 usage.cached_input_tokens,
+                usage.cache_write_input_tokens,
                 usage.reasoning_tokens,
             );
         }

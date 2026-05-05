@@ -1160,6 +1160,8 @@ struct ChatApp {
 struct TokenUsageMeter {
     session_tokens: u64,
     latest_context_input_tokens: Option<u32>,
+    latest_cached_input_tokens: Option<u32>,
+    latest_cache_write_input_tokens: Option<u32>,
     context_window: Option<u32>,
     max_output_tokens: Option<u32>,
 }
@@ -1171,6 +1173,12 @@ impl TokenUsageMeter {
         }
         if let Some(input_tokens) = usage.context_input_tokens() {
             self.latest_context_input_tokens = Some(input_tokens);
+        }
+        if usage.cached_input_tokens.is_some() {
+            self.latest_cached_input_tokens = usage.cached_input_tokens;
+        }
+        if usage.cache_write_input_tokens.is_some() {
+            self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
         }
     }
 
@@ -1194,6 +1202,19 @@ impl TokenUsageMeter {
             ));
         } else if self.latest_context_input_tokens.is_some() || self.context_window.is_some() {
             parts.push("ctx window unknown".to_string());
+        }
+        if let Some(cached) = self.latest_cached_input_tokens
+            && cached > 0
+        {
+            parts.push(format!("cached {} tok", compact_u64(u64::from(cached))));
+        }
+        if let Some(written) = self.latest_cache_write_input_tokens
+            && written > 0
+        {
+            parts.push(format!(
+                "cache write {} tok",
+                compact_u64(u64::from(written))
+            ));
         }
         if self.session_tokens > 0 {
             parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
@@ -3743,6 +3764,7 @@ mod tests {
                     output_tokens: Some(500),
                     total_tokens: Some(2_500),
                     cached_input_tokens: None,
+                    cache_write_input_tokens: None,
                     reasoning_tokens: None,
                 },
             },

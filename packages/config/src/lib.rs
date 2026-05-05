@@ -319,6 +319,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub max_tool_rounds: Option<u32>,
     #[serde(default)]
+    pub prompt_cache: PromptCacheConfig,
+    #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ModelProfileConfig>,
@@ -343,10 +345,29 @@ impl ModelConfig {
         if next.max_tool_rounds.is_some() {
             self.max_tool_rounds = next.max_tool_rounds;
         }
+        if next.prompt_cache != PromptCacheConfig::default() {
+            self.prompt_cache = next.prompt_cache;
+        }
         if next.profile.is_some() {
             self.profile = next.profile;
         }
         self.profiles.extend(next.profiles);
+    }
+}
+
+/// Prompt cache configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheConfig {
+    /// Prompt cache mode. Defaults to `auto`.
+    #[serde(default)]
+    pub mode: bcode_model::PromptCacheMode,
+}
+
+impl Default for PromptCacheConfig {
+    fn default() -> Self {
+        Self {
+            mode: bcode_model::PromptCacheMode::Auto,
+        }
     }
 }
 
@@ -697,6 +718,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         || model.default_thinking_level.is_some()
         || model.max_tool_rounds.is_some()
         || model.profile.is_some()
+        || model.prompt_cache != PromptCacheConfig::default()
     {
         output.push_str("[model]\n");
         if let Some(profile) = &model.profile {
@@ -723,6 +745,16 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
             writeln!(output, "max_tool_rounds = {max_tool_rounds}")
                 .expect("writing to string should not fail");
         }
+        output.push('\n');
+    }
+    if model.prompt_cache != PromptCacheConfig::default() {
+        output.push_str("[model.prompt_cache]\n");
+        writeln!(
+            output,
+            "mode = {}",
+            toml_string(prompt_cache_mode_name(model.prompt_cache.mode))
+        )
+        .expect("writing to string should not fail");
         output.push('\n');
     }
     for (profile_name, profile) in &model.profiles {
@@ -847,6 +879,14 @@ fn write_action_map(
         .expect("writing to string should not fail");
     }
     output.push_str(" }\n");
+}
+
+const fn prompt_cache_mode_name(mode: bcode_model::PromptCacheMode) -> &'static str {
+    match mode {
+        bcode_model::PromptCacheMode::Off => "off",
+        bcode_model::PromptCacheMode::Auto => "auto",
+        bcode_model::PromptCacheMode::Aggressive => "aggressive",
+    }
 }
 
 const fn action_name(action: bcode_agent_policy_models::Action) -> &'static str {
@@ -1188,6 +1228,22 @@ profile = "work"
         assert_eq!(
             selection.settings.get("region"),
             Some(&"us-east-1".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_prompt_cache_mode() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model.prompt_cache]
+mode = "off"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.model.prompt_cache.mode,
+            bcode_model::PromptCacheMode::Off
         );
     }
 

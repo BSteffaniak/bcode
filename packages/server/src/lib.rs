@@ -75,6 +75,7 @@ struct ServerState {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
+    prompt_cache_mode: bcode_model::PromptCacheMode,
     max_tool_rounds: Option<u32>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -113,6 +114,7 @@ impl ServerState {
         selected_provider_plugin_id: Option<String>,
         selected_model_id: Option<String>,
         selected_provider_context: bcode_model::ProviderRequestContext,
+        prompt_cache_mode: bcode_model::PromptCacheMode,
         max_tool_rounds: Option<u32>,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
@@ -122,6 +124,7 @@ impl ServerState {
             selected_provider_plugin_id,
             selected_model_id,
             selected_provider_context,
+            prompt_cache_mode,
             max_tool_rounds,
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
@@ -202,6 +205,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             auth_profile: resolved_model.auth_profile,
             settings: resolved_model.settings,
         },
+        config.model.prompt_cache.mode,
         config.model.effective_max_tool_rounds(),
     ));
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
@@ -1469,13 +1473,30 @@ async fn build_model_turn_request(
     selected_model_id: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.session_history(session_id).await?;
-    let messages = history
+    let mut messages = history
         .iter()
         .filter_map(session_event_to_model_message)
-        .collect();
+        .collect::<Vec<_>>();
+    let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
     let selection = session_model_selection(state, session_id).await;
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;
+    let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
+        agent_context
+            .as_ref()
+            .and_then(|context| context.system_prompt_suffix.as_deref()),
+    );
+    if !dynamic_system_context.trim().is_empty() {
+        messages.insert(
+            0,
+            ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text {
+                    text: dynamic_system_context,
+                }],
+            },
+        );
+    }
     let enabled_tools = agent_context
         .as_ref()
         .and_then(|context| context.enabled_tools.clone());
@@ -1484,11 +1505,7 @@ async fn build_model_turn_request(
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id: model_id_for_provider_request(selected_model_id),
         provider_context: selection.provider_context,
-        system_prompt: Some(build_coding_system_prompt(
-            agent_context
-                .as_ref()
-                .and_then(|context| context.system_prompt_suffix.as_deref()),
-        )),
+        system_prompt: Some(system_prompt),
         messages,
         tools: collect_model_tools(state, enabled_tools).await,
         parameters: {
@@ -1498,8 +1515,54 @@ async fn build_model_turn_request(
             }
             p
         },
+        prompt_cache,
         metadata: std::collections::BTreeMap::new(),
     })
+}
+
+fn plan_prompt_cache(
+    messages: &mut [ModelMessage],
+    mode: bcode_model::PromptCacheMode,
+) -> bcode_model::PromptCacheHints {
+    if !mode.is_enabled() {
+        return bcode_model::PromptCacheHints::default();
+    }
+
+    if mode.cache_conversation_prefix()
+        && let Some(index) = conversation_cache_point_index(messages)
+    {
+        messages[index].content.push(ContentBlock::CachePoint {
+            hint: bcode_model::PromptCachePoint {
+                label: Some("conversation_prefix".to_string()),
+                ttl_seconds: None,
+            },
+        });
+    }
+
+    bcode_model::PromptCacheHints {
+        mode,
+        cache_system_prompt: true,
+        cache_tools: true,
+    }
+}
+
+fn conversation_cache_point_index(messages: &[ModelMessage]) -> Option<usize> {
+    const MIN_MESSAGES_FOR_CONVERSATION_CACHE: usize = 6;
+    if messages.len() < MIN_MESSAGES_FOR_CONVERSATION_CACHE {
+        return None;
+    }
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .skip(2)
+        .find_map(|(index, message)| {
+            matches!(
+                message.role,
+                MessageRole::User | MessageRole::Assistant | MessageRole::Tool
+            )
+            .then_some(index)
+        })
 }
 
 fn model_id_for_provider_request(selected_model_id: Option<&str>) -> String {
@@ -1533,51 +1596,59 @@ const MAX_GIT_STATUS_CHARS: usize = 4_000;
 const MAX_MODEL_TOOL_RESULT_CHARS: usize = 16_000;
 const MODEL_TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 
-fn build_coding_system_prompt(agent_prompt_suffix: Option<&str>) -> String {
-    let mut prompt = format!(
+fn build_coding_system_prompt_parts(agent_prompt_suffix: Option<&str>) -> (String, String) {
+    let (stable_context, dynamic_context) = build_repository_context_parts();
+    let mut stable = format!(
         "{DEFAULT_CODING_SYSTEM_PROMPT}\n\n{}",
-        truncate_text(&build_repository_context(), MAX_REPOSITORY_CONTEXT_CHARS)
+        truncate_text(&stable_context, MAX_REPOSITORY_CONTEXT_CHARS)
     );
     if let Some(suffix) = agent_prompt_suffix
         && !suffix.trim().is_empty()
     {
-        prompt.push_str("\n\n");
-        prompt.push_str(suffix.trim());
+        stable.push_str("\n\nAgent-specific instructions:\n");
+        stable.push_str(suffix.trim());
     }
-    prompt
+
+    (
+        stable,
+        truncate_text(&dynamic_context, MAX_REPOSITORY_CONTEXT_CHARS),
+    )
 }
 
-fn build_repository_context() -> String {
+fn build_repository_context_parts() -> (String, String) {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repo_root = discover_git_root(&cwd);
     let context_root = repo_root.as_deref().unwrap_or(cwd.as_path());
 
-    let mut lines = vec![
-        "Repository context:".to_string(),
-        format!("* Current directory: {}", cwd.display()),
-    ];
-    if let Some(repo_root) = &repo_root {
-        lines.push(format!("* Git root: {}", repo_root.display()));
-    }
-    if let Some(branch) = run_command(context_root, "git", &["branch", "--show-current"])
-        && !branch.is_empty()
-    {
-        lines.push(format!("* Git branch: {branch}"));
-    }
-    if let Some(status) = run_command(context_root, "git", &["status", "--short"]) {
-        lines.push(format!(
-            "* Git status:\n{}",
-            format_block_or_placeholder(&status, "clean")
-        ));
-    }
-    lines.push(format!(
+    let mut stable_lines = vec!["Stable repository context:".to_string()];
+    stable_lines.push(format!(
         "* Detected project files: {}",
         detected_project_files(context_root).join(", ")
     ));
     if let Some(instructions) = read_nearest_agent_instructions(&cwd, context_root) {
-        lines.push(format!("* Project instructions excerpt:\n{instructions}"));
+        stable_lines.push(format!("* Project instructions excerpt:\n{instructions}"));
     }
-    lines.join("\n")
+
+    let mut dynamic_lines = vec![
+        "Dynamic repository context:".to_string(),
+        format!("* Current directory: {}", cwd.display()),
+    ];
+    if let Some(repo_root) = &repo_root {
+        dynamic_lines.push(format!("* Git root: {}", repo_root.display()));
+    }
+    if let Some(branch) = run_command(context_root, "git", &["branch", "--show-current"])
+        && !branch.is_empty()
+    {
+        dynamic_lines.push(format!("* Git branch: {branch}"));
+    }
+    if let Some(status) = run_command(context_root, "git", &["status", "--short"]) {
+        dynamic_lines.push(format!(
+            "* Git status:\n{}",
+            format_block_or_placeholder(&status, "clean")
+        ));
+    }
+
+    (stable_lines.join("\n"), dynamic_lines.join("\n"))
 }
 
 fn discover_git_root(cwd: &Path) -> Option<PathBuf> {
@@ -2142,6 +2213,7 @@ const fn session_token_usage(usage: &TokenUsage) -> SessionTokenUsage {
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,
         cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
         reasoning_tokens: usage.reasoning_tokens,
     }
 }
@@ -2369,12 +2441,59 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_auto_marks_stable_sections_only() {
+        let mut messages = Vec::new();
+
+        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Auto);
+
+        assert!(hints.cache_system_prompt);
+        assert!(hints.cache_tools);
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[test]
+    fn prompt_cache_aggressive_marks_conversation_prefix() {
+        let mut messages = (0..6)
+            .map(|index| ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("message {index}"),
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Aggressive);
+
+        assert!(hints.cache_system_prompt);
+        assert!(matches!(
+            messages[3].content.last(),
+            Some(ContentBlock::CachePoint { .. })
+        ));
+        assert!(!matches!(
+            messages[5].content.last(),
+            Some(ContentBlock::CachePoint { .. })
+        ));
+    }
+
+    #[test]
+    fn coding_system_prompt_splits_stable_and_dynamic_context() {
+        let (stable, dynamic) = build_coding_system_prompt_parts(Some("agent suffix"));
+
+        assert!(stable.contains(DEFAULT_CODING_SYSTEM_PROMPT));
+        assert!(stable.contains("Stable repository context:"));
+        assert!(stable.contains("agent suffix"));
+        assert!(dynamic.contains("Dynamic repository context:"));
+        assert!(!stable.contains("Git status:"));
+    }
+
+    #[test]
     fn session_token_usage_preserves_normalized_fields() {
         let usage = session_token_usage(&TokenUsage {
             input_tokens: Some(10),
             output_tokens: Some(5),
             total_tokens: Some(15),
             cached_input_tokens: Some(3),
+            cache_write_input_tokens: Some(4),
             reasoning_tokens: Some(2),
         });
 
@@ -2382,6 +2501,7 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.metered_total_tokens(), Some(15));
         assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.cache_write_input_tokens, Some(4));
         assert_eq!(usage.reasoning_tokens, Some(2));
     }
 

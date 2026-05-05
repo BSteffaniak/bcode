@@ -9,10 +9,11 @@ use aws_sdk_bedrock as bedrock;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::DisplayErrorContext;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
-    ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage,
-    StopReason as BedrockStopReason, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
-    ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
+    CachePointBlock, CachePointType, ContentBlock as BedrockContentBlock, ContentBlockDelta,
+    ContentBlockStart, ConversationRole, ConverseStreamOutput, InferenceConfiguration,
+    Message as BedrockMessage, StopReason as BedrockStopReason, SystemContentBlock, Tool,
+    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
+    ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::{Document, Number};
 use bcode_model::{
@@ -221,6 +222,35 @@ async fn stream_bedrock_turn_inner(
             }
             Err(error) => {
                 let error = bedrock_sdk_error(&error);
+                if prompt_cache_rejected(&error) && request.prompt_cache.mode.is_enabled() {
+                    turn.push(ProviderTurnEvent::Warning {
+                        message: format!(
+                            "Bedrock model {model_id} rejected prompt cache points; retrying without explicit cache points"
+                        ),
+                    });
+                    let mut retry_request = request.clone();
+                    retry_request.prompt_cache = bcode_model::PromptCacheHints::default();
+                    let bedrock_request = build_converse_request(&retry_request, model_id.clone())?;
+                    let mut retry_builder = client
+                        .converse_stream()
+                        .model_id(bedrock_request.model_id)
+                        .set_messages(Some(bedrock_request.messages));
+                    if !bedrock_request.system.is_empty() {
+                        retry_builder = retry_builder.set_system(Some(bedrock_request.system));
+                    }
+                    if let Some(tool_config) = bedrock_request.tool_config {
+                        retry_builder = retry_builder.tool_config(tool_config);
+                    }
+                    if let Some(inference_config) = bedrock_request.inference_config {
+                        retry_builder = retry_builder.inference_config(inference_config);
+                    }
+                    return match retry_builder.send().await {
+                        Ok(response) => {
+                            read_bedrock_stream(response.stream, turn, name_map.clone()).await
+                        }
+                        Err(retry_error) => Err(bedrock_sdk_error(&retry_error)),
+                    };
+                }
                 if !selection.explicit
                     && streaming_tool_use_unsupported(&error)
                     && selection.model_ids.last() != Some(model_id)
@@ -381,6 +411,9 @@ impl StreamAccumulator {
                             cached_input_tokens: usage
                                 .cache_read_input_tokens()
                                 .and_then(nonnegative_i32_to_u32),
+                            cache_write_input_tokens: usage
+                                .cache_write_input_tokens()
+                                .and_then(nonnegative_i32_to_u32),
                             ..TokenUsage::default()
                         },
                     });
@@ -469,7 +502,7 @@ fn build_converse_request(
         model_id,
         messages: model_messages_to_bedrock_messages(request)?,
         system: system_blocks(request),
-        tool_config: model_tools_to_bedrock_tool_config(&request.tools)?,
+        tool_config: model_tools_to_bedrock_tool_config(request)?,
         inference_config: model_parameters_to_inference_config(request),
     })
 }
@@ -481,6 +514,9 @@ fn system_blocks(request: &ModelTurnRequest) -> Vec<SystemContentBlock> {
         .filter(|prompt| !prompt.trim().is_empty())
         .map(|prompt| vec![SystemContentBlock::Text(prompt.clone())])
         .unwrap_or_default();
+    if request.prompt_cache.cache_system_prompt && !system.is_empty() {
+        system.push(SystemContentBlock::CachePoint(default_cache_point()));
+    }
     for message in &request.messages {
         if message.role == MessageRole::System {
             let text = joined_text_content(message);
@@ -556,6 +592,9 @@ fn bedrock_content_blocks(
                     builder.build().map_err(|error| build_error(&error))?,
                 ));
             }
+            ContentBlock::CachePoint { .. } => {
+                blocks.push(BedrockContentBlock::CachePoint(default_cache_point()));
+            }
             ContentBlock::Text { .. } | ContentBlock::ProviderExtension { .. } => {}
         }
     }
@@ -575,12 +614,13 @@ fn joined_text_content(message: &ModelMessage) -> String {
 }
 
 fn model_tools_to_bedrock_tool_config(
-    tools: &[ToolDefinition],
+    request: &ModelTurnRequest,
 ) -> Result<Option<ToolConfiguration>, ProviderError> {
-    if tools.is_empty() {
+    if request.tools.is_empty() {
         return Ok(None);
     }
-    let tools = tools
+    let mut tools = request
+        .tools
         .iter()
         .map(|tool| {
             ToolSpecification::builder()
@@ -594,11 +634,21 @@ fn model_tools_to_bedrock_tool_config(
                 .map_err(|error| build_error(&error))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if request.prompt_cache.cache_tools {
+        tools.push(Tool::CachePoint(default_cache_point()));
+    }
     ToolConfiguration::builder()
         .set_tools(Some(tools))
         .build()
         .map(Some)
         .map_err(|error| build_error(&error))
+}
+
+fn default_cache_point() -> CachePointBlock {
+    CachePointBlock::builder()
+        .r#type(CachePointType::Default)
+        .build()
+        .expect("default cache point should build")
 }
 
 fn bedrock_tool_name_map(tools: &[ToolDefinition]) -> BTreeMap<String, String> {
@@ -784,6 +834,7 @@ fn capabilities() -> ProviderCapabilities {
             ProviderCapability::Streaming,
             ProviderCapability::Cancellation,
             ProviderCapability::Tools,
+            ProviderCapability::PromptCaching,
         ]
         .into_iter()
         .collect(),
@@ -902,9 +953,13 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             is_default: default_model == Some(model_id.as_str()),
             context_window: None,
             max_output_tokens: None,
-            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
-                .into_iter()
-                .collect(),
+            capabilities: [
+                ModelCapability::StreamingText,
+                ModelCapability::ToolCalls,
+                ModelCapability::PromptCaching,
+            ]
+            .into_iter()
+            .collect(),
         })
         .collect()
 }
@@ -1175,6 +1230,11 @@ fn streaming_tool_use_unsupported(error: &ProviderError) -> bool {
             .contains("doesn't support tool use in streaming mode")
 }
 
+fn prompt_cache_rejected(error: &ProviderError) -> bool {
+    error.category == ProviderErrorCategory::InvalidRequest
+        && error.message.to_ascii_lowercase().contains("cache")
+}
+
 impl PersistedCompatibilityCache {
     fn unsupported_for(&self, key: &DiscoveryCacheKey) -> BTreeSet<String> {
         self.entries
@@ -1364,9 +1424,13 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             display_name: candidate.display_name,
             context_window: None,
             max_output_tokens: None,
-            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
-                .into_iter()
-                .collect(),
+            capabilities: [
+                ModelCapability::StreamingText,
+                ModelCapability::ToolCalls,
+                ModelCapability::PromptCaching,
+            ]
+            .into_iter()
+            .collect(),
         })
         .collect();
     Ok(ModelDiscovery {
@@ -1710,6 +1774,59 @@ mod tests {
             panic!("expected tool use block");
         };
         assert_eq!(tool_use.name(), "shell_run");
+    }
+
+    #[test]
+    fn cache_hints_emit_bedrock_cache_points() {
+        let request = ModelTurnRequest {
+            session_id: "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("static nil UUID should parse"),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: Some("stable".to_string()),
+            messages: vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "hello".to_string(),
+                    },
+                    ContentBlock::CachePoint {
+                        hint: bcode_model::PromptCachePoint::default(),
+                    },
+                ],
+            }],
+            tools: vec![ToolDefinition {
+                name: "filesystem.read".to_string(),
+                description: "read".to_string(),
+                input_schema: serde_json::json!({"type":"object"}),
+                side_effect: bcode_model::ToolSideEffect::default(),
+                requires_permission: false,
+            }],
+            parameters: bcode_model::ModelParameters::default(),
+            prompt_cache: bcode_model::PromptCacheHints {
+                mode: bcode_model::PromptCacheMode::Auto,
+                cache_system_prompt: true,
+                cache_tools: true,
+            },
+            metadata: BTreeMap::default(),
+        };
+
+        let system = system_blocks(&request);
+        assert!(matches!(system[1], SystemContentBlock::CachePoint(_)));
+        let messages = model_messages_to_bedrock_messages(&request).expect("messages convert");
+        assert!(matches!(
+            messages[0].content().last(),
+            Some(BedrockContentBlock::CachePoint(_))
+        ));
+        let tool_config = model_tools_to_bedrock_tool_config(&request)
+            .expect("tools convert")
+            .expect("tool config should exist");
+        assert!(matches!(
+            tool_config.tools().last(),
+            Some(Tool::CachePoint(_))
+        ));
     }
 
     #[test]

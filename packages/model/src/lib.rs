@@ -51,6 +51,8 @@ pub enum ProviderCapability {
     Tools,
     Cancellation,
     JsonMode,
+    PromptCaching,
+    ConversationReuse,
 }
 
 /// Model listing response.
@@ -84,6 +86,7 @@ pub enum ModelCapability {
     JsonMode,
     Reasoning,
     ImageInput,
+    PromptCaching,
 }
 
 /// User-facing thinking / reasoning effort level for models that support it.
@@ -143,7 +146,47 @@ pub struct ModelTurnRequest {
     #[serde(default)]
     pub parameters: ModelParameters,
     #[serde(default)]
+    pub prompt_cache: PromptCacheHints,
+    #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider-neutral prompt cache hints for a model turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheHints {
+    /// Prompt cache mode selected by the host.
+    #[serde(default)]
+    pub mode: PromptCacheMode,
+    /// Whether the stable system prompt prefix should end with a provider cache point.
+    #[serde(default)]
+    pub cache_system_prompt: bool,
+    /// Whether provider tool definitions should end with a provider cache point.
+    #[serde(default)]
+    pub cache_tools: bool,
+}
+
+/// Prompt caching policy level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheMode {
+    Off,
+    #[default]
+    Auto,
+    Aggressive,
+}
+
+impl PromptCacheMode {
+    /// Return whether provider cache hints should be emitted.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Return whether conversation-prefix cache points should be emitted.
+    #[must_use]
+    pub const fn cache_conversation_prefix(self) -> bool {
+        matches!(self, Self::Aggressive)
+    }
 }
 
 /// Provider response after starting a turn.
@@ -201,10 +244,33 @@ pub enum MessageRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    ToolCall { call: ToolCall },
-    ToolResult { result: ToolResult },
-    ProviderExtension { value: serde_json::Value },
+    Text {
+        text: String,
+    },
+    ToolCall {
+        call: ToolCall,
+    },
+    ToolResult {
+        result: ToolResult,
+    },
+    /// Provider-neutral cache point hint. Providers that do not support explicit prompt caching should ignore it.
+    CachePoint {
+        hint: PromptCachePoint,
+    },
+    ProviderExtension {
+        value: serde_json::Value,
+    },
+}
+
+/// Provider-neutral prompt cache point.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCachePoint {
+    /// Optional provider-neutral label for diagnostics.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Optional provider-neutral TTL in seconds.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
 }
 
 /// Model parameters.
@@ -295,6 +361,9 @@ pub struct TokenUsage {
     /// Input tokens served from a provider cache, when available.
     #[serde(default)]
     pub cached_input_tokens: Option<u32>,
+    /// Input tokens written to a provider prompt cache, when available.
+    #[serde(default)]
+    pub cache_write_input_tokens: Option<u32>,
     /// Reasoning tokens reported separately by a provider, when available.
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
@@ -321,6 +390,15 @@ impl TokenUsage {
     #[must_use]
     pub const fn context_input_tokens(&self) -> Option<u32> {
         self.input_tokens
+    }
+
+    /// Return uncached input tokens when both input and cached counts are known.
+    #[must_use]
+    pub const fn uncached_input_tokens(&self) -> Option<u32> {
+        match (self.input_tokens, self.cached_input_tokens) {
+            (Some(input), Some(cached)) => Some(input.saturating_sub(cached)),
+            _ => self.input_tokens,
+        }
     }
 }
 

@@ -960,6 +960,7 @@ fn token_usage_from_openai_usage(usage: OpenAiUsage) -> TokenUsage {
         output_tokens: usage.completion_tokens.or(usage.output_tokens),
         total_tokens: usage.total_tokens,
         cached_input_tokens,
+        cache_write_input_tokens: None,
         reasoning_tokens,
     }
 }
@@ -1057,7 +1058,7 @@ fn model_messages_to_responses_input(request: &ModelTurnRequest) -> Vec<Response
 
 fn model_message_to_responses_input(message: &ModelMessage) -> Vec<ResponsesInputItem> {
     match message.role {
-        MessageRole::System => Vec::new(),
+        MessageRole::System => responses_text_message("system", message, true),
         MessageRole::User => responses_text_message("user", message, true),
         MessageRole::Assistant => responses_assistant_items(message),
         MessageRole::Tool => responses_tool_items(message),
@@ -1270,6 +1271,7 @@ fn capabilities() -> ProviderCapabilities {
             ProviderCapability::Streaming,
             ProviderCapability::Cancellation,
             ProviderCapability::Tools,
+            ProviderCapability::PromptCaching,
         ]
         .into_iter()
         .collect(),
@@ -1302,9 +1304,13 @@ fn model_infos_from_ids(model_ids: &[String], default_model: &str) -> Vec<ModelI
             is_default: model_id == default_model,
             context_window: None,
             max_output_tokens: None,
-            capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
-                .into_iter()
-                .collect(),
+            capabilities: [
+                ModelCapability::StreamingText,
+                ModelCapability::ToolCalls,
+                ModelCapability::PromptCaching,
+            ]
+            .into_iter()
+            .collect(),
         })
         .collect()
 }
