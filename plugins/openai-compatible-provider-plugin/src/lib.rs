@@ -249,6 +249,7 @@ struct ResponsesRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponsesInputItem {
     Message {
@@ -267,6 +268,7 @@ enum ResponsesInputItem {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponsesContent {
     InputText { text: String },
@@ -614,7 +616,7 @@ async fn send_responses_request(
     let url = OPENAI_CODEX_API_ENDPOINT;
     let request_body = ResponsesRequest {
         model: model_id.to_string(),
-        instructions: request.system_prompt.clone(),
+        instructions: responses_instructions(request),
         input: model_messages_to_responses_input_for_reuse(request),
         stream: true,
         store: request.conversation_reuse.mode.is_enabled(),
@@ -1097,6 +1099,24 @@ fn finish_tool_calls(
     Ok(())
 }
 
+fn responses_instructions(request: &ModelTurnRequest) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(system_prompt) = &request.system_prompt
+        && !system_prompt.trim().is_empty()
+    {
+        parts.push(system_prompt.clone());
+    }
+    parts.extend(
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::System)
+            .map(joined_text_content)
+            .filter(|text| !text.trim().is_empty()),
+    );
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 fn model_messages_to_responses_input_for_reuse(
     request: &ModelTurnRequest,
 ) -> Vec<ResponsesInputItem> {
@@ -1116,7 +1136,7 @@ fn model_messages_to_responses_input_for_reuse(
 
 fn model_message_to_responses_input(message: &ModelMessage) -> Vec<ResponsesInputItem> {
     match message.role {
-        MessageRole::System => responses_text_message("system", message, true),
+        MessageRole::System => Vec::new(),
         MessageRole::User => responses_text_message("user", message, true),
         MessageRole::Assistant => responses_assistant_items(message),
         MessageRole::Tool => responses_tool_items(message),
@@ -2415,6 +2435,47 @@ mod tests {
         assert_eq!(usage.total_tokens, Some(27));
         assert_eq!(usage.cached_input_tokens, Some(4));
         assert_eq!(usage.reasoning_tokens, Some(6));
+    }
+
+    #[test]
+    fn responses_input_omits_system_messages_and_instructions_include_them() {
+        let request = ModelTurnRequest {
+            session_id: "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("static nil UUID should parse"),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: Some("top-level".to_string()),
+            messages: vec![
+                ModelMessage {
+                    role: MessageRole::System,
+                    content: vec![ContentBlock::Text {
+                        text: "dynamic system".to_string(),
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "hello".to_string(),
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            parameters: bcode_model::ModelParameters::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        };
+
+        let instructions = responses_instructions(&request).expect("instructions should exist");
+        let items = model_messages_to_responses_input_for_reuse(&request);
+        let encoded_items = serde_json::to_value(&items).expect("input should serialize");
+
+        assert!(instructions.contains("top-level"));
+        assert!(instructions.contains("dynamic system"));
+        assert_eq!(items.len(), 1);
+        assert!(!encoded_items.to_string().contains(r#""role":"system""#));
     }
 
     #[test]
