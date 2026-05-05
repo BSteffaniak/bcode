@@ -20,7 +20,7 @@
 use bcode_client::{BcodeClient, ClientError};
 use bcode_command::CommandInfo;
 use bcode_ipc::Event;
-use bcode_model::ReasoningEffort;
+use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
     ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionSummary, SessionTokenUsage,
 };
@@ -830,6 +830,22 @@ async fn handle_slash_command(
         "plan" => set_session_agent_from_tui(client, app, session_id, "plan").await,
         "build" => set_session_agent_from_tui(client, app, session_id, "build").await,
         "compact" => compact_session_from_tui(client, app, session_id).await,
+        "models" | "model" if parts.len() == 1 => {
+            list_models_from_tui(client, app, session_id).await
+        }
+        "model" | "set-model" if parts.len() > 1 => {
+            set_session_model_from_tui(client, app, session_id, &parts).await
+        }
+        "provider" | "set-provider" if parts.len() > 1 => {
+            set_session_provider_from_tui(client, app, session_id, parts[1]).await
+        }
+        "provider" => {
+            app.status = format!(
+                "current provider: {}",
+                app.selected_provider_plugin_id.as_deref().unwrap_or("auto")
+            );
+            true
+        }
         "agent" if parts.len() > 1 => {
             set_session_agent_from_tui(client, app, session_id, parts[1]).await
         }
@@ -856,6 +872,112 @@ async fn handle_slash_command(
         }
         _ => app.parse_and_execute_slash(message, client),
     }
+}
+
+async fn list_models_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+) -> bool {
+    let provider_plugin_id = if app.selected_provider_plugin_id.is_some() {
+        app.selected_provider_plugin_id.clone()
+    } else {
+        client
+            .session_model_status(session_id)
+            .await
+            .ok()
+            .and_then(|status| status.provider_plugin_id)
+    };
+    let response = if let Some(provider_plugin_id) = provider_plugin_id.clone() {
+        client
+            .invoke_plugin_service(
+                provider_plugin_id,
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                bcode_model::OP_MODELS.to_string(),
+                Vec::new(),
+            )
+            .await
+    } else {
+        client
+            .call_plugin_service(
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                bcode_model::OP_MODELS.to_string(),
+                Vec::new(),
+            )
+            .await
+    };
+    match response {
+        Ok(response) => {
+            if let Some(error) = response.error {
+                app.status = format!("model list failed: {}", error.message);
+                return true;
+            }
+            match serde_json::from_slice::<ModelList>(&response.payload) {
+                Ok(models) => app.show_model_list(&models.models),
+                Err(error) => app.status = format!("model list decode failed: {error}"),
+            }
+        }
+        Err(error) => app.status = format!("model list failed: {error}"),
+    }
+    true
+}
+
+async fn set_session_model_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+    parts: &[&str],
+) -> bool {
+    let model_id = parts[1];
+    let provider = slash_option_value(parts, "--provider").map(ToString::to_string);
+    match client
+        .set_session_model(session_id, provider.clone(), model_id.to_string())
+        .await
+    {
+        Ok(()) => {
+            if let Some(provider) = provider {
+                app.selected_provider_plugin_id = Some(provider);
+            }
+            app.selected_model_id = (model_id != "<default>").then(|| model_id.to_string());
+            app.model_status_refresh_needed = true;
+            app.status = format!("model set to {model_id}");
+        }
+        Err(error) => app.status = format!("model switch failed: {error}"),
+    }
+    true
+}
+
+async fn set_session_provider_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+    provider_plugin_id: &str,
+) -> bool {
+    match client
+        .set_session_model(
+            session_id,
+            Some(provider_plugin_id.to_string()),
+            "<default>".to_string(),
+        )
+        .await
+    {
+        Ok(()) => {
+            app.selected_provider_plugin_id = Some(provider_plugin_id.to_string());
+            app.selected_model_id = None;
+            app.model_status_refresh_needed = true;
+            app.status =
+                format!("provider set to {provider_plugin_id}; model uses provider default");
+        }
+        Err(error) => app.status = format!("provider switch failed: {error}"),
+    }
+    true
+}
+
+fn slash_option_value<'a>(parts: &'a [&str], option: &str) -> Option<&'a str> {
+    parts
+        .windows(2)
+        .find(|window| window[0] == option)
+        .map(|window| window[1])
 }
 
 async fn set_session_agent_from_tui(
@@ -1476,6 +1598,29 @@ impl ChatApp {
         self.model_status_refresh_needed = false;
     }
 
+    fn show_model_list(&mut self, models: &[bcode_model::ModelInfo]) {
+        if models.is_empty() {
+            self.status = "no models returned by provider".to_string();
+            return;
+        }
+        let mut lines = vec!["Available models:".to_string()];
+        lines.extend(models.iter().take(40).map(|model| {
+            let marker = if model.is_default { "*" } else { " " };
+            format!("{marker} {}", model.model_id)
+        }));
+        if models.len() > 40 {
+            lines.push(format!("… {} more", models.len() - 40));
+        }
+        lines.push("Use /model <id> [--provider <plugin-id>] to switch.".to_string());
+        self.finish_streaming_block_if_needed();
+        self.blocks.push(TranscriptBlock::System {
+            text: lines.join("\n"),
+        });
+        self.mark_transcript_dirty();
+        self.scroll_rows_from_bottom = 0;
+        self.status = format!("listed {} models", models.len());
+    }
+
     fn take_model_status_refresh_needed(&mut self) -> bool {
         let needed = self.model_status_refresh_needed;
         self.model_status_refresh_needed = false;
@@ -2025,9 +2170,7 @@ impl ChatApp {
     async fn execute_command(&mut self, _client: &BcodeClient, cmd: &CommandInfo) {
         match cmd.id.as_str() {
             "switch-model" | "set-model" => {
-                self.status =
-                    "use slash /model <id> [--provider <p>] (palette shows discovery only)"
-                        .to_string();
+                self.status = "use /models to list, then /model <id> [--provider <p>]".to_string();
             }
             "switch-provider" | "set-provider" => {
                 self.status = "use slash /provider <plugin-id>".to_string();
@@ -2044,7 +2187,7 @@ impl ChatApp {
             }
             "help" => {
                 self.status =
-                    "Slash: /model <id>, /provider <id>, /thinking low|medium|high, /compact, /clear, /help"
+                    "Slash: /models, /model <id>, /provider <id>, /thinking low|medium|high, /compact, /clear, /help"
                         .to_string();
             }
             "compact" => {
@@ -2110,7 +2253,7 @@ impl ChatApp {
             }
             "help" => {
                 self.status =
-                    "Commands: /model, /provider, /thinking <level>, /compact, /clear, /help"
+                    "Commands: /models, /model <id>, /provider <id>, /thinking <level>, /compact, /clear, /help"
                         .to_string();
                 true
             }
