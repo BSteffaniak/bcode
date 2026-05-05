@@ -538,7 +538,7 @@ fn bedrock_content_blocks(
                 blocks.push(BedrockContentBlock::ToolUse(
                     ToolUseBlock::builder()
                         .tool_use_id(call.id.clone())
-                        .name(call.name.clone())
+                        .name(bedrock_tool_name(&call.name))
                         .input(json_value_to_document(&call.arguments))
                         .build()
                         .map_err(|error| build_error(&error))?,
@@ -1689,6 +1689,26 @@ mod tests {
     #[test]
     fn bedrock_tool_names_are_sanitized() {
         assert_eq!(bedrock_tool_name("filesystem.read"), "filesystem_read");
+    }
+
+    #[test]
+    fn historical_tool_use_names_are_sanitized_for_bedrock() {
+        let message = ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolCall {
+                call: ToolCall {
+                    id: "tooluse_1".to_string(),
+                    name: "shell.run".to_string(),
+                    arguments: serde_json::json!({"command":"git status"}),
+                },
+            }],
+        };
+        let blocks = bedrock_content_blocks(&message).expect("tool call should convert");
+
+        let BedrockContentBlock::ToolUse(tool_use) = &blocks[0] else {
+            panic!("expected tool use block");
+        };
+        assert_eq!(tool_use.name(), "shell_run");
     }
 
     #[test]
