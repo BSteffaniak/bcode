@@ -148,7 +148,43 @@ pub struct ModelTurnRequest {
     #[serde(default)]
     pub prompt_cache: PromptCacheHints,
     #[serde(default)]
+    pub conversation_reuse: ConversationReuseHints,
+    #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider-neutral conversation reuse hints for provider-native continuation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationReuseHints {
+    /// Provider-native conversation reuse mode selected by the host.
+    #[serde(default)]
+    pub mode: ConversationReuseMode,
+    /// Stable key for the reusable provider conversation state.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Provider response/turn ID to continue from, when available.
+    #[serde(default)]
+    pub previous_provider_response_id: Option<String>,
+    /// First message index not covered by `previous_provider_response_id`.
+    #[serde(default)]
+    pub new_messages_start_index: Option<usize>,
+}
+
+/// Provider-native conversation reuse policy level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationReuseMode {
+    #[default]
+    Off,
+    Auto,
+}
+
+impl ConversationReuseMode {
+    /// Return whether provider-native continuation may be used.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 /// Provider-neutral prompt cache hints for a model turn.
@@ -334,15 +370,40 @@ pub struct ToolResult {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderTurnEvent {
     TurnStarted,
-    TextDelta { text: String },
-    ReasoningDelta { text: String },
-    ToolCallStarted { call_id: String, name: String },
-    ToolCallDelta { call_id: String, delta: String },
-    ToolCallFinished { call: ToolCall },
-    Usage { usage: TokenUsage },
-    Warning { message: String },
-    Error { error: ProviderError },
-    TurnFinished { stop_reason: StopReason },
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        call_id: String,
+        delta: String,
+    },
+    ToolCallFinished {
+        call: ToolCall,
+    },
+    Usage {
+        usage: TokenUsage,
+    },
+    /// Provider-specific metadata that the host may use for invisible optimization state.
+    ProviderMetadata {
+        key: String,
+        value: String,
+    },
+    Warning {
+        message: String,
+    },
+    Error {
+        error: ProviderError,
+    },
+    TurnFinished {
+        stop_reason: StopReason,
+    },
     Cancelled,
 }
 

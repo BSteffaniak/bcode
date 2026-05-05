@@ -234,6 +234,8 @@ struct ResponsesRequest {
     input: Vec<ResponsesInputItem>,
     stream: bool,
     store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -581,9 +583,13 @@ async fn send_responses_request(
             request.model_id.clone()
         },
         instructions: request.system_prompt.clone(),
-        input: model_messages_to_responses_input(request),
+        input: model_messages_to_responses_input_for_reuse(request),
         stream: true,
-        store: false,
+        store: request.conversation_reuse.mode.is_enabled(),
+        previous_response_id: request
+            .conversation_reuse
+            .previous_provider_response_id
+            .clone(),
         tools: model_tools_to_responses_tools(request),
         temperature: request.parameters.temperature,
         max_output_tokens: request.parameters.max_output_tokens,
@@ -774,12 +780,23 @@ fn process_responses_stream_line(
             if let Some(usage) = token_usage_from_responses_event(&event) {
                 turn.push(ProviderTurnEvent::Usage { usage });
             }
-            return Ok(if *saw_tool_call {
+            let outcome = if *saw_tool_call {
                 finish_tool_calls(turn, tool_calls, &openai_tool_name_map(request))?;
                 StreamOutcome::ToolCall
             } else {
                 StreamOutcome::Finished
-            });
+            };
+            if let Some(response_id) = event
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                turn.push(ProviderTurnEvent::ProviderMetadata {
+                    key: "provider_response_id".to_string(),
+                    value: response_id.to_string(),
+                });
+            }
+            return Ok(outcome);
         }
         "response.failed" | "error" => {
             let message = event
@@ -1048,10 +1065,19 @@ fn finish_tool_calls(
     Ok(())
 }
 
-fn model_messages_to_responses_input(request: &ModelTurnRequest) -> Vec<ResponsesInputItem> {
+fn model_messages_to_responses_input_for_reuse(
+    request: &ModelTurnRequest,
+) -> Vec<ResponsesInputItem> {
+    let start = request
+        .conversation_reuse
+        .previous_provider_response_id
+        .as_ref()
+        .and(request.conversation_reuse.new_messages_start_index)
+        .unwrap_or_default();
     request
         .messages
         .iter()
+        .skip(start.min(request.messages.len()))
         .flat_map(model_message_to_responses_input)
         .collect()
 }
@@ -2242,6 +2268,91 @@ mod tests {
         assert_eq!(usage.total_tokens, Some(27));
         assert_eq!(usage.cached_input_tokens, Some(4));
         assert_eq!(usage.reasoning_tokens, Some(6));
+    }
+
+    #[test]
+    fn responses_reuse_sends_only_new_messages() {
+        let request = ModelTurnRequest {
+            session_id: "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("static nil UUID should parse"),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: None,
+            messages: vec![
+                ModelMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "old".to_string(),
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "old answer".to_string(),
+                    }],
+                },
+                ModelMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "new".to_string(),
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            parameters: bcode_model::ModelParameters::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints {
+                mode: bcode_model::ConversationReuseMode::Auto,
+                key: Some("key".to_string()),
+                previous_provider_response_id: Some("resp_1".to_string()),
+                new_messages_start_index: Some(2),
+            },
+            metadata: BTreeMap::new(),
+        };
+
+        let items = model_messages_to_responses_input_for_reuse(&request);
+
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn responses_completed_emits_provider_response_id_metadata() {
+        let request = ModelTurnRequest {
+            session_id: "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("static nil UUID should parse"),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            parameters: bcode_model::ModelParameters::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        };
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+
+        let outcome = process_responses_stream_line(
+            r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
+            &turn,
+            &request,
+            &mut tool_calls,
+            &mut saw_tool_call,
+        )
+        .expect("stream event should process");
+
+        assert!(matches!(outcome, StreamOutcome::Finished));
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ProviderMetadata { key, value }
+                if key == "provider_response_id" && value == "resp_123"
+        )));
     }
 
     #[test]

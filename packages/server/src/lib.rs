@@ -30,9 +30,11 @@ use bcode_tool::{
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolList,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -76,6 +78,8 @@ struct ServerState {
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
     prompt_cache_mode: bcode_model::PromptCacheMode,
+    conversation_reuse_mode: bcode_model::ConversationReuseMode,
+    provider_state: Mutex<ProviderStateStore>,
     max_tool_rounds: Option<u32>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -90,6 +94,73 @@ struct ServerState {
 struct ActiveModelTurn {
     provider_plugin_id: Option<String>,
     provider_turn_id: String,
+    reuse_key: Option<String>,
+    request_message_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct ProviderStateKey {
+    session_id: SessionId,
+    provider_plugin_id: String,
+    model_id: String,
+    stable_prompt_hash: String,
+    tools_hash: String,
+    parameters_hash: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProviderContinuationState {
+    provider_response_id: String,
+    reusable_message_count: usize,
+    updated_sequence: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProviderTelemetryState {
+    input: Option<u32>,
+    cached: Option<u32>,
+    cache_write: Option<u32>,
+    uncached: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProviderStateRecord {
+    #[serde(default)]
+    continuation: Option<ProviderContinuationState>,
+    #[serde(default)]
+    telemetry: ProviderTelemetryState,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderStateStore {
+    path: PathBuf,
+    records: BTreeMap<String, ProviderStateRecord>,
+}
+
+impl ProviderStateStore {
+    fn load(path: PathBuf) -> Self {
+        let records = fs::read_to_string(&path)
+            .ok()
+            .and_then(|contents| serde_json::from_str(&contents).ok())
+            .unwrap_or_default();
+        Self { path, records }
+    }
+
+    fn save(&self) {
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!("failed to create provider state directory: {error}");
+            return;
+        }
+        let Ok(contents) = serde_json::to_string_pretty(&self.records) else {
+            eprintln!("failed to encode provider state");
+            return;
+        };
+        if let Err(error) = fs::write(&self.path, contents) {
+            eprintln!("failed to persist provider state: {error}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -107,25 +178,33 @@ struct PendingPermission {
     notify: Arc<Notify>,
 }
 
+struct ServerStateInit {
+    selected_provider_plugin_id: Option<String>,
+    selected_model_id: Option<String>,
+    selected_provider_context: bcode_model::ProviderRequestContext,
+    prompt_cache_mode: bcode_model::PromptCacheMode,
+    conversation_reuse_mode: bcode_model::ConversationReuseMode,
+    provider_state: ProviderStateStore,
+    max_tool_rounds: Option<u32>,
+}
+
 impl ServerState {
     fn new(
         sessions: SessionManager,
         plugins: bcode_plugin::PluginHost,
-        selected_provider_plugin_id: Option<String>,
-        selected_model_id: Option<String>,
-        selected_provider_context: bcode_model::ProviderRequestContext,
-        prompt_cache_mode: bcode_model::PromptCacheMode,
-        max_tool_rounds: Option<u32>,
+        init: ServerStateInit,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions,
             plugins: Arc::new(Mutex::new(plugins)),
-            selected_provider_plugin_id,
-            selected_model_id,
-            selected_provider_context,
-            prompt_cache_mode,
-            max_tool_rounds,
+            selected_provider_plugin_id: init.selected_provider_plugin_id,
+            selected_model_id: init.selected_model_id,
+            selected_provider_context: init.selected_provider_context,
+            prompt_cache_mode: init.prompt_cache_mode,
+            conversation_reuse_mode: init.conversation_reuse_mode,
+            provider_state: Mutex::new(init.provider_state),
+            max_tool_rounds: init.max_tool_rounds,
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -198,15 +277,19 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
-        resolved_model.provider_plugin_id,
-        resolved_model.model_id,
-        bcode_model::ProviderRequestContext {
-            model_profile: resolved_model.model_profile,
-            auth_profile: resolved_model.auth_profile,
-            settings: resolved_model.settings,
+        ServerStateInit {
+            selected_provider_plugin_id: resolved_model.provider_plugin_id,
+            selected_model_id: resolved_model.model_id,
+            selected_provider_context: bcode_model::ProviderRequestContext {
+                model_profile: resolved_model.model_profile,
+                auth_profile: resolved_model.auth_profile,
+                settings: resolved_model.settings,
+            },
+            prompt_cache_mode: config.model.prompt_cache.mode,
+            conversation_reuse_mode: config.model.conversation_reuse.mode,
+            provider_state: ProviderStateStore::load(default_provider_state_path()),
+            max_tool_rounds: config.model.effective_max_tool_rounds(),
         },
-        config.model.prompt_cache.mode,
-        config.model.effective_max_tool_rounds(),
     ));
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
@@ -967,6 +1050,7 @@ async fn run_model_turn_inner(
             session_id,
             trigger_event,
             round,
+            provider_plugin_id.as_deref(),
             selection.model_id.as_deref(),
         )
         .await
@@ -1036,6 +1120,8 @@ async fn run_model_turn_round(
         ActiveModelTurn {
             provider_plugin_id: provider_plugin_id.map(ToString::to_string),
             provider_turn_id: start.provider_turn_id.clone(),
+            reuse_key: request.conversation_reuse.key.clone(),
+            request_message_count: request.messages.len(),
         },
     );
 
@@ -1200,13 +1286,78 @@ async fn handle_provider_turn_event(
             append_system_event(state, session_id, format!("model warning: {message}")).await;
         }
         ProviderTurnEvent::Usage { usage } => {
+            update_provider_usage_state(state, session_id, &usage).await;
             append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
+        }
+        ProviderTurnEvent::ProviderMetadata { key, value } => {
+            update_provider_metadata_state(state, session_id, &key, value).await;
         }
         ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::ToolCallStarted { .. }
         | ProviderTurnEvent::ReasoningDelta { .. }
         | ProviderTurnEvent::ToolCallDelta { .. } => {}
     }
+}
+
+async fn update_provider_usage_state(
+    state: &ServerState,
+    session_id: SessionId,
+    usage: &TokenUsage,
+) {
+    let reuse_key = state
+        .active_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .and_then(|turn| turn.reuse_key.clone());
+    let Some(reuse_key) = reuse_key else {
+        return;
+    };
+
+    let mut provider_state = state.provider_state.lock().await;
+    let record = provider_state.records.entry(reuse_key).or_default();
+    record.telemetry = ProviderTelemetryState {
+        input: usage.input_tokens,
+        cached: usage.cached_input_tokens,
+        cache_write: usage.cache_write_input_tokens,
+        uncached: usage.uncached_input_tokens(),
+    };
+    provider_state.save();
+}
+
+async fn update_provider_metadata_state(
+    state: &ServerState,
+    session_id: SessionId,
+    key: &str,
+    value: String,
+) {
+    if key != "provider_response_id" {
+        return;
+    }
+    let reuse_key = state
+        .active_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .and_then(|turn| turn.reuse_key.clone());
+    let Some(reuse_key) = reuse_key else {
+        return;
+    };
+    let reusable_message_count = state
+        .active_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .map_or(0, |turn| turn.request_message_count.saturating_add(1));
+
+    let mut provider_state = state.provider_state.lock().await;
+    let record = provider_state.records.entry(reuse_key).or_default();
+    record.continuation = Some(ProviderContinuationState {
+        provider_response_id: value,
+        reusable_message_count,
+        updated_sequence: reusable_message_count.try_into().unwrap_or(u64::MAX),
+    });
+    provider_state.save();
 }
 
 async fn agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse> {
@@ -1470,6 +1621,7 @@ async fn build_model_turn_request(
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
     round: u32,
+    provider_plugin_id: Option<&str>,
     selected_model_id: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.session_history(session_id).await?;
@@ -1500,24 +1652,141 @@ async fn build_model_turn_request(
     let enabled_tools = agent_context
         .as_ref()
         .and_then(|context| context.enabled_tools.clone());
+    let tools = collect_model_tools(state, enabled_tools).await;
+    let parameters = {
+        let mut p = ModelParameters::default();
+        if let Some(level) = &selection.thinking_level {
+            p.reasoning_effort = Some(*level);
+        }
+        p
+    };
+    let model_id = model_id_for_provider_request(selected_model_id);
+    let projection = ConversationProjection::new(
+        session_id,
+        provider_plugin_id.unwrap_or("<auto>"),
+        &model_id,
+        &system_prompt,
+        &tools,
+        &parameters,
+        &messages,
+    );
+    let conversation_reuse = plan_conversation_reuse(state, &projection, messages.len()).await;
+    let metadata = projection.metadata();
     Ok(ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
-        model_id: model_id_for_provider_request(selected_model_id),
+        model_id,
         provider_context: selection.provider_context,
         system_prompt: Some(system_prompt),
         messages,
-        tools: collect_model_tools(state, enabled_tools).await,
-        parameters: {
-            let mut p = ModelParameters::default();
-            if let Some(level) = &selection.thinking_level {
-                p.reasoning_effort = Some(*level);
-            }
-            p
-        },
+        tools,
+        parameters,
         prompt_cache,
-        metadata: std::collections::BTreeMap::new(),
+        conversation_reuse,
+        metadata,
     })
+}
+
+#[derive(Debug, Clone)]
+struct ConversationProjection {
+    key: ProviderStateKey,
+    conversation_hash: String,
+}
+
+impl ConversationProjection {
+    fn new(
+        session_id: SessionId,
+        provider_plugin_id: &str,
+        model_id: &str,
+        system_prompt: &str,
+        tools: &[bcode_model::ToolDefinition],
+        parameters: &ModelParameters,
+        messages: &[ModelMessage],
+    ) -> Self {
+        let stable_prompt_hash = stable_hash(system_prompt);
+        let tools_hash = stable_json_hash(tools);
+        let parameters_hash = stable_json_hash(parameters);
+        let conversation_hash = stable_json_hash(messages);
+        Self {
+            key: ProviderStateKey {
+                session_id,
+                provider_plugin_id: provider_plugin_id.to_string(),
+                model_id: model_id.to_string(),
+                stable_prompt_hash,
+                tools_hash,
+                parameters_hash,
+            },
+            conversation_hash,
+        }
+    }
+
+    fn reuse_key(&self) -> String {
+        stable_json_hash(&self.key)
+    }
+
+    fn metadata(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "stable_prompt_hash".to_string(),
+                self.key.stable_prompt_hash.clone(),
+            ),
+            ("tools_hash".to_string(), self.key.tools_hash.clone()),
+            (
+                "parameters_hash".to_string(),
+                self.key.parameters_hash.clone(),
+            ),
+            (
+                "conversation_hash".to_string(),
+                self.conversation_hash.clone(),
+            ),
+            ("conversation_reuse_key".to_string(), self.reuse_key()),
+        ])
+    }
+}
+
+async fn plan_conversation_reuse(
+    state: &ServerState,
+    projection: &ConversationProjection,
+    message_count: usize,
+) -> bcode_model::ConversationReuseHints {
+    let mode = state.conversation_reuse_mode;
+    if !mode.is_enabled() {
+        return bcode_model::ConversationReuseHints::default();
+    }
+
+    let reuse_key = projection.reuse_key();
+    let previous = state
+        .provider_state
+        .lock()
+        .await
+        .records
+        .get(&reuse_key)
+        .and_then(|record| record.continuation.clone())
+        .filter(|continuation| continuation.reusable_message_count <= message_count);
+
+    bcode_model::ConversationReuseHints {
+        mode,
+        key: Some(reuse_key),
+        previous_provider_response_id: previous
+            .as_ref()
+            .map(|continuation| continuation.provider_response_id.clone()),
+        new_messages_start_index: previous
+            .as_ref()
+            .map(|continuation| continuation.reusable_message_count),
+    }
+}
+
+fn stable_json_hash(value: &(impl serde::Serialize + ?Sized)) -> String {
+    serde_json::to_string(value).map_or_else(
+        |_| stable_hash("<serialize-error>"),
+        |json| stable_hash(&json),
+    )
+}
+
+fn stable_hash(value: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn plan_prompt_cache(
@@ -2413,6 +2682,10 @@ async fn send_response(
 
 fn default_session_store_dir() -> PathBuf {
     bcode_config::default_state_dir().join("sessions")
+}
+
+fn default_provider_state_path() -> PathBuf {
+    bcode_config::default_state_dir().join("provider-state.json")
 }
 
 #[cfg(test)]

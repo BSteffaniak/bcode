@@ -321,6 +321,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub prompt_cache: PromptCacheConfig,
     #[serde(default)]
+    pub conversation_reuse: ConversationReuseConfig,
+    #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ModelProfileConfig>,
@@ -348,6 +350,9 @@ impl ModelConfig {
         if next.prompt_cache != PromptCacheConfig::default() {
             self.prompt_cache = next.prompt_cache;
         }
+        if next.conversation_reuse != ConversationReuseConfig::default() {
+            self.conversation_reuse = next.conversation_reuse;
+        }
         if next.profile.is_some() {
             self.profile = next.profile;
         }
@@ -369,6 +374,14 @@ impl Default for PromptCacheConfig {
             mode: bcode_model::PromptCacheMode::Auto,
         }
     }
+}
+
+/// Provider-native conversation reuse configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationReuseConfig {
+    /// Conversation reuse mode. Defaults to `off` because provider-native retention semantics are provider-specific.
+    #[serde(default)]
+    pub mode: bcode_model::ConversationReuseMode,
 }
 
 /// Generic model provider profile configuration.
@@ -719,6 +732,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         || model.max_tool_rounds.is_some()
         || model.profile.is_some()
         || model.prompt_cache != PromptCacheConfig::default()
+        || model.conversation_reuse != ConversationReuseConfig::default()
     {
         output.push_str("[model]\n");
         if let Some(profile) = &model.profile {
@@ -753,6 +767,16 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
             output,
             "mode = {}",
             toml_string(prompt_cache_mode_name(model.prompt_cache.mode))
+        )
+        .expect("writing to string should not fail");
+        output.push('\n');
+    }
+    if model.conversation_reuse != ConversationReuseConfig::default() {
+        output.push_str("[model.conversation_reuse]\n");
+        writeln!(
+            output,
+            "mode = {}",
+            toml_string(conversation_reuse_mode_name(model.conversation_reuse.mode))
         )
         .expect("writing to string should not fail");
         output.push('\n');
@@ -886,6 +910,13 @@ const fn prompt_cache_mode_name(mode: bcode_model::PromptCacheMode) -> &'static 
         bcode_model::PromptCacheMode::Off => "off",
         bcode_model::PromptCacheMode::Auto => "auto",
         bcode_model::PromptCacheMode::Aggressive => "aggressive",
+    }
+}
+
+const fn conversation_reuse_mode_name(mode: bcode_model::ConversationReuseMode) -> &'static str {
+    match mode {
+        bcode_model::ConversationReuseMode::Off => "off",
+        bcode_model::ConversationReuseMode::Auto => "auto",
     }
 }
 
@@ -1244,6 +1275,22 @@ mode = "off"
         assert_eq!(
             config.model.prompt_cache.mode,
             bcode_model::PromptCacheMode::Off
+        );
+    }
+
+    #[test]
+    fn parses_conversation_reuse_mode() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model.conversation_reuse]
+mode = "auto"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.model.conversation_reuse.mode,
+            bcode_model::ConversationReuseMode::Auto
         );
     }
 

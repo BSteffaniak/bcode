@@ -40,6 +40,7 @@ const MODEL_DISCOVERY_TTL: Duration = Duration::from_secs(10 * 60);
 const COMPATIBILITY_CACHE_VERSION: u8 = 1;
 const COMPATIBILITY_CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const STREAMING_TOOL_UNSUPPORTED_REASON: &str = "streaming_tool_use_unsupported";
+const PROMPT_CACHE_UNSUPPORTED_REASON: &str = "prompt_cache_unsupported";
 
 /// Amazon Bedrock model provider plugin.
 pub struct BedrockProviderPlugin {
@@ -202,7 +203,16 @@ async fn stream_bedrock_turn_inner(
     let name_map = bedrock_tool_name_map(&request.tools);
     let mut last_error = None;
     for model_id in &selection.model_ids {
-        let bedrock_request = build_converse_request(request, model_id.clone())?;
+        let mut effective_request;
+        let request_for_model =
+            if prompt_cache_known_unsupported(&discovery, selection.cache_key.as_ref(), model_id) {
+                effective_request = request.clone();
+                effective_request.prompt_cache = bcode_model::PromptCacheHints::default();
+                &effective_request
+            } else {
+                request
+            };
+        let bedrock_request = build_converse_request(request_for_model, model_id.clone())?;
         let mut builder = client
             .converse_stream()
             .model_id(bedrock_request.model_id)
@@ -222,34 +232,27 @@ async fn stream_bedrock_turn_inner(
             }
             Err(error) => {
                 let error = bedrock_sdk_error(&error);
-                if prompt_cache_rejected(&error) && request.prompt_cache.mode.is_enabled() {
+                if prompt_cache_rejected(&error) && request_for_model.prompt_cache.mode.is_enabled()
+                {
                     turn.push(ProviderTurnEvent::Warning {
                         message: format!(
                             "Bedrock model {model_id} rejected prompt cache points; retrying without explicit cache points"
                         ),
                     });
-                    let mut retry_request = request.clone();
-                    retry_request.prompt_cache = bcode_model::PromptCacheHints::default();
-                    let bedrock_request = build_converse_request(&retry_request, model_id.clone())?;
-                    let mut retry_builder = client
-                        .converse_stream()
-                        .model_id(bedrock_request.model_id)
-                        .set_messages(Some(bedrock_request.messages));
-                    if !bedrock_request.system.is_empty() {
-                        retry_builder = retry_builder.set_system(Some(bedrock_request.system));
-                    }
-                    if let Some(tool_config) = bedrock_request.tool_config {
-                        retry_builder = retry_builder.tool_config(tool_config);
-                    }
-                    if let Some(inference_config) = bedrock_request.inference_config {
-                        retry_builder = retry_builder.inference_config(inference_config);
-                    }
-                    return match retry_builder.send().await {
-                        Ok(response) => {
-                            read_bedrock_stream(response.stream, turn, name_map.clone()).await
-                        }
-                        Err(retry_error) => Err(bedrock_sdk_error(&retry_error)),
-                    };
+                    mark_prompt_cache_unsupported(
+                        &discovery,
+                        selection.cache_key.as_ref(),
+                        model_id,
+                        &error.message,
+                    );
+                    return retry_bedrock_without_prompt_cache(
+                        &client,
+                        request,
+                        model_id,
+                        turn,
+                        name_map.clone(),
+                    )
+                    .await;
                 }
                 if !selection.explicit
                     && streaming_tool_use_unsupported(&error)
@@ -280,6 +283,35 @@ async fn stream_bedrock_turn_inner(
             "Bedrock model discovery returned no usable streaming tool-use models; set BCODE_BEDROCK_MODEL or configure a Bedrock model profile",
         )
     }))
+}
+
+async fn retry_bedrock_without_prompt_cache(
+    client: &Client,
+    request: &ModelTurnRequest,
+    model_id: &str,
+    turn: &TurnState,
+    name_map: BTreeMap<String, String>,
+) -> Result<StreamOutcome, ProviderError> {
+    let mut retry_request = request.clone();
+    retry_request.prompt_cache = bcode_model::PromptCacheHints::default();
+    let bedrock_request = build_converse_request(&retry_request, model_id.to_string())?;
+    let mut retry_builder = client
+        .converse_stream()
+        .model_id(bedrock_request.model_id)
+        .set_messages(Some(bedrock_request.messages));
+    if !bedrock_request.system.is_empty() {
+        retry_builder = retry_builder.set_system(Some(bedrock_request.system));
+    }
+    if let Some(tool_config) = bedrock_request.tool_config {
+        retry_builder = retry_builder.tool_config(tool_config);
+    }
+    if let Some(inference_config) = bedrock_request.inference_config {
+        retry_builder = retry_builder.inference_config(inference_config);
+    }
+    match retry_builder.send().await {
+        Ok(response) => read_bedrock_stream(response.stream, turn, name_map).await,
+        Err(retry_error) => Err(bedrock_sdk_error(&retry_error)),
+    }
 }
 
 async fn bedrock_client(settings: &Settings) -> Client {
@@ -1062,6 +1094,8 @@ struct PersistedCompatibilityEntry {
     key: DiscoveryCacheKey,
     #[serde(default)]
     unsupported_streaming_tool_models: BTreeMap<String, PersistedModelIncompatibility>,
+    #[serde(default)]
+    unsupported_prompt_cache_models: BTreeMap<String, PersistedModelIncompatibility>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1077,6 +1111,7 @@ struct CachedDiscovery {
     discovered_at: Instant,
     discovery: ModelDiscovery,
     unsupported_streaming_tool_models: BTreeSet<String>,
+    unsupported_prompt_cache_models: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1176,13 +1211,22 @@ fn store_discovery(
             .get(&key)
             .map(|cached| cached.unsupported_streaming_tool_models.clone())
             .unwrap_or_default();
-        unsupported_streaming_tool_models.extend(cache.compatibility.unsupported_for(&key));
+        let mut unsupported_prompt_cache_models = cache
+            .entries
+            .get(&key)
+            .map(|cached| cached.unsupported_prompt_cache_models.clone())
+            .unwrap_or_default();
+        unsupported_streaming_tool_models
+            .extend(cache.compatibility.unsupported_streaming_for(&key));
+        unsupported_prompt_cache_models
+            .extend(cache.compatibility.unsupported_prompt_cache_for(&key));
         cache.entries.insert(
             key,
             CachedDiscovery {
                 discovered_at: Instant::now(),
                 discovery,
                 unsupported_streaming_tool_models,
+                unsupported_prompt_cache_models,
             },
         );
     }
@@ -1203,10 +1247,9 @@ fn mark_streaming_tool_unsupported(
                 .unsupported_streaming_tool_models
                 .insert(model_id.to_string());
         }
-        cache.compatibility.mark_unsupported(
+        cache.compatibility.mark_streaming_tool_unsupported(
             key,
             model_id,
-            STREAMING_TOOL_UNSUPPORTED_REASON,
             message,
             now_unix_seconds(),
         );
@@ -1235,8 +1278,57 @@ fn prompt_cache_rejected(error: &ProviderError) -> bool {
         && error.message.to_ascii_lowercase().contains("cache")
 }
 
+fn prompt_cache_known_unsupported(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: Option<&DiscoveryCacheKey>,
+    model_id: &str,
+) -> bool {
+    let Some(key) = key else {
+        return false;
+    };
+    cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.entries.get(key).cloned())
+        .is_some_and(|entry| entry.unsupported_prompt_cache_models.contains(model_id))
+}
+
+fn mark_prompt_cache_unsupported(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: Option<&DiscoveryCacheKey>,
+    model_id: &str,
+    message: &str,
+) {
+    let Some(key) = key else {
+        return;
+    };
+    let compatibility = cache.lock().ok().map(|mut cache| {
+        if let Some(cached) = cache.entries.get_mut(key) {
+            cached
+                .unsupported_prompt_cache_models
+                .insert(model_id.to_string());
+        }
+        cache.compatibility.mark_prompt_cache_unsupported(
+            key,
+            model_id,
+            message,
+            now_unix_seconds(),
+        );
+        cache.compatibility.clone()
+    });
+    if let Some(compatibility) = compatibility
+        && let Err(error) = save_compatibility_cache(&compatibility)
+    {
+        tracing::warn!(
+            target: "bcode_bedrock::compatibility",
+            error = %error.message,
+            "failed to save Bedrock compatibility cache"
+        );
+    }
+}
+
 impl PersistedCompatibilityCache {
-    fn unsupported_for(&self, key: &DiscoveryCacheKey) -> BTreeSet<String> {
+    fn unsupported_streaming_for(&self, key: &DiscoveryCacheKey) -> BTreeSet<String> {
         self.entries
             .iter()
             .find(|entry| &entry.key == key)
@@ -1250,6 +1342,54 @@ impl PersistedCompatibilityCache {
             .unwrap_or_default()
     }
 
+    fn unsupported_prompt_cache_for(&self, key: &DiscoveryCacheKey) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.key == key)
+            .map(|entry| {
+                entry
+                    .unsupported_prompt_cache_models
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn mark_streaming_tool_unsupported(
+        &mut self,
+        key: &DiscoveryCacheKey,
+        model_id: &str,
+        message: &str,
+        now: u64,
+    ) {
+        self.mark_unsupported(
+            key,
+            model_id,
+            STREAMING_TOOL_UNSUPPORTED_REASON,
+            message,
+            now,
+            true,
+        );
+    }
+
+    fn mark_prompt_cache_unsupported(
+        &mut self,
+        key: &DiscoveryCacheKey,
+        model_id: &str,
+        message: &str,
+        now: u64,
+    ) {
+        self.mark_unsupported(
+            key,
+            model_id,
+            PROMPT_CACHE_UNSUPPORTED_REASON,
+            message,
+            now,
+            false,
+        );
+    }
+
     fn mark_unsupported(
         &mut self,
         key: &DiscoveryCacheKey,
@@ -1257,10 +1397,15 @@ impl PersistedCompatibilityCache {
         reason: &str,
         message: &str,
         now: u64,
+        streaming_tool: bool,
     ) {
         let entry = self.entry_mut(key.clone());
-        entry
-            .unsupported_streaming_tool_models
+        let models = if streaming_tool {
+            &mut entry.unsupported_streaming_tool_models
+        } else {
+            &mut entry.unsupported_prompt_cache_models
+        };
+        models
             .entry(model_id.to_string())
             .and_modify(|model| {
                 model.message = message.to_string();
@@ -1279,9 +1424,14 @@ impl PersistedCompatibilityCache {
             entry.unsupported_streaming_tool_models.retain(|_, model| {
                 now.saturating_sub(model.last_seen_unix_seconds) <= COMPATIBILITY_CACHE_TTL_SECONDS
             });
+            entry.unsupported_prompt_cache_models.retain(|_, model| {
+                now.saturating_sub(model.last_seen_unix_seconds) <= COMPATIBILITY_CACHE_TTL_SECONDS
+            });
         }
-        self.entries
-            .retain(|entry| !entry.unsupported_streaming_tool_models.is_empty());
+        self.entries.retain(|entry| {
+            !entry.unsupported_streaming_tool_models.is_empty()
+                || !entry.unsupported_prompt_cache_models.is_empty()
+        });
     }
 
     fn entry_mut(&mut self, key: DiscoveryCacheKey) -> &mut PersistedCompatibilityEntry {
@@ -1291,6 +1441,7 @@ impl PersistedCompatibilityCache {
         self.entries.push(PersistedCompatibilityEntry {
             key,
             unsupported_streaming_tool_models: BTreeMap::new(),
+            unsupported_prompt_cache_models: BTreeMap::new(),
         });
         self.entries.last_mut().expect("entry was just inserted")
     }
@@ -1810,6 +1961,7 @@ mod tests {
                 cache_system_prompt: true,
                 cache_tools: true,
             },
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
             metadata: BTreeMap::default(),
         };
 
@@ -1830,6 +1982,24 @@ mod tests {
     }
 
     #[test]
+    fn persisted_compatibility_tracks_prompt_cache_unsupported() {
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".to_string(),
+            aws_profile: None,
+            endpoint_url: None,
+        };
+        let mut compatibility = PersistedCompatibilityCache::default();
+        compatibility.mark_prompt_cache_unsupported(&key, "model", "no cache", 10);
+
+        assert!(
+            compatibility
+                .unsupported_prompt_cache_for(&key)
+                .contains("model")
+        );
+        assert!(compatibility.unsupported_streaming_for(&key).is_empty());
+    }
+
+    #[test]
     fn model_list_includes_default_first() {
         let mut settings = Settings::resolve(None);
         settings.default_model = Some("model-b".to_string());
@@ -1846,13 +2016,7 @@ mod tests {
             endpoint_url: None,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
-        compatibility.mark_unsupported(
-            &key,
-            "bad-model",
-            STREAMING_TOOL_UNSUPPORTED_REASON,
-            "unsupported",
-            10,
-        );
+        compatibility.mark_streaming_tool_unsupported(&key, "bad-model", "unsupported", 10);
         let discovery = ModelDiscovery {
             models: model_infos_from_ids(
                 &["bad-model".to_string(), "good-model".to_string()],
@@ -1860,7 +2024,8 @@ mod tests {
             ),
             default_model_id: Some("bad-model".to_string()),
         };
-        let filtered = filtered_discovery(&discovery, &compatibility.unsupported_for(&key));
+        let filtered =
+            filtered_discovery(&discovery, &compatibility.unsupported_streaming_for(&key));
         assert_eq!(filtered.default_model_id, Some("good-model".to_string()));
     }
 
@@ -1872,8 +2037,8 @@ mod tests {
             endpoint_url: None,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
-        compatibility.mark_unsupported(&key, "model", "reason", "first", 10);
-        compatibility.mark_unsupported(&key, "model", "reason", "second", 20);
+        compatibility.mark_streaming_tool_unsupported(&key, "model", "first", 10);
+        compatibility.mark_streaming_tool_unsupported(&key, "model", "second", 20);
         let record = compatibility.entries[0]
             .unsupported_streaming_tool_models
             .get("model")
@@ -1891,16 +2056,15 @@ mod tests {
             endpoint_url: None,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
-        compatibility.mark_unsupported(&key, "stale", "reason", "old", 1);
-        compatibility.mark_unsupported(
+        compatibility.mark_streaming_tool_unsupported(&key, "stale", "old", 1);
+        compatibility.mark_streaming_tool_unsupported(
             &key,
             "fresh",
-            "reason",
             "new",
             COMPATIBILITY_CACHE_TTL_SECONDS + 1,
         );
         compatibility.prune_expired(COMPATIBILITY_CACHE_TTL_SECONDS + 2);
-        let unsupported = compatibility.unsupported_for(&key);
+        let unsupported = compatibility.unsupported_streaming_for(&key);
         assert!(!unsupported.contains("stale"));
         assert!(unsupported.contains("fresh"));
     }
@@ -1915,10 +2079,10 @@ mod tests {
             endpoint_url: Some("https://example.com".to_string()),
         };
         let mut compatibility = PersistedCompatibilityCache::default();
-        compatibility.mark_unsupported(&key, "model", "reason", "message", now_unix_seconds());
+        compatibility.mark_streaming_tool_unsupported(&key, "model", "message", now_unix_seconds());
         save_compatibility_cache_to_path(&path, &compatibility).expect("cache should save");
         let loaded = load_compatibility_cache_from_path(&path).expect("cache should load");
-        assert!(loaded.unsupported_for(&key).contains("model"));
+        assert!(loaded.unsupported_streaming_for(&key).contains("model"));
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
