@@ -162,6 +162,10 @@ pub fn active_tools_for(config: &AgentConfig) -> Vec<String> {
     let mut tools = BTreeSet::from([
         "filesystem.read".to_string(),
         "filesystem.exists".to_string(),
+        "filesystem.list".to_string(),
+        "filesystem.find".to_string(),
+        "filesystem.grep".to_string(),
+        "filesystem.stat".to_string(),
     ]);
     for (tool, enabled) in &config.tools {
         if *enabled {
@@ -463,7 +467,9 @@ fn tool_aliases(tool_name: &str) -> Vec<String> {
         "shell.run" => aliases.push("bash".to_string()),
         "filesystem.write" => aliases.push("write".to_string()),
         "filesystem.edit" => aliases.push("edit".to_string()),
-        "filesystem.read" | "filesystem.exists" => aliases.push("read".to_string()),
+        "filesystem.read" | "filesystem.exists" | "filesystem.stat" => {
+            aliases.push("read".to_string());
+        }
         "filesystem.grep" => aliases.push("grep".to_string()),
         "filesystem.find" => aliases.push("find".to_string()),
         "filesystem.list" => aliases.push("ls".to_string()),
@@ -480,10 +486,12 @@ pub fn normalize_tool_names(tool: &str) -> Vec<String> {
         "read" => vec![
             "filesystem.read".to_string(),
             "filesystem.exists".to_string(),
+            "filesystem.stat".to_string(),
         ],
         "grep" => vec!["filesystem.grep".to_string()],
         "find" => vec!["filesystem.find".to_string()],
         "ls" => vec!["filesystem.list".to_string()],
+        "stat" => vec!["filesystem.stat".to_string()],
         "write" => vec!["filesystem.write".to_string()],
         "edit" => vec!["filesystem.edit".to_string()],
         other => vec![other.to_string()],
@@ -629,6 +637,20 @@ mod tests {
             arguments: json!({ "command": command }),
             cwd: Some("/tmp/project".to_string()),
         }
+    }
+
+    #[test]
+    fn active_tools_include_typed_read_only_tools_by_default() {
+        let config = default_config();
+        let plan = agent_config(&config, PLAN_AGENT);
+        let tools = active_tools_for(&plan);
+
+        assert!(tools.contains(&"filesystem.read".to_string()));
+        assert!(tools.contains(&"filesystem.list".to_string()));
+        assert!(tools.contains(&"filesystem.find".to_string()));
+        assert!(tools.contains(&"filesystem.grep".to_string()));
+        assert!(tools.contains(&"filesystem.stat".to_string()));
+        assert!(!tools.contains(&"filesystem.write".to_string()));
     }
 
     #[test]
