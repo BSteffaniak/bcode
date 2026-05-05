@@ -12,8 +12,8 @@ use bcode_model::{
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
     OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
-    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse,
-    StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestContext,
+    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -36,6 +36,8 @@ const PROVIDER_ID: &str = "bcode.openai-compatible";
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const OPENAI_DIALECT_SETTING: &str = "dialect";
+const OPENAI_NAMESPACED_DIALECT_SETTING: &str = "openai.dialect";
 
 /// OpenAI-compatible model provider plugin.
 pub struct OpenAiCompatibleProviderPlugin {
@@ -168,11 +170,41 @@ impl OpenAiCompatibleProviderPlugin {
 struct Settings {
     auth: AuthSettings,
     auth_diagnostics: AuthDiagnostics,
+    dialect: OpenAiCompatibleDialect,
     base_url: String,
     default_model: Option<String>,
     fallback_model: String,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiCompatibleDialect {
+    ChatCompletions,
+    ResponsesApi,
+    ChatGptCodex,
+}
+
+impl OpenAiCompatibleDialect {
+    const fn supports_native_conversation_reuse(self) -> bool {
+        matches!(self, Self::ResponsesApi)
+    }
+
+    const fn projects_reused_history(self) -> bool {
+        self.supports_native_conversation_reuse()
+    }
+
+    const fn uses_codex_request_shape(self) -> bool {
+        matches!(self, Self::ChatGptCodex)
+    }
+
+    const fn metadata_value(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::ResponsesApi => "responses_api",
+            Self::ChatGptCodex => "chatgpt_codex",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -241,11 +273,26 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<ResponsesTextOptions>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    include: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesTextOptions {
+    verbosity: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -281,6 +328,7 @@ struct ResponsesTool {
     name: String,
     description: String,
     parameters: serde_json::Value,
+    strict: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -484,7 +532,7 @@ async fn stream_chat_completion_inner(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
-    let mut settings = settings();
+    let mut settings = settings_for_context(&request.provider_context);
     refresh_chatgpt_auth_if_needed(&mut settings).await?;
     if matches!(settings.auth, AuthSettings::Missing) {
         return Err(provider_error(
@@ -504,20 +552,35 @@ async fn stream_chat_completion_inner(
             )
         })?;
     let model_id = resolve_model_id_for_turn(&settings, request, turn).await;
-    match &settings.auth {
-        AuthSettings::ApiKey(api_key) => {
+    match (&settings.auth, settings.dialect) {
+        (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ChatCompletions) => {
             let response =
                 send_chat_completion_request(&client, &settings, api_key, request, &model_id)
                     .await?;
             read_stream_events(response, turn, request).await
         }
-        AuthSettings::ChatGpt { access_token, .. } => {
+        (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ResponsesApi) => {
+            let response =
+                send_responses_request(&client, &settings, api_key, request, &model_id).await?;
+            read_responses_stream_events(response, turn, request, settings.dialect).await
+        }
+        (AuthSettings::ChatGpt { access_token, .. }, OpenAiCompatibleDialect::ChatGptCodex) => {
             let response =
                 send_responses_request(&client, &settings, access_token, request, &model_id)
                     .await?;
-            read_responses_stream_events(response, turn, request).await
+            read_responses_stream_events(response, turn, request, settings.dialect).await
         }
-        AuthSettings::Missing => unreachable!("missing auth handled above"),
+        (AuthSettings::ChatGpt { .. }, _) => Err(provider_error(
+            "invalid_dialect_for_auth",
+            ProviderErrorCategory::InvalidRequest,
+            "ChatGPT subscription auth requires the chatgpt_codex dialect",
+        )),
+        (AuthSettings::ApiKey(_), OpenAiCompatibleDialect::ChatGptCodex) => Err(provider_error(
+            "invalid_dialect_for_auth",
+            ProviderErrorCategory::InvalidRequest,
+            "chatgpt_codex dialect requires ChatGPT subscription auth; use responses_api or chat_completions with API-key auth",
+        )),
+        (AuthSettings::Missing, _) => unreachable!("missing auth handled above"),
     }
 }
 
@@ -570,7 +633,7 @@ async fn send_chat_completion_request(
         stream_options: Some(ChatStreamOptions {
             include_usage: true,
         }),
-        tools: model_tools_to_chat_tools(request),
+        tools: model_tools_to_chat_tools(request, settings.dialect)?,
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
@@ -613,15 +676,19 @@ async fn send_responses_request(
     request: &ModelTurnRequest,
     model_id: &str,
 ) -> Result<reqwest::Response, ProviderError> {
-    let url = OPENAI_CODEX_API_ENDPOINT;
-    let request_body = build_responses_request(settings, request, model_id);
+    let url = responses_endpoint(settings);
+    let request_body = build_responses_request(settings, request, model_id)?;
     let mut builder = client
         .post(url)
         .bearer_auth(access_token)
         .header("originator", "bcode")
         .header("User-Agent", "bcode/0.0.1")
-        .header("session_id", request.session_id.to_string())
-        .json(&request_body);
+        .header("accept", "text/event-stream")
+        .header("session_id", request.session_id.to_string());
+    if settings.dialect.uses_codex_request_shape() {
+        builder = builder.header("OpenAI-Beta", "responses=experimental");
+    }
+    let mut builder = builder.json(&request_body);
     if let AuthSettings::ChatGpt {
         account_id: Some(account_id),
         ..
@@ -654,6 +721,7 @@ async fn read_stream_events(
     request: &ModelTurnRequest,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut buffer = String::new();
+    let name_map = projected_tool_name_map(request, OpenAiCompatibleDialect::ChatCompletions)?;
     let mut tool_calls = BTreeMap::new();
     loop {
         if turn.is_cancelled() {
@@ -671,7 +739,7 @@ async fn read_stream_events(
                     return Ok(StreamOutcome::Finished);
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-                let outcome = process_stream_buffer(&mut buffer, turn, request, &mut tool_calls)?;
+                let outcome = process_stream_buffer(&mut buffer, turn, &mut tool_calls, &name_map)?;
                 if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
                     return Ok(outcome);
                 }
@@ -685,8 +753,10 @@ async fn read_responses_stream_events(
     mut response: reqwest::Response,
     turn: &TurnState,
     request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut buffer = String::new();
+    let name_map = projected_tool_name_map(request, dialect)?;
     let mut tool_calls = BTreeMap::new();
     let mut saw_tool_call = false;
     loop {
@@ -708,9 +778,10 @@ async fn read_responses_stream_events(
                 let outcome = process_responses_stream_buffer(
                     &mut buffer,
                     turn,
-                    request,
+                    dialect,
                     &mut tool_calls,
                     &mut saw_tool_call,
+                    &name_map,
                 )?;
                 if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
                     return Ok(outcome);
@@ -724,9 +795,10 @@ async fn read_responses_stream_events(
 fn process_responses_stream_buffer(
     buffer: &mut String,
     turn: &TurnState,
-    request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
     saw_tool_call: &mut bool,
+    name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     while let Some(position) = buffer.find('\n') {
         let mut line = buffer[..position].to_string();
@@ -734,8 +806,14 @@ fn process_responses_stream_buffer(
             line.pop();
         }
         buffer.drain(..=position);
-        let outcome =
-            process_responses_stream_line(line.trim(), turn, request, tool_calls, saw_tool_call)?;
+        let outcome = process_responses_stream_line(
+            line.trim(),
+            turn,
+            dialect,
+            tool_calls,
+            saw_tool_call,
+            name_map,
+        )?;
         if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
             return Ok(outcome);
         }
@@ -746,9 +824,10 @@ fn process_responses_stream_buffer(
 fn process_responses_stream_line(
     line: &str,
     turn: &TurnState,
-    request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
     saw_tool_call: &mut bool,
+    name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     let Some(data) = line.strip_prefix("data: ") else {
         return Ok(StreamOutcome::Cancelled);
@@ -772,7 +851,7 @@ fn process_responses_stream_line(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     match event_type {
-        "response.output_text.delta" => {
+        "response.output_text.delta" | "response.refusal.delta" => {
             if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
                 && !delta.is_empty()
             {
@@ -791,25 +870,29 @@ fn process_responses_stream_line(
             }
         }
         "response.output_item.added" | "response.output_item.done" => {
-            process_responses_output_item(&event, turn, request, tool_calls, saw_tool_call);
+            process_responses_output_item(&event, turn, tool_calls, saw_tool_call, name_map);
         }
         "response.function_call_arguments.delta" => {
-            process_responses_function_arguments_delta(&event, tool_calls);
+            process_responses_function_arguments_delta(&event, turn, tool_calls);
         }
-        "response.completed" => {
+        "response.function_call_arguments.done" => {
+            process_responses_function_arguments_done(&event, tool_calls);
+        }
+        "response.completed" | "response.done" | "response.incomplete" => {
             if let Some(usage) = token_usage_from_responses_event(&event) {
                 turn.push(ProviderTurnEvent::Usage { usage });
             }
             let outcome = if *saw_tool_call {
-                finish_tool_calls(turn, tool_calls, &openai_tool_name_map(request))?;
+                finish_tool_calls(turn, tool_calls, name_map, dialect)?;
                 StreamOutcome::ToolCall
             } else {
                 StreamOutcome::Finished
             };
-            if let Some(response_id) = event
-                .get("response")
-                .and_then(|response| response.get("id"))
-                .and_then(serde_json::Value::as_str)
+            if dialect.supports_native_conversation_reuse()
+                && let Some(response_id) = event
+                    .get("response")
+                    .and_then(|response| response.get("id"))
+                    .and_then(serde_json::Value::as_str)
             {
                 turn.push(ProviderTurnEvent::ProviderMetadata {
                     key: "provider_response_id".to_string(),
@@ -839,9 +922,9 @@ fn process_responses_stream_line(
 fn process_responses_output_item(
     event: &serde_json::Value,
     turn: &TurnState,
-    request: &ModelTurnRequest,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
     saw_tool_call: &mut bool,
+    name_map: &BTreeMap<String, String>,
 ) {
     let Some(item) = event.get("item") else {
         return;
@@ -850,12 +933,7 @@ fn process_responses_output_item(
         return;
     }
     *saw_tool_call = true;
-    let output_index = event
-        .get("output_index")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|index| u32::try_from(index).ok())
-        .unwrap_or_else(|| u32::try_from(tool_calls.len()).unwrap_or(u32::MAX));
-    let name_map = openai_tool_name_map(request);
+    let output_index = responses_output_index(event, item, tool_calls);
     let entry = tool_calls.entry(output_index).or_default();
     if let Some(call_id) = item.get("call_id").and_then(serde_json::Value::as_str) {
         entry.id = Some(call_id.to_string());
@@ -873,14 +951,37 @@ fn process_responses_output_item(
     {
         turn.push(ProviderTurnEvent::ToolCallStarted {
             call_id: id.clone(),
-            name: original_tool_name(name, &name_map),
+            name: original_tool_name(name, name_map),
         });
         entry.started = true;
     }
 }
 
+fn responses_output_index(
+    event: &serde_json::Value,
+    item: &serde_json::Value,
+    tool_calls: &BTreeMap<u32, ToolCallAccumulator>,
+) -> u32 {
+    if let Some(output_index) = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+    {
+        return output_index;
+    }
+    let call_id = item.get("call_id").and_then(serde_json::Value::as_str);
+    if let Some((index, _)) = tool_calls
+        .iter()
+        .find(|(_, call)| call.id.as_deref() == call_id)
+    {
+        return *index;
+    }
+    u32::try_from(tool_calls.len()).unwrap_or(u32::MAX)
+}
+
 fn process_responses_function_arguments_delta(
     event: &serde_json::Value,
+    turn: &TurnState,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
 ) {
     let output_index = event
@@ -889,19 +990,36 @@ fn process_responses_function_arguments_delta(
         .and_then(|index| u32::try_from(index).ok())
         .unwrap_or(0);
     if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
-        tool_calls
-            .entry(output_index)
-            .or_default()
-            .arguments
-            .push_str(delta);
+        let entry = tool_calls.entry(output_index).or_default();
+        entry.arguments.push_str(delta);
+        if let Some(call_id) = &entry.id {
+            turn.push(ProviderTurnEvent::ToolCallDelta {
+                call_id: call_id.clone(),
+                delta: delta.to_string(),
+            });
+        }
+    }
+}
+
+fn process_responses_function_arguments_done(
+    event: &serde_json::Value,
+    tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+) {
+    let output_index = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(0);
+    if let Some(arguments) = event.get("arguments").and_then(serde_json::Value::as_str) {
+        tool_calls.entry(output_index).or_default().arguments = arguments.to_string();
     }
 }
 
 fn process_stream_buffer(
     buffer: &mut String,
     turn: &TurnState,
-    request: &ModelTurnRequest,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     while let Some(position) = buffer.find('\n') {
         let mut line = buffer[..position].to_string();
@@ -909,7 +1027,7 @@ fn process_stream_buffer(
             line.pop();
         }
         buffer.drain(..=position);
-        let outcome = process_stream_line(&line, turn, request, tool_calls)?;
+        let outcome = process_stream_line(&line, turn, tool_calls, name_map)?;
         if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
             return Ok(outcome);
         }
@@ -920,8 +1038,8 @@ fn process_stream_buffer(
 fn process_stream_line(
     line: &str,
     turn: &TurnState,
-    request: &ModelTurnRequest,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     let Some(data) = line.strip_prefix("data: ") else {
         return Ok(StreamOutcome::Cancelled);
@@ -956,17 +1074,21 @@ fn process_stream_line(
             usage: token_usage_from_openai_usage(usage),
         });
     }
-    let name_map = openai_tool_name_map(request);
     for choice in chunk.choices {
         if let Some(content) = choice.delta.content
             && !content.is_empty()
         {
             turn.push(ProviderTurnEvent::TextDelta { text: content });
         }
-        process_tool_call_deltas(turn, &choice.delta.tool_calls, tool_calls, &name_map);
+        process_tool_call_deltas(turn, &choice.delta.tool_calls, tool_calls, name_map);
         if let Some(finish_reason) = choice.finish_reason {
             if finish_reason == "tool_calls" {
-                finish_tool_calls(turn, tool_calls, &name_map)?;
+                finish_tool_calls(
+                    turn,
+                    tool_calls,
+                    name_map,
+                    OpenAiCompatibleDialect::ChatCompletions,
+                )?;
                 return Ok(StreamOutcome::ToolCall);
             }
             return Ok(StreamOutcome::Finished);
@@ -1029,6 +1151,12 @@ fn process_tool_call_deltas(
             }
             if let Some(arguments) = &function.arguments {
                 entry.arguments.push_str(arguments);
+                if let Some(call_id) = &entry.id {
+                    turn.push(ProviderTurnEvent::ToolCallDelta {
+                        call_id: call_id.clone(),
+                        delta: arguments.clone(),
+                    });
+                }
             }
         }
         if !entry.started
@@ -1047,6 +1175,7 @@ fn finish_tool_calls(
     turn: &TurnState,
     tool_calls: &BTreeMap<u32, ToolCallAccumulator>,
     name_map: &BTreeMap<String, String>,
+    dialect: OpenAiCompatibleDialect,
 ) -> Result<(), ProviderError> {
     for accumulator in tool_calls.values() {
         let id = accumulator.id.clone().ok_or_else(|| {
@@ -1056,33 +1185,86 @@ fn finish_tool_calls(
                 "provider emitted a tool call without an id",
             )
         })?;
-        let name = accumulator.name.clone().ok_or_else(|| {
+        let provider_name = accumulator.name.clone().ok_or_else(|| {
             provider_error(
                 "missing_tool_call_name",
                 ProviderErrorCategory::ProviderInternal,
                 "provider emitted a tool call without a function name",
             )
         })?;
-        let arguments = if accumulator.arguments.trim().is_empty() {
-            serde_json::Value::Object(serde_json::Map::new())
-        } else {
-            serde_json::from_str(&accumulator.arguments).map_err(|error| {
-                provider_error(
-                    "tool_arguments_decode_failed",
-                    ProviderErrorCategory::ProviderInternal,
-                    error.to_string(),
-                )
-            })?
-        };
+        let name = original_tool_name(&provider_name, name_map);
+        let arguments = parse_tool_arguments(&accumulator.arguments, &id, &name)?;
         turn.push(ProviderTurnEvent::ToolCallFinished {
             call: ToolCall {
                 id,
-                name: original_tool_name(&name, name_map),
-                arguments,
+                name: name.clone(),
+                arguments: provider_arguments_to_bcode(&name, arguments, dialect),
             },
         });
     }
     Ok(())
+}
+
+fn parse_tool_arguments(
+    arguments: &str,
+    call_id: &str,
+    tool_name: &str,
+) -> Result<serde_json::Value, ProviderError> {
+    if arguments.trim().is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_str(arguments).map_err(|error| {
+        provider_error(
+            "tool_arguments_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            format!("failed to decode arguments for tool call {call_id} ({tool_name}): {error}"),
+        )
+    })
+}
+
+fn provider_arguments_to_bcode(
+    tool_name: &str,
+    arguments: serde_json::Value,
+    dialect: OpenAiCompatibleDialect,
+) -> serde_json::Value {
+    if dialect != OpenAiCompatibleDialect::ChatGptCodex || tool_name != "shell.run" {
+        return arguments;
+    }
+    normalize_shell_run_arguments(arguments)
+}
+
+fn normalize_shell_run_arguments(arguments: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut object) = arguments else {
+        return arguments;
+    };
+    if !object.contains_key("command")
+        && let Some(command) = object.remove("cmd")
+    {
+        object.insert("command".to_string(), command);
+    }
+    if !object.contains_key("cwd")
+        && let Some(cwd) = object.remove("workdir")
+    {
+        object.insert("cwd".to_string(), cwd);
+    }
+    if !object.contains_key("timeout_ms")
+        && let Some(timeout) = object.remove("timeout")
+    {
+        object.insert("timeout_ms".to_string(), timeout_seconds_to_millis(timeout));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn timeout_seconds_to_millis(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .map_or(serde_json::Value::Number(number), |millis| {
+                serde_json::Value::Number(serde_json::Number::from(millis))
+            }),
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,20 +1281,44 @@ fn build_responses_request(
     settings: &Settings,
     request: &ModelTurnRequest,
     model_id: &str,
-) -> ResponsesRequest {
-    let projection = responses_projection(request, responses_instruction_strategy(settings));
-    ResponsesRequest {
+) -> Result<ResponsesRequest, ProviderError> {
+    let previous_response_id = responses_previous_response_id(settings, request);
+    let projection = responses_projection(
+        request,
+        responses_instruction_strategy(settings),
+        settings.dialect.projects_reused_history() && previous_response_id.is_some(),
+        settings.dialect,
+    );
+    Ok(ResponsesRequest {
         model: model_id.to_string(),
         instructions: projection.instructions,
         input: projection.input,
         stream: true,
         store: responses_store_enabled(settings, request),
-        previous_response_id: responses_previous_response_id(settings, request),
-        tools: model_tools_to_responses_tools(request),
+        previous_response_id,
+        tools: model_tools_to_responses_tools(request, settings.dialect)?,
+        tool_choice: settings
+            .dialect
+            .uses_codex_request_shape()
+            .then_some("auto"),
+        parallel_tool_calls: settings.dialect.uses_codex_request_shape().then_some(true),
+        text: settings
+            .dialect
+            .uses_codex_request_shape()
+            .then_some(ResponsesTextOptions { verbosity: "low" }),
+        include: if settings.dialect.uses_codex_request_shape() {
+            vec!["reasoning.encrypted_content"]
+        } else {
+            Vec::new()
+        },
+        prompt_cache_key: settings
+            .dialect
+            .uses_codex_request_shape()
+            .then(|| request.session_id.to_string()),
         temperature: request.parameters.temperature,
         max_output_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
-    }
+    })
 }
 
 const fn responses_instruction_strategy(_settings: &Settings) -> ResponsesInstructionStrategy {
@@ -1120,7 +1326,7 @@ const fn responses_instruction_strategy(_settings: &Settings) -> ResponsesInstru
 }
 
 const fn responses_store_enabled(settings: &Settings, request: &ModelTurnRequest) -> bool {
-    !matches!(settings.auth, AuthSettings::ChatGpt { .. })
+    settings.dialect.supports_native_conversation_reuse()
         && request.conversation_reuse.mode.is_enabled()
 }
 
@@ -1128,7 +1334,9 @@ fn responses_previous_response_id(
     settings: &Settings,
     request: &ModelTurnRequest,
 ) -> Option<String> {
-    (!matches!(settings.auth, AuthSettings::ChatGpt { .. }))
+    settings
+        .dialect
+        .supports_native_conversation_reuse()
         .then(|| {
             request
                 .conversation_reuse
@@ -1141,9 +1349,11 @@ fn responses_previous_response_id(
 fn responses_projection(
     request: &ModelTurnRequest,
     strategy: ResponsesInstructionStrategy,
+    project_reused_history: bool,
+    dialect: OpenAiCompatibleDialect,
 ) -> ResponsesProjection {
     let instruction_bundle = response_instruction_bundle(request);
-    let input = model_messages_to_responses_input_for_reuse(request);
+    let input = model_messages_to_responses_input(request, project_reused_history, dialect);
     let instructions = match strategy {
         ResponsesInstructionStrategy::TopLevelInstructions => instruction_bundle,
     };
@@ -1171,28 +1381,37 @@ fn response_instruction_bundle(request: &ModelTurnRequest) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-fn model_messages_to_responses_input_for_reuse(
+fn model_messages_to_responses_input(
     request: &ModelTurnRequest,
+    project_reused_history: bool,
+    dialect: OpenAiCompatibleDialect,
 ) -> Vec<ResponsesInputItem> {
-    let start = request
-        .conversation_reuse
-        .previous_provider_response_id
-        .as_ref()
-        .and(request.conversation_reuse.new_messages_start_index)
+    let start = project_reused_history
+        .then(|| {
+            request
+                .conversation_reuse
+                .previous_provider_response_id
+                .as_ref()
+                .and(request.conversation_reuse.new_messages_start_index)
+        })
+        .flatten()
         .unwrap_or_default();
     request
         .messages
         .iter()
         .skip(start.min(request.messages.len()))
-        .flat_map(model_message_to_responses_input)
+        .flat_map(|message| model_message_to_responses_input(message, dialect))
         .collect()
 }
 
-fn model_message_to_responses_input(message: &ModelMessage) -> Vec<ResponsesInputItem> {
+fn model_message_to_responses_input(
+    message: &ModelMessage,
+    dialect: OpenAiCompatibleDialect,
+) -> Vec<ResponsesInputItem> {
     match message.role {
         MessageRole::System => Vec::new(),
         MessageRole::User => responses_text_message("user", message, true),
-        MessageRole::Assistant => responses_assistant_items(message),
+        MessageRole::Assistant => responses_assistant_items(message, dialect),
         MessageRole::Tool => responses_tool_items(message),
     }
 }
@@ -1217,12 +1436,15 @@ fn responses_text_message(
     }]
 }
 
-fn responses_assistant_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
+fn responses_assistant_items(
+    message: &ModelMessage,
+    dialect: OpenAiCompatibleDialect,
+) -> Vec<ResponsesInputItem> {
     let mut items = responses_text_message("assistant", message, false);
     items.extend(message.content.iter().filter_map(|block| match block {
         ContentBlock::ToolCall { call } => Some(ResponsesInputItem::FunctionCall {
             call_id: call.id.clone(),
-            name: openai_tool_name(&call.name),
+            name: provider_tool_name(&call.name, dialect),
             arguments: serde_json::to_string(&call.arguments).unwrap_or_default(),
         }),
         _ => None,
@@ -1339,40 +1561,102 @@ fn joined_text_content(message: &ModelMessage) -> String {
         .join("\n")
 }
 
-fn model_tools_to_responses_tools(request: &ModelTurnRequest) -> Vec<ResponsesTool> {
-    request
-        .tools
-        .iter()
+fn model_tools_to_responses_tools(
+    request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
+) -> Result<Vec<ResponsesTool>, ProviderError> {
+    let tools = project_model_tools(request, dialect)?;
+    Ok(tools
+        .into_iter()
         .map(|tool| ResponsesTool {
             r#type: "function",
-            name: openai_tool_name(&tool.name),
-            description: tool.description.clone(),
-            parameters: tool.input_schema.clone(),
+            name: tool.provider_name,
+            description: tool.description,
+            parameters: tool.parameters,
+            strict: if dialect.uses_codex_request_shape() {
+                None
+            } else {
+                Some(false)
+            },
         })
-        .collect()
+        .collect())
 }
 
-fn model_tools_to_chat_tools(request: &ModelTurnRequest) -> Vec<ChatTool> {
-    request
-        .tools
-        .iter()
+fn model_tools_to_chat_tools(
+    request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
+) -> Result<Vec<ChatTool>, ProviderError> {
+    let tools = project_model_tools(request, dialect)?;
+    Ok(tools
+        .into_iter()
         .map(|tool| ChatTool {
             r#type: "function",
             function: ChatToolFunction {
-                name: openai_tool_name(&tool.name),
-                description: tool.description.clone(),
-                parameters: tool.input_schema.clone(),
+                name: tool.provider_name,
+                description: tool.description,
+                parameters: tool.parameters,
             },
         })
-        .collect()
+        .collect())
 }
 
-fn openai_tool_name_map(request: &ModelTurnRequest) -> BTreeMap<String, String> {
-    request
-        .tools
-        .iter()
-        .map(|tool| (openai_tool_name(&tool.name), tool.name.clone()))
-        .collect()
+#[derive(Debug)]
+struct ProjectedTool {
+    provider_name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+fn project_model_tools(
+    request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
+) -> Result<Vec<ProjectedTool>, ProviderError> {
+    let mut projected = Vec::with_capacity(request.tools.len());
+    let mut names = BTreeMap::new();
+    for tool in &request.tools {
+        let provider_name = provider_tool_name(&tool.name, dialect);
+        if let Some(existing) = names.insert(provider_name.clone(), tool.name.clone()) {
+            return Err(provider_error(
+                "tool_name_collision",
+                ProviderErrorCategory::InvalidRequest,
+                format!(
+                    "tools '{existing}' and '{}' both project to provider tool name '{provider_name}'",
+                    tool.name
+                ),
+            ));
+        }
+        projected.push(ProjectedTool {
+            provider_name,
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+        });
+    }
+    Ok(projected)
+}
+
+fn projected_tool_name_map(
+    request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
+) -> Result<BTreeMap<String, String>, ProviderError> {
+    let mut names = BTreeMap::new();
+    for tool in &request.tools {
+        let provider_name = provider_tool_name(&tool.name, dialect);
+        if let Some(existing) = names.insert(provider_name.clone(), tool.name.clone()) {
+            return Err(provider_error(
+                "tool_name_collision",
+                ProviderErrorCategory::InvalidRequest,
+                format!(
+                    "tools '{existing}' and '{}' both project to provider tool name '{provider_name}'",
+                    tool.name
+                ),
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn provider_tool_name(name: &str, _dialect: OpenAiCompatibleDialect) -> String {
+    openai_tool_name(name)
 }
 
 fn original_tool_name(name: &str, name_map: &BTreeMap<String, String>) -> String {
@@ -1703,13 +1987,10 @@ fn diagnostics_metadata(
             settings.auth_diagnostics.detail.clone(),
         ),
         (
-            "endpoint".to_string(),
-            if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
-                OPENAI_CODEX_API_ENDPOINT.to_string()
-            } else {
-                settings.base_url.clone()
-            },
+            "dialect".to_string(),
+            settings.dialect.metadata_value().to_string(),
         ),
+        ("endpoint".to_string(), responses_or_chat_endpoint(settings)),
         ("api_base_url".to_string(), settings.base_url.clone()),
         (
             "default_model".to_string(),
@@ -1746,6 +2027,10 @@ fn diagnostics_metadata(
 }
 
 fn settings() -> Settings {
+    settings_for_context(&ProviderRequestContext::default())
+}
+
+fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let saved = saved_openai_auth();
     let xai_mode = saved_has_xai_keys(&saved) || env_has_xai_keys();
     let chatgpt_mode = saved_openai_auth_is_chatgpt(&saved) && !xai_mode;
@@ -1778,12 +2063,17 @@ fn settings() -> Settings {
         model_ids.insert(0, default_model.clone());
     }
     let (auth, auth_diagnostics) = openai_auth_settings(&saved);
-    let base_url = first_env([
-        "BCODE_XAI_BASE_URL",
-        "XAI_BASE_URL",
-        "BCODE_OPENAI_BASE_URL",
-        "OPENAI_BASE_URL",
-    ])
+    let base_url = first_context_or_env(
+        context,
+        "base_url",
+        "openai.base_url",
+        [
+            "BCODE_XAI_BASE_URL",
+            "XAI_BASE_URL",
+            "BCODE_OPENAI_BASE_URL",
+            "OPENAI_BASE_URL",
+        ],
+    )
     .or_else(|| saved.values.get("BCODE_XAI_BASE_URL").cloned())
     .or_else(|| saved.values.get("XAI_BASE_URL").cloned())
     .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
@@ -1795,9 +2085,11 @@ fn settings() -> Settings {
             DEFAULT_BASE_URL.to_string()
         }
     });
+    let dialect = resolve_dialect(&auth, context);
     Settings {
         auth,
         auth_diagnostics,
+        dialect,
         base_url,
         default_model,
         fallback_model,
@@ -2320,6 +2612,77 @@ fn first_env<const N: usize>(names: [&str; N]) -> Option<String> {
         })
 }
 
+fn first_context_or_env<const N: usize>(
+    context: &ProviderRequestContext,
+    key: &str,
+    namespaced_key: &str,
+    env_names: [&str; N],
+) -> Option<String> {
+    context
+        .settings
+        .get(namespaced_key)
+        .or_else(|| context.settings.get(key))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .or_else(|| first_env(env_names))
+}
+
+fn resolve_dialect(
+    auth: &AuthSettings,
+    context: &ProviderRequestContext,
+) -> OpenAiCompatibleDialect {
+    if matches!(auth, AuthSettings::ChatGpt { .. }) {
+        return OpenAiCompatibleDialect::ChatGptCodex;
+    }
+    first_context_or_env(
+        context,
+        OPENAI_DIALECT_SETTING,
+        OPENAI_NAMESPACED_DIALECT_SETTING,
+        ["BCODE_OPENAI_DIALECT", "OPENAI_DIALECT"],
+    )
+    .as_deref()
+    .and_then(parse_dialect)
+    .unwrap_or(OpenAiCompatibleDialect::ChatCompletions)
+}
+
+fn parse_dialect(value: &str) -> Option<OpenAiCompatibleDialect> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "chat_completions" | "chat-completions" | "chat" | "completions" => {
+            Some(OpenAiCompatibleDialect::ChatCompletions)
+        }
+        "responses_api" | "responses-api" | "responses" | "openai_responses" => {
+            Some(OpenAiCompatibleDialect::ResponsesApi)
+        }
+        "chatgpt_codex" | "chatgpt-codex" | "codex" => Some(OpenAiCompatibleDialect::ChatGptCodex),
+        _ => None,
+    }
+}
+
+fn responses_endpoint(settings: &Settings) -> String {
+    match settings.dialect {
+        OpenAiCompatibleDialect::ChatGptCodex => OPENAI_CODEX_API_ENDPOINT.to_string(),
+        OpenAiCompatibleDialect::ResponsesApi => {
+            format!("{}/responses", settings.base_url.trim_end_matches('/'))
+        }
+        OpenAiCompatibleDialect::ChatCompletions => responses_or_chat_endpoint(settings),
+    }
+}
+
+fn responses_or_chat_endpoint(settings: &Settings) -> String {
+    match settings.dialect {
+        OpenAiCompatibleDialect::ChatCompletions => {
+            format!(
+                "{}/chat/completions",
+                settings.base_url.trim_end_matches('/')
+            )
+        }
+        OpenAiCompatibleDialect::ResponsesApi => {
+            format!("{}/responses", settings.base_url.trim_end_matches('/'))
+        }
+        OpenAiCompatibleDialect::ChatGptCodex => OPENAI_CODEX_API_ENDPOINT.to_string(),
+    }
+}
+
 fn error_from_status(status: u16, body: &str) -> ProviderError {
     let parsed = serde_json::from_str::<ErrorResponseBody>(body).ok();
     let message = parsed
@@ -2384,6 +2747,65 @@ mod tests {
         ModelResponseItem {
             id: id.to_string(),
             created: Some(created),
+        }
+    }
+
+    fn test_settings(auth: AuthSettings, dialect: OpenAiCompatibleDialect) -> Settings {
+        Settings {
+            auth,
+            auth_diagnostics: AuthDiagnostics {
+                source: "test".to_string(),
+                mode: "test".to_string(),
+                detail: "test".to_string(),
+            },
+            dialect,
+            base_url: DEFAULT_BASE_URL.to_string(),
+            default_model: Some("model".to_string()),
+            fallback_model: DEFAULT_MODEL_ID.to_string(),
+            model_ids: vec!["model".to_string()],
+            model_ids_are_explicit: true,
+        }
+    }
+
+    fn test_chatgpt_auth() -> AuthSettings {
+        AuthSettings::ChatGpt {
+            access_token: "token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            account_id: None,
+            profile: None,
+            vault: None,
+        }
+    }
+
+    fn test_api_key_auth() -> AuthSettings {
+        AuthSettings::ApiKey("token".to_string())
+    }
+
+    fn test_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {
+        ModelTurnRequest {
+            session_id: "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("static nil UUID should parse"),
+            turn_id: "turn".to_string(),
+            model_id: "model".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: None,
+            messages,
+            tools: Vec::new(),
+            parameters: bcode_model::ModelParameters::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn text_message(role: MessageRole, text: &str) -> ModelMessage {
+        ModelMessage {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
         }
     }
 
@@ -2522,8 +2944,12 @@ mod tests {
             metadata: BTreeMap::new(),
         };
 
-        let projection =
-            responses_projection(&request, ResponsesInstructionStrategy::TopLevelInstructions);
+        let projection = responses_projection(
+            &request,
+            ResponsesInstructionStrategy::TopLevelInstructions,
+            false,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        );
         let instructions = projection.instructions.expect("instructions should exist");
         let encoded_items =
             serde_json::to_value(&projection.input).expect("input should serialize");
@@ -2569,28 +2995,10 @@ mod tests {
             },
             metadata: BTreeMap::new(),
         };
-        let settings = Settings {
-            auth: AuthSettings::ChatGpt {
-                access_token: "token".to_string(),
-                refresh_token: None,
-                expires_at: None,
-                account_id: None,
-                profile: None,
-                vault: None,
-            },
-            auth_diagnostics: AuthDiagnostics {
-                source: "test".to_string(),
-                mode: "test".to_string(),
-                detail: "test".to_string(),
-            },
-            base_url: DEFAULT_BASE_URL.to_string(),
-            default_model: Some("model".to_string()),
-            fallback_model: DEFAULT_MODEL_ID.to_string(),
-            model_ids: vec!["model".to_string()],
-            model_ids_are_explicit: true,
-        };
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
 
-        let body = build_responses_request(&settings, &request, "model");
+        let body =
+            build_responses_request(&settings, &request, "model").expect("request should build");
         let encoded = serde_json::to_value(&body).expect("request should serialize");
         let encoded_text = encoded.to_string();
 
@@ -2650,38 +3058,164 @@ mod tests {
             metadata: BTreeMap::new(),
         };
 
-        let items = model_messages_to_responses_input_for_reuse(&request);
+        let items = model_messages_to_responses_input(
+            &request,
+            true,
+            OpenAiCompatibleDialect::ResponsesApi,
+        );
 
         assert_eq!(items.len(), 1);
     }
 
     #[test]
-    fn responses_completed_emits_provider_response_id_metadata() {
-        let request = ModelTurnRequest {
-            session_id: "00000000-0000-0000-0000-000000000000"
-                .parse()
-                .expect("static nil UUID should parse"),
-            turn_id: "turn".to_string(),
-            model_id: "model".to_string(),
-            provider_context: bcode_model::ProviderRequestContext::default(),
-            system_prompt: None,
-            messages: Vec::new(),
-            tools: Vec::new(),
-            parameters: bcode_model::ModelParameters::default(),
-            prompt_cache: bcode_model::PromptCacheHints::default(),
-            conversation_reuse: bcode_model::ConversationReuseHints::default(),
-            metadata: BTreeMap::new(),
+    fn chatgpt_codex_request_uses_full_history_when_reuse_hint_exists() {
+        let mut request = test_request(vec![
+            text_message(MessageRole::User, "old"),
+            text_message(MessageRole::Assistant, "old answer"),
+            text_message(MessageRole::User, "new"),
+        ]);
+        request.conversation_reuse = bcode_model::ConversationReuseHints {
+            mode: bcode_model::ConversationReuseMode::Auto,
+            key: Some("key".to_string()),
+            previous_provider_response_id: Some("resp_1".to_string()),
+            new_messages_start_index: Some(2),
         };
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body =
+            build_responses_request(&settings, &request, "model").expect("request should build");
+        let encoded = serde_json::to_value(&body).expect("request should serialize");
+
+        assert_eq!(body.input.len(), 3);
+        assert_eq!(
+            encoded.get("store").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(encoded.get("previous_response_id").is_none());
+        assert_eq!(
+            encoded
+                .get("tool_choice")
+                .and_then(serde_json::Value::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            encoded
+                .get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn responses_api_request_projects_reused_history_only_when_previous_id_is_sent() {
+        let mut request = test_request(vec![
+            text_message(MessageRole::User, "old"),
+            text_message(MessageRole::Assistant, "old answer"),
+            text_message(MessageRole::User, "new"),
+        ]);
+        request.conversation_reuse = bcode_model::ConversationReuseHints {
+            mode: bcode_model::ConversationReuseMode::Auto,
+            key: Some("key".to_string()),
+            previous_provider_response_id: Some("resp_1".to_string()),
+            new_messages_start_index: Some(2),
+        };
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+
+        let body =
+            build_responses_request(&settings, &request, "model").expect("request should build");
+
+        assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
+        assert!(body.store);
+        assert_eq!(body.input.len(), 1);
+    }
+
+    #[test]
+    fn projected_tool_name_collision_is_rejected() {
+        let mut request = test_request(Vec::new());
+        request.tools = vec![
+            bcode_model::ToolDefinition {
+                name: "fs.read".to_string(),
+                description: "read".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                side_effect: bcode_model::ToolSideEffect::ReadOnly,
+                requires_permission: false,
+            },
+            bcode_model::ToolDefinition {
+                name: "fs_read".to_string(),
+                description: "read".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                side_effect: bcode_model::ToolSideEffect::ReadOnly,
+                requires_permission: false,
+            },
+        ];
+
+        let error = project_model_tools(&request, OpenAiCompatibleDialect::ChatCompletions)
+            .expect_err("collision should fail");
+
+        assert_eq!(error.code, "tool_name_collision");
+    }
+
+    #[test]
+    fn responses_tool_call_done_parses_original_tool_and_codex_argument_aliases() {
+        let mut request = test_request(Vec::new());
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "shell.run".to_string(),
+            description: "run shell".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            side_effect: bcode_model::ToolSideEffect::ExecuteProcess,
+            requires_permission: true,
+        }];
+        let name_map = projected_tool_name_map(&request, OpenAiCompatibleDialect::ChatGptCodex)
+            .expect("tool names should project");
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
         let mut saw_tool_call = false;
 
+        let added = process_responses_stream_line(
+            r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"shell_run","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/tmp\",\"timeout\":2}"}}"#,
+            &turn,
+            OpenAiCompatibleDialect::ChatGptCodex,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("tool event should process");
+        let completed = process_responses_stream_line(
+            r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
+            &turn,
+            OpenAiCompatibleDialect::ChatGptCodex,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("completed event should process");
+
+        assert!(matches!(added, StreamOutcome::Cancelled));
+        assert!(matches!(completed, StreamOutcome::ToolCall));
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ToolCallFinished { call }
+                if call.name == "shell.run"
+                    && call.arguments.get("command").and_then(serde_json::Value::as_str) == Some("ls")
+                    && call.arguments.get("cwd").and_then(serde_json::Value::as_str) == Some("/tmp")
+                    && call.arguments.get("timeout_ms").and_then(serde_json::Value::as_u64) == Some(2_000)
+        )));
+    }
+
+    #[test]
+    fn responses_completed_emits_provider_response_id_metadata() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+
         let outcome = process_responses_stream_line(
             r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
             &turn,
-            &request,
+            OpenAiCompatibleDialect::ResponsesApi,
             &mut tool_calls,
             &mut saw_tool_call,
+            &name_map,
         )
         .expect("stream event should process");
 
@@ -2690,6 +3224,30 @@ mod tests {
             event,
             ProviderTurnEvent::ProviderMetadata { key, value }
                 if key == "provider_response_id" && value == "resp_123"
+        )));
+    }
+
+    #[test]
+    fn chatgpt_codex_completed_does_not_emit_reuse_metadata() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+
+        let outcome = process_responses_stream_line(
+            r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
+            &turn,
+            OpenAiCompatibleDialect::ChatGptCodex,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("stream event should process");
+
+        assert!(matches!(outcome, StreamOutcome::Finished));
+        assert!(!turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ProviderMetadata { key, .. } if key == "provider_response_id"
         )));
     }
 
