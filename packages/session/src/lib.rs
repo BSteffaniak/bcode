@@ -497,6 +497,27 @@ impl SessionManager {
             .await
     }
 
+    /// Append a context-compaction summary to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_context_compacted(
+        &self,
+        session_id: SessionId,
+        summary: String,
+        compacted_through_sequence: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            },
+        )
+        .await
+    }
+
     /// Append an event to a session.
     ///
     /// # Errors

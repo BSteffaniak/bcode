@@ -403,6 +403,9 @@ async fn handle_request(
         Request::CancelSessionTurn { session_id } => {
             handle_cancel_session_turn(request_id, state, writer, session_id).await
         }
+        Request::CompactSession { session_id } => {
+            handle_compact_session(request_id, state, writer, session_id).await
+        }
         Request::SetSessionModel {
             session_id,
             provider_plugin_id,
@@ -896,6 +899,76 @@ async fn handle_cancel_session_turn(
     }
 }
 
+async fn handle_compact_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    match compact_session_context(state, session_id).await {
+        Ok(message) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionCompacted {
+                    compacted: true,
+                    message,
+                }),
+            )
+            .await
+        }
+        Err(CompactionError::NothingToCompact(message)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionCompacted {
+                    compacted: false,
+                    message,
+                }),
+            )
+            .await
+        }
+        Err(CompactionError::Session(error)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+        Err(CompactionError::Busy) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_busy",
+                    "cannot compact while a model turn is active for this session",
+                )),
+            )
+            .await
+        }
+        Err(CompactionError::ProviderUnavailable) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "provider_unavailable",
+                    "model provider unavailable",
+                )),
+            )
+            .await
+        }
+        Err(CompactionError::Provider(error)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("plugin_error", error)),
+            )
+            .await
+        }
+    }
+}
+
 async fn handle_list_permissions(
     request_id: u64,
     state: &ServerState,
@@ -1008,6 +1081,322 @@ impl ModelTurnCompletion {
             outcome,
             message: Some(message.into()),
         }
+    }
+}
+
+#[derive(Debug, Error)]
+enum CompactionError {
+    #[error("nothing to compact: {0}")]
+    NothingToCompact(String),
+    #[error("session error: {0}")]
+    Session(#[from] bcode_session::SessionError),
+    #[error("model provider unavailable")]
+    ProviderUnavailable,
+    #[error("session has an active model turn")]
+    Busy,
+    #[error("provider error: {0}")]
+    Provider(String),
+}
+
+struct CompactionTranscript {
+    text: String,
+    compacted_through_sequence: u64,
+    event_count: usize,
+}
+
+const COMPACTION_SYSTEM_PROMPT: &str = "You compact coding-agent session history. Produce only a durable continuation summary for future model turns. Preserve all facts needed to continue the work, including user goals, decisions, constraints, files changed, commands run, validation results, current blockers, and next steps. Do not invent details. Do not include markdown fences.";
+
+async fn compact_session_context(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<String, CompactionError> {
+    if state.active_turns.lock().await.contains_key(&session_id) {
+        return Err(CompactionError::Busy);
+    }
+
+    let history = state.sessions.session_history(session_id).await?;
+    let Some(transcript) = compaction_transcript(&history) else {
+        return Err(CompactionError::NothingToCompact(
+            "nothing new to compact".to_string(),
+        ));
+    };
+
+    let selection = session_model_selection(state, session_id).await;
+    if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
+        return Err(CompactionError::ProviderUnavailable);
+    }
+
+    let summary = collect_compaction_summary(state, session_id, &selection, &transcript).await?;
+    let summary = summary.trim().to_string();
+    if summary.is_empty() {
+        return Err(CompactionError::Provider(
+            "provider returned an empty compaction summary".to_string(),
+        ));
+    }
+
+    let event = state
+        .sessions
+        .append_context_compacted(session_id, summary, transcript.compacted_through_sequence)
+        .await?;
+    publish_session_event(state, &event).await;
+
+    Ok(format!(
+        "compacted {} events through #{}",
+        transcript.event_count, transcript.compacted_through_sequence
+    ))
+}
+
+async fn collect_compaction_summary(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    transcript: &CompactionTranscript,
+) -> Result<String, CompactionError> {
+    let turn_id = format!(
+        "{}-compact-{}",
+        session_id, transcript.compacted_through_sequence
+    );
+    let request = build_compaction_request(session_id, selection, transcript, turn_id.clone());
+    let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
+        state,
+        selection.provider_plugin_id.clone(),
+        OP_START_TURN,
+        request,
+    )
+    .await
+    .map_err(CompactionError::Provider)?;
+
+    let provider_turn_id = start.provider_turn_id;
+    let result =
+        poll_compaction_summary(state, session_id, selection, &provider_turn_id, &turn_id).await;
+    finish_provider_turn(
+        state,
+        selection.provider_plugin_id.clone(),
+        provider_turn_id,
+    )
+    .await;
+    result
+}
+
+fn build_compaction_request(
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    transcript: &CompactionTranscript,
+    turn_id: String,
+) -> ModelTurnRequest {
+    ModelTurnRequest {
+        session_id,
+        turn_id,
+        model_id: model_id_for_provider_request(selection.model_id.as_deref()),
+        provider_context: selection.provider_context.clone(),
+        system_prompt: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        messages: vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: format!(
+                    "Compact this Bcode session transcript for future continuation. Return only the summary.\n\n{}",
+                    transcript.text
+                ),
+            }],
+        }],
+        tools: Vec::new(),
+        parameters: ModelParameters {
+            temperature: Some(0.0),
+            max_output_tokens: Some(2048),
+            ..ModelParameters::default()
+        },
+        prompt_cache: bcode_model::PromptCacheHints::default(),
+        conversation_reuse: bcode_model::ConversationReuseHints::default(),
+        metadata: BTreeMap::from([("bcode_request_kind".to_string(), "compaction".to_string())]),
+    }
+}
+
+async fn poll_compaction_summary(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    provider_turn_id: &str,
+    turn_id: &str,
+) -> Result<String, CompactionError> {
+    let mut summary = String::new();
+    let mut idle_for = Duration::ZERO;
+    for _ in 0..1_200 {
+        let poll = PollTurnEventsRequest {
+            provider_turn_id: provider_turn_id.to_string(),
+        };
+        let response = poll_model_turn(state, selection.provider_plugin_id.as_deref(), &poll)
+            .await
+            .map_err(CompactionError::Provider)?;
+        if response.events.is_empty() {
+            idle_for = wait_for_compaction_event(idle_for).await?;
+            continue;
+        }
+        idle_for = Duration::ZERO;
+        match handle_compaction_events(state, session_id, turn_id, &mut summary, response.events)
+            .await
+        {
+            CompactionPollStatus::Continue => {}
+            CompactionPollStatus::Finished => return Ok(summary),
+            CompactionPollStatus::Failed(error) => return Err(CompactionError::Provider(error)),
+        }
+    }
+    Err(CompactionError::Provider(
+        "model provider did not finish compaction turn".to_string(),
+    ))
+}
+
+async fn wait_for_compaction_event(idle_for: Duration) -> Result<Duration, CompactionError> {
+    let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
+    if idle_for > MODEL_IDLE_TIMEOUT {
+        return Err(CompactionError::Provider(format!(
+            "model provider was idle for {} seconds before timeout",
+            MODEL_IDLE_TIMEOUT.as_secs()
+        )));
+    }
+    tokio::time::sleep(MODEL_POLL_INTERVAL).await;
+    Ok(idle_for)
+}
+
+enum CompactionPollStatus {
+    Continue,
+    Finished,
+    Failed(String),
+}
+
+async fn handle_compaction_events(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    summary: &mut String,
+    events: Vec<ProviderTurnEvent>,
+) -> CompactionPollStatus {
+    for event in events {
+        match event {
+            ProviderTurnEvent::TextDelta { text } => summary.push_str(&text),
+            ProviderTurnEvent::Usage { usage } => {
+                append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
+            }
+            ProviderTurnEvent::Warning { message } => {
+                append_system_event(state, session_id, format!("model warning: {message}")).await;
+            }
+            ProviderTurnEvent::Error { error } => {
+                return CompactionPollStatus::Failed(format!(
+                    "model error {}: {}",
+                    error.code, error.message
+                ));
+            }
+            ProviderTurnEvent::Cancelled => {
+                return CompactionPollStatus::Failed("model turn cancelled".to_string());
+            }
+            ProviderTurnEvent::TurnFinished { stop_reason } => match stop_reason {
+                bcode_model::StopReason::Error => {
+                    return CompactionPollStatus::Failed("model turn ended with error".to_string());
+                }
+                bcode_model::StopReason::Cancelled => {
+                    return CompactionPollStatus::Failed("model turn cancelled".to_string());
+                }
+                _ => return CompactionPollStatus::Finished,
+            },
+            ProviderTurnEvent::ToolCallFinished { .. } => {
+                return CompactionPollStatus::Failed(
+                    "compaction summary unexpectedly requested a tool".to_string(),
+                );
+            }
+            ProviderTurnEvent::TurnStarted
+            | ProviderTurnEvent::ReasoningDelta { .. }
+            | ProviderTurnEvent::ToolCallStarted { .. }
+            | ProviderTurnEvent::ToolCallDelta { .. }
+            | ProviderTurnEvent::ProviderMetadata { .. } => {}
+        }
+    }
+    CompactionPollStatus::Continue
+}
+
+async fn finish_provider_turn(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    provider_turn_id: String,
+) {
+    let finish = FinishTurnRequest { provider_turn_id };
+    let _ = invoke_model_provider_json_blocking::<_, bcode_model::AckResponse>(
+        state,
+        provider_plugin_id,
+        OP_FINISH_TURN,
+        finish,
+    )
+    .await;
+}
+
+fn compaction_transcript(
+    history: &[bcode_session_models::SessionEvent],
+) -> Option<CompactionTranscript> {
+    let history = compact_attach_history(history.to_vec());
+    let compacted_through_sequence = history.last()?.sequence;
+    let latest_compaction =
+        history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match &event.kind {
+                SessionEventKind::ContextCompacted { summary, .. } => Some((index, summary)),
+                _ => None,
+            });
+
+    let mut lines = Vec::new();
+    if let Some((_, summary)) = latest_compaction {
+        lines.push("Previous compacted summary:".to_string());
+        lines.push(summary.clone());
+        lines.push("Events since previous compaction:".to_string());
+    }
+
+    let start_index = latest_compaction.map_or(0, |(index, _)| index.saturating_add(1));
+    let mut event_count = 0_usize;
+    for event in &history[start_index..] {
+        if let Some(line) = session_event_compaction_line(event) {
+            event_count = event_count.saturating_add(1);
+            lines.push(line);
+        }
+    }
+
+    if event_count == 0 {
+        return None;
+    }
+
+    Some(CompactionTranscript {
+        text: lines.join("\n\n"),
+        compacted_through_sequence,
+        event_count,
+    })
+}
+
+fn session_event_compaction_line(event: &bcode_session_models::SessionEvent) -> Option<String> {
+    match &event.kind {
+        SessionEventKind::UserMessage { text, .. } => {
+            Some(format!("#{} user:\n{text}", event.sequence))
+        }
+        SessionEventKind::AssistantMessage { text } => {
+            Some(format!("#{} assistant:\n{text}", event.sequence))
+        }
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        } => Some(format!(
+            "#{} assistant tool call {tool_call_id} ({tool_name}):\n{arguments_json}",
+            event.sequence
+        )),
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            result,
+            is_error,
+        } => Some(format!(
+            "#{} tool result {tool_call_id} (error={is_error}):\n{result}",
+            event.sequence
+        )),
+        SessionEventKind::SystemMessage { text } => {
+            Some(format!("#{} system:\n{text}", event.sequence))
+        }
+        _ => None,
     }
 }
 
@@ -1625,10 +2014,7 @@ async fn build_model_turn_request(
     selected_model_id: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.session_history(session_id).await?;
-    let mut messages = history
-        .iter()
-        .filter_map(session_event_to_model_message)
-        .collect::<Vec<_>>();
+    let mut messages = session_events_to_model_messages(&history);
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
     let selection = session_model_selection(state, session_id).await;
     let agent_id = session_agent_selection(state, session_id).await;
@@ -2317,6 +2703,30 @@ async fn append_permission_resolved_event(
     }
 }
 
+fn session_events_to_model_messages(
+    history: &[bcode_session_models::SessionEvent],
+) -> Vec<ModelMessage> {
+    let history = compact_attach_history(history.to_vec());
+    let latest_compaction_index = history.iter().enumerate().rev().find_map(|(index, event)| {
+        matches!(&event.kind, SessionEventKind::ContextCompacted { .. }).then_some(index)
+    });
+
+    let mut messages = Vec::new();
+    if let Some(index) = latest_compaction_index {
+        if let Some(message) = session_event_to_model_message(&history[index]) {
+            messages.push(message);
+        }
+        messages.extend(
+            history[index.saturating_add(1)..]
+                .iter()
+                .filter_map(session_event_to_model_message),
+        );
+    } else {
+        messages.extend(history.iter().filter_map(session_event_to_model_message));
+    }
+    messages
+}
+
 fn session_event_to_model_message(
     event: &bcode_session_models::SessionEvent,
 ) -> Option<ModelMessage> {
@@ -2360,6 +2770,12 @@ fn session_event_to_model_message(
         SessionEventKind::SystemMessage { text } => Some(ModelMessage {
             role: MessageRole::System,
             content: vec![ContentBlock::Text { text: text.clone() }],
+        }),
+        SessionEventKind::ContextCompacted { summary, .. } => Some(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: format!("Previous conversation summary:\n{summary}"),
+            }],
         }),
         _ => None,
     }
@@ -2759,6 +3175,51 @@ mod tests {
         assert!(matches!(
             compacted[2].kind,
             SessionEventKind::SystemMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn session_projection_uses_latest_context_compaction() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                0,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "old request".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::ContextCompacted {
+                    summary: "summary of old request".to_string(),
+                    compacted_through_sequence: 0,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "new request".to_string(),
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&history);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::Text { text } if text.contains("summary of old request")
+        ));
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::Text { text } if text == "new request"
         ));
     }
 

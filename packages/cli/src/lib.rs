@@ -2318,6 +2318,13 @@ fn print_session_event(event: &SessionEvent) {
         SessionEventKind::SystemMessage { text } => {
             println!("#{} system: {text}", event.sequence);
         }
+        SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => println!(
+            "#{} context compacted through #{compacted_through_sequence}",
+            event.sequence
+        ),
         SessionEventKind::ModelTurnStarted { turn_id } => {
             println!("#{} model turn started: {turn_id}", event.sequence);
         }
@@ -2333,16 +2340,23 @@ fn print_session_event(event: &SessionEvent) {
             );
         }
         SessionEventKind::ModelUsage { turn_id, usage } => {
-            println!(
-                "#{} model usage: {turn_id} input={:?} output={:?} total={:?} cached={:?} cache_write={:?} reasoning={:?}",
-                event.sequence,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.metered_total_tokens(),
-                usage.cached_input_tokens,
-                usage.cache_write_input_tokens,
-                usage.reasoning_tokens,
-            );
+            print_model_usage_event(event.sequence, turn_id, usage);
         }
     }
+}
+
+fn print_model_usage_event(
+    sequence: u64,
+    turn_id: &str,
+    usage: &bcode_session_models::SessionTokenUsage,
+) {
+    println!(
+        "#{sequence} model usage: {turn_id} input={:?} output={:?} total={:?} cached={:?} cache_write={:?} reasoning={:?}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.metered_total_tokens(),
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
+        usage.reasoning_tokens,
+    );
 }

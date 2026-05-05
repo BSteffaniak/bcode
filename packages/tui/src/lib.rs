@@ -829,6 +829,7 @@ async fn handle_slash_command(
     match command {
         "plan" => set_session_agent_from_tui(client, app, session_id, "plan").await,
         "build" => set_session_agent_from_tui(client, app, session_id, "build").await,
+        "compact" => compact_session_from_tui(client, app, session_id).await,
         "agent" if parts.len() > 1 => {
             set_session_agent_from_tui(client, app, session_id, parts[1]).await
         }
@@ -872,6 +873,19 @@ async fn set_session_agent_from_tui(
             app.status = format!("agent set to {agent_id}");
         }
         Err(error) => app.status = format!("agent switch failed: {error}"),
+    }
+    true
+}
+
+async fn compact_session_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+) -> bool {
+    app.status = "compacting context...".to_string();
+    match client.compact_session(session_id).await {
+        Ok(message) => app.status = message,
+        Err(error) => app.status = format!("compaction failed: {error}"),
     }
     true
 }
@@ -1532,6 +1546,7 @@ impl ChatApp {
             | SessionEventKind::ModelChanged { .. }
             | SessionEventKind::AgentChanged { .. }
             | SessionEventKind::SystemMessage { .. }
+            | SessionEventKind::ContextCompacted { .. }
             | SessionEventKind::ModelUsage { .. } => {}
         }
     }
@@ -1982,9 +1997,16 @@ impl ChatApp {
                 category: Some("general".into()),
             },
             CommandInfo {
+                id: "compact".into(),
+                name: "Compact Context".into(),
+                description: Some("Summarize older context for future model turns".into()),
+                requires_args: false,
+                category: Some("general".into()),
+            },
+            CommandInfo {
                 id: "clear".into(),
                 name: "Clear Transcript".into(),
-                description: Some("Clear chat history in TUI".into()),
+                description: Some("Clear chat transcript display in TUI".into()),
                 requires_args: false,
                 category: Some("general".into()),
             },
@@ -2022,8 +2044,11 @@ impl ChatApp {
             }
             "help" => {
                 self.status =
-                    "Slash: /model <id>, /provider <id>, /thinking low|medium|high, /clear, /help"
+                    "Slash: /model <id>, /provider <id>, /thinking low|medium|high, /compact, /clear, /help"
                         .to_string();
+            }
+            "compact" => {
+                self.status = "use slash /compact".to_string();
             }
             "clear" => {
                 self.blocks.clear();
@@ -2085,7 +2110,8 @@ impl ChatApp {
             }
             "help" => {
                 self.status =
-                    "Commands: /model, /provider, /thinking <level>, /clear, /help".to_string();
+                    "Commands: /model, /provider, /thinking <level>, /compact, /clear, /help"
+                        .to_string();
                 true
             }
             "clear" => {
@@ -3300,6 +3326,12 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         SessionEventKind::SystemMessage { text } => {
             vec![TranscriptBlock::System { text: text.clone() }]
         }
+        SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => vec![TranscriptBlock::Meta {
+            text: format!("context compacted through #{compacted_through_sequence}"),
+        }],
         SessionEventKind::ModelTurnFinished {
             outcome, message, ..
         } => {

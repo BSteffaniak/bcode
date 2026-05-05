@@ -209,6 +209,22 @@ impl BcodeClient {
         }
     }
 
+    /// Compact the model-visible context for a session while preserving append-only history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn compact_session(&self, session_id: SessionId) -> Result<String, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::CompactSession { session_id })
+            .await?
+        {
+            ResponsePayload::SessionCompacted { message, .. } => Ok(message),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List available agent profiles.
     ///
     /// # Errors

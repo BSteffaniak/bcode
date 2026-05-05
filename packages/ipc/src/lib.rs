@@ -103,6 +103,9 @@ pub enum Request {
     CancelSessionTurn {
         session_id: SessionId,
     },
+    CompactSession {
+        session_id: SessionId,
+    },
     SetSessionModel {
         session_id: SessionId,
         provider_plugin_id: Option<String>,
@@ -232,6 +235,10 @@ pub enum ResponsePayload {
     MessageSent,
     TurnCancellationRequested {
         cancelled: bool,
+    },
+    SessionCompacted {
+        compacted: bool,
+        message: String,
     },
     SessionModelSet,
     SessionModelStatus {
