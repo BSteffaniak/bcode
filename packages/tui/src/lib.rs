@@ -1189,20 +1189,8 @@ impl TokenUsageMeter {
         }
     }
 
-    fn footer_summary(&self) -> Option<String> {
-        let mut parts = Vec::new();
-        if let (Some(input), Some(window)) = (self.latest_context_input_tokens, self.context_window)
-            && window > 0
-        {
-            parts.push(format!(
-                "ctx {}/{} {}%",
-                compact_u64(u64::from(input)),
-                compact_u64(u64::from(window)),
-                context_window_percentage(input, window)
-            ));
-        } else if self.latest_context_input_tokens.is_some() || self.context_window.is_some() {
-            parts.push("ctx window unknown".to_string());
-        }
+    fn footer_summary(&self) -> String {
+        let mut parts = vec![self.context_summary()];
         if let Some(cached) = self.latest_cached_input_tokens
             && cached > 0
         {
@@ -1216,14 +1204,23 @@ impl TokenUsageMeter {
                 compact_u64(u64::from(written))
             ));
         }
-        if self.session_tokens > 0 {
-            parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
+        parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
+        parts.join(" · ")
+    }
+
+    fn context_summary(&self) -> String {
+        if let Some(window) = self.context_window
+            && window > 0
+        {
+            let input = self.latest_context_input_tokens.unwrap_or_default();
+            return format!(
+                "ctx {}/{} {}%",
+                compact_u64(u64::from(input)),
+                compact_u64(u64::from(window)),
+                context_window_percentage(input, window)
+            );
         }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" · "))
-        }
+        "ctx unknown".to_string()
     }
 }
 
@@ -2281,9 +2278,8 @@ fn render_chat_status(
             muted_style(),
         ));
     }
-    if let Some(summary) = app.token_usage.footer_summary() {
-        spans.push(Span::styled(format!("  ·  {summary}"), muted_style()));
-    }
+    let summary = app.token_usage.footer_summary();
+    spans.push(Span::styled(format!("  ·  {summary}"), muted_style()));
     spans.push(Span::styled("  ·  ", muted_style()));
     spans.extend(key_hint_spans(&app.key_hints));
     Paragraph::new(Line::from(spans)).render(area, buf);
@@ -3785,7 +3781,21 @@ mod tests {
 
         assert_eq!(
             app.token_usage.footer_summary(),
-            Some("ctx 2.0k/8.0k 25% · spent 2.5k tok".to_string())
+            "ctx 2.0k/8.0k 25% · spent 2.5k tok"
+        );
+    }
+
+    #[test]
+    fn token_usage_footer_is_visible_before_usage_arrives() {
+        let app = ChatApp::new(
+            SessionId::new(),
+            &[],
+            &KeyMap::from_config(&bcode_config::TuiConfig::default()),
+        );
+
+        assert_eq!(
+            app.token_usage.footer_summary(),
+            "ctx unknown · spent 0 tok"
         );
     }
 
