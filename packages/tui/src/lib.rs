@@ -892,23 +892,39 @@ async fn persist_first_permission_rule(client: &BcodeClient, app: &mut ChatApp, 
         return;
     };
     let agent_id = app.current_agent_id.clone();
-    let (category, pattern) = permission.policy_rule();
+    let rules = permission.policy_rules();
     let action = if approved { "allow" } else { "deny" };
-    match client
-        .add_permission_rule(
-            agent_id.clone(),
-            category.to_string(),
-            pattern.clone(),
-            action.to_string(),
-        )
-        .await
-    {
-        Ok(_) => {
-            resolve_first_permission(client, app, approved).await;
-            app.status = format!("persisted {action} rule agent={agent_id} {category} {pattern:?}");
+    let mut persisted = 0usize;
+    let mut last_error: Option<String> = None;
+    for (category, pattern) in &rules {
+        match client
+            .add_permission_rule(
+                agent_id.clone(),
+                (*category).to_string(),
+                pattern.clone(),
+                action.to_string(),
+            )
+            .await
+        {
+            Ok(_) => persisted += 1,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                break;
+            }
         }
-        Err(error) => app.status = format!("persist rule failed: {error}"),
     }
+    if let Some(error) = last_error {
+        app.status = format!("persist rule failed after {persisted} rule(s): {error}");
+        return;
+    }
+    resolve_first_permission(client, app, approved).await;
+    let rule_count = rules.len();
+    let summary = rules
+        .iter()
+        .map(|(category, pattern)| format!("{category} {pattern:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    app.status = format!("persisted {action} rule agent={agent_id} ({rule_count}): {summary}");
 }
 
 async fn resolve_session(
@@ -1216,37 +1232,80 @@ struct PendingPermissionView {
     arguments_json: String,
 }
 
+/// Return a broadened glob prefix for a shell command.
+///
+/// Extracts the leading command word (typically the program name) so
+/// `persist_first_permission_rule` can persist an additional rule like
+/// `<prefix> *` that covers variations of the same command with different
+/// arguments. Returns `None` for empty inputs.
+fn shell_command_broadened_glob(command: &str) -> Option<String> {
+    let trimmed = command.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first_word: String = trimmed
+        .chars()
+        .take_while(|char| !char.is_whitespace())
+        .collect();
+    if first_word.is_empty() {
+        None
+    } else {
+        Some(first_word)
+    }
+}
+
 impl PendingPermissionView {
-    /// Return `(category, pattern)` for persisting a rule derived from this permission.
+    /// Return `(category, pattern)` pairs to persist as rules for this permission.
     ///
     /// The action (`allow` / `deny`) is supplied separately by the caller based on
     /// whether the user approved the prompt.
-    fn policy_rule(&self) -> (&'static str, String) {
+    ///
+    /// For `shell.run`, this returns both the literal bash command and a
+    /// broadened `<first-word> *` glob so that variations of the same command
+    /// (for example `echo hi` after approving `echo hello`) match without
+    /// re-prompting. The literal form covers the bare-command case (for
+    /// example `ls` with no arguments) that a trailing-`*` glob would not
+    /// match on its own.
+    ///
+    /// For filesystem tools, this returns a single rule with the literal path
+    /// argument. Broadening paths is left to the user editing `bcode.toml`
+    /// because implicit directory globs can grant unintended access.
+    fn policy_rules(&self) -> Vec<(&'static str, String)> {
         if self.tool_name == "shell.run"
             && let Some(command) = self.string_argument("command")
         {
-            return ("bash", command);
+            let trimmed = command.trim();
+            if !trimmed.is_empty() {
+                let mut rules = vec![("bash", trimmed.to_string())];
+                if let Some(prefix) = shell_command_broadened_glob(trimmed) {
+                    let broadened = format!("{prefix} *");
+                    if broadened != trimmed {
+                        rules.push(("bash", broadened));
+                    }
+                }
+                return rules;
+            }
         }
         match self.tool_name.as_str() {
             "filesystem.write" => {
                 if let Some(path) = self.string_argument("path") {
-                    return ("write", path);
+                    return vec![("write", path)];
                 }
             }
             "filesystem.edit" => {
                 if let Some(path) = self.string_argument("path") {
-                    return ("edit", path);
+                    return vec![("edit", path)];
                 }
             }
             "filesystem.read" | "filesystem.list" | "filesystem.find" | "filesystem.grep"
             | "filesystem.stat" | "filesystem.exists" => {
                 if let Some(path) = self.string_argument("path") {
-                    return ("read", path);
+                    return vec![("read", path)];
                 }
             }
             _ => {}
         }
-        ("bash", self.tool_name.clone())
+        vec![("bash", self.tool_name.clone())]
     }
 
     fn string_argument(&self, key: &str) -> Option<String> {
@@ -3882,5 +3941,90 @@ mod tests {
                 row
             })
             .collect()
+    }
+
+    fn view(tool_name: &str, arguments_json: &str) -> PendingPermissionView {
+        PendingPermissionView {
+            permission_id: "perm-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments_json: arguments_json.to_string(),
+        }
+    }
+
+    #[test]
+    fn shell_policy_rules_persist_literal_and_broadened_glob() {
+        let rules = view("shell.run", r#"{"command":"echo hello"}"#).policy_rules();
+
+        assert_eq!(
+            rules,
+            vec![
+                ("bash", "echo hello".to_string()),
+                ("bash", "echo *".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_policy_rules_handle_single_word_command() {
+        let rules = view("shell.run", r#"{"command":"ls"}"#).policy_rules();
+
+        assert_eq!(
+            rules,
+            vec![("bash", "ls".to_string()), ("bash", "ls *".to_string()),]
+        );
+    }
+
+    #[test]
+    fn shell_policy_rules_collapse_when_broadening_matches_literal() {
+        // Literal already ends in `*`; broadened form would be identical, so skip it.
+        let rules = view("shell.run", r#"{"command":"cargo *"}"#).policy_rules();
+
+        assert_eq!(rules, vec![("bash", "cargo *".to_string())]);
+    }
+
+    #[test]
+    fn shell_policy_rules_preserve_leading_path_command() {
+        let rules = view("shell.run", r#"{"command":"./scripts/build.sh --prod"}"#).policy_rules();
+
+        assert_eq!(
+            rules,
+            vec![
+                ("bash", "./scripts/build.sh --prod".to_string()),
+                ("bash", "./scripts/build.sh *".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn filesystem_write_policy_rule_stays_literal() {
+        let rules = view(
+            "filesystem.write",
+            r#"{"path":"src/foo.rs","content":"..."}"#,
+        )
+        .policy_rules();
+
+        assert_eq!(rules, vec![("write", "src/foo.rs".to_string())]);
+    }
+
+    #[test]
+    fn filesystem_edit_policy_rule_stays_literal() {
+        let rules = view("filesystem.edit", r#"{"path":"docs/readme.md"}"#).policy_rules();
+
+        assert_eq!(rules, vec![("edit", "docs/readme.md".to_string())]);
+    }
+
+    #[test]
+    fn filesystem_read_policy_rule_stays_literal() {
+        let rules = view("filesystem.read", r#"{"path":"Cargo.toml"}"#).policy_rules();
+
+        assert_eq!(rules, vec![("read", "Cargo.toml".to_string())]);
+    }
+
+    #[test]
+    fn empty_shell_command_falls_back_to_literal_tool_name() {
+        let rules = view("shell.run", r#"{"command":""}"#).policy_rules();
+
+        assert_eq!(rules, vec![("bash", "shell.run".to_string())]);
     }
 }

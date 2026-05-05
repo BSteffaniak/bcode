@@ -83,14 +83,14 @@ Any `[agent.<id>]` you declare is usable via `/agent <id>` in the TUI and the CL
 
 ## Runtime rule persistence
 
-The TUI permission prompt offers an "always allow" action that writes a rule back into `bcode.toml`. The rule is scoped to the currently selected agent, with category inferred from the tool:
+The TUI permission prompt offers an "always allow" / "always deny" action that writes a rule back into `bcode.toml`. The rule is scoped to the currently selected agent, with category inferred from the tool:
 
-* `shell.run` → `bash`
-* `filesystem.write` → `write`
-* `filesystem.edit`  → `edit`
-* `filesystem.{read,list,find,grep,stat,exists}` → `read`
+* `shell.run` → `bash`. Persists **two** rules: the literal command (so the exact same invocation is remembered) and a broadened `<first-word> *` glob (so variations like `echo hello` after approving `echo hi` don't prompt again). If the literal command already contains a trailing `*`, only the literal rule is persisted.
+* `filesystem.write` → `write` (literal path).
+* `filesystem.edit`  → `edit` (literal path).
+* `filesystem.{read,list,find,grep,stat,exists}` → `read` (literal path).
 
-The pattern used is the literal command/path from the pending request; edit `bcode.toml` directly to broaden it to a glob.
+Filesystem paths are persisted literally by default because implicit directory globs can grant unintended access. To broaden a persisted path rule, edit `bcode.toml` directly (for example, replace `"src/foo.rs" = "allow"` with `"src/**" = "allow"`).
 
 The CLI equivalent is:
 
