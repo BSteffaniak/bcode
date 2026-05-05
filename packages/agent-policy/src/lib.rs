@@ -265,6 +265,19 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
             None,
         );
     };
+    if writes_disabled(config)
+        && let Some(part) = mutating_shell_command_part(command)
+    {
+        return evaluation(
+            AgentDecision::Deny,
+            format!(
+                "{} agent denied shell command '{}': shell command writes files; switch agents if implementation is needed",
+                request.agent_id, part
+            ),
+            None,
+            Some(part.to_string()),
+        );
+    }
     let rules = compile_rules(config);
     if let Some(denied) = denied_command_part(command, &rules) {
         let rule_pattern = denied.rule.as_ref().map(|rule| rule.pattern.clone());
@@ -372,6 +385,76 @@ fn tool_enabled(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Opti
     tool_aliases(&request.tool_name)
         .iter()
         .find_map(|name| config.tools.get(name).copied())
+}
+
+fn writes_disabled(config: &AgentConfig) -> bool {
+    ["write", "edit", "filesystem.write", "filesystem.edit"]
+        .iter()
+        .any(|tool| config.tools.get(*tool) == Some(&false))
+}
+
+fn mutating_shell_command_part(command: &str) -> Option<&str> {
+    command_parts(command)
+        .into_iter()
+        .find(|part| shell_part_writes_files(part))
+}
+
+fn shell_part_writes_files(part: &str) -> bool {
+    has_unquoted_write_redirection(part) || starts_with_mutating_command(part)
+}
+
+fn has_unquoted_write_redirection(part: &str) -> bool {
+    let mut escaped = false;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let chars = part.chars().collect::<Vec<_>>();
+    for (index, character) in chars.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && !in_single_quote {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            '>' if !in_single_quote && !in_double_quote => {
+                let previous = index
+                    .checked_sub(1)
+                    .and_then(|previous| chars.get(previous));
+                if chars.get(index + 1) == Some(&'&') && previous != Some(&'&') {
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn starts_with_mutating_command(part: &str) -> bool {
+    let Some(command) = first_command_word(part) else {
+        return false;
+    };
+    matches!(
+        command,
+        "cp" | "install" | "mkdir" | "mv" | "rm" | "rmdir" | "tee" | "touch" | "truncate"
+    ) || command == "sed"
+        && part
+            .split_whitespace()
+            .any(|arg| arg == "-i" || arg.starts_with("-i"))
+        || command == "perl"
+            && part
+                .split_whitespace()
+                .any(|arg| arg == "-pi" || arg.starts_with("-pi"))
+}
+
+fn first_command_word(part: &str) -> Option<&str> {
+    part.split_whitespace()
+        .find(|word| !word.contains('=') && *word != "env")
 }
 
 fn tool_aliases(tool_name: &str) -> Vec<String> {
@@ -607,6 +690,79 @@ mod tests {
 
         assert_eq!(result.response.decision, AgentDecision::Deny);
         assert_eq!(result.command_part.as_deref(), Some("git commit -m nope"));
+    }
+
+    #[test]
+    fn plan_denies_shell_redirection_even_when_echo_is_allowed() {
+        let config = AgentPermissionConfig {
+            agent: BTreeMap::from([(
+                PLAN_AGENT.to_string(),
+                AgentConfig {
+                    tools: BTreeMap::from([
+                        ("bash".to_string(), true),
+                        ("write".to_string(), false),
+                        ("edit".to_string(), false),
+                    ]),
+                    permission: PermissionConfig {
+                        bash: BTreeMap::from([
+                            ("*".to_string(), Action::Deny),
+                            ("echo *".to_string(), Action::Allow),
+                        ]),
+                        external_directory: Action::Allow,
+                    },
+                },
+            )]),
+        };
+        let plan = agent_config(&config, PLAN_AGENT);
+
+        let denied = evaluate_tool_call(
+            &plan,
+            &request(PLAN_AGENT, "echo \"hello\" > test.txt"),
+            Path::new("/tmp/project"),
+        );
+        let allowed = evaluate_tool_call(
+            &plan,
+            &request(PLAN_AGENT, "echo hello"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(denied.response.decision, AgentDecision::Deny);
+        assert_eq!(
+            denied.command_part.as_deref(),
+            Some("echo \"hello\" > test.txt")
+        );
+        assert_eq!(allowed.response.decision, AgentDecision::Allow);
+    }
+
+    #[test]
+    fn plan_denies_tee_as_shell_file_write() {
+        let config = AgentPermissionConfig {
+            agent: BTreeMap::from([(
+                PLAN_AGENT.to_string(),
+                AgentConfig {
+                    tools: BTreeMap::from([
+                        ("bash".to_string(), true),
+                        ("write".to_string(), false),
+                    ]),
+                    permission: PermissionConfig {
+                        bash: BTreeMap::from([
+                            ("*".to_string(), Action::Deny),
+                            ("tee *".to_string(), Action::Allow),
+                        ]),
+                        external_directory: Action::Allow,
+                    },
+                },
+            )]),
+        };
+        let plan = agent_config(&config, PLAN_AGENT);
+
+        let denied = evaluate_tool_call(
+            &plan,
+            &request(PLAN_AGENT, "tee test.txt"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(denied.response.decision, AgentDecision::Deny);
     }
 
     #[test]
