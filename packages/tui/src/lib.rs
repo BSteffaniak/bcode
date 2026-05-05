@@ -1282,9 +1282,7 @@ impl ChatApp {
             selected_permission_choice: PermissionChoice::AllowOnce,
             command_palette: None,
         };
-        for event in history {
-            app.absorb_session_event(event);
-        }
+        app.absorb_history(history);
         app
     }
 
@@ -1519,14 +1517,29 @@ impl ChatApp {
         total_rows.saturating_sub(usize::from(self.last_transcript_height.get()))
     }
 
+    fn absorb_history(&mut self, history: &[SessionEvent]) {
+        // Large sessions can contain thousands of tiny AssistantDelta events.
+        // Recomputing wrapped transcript metrics after each replayed event makes
+        // initial TUI load effectively quadratic, so replay all durable state
+        // first and clamp the final scroll position once.
+        for event in history {
+            self.absorb_session_event_with_scroll_clamp(event, false);
+        }
+        self.clamp_scroll();
+    }
+
     fn absorb_session_event(&mut self, event: &SessionEvent) {
+        self.absorb_session_event_with_scroll_clamp(event, true);
+    }
+
+    fn absorb_session_event_with_scroll_clamp(&mut self, event: &SessionEvent, clamp_scroll: bool) {
         match &event.kind {
             SessionEventKind::AssistantDelta { text } => {
-                self.push_assistant_delta(text);
+                self.push_assistant_delta_with_scroll_clamp(text, clamp_scroll);
                 return;
             }
             SessionEventKind::AssistantMessage { text } => {
-                self.finish_assistant_message(text);
+                self.finish_assistant_message_with_scroll_clamp(text, clamp_scroll);
                 return;
             }
             SessionEventKind::PermissionRequested {
@@ -1560,7 +1573,9 @@ impl ChatApp {
             _ => {}
         }
         self.push_session_event(event);
-        self.clamp_scroll();
+        if clamp_scroll {
+            self.clamp_scroll();
+        }
     }
 
     fn push_session_event(&mut self, event: &SessionEvent) {
@@ -1568,7 +1583,7 @@ impl ChatApp {
         self.blocks.extend(transcript_blocks_from_event(event));
     }
 
-    fn push_assistant_delta(&mut self, text: &str) {
+    fn push_assistant_delta_with_scroll_clamp(&mut self, text: &str, clamp_scroll: bool) {
         match self.blocks.last_mut() {
             Some(TranscriptBlock::Assistant {
                 text: current,
@@ -1581,10 +1596,12 @@ impl ChatApp {
                 streaming: true,
             }),
         }
-        self.clamp_scroll();
+        if clamp_scroll {
+            self.clamp_scroll();
+        }
     }
 
-    fn finish_assistant_message(&mut self, text: &str) {
+    fn finish_assistant_message_with_scroll_clamp(&mut self, text: &str, clamp_scroll: bool) {
         match self.blocks.last_mut() {
             Some(TranscriptBlock::Assistant {
                 text: current,
@@ -1598,7 +1615,9 @@ impl ChatApp {
                 streaming: false,
             }),
         }
-        self.clamp_scroll();
+        if clamp_scroll {
+            self.clamp_scroll();
+        }
     }
 
     fn finish_streaming_block_if_needed(&mut self) {
@@ -3250,6 +3269,36 @@ mod tests {
         let app = ChatApp::new(session_id, &history, &keymap);
 
         assert_eq!(app.activity, ActivityState::Idle);
+    }
+
+    #[test]
+    fn large_delta_history_replay_restores_final_assistant_message() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut history = (0..2_000)
+            .map(|index| {
+                session_event(
+                    session_id,
+                    SessionEventKind::AssistantDelta {
+                        text: format!("{index} "),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        history.push(session_event(
+            session_id,
+            SessionEventKind::AssistantMessage {
+                text: "complete".to_string(),
+            },
+        ));
+
+        let app = ChatApp::new(session_id, &history, &keymap);
+
+        assert_eq!(app.activity, ActivityState::Idle);
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [TranscriptBlock::Assistant { text, streaming: false }] if text == "complete"
+        ));
     }
 
     #[test]
