@@ -156,13 +156,21 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
         );
     }
 
-    let mut agents = declarative.agent;
-    bcode_config::merge_agent_configs(&mut agents, state);
+    let mut agents = default_config().agent;
+    if !declarative_empty {
+        bcode_config::merge_agent_configs(&mut agents, declarative.agent);
+    }
+    if !state_empty {
+        bcode_config::merge_agent_configs(&mut agents, state);
+    }
 
     let label = match (declarative_empty, state_empty) {
-        (false, false) => "bcode.toml [agent] + runtime permissions state".to_string(),
-        (false, true) => "bcode.toml [agent]".to_string(),
-        (true, false) => "runtime permissions state".to_string(),
+        (false, false) => {
+            "built-in default agent policy + bcode.toml [agent] + runtime permissions state"
+                .to_string()
+        }
+        (false, true) => "built-in default agent policy + bcode.toml [agent]".to_string(),
+        (true, false) => "built-in default agent policy + runtime permissions state".to_string(),
         (true, true) => unreachable!("handled above"),
     };
 
@@ -189,11 +197,16 @@ export_plugin!(DefaultAgentsPlugin, MANIFEST);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_agent_policy::Action;
     use bcode_agent_profile::AgentDecision;
     use bcode_session_models::SessionId;
     use bcode_tool::ToolSideEffect;
     use serde_json::json;
     use std::path::Path;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn list_agents_contains_plan_and_build() {
@@ -219,5 +232,64 @@ mod tests {
         let result = evaluate_tool_call(&agent, &request, Path::new("/tmp/project"));
 
         assert_eq!(result.response.decision, AgentDecision::Deny);
+    }
+
+    #[test]
+    fn runtime_permission_state_preserves_build_default_tools() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let config_path = root.join("bcode.toml");
+        let state_path = root.join("permissions.toml");
+        std::fs::write(&config_path, "").expect("config should be written");
+        std::fs::write(
+            &state_path,
+            r#"
+[agent.build.permission]
+bash = { "python3 *" = "allow" }
+"#,
+        )
+        .expect("state should be written");
+        let previous_config = std::env::var_os("BCODE_CONFIG");
+        let previous_state = std::env::var_os("BCODE_PERMISSIONS_STATE");
+        unsafe {
+            std::env::set_var("BCODE_CONFIG", &config_path);
+            std::env::set_var("BCODE_PERMISSIONS_STATE", &state_path);
+        }
+
+        let (config, source) = load_config();
+        let build = agent_config(&config, BUILD_AGENT);
+        let tools = active_tools_for(&build);
+
+        assert!(tools.contains(&"filesystem.write".to_string()));
+        assert!(tools.contains(&"filesystem.edit".to_string()));
+        assert!(tools.contains(&"shell.run".to_string()));
+        assert_eq!(build.permission.bash.get("python3 *"), Some(&Action::Allow));
+        assert_eq!(
+            source.label,
+            "built-in default agent policy + runtime permissions state"
+        );
+        assert!(!source.using_default);
+
+        restore_env("BCODE_CONFIG", previous_config);
+        restore_env("BCODE_PERMISSIONS_STATE", previous_state);
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    fn unique_temp_dir() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("bcode-default-agents-test-{nanos}"))
     }
 }
