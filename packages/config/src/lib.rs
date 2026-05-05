@@ -17,6 +17,73 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 
 const DEFAULT_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
 
+struct ProviderEnvironmentSpec {
+    plugin_id: &'static str,
+    aliases: &'static [&'static str],
+    signal_env_vars: &'static [&'static str],
+    model_env_vars: &'static [&'static str],
+    config_auth_is_configured: fn(&BcodeConfig) -> bool,
+}
+
+const PROVIDER_ENVIRONMENT_SPECS: &[ProviderEnvironmentSpec] = &[
+    ProviderEnvironmentSpec {
+        plugin_id: "bcode.bedrock",
+        aliases: &["bedrock", "aws-bedrock", "aws_bedrock", "bcode.bedrock"],
+        signal_env_vars: &[
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "BCODE_BEDROCK_MODEL",
+            "BCODE_BEDROCK_MODELS",
+            "BCODE_BEDROCK_REGION",
+            "BCODE_BEDROCK_AWS_PROFILE",
+            "BCODE_BEDROCK_ENDPOINT_URL",
+            "BEDROCK_MODEL",
+            "BEDROCK_MODELS",
+            "BEDROCK_ENDPOINT_URL",
+        ],
+        model_env_vars: &["BCODE_BEDROCK_MODEL", "BEDROCK_MODEL"],
+        config_auth_is_configured: no_config_auth_signal,
+    },
+    ProviderEnvironmentSpec {
+        plugin_id: "bcode.openai-compatible",
+        aliases: &[
+            "openai",
+            "openai-compatible",
+            "openai_compatible",
+            "xai",
+            "grok",
+            "bcode.openai-compatible",
+        ],
+        signal_env_vars: &[
+            "BCODE_XAI_API_KEY",
+            "XAI_API_KEY",
+            "BCODE_XAI_MODEL",
+            "XAI_MODEL",
+            "BCODE_XAI_MODELS",
+            "XAI_MODELS",
+            "BCODE_XAI_BASE_URL",
+            "XAI_BASE_URL",
+            "BCODE_OPENAI_API_KEY",
+            "OPENAI_API_KEY",
+            "BCODE_OPENAI_MODEL",
+            "OPENAI_MODEL",
+            "BCODE_OPENAI_MODELS",
+            "OPENAI_MODELS",
+            "BCODE_OPENAI_BASE_URL",
+            "OPENAI_BASE_URL",
+            "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
+            "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
+            "BCODE_OPENAI_CODEX_ID_TOKEN",
+        ],
+        model_env_vars: &[
+            "BCODE_XAI_MODEL",
+            "XAI_MODEL",
+            "BCODE_OPENAI_MODEL",
+            "OPENAI_MODEL",
+        ],
+        config_auth_is_configured: openai_config_auth_is_configured,
+    },
+];
+
 /// Top-level Bcode configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BcodeConfig {
@@ -67,6 +134,11 @@ impl BcodeConfig {
             selection.auth_profile.clone_from(&profile.auth_profile);
             selection.settings = profile.settings.clone();
         }
+        if selection.provider_plugin_id.is_none()
+            && let Some(config_provider) = self.provider_plugin_id_from_config_auth()
+        {
+            selection.provider_plugin_id = Some(config_provider);
+        }
         if let Some(env_provider) = provider_plugin_id_from_environment() {
             let provider_changed =
                 selection.provider_plugin_id.as_deref() != Some(env_provider.as_str());
@@ -84,8 +156,32 @@ impl BcodeConfig {
                 selection.settings.clear();
             }
         }
+        if let Some(provider_plugin_id) = &selection.provider_plugin_id
+            && let Some(model_id) = model_id_from_environment(provider_plugin_id)
+        {
+            selection.model_id = Some(model_id);
+        }
         selection
     }
+
+    fn provider_plugin_id_from_config_auth(&self) -> Option<String> {
+        PROVIDER_ENVIRONMENT_SPECS
+            .iter()
+            .find(|spec| (spec.config_auth_is_configured)(self))
+            .map(|spec| spec.plugin_id.to_string())
+    }
+}
+
+const fn no_config_auth_signal(_config: &BcodeConfig) -> bool {
+    false
+}
+
+fn openai_config_auth_is_configured(config: &BcodeConfig) -> bool {
+    config
+        .auth
+        .openai
+        .as_ref()
+        .is_some_and(|auth| auth.backend == "sshenv")
 }
 
 /// Return a provider plugin ID explicitly or implicitly selected by environment variables.
@@ -93,39 +189,36 @@ impl BcodeConfig {
 pub fn provider_plugin_id_from_environment() -> Option<String> {
     first_env_value(["BCODE_MODEL_PROVIDER", "BCODE_PROVIDER"])
         .and_then(|value| normalize_provider_plugin_id(&value))
-        .or_else(|| bedrock_environment_is_configured().then(|| "bcode.bedrock".to_string()))
+        .or_else(implicit_provider_plugin_id_from_environment)
+}
+
+fn implicit_provider_plugin_id_from_environment() -> Option<String> {
+    PROVIDER_ENVIRONMENT_SPECS.iter().find_map(|spec| {
+        first_env_value_from_slice(spec.signal_env_vars).map(|_| spec.plugin_id.to_string())
+    })
 }
 
 fn normalize_provider_plugin_id(value: &str) -> Option<String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "bedrock" | "aws-bedrock" | "aws_bedrock" | "bcode.bedrock" => {
-            Some("bcode.bedrock".to_string())
-        }
-        "openai"
-        | "openai-compatible"
-        | "openai_compatible"
-        | "xai"
-        | "grok"
-        | "bcode.openai-compatible" => Some("bcode.openai-compatible".to_string()),
-        _ => None,
-    }
+    let value = value.trim().to_ascii_lowercase();
+    PROVIDER_ENVIRONMENT_SPECS
+        .iter()
+        .find(|spec| spec.aliases.contains(&value.as_str()))
+        .map(|spec| spec.plugin_id.to_string())
 }
 
 fn model_id_from_environment(provider_plugin_id: &str) -> Option<String> {
-    match provider_plugin_id {
-        "bcode.bedrock" => first_env_value(["BCODE_BEDROCK_MODEL", "BEDROCK_MODEL"]),
-        "bcode.openai-compatible" => first_env_value([
-            "BCODE_XAI_MODEL",
-            "XAI_MODEL",
-            "BCODE_OPENAI_MODEL",
-            "OPENAI_MODEL",
-        ]),
-        _ => None,
-    }
+    PROVIDER_ENVIRONMENT_SPECS
+        .iter()
+        .find(|spec| spec.plugin_id == provider_plugin_id)
+        .and_then(|spec| first_env_value_from_slice(spec.model_env_vars))
 }
 
 fn first_env_value<const N: usize>(names: [&str; N]) -> Option<String> {
-    names.into_iter().find_map(|name| match env::var(name) {
+    first_env_value_from_slice(&names)
+}
+
+fn first_env_value_from_slice(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| match env::var(name) {
         Ok(value) if !value.trim().is_empty() => Some(value),
         _ => None,
     })
@@ -134,19 +227,10 @@ fn first_env_value<const N: usize>(names: [&str; N]) -> Option<String> {
 /// Return true when environment variables imply Bedrock should be selected.
 #[must_use]
 pub fn bedrock_environment_is_configured() -> bool {
-    [
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "BCODE_BEDROCK_MODEL",
-        "BCODE_BEDROCK_MODELS",
-        "BCODE_BEDROCK_REGION",
-        "BCODE_BEDROCK_AWS_PROFILE",
-        "BCODE_BEDROCK_ENDPOINT_URL",
-        "BEDROCK_MODEL",
-        "BEDROCK_MODELS",
-        "BEDROCK_ENDPOINT_URL",
-    ]
-    .into_iter()
-    .any(|name| env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+    PROVIDER_ENVIRONMENT_SPECS
+        .iter()
+        .find(|spec| spec.plugin_id == "bcode.bedrock")
+        .is_some_and(|spec| first_env_value_from_slice(spec.signal_env_vars).is_some())
 }
 
 /// Terminal UI configuration.
@@ -1377,6 +1461,8 @@ edit = { "src/**" = "ask" }
 
     #[test]
     fn resolves_active_model_profile() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
         let config: BcodeConfig = toml::from_str(
             r#"
 [model]
@@ -1413,6 +1499,8 @@ profile = "work"
             selection.settings.get("region"),
             Some(&"us-east-1".to_string())
         );
+
+        restore_provider_env(previous_env);
     }
 
     #[test]
@@ -1485,6 +1573,8 @@ max_tool_rounds = 3
 
     #[test]
     fn default_plugin_selection_includes_default_agent_profiles() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
         let config = BcodeConfig::default();
         let plugin_selection = PluginSelection::from(&config);
 
@@ -1493,10 +1583,14 @@ max_tool_rounds = 3
                 .enabled
                 .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
         );
+
+        restore_provider_env(previous_env);
     }
 
     #[test]
     fn explicit_plugin_selection_still_includes_default_agent_profiles() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
         let config: BcodeConfig = toml::from_str(
             r#"
 [plugins]
@@ -1512,10 +1606,14 @@ enabled = ["bcode.bedrock"]
                 .enabled
                 .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
         );
+
+        restore_provider_env(previous_env);
     }
 
     #[test]
     fn default_agent_profiles_can_be_disabled() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
         let config: BcodeConfig = toml::from_str(
             r#"
 [plugins]
@@ -1530,16 +1628,16 @@ disabled = ["bcode.default-agents"]
                 .enabled
                 .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
         );
+
+        restore_provider_env(previous_env);
     }
 
     #[test]
     fn bedrock_env_overrides_persisted_openai_provider() {
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let previous_token = std::env::var_os("AWS_BEARER_TOKEN_BEDROCK");
-        let previous_model = std::env::var_os("BCODE_BEDROCK_MODEL");
+        let previous_env = clear_provider_env();
         unsafe {
             std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", "test-token");
-            std::env::remove_var("BCODE_BEDROCK_MODEL");
         }
 
         let config: BcodeConfig = toml::from_str(
@@ -1569,8 +1667,140 @@ model_id = "gpt-4.1-mini"
         );
         assert!(!plugin_selection.enabled.contains("bcode.openai-compatible"));
 
-        restore_env("AWS_BEARER_TOKEN_BEDROCK", previous_token);
-        restore_env("BCODE_BEDROCK_MODEL", previous_model);
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn openai_env_overrides_persisted_bedrock_provider() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+        }
+
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+enabled = ["bcode.bedrock"]
+
+[model]
+provider_plugin_id = "bcode.bedrock"
+model_id = "anthropic.claude-test"
+"#,
+        )
+        .expect("config should parse");
+        let selection = config.resolved_model_selection();
+        assert_eq!(
+            selection.provider_plugin_id,
+            Some("bcode.openai-compatible".to_string())
+        );
+        assert_eq!(selection.model_id, None);
+
+        let plugin_selection = PluginSelection::from(&config);
+        assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+        );
+        assert!(!plugin_selection.enabled.contains("bcode.bedrock"));
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn explicit_provider_env_wins_over_provider_specific_env() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        unsafe {
+            std::env::set_var("BCODE_PROVIDER", "bedrock");
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+        }
+
+        let config = BcodeConfig::default();
+        let selection = config.resolved_model_selection();
+        assert_eq!(
+            selection.provider_plugin_id,
+            Some("bcode.bedrock".to_string())
+        );
+        assert_eq!(selection.model_id, None);
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn provider_env_model_overrides_same_provider_config_model() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        unsafe {
+            std::env::set_var("BCODE_OPENAI_MODEL", "env-model");
+        }
+
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "config-model"
+"#,
+        )
+        .expect("config should parse");
+        let selection = config.resolved_model_selection();
+        assert_eq!(
+            selection.provider_plugin_id,
+            Some("bcode.openai-compatible".to_string())
+        );
+        assert_eq!(selection.model_id, Some("env-model".to_string()));
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn same_provider_config_model_survives_without_env_model() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+        }
+
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "config-model"
+"#,
+        )
+        .expect("config should parse");
+        let selection = config.resolved_model_selection();
+        assert_eq!(
+            selection.provider_plugin_id,
+            Some("bcode.openai-compatible".to_string())
+        );
+        assert_eq!(selection.model_id, Some("config-model".to_string()));
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn config_auth_selects_openai_provider_when_model_provider_is_omitted() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[auth.openai]
+backend = "sshenv"
+profile = "openai-max"
+mode = "chatgpt"
+"#,
+        )
+        .expect("config should parse");
+        let selection = config.resolved_model_selection();
+        assert_eq!(
+            selection.provider_plugin_id,
+            Some("bcode.openai-compatible".to_string())
+        );
+
+        restore_provider_env(previous_env);
     }
 
     #[test]
@@ -1707,6 +1937,58 @@ bash = { "cargo *" = "allow" }
         let missing = root.join("nonexistent.toml");
         let loaded = load_permissions_state_from(&missing).expect("missing file should be ok");
         assert!(loaded.is_empty());
+    }
+
+    const TEST_PROVIDER_ENV_NAMES: &[&str] = &[
+        "BCODE_MODEL_PROVIDER",
+        "BCODE_PROVIDER",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "BCODE_BEDROCK_MODEL",
+        "BCODE_BEDROCK_MODELS",
+        "BCODE_BEDROCK_REGION",
+        "BCODE_BEDROCK_AWS_PROFILE",
+        "BCODE_BEDROCK_ENDPOINT_URL",
+        "BEDROCK_MODEL",
+        "BEDROCK_MODELS",
+        "BEDROCK_ENDPOINT_URL",
+        "BCODE_XAI_API_KEY",
+        "XAI_API_KEY",
+        "BCODE_XAI_MODEL",
+        "XAI_MODEL",
+        "BCODE_XAI_MODELS",
+        "XAI_MODELS",
+        "BCODE_XAI_BASE_URL",
+        "XAI_BASE_URL",
+        "BCODE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "BCODE_OPENAI_MODEL",
+        "OPENAI_MODEL",
+        "BCODE_OPENAI_MODELS",
+        "OPENAI_MODELS",
+        "BCODE_OPENAI_BASE_URL",
+        "OPENAI_BASE_URL",
+        "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
+        "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
+        "BCODE_OPENAI_CODEX_ID_TOKEN",
+    ];
+
+    fn clear_provider_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        let previous = TEST_PROVIDER_ENV_NAMES
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        unsafe {
+            for name in TEST_PROVIDER_ENV_NAMES {
+                std::env::remove_var(name);
+            }
+        }
+        previous
+    }
+
+    fn restore_provider_env(previous: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (name, value) in previous {
+            restore_env(name, value);
+        }
     }
 
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
