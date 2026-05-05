@@ -8,6 +8,7 @@ members = [
     "plugins/openai-compatible-provider-plugin",
     "plugins/shell-plugin",
     "packages/agent-policy",
+    "packages/agent-policy/models",
     "packages/agent-profile",
     "packages/bcode",
     "packages/cli",
@@ -38,6 +39,7 @@ version    = "0.0.1-alpha.0"
 [workspace.dependencies]
 # Internal bcode packages
 bcode_agent_policy           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy" }
+bcode_agent_policy_models    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy/models" }
 bcode_agent_profile          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-profile" }
 bcode_cli                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bcode_client                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }

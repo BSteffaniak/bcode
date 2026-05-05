@@ -650,11 +650,19 @@ dependencies = [
 name = "bcode_agent_policy"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_policy_models",
  "bcode_agent_profile",
  "bcode_session_models",
  "bcode_tool",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bcode_agent_policy_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

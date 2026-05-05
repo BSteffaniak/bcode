@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Agent permission policy models for bcode"
+edition     = { workspace = true }
+keywords    = ["agent", "bcode", "models", "policy"]
+license     = { workspace = true }
+name        = "bcode_agent_policy_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

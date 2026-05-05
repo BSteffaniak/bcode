@@ -4,9 +4,12 @@
 
 //! Pi/OpenCode-style agent policy parsing and evaluation.
 
+pub use bcode_agent_policy_models::{
+    Action, AgentConfig, AgentPermissionConfig, PermissionConfig, default_external_directory_action,
+};
+
 use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse};
 use bcode_tool::ToolSideEffect;
-use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -14,57 +17,6 @@ use std::path::{Path, PathBuf};
 pub const BUILD_AGENT: &str = "build";
 /// Built-in plan agent ID.
 pub const PLAN_AGENT: &str = "plan";
-
-/// Agent action loaded from Pi/OpenCode-style permission config.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Action {
-    /// Allow the operation without prompting.
-    Allow,
-    /// Deny the operation.
-    Deny,
-    /// Ask via the host permission prompt.
-    #[default]
-    Ask,
-}
-
-/// Agent mode/profile configuration.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct AgentConfig {
-    #[serde(default)]
-    pub tools: BTreeMap<String, bool>,
-    #[serde(default)]
-    pub permission: PermissionConfig,
-}
-
-/// Permission configuration for an agent.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PermissionConfig {
-    #[serde(default)]
-    pub bash: BTreeMap<String, Action>,
-    #[serde(default = "default_external_directory_action")]
-    pub external_directory: Action,
-}
-
-impl Default for PermissionConfig {
-    fn default() -> Self {
-        Self {
-            bash: BTreeMap::new(),
-            external_directory: default_external_directory_action(),
-        }
-    }
-}
-
-const fn default_external_directory_action() -> Action {
-    Action::Allow
-}
-
-/// Pi/OpenCode-style top-level permission config.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct AgentPermissionConfig {
-    #[serde(default)]
-    pub agent: BTreeMap<String, AgentConfig>,
-}
 
 /// Compiled bash permission rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +54,7 @@ pub fn default_config() -> AgentPermissionConfig {
             permission: PermissionConfig {
                 bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
                 external_directory: Action::Allow,
+                ..PermissionConfig::default()
             },
         },
     );
@@ -134,6 +87,7 @@ pub fn default_config() -> AgentPermissionConfig {
                     ("rg *".to_string(), Action::Allow),
                 ]),
                 external_directory: Action::Allow,
+                ..PermissionConfig::default()
             },
         },
     );
@@ -731,6 +685,7 @@ mod tests {
                             ("echo *".to_string(), Action::Allow),
                         ]),
                         external_directory: Action::Allow,
+                        ..PermissionConfig::default()
                     },
                 },
             )]),
@@ -772,6 +727,7 @@ mod tests {
                             ("tee *".to_string(), Action::Allow),
                         ]),
                         external_directory: Action::Allow,
+                        ..PermissionConfig::default()
                     },
                 },
             )]),
@@ -800,6 +756,7 @@ mod tests {
                             ("git commit *".to_string(), Action::Deny),
                         ]),
                         external_directory: Action::Allow,
+                        ..PermissionConfig::default()
                     },
                 },
             )]),
@@ -835,6 +792,7 @@ mod tests {
             permission: PermissionConfig {
                 bash: BTreeMap::new(),
                 external_directory: Action::Deny,
+                ..PermissionConfig::default()
             },
         };
         let request = EvaluateToolCallRequest {
