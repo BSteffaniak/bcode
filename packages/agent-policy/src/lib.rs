@@ -179,10 +179,22 @@ fn evaluate_after_path(
     config: &AgentConfig,
     request: &EvaluateToolCallRequest,
 ) -> PolicyEvaluation {
-    if request.tool_name == "shell.run" {
-        return evaluate_shell(config, request);
+    match request.tool_name.as_str() {
+        "shell.run" => evaluate_shell(config, request),
+        "filesystem.read" | "filesystem.list" | "filesystem.find" | "filesystem.grep"
+        | "filesystem.stat" | "filesystem.exists" => {
+            evaluate_filesystem_path(config, request, &config.permission.read)
+        }
+        "filesystem.write" => evaluate_filesystem_path(config, request, &config.permission.write),
+        "filesystem.edit" => evaluate_filesystem_path(config, request, &config.permission.edit),
+        _ => evaluate_side_effect_fallback(config, request),
     }
+}
 
+fn evaluate_side_effect_fallback(
+    config: &AgentConfig,
+    request: &EvaluateToolCallRequest,
+) -> PolicyEvaluation {
     match request.side_effect {
         ToolSideEffect::ReadOnly => evaluation(AgentDecision::Allow, String::new(), None, None),
         ToolSideEffect::WriteFiles | ToolSideEffect::ExecuteProcess => {
@@ -209,6 +221,48 @@ fn evaluate_after_path(
             }
         }
     }
+}
+
+fn evaluate_filesystem_path(
+    config: &AgentConfig,
+    request: &EvaluateToolCallRequest,
+    rules: &BTreeMap<String, Action>,
+) -> PolicyEvaluation {
+    let candidates = candidate_paths(&request.tool_name, &request.arguments);
+    let path = candidates.first().cloned();
+    let compiled = compile_path_rules(rules);
+
+    let rule_match = path
+        .as_deref()
+        .and_then(|path| matching_path_rule(&compiled, path));
+
+    if let Some(rule) = rule_match {
+        let rule_pattern = Some(rule.pattern.clone());
+        let subject = path.unwrap_or_default();
+        return match rule.action {
+            Action::Allow => evaluation(AgentDecision::Allow, String::new(), rule_pattern, None),
+            Action::Ask => evaluation(
+                AgentDecision::Ask,
+                format!(
+                    "{} agent asks before {} on {}",
+                    request.agent_id, request.tool_name, subject
+                ),
+                rule_pattern,
+                Some(subject),
+            ),
+            Action::Deny => evaluation(
+                AgentDecision::Deny,
+                format!(
+                    "{} agent denied {} on '{}' by rule '{}'",
+                    request.agent_id, request.tool_name, subject, rule.pattern
+                ),
+                rule_pattern,
+                Some(subject),
+            ),
+        };
+    }
+
+    evaluate_side_effect_fallback(config, request)
 }
 
 fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
@@ -572,6 +626,82 @@ pub fn rule_specificity(pattern: &str) -> usize {
     exact_bonus + pattern.chars().filter(|char| *char != '*').count()
 }
 
+/// Compiled filesystem path rule.
+#[derive(Debug, Clone)]
+pub struct PathRule {
+    pub pattern: String,
+    pub action: Action,
+    pub specificity: usize,
+    matcher: globset::GlobMatcher,
+}
+
+impl PartialEq for PathRule {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+            && self.action == other.action
+            && self.specificity == other.specificity
+    }
+}
+
+impl Eq for PathRule {}
+
+/// Compile a map of path glob patterns into matchable rules.
+///
+/// Invalid glob patterns are silently skipped so a single malformed entry
+/// cannot disable the rest of an agent's policy.
+#[must_use]
+pub fn compile_path_rules(rules: &BTreeMap<String, Action>) -> Vec<PathRule> {
+    let mut compiled: Vec<PathRule> = rules
+        .iter()
+        .filter_map(|(pattern, action)| {
+            let glob = globset::GlobBuilder::new(pattern)
+                .literal_separator(false)
+                .build()
+                .ok()?;
+            Some(PathRule {
+                pattern: pattern.clone(),
+                action: *action,
+                specificity: path_rule_specificity(pattern),
+                matcher: glob.compile_matcher(),
+            })
+        })
+        .collect();
+    compiled.sort_by(|lhs, rhs| {
+        rhs.specificity
+            .cmp(&lhs.specificity)
+            .then_with(|| rhs.pattern.len().cmp(&lhs.pattern.len()))
+            .then_with(|| lhs.pattern.cmp(&rhs.pattern))
+    });
+    compiled
+}
+
+/// Return the highest-specificity compiled path rule matching `path`.
+#[must_use]
+pub fn matching_path_rule<'a>(rules: &'a [PathRule], path: &str) -> Option<&'a PathRule> {
+    rules.iter().find(|rule| rule.matcher.is_match(path))
+}
+
+/// Return path-rule specificity.
+///
+/// Scores each pattern by the count of literal characters. Patterns without
+/// glob metacharacters receive a large exact-match bonus so a literal path
+/// always outranks a wildcard pattern of equivalent length.
+#[must_use]
+pub fn path_rule_specificity(pattern: &str) -> usize {
+    let has_meta = pattern
+        .chars()
+        .any(|char| matches!(char, '*' | '?' | '[' | ']' | '{' | '}'));
+    let literal_count = pattern
+        .chars()
+        .filter(|char| !matches!(char, '*' | '?' | '[' | ']' | '{' | '}'))
+        .count();
+    if has_meta {
+        literal_count
+    } else {
+        1_000 + literal_count
+    }
+}
+
 fn string_argument<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     arguments.get(key).and_then(serde_json::Value::as_str)
 }
@@ -805,6 +935,164 @@ mod tests {
         };
 
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+    }
+
+    fn path_request(tool_name: &str, path: &str) -> EvaluateToolCallRequest {
+        EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: tool_name.to_string(),
+            side_effect: match tool_name {
+                "filesystem.write" | "filesystem.edit" => ToolSideEffect::WriteFiles,
+                _ => ToolSideEffect::ReadOnly,
+            },
+            arguments: json!({ "path": path }),
+            cwd: Some("/tmp/project".to_string()),
+        }
+    }
+
+    fn build_with_permission(permission: PermissionConfig) -> AgentConfig {
+        AgentConfig {
+            tools: BTreeMap::from([
+                ("filesystem.read".to_string(), true),
+                ("filesystem.write".to_string(), true),
+                ("filesystem.edit".to_string(), true),
+            ]),
+            permission,
+        }
+    }
+
+    #[test]
+    fn filesystem_write_allow_glob_skips_ask() {
+        let config = build_with_permission(PermissionConfig {
+            write: BTreeMap::from([("target/**".to_string(), Action::Allow)]),
+            ..PermissionConfig::default()
+        });
+
+        let result = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.write", "target/release/out.log"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(result.response.decision, AgentDecision::Allow);
+        assert_eq!(result.matched_rule.as_deref(), Some("target/**"));
+    }
+
+    #[test]
+    fn filesystem_write_deny_glob_blocks() {
+        let config = build_with_permission(PermissionConfig {
+            write: BTreeMap::from([(".ssh/**".to_string(), Action::Deny)]),
+            ..PermissionConfig::default()
+        });
+
+        let result = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.write", ".ssh/id_rsa"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+        assert_eq!(result.matched_rule.as_deref(), Some(".ssh/**"));
+    }
+
+    #[test]
+    fn filesystem_edit_specificity_picks_most_specific_rule() {
+        let config = build_with_permission(PermissionConfig {
+            edit: BTreeMap::from([
+                ("**".to_string(), Action::Ask),
+                ("src/**/*.rs".to_string(), Action::Allow),
+                ("src/generated/**".to_string(), Action::Deny),
+            ]),
+            ..PermissionConfig::default()
+        });
+
+        let generated = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.edit", "src/generated/bindings.rs"),
+            Path::new("/tmp/project"),
+        );
+        let regular = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.edit", "src/main.rs"),
+            Path::new("/tmp/project"),
+        );
+        let other = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.edit", "README.md"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(generated.response.decision, AgentDecision::Deny);
+        assert_eq!(generated.matched_rule.as_deref(), Some("src/generated/**"));
+        assert_eq!(regular.response.decision, AgentDecision::Allow);
+        assert_eq!(regular.matched_rule.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(other.response.decision, AgentDecision::Ask);
+        assert_eq!(other.matched_rule.as_deref(), Some("**"));
+    }
+
+    #[test]
+    fn filesystem_read_unmatched_falls_back_to_allow_when_enabled() {
+        let config = build_with_permission(PermissionConfig::default());
+
+        let result = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.read", "README.md"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(result.response.decision, AgentDecision::Allow);
+        assert!(result.matched_rule.is_none());
+    }
+
+    #[test]
+    fn filesystem_write_unmatched_falls_back_to_ask_when_enabled() {
+        let config = build_with_permission(PermissionConfig::default());
+
+        let result = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.write", "notes.md"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(result.response.decision, AgentDecision::Ask);
+        assert!(result.matched_rule.is_none());
+    }
+
+    #[test]
+    fn filesystem_write_falls_back_to_deny_when_tool_disabled() {
+        let config = AgentConfig {
+            tools: BTreeMap::from([("filesystem.write".to_string(), false)]),
+            permission: PermissionConfig::default(),
+        };
+
+        let result = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.write", "notes.md"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+    }
+
+    #[test]
+    fn external_directory_short_circuits_before_path_rules() {
+        let config = AgentConfig {
+            tools: BTreeMap::from([("filesystem.write".to_string(), true)]),
+            permission: PermissionConfig {
+                external_directory: Action::Deny,
+                write: BTreeMap::from([("**".to_string(), Action::Allow)]),
+                ..PermissionConfig::default()
+            },
+        };
+
+        let result = evaluate_tool_call(
+            &config,
+            &path_request("filesystem.write", "../outside.txt"),
+            Path::new("/tmp/project"),
+        );
 
         assert_eq!(result.response.decision, AgentDecision::Deny);
     }
