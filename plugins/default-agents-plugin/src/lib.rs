@@ -117,22 +117,62 @@ struct PolicySource {
 }
 
 fn load_config() -> (AgentPermissionConfig, PolicySource) {
-    match bcode_config::load_config() {
-        Ok(cfg) if !cfg.agent.is_empty() => (
-            AgentPermissionConfig { agent: cfg.agent },
-            PolicySource {
-                label: "bcode.toml [agent]".to_string(),
-                using_default: false,
-            },
-        ),
-        _ => (
+    let declarative = match bcode_config::load_config() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!(
+                "bcode.default-agents: failed to load declarative config ({error}); using built-in defaults"
+            );
+            return (
+                default_config(),
+                PolicySource {
+                    label: "built-in default agent policy".to_string(),
+                    using_default: true,
+                },
+            );
+        }
+    };
+
+    let state = match bcode_config::load_permissions_state() {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "bcode.default-agents: failed to load runtime permissions state ({error}); using declarative config only"
+            );
+            std::collections::BTreeMap::new()
+        }
+    };
+
+    let declarative_empty = declarative.agent.is_empty();
+    let state_empty = state.is_empty();
+
+    if declarative_empty && state_empty {
+        return (
             default_config(),
             PolicySource {
                 label: "built-in default agent policy".to_string(),
                 using_default: true,
             },
-        ),
+        );
     }
+
+    let mut agents = declarative.agent;
+    bcode_config::merge_agent_configs(&mut agents, state);
+
+    let label = match (declarative_empty, state_empty) {
+        (false, false) => "bcode.toml [agent] + runtime permissions state".to_string(),
+        (false, true) => "bcode.toml [agent]".to_string(),
+        (true, false) => "runtime permissions state".to_string(),
+        (true, true) => unreachable!("handled above"),
+    };
+
+    (
+        AgentPermissionConfig { agent: agents },
+        PolicySource {
+            label,
+            using_default: false,
+        },
+    )
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {

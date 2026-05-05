@@ -1,6 +1,6 @@
 # Permissions
 
-Bcode uses an agent-scoped permission model with three verbs: `allow`, `ask`, and `deny`. Rules live in `bcode.toml` under `[agent.<agent_id>]` sections.
+Bcode uses an agent-scoped permission model with three verbs: `allow`, `ask`, and `deny`. Declarative rules live in `bcode.toml` under `[agent.<agent_id>]` sections. Runtime rules written by the TUI "always allow" prompt live in a separate state file (see [Runtime rule persistence](#runtime-rule-persistence) below), so a read-only declarative config (for example on NixOS / home-manager) is never mutated.
 
 ## Config shape
 
@@ -83,27 +83,42 @@ Any `[agent.<id>]` you declare is usable via `/agent <id>` in the TUI and the CL
 
 ## Runtime rule persistence
 
-The TUI permission prompt offers an "always allow" / "always deny" action that writes a rule back into `bcode.toml`. The rule is scoped to the currently selected agent, with category inferred from the tool:
+The TUI permission prompt offers an "always allow" / "always deny" action that writes a rule into a **runtime state file**, never into `bcode.toml`. This means Nix / home-manager users (and anyone with a read-only declarative config) can still click "always allow" without their config being touched.
+
+The state file lives at `$BCODE_PERMISSIONS_STATE` if set, otherwise `$BCODE_STATE_DIR/permissions.toml`, otherwise `$XDG_STATE_HOME/bcode/permissions.toml`, otherwise `$HOME/.local/state/bcode/permissions.toml`. It uses the same `[agent.<id>.permission.<category>]` schema as `bcode.toml`, so rules can be promoted to declarative config by copying entries verbatim.
+
+At load time, the state file is merged **on top of** `bcode.toml` per `(agent, category, pattern)`. State entries win over same-pattern declarative entries. Patterns present only in declarative config survive untouched.
+
+The rule is scoped to the currently selected agent, with category inferred from the tool:
 
 * `shell.run` → `bash`. Persists **two** rules: the literal command (so the exact same invocation is remembered) and a broadened `<first-word> *` glob (so variations like `echo hello` after approving `echo hi` don't prompt again). If the literal command already contains a trailing `*`, only the literal rule is persisted.
 * `filesystem.write` → `write` (literal path).
 * `filesystem.edit`  → `edit` (literal path).
 * `filesystem.{read,list,find,grep,stat,exists}` → `read` (literal path).
 
-Filesystem paths are persisted literally by default because implicit directory globs can grant unintended access. To broaden a persisted path rule, edit `bcode.toml` directly (for example, replace `"src/foo.rs" = "allow"` with `"src/**" = "allow"`).
+Filesystem paths are persisted literally by default because implicit directory globs can grant unintended access. To broaden a persisted path rule, edit the state file (or `bcode.toml`) directly — for example, replace `"src/foo.rs" = "allow"` with `"src/**" = "allow"`.
 
-The CLI equivalent is:
+The CLI equivalent also writes to the state file:
 
 ```sh
 bcode permission add --agent build --category bash --pattern 'cargo *' --action allow
 ```
 
+### Promoting runtime rules to declarative config
+
+Because both files share the same schema, promoting a runtime rule into your declarative `bcode.toml` is a straightforward copy: open `$BCODE_STATE_DIR/permissions.toml`, pick the `[agent.<id>.permission.<category>]` entries you want permanent, and move them to your `bcode.toml`. Deleting them from the state file afterward keeps the two sources in sync.
+
+### Why state wins
+
+If your declarative config sets `"rm -rf /" = "ask"` and you then click **always allow**, the state file records `"rm -rf /" = "allow"` and it will win. That is deliberate: declarative config that opts into `ask` has already delegated the final decision to you. To make a rule truly unoverridable from the TUI, declaratively set it to `allow` or `deny` — the TUI never prompts for rules the evaluator short-circuits, so no "always allow" button can be clicked for them in the first place.
+
 ## Precedence
 
-The effective policy for an agent comes from, in order:
+The effective policy for an agent comes from these sources, merged in order (later sources override earlier ones per `(agent, category, pattern)`):
 
-1. `$XDG_CONFIG_HOME/bcode/bcode.toml` (or `$HOME/.config/bcode/bcode.toml`).
-2. `$CWD/.bcode/bcode.toml` (per-project overrides).
-3. Built-in `default_config()` when the merged `[agent]` map is empty.
+1. Built-in `default_config()` — used only when every later source is empty for that agent.
+2. `$XDG_CONFIG_HOME/bcode/bcode.toml` (or `$HOME/.config/bcode/bcode.toml`) — declarative user config.
+3. `$CWD/.bcode/bcode.toml` — per-project declarative overrides.
+4. Runtime permissions state file (see [Runtime rule persistence](#runtime-rule-persistence)) — highest priority, per-rule overrides.
 
-User config wins over project config for the same keys (later files in the merge order extend and replace). Per-agent entries replace wholesale; there is no partial merge within a single `[agent.<id>]` block across files.
+Per-agent entries replace wholesale across declarative files; there is no partial merge within a single `[agent.<id>]` block across `bcode.toml` files. The runtime state file, in contrast, merges per-rule: a rule in the state file overrides the same-pattern rule from declarative config but does not replace declarative rules for other patterns.

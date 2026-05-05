@@ -508,15 +508,22 @@ pub enum ConfigError {
     UnknownPermissionAction(String),
 }
 
-/// Upsert a permission rule under `[agent.<agent_id>.permission.<category>]`.
+/// Upsert a permission rule under `[agent.<agent_id>.permission.<category>]` in
+/// the runtime permissions state file.
+///
+/// Runtime rules live in `$BCODE_STATE_DIR/permissions.toml` (or the XDG state
+/// directory) rather than `bcode.toml`, so declarative configuration (for
+/// example a read-only Nix-managed `bcode.toml`) is never touched. When merged
+/// at load time, state-file rules win over same-pattern rules declared in
+/// `bcode.toml`.
 ///
 /// `category` must be one of `bash`, `read`, `write`, or `edit`.
 /// `action` must be one of `allow`, `ask`, or `deny`.
 ///
 /// # Errors
 ///
-/// Returns an error when the config cannot be read, the category or action is
-/// unknown, or the updated config cannot be written.
+/// Returns an error when the state file cannot be read, the category or action
+/// is unknown, or the updated file cannot be written.
 pub fn upsert_agent_permission_rule(
     agent_id: &str,
     category: &str,
@@ -524,8 +531,8 @@ pub fn upsert_agent_permission_rule(
     action: &str,
 ) -> Result<PathBuf, ConfigError> {
     let action = parse_action(action)?;
-    update_writable_config(|config| {
-        insert_agent_permission_rule(&mut config.agent, agent_id, category, pattern, action)
+    update_permissions_state(|agents| {
+        insert_agent_permission_rule(agents, agent_id, category, pattern, action)
     })
 }
 
@@ -678,6 +685,136 @@ pub fn default_auth_vault_path() -> PathBuf {
         return PathBuf::from(path);
     }
     default_state_dir().join("auth").join("vault")
+}
+
+/// Return the default runtime permissions state file path.
+///
+/// Runtime "always allow" / "always deny" clicks from the TUI and
+/// `bcode permission add` invocations persist to this path instead of the
+/// user's `bcode.toml`, so declarative configuration (for example a Nix-managed
+/// read-only `bcode.toml`) is never mutated at runtime.
+///
+/// Resolution precedence:
+///
+/// * `$BCODE_PERMISSIONS_STATE` if set.
+/// * Otherwise `<default_state_dir>/permissions.toml`.
+#[must_use]
+pub fn default_permissions_state_path() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_PERMISSIONS_STATE") {
+        return PathBuf::from(path);
+    }
+    default_state_dir().join("permissions.toml")
+}
+
+/// Load the runtime permissions state file.
+///
+/// Returns an empty agent map when the file does not exist. The file uses the
+/// same `[agent.<id>.permission.<category>]` schema as `bcode.toml`, so rules
+/// can be promoted to declarative config by copying entries verbatim.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn load_permissions_state()
+-> Result<BTreeMap<String, bcode_agent_policy_models::AgentConfig>, ConfigError> {
+    load_permissions_state_from(&default_permissions_state_path())
+}
+
+/// Load the runtime permissions state file from an explicit path.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn load_permissions_state_from(
+    path: &Path,
+) -> Result<BTreeMap<String, bcode_agent_policy_models::AgentConfig>, ConfigError> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    // Reuse the full config parser so the `[agent.<id>]` shape matches exactly.
+    let config: BcodeConfig = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(config.agent)
+}
+
+/// Merge a state-file agent map over a declarative agent map.
+///
+/// State entries win per `(agent, category, pattern)`: a rule appearing in the
+/// state map replaces the same-pattern rule in the declarative map. Patterns
+/// present only in the declarative map survive untouched. Tool enablement
+/// (`[agent.<id>.tools]`) and `external_directory` fields also take the state
+/// value when set in the state map.
+pub fn merge_agent_configs(
+    base: &mut BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
+    overlay: BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
+) {
+    for (agent_id, overlay_agent) in overlay {
+        let entry = base.entry(agent_id).or_default();
+        for (tool, enabled) in overlay_agent.tools {
+            entry.tools.insert(tool, enabled);
+        }
+        // External directory: treat a non-default state value as an override.
+        let overlay_external = overlay_agent.permission.external_directory;
+        if overlay_external != bcode_agent_policy_models::default_external_directory_action() {
+            entry.permission.external_directory = overlay_external;
+        }
+        for (pattern, action) in overlay_agent.permission.bash {
+            entry.permission.bash.insert(pattern, action);
+        }
+        for (pattern, action) in overlay_agent.permission.read {
+            entry.permission.read.insert(pattern, action);
+        }
+        for (pattern, action) in overlay_agent.permission.write {
+            entry.permission.write.insert(pattern, action);
+        }
+        for (pattern, action) in overlay_agent.permission.edit {
+            entry.permission.edit.insert(pattern, action);
+        }
+    }
+}
+
+fn update_permissions_state(
+    update: impl FnOnce(
+        &mut BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
+    ) -> Result<(), ConfigError>,
+) -> Result<PathBuf, ConfigError> {
+    let path = default_permissions_state_path();
+    let mut agents = if path.exists() {
+        load_permissions_state_from(&path)?
+    } else {
+        BTreeMap::new()
+    };
+    update(&mut agents)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, permissions_state_to_toml(&agents)).map_err(|source| {
+        ConfigError::Io {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(path)
+}
+
+fn permissions_state_to_toml(
+    agents: &BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
+) -> String {
+    let mut output = String::new();
+    output.push_str("# Bcode runtime permissions state. Managed automatically by\n");
+    output.push_str("# `bcode permission add` and the TUI always-allow prompts.\n");
+    output.push_str("# Entries here win over same-pattern rules in bcode.toml.\n\n");
+    write_agents_toml(&mut output, agents);
+    output
 }
 
 fn insert_agent_permission_rule(
@@ -1118,8 +1255,12 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, DEFAULT_AGENT_PROFILE_PLUGIN_ID, PluginSelection, load_config_from_paths,
+        BcodeConfig, DEFAULT_AGENT_PROFILE_PLUGIN_ID, PluginSelection,
+        default_permissions_state_path, load_config_from_paths, load_permissions_state_from,
+        merge_agent_configs, upsert_agent_permission_rule,
     };
+    use bcode_agent_policy_models::{Action, AgentConfig, PermissionConfig};
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1430,6 +1571,142 @@ model_id = "gpt-4.1-mini"
 
         restore_env("AWS_BEARER_TOKEN_BEDROCK", previous_token);
         restore_env("BCODE_BEDROCK_MODEL", previous_model);
+    }
+
+    #[test]
+    fn upsert_permission_rule_writes_state_file_only() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let state_path = root.join("permissions.toml");
+        let config_path = root.join("bcode.toml");
+        std::fs::write(
+            &config_path,
+            r#"[agent.build.permission]
+bash = { "cargo *" = "allow" }
+"#,
+        )
+        .expect("declarative config should be written");
+
+        let previous_state = std::env::var_os("BCODE_PERMISSIONS_STATE");
+        let previous_config = std::env::var_os("BCODE_CONFIG");
+        unsafe {
+            std::env::set_var("BCODE_PERMISSIONS_STATE", &state_path);
+            std::env::set_var("BCODE_CONFIG", &config_path);
+        }
+
+        let written =
+            upsert_agent_permission_rule("build", "bash", "echo hello".to_string(), "allow")
+                .expect("state write should succeed");
+
+        assert_eq!(written, state_path);
+        assert_eq!(default_permissions_state_path(), state_path);
+
+        let declarative_after = std::fs::read_to_string(&config_path)
+            .expect("declarative config should still be readable");
+        assert!(
+            declarative_after.contains("cargo *"),
+            "declarative bcode.toml must not be rewritten by runtime rule upsert"
+        );
+        assert!(
+            !declarative_after.contains("echo hello"),
+            "runtime rule must not leak into declarative bcode.toml"
+        );
+
+        let state_after =
+            std::fs::read_to_string(&state_path).expect("state file should be written");
+        assert!(state_after.contains("echo hello"));
+
+        let loaded = load_permissions_state_from(&state_path).expect("state file should load");
+        assert_eq!(
+            loaded
+                .get("build")
+                .and_then(|agent| agent.permission.bash.get("echo hello").copied()),
+            Some(Action::Allow)
+        );
+
+        restore_env("BCODE_PERMISSIONS_STATE", previous_state);
+        restore_env("BCODE_CONFIG", previous_config);
+    }
+
+    #[test]
+    fn merge_agent_configs_state_wins_on_same_pattern() {
+        let mut base = BTreeMap::from([(
+            "build".to_string(),
+            AgentConfig {
+                tools: BTreeMap::new(),
+                permission: PermissionConfig {
+                    bash: BTreeMap::from([
+                        ("cargo *".to_string(), Action::Allow),
+                        ("git push *".to_string(), Action::Deny),
+                    ]),
+                    ..PermissionConfig::default()
+                },
+            },
+        )]);
+        let overlay = BTreeMap::from([(
+            "build".to_string(),
+            AgentConfig {
+                tools: BTreeMap::new(),
+                permission: PermissionConfig {
+                    bash: BTreeMap::from([
+                        // Flip the declarative allow to deny; that is the
+                        // "state wins" contract the user signed up for.
+                        ("cargo *".to_string(), Action::Deny),
+                        // Add a brand-new pattern.
+                        ("echo *".to_string(), Action::Allow),
+                    ]),
+                    ..PermissionConfig::default()
+                },
+            },
+        )]);
+
+        merge_agent_configs(&mut base, overlay);
+
+        let build = base.get("build").expect("build agent should exist");
+        assert_eq!(
+            build.permission.bash.get("cargo *").copied(),
+            Some(Action::Deny)
+        );
+        assert_eq!(
+            build.permission.bash.get("git push *").copied(),
+            Some(Action::Deny),
+            "declarative-only rules survive the merge"
+        );
+        assert_eq!(
+            build.permission.bash.get("echo *").copied(),
+            Some(Action::Allow)
+        );
+    }
+
+    #[test]
+    fn merge_agent_configs_state_only_agent_is_added() {
+        let mut base: BTreeMap<String, AgentConfig> = BTreeMap::new();
+        let overlay = BTreeMap::from([(
+            "scratch".to_string(),
+            AgentConfig {
+                tools: BTreeMap::from([("shell.run".to_string(), true)]),
+                permission: PermissionConfig {
+                    bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
+                    ..PermissionConfig::default()
+                },
+            },
+        )]);
+
+        merge_agent_configs(&mut base, overlay);
+
+        let scratch = base.get("scratch").expect("scratch agent should be added");
+        assert_eq!(scratch.tools.get("shell.run").copied(), Some(true));
+        assert_eq!(scratch.permission.bash.get("*").copied(), Some(Action::Ask));
+    }
+
+    #[test]
+    fn load_permissions_state_missing_file_returns_empty() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let missing = root.join("nonexistent.toml");
+        let loaded = load_permissions_state_from(&missing).expect("missing file should be ok");
+        assert!(loaded.is_empty());
     }
 
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
