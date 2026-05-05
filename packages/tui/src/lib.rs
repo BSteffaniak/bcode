@@ -41,7 +41,7 @@ use ratatui::widgets::{
     Widget, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
@@ -1109,6 +1109,8 @@ struct ChatApp {
     activity: ActivityState,
     activity_started_at: Option<Instant>,
     render_tick: Cell<u64>,
+    transcript_revision: Cell<u64>,
+    transcript_cache: RefCell<TranscriptRenderCache>,
     scroll_rows_from_bottom: usize,
     last_transcript_width: Cell<u16>,
     last_transcript_height: Cell<u16>,
@@ -1266,6 +1268,8 @@ impl ChatApp {
             activity: ActivityState::Idle,
             activity_started_at: None,
             render_tick: Cell::new(0),
+            transcript_revision: Cell::new(0),
+            transcript_cache: RefCell::new(TranscriptRenderCache::default()),
             scroll_rows_from_bottom: 0,
             last_transcript_width: Cell::new(DEFAULT_TRANSCRIPT_WIDTH),
             last_transcript_height: Cell::new(DEFAULT_TRANSCRIPT_HEIGHT),
@@ -1445,29 +1449,35 @@ impl ChatApp {
     }
 
     fn top_visible_line_index(&self) -> usize {
-        let lines = self.rendered_transcript_lines();
-        let (metrics, total_rows) = visual_line_metrics(&lines, self.last_transcript_width.get());
-        let Some(last_metric) = metrics.last() else {
-            return 0;
-        };
-        let viewport_rows = usize::from(self.last_transcript_height.get());
-        let max_scroll_rows_from_bottom = total_rows.saturating_sub(viewport_rows);
-        let effective_scroll_rows_from_bottom = self
-            .scroll_rows_from_bottom
-            .min(max_scroll_rows_from_bottom);
-        let top_visual_row =
-            max_scroll_rows_from_bottom.saturating_sub(effective_scroll_rows_from_bottom);
-        metrics
-            .iter()
-            .find(|metric| metric.end_row > top_visual_row)
-            .map_or(last_metric.logical_index, |metric| metric.logical_index)
+        self.with_transcript_snapshot(self.last_transcript_width.get(), |snapshot| {
+            let Some(last_metric) = snapshot.metrics.last() else {
+                return 0;
+            };
+            let viewport_rows = usize::from(self.last_transcript_height.get());
+            let max_scroll_rows_from_bottom = snapshot.total_rows.saturating_sub(viewport_rows);
+            let effective_scroll_rows_from_bottom = self
+                .scroll_rows_from_bottom
+                .min(max_scroll_rows_from_bottom);
+            let top_visual_row =
+                max_scroll_rows_from_bottom.saturating_sub(effective_scroll_rows_from_bottom);
+            snapshot
+                .metrics
+                .iter()
+                .find(|metric| metric.end_row > top_visual_row)
+                .map_or(last_metric.logical_index, |metric| metric.logical_index)
+        })
     }
 
     fn scroll_to_line(&mut self, index: usize) {
-        let lines = self.rendered_transcript_lines();
-        let (metrics, total_rows) = visual_line_metrics(&lines, self.last_transcript_width.get());
-        if let Some(metric) = metrics.get(index) {
-            self.scroll_rows_from_bottom = total_rows.saturating_sub(metric.end_row);
+        let scroll_rows_from_bottom =
+            self.with_transcript_snapshot(self.last_transcript_width.get(), |snapshot| {
+                snapshot
+                    .metrics
+                    .get(index)
+                    .map(|metric| snapshot.total_rows.saturating_sub(metric.end_row))
+            });
+        if let Some(scroll_rows_from_bottom) = scroll_rows_from_bottom {
+            self.scroll_rows_from_bottom = scroll_rows_from_bottom;
         }
         self.clamp_scroll();
     }
@@ -1512,9 +1522,11 @@ impl ChatApp {
     }
 
     fn max_scroll_rows_from_bottom(&self) -> usize {
-        let lines = self.rendered_transcript_lines();
-        let (_, total_rows) = visual_line_metrics(&lines, self.last_transcript_width.get());
-        total_rows.saturating_sub(usize::from(self.last_transcript_height.get()))
+        self.with_transcript_snapshot(self.last_transcript_width.get(), |snapshot| {
+            snapshot
+                .total_rows
+                .saturating_sub(usize::from(self.last_transcript_height.get()))
+        })
     }
 
     fn absorb_history(&mut self, history: &[SessionEvent]) {
@@ -1529,7 +1541,7 @@ impl ChatApp {
     }
 
     fn absorb_session_event(&mut self, event: &SessionEvent) {
-        self.absorb_session_event_with_scroll_clamp(event, true);
+        self.absorb_session_event_with_scroll_clamp(event, false);
     }
 
     fn absorb_session_event_with_scroll_clamp(&mut self, event: &SessionEvent, clamp_scroll: bool) {
@@ -1581,6 +1593,7 @@ impl ChatApp {
     fn push_session_event(&mut self, event: &SessionEvent) {
         self.finish_streaming_block_if_needed();
         self.blocks.extend(transcript_blocks_from_event(event));
+        self.mark_transcript_dirty();
     }
 
     fn push_assistant_delta_with_scroll_clamp(&mut self, text: &str, clamp_scroll: bool) {
@@ -1596,6 +1609,7 @@ impl ChatApp {
                 streaming: true,
             }),
         }
+        self.mark_transcript_dirty();
         if clamp_scroll {
             self.clamp_scroll();
         }
@@ -1615,6 +1629,7 @@ impl ChatApp {
                 streaming: false,
             }),
         }
+        self.mark_transcript_dirty();
         if clamp_scroll {
             self.clamp_scroll();
         }
@@ -1632,14 +1647,65 @@ impl ChatApp {
             .min(self.max_scroll_rows_from_bottom());
     }
 
-    fn rendered_line_texts(&self) -> Vec<String> {
-        self.rendered_transcript_lines()
-            .iter()
-            .map(line_plain_text)
-            .collect()
+    fn mark_transcript_dirty(&self) {
+        self.transcript_revision
+            .set(self.transcript_revision.get().wrapping_add(1));
     }
 
+    fn with_transcript_snapshot<R>(
+        &self,
+        width: u16,
+        f: impl FnOnce(&TranscriptRenderSnapshot) -> R,
+    ) -> R {
+        let width = width.max(1);
+        let revision = self.transcript_revision.get();
+        let needs_refresh =
+            self.transcript_cache
+                .borrow()
+                .snapshot
+                .as_ref()
+                .is_none_or(|snapshot| {
+                    snapshot.revision != revision
+                        || snapshot.width != width
+                        || snapshot.block_count != self.blocks.len()
+                        || snapshot.search_query != self.search_query
+                });
+        if needs_refresh {
+            let lines = self.rendered_transcript_lines_uncached();
+            let (metrics, total_rows) = visual_line_metrics(&lines, width);
+            self.transcript_cache.borrow_mut().snapshot = Some(TranscriptRenderSnapshot {
+                revision,
+                width,
+                block_count: self.blocks.len(),
+                search_query: self.search_query.clone(),
+                lines,
+                metrics,
+                total_rows,
+            });
+        }
+
+        let cache = self.transcript_cache.borrow();
+        let snapshot = cache
+            .snapshot
+            .as_ref()
+            .expect("transcript snapshot should exist after refresh");
+        f(snapshot)
+    }
+
+    fn rendered_line_texts(&self) -> Vec<String> {
+        self.with_transcript_snapshot(self.last_transcript_width.get(), |snapshot| {
+            snapshot.lines.iter().map(line_plain_text).collect()
+        })
+    }
+
+    #[cfg(test)]
     fn rendered_transcript_lines(&self) -> Vec<Line<'static>> {
+        self.with_transcript_snapshot(self.last_transcript_width.get(), |snapshot| {
+            snapshot.lines.clone()
+        })
+    }
+
+    fn rendered_transcript_lines_uncached(&self) -> Vec<Line<'static>> {
         self.blocks
             .iter()
             .flat_map(|block| block.render_lines(&self.search_query))
@@ -1785,6 +1851,8 @@ impl ChatApp {
             }
             "clear" => {
                 self.blocks.clear();
+                self.scroll_rows_from_bottom = 0;
+                self.mark_transcript_dirty();
                 self.status = "transcript cleared".to_string();
             }
             _ => {
@@ -1846,6 +1914,8 @@ impl ChatApp {
             }
             "clear" => {
                 self.blocks.clear();
+                self.scroll_rows_from_bottom = 0;
+                self.mark_transcript_dirty();
                 self.status = "cleared".to_string();
                 true
             }
@@ -1919,13 +1989,16 @@ impl ratatui::widgets::Widget for &ChatApp {
         self.last_transcript_height.set(transcript_height);
         self.last_transcript_area.set(chunks[1]);
 
-        let rendered_lines = self.rendered_transcript_lines();
-        let viewport = transcript_viewport(
-            &rendered_lines,
-            transcript_width,
-            transcript_height,
-            self.scroll_rows_from_bottom,
-        );
+        let viewport = self.with_transcript_snapshot(transcript_width, |snapshot| {
+            transcript_viewport_from_metrics(
+                &snapshot.lines,
+                &snapshot.metrics,
+                snapshot.total_rows,
+                transcript_width,
+                transcript_height,
+                self.scroll_rows_from_bottom,
+            )
+        });
         let transcript = if viewport.lines.is_empty() {
             Paragraph::new(Text::from(vec![Line::from(vec![Span::styled(
                 "Start a conversation with Bcode.",
@@ -2637,6 +2710,22 @@ struct VisualLineMetric {
     end_row: usize,
 }
 
+#[derive(Debug, Default)]
+struct TranscriptRenderCache {
+    snapshot: Option<TranscriptRenderSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptRenderSnapshot {
+    revision: u64,
+    width: u16,
+    block_count: usize,
+    search_query: String,
+    lines: Vec<Line<'static>>,
+    metrics: Vec<VisualLineMetric>,
+    total_rows: usize,
+}
+
 #[derive(Debug, Clone)]
 struct TranscriptViewport {
     lines: Vec<Line<'static>>,
@@ -2644,13 +2733,33 @@ struct TranscriptViewport {
     local_scroll_y: usize,
 }
 
+#[cfg(test)]
 fn transcript_viewport(
     lines: &[Line<'static>],
     width: u16,
     height: u16,
     scroll_rows_from_bottom: usize,
 ) -> TranscriptViewport {
-    if lines.is_empty() || width == 0 || height == 0 {
+    let (metrics, total_rows) = visual_line_metrics(lines, width);
+    transcript_viewport_from_metrics(
+        lines,
+        &metrics,
+        total_rows,
+        width,
+        height,
+        scroll_rows_from_bottom,
+    )
+}
+
+fn transcript_viewport_from_metrics(
+    lines: &[Line<'static>],
+    metrics: &[VisualLineMetric],
+    total_rows: usize,
+    width: u16,
+    height: u16,
+    scroll_rows_from_bottom: usize,
+) -> TranscriptViewport {
+    if lines.is_empty() || metrics.is_empty() || width == 0 || height == 0 {
         return TranscriptViewport {
             lines: Vec::new(),
             effective_scroll_rows_from_bottom: 0,
@@ -2659,7 +2768,6 @@ fn transcript_viewport(
     }
 
     let viewport_rows = usize::from(height);
-    let (metrics, total_rows) = visual_line_metrics(lines, width);
     let max_scroll_rows_from_bottom = total_rows.saturating_sub(viewport_rows);
     let effective_scroll_rows_from_bottom =
         scroll_rows_from_bottom.min(max_scroll_rows_from_bottom);
