@@ -19,7 +19,8 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -168,7 +169,8 @@ struct Settings {
     auth: AuthSettings,
     auth_diagnostics: AuthDiagnostics,
     base_url: String,
-    default_model: String,
+    default_model: Option<String>,
+    fallback_model: String,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
 }
@@ -361,6 +363,8 @@ struct ModelsResponseBody {
 #[derive(Debug, Deserialize)]
 struct ModelResponseItem {
     id: String,
+    #[serde(default)]
+    created: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,19 +501,53 @@ async fn stream_chat_completion_inner(
                 error.to_string(),
             )
         })?;
+    let model_id = resolve_model_id_for_turn(&settings, request, turn).await;
     match &settings.auth {
         AuthSettings::ApiKey(api_key) => {
             let response =
-                send_chat_completion_request(&client, &settings, api_key, request).await?;
+                send_chat_completion_request(&client, &settings, api_key, request, &model_id)
+                    .await?;
             read_stream_events(response, turn, request).await
         }
         AuthSettings::ChatGpt { access_token, .. } => {
             let response =
-                send_responses_request(&client, &settings, access_token, request).await?;
+                send_responses_request(&client, &settings, access_token, request, &model_id)
+                    .await?;
             read_responses_stream_events(response, turn, request).await
         }
         AuthSettings::Missing => unreachable!("missing auth handled above"),
     }
+}
+
+async fn resolve_model_id_for_turn(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> String {
+    if !request.model_id.trim().is_empty() {
+        return request.model_id.clone();
+    }
+    if let Some(model_id) = &settings.default_model
+        && !model_id.trim().is_empty()
+    {
+        return model_id.clone();
+    }
+    if let AuthSettings::ApiKey(api_key) = &settings.auth {
+        match discover_models_async(settings, api_key).await {
+            Ok(models) => {
+                if let Some(model) = select_default_model_info(&models) {
+                    return model.model_id.clone();
+                }
+            }
+            Err(error) => turn.push(ProviderTurnEvent::Warning {
+                message: format!(
+                    "OpenAI-compatible model discovery failed ({}); falling back to {}",
+                    error.message, settings.fallback_model
+                ),
+            }),
+        }
+    }
+    settings.fallback_model.clone()
 }
 
 async fn send_chat_completion_request(
@@ -517,17 +555,14 @@ async fn send_chat_completion_request(
     settings: &Settings,
     api_key: &str,
     request: &ModelTurnRequest,
+    model_id: &str,
 ) -> Result<reqwest::Response, ProviderError> {
     let url = format!(
         "{}/chat/completions",
         settings.base_url.trim_end_matches('/')
     );
     let request_body = ChatCompletionRequest {
-        model: if request.model_id.is_empty() {
-            settings.default_model.clone()
-        } else {
-            request.model_id.clone()
-        },
+        model: model_id.to_string(),
         messages: model_messages_to_chat_messages(request),
         stream: true,
         stream_options: Some(ChatStreamOptions {
@@ -574,14 +609,11 @@ async fn send_responses_request(
     settings: &Settings,
     access_token: &str,
     request: &ModelTurnRequest,
+    model_id: &str,
 ) -> Result<reqwest::Response, ProviderError> {
     let url = OPENAI_CODEX_API_ENDPOINT;
     let request_body = ResponsesRequest {
-        model: if request.model_id.is_empty() {
-            settings.default_model.clone()
-        } else {
-            request.model_id.clone()
-        },
+        model: model_id.to_string(),
         instructions: request.system_prompt.clone(),
         input: model_messages_to_responses_input_for_reuse(request),
         stream: true,
@@ -1309,6 +1341,7 @@ impl OpenAiCompatibleProviderPlugin {
     fn models(&self) -> ModelList {
         let settings = settings();
         if !settings.model_ids_are_explicit
+            && settings.default_model.is_none()
             && let Some(discovered_models) = self.discover_models(&settings)
         {
             return ModelList {
@@ -1316,18 +1349,55 @@ impl OpenAiCompatibleProviderPlugin {
             };
         }
         ModelList {
-            models: model_infos_from_ids(&settings.model_ids, &settings.default_model),
+            models: model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
         }
     }
 }
 
-fn model_infos_from_ids(model_ids: &[String], default_model: &str) -> Vec<ModelInfo> {
-    model_ids
-        .iter()
-        .map(|model_id| ModelInfo {
-            model_id: model_id.clone(),
-            display_name: model_id.clone(),
-            is_default: model_id == default_model,
+fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
+    model_infos_from_items(
+        model_ids
+            .iter()
+            .map(|model_id| ModelResponseItem {
+                id: model_id.clone(),
+                created: None,
+            })
+            .collect(),
+        default_model,
+    )
+}
+
+fn model_infos_from_items(
+    models: Vec<ModelResponseItem>,
+    default_model: Option<&str>,
+) -> Vec<ModelInfo> {
+    let mut deduped = models
+        .into_iter()
+        .filter(|model| !model.id.trim().is_empty())
+        .map(|model| (model.id.clone(), model))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(default_model) = default_model
+        && !deduped.contains_key(default_model)
+    {
+        deduped.insert(
+            default_model.to_string(),
+            ModelResponseItem {
+                id: default_model.to_string(),
+                created: None,
+            },
+        );
+    }
+    let mut models = deduped.into_values().collect::<Vec<_>>();
+    models.sort_by(compare_model_candidates);
+    let selected_default = default_model
+        .map(ToString::to_string)
+        .or_else(|| models.first().map(|model| model.id.clone()));
+    models
+        .into_iter()
+        .map(|model| ModelInfo {
+            is_default: selected_default.as_deref() == Some(model.id.as_str()),
+            model_id: model.id.clone(),
+            display_name: model.id,
             context_window: None,
             max_output_tokens: None,
             capabilities: [
@@ -1339,6 +1409,86 @@ fn model_infos_from_ids(model_ids: &[String], default_model: &str) -> Vec<ModelI
             .collect(),
         })
         .collect()
+}
+
+fn select_default_model_info(models: &[ModelInfo]) -> Option<&ModelInfo> {
+    models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| models.first())
+}
+
+fn compare_model_candidates(left: &ModelResponseItem, right: &ModelResponseItem) -> CmpOrdering {
+    model_preference_key(right)
+        .cmp(&model_preference_key(left))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn model_preference_key(model: &ModelResponseItem) -> (i32, Vec<u32>, i64) {
+    let id = model.id.to_ascii_lowercase();
+    (
+        model_variant_score(&id),
+        numeric_version_key(&id),
+        model.created.unwrap_or_default(),
+    )
+}
+
+fn model_variant_score(model_id: &str) -> i32 {
+    if contains_any(
+        model_id,
+        &[
+            "embedding",
+            "embed",
+            "audio",
+            "whisper",
+            "tts",
+            "transcribe",
+            "image",
+            "dall-e",
+            "moderation",
+            "realtime",
+            "search",
+            "rerank",
+            "vision",
+            "ft:",
+        ],
+    ) {
+        return 0;
+    }
+    if contains_any(
+        model_id,
+        &[
+            "mini", "nano", "micro", "small", "lite", "flash", "fast", "cheap",
+        ],
+    ) {
+        return 10;
+    }
+    20
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn numeric_version_key(model_id: &str) -> Vec<u32> {
+    let mut key = Vec::new();
+    let mut current = String::new();
+    for character in model_id.chars() {
+        if character.is_ascii_digit() {
+            current.push(character);
+        } else if !current.is_empty() {
+            if let Ok(number) = current.parse() {
+                key.push(number);
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty()
+        && let Ok(number) = current.parse()
+    {
+        key.push(number);
+    }
+    key
 }
 
 impl OpenAiCompatibleProviderPlugin {
@@ -1404,24 +1554,10 @@ async fn discover_models_async(
             error.to_string(),
         )
     })?;
-    Ok(model_infos_from_ids(
-        &model_ids_with_default(body.data, &settings.default_model),
-        &settings.default_model,
+    Ok(model_infos_from_items(
+        body.data,
+        settings.default_model.as_deref(),
     ))
-}
-
-fn model_ids_with_default(models: Vec<ModelResponseItem>, default_model: &str) -> Vec<String> {
-    let mut model_ids = models
-        .into_iter()
-        .map(|model| model.id)
-        .filter(|model_id| !model_id.is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if !model_ids.iter().any(|model_id| model_id == default_model) {
-        model_ids.insert(0, default_model.to_string());
-    }
-    model_ids
 }
 
 impl OpenAiCompatibleProviderPlugin {
@@ -1501,7 +1637,17 @@ fn diagnostics_metadata(
             },
         ),
         ("api_base_url".to_string(), settings.base_url.clone()),
-        ("default_model".to_string(), settings.default_model.clone()),
+        (
+            "default_model".to_string(),
+            settings
+                .default_model
+                .clone()
+                .unwrap_or_else(|| "<auto-discovered>".to_string()),
+        ),
+        (
+            "fallback_model".to_string(),
+            settings.fallback_model.clone(),
+        ),
         (
             "model_list_source".to_string(),
             if settings.model_ids_are_explicit {
@@ -1529,21 +1675,20 @@ fn settings() -> Settings {
     let saved = saved_openai_auth();
     let xai_mode = saved_has_xai_keys(&saved) || env_has_xai_keys();
     let chatgpt_mode = saved_openai_auth_is_chatgpt(&saved) && !xai_mode;
+    let fallback_model = if xai_mode {
+        DEFAULT_XAI_MODEL_ID.to_string()
+    } else if chatgpt_mode {
+        DEFAULT_CODEX_MODEL_ID.to_string()
+    } else {
+        DEFAULT_MODEL_ID.to_string()
+    };
     let default_model = first_env([
         "BCODE_XAI_MODEL",
         "XAI_MODEL",
         "BCODE_OPENAI_MODEL",
         "OPENAI_MODEL",
     ])
-    .unwrap_or_else(|| {
-        if xai_mode {
-            DEFAULT_XAI_MODEL_ID.to_string()
-        } else if chatgpt_mode {
-            DEFAULT_CODEX_MODEL_ID.to_string()
-        } else {
-            DEFAULT_MODEL_ID.to_string()
-        }
-    });
+    .or_else(|| chatgpt_mode.then(|| DEFAULT_CODEX_MODEL_ID.to_string()));
     let model_ids_env = first_env([
         "BCODE_XAI_MODELS",
         "XAI_MODELS",
@@ -1553,7 +1698,9 @@ fn settings() -> Settings {
     let mut model_ids = model_ids_env
         .as_deref()
         .map_or_else(|| default_model_ids(chatgpt_mode), parse_model_list);
-    if !model_ids.contains(&default_model) {
+    if let Some(default_model) = &default_model
+        && !model_ids.contains(default_model)
+    {
         model_ids.insert(0, default_model.clone());
     }
     let (auth, auth_diagnostics) = openai_auth_settings(&saved);
@@ -1579,6 +1726,7 @@ fn settings() -> Settings {
         auth_diagnostics,
         base_url,
         default_model,
+        fallback_model,
         model_ids,
         model_ids_are_explicit: model_ids_env.is_some(),
     }
@@ -2158,50 +2306,49 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 mod tests {
     use super::*;
 
+    fn model_item(id: &str, created: i64) -> ModelResponseItem {
+        ModelResponseItem {
+            id: id.to_string(),
+            created: Some(created),
+        }
+    }
+
     #[test]
-    fn model_ids_with_default_sorts_deduplicates_and_inserts_default() {
-        let model_ids = model_ids_with_default(
+    fn discovered_model_infos_prefers_newest_flagship() {
+        let model_infos = model_infos_from_items(
             vec![
-                ModelResponseItem {
-                    id: "z-model".to_string(),
-                },
-                ModelResponseItem {
-                    id: "a-model".to_string(),
-                },
-                ModelResponseItem {
-                    id: "z-model".to_string(),
-                },
+                model_item("gpt-4.1", 100),
+                model_item("gpt-5", 90),
+                model_item("gpt-4.1-mini", 300),
+                model_item("text-embedding-3-large", 400),
             ],
-            "default-model",
+            None,
         );
 
         assert_eq!(
-            model_ids,
-            vec![
-                "default-model".to_string(),
-                "a-model".to_string(),
-                "z-model".to_string(),
-            ]
+            select_default_model_info(&model_infos).map(|model| model.model_id.as_str()),
+            Some("gpt-5")
         );
     }
 
     #[test]
-    fn model_ids_with_default_does_not_duplicate_existing_default() {
-        let model_ids = model_ids_with_default(
-            vec![ModelResponseItem {
-                id: "default-model".to_string(),
-            }],
-            "default-model",
+    fn discovered_model_infos_prefers_flagship_over_newer_mini() {
+        let model_infos = model_infos_from_items(
+            vec![model_item("gpt-5-mini", 300), model_item("gpt-4.1", 100)],
+            None,
         );
 
-        assert_eq!(model_ids, vec!["default-model".to_string()]);
+        assert_eq!(
+            select_default_model_info(&model_infos).map(|model| model.model_id.as_str()),
+            Some("gpt-4.1")
+        );
     }
 
     #[test]
     fn model_infos_mark_default_and_tool_capability() {
         let model_infos = model_infos_from_ids(
             &["default-model".to_string(), "other-model".to_string()],
-            "default-model",
+            Some("default-model"),
         );
 
         assert!(model_infos[0].is_default);
