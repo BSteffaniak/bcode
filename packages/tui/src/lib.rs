@@ -1927,8 +1927,12 @@ impl ChatApp {
     }
 
     fn push_session_event(&mut self, event: &SessionEvent) {
+        let blocks = transcript_blocks_from_event(event);
+        if blocks.is_empty() {
+            return;
+        }
         self.finish_streaming_block_if_needed();
-        self.blocks.extend(transcript_blocks_from_event(event));
+        self.blocks.extend(blocks);
         self.mark_transcript_dirty();
     }
 
@@ -3809,6 +3813,38 @@ mod tests {
         )));
 
         assert_eq!(app.activity, ActivityState::Streaming { chars: 7 });
+    }
+
+    #[test]
+    fn live_assistant_final_message_replaces_stream_after_invisible_events() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::AssistantDelta {
+                text: "hel".to_string(),
+            },
+        )));
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn".to_string(),
+                usage: SessionTokenUsage::default(),
+            },
+        )));
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::AssistantMessage {
+                text: "hello".to_string(),
+            },
+        )));
+
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [TranscriptBlock::Assistant { text, streaming: false }] if text == "hello"
+        ));
     }
 
     #[test]
