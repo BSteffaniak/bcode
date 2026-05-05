@@ -122,8 +122,11 @@ Minimum expected validation once Rust crates exist:
 
 - `cargo fmt --check`
 - `cargo check --workspace`
+- `cargo clippy --workspace --all-targets -- -D warnings`
 - relevant `cargo test` commands for changed packages
 - relevant plugin rebuild/check commands when plugin crates exist
+
+Treat clippy warnings as blocking. Fix root causes rather than adding broad suppressions.
 
 For docs-only changes, no runtime validation is required.
 
