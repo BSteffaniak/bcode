@@ -383,6 +383,12 @@ async fn handle_request(
             handle_create_session(request_id, state, writer, name).await
         }
         Request::ListSessions => handle_list_sessions(request_id, state, writer).await,
+        Request::RenameSession { session_id, name } => {
+            handle_rename_session(request_id, state, writer, session_id, name).await
+        }
+        Request::DeleteSession { session_id } => {
+            handle_delete_session(request_id, state, writer, session_id).await
+        }
         Request::SessionHistory { session_id } => {
             handle_session_history(request_id, state, writer, session_id).await
         }
@@ -575,6 +581,88 @@ async fn handle_list_sessions(
     .await
 }
 
+async fn handle_rename_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    name: Option<String>,
+) -> Result<(), ServerError> {
+    match state.sessions.rename_session(session_id, name).await {
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            let session = state.sessions.session_summary(session_id).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionRenamed { session }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_rename_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_delete_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    if state.active_turns.lock().await.contains_key(&session_id) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_busy",
+                format!("session has an active model turn: {session_id}"),
+            )),
+        )
+        .await;
+    }
+    match state.sessions.delete_session(session_id).await {
+        Ok(session) => {
+            state
+                .session_model_selections
+                .lock()
+                .await
+                .remove(&session_id);
+            state
+                .session_agent_selections
+                .lock()
+                .await
+                .remove(&session_id);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionDeleted { session }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_delete_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
 async fn handle_session_history(
     request_id: u64,
     state: &ServerState,
@@ -652,11 +740,24 @@ async fn handle_user_message(
         .append_user_message(session_id, client_id, text)
         .await
     {
-        Ok(event) => {
-            publish_session_event(state, &event).await;
+        Ok(events) => {
+            for event in &events {
+                publish_session_event(state, event).await;
+            }
+            let Some(user_event) = events.last().cloned() else {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "message_not_appended",
+                        "no user message event was appended",
+                    )),
+                )
+                .await;
+            };
             let state_for_turn = Arc::clone(state);
             tokio::spawn(async move {
-                run_model_turn(&state_for_turn, session_id, &event).await;
+                run_model_turn(&state_for_turn, session_id, &user_event).await;
             });
             send_response(
                 writer,

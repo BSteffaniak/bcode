@@ -14,7 +14,7 @@ use bcode_session_models::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
@@ -29,6 +29,8 @@ pub enum SessionError {
     NotFound(SessionId),
     #[error("session event store error: {0}")]
     Store(#[from] SessionStoreError),
+    #[error("session has connected clients: {0}")]
+    ConnectedClients(SessionId),
 }
 
 /// Errors returned by the append-only session event store.
@@ -93,6 +95,15 @@ impl SessionEventStore {
         file.write_all(&payload)?;
         file.flush()?;
         Ok(())
+    }
+
+    fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
+        let path = self.event_path(session_id);
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(SessionStoreError::Io(error)),
+        }
     }
 
     fn event_path(&self, session_id: SessionId) -> PathBuf {
@@ -180,6 +191,85 @@ impl SessionManager {
     pub async fn list_sessions(&self) -> Vec<SessionSummary> {
         let inner = self.inner.lock().await;
         inner.sessions.values().map(SessionState::summary).collect()
+    }
+
+    /// Rename a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the session does not exist
+    /// * the rename event cannot be persisted
+    pub async fn rename_session(
+        &self,
+        session_id: SessionId,
+        name: Option<String>,
+    ) -> Result<SessionEvent, SessionError> {
+        let normalized_name = normalize_session_name(name);
+        let event = {
+            let mut inner = self.inner.lock().await;
+            let state = inner
+                .sessions
+                .get_mut(&session_id)
+                .ok_or(SessionError::NotFound(session_id))?;
+            state.summary.name.clone_from(&normalized_name);
+            state.push_event(
+                SessionEventKind::SessionRenamed {
+                    name: normalized_name,
+                },
+                self.store.as_ref(),
+            )?
+        };
+        Ok(event)
+    }
+
+    /// Delete a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the session does not exist
+    /// * the session has connected clients
+    /// * the persistent event file cannot be removed
+    pub async fn delete_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, SessionError> {
+        let mut inner = self.inner.lock().await;
+        let state = inner
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        if !state.clients.is_empty() {
+            return Err(SessionError::ConnectedClients(session_id));
+        }
+        if let Some(store) = &self.store {
+            store.delete(session_id)?;
+        }
+        let removed = inner
+            .sessions
+            .remove(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(removed.summary)
+    }
+
+    /// Return a summary for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn session_summary(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, SessionError> {
+        let inner = self.inner.lock().await;
+        inner
+            .sessions
+            .get(&session_id)
+            .map(SessionState::summary)
+            .ok_or(SessionError::NotFound(session_id))
     }
 
     /// Return replayable history for a session.
@@ -272,12 +362,29 @@ impl SessionManager {
         session_id: SessionId,
         client_id: ClientId,
         text: String,
-    ) -> Result<SessionEvent, SessionError> {
-        self.append_event(
-            session_id,
-            SessionEventKind::UserMessage { client_id, text },
-        )
-        .await
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        let events = {
+            let mut inner = self.inner.lock().await;
+            let state = inner
+                .sessions
+                .get_mut(&session_id)
+                .ok_or(SessionError::NotFound(session_id))?;
+            let mut events = Vec::new();
+            if state.summary.name.is_none() && !state.has_user_message() {
+                let title = title_from_first_prompt(&text);
+                state.summary.name = Some(title.clone());
+                events.push(state.push_event(
+                    SessionEventKind::SessionRenamed { name: Some(title) },
+                    self.store.as_ref(),
+                )?);
+            }
+            events.push(state.push_event(
+                SessionEventKind::UserMessage { client_id, text },
+                self.store.as_ref(),
+            )?);
+            events
+        };
+        Ok(events)
     }
 
     /// Append an assistant streaming delta to a session.
@@ -549,10 +656,16 @@ impl SessionState {
         if events.is_empty() {
             return None;
         }
-        let name = events.iter().find_map(|event| match &event.kind {
-            SessionEventKind::SessionCreated { name } => Some(name.clone()),
-            _ => None,
-        });
+        let mut name = None;
+        for event in &events {
+            match &event.kind {
+                SessionEventKind::SessionCreated { name: created_name }
+                | SessionEventKind::SessionRenamed { name: created_name } => {
+                    name.clone_from(created_name);
+                }
+                _ => {}
+            }
+        }
         let next_sequence = events
             .iter()
             .map(|event| event.sequence)
@@ -562,7 +675,7 @@ impl SessionState {
         Some(Self {
             summary: SessionSummary {
                 id: session_id,
-                name: name.flatten(),
+                name,
                 client_count: 0,
             },
             clients: BTreeSet::new(),
@@ -574,6 +687,12 @@ impl SessionState {
 
     fn summary(&self) -> SessionSummary {
         self.summary.clone()
+    }
+
+    fn has_user_message(&self) -> bool {
+        self.events
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
     }
 
     fn push_event(
@@ -594,6 +713,44 @@ impl SessionState {
         self.events.push(event.clone());
         let _ = self.sender.send(event.clone());
         Ok(event)
+    }
+}
+
+fn normalize_session_name(name: Option<String>) -> Option<String> {
+    name.map(|value| squish_whitespace(&value))
+        .filter(|value| !value.is_empty())
+}
+
+fn title_from_first_prompt(prompt: &str) -> String {
+    let first_content_line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("```") && !line.starts_with("---"))
+        .unwrap_or(prompt);
+    let cleaned = first_content_line
+        .trim_start_matches(|character: char| {
+            matches!(character, '#' | '-' | '*' | '>' | '`' | ':' | ';')
+                || character.is_whitespace()
+        })
+        .trim();
+    let squished = squish_whitespace(cleaned);
+    if squished.is_empty() {
+        return "New session".to_string();
+    }
+    truncate_title(&squished, 64)
+}
+
+fn squish_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_title(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
     }
 }
 
@@ -692,7 +849,10 @@ mod tests {
     use super::SessionManager;
     use bcode_session_models::{ClientId, SessionEventKind};
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -871,11 +1031,114 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
+    #[tokio::test]
+    async fn unnamed_session_uses_first_prompt_as_title() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(None)
+            .await
+            .expect("session should be created");
+
+        let events = manager
+            .append_user_message(
+                session.id,
+                ClientId::new(),
+                "# Fix session selection UX\n\nPlease make this nicer".to_string(),
+            )
+            .await
+            .expect("message should append");
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].kind,
+            SessionEventKind::SessionRenamed { name } if name.as_deref() == Some("Fix session selection UX")
+        ));
+        let sessions = manager.list_sessions().await;
+        assert_eq!(
+            sessions[0].name.as_deref(),
+            Some("Fix session selection UX")
+        );
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let restored_sessions = restored.list_sessions().await;
+        assert_eq!(
+            restored_sessions[0].name.as_deref(),
+            Some("Fix session selection UX")
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn explicit_session_name_is_not_replaced_by_first_prompt() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("Manual title".to_string()))
+            .await
+            .expect("session should be created");
+
+        let events = manager
+            .append_user_message(session.id, ClientId::new(), "Different title".to_string())
+            .await
+            .expect("message should append");
+
+        assert_eq!(events.len(), 1);
+        let sessions = manager.list_sessions().await;
+        assert_eq!(sessions[0].name.as_deref(), Some("Manual title"));
+    }
+
+    #[tokio::test]
+    async fn rename_session_restores_latest_name() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("Old title".to_string()))
+            .await
+            .expect("session should be created");
+
+        manager
+            .rename_session(session.id, Some("  New   title  ".to_string()))
+            .await
+            .expect("session should rename");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let sessions = restored.list_sessions().await;
+        assert_eq!(sessions[0].name.as_deref(), Some("New title"));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_persisted_history() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("Delete me".to_string()))
+            .await
+            .expect("session should be created");
+
+        manager
+            .delete_session(session.id)
+            .await
+            .expect("session should delete");
+
+        assert!(manager.list_sessions().await.is_empty());
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        assert!(restored.list_sessions().await.is_empty());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
     fn unique_temp_dir() -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("bcode-session-test-{nanos}"))
+        let counter = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "bcode-session-test-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
     }
 }

@@ -90,6 +90,13 @@ pub enum Request {
         name: Option<String>,
     },
     ListSessions,
+    RenameSession {
+        session_id: SessionId,
+        name: Option<String>,
+    },
+    DeleteSession {
+        session_id: SessionId,
+    },
     SessionHistory {
         session_id: SessionId,
     },
@@ -223,6 +230,12 @@ pub enum ResponsePayload {
     },
     SessionList {
         sessions: Vec<SessionSummary>,
+    },
+    SessionRenamed {
+        session: SessionSummary,
+    },
+    SessionDeleted {
+        session: SessionSummary,
     },
     SessionHistory {
         session_id: SessionId,

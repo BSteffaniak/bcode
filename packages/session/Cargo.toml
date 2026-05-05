@@ -14,7 +14,7 @@ version     = { workspace = true }
 bcode_session_models = { workspace = true }
 bmux_codec           = { workspace = true }
 thiserror            = { workspace = true }
-tokio                = { workspace = true, features = ["sync"] }
+tokio                = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [features]
 default          = []

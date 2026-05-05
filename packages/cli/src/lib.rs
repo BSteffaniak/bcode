@@ -81,6 +81,8 @@ pub async fn run() -> Result<(), CliError> {
         Commands::Session { command } => match command {
             SessionCommand::Create { name } => create_session(name).await?,
             SessionCommand::List => list_sessions().await?,
+            SessionCommand::Rename { session_id, name } => rename_session(session_id, name).await?,
+            SessionCommand::Delete { session_id } => delete_session(session_id).await?,
             SessionCommand::History { session_id } => session_history(session_id).await?,
         },
         Commands::Plugin { command } => match command {
@@ -251,6 +253,8 @@ enum ServerCommand {
 enum SessionCommand {
     Create { name: Option<String> },
     List,
+    Rename { session_id: SessionId, name: String },
+    Delete { session_id: SessionId },
     History { session_id: SessionId },
 }
 
@@ -2099,7 +2103,7 @@ async fn server_status() -> Result<(), CliError> {
     println!("log: {}", daemon_log_path().display());
     for session in status.sessions {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
-        println!("{}\t{}\t{} clients", session.id, name, session.client_count);
+        println!("{}\t{}\t{} clients", name, session.id, session.client_count);
     }
     Ok(())
 }
@@ -2146,8 +2150,30 @@ async fn list_sessions() -> Result<(), CliError> {
     }
     for session in sessions {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
-        println!("{}\t{}\t{} clients", session.id, name, session.client_count);
+        println!("{}\t{}\t{} clients", name, session.id, session.client_count);
     }
+    Ok(())
+}
+
+async fn rename_session(session_id: SessionId, name: String) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let session = client.rename_session(session_id, Some(name)).await?;
+    println!(
+        "renamed {} to {}",
+        session.id,
+        session.name.unwrap_or_else(|| "<unnamed>".to_string())
+    );
+    Ok(())
+}
+
+async fn delete_session(session_id: SessionId) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let session = client.delete_session(session_id).await?;
+    println!(
+        "deleted {} ({})",
+        session.name.unwrap_or_else(|| "<unnamed>".to_string()),
+        session.id
+    );
     Ok(())
 }
 
@@ -2252,6 +2278,10 @@ fn print_session_event(event: &SessionEvent) {
         SessionEventKind::SessionCreated { name } => {
             let name = name.as_deref().unwrap_or("<unnamed>");
             println!("#{} session created: {name}", event.sequence);
+        }
+        SessionEventKind::SessionRenamed { name } => {
+            let name = name.as_deref().unwrap_or("<unnamed>");
+            println!("#{} session renamed: {name}", event.sequence);
         }
         SessionEventKind::ClientAttached { client_id } => {
             println!("#{} client attached: {client_id}", event.sequence);

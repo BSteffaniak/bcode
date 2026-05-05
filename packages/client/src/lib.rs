@@ -116,6 +116,45 @@ impl BcodeClient {
         }
     }
 
+    /// Rename a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn rename_session(
+        &self,
+        session_id: SessionId,
+        name: Option<String>,
+    ) -> Result<SessionSummary, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::RenameSession { session_id, name })
+            .await?
+        {
+            ResponsePayload::SessionRenamed { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Delete a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn delete_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::DeleteSession { session_id })
+            .await?
+        {
+            ResponsePayload::SessionDeleted { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return replayable session history.
     ///
     /// # Errors

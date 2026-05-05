@@ -10,7 +10,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 6;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 7;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -228,5 +228,8 @@ pub enum SessionEventKind {
     ContextCompacted {
         summary: String,
         compacted_through_sequence: u64,
+    },
+    SessionRenamed {
+        name: Option<String>,
     },
 }

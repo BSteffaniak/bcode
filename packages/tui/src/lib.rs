@@ -111,6 +111,9 @@ enum TuiAction {
     CommandPaletteDown,
     CommandPaletteConfirm,
     CommandPaletteFilter,
+    SessionNew,
+    SessionRename,
+    SessionDelete,
 }
 
 impl TuiAction {
@@ -145,6 +148,9 @@ impl TuiAction {
             "tui.palette.down" | "tui.palette.next" => Self::CommandPaletteDown,
             "app.command_palette.confirm" => Self::CommandPaletteConfirm,
             "app.command_palette.filter" => Self::CommandPaletteFilter,
+            "tui.session.new" => Self::SessionNew,
+            "tui.session.rename" => Self::SessionRename,
+            "tui.session.delete" => Self::SessionDelete,
             _ => return None,
         })
     }
@@ -313,6 +319,9 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("down", TuiAction::SelectDown),
                 ("j", TuiAction::SelectDown),
                 ("enter", TuiAction::SelectConfirm),
+                ("n", TuiAction::SessionNew),
+                ("r", TuiAction::SessionRename),
+                ("d", TuiAction::SessionDelete),
                 ("escape", TuiAction::SelectCancel),
                 ("ctrl+c", TuiAction::SelectCancel),
             ]),
@@ -370,6 +379,9 @@ fn legacy_scopes_for_action(action: TuiAction) -> &'static [TuiScope] {
         | TuiAction::SelectDown
         | TuiAction::SelectConfirm
         | TuiAction::SelectCancel => &[TuiScope::Permission, TuiScope::SessionPicker],
+        TuiAction::SessionNew | TuiAction::SessionRename | TuiAction::SessionDelete => {
+            &[TuiScope::SessionPicker]
+        }
         TuiAction::CommandPaletteOpen
         | TuiAction::CommandPaletteClose
         | TuiAction::CommandPaletteUp
@@ -788,8 +800,11 @@ async fn handle_tui_action(
             }
             app.close_command_palette();
         }
-        TuiAction::CommandPaletteFilter => {
-            // filter updated on text input when palette open
+        TuiAction::CommandPaletteFilter
+        | TuiAction::SessionNew
+        | TuiAction::SessionRename
+        | TuiAction::SessionDelete => {
+            // filter/session-picker-only actions are handled outside this chat action path
         }
     }
     false
@@ -1080,17 +1095,13 @@ async fn resolve_session(
     if let Some(session_id) = session_id {
         return Ok(session_id);
     }
-    let sessions = client.list_sessions().await?;
-    match sessions.len() {
-        0 => Ok(client.create_session(Some("default".to_string())).await?.id),
-        1 => Ok(sessions[0].id),
-        _ => pick_session(&sessions, keymap),
-    }
+    pick_session(client, keymap).await
 }
 
-fn pick_session(sessions: &[SessionSummary], keymap: &KeyMap) -> Result<SessionId, TuiError> {
+async fn pick_session(client: &BcodeClient, keymap: &KeyMap) -> Result<SessionId, TuiError> {
+    let sessions = client.list_sessions().await?;
     let mut terminal = TerminalGuard::enter()?;
-    let mut app = SessionPickerApp::new(sessions);
+    let mut app = SessionPickerApp::new(&sessions);
     loop {
         terminal.draw(&app)?;
         if !event::poll(Duration::from_millis(50))? {
@@ -1102,20 +1113,110 @@ fn pick_session(sessions: &[SessionSummary], keymap: &KeyMap) -> Result<SessionI
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        if handle_session_picker_text_key(client, &mut app, &key).await? {
+            continue;
+        }
         match keymap.action_for_key(TuiScope::SessionPicker, &key) {
             Some(TuiAction::SelectCancel) => return Err(TuiError::Canceled),
             Some(TuiAction::SelectUp) => app.previous(),
             Some(TuiAction::SelectDown) => app.next(),
-            Some(TuiAction::SelectConfirm) => return Ok(app.selected_session_id()),
+            Some(TuiAction::SelectConfirm) => {
+                if let Some(session_id) = app.selected_session_id() {
+                    return Ok(session_id);
+                }
+                return Ok(client.create_session(None).await?.id);
+            }
+            Some(TuiAction::SessionNew) => return Ok(client.create_session(None).await?.id),
+            Some(TuiAction::SessionRename) => app.start_rename(),
+            Some(TuiAction::SessionDelete) => app.start_delete_confirmation(),
             _ => {}
         }
     }
+}
+
+async fn handle_session_picker_text_key(
+    client: &BcodeClient,
+    app: &mut SessionPickerApp,
+    key: &KeyEvent,
+) -> Result<bool, TuiError> {
+    match app.mode.clone() {
+        SessionPickerMode::Browsing => Ok(false),
+        SessionPickerMode::Renaming { mut input } => match key.code {
+            KeyCode::Enter => {
+                let Some(session_id) = app.selected_session_id() else {
+                    app.mode = SessionPickerMode::Browsing;
+                    return Ok(true);
+                };
+                match client.rename_session(session_id, Some(input)).await {
+                    Ok(session) => {
+                        app.upsert_session(session);
+                        app.mode = SessionPickerMode::Browsing;
+                        app.status = "session renamed".to_string();
+                    }
+                    Err(error) => app.status = format!("rename failed: {error}"),
+                }
+                Ok(true)
+            }
+            KeyCode::Esc => {
+                app.mode = SessionPickerMode::Browsing;
+                app.status = "rename canceled".to_string();
+                Ok(true)
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            _ => {
+                if let Some(character) = key_is_text_input(key) {
+                    input.push(character);
+                    app.mode = SessionPickerMode::Renaming { input };
+                }
+                Ok(true)
+            }
+        },
+        SessionPickerMode::ConfirmDelete => match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                let Some(session_id) = app.selected_session_id() else {
+                    app.mode = SessionPickerMode::Browsing;
+                    return Ok(true);
+                };
+                match client.delete_session(session_id).await {
+                    Ok(session) => {
+                        app.remove_session(session.id);
+                        app.mode = SessionPickerMode::Browsing;
+                        app.status = "session deleted".to_string();
+                    }
+                    Err(error) => {
+                        app.mode = SessionPickerMode::Browsing;
+                        app.status = format!("delete failed: {error}");
+                    }
+                }
+                Ok(true)
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                app.mode = SessionPickerMode::Browsing;
+                app.status = "delete canceled".to_string();
+                Ok(true)
+            }
+            _ => Ok(true),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionPickerMode {
+    Browsing,
+    Renaming { input: String },
+    ConfirmDelete,
 }
 
 #[derive(Debug)]
 struct SessionPickerApp {
     sessions: Vec<SessionSummary>,
     selected: usize,
+    mode: SessionPickerMode,
+    status: String,
 }
 
 impl SessionPickerApp {
@@ -1123,34 +1224,83 @@ impl SessionPickerApp {
         Self {
             sessions: sessions.to_vec(),
             selected: 0,
+            mode: SessionPickerMode::Browsing,
+            status: "choose a session or create a new one".to_string(),
         }
+    }
+
+    fn total_rows(&self) -> usize {
+        self.sessions.len() + 1
     }
 
     fn next(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        self.selected = (self.selected + 1) % self.sessions.len();
+        self.selected = (self.selected + 1) % self.total_rows();
     }
 
     fn previous(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
         self.selected = self
             .selected
             .checked_sub(1)
-            .unwrap_or_else(|| self.sessions.len() - 1);
+            .unwrap_or_else(|| self.total_rows() - 1);
     }
 
-    fn selected_session_id(&self) -> SessionId {
-        self.sessions[self.selected].id
+    fn selected_existing_index(&self) -> Option<usize> {
+        self.selected.checked_sub(1)
+    }
+
+    fn selected_session(&self) -> Option<&SessionSummary> {
+        self.selected_existing_index()
+            .and_then(|index| self.sessions.get(index))
+    }
+
+    fn selected_session_id(&self) -> Option<SessionId> {
+        self.selected_session().map(|session| session.id)
+    }
+
+    fn start_rename(&mut self) {
+        let Some(session) = self.selected_session() else {
+            self.status = "select an existing session to rename".to_string();
+            return;
+        };
+        self.mode = SessionPickerMode::Renaming {
+            input: session.name.clone().unwrap_or_default(),
+        };
+        self.status = "type a new title and press enter".to_string();
+    }
+
+    fn start_delete_confirmation(&mut self) {
+        if self.selected_session().is_none() {
+            self.status = "select an existing session to delete".to_string();
+            return;
+        }
+        self.mode = SessionPickerMode::ConfirmDelete;
+        self.status =
+            "delete selected session? press y/enter to confirm, esc/n to cancel".to_string();
+    }
+
+    fn upsert_session(&mut self, session: SessionSummary) {
+        if let Some(existing) = self
+            .sessions
+            .iter_mut()
+            .find(|existing| existing.id == session.id)
+        {
+            *existing = session;
+        } else {
+            self.sessions.push(session);
+        }
+    }
+
+    fn remove_session(&mut self, session_id: SessionId) {
+        self.sessions.retain(|session| session.id != session_id);
+        if self.selected >= self.total_rows() {
+            self.selected = self.total_rows().saturating_sub(1);
+        }
     }
 }
 
 impl ratatui::widgets::Widget for &SessionPickerApp {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let panel = centered_rect(area, area.width.min(92), area.height.min(24));
+        let panel = centered_rect(area, area.width.min(96), area.height.min(26));
         ratatui::widgets::Widget::render(Clear, panel, buf);
         let block = Block::new()
             .title(Line::from(vec![
@@ -1163,11 +1313,17 @@ impl ratatui::widgets::Widget for &SessionPickerApp {
         let inner = inset(panel, 2, 1);
         ratatui::widgets::Widget::render(block, panel, buf);
 
+        let rename_rows = if matches!(self.mode, SessionPickerMode::Renaming { .. }) {
+            2
+        } else {
+            0
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(3),
+                Constraint::Length(rename_rows),
                 Constraint::Length(1),
             ])
             .split(inner);
@@ -1175,38 +1331,77 @@ impl ratatui::widgets::Widget for &SessionPickerApp {
         Paragraph::new(Text::from(vec![
             Line::from(vec![Span::styled("Select a session", title_style())]),
             Line::from(vec![Span::styled(
-                "Attach to an existing Bcode conversation",
+                "Friendly titles are shown first; UUIDs remain available for raw identification",
                 muted_style(),
             )]),
         ]))
         .render(chunks[0], buf);
 
-        let items = self.sessions.iter().map(|session| {
-            let name = session.name.as_deref().unwrap_or("untitled");
+        let mut items = vec![ListItem::new(Line::from(vec![
+            Span::styled("+ ", accent_style()),
+            Span::styled("New session", normal_style()),
+            Span::styled("  starts untitled; first prompt names it", muted_style()),
+        ]))];
+        items.extend(self.sessions.iter().map(|session| {
+            let title = session.name.as_deref().unwrap_or("Untitled session");
             let id = truncate_middle(&session.id.to_string(), 12);
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{id:<12}"), muted_style()),
+                Span::styled(truncate_end(title, 46), normal_style()),
                 Span::raw("  "),
-                Span::styled(truncate_end(name, 44), normal_style()),
+                Span::styled(id, muted_style()),
                 Span::raw("  "),
                 Span::styled(format!("{} clients", session.client_count), muted_style()),
             ]))
-        });
+        }));
         let list = List::new(items)
-            .highlight_symbol("  ")
+            .highlight_symbol("› ")
             .highlight_style(selected_style());
         let mut state = ListState::default().with_selected(Some(self.selected));
         StatefulWidget::render(list, chunks[1], buf, &mut state);
 
-        Paragraph::new(Line::from(vec![
-            Span::styled("enter", key_style()),
-            Span::styled(" select · ", muted_style()),
-            Span::styled("j/k", key_style()),
-            Span::styled(" move · ", muted_style()),
-            Span::styled("esc", key_style()),
-            Span::styled(" quit", muted_style()),
-        ]))
-        .render(chunks[2], buf);
+        if let SessionPickerMode::Renaming { input } = &self.mode {
+            let rename_block = Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border_style())
+                .title(Span::styled(" rename ", muted_style()));
+            Paragraph::new(input.as_str())
+                .style(normal_style())
+                .block(rename_block)
+                .render(chunks[2], buf);
+        }
+
+        let hint = match self.mode {
+            SessionPickerMode::Browsing => Line::from(vec![
+                Span::styled("enter", key_style()),
+                Span::styled(" open · ", muted_style()),
+                Span::styled("n", key_style()),
+                Span::styled(" new · ", muted_style()),
+                Span::styled("r", key_style()),
+                Span::styled(" rename · ", muted_style()),
+                Span::styled("d", key_style()),
+                Span::styled(" delete · ", muted_style()),
+                Span::styled("esc", key_style()),
+                Span::styled(" quit", muted_style()),
+                Span::styled(format!("  ·  {}", self.status), status_style(&self.status)),
+            ]),
+            SessionPickerMode::Renaming { .. } => Line::from(vec![
+                Span::styled("enter", key_style()),
+                Span::styled(" save · ", muted_style()),
+                Span::styled("backspace", key_style()),
+                Span::styled(" edit · ", muted_style()),
+                Span::styled("esc", key_style()),
+                Span::styled(" cancel", muted_style()),
+            ]),
+            SessionPickerMode::ConfirmDelete => Line::from(vec![
+                Span::styled("y/enter", key_style()),
+                Span::styled(" delete · ", muted_style()),
+                Span::styled("n/esc", key_style()),
+                Span::styled(" cancel", muted_style()),
+                Span::styled(format!("  ·  {}", self.status), status_style(&self.status)),
+            ]),
+        };
+        Paragraph::new(hint).render(chunks[3], buf);
     }
 }
 
@@ -1265,6 +1460,7 @@ impl ActivityState {
 #[derive(Debug)]
 struct ChatApp {
     session_id: SessionId,
+    session_title: Option<String>,
     blocks: Vec<TranscriptBlock>,
     input: String,
     status: String,
@@ -1539,6 +1735,7 @@ impl ChatApp {
     fn new(session_id: SessionId, history: &[SessionEvent], keymap: &KeyMap) -> Self {
         let mut app = Self {
             session_id,
+            session_title: None,
             blocks: Vec::new(),
             input: String::new(),
             status: keymap
@@ -1684,8 +1881,11 @@ impl ChatApp {
                     .clone()
                     .unwrap_or_else(|| model_turn_outcome_label(*outcome).to_string());
             }
-            SessionEventKind::SessionCreated { .. }
-            | SessionEventKind::ClientAttached { .. }
+            SessionEventKind::SessionCreated { name }
+            | SessionEventKind::SessionRenamed { name } => {
+                self.session_title.clone_from(name);
+            }
+            SessionEventKind::ClientAttached { .. }
             | SessionEventKind::ClientDetached { .. }
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ModelChanged { .. }
@@ -1917,6 +2117,10 @@ impl ChatApp {
             }
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent_id.clone_from(agent_id);
+            }
+            SessionEventKind::SessionCreated { name }
+            | SessionEventKind::SessionRenamed { name } => {
+                self.session_title.clone_from(name);
             }
             _ => {}
         }
@@ -2416,11 +2620,16 @@ fn render_chat_header(app: &ChatApp, area: Rect, buf: &mut ratatui::buffer::Buff
         .map(|level| format!("{:?}", level))
         .unwrap_or_else(|| "default".to_string());
     let agent = truncate_middle(&app.current_agent_id, 18);
-    let session = truncate_middle(&app.session_id.to_string(), 12);
+    let session_id = truncate_middle(&app.session_id.to_string(), 12);
+    let session_title = app.session_title.as_deref().map_or_else(
+        || "Untitled session".to_string(),
+        |title| truncate_end(title, 28),
+    );
     let mut spans = vec![
         Span::styled(" bcode ", title_style()),
         Span::styled("session ", muted_style()),
-        Span::styled(session, normal_style()),
+        Span::styled(session_title, normal_style()),
+        Span::styled(format!(" ({session_id})"), muted_style()),
         Span::raw("  "),
     ];
     push_label_value(&mut spans, "provider", &provider, accent_style());
@@ -3414,6 +3623,9 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
     match &event.kind {
         SessionEventKind::SessionCreated { name } => vec![TranscriptBlock::Meta {
             text: format!("session started: {}", name.as_deref().unwrap_or("untitled")),
+        }],
+        SessionEventKind::SessionRenamed { name } => vec![TranscriptBlock::Meta {
+            text: format!("session renamed: {}", name.as_deref().unwrap_or("untitled")),
         }],
         SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
