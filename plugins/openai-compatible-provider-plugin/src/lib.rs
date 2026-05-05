@@ -1088,7 +1088,6 @@ fn finish_tool_calls(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponsesInstructionStrategy {
     TopLevelInstructions,
-    UserPreamble,
 }
 
 struct ResponsesProjection {
@@ -1119,12 +1118,8 @@ fn build_responses_request(
     }
 }
 
-const fn responses_instruction_strategy(settings: &Settings) -> ResponsesInstructionStrategy {
-    if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
-        ResponsesInstructionStrategy::UserPreamble
-    } else {
-        ResponsesInstructionStrategy::TopLevelInstructions
-    }
+const fn responses_instruction_strategy(_settings: &Settings) -> ResponsesInstructionStrategy {
+    ResponsesInstructionStrategy::TopLevelInstructions
 }
 
 fn responses_projection(
@@ -1132,14 +1127,9 @@ fn responses_projection(
     strategy: ResponsesInstructionStrategy,
 ) -> ResponsesProjection {
     let instruction_bundle = response_instruction_bundle(request);
-    let mut input = model_messages_to_responses_input_for_reuse(request);
-    let instructions = match (strategy, instruction_bundle) {
-        (ResponsesInstructionStrategy::TopLevelInstructions, instructions) => instructions,
-        (ResponsesInstructionStrategy::UserPreamble, Some(instructions)) => {
-            input.insert(0, responses_user_preamble(&instructions));
-            None
-        }
-        (ResponsesInstructionStrategy::UserPreamble, None) => None,
+    let input = model_messages_to_responses_input_for_reuse(request);
+    let instructions = match strategy {
+        ResponsesInstructionStrategy::TopLevelInstructions => instruction_bundle,
     };
     ResponsesProjection {
         instructions,
@@ -1163,17 +1153,6 @@ fn response_instruction_bundle(request: &ModelTurnRequest) -> Option<String> {
             .filter(|text| !text.trim().is_empty()),
     );
     (!parts.is_empty()).then(|| parts.join("\n\n"))
-}
-
-fn responses_user_preamble(instructions: &str) -> ResponsesInputItem {
-    ResponsesInputItem::Message {
-        role: "user",
-        content: vec![ResponsesContent::InputText {
-            text: format!(
-                "Bcode operating instructions for this turn. Follow these instructions exactly; they are not part of the user's request.\n\n{instructions}"
-            ),
-        }],
-    }
 }
 
 fn model_messages_to_responses_input_for_reuse(
@@ -2540,7 +2519,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_chatgpt_strategy_uses_user_preamble_without_system_shape() {
+    fn final_responses_request_has_required_instructions_without_system_input() {
         let request = ModelTurnRequest {
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
@@ -2569,16 +2548,31 @@ mod tests {
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
             metadata: BTreeMap::new(),
         };
+        let settings = Settings {
+            auth: AuthSettings::Missing,
+            auth_diagnostics: AuthDiagnostics {
+                source: "test".to_string(),
+                mode: "test".to_string(),
+                detail: "test".to_string(),
+            },
+            base_url: DEFAULT_BASE_URL.to_string(),
+            default_model: Some("model".to_string()),
+            fallback_model: DEFAULT_MODEL_ID.to_string(),
+            model_ids: vec!["model".to_string()],
+            model_ids_are_explicit: true,
+        };
 
-        let projection = responses_projection(&request, ResponsesInstructionStrategy::UserPreamble);
-        let encoded = serde_json::to_value(&projection.input).expect("input should serialize");
+        let body = build_responses_request(&settings, &request, "model");
+        let encoded = serde_json::to_value(&body).expect("request should serialize");
         let encoded_text = encoded.to_string();
 
-        assert!(projection.instructions.is_none());
-        assert_eq!(projection.input.len(), 2);
+        assert!(
+            body.instructions.as_deref().is_some_and(|text| {
+                text.contains("top-level") && text.contains("dynamic system")
+            })
+        );
         assert!(!encoded_text.contains(r#""role":"system""#));
-        assert!(encoded_text.contains("top-level"));
-        assert!(encoded_text.contains("dynamic system"));
+        assert!(encoded.get("instructions").is_some());
     }
 
     #[test]
