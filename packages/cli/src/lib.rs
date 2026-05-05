@@ -132,23 +132,13 @@ pub async fn run() -> Result<(), CliError> {
             PermissionCommand::Deny { permission_id } => {
                 resolve_permission(permission_id, false).await?;
             }
-            PermissionCommand::AllowTool { tool_name } => {
-                add_permission_rule("allow_tool", tool_name).await?;
-            }
-            PermissionCommand::DenyTool { tool_name } => {
-                add_permission_rule("deny_tool", tool_name).await?;
-            }
-            PermissionCommand::AllowShellPrefix { prefix } => {
-                add_permission_rule("allow_shell_command_prefix", prefix).await?;
-            }
-            PermissionCommand::DenyShellPrefix { prefix } => {
-                add_permission_rule("deny_shell_command_prefix", prefix).await?;
-            }
-            PermissionCommand::AllowPathPrefix { prefix } => {
-                add_permission_rule("allow_path_prefix", prefix).await?;
-            }
-            PermissionCommand::DenyPathPrefix { prefix } => {
-                add_permission_rule("deny_path_prefix", prefix).await?;
+            PermissionCommand::Add {
+                agent,
+                category,
+                pattern,
+                action,
+            } => {
+                add_permission_rule(&agent, &category, pattern, &action).await?;
             }
         },
         Commands::Cancel { session_id } => cancel_session_turn(session_id).await?,
@@ -395,14 +385,27 @@ enum OpenAiLoginFlow {
 #[derive(Debug, Subcommand)]
 enum PermissionCommand {
     List,
-    Approve { permission_id: String },
-    Deny { permission_id: String },
-    AllowTool { tool_name: String },
-    DenyTool { tool_name: String },
-    AllowShellPrefix { prefix: String },
-    DenyShellPrefix { prefix: String },
-    AllowPathPrefix { prefix: String },
-    DenyPathPrefix { prefix: String },
+    Approve {
+        permission_id: String,
+    },
+    Deny {
+        permission_id: String,
+    },
+    /// Add or replace a permission rule under `[agent.<agent_id>.permission.<category>]`.
+    Add {
+        /// Agent ID that owns the rule (for example `build` or `plan`).
+        #[arg(long)]
+        agent: String,
+        /// Permission category: `bash`, `read`, `write`, or `edit`.
+        #[arg(long)]
+        category: String,
+        /// Glob pattern to match.
+        #[arg(long)]
+        pattern: String,
+        /// Action: `allow`, `ask`, or `deny`.
+        #[arg(long)]
+        action: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2183,9 +2186,19 @@ async fn resolve_permission(permission_id: String, approved: bool) -> Result<(),
     Ok(())
 }
 
-async fn add_permission_rule(kind: &str, value: String) -> Result<(), CliError> {
+async fn add_permission_rule(
+    agent_id: &str,
+    category: &str,
+    pattern: String,
+    action: &str,
+) -> Result<(), CliError> {
     let config_path = BcodeClient::default_endpoint()
-        .add_permission_rule(kind.to_string(), value)
+        .add_permission_rule(
+            agent_id.to_string(),
+            category.to_string(),
+            pattern,
+            action.to_string(),
+        )
         .await?;
     println!("permission rule added: {config_path}");
     Ok(())
@@ -2193,11 +2206,12 @@ async fn add_permission_rule(kind: &str, value: String) -> Result<(), CliError> 
 
 fn print_permission(permission: &PermissionSummary) {
     println!(
-        "{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}",
         permission.permission_id,
         permission.session_id,
         permission.tool_call_id,
         permission.tool_name,
+        permission.agent_id,
         permission.arguments_json
     );
 }

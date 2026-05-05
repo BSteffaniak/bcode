@@ -37,3 +37,7 @@ TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.
 Key format follows `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples: `ctrl+d`, `pageUp`, `escape`, `enter`.
 
 Permission prompts are modal by default: permission actions only apply in the permission scope, and hints are generated from the configured permission keymap.
+
+### Permissions
+
+Bcode uses an agent-scoped permission model with `allow` / `ask` / `deny` rules under `[agent.<id>.permission]` in `bcode.toml`. See [`docs/permissions.md`](docs/permissions.md) for the full shape, category list, and built-in defaults for the `plan` and `build` agents.

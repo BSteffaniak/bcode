@@ -24,8 +24,12 @@ pub struct BcodeConfig {
     pub plugins: PluginConfig,
     #[serde(default)]
     pub model: ModelConfig,
+    /// Per-agent permission and tool configuration.
+    ///
+    /// Keys are agent IDs (for example `build`, `plan`). When a key is absent,
+    /// the built-in defaults from `bcode_agent_policy::default_config` apply.
     #[serde(default)]
-    pub permissions: PermissionConfig,
+    pub agent: BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
@@ -36,7 +40,9 @@ impl BcodeConfig {
     fn merge(&mut self, next: Self) {
         self.plugins.merge(next.plugins);
         self.model.merge(next.model);
-        self.permissions.merge(next.permissions);
+        for (agent_id, agent_config) in next.agent {
+            self.agent.insert(agent_id, agent_config);
+        }
         self.auth.merge(next.auth);
         self.tui.merge(next.tui);
     }
@@ -366,36 +372,6 @@ pub struct ResolvedModelSelection {
     pub settings: BTreeMap<String, String>,
 }
 
-/// Permission policy configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionConfig {
-    #[serde(default)]
-    pub allow_tools: BTreeSet<String>,
-    #[serde(default)]
-    pub deny_tools: BTreeSet<String>,
-    #[serde(default)]
-    pub allow_shell_command_prefixes: BTreeSet<String>,
-    #[serde(default)]
-    pub deny_shell_command_prefixes: BTreeSet<String>,
-    #[serde(default)]
-    pub allow_path_prefixes: BTreeSet<String>,
-    #[serde(default)]
-    pub deny_path_prefixes: BTreeSet<String>,
-}
-
-impl PermissionConfig {
-    fn merge(&mut self, next: Self) {
-        self.allow_tools.extend(next.allow_tools);
-        self.deny_tools.extend(next.deny_tools);
-        self.allow_shell_command_prefixes
-            .extend(next.allow_shell_command_prefixes);
-        self.deny_shell_command_prefixes
-            .extend(next.deny_shell_command_prefixes);
-        self.allow_path_prefixes.extend(next.allow_path_prefixes);
-        self.deny_path_prefixes.extend(next.deny_path_prefixes);
-    }
-}
-
 /// Plugin configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginConfig {
@@ -480,17 +456,31 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("unknown permission rule kind: {0}")]
-    UnknownPermissionRule(String),
+    #[error("unknown permission category: {0}")]
+    UnknownPermissionCategory(String),
+    #[error("unknown permission action: {0}")]
+    UnknownPermissionAction(String),
 }
 
-/// Add a permission rule to the default writable config file.
+/// Upsert a permission rule under `[agent.<agent_id>.permission.<category>]`.
+///
+/// `category` must be one of `bash`, `read`, `write`, or `edit`.
+/// `action` must be one of `allow`, `ask`, or `deny`.
 ///
 /// # Errors
 ///
-/// Returns an error when the config cannot be read, updated, or written.
-pub fn add_permission_rule(kind: &str, value: String) -> Result<PathBuf, ConfigError> {
-    update_writable_config(|config| insert_permission_rule(&mut config.permissions, kind, value))
+/// Returns an error when the config cannot be read, the category or action is
+/// unknown, or the updated config cannot be written.
+pub fn upsert_agent_permission_rule(
+    agent_id: &str,
+    category: &str,
+    pattern: String,
+    action: &str,
+) -> Result<PathBuf, ConfigError> {
+    let action = parse_action(action)?;
+    update_writable_config(|config| {
+        insert_agent_permission_rule(&mut config.agent, agent_id, category, pattern, action)
+    })
 }
 
 /// Configure OpenAI-compatible provider (`OpenAI`, xAI/Grok, etc.) authentication
@@ -644,21 +634,33 @@ pub fn default_auth_vault_path() -> PathBuf {
     default_state_dir().join("auth").join("vault")
 }
 
-fn insert_permission_rule(
-    permissions: &mut PermissionConfig,
-    kind: &str,
-    value: String,
+fn insert_agent_permission_rule(
+    agent: &mut BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
+    agent_id: &str,
+    category: &str,
+    pattern: String,
+    action: bcode_agent_policy_models::Action,
 ) -> Result<(), ConfigError> {
-    match kind {
-        "allow_tool" => permissions.allow_tools.insert(value),
-        "deny_tool" => permissions.deny_tools.insert(value),
-        "allow_shell_command_prefix" => permissions.allow_shell_command_prefixes.insert(value),
-        "deny_shell_command_prefix" => permissions.deny_shell_command_prefixes.insert(value),
-        "allow_path_prefix" => permissions.allow_path_prefixes.insert(value),
-        "deny_path_prefix" => permissions.deny_path_prefixes.insert(value),
-        _ => return Err(ConfigError::UnknownPermissionRule(kind.to_string())),
+    let entry = agent.entry(agent_id.to_string()).or_default();
+    let permission = &mut entry.permission;
+    let map = match category {
+        "bash" => &mut permission.bash,
+        "read" => &mut permission.read,
+        "write" => &mut permission.write,
+        "edit" => &mut permission.edit,
+        _ => return Err(ConfigError::UnknownPermissionCategory(category.to_string())),
     };
+    map.insert(pattern, action);
     Ok(())
+}
+
+fn parse_action(action: &str) -> Result<bcode_agent_policy_models::Action, ConfigError> {
+    match action {
+        "allow" => Ok(bcode_agent_policy_models::Action::Allow),
+        "ask" => Ok(bcode_agent_policy_models::Action::Ask),
+        "deny" => Ok(bcode_agent_policy_models::Action::Deny),
+        _ => Err(ConfigError::UnknownPermissionAction(action.to_string())),
+    }
 }
 
 fn writable_config_path() -> PathBuf {
@@ -683,7 +685,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     let mut output = String::new();
     write_plugins_toml(&mut output, &config.plugins);
     write_model_toml(&mut output, &config.model);
-    write_permissions_toml(&mut output, &config.permissions);
+    write_agents_toml(&mut output, &config.agent);
     write_auth_toml(&mut output, &config.auth);
     write_tui_toml(&mut output, &config.tui);
     output
@@ -774,34 +776,97 @@ fn write_tui_keybinding_section(
     output.push('\n');
 }
 
-fn write_permissions_toml(output: &mut String, permissions: &PermissionConfig) {
-    if permissions == &PermissionConfig::default() {
+fn write_agents_toml(
+    output: &mut String,
+    agents: &BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
+) {
+    for (agent_id, agent) in agents {
+        if !agent.tools.is_empty() {
+            writeln!(output, "[agent.{}.tools]", toml_table_key(agent_id))
+                .expect("writing to string should not fail");
+            for (tool, enabled) in &agent.tools {
+                writeln!(output, "{} = {}", toml_string(tool), enabled)
+                    .expect("writing to string should not fail");
+            }
+            output.push('\n');
+        }
+
+        let permission = &agent.permission;
+        let has_permission = !permission.bash.is_empty()
+            || !permission.read.is_empty()
+            || !permission.write.is_empty()
+            || !permission.edit.is_empty()
+            || permission.external_directory
+                != bcode_agent_policy_models::default_external_directory_action();
+        if !has_permission {
+            continue;
+        }
+
+        writeln!(output, "[agent.{}.permission]", toml_table_key(agent_id))
+            .expect("writing to string should not fail");
+        if permission.external_directory
+            != bcode_agent_policy_models::default_external_directory_action()
+        {
+            writeln!(
+                output,
+                "external_directory = {}",
+                toml_string(action_name(permission.external_directory))
+            )
+            .expect("writing to string should not fail");
+        }
+        write_action_map(output, "bash", &permission.bash);
+        write_action_map(output, "read", &permission.read);
+        write_action_map(output, "write", &permission.write);
+        write_action_map(output, "edit", &permission.edit);
+        output.push('\n');
+    }
+}
+
+fn write_action_map(
+    output: &mut String,
+    name: &str,
+    map: &BTreeMap<String, bcode_agent_policy_models::Action>,
+) {
+    if map.is_empty() {
         return;
     }
-    output.push_str("[permissions]\n");
-    write_string_set(output, "allow_tools", &permissions.allow_tools);
-    write_string_set(output, "deny_tools", &permissions.deny_tools);
-    write_string_set(
-        output,
-        "allow_shell_command_prefixes",
-        &permissions.allow_shell_command_prefixes,
-    );
-    write_string_set(
-        output,
-        "deny_shell_command_prefixes",
-        &permissions.deny_shell_command_prefixes,
-    );
-    write_string_set(
-        output,
-        "allow_path_prefixes",
-        &permissions.allow_path_prefixes,
-    );
-    write_string_set(
-        output,
-        "deny_path_prefixes",
-        &permissions.deny_path_prefixes,
-    );
-    output.push('\n');
+    output.push_str(name);
+    output.push_str(" = { ");
+    let mut first = true;
+    for (pattern, action) in map {
+        if !first {
+            output.push_str(", ");
+        }
+        first = false;
+        write!(
+            output,
+            "{} = {}",
+            toml_string(pattern),
+            toml_string(action_name(*action))
+        )
+        .expect("writing to string should not fail");
+    }
+    output.push_str(" }\n");
+}
+
+const fn action_name(action: bcode_agent_policy_models::Action) -> &'static str {
+    match action {
+        bcode_agent_policy_models::Action::Allow => "allow",
+        bcode_agent_policy_models::Action::Ask => "ask",
+        bcode_agent_policy_models::Action::Deny => "deny",
+    }
+}
+
+fn toml_table_key(key: &str) -> String {
+    let needs_quoting = key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if needs_quoting {
+        toml_string(key)
+    } else {
+        key.to_string()
+    }
 }
 
 fn write_auth_toml(output: &mut String, auth: &AuthConfig) {
@@ -999,13 +1064,15 @@ disabled = ["example.b"]
 enabled = ["example.c"]
 disabled = ["example.d"]
 
-[permissions]
-allow_tools = ["filesystem.read"]
-deny_tools = ["shell.run"]
-allow_shell_command_prefixes = ["git status"]
-deny_shell_command_prefixes = ["rm -rf"]
-allow_path_prefixes = ["/tmp/project"]
-deny_path_prefixes = ["/tmp/project/target"]
+[agent.build.tools]
+"shell.run" = true
+
+[agent.build.permission]
+external_directory = "ask"
+bash = { "cargo *" = "allow", "git push *" = "deny" }
+read = { "**" = "allow" }
+write = { "target/**" = "allow" }
+edit = { "src/**" = "ask" }
 
 [tui.keybindings.chat]
 "ctrl+x" = "app.exit"
@@ -1026,31 +1093,39 @@ deny_path_prefixes = ["/tmp/project/target"]
         assert!(config.plugins.enabled.contains("example.c"));
         assert!(config.plugins.disabled.contains("example.b"));
         assert!(config.plugins.disabled.contains("example.d"));
-        assert!(config.permissions.allow_tools.contains("filesystem.read"));
-        assert!(config.permissions.deny_tools.contains("shell.run"));
-        assert!(
-            config
-                .permissions
-                .allow_shell_command_prefixes
-                .contains("git status")
+
+        let build = config
+            .agent
+            .get("build")
+            .expect("build agent config should be loaded");
+        assert_eq!(
+            build.tools.get("shell.run").copied(),
+            Some(true),
+            "build agent should enable shell.run"
         );
-        assert!(
-            config
-                .permissions
-                .deny_shell_command_prefixes
-                .contains("rm -rf")
+        assert_eq!(
+            build.permission.external_directory,
+            bcode_agent_policy_models::Action::Ask
         );
-        assert!(
-            config
-                .permissions
-                .allow_path_prefixes
-                .contains("/tmp/project")
+        assert_eq!(
+            build.permission.bash.get("cargo *").copied(),
+            Some(bcode_agent_policy_models::Action::Allow)
         );
-        assert!(
-            config
-                .permissions
-                .deny_path_prefixes
-                .contains("/tmp/project/target")
+        assert_eq!(
+            build.permission.bash.get("git push *").copied(),
+            Some(bcode_agent_policy_models::Action::Deny)
+        );
+        assert_eq!(
+            build.permission.read.get("**").copied(),
+            Some(bcode_agent_policy_models::Action::Allow)
+        );
+        assert_eq!(
+            build.permission.write.get("target/**").copied(),
+            Some(bcode_agent_policy_models::Action::Allow)
+        );
+        assert_eq!(
+            build.permission.edit.get("src/**").copied(),
+            Some(bcode_agent_policy_models::Action::Ask)
         );
         assert_eq!(
             config.tui.keybindings.chat.get("ctrl+x"),

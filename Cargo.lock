@@ -747,6 +747,7 @@ dependencies = [
 name = "bcode_config"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_policy_models",
  "bcode_command",
  "bcode_model",
  "bcode_plugin",
@@ -761,6 +762,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_policy",
  "bcode_agent_profile",
+ "bcode_config",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_tool",

@@ -275,19 +275,29 @@ impl BcodeClient {
         }
     }
 
-    /// Persist and activate a permission policy rule.
+    /// Persist and activate a permission policy rule under `[agent.<agent_id>.permission.<category>]`.
+    ///
+    /// `category` must be one of `bash`, `read`, `write`, or `edit`.
+    /// `action` must be one of `allow`, `ask`, or `deny`.
     ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn add_permission_rule(
         &self,
-        kind: String,
-        value: String,
+        agent_id: String,
+        category: String,
+        pattern: String,
+        action: String,
     ) -> Result<String, ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         match connection
-            .send_request(Request::AddPermissionRule { kind, value })
+            .send_request(Request::AddPermissionRule {
+                agent_id,
+                category,
+                pattern,
+                action,
+            })
             .await?
         {
             ResponsePayload::PermissionRuleAdded { config_path } => Ok(config_path),

@@ -11,12 +11,13 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_command = { workspace = true }
-bcode_model   = { workspace = true }
-bcode_plugin  = { workspace = true }
-serde         = { workspace = true, features = ["derive", "std"] }
-thiserror     = { workspace = true }
-toml          = { workspace = true }
+bcode_agent_policy_models = { workspace = true }
+bcode_command             = { workspace = true }
+bcode_model               = { workspace = true }
+bcode_plugin              = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+thiserror                 = { workspace = true }
+toml                      = { workspace = true }
 
 [features]
 default          = []

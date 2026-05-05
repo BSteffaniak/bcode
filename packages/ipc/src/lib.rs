@@ -116,8 +116,10 @@ pub enum Request {
         approved: bool,
     },
     AddPermissionRule {
-        kind: String,
-        value: String,
+        agent_id: String,
+        category: String,
+        pattern: String,
+        action: String,
     },
     ListPluginServices,
     InvokePluginService {
@@ -165,6 +167,7 @@ pub struct PermissionSummary {
     pub tool_call_id: String,
     pub tool_name: String,
     pub arguments_json: String,
+    pub agent_id: String,
 }
 
 /// Plugin service invocation result.

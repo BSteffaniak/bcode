@@ -73,7 +73,6 @@ struct ServerState {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
-    permission_policy: Mutex<PermissionPolicy>,
     max_tool_rounds: Option<u32>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -105,92 +104,6 @@ struct PendingPermission {
     notify: Arc<Notify>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct PermissionPolicy {
-    allow_tools: BTreeSet<String>,
-    deny_tools: BTreeSet<String>,
-    allow_shell_command_prefixes: BTreeSet<String>,
-    deny_shell_command_prefixes: BTreeSet<String>,
-    allow_path_prefixes: BTreeSet<String>,
-    deny_path_prefixes: BTreeSet<String>,
-}
-
-impl PermissionPolicy {
-    fn add_rule(&mut self, kind: &str, value: String) -> Result<(), String> {
-        match kind {
-            "allow_tool" => self.allow_tools.insert(value),
-            "deny_tool" => self.deny_tools.insert(value),
-            "allow_shell_command_prefix" => self.allow_shell_command_prefixes.insert(value),
-            "deny_shell_command_prefix" => self.deny_shell_command_prefixes.insert(value),
-            "allow_path_prefix" => self.allow_path_prefixes.insert(value),
-            "deny_path_prefix" => self.deny_path_prefixes.insert(value),
-            _ => return Err(format!("unknown permission rule kind: {kind}")),
-        };
-        Ok(())
-    }
-
-    fn decision_for_call(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<bool> {
-        if self.deny_tools.contains(tool_name)
-            || self.denies_shell_command(tool_name, arguments)
-            || self.denies_path(tool_name, arguments)
-        {
-            Some(false)
-        } else if self.allow_tools.contains(tool_name)
-            || self.allows_shell_command(tool_name, arguments)
-            || self.allows_path(tool_name, arguments)
-        {
-            Some(true)
-        } else {
-            None
-        }
-    }
-
-    fn denies_shell_command(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
-        tool_name == "shell.run"
-            && string_argument(arguments, "command")
-                .is_some_and(|command| has_prefix(command, &self.deny_shell_command_prefixes))
-    }
-
-    fn allows_shell_command(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
-        tool_name == "shell.run"
-            && string_argument(arguments, "command")
-                .is_some_and(|command| has_prefix(command, &self.allow_shell_command_prefixes))
-    }
-
-    fn denies_path(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
-        tool_name.starts_with("filesystem.")
-            && string_argument(arguments, "path")
-                .is_some_and(|path| has_prefix(path, &self.deny_path_prefixes))
-    }
-
-    fn allows_path(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
-        tool_name.starts_with("filesystem.")
-            && string_argument(arguments, "path")
-                .is_some_and(|path| has_prefix(path, &self.allow_path_prefixes))
-    }
-}
-
-impl From<&bcode_config::PermissionConfig> for PermissionPolicy {
-    fn from(value: &bcode_config::PermissionConfig) -> Self {
-        Self {
-            allow_tools: value.allow_tools.clone(),
-            deny_tools: value.deny_tools.clone(),
-            allow_shell_command_prefixes: value.allow_shell_command_prefixes.clone(),
-            deny_shell_command_prefixes: value.deny_shell_command_prefixes.clone(),
-            allow_path_prefixes: value.allow_path_prefixes.clone(),
-            deny_path_prefixes: value.deny_path_prefixes.clone(),
-        }
-    }
-}
-
-fn string_argument<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    arguments.get(key).and_then(serde_json::Value::as_str)
-}
-
-fn has_prefix(value: &str, prefixes: &BTreeSet<String>) -> bool {
-    prefixes.iter().any(|prefix| value.starts_with(prefix))
-}
-
 impl ServerState {
     fn new(
         sessions: SessionManager,
@@ -198,7 +111,6 @@ impl ServerState {
         selected_provider_plugin_id: Option<String>,
         selected_model_id: Option<String>,
         selected_provider_context: bcode_model::ProviderRequestContext,
-        permission_policy: PermissionPolicy,
         max_tool_rounds: Option<u32>,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
@@ -208,7 +120,6 @@ impl ServerState {
             selected_provider_plugin_id,
             selected_model_id,
             selected_provider_context,
-            permission_policy: Mutex::new(permission_policy),
             max_tool_rounds,
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
@@ -278,6 +189,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         model = ?resolved_model.model_id,
         "model selection resolved"
     );
+    let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
@@ -288,9 +200,9 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             auth_profile: resolved_model.auth_profile,
             settings: resolved_model.settings,
         },
-        PermissionPolicy::from(&config.permissions),
         config.model.effective_max_tool_rounds(),
     ));
+    warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
     tracing::info!(target: "bcode_server::startup", "server ready; accepting clients");
     loop {
@@ -430,8 +342,16 @@ async fn handle_request(
             permission_id,
             approved,
         } => handle_resolve_permission(request_id, state, writer, &permission_id, approved).await,
-        Request::AddPermissionRule { kind, value } => {
-            handle_add_permission_rule(request_id, state, writer, &kind, value).await
+        Request::AddPermissionRule {
+            agent_id,
+            category,
+            pattern,
+            action,
+        } => {
+            handle_add_permission_rule(
+                request_id, state, writer, &agent_id, &category, pattern, &action,
+            )
+            .await
         }
         Request::ListPluginServices => handle_list_plugin_services(request_id, state, writer).await,
         Request::InvokePluginService {
@@ -845,22 +765,15 @@ async fn handle_list_permissions(
 
 async fn handle_add_permission_rule(
     request_id: u64,
-    state: &ServerState,
+    _state: &ServerState,
     writer: &SharedWriter,
-    kind: &str,
-    value: String,
+    agent_id: &str,
+    category: &str,
+    pattern: String,
+    action: &str,
 ) -> Result<(), ServerError> {
-    match bcode_config::add_permission_rule(kind, value.clone()) {
+    match bcode_config::upsert_agent_permission_rule(agent_id, category, pattern, action) {
         Ok(path) => {
-            let add_result = state.permission_policy.lock().await.add_rule(kind, value);
-            if let Err(error) = add_result {
-                return send_response(
-                    writer,
-                    request_id,
-                    Response::Err(ErrorResponse::new("invalid_permission_rule", error)),
-                )
-                .await;
-            }
             send_response(
                 writer,
                 request_id,
@@ -1239,6 +1152,26 @@ async fn list_agent_profiles(state: &ServerState) -> Vec<AgentInfo> {
     .ok()
     .and_then(Result::ok)
     .map_or_else(default_agent_profiles, |list| list.agents)
+}
+
+async fn warn_on_unregistered_agent_ids(state: &ServerState, configured_agent_ids: &[String]) {
+    if configured_agent_ids.is_empty() {
+        return;
+    }
+    let registered: BTreeSet<String> = list_agent_profiles(state)
+        .await
+        .into_iter()
+        .flat_map(|agent| std::iter::once(agent.id).chain(agent.aliases))
+        .collect();
+    for agent_id in configured_agent_ids {
+        if !registered.contains(agent_id) {
+            tracing::warn!(
+                target: "bcode_server::startup",
+                agent_id = %agent_id,
+                "agent defined in bcode.toml but not registered by any agent-profile plugin; it will be usable via /agent {agent_id} but won't appear in agent pickers"
+            );
+        }
+    }
 }
 
 fn default_agent_profiles() -> Vec<AgentInfo> {
@@ -1883,6 +1816,7 @@ async fn request_tool_permission(
 ) -> bool {
     let permission_id = next_permission_id(state).await;
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
+    let agent_id = session_agent_selection(state, session_id).await;
     append_permission_requested_event(
         state,
         session_id,
@@ -1892,15 +1826,6 @@ async fn request_tool_permission(
         arguments_json.clone(),
     )
     .await;
-    let policy_decision = state
-        .permission_policy
-        .lock()
-        .await
-        .decision_for_call(&definition.name, &call.arguments);
-    if let Some(decision) = policy_decision {
-        append_permission_resolved_event(state, session_id, permission_id, decision).await;
-        return decision;
-    }
     let pending = PendingPermission {
         summary: PermissionSummary {
             permission_id: permission_id.clone(),
@@ -1908,6 +1833,7 @@ async fn request_tool_permission(
             tool_call_id: call.id.clone(),
             tool_name: definition.name.clone(),
             arguments_json,
+            agent_id,
         },
         decision: Arc::new(Mutex::new(None)),
         notify: Arc::new(Notify::new()),

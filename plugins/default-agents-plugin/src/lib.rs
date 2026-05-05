@@ -14,7 +14,7 @@ use bcode_agent_profile::{
     OP_POLICY_STATUS, PolicyStatusResponse,
 };
 use bcode_plugin_sdk::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
 
@@ -117,38 +117,22 @@ struct PolicySource {
 }
 
 fn load_config() -> (AgentPermissionConfig, PolicySource) {
-    if let Some(path) = config_path()
-        && let Ok(contents) = std::fs::read_to_string(&path)
-        && let Ok(config) = serde_json::from_str::<AgentPermissionConfig>(&contents)
-        && !config.agent.is_empty()
-    {
-        return (
-            config,
+    match bcode_config::load_config() {
+        Ok(cfg) if !cfg.agent.is_empty() => (
+            AgentPermissionConfig { agent: cfg.agent },
             PolicySource {
-                label: path.display().to_string(),
+                label: "bcode.toml [agent]".to_string(),
                 using_default: false,
             },
-        );
+        ),
+        _ => (
+            default_config(),
+            PolicySource {
+                label: "built-in default agent policy".to_string(),
+                using_default: true,
+            },
+        ),
     }
-    (
-        default_config(),
-        PolicySource {
-            label: "built-in default agent policy".to_string(),
-            using_default: true,
-        },
-    )
-}
-
-fn config_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("BCODE_AGENT_PERMISSIONS") {
-        return Some(PathBuf::from(path));
-    }
-    std::env::var_os("HOME").map(|home| {
-        Path::new(&home)
-            .join(".pi")
-            .join("agent")
-            .join("opencode-permissions.json")
-    })
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
@@ -169,6 +153,7 @@ mod tests {
     use bcode_session_models::SessionId;
     use bcode_tool::ToolSideEffect;
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn list_agents_contains_plan_and_build() {

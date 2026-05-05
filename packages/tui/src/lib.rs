@@ -891,15 +891,21 @@ async fn persist_first_permission_rule(client: &BcodeClient, app: &mut ChatApp, 
         app.status = "no pending permission".to_string();
         return;
     };
-    let (kind, value) = permission.policy_rule(approved);
+    let agent_id = app.current_agent_id.clone();
+    let (category, pattern) = permission.policy_rule();
+    let action = if approved { "allow" } else { "deny" };
     match client
-        .add_permission_rule(kind.to_string(), value.clone())
+        .add_permission_rule(
+            agent_id.clone(),
+            category.to_string(),
+            pattern.clone(),
+            action.to_string(),
+        )
         .await
     {
         Ok(_) => {
             resolve_first_permission(client, app, approved).await;
-            let action = if approved { "allow" } else { "deny" };
-            app.status = format!("persisted {action} rule {kind}={value}");
+            app.status = format!("persisted {action} rule agent={agent_id} {category} {pattern:?}");
         }
         Err(error) => app.status = format!("persist rule failed: {error}"),
     }
@@ -1211,30 +1217,36 @@ struct PendingPermissionView {
 }
 
 impl PendingPermissionView {
-    fn policy_rule(&self, approved: bool) -> (&'static str, String) {
+    /// Return `(category, pattern)` for persisting a rule derived from this permission.
+    ///
+    /// The action (`allow` / `deny`) is supplied separately by the caller based on
+    /// whether the user approved the prompt.
+    fn policy_rule(&self) -> (&'static str, String) {
         if self.tool_name == "shell.run"
             && let Some(command) = self.string_argument("command")
         {
-            return if approved {
-                ("allow_shell_command_prefix", command)
-            } else {
-                ("deny_shell_command_prefix", command)
-            };
+            return ("bash", command);
         }
-        if self.tool_name.starts_with("filesystem.")
-            && let Some(path) = self.string_argument("path")
-        {
-            return if approved {
-                ("allow_path_prefix", path)
-            } else {
-                ("deny_path_prefix", path)
-            };
+        match self.tool_name.as_str() {
+            "filesystem.write" => {
+                if let Some(path) = self.string_argument("path") {
+                    return ("write", path);
+                }
+            }
+            "filesystem.edit" => {
+                if let Some(path) = self.string_argument("path") {
+                    return ("edit", path);
+                }
+            }
+            "filesystem.read" | "filesystem.list" | "filesystem.find" | "filesystem.grep"
+            | "filesystem.stat" | "filesystem.exists" => {
+                if let Some(path) = self.string_argument("path") {
+                    return ("read", path);
+                }
+            }
+            _ => {}
         }
-        if approved {
-            ("allow_tool", self.tool_name.clone())
-        } else {
-            ("deny_tool", self.tool_name.clone())
-        }
+        ("bash", self.tool_name.clone())
     }
 
     fn string_argument(&self, key: &str) -> Option<String> {
