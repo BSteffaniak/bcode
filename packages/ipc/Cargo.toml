@@ -21,6 +21,9 @@ serde                = { workspace = true, features = ["derive", "std"] }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["io-util"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
 [features]
 default          = []
 fail-on-warnings = []

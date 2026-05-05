@@ -535,7 +535,7 @@ async fn handle_attach_session(
                 request_id,
                 Response::Ok(ResponsePayload::Attached {
                     session_id,
-                    history: attachment.history,
+                    history: compact_attach_history(attachment.history),
                 }),
             )
             .await?;
@@ -2375,6 +2375,30 @@ fn forward_session_events(
     });
 }
 
+fn compact_attach_history(
+    history: Vec<bcode_session_models::SessionEvent>,
+) -> Vec<bcode_session_models::SessionEvent> {
+    let mut compacted = Vec::with_capacity(history.len());
+    let mut pending_assistant_deltas = Vec::new();
+
+    for event in history {
+        match event.kind {
+            SessionEventKind::AssistantDelta { .. } => pending_assistant_deltas.push(event),
+            SessionEventKind::AssistantMessage { .. } => {
+                pending_assistant_deltas.clear();
+                compacted.push(event);
+            }
+            _ => {
+                compacted.append(&mut pending_assistant_deltas);
+                compacted.push(event);
+            }
+        }
+    }
+
+    compacted.append(&mut pending_assistant_deltas);
+    compacted
+}
+
 async fn send_response(
     writer: &SharedWriter,
     request_id: u64,
@@ -2395,6 +2419,152 @@ fn default_session_store_dir() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
+
+    fn session_event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            session_id,
+            kind,
+        }
+    }
+
+    #[test]
+    fn compact_attach_history_drops_completed_assistant_deltas() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                0,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "hello".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::AssistantDelta {
+                    text: "hel".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::AssistantDelta {
+                    text: "lo".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::AssistantMessage {
+                    text: "hello".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::SystemMessage {
+                    text: "done".to_string(),
+                },
+            ),
+        ];
+
+        let compacted = compact_attach_history(history);
+
+        assert_eq!(compacted.len(), 3);
+        assert!(matches!(
+            compacted[0].kind,
+            SessionEventKind::UserMessage { .. }
+        ));
+        assert!(matches!(
+            compacted[1].kind,
+            SessionEventKind::AssistantMessage { .. }
+        ));
+        assert_eq!(compacted[1].sequence, 3);
+        assert!(matches!(
+            compacted[2].kind,
+            SessionEventKind::SystemMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn compact_attach_history_preserves_incomplete_assistant_deltas() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                0,
+                SessionEventKind::AssistantDelta {
+                    text: "still".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::AssistantDelta {
+                    text: " streaming".to_string(),
+                },
+            ),
+        ];
+
+        let compacted = compact_attach_history(history);
+
+        assert_eq!(compacted.len(), 2);
+        assert!(matches!(
+            compacted[0].kind,
+            SessionEventKind::AssistantDelta { .. }
+        ));
+        assert!(matches!(
+            compacted[1].kind,
+            SessionEventKind::AssistantDelta { .. }
+        ));
+    }
+
+    #[test]
+    fn compact_attach_history_flushes_deltas_before_non_assistant_events() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                0,
+                SessionEventKind::AssistantDelta {
+                    text: "partial".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::SystemMessage {
+                    text: "interrupted".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "next turn".to_string(),
+                },
+            ),
+        ];
+
+        let compacted = compact_attach_history(history);
+
+        assert_eq!(compacted.len(), 3);
+        assert!(matches!(
+            compacted[0].kind,
+            SessionEventKind::AssistantDelta { .. }
+        ));
+        assert!(matches!(
+            compacted[1].kind,
+            SessionEventKind::SystemMessage { .. }
+        ));
+        assert!(matches!(
+            compacted[2].kind,
+            SessionEventKind::AssistantMessage { .. }
+        ));
+    }
 
     #[test]
     fn unspecified_model_selection_lets_provider_choose_default() {
