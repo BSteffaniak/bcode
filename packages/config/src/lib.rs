@@ -377,11 +377,23 @@ impl Default for PromptCacheConfig {
 }
 
 /// Provider-native conversation reuse configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationReuseConfig {
-    /// Conversation reuse mode. Defaults to `off` because provider-native retention semantics are provider-specific.
-    #[serde(default)]
+    /// Conversation reuse mode. Defaults to `auto` so providers can use native continuation when supported.
+    #[serde(default = "default_conversation_reuse_mode")]
     pub mode: bcode_model::ConversationReuseMode,
+}
+
+impl Default for ConversationReuseConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_conversation_reuse_mode(),
+        }
+    }
+}
+
+const fn default_conversation_reuse_mode() -> bcode_model::ConversationReuseMode {
+    bcode_model::ConversationReuseMode::Auto
 }
 
 /// Generic model provider profile configuration.
@@ -1279,18 +1291,28 @@ mode = "off"
     }
 
     #[test]
+    fn defaults_conversation_reuse_to_auto() {
+        let config = BcodeConfig::default();
+
+        assert_eq!(
+            config.model.conversation_reuse.mode,
+            bcode_model::ConversationReuseMode::Auto
+        );
+    }
+
+    #[test]
     fn parses_conversation_reuse_mode() {
         let config: BcodeConfig = toml::from_str(
             r#"
 [model.conversation_reuse]
-mode = "auto"
+mode = "off"
 "#,
         )
         .expect("config should parse");
 
         assert_eq!(
             config.model.conversation_reuse.mode,
-            bcode_model::ConversationReuseMode::Auto
+            bcode_model::ConversationReuseMode::Off
         );
     }
 
