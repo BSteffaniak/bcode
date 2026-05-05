@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
 
 const FRAME_LEN_BYTES: usize = 4;
+const MAX_SESSION_EVENT_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
@@ -608,25 +609,89 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 fn read_events(path: &Path) -> Result<Vec<SessionEvent>, SessionStoreError> {
     let mut file = File::open(path)?;
     let mut events = Vec::new();
+    let mut offset = 0_u64;
     loop {
-        let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
-        match file.read_exact(&mut len_bytes) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(error.into()),
+        let frame_offset = offset;
+        let Some(payload_len) = read_frame_len(path, &mut file, &mut offset, frame_offset)? else {
+            break;
+        };
+        if payload_len > MAX_SESSION_EVENT_FRAME_BYTES {
+            eprintln!(
+                "ignoring unreadable tail in session event file {} at byte {frame_offset}: frame length {payload_len} exceeds safety limit",
+                path.display()
+            );
+            break;
         }
-        let payload_len = u32::from_le_bytes(len_bytes) as usize;
-        let mut payload = vec![0_u8; payload_len];
-        file.read_exact(&mut payload)?;
-        events.push(bmux_codec::from_bytes(&payload).map_err(SessionStoreError::Decode)?);
+        let Some(payload) =
+            read_frame_payload(path, &mut file, payload_len, &mut offset, frame_offset)?
+        else {
+            break;
+        };
+        match bmux_codec::from_bytes(&payload) {
+            Ok(event) => events.push(event),
+            Err(error) => eprintln!(
+                "ignoring corrupt session event frame in {} at byte {frame_offset}: {error}",
+                path.display()
+            ),
+        }
     }
     Ok(events)
+}
+
+fn read_frame_len(
+    path: &Path,
+    file: &mut File,
+    offset: &mut u64,
+    frame_offset: u64,
+) -> Result<Option<usize>, SessionStoreError> {
+    let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
+    let mut bytes_read = 0_usize;
+    while bytes_read < FRAME_LEN_BYTES {
+        let read = file.read(&mut len_bytes[bytes_read..])?;
+        if read == 0 {
+            if bytes_read > 0 {
+                eprintln!(
+                    "ignoring truncated session event length in {} at byte {frame_offset}",
+                    path.display()
+                );
+            }
+            return Ok(None);
+        }
+        bytes_read += read;
+        *offset = offset.saturating_add(read.try_into().unwrap_or(u64::MAX));
+    }
+    Ok(Some(u32::from_le_bytes(len_bytes) as usize))
+}
+
+fn read_frame_payload(
+    path: &Path,
+    file: &mut File,
+    payload_len: usize,
+    offset: &mut u64,
+    frame_offset: u64,
+) -> Result<Option<Vec<u8>>, SessionStoreError> {
+    let mut payload = vec![0_u8; payload_len];
+    let mut bytes_read = 0_usize;
+    while bytes_read < payload_len {
+        let read = file.read(&mut payload[bytes_read..])?;
+        if read == 0 {
+            eprintln!(
+                "ignoring truncated session event payload in {} at byte {frame_offset}: expected {payload_len} bytes, got {bytes_read}",
+                path.display()
+            );
+            return Ok(None);
+        }
+        bytes_read += read;
+        *offset = offset.saturating_add(read.try_into().unwrap_or(u64::MAX));
+    }
+    Ok(Some(payload))
 }
 
 #[cfg(test)]
 mod tests {
     use super::SessionManager;
     use bcode_session_models::{ClientId, SessionEventKind};
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
@@ -764,6 +829,43 @@ mod tests {
         assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::SystemMessage { text } if text == "system"
+        )));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn persistent_manager_ignores_corrupt_session_tail() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("test".to_string()))
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "hello".to_string())
+            .await
+            .expect("message should append");
+
+        let path = root.join(format!("{}.events", session.id));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("event file should open");
+        file.write_all(&3_u32.to_le_bytes())
+            .expect("corrupt frame length should append");
+        file.write_all(&[1_u8])
+            .expect("partial corrupt frame should append");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let history = restored
+            .session_history(session.id)
+            .await
+            .expect("history should load");
+
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "hello"
         )));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");

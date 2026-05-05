@@ -151,6 +151,14 @@ impl SessionTokenUsage {
 }
 
 /// Session event payload.
+///
+/// IMPORTANT: This enum is persisted with `bmux_codec`, whose binary enum
+/// representation is order-sensitive. Do not reorder existing variants or
+/// insert new variants between existing ones. Add new variants only at the end,
+/// and bump `CURRENT_SESSION_EVENT_SCHEMA_VERSION` when doing so.
+///
+/// Reordering variants can make existing persisted `*.events` session files
+/// decode as the wrong event type or fail daemon startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEventKind {
@@ -201,10 +209,6 @@ pub enum SessionEventKind {
     SystemMessage {
         text: String,
     },
-    ContextCompacted {
-        summary: String,
-        compacted_through_sequence: u64,
-    },
     AgentChanged {
         agent_id: String,
     },
@@ -220,5 +224,9 @@ pub enum SessionEventKind {
     ModelUsage {
         turn_id: String,
         usage: SessionTokenUsage,
+    },
+    ContextCompacted {
+        summary: String,
+        compacted_through_sequence: u64,
     },
 }
