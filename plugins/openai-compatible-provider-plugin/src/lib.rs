@@ -1106,11 +1106,8 @@ fn build_responses_request(
         instructions: projection.instructions,
         input: projection.input,
         stream: true,
-        store: request.conversation_reuse.mode.is_enabled(),
-        previous_response_id: request
-            .conversation_reuse
-            .previous_provider_response_id
-            .clone(),
+        store: responses_store_enabled(settings, request),
+        previous_response_id: responses_previous_response_id(settings, request),
         tools: model_tools_to_responses_tools(request),
         temperature: request.parameters.temperature,
         max_output_tokens: request.parameters.max_output_tokens,
@@ -1120,6 +1117,25 @@ fn build_responses_request(
 
 const fn responses_instruction_strategy(_settings: &Settings) -> ResponsesInstructionStrategy {
     ResponsesInstructionStrategy::TopLevelInstructions
+}
+
+const fn responses_store_enabled(settings: &Settings, request: &ModelTurnRequest) -> bool {
+    !matches!(settings.auth, AuthSettings::ChatGpt { .. })
+        && request.conversation_reuse.mode.is_enabled()
+}
+
+fn responses_previous_response_id(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> Option<String> {
+    (!matches!(settings.auth, AuthSettings::ChatGpt { .. }))
+        .then(|| {
+            request
+                .conversation_reuse
+                .previous_provider_response_id
+                .clone()
+        })
+        .flatten()
 }
 
 fn responses_projection(
@@ -2545,11 +2561,23 @@ mod tests {
             tools: Vec::new(),
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
-            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints {
+                mode: bcode_model::ConversationReuseMode::Auto,
+                key: Some("key".to_string()),
+                previous_provider_response_id: Some("resp_previous".to_string()),
+                new_messages_start_index: Some(0),
+            },
             metadata: BTreeMap::new(),
         };
         let settings = Settings {
-            auth: AuthSettings::Missing,
+            auth: AuthSettings::ChatGpt {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                account_id: None,
+                profile: None,
+                vault: None,
+            },
             auth_diagnostics: AuthDiagnostics {
                 source: "test".to_string(),
                 mode: "test".to_string(),
@@ -2573,6 +2601,11 @@ mod tests {
         );
         assert!(!encoded_text.contains(r#""role":"system""#));
         assert!(encoded.get("instructions").is_some());
+        assert_eq!(
+            encoded.get("store").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(encoded.get("previous_response_id").is_none());
     }
 
     #[test]
