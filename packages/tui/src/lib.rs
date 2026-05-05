@@ -21,7 +21,9 @@ use bcode_client::{BcodeClient, ClientError};
 use bcode_command::CommandInfo;
 use bcode_ipc::Event;
 use bcode_model::ReasoningEffort;
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionSummary};
+use bcode_session_models::{
+    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionSummary,
+};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
     KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -1305,7 +1307,9 @@ impl ChatApp {
 
     fn update_activity_from_live_event(&mut self, event: &SessionEvent) {
         match &event.kind {
-            SessionEventKind::UserMessage { .. } | SessionEventKind::ToolCallFinished { .. } => {
+            SessionEventKind::UserMessage { .. }
+            | SessionEventKind::ToolCallFinished { .. }
+            | SessionEventKind::ModelTurnStarted { .. } => {
                 self.set_activity(ActivityState::Thinking);
             }
             SessionEventKind::AssistantDelta { text } => {
@@ -1315,10 +1319,6 @@ impl ChatApp {
                 } else {
                     self.set_activity(ActivityState::Streaming { chars: delta_chars });
                 }
-            }
-            SessionEventKind::AssistantMessage { .. } => {
-                self.set_activity(ActivityState::Idle);
-                self.status = "ready".to_string();
             }
             SessionEventKind::ToolCallRequested { tool_name, .. } => {
                 self.set_activity(ActivityState::RunningTool {
@@ -1346,12 +1346,18 @@ impl ChatApp {
                     self.set_activity(ActivityState::Thinking);
                 }
             }
-            SessionEventKind::SystemMessage { text } if system_message_finishes_activity(text) => {
+            SessionEventKind::ModelTurnFinished {
+                outcome, message, ..
+            } => {
                 self.set_activity(ActivityState::Idle);
+                self.status = message
+                    .clone()
+                    .unwrap_or_else(|| model_turn_outcome_label(*outcome).to_string());
             }
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::ClientAttached { .. }
             | SessionEventKind::ClientDetached { .. }
+            | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ModelChanged { .. }
             | SessionEventKind::AgentChanged { .. }
             | SessionEventKind::SystemMessage { .. } => {}
@@ -1845,14 +1851,15 @@ fn model_to_display_selection(model: &str) -> Option<String> {
     }
 }
 
-fn system_message_finishes_activity(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("cancelled")
-        || lower.contains("canceled")
-        || lower.contains("model error")
-        || lower.contains("model provider error")
-        || lower.contains("model request error")
-        || lower.contains("timeout")
+fn model_turn_outcome_label(outcome: ModelTurnOutcome) -> &'static str {
+    match outcome {
+        ModelTurnOutcome::Completed => "ready",
+        ModelTurnOutcome::Cancelled => "model turn cancelled",
+        ModelTurnOutcome::Error => "model turn failed",
+        ModelTurnOutcome::IdleTimeout => "model provider idle timeout",
+        ModelTurnOutcome::ToolRoundLimitReached => "model tool-call round limit reached",
+        ModelTurnOutcome::ProviderUnavailable => "model provider unavailable",
+    }
 }
 
 fn render_chat_frame(frame: &mut Frame<'_>, app: &ChatApp) {
@@ -2977,6 +2984,20 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         SessionEventKind::SystemMessage { text } => {
             vec![TranscriptBlock::System { text: text.clone() }]
         }
+        SessionEventKind::ModelTurnStarted { .. } => Vec::new(),
+        SessionEventKind::ModelTurnFinished {
+            outcome, message, ..
+        } => {
+            if *outcome == ModelTurnOutcome::Completed {
+                Vec::new()
+            } else {
+                vec![TranscriptBlock::System {
+                    text: message
+                        .clone()
+                        .unwrap_or_else(|| model_turn_outcome_label(*outcome).to_string()),
+                }]
+            }
+        }
     }
 }
 
@@ -3333,28 +3354,37 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_and_model_error_clear_activity() {
+    fn model_turn_lifecycle_controls_activity() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let session_id = SessionId::new();
         let mut app = ChatApp::new(session_id, &[], &keymap);
-        app.set_activity(ActivityState::Thinking);
 
         app.push_event(Event::Session(session_event(
             session_id,
-            SessionEventKind::AssistantMessage {
-                text: "done".to_string(),
+            SessionEventKind::ModelTurnStarted {
+                turn_id: "turn-1".to_string(),
             },
         )));
-        assert_eq!(app.activity, ActivityState::Idle);
+        assert_eq!(app.activity, ActivityState::Thinking);
 
-        app.set_activity(ActivityState::Thinking);
         app.push_event(Event::Session(session_event(
             session_id,
             SessionEventKind::SystemMessage {
-                text: "model error provider failed".to_string(),
+                text: "model warning should not finish activity".to_string(),
+            },
+        )));
+        assert_eq!(app.activity, ActivityState::Thinking);
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".to_string(),
+                outcome: ModelTurnOutcome::Error,
+                message: Some("provider failed".to_string()),
             },
         )));
         assert_eq!(app.activity, ActivityState::Idle);
+        assert_eq!(app.status, "provider failed");
     }
 
     #[test]

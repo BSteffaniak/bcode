@@ -10,7 +10,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 3;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 4;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -87,6 +87,18 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
+/// Model turn terminal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTurnOutcome {
+    Completed,
+    Cancelled,
+    Error,
+    IdleTimeout,
+    ToolRoundLimitReached,
+    ProviderUnavailable,
+}
+
 /// Session event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,5 +152,14 @@ pub enum SessionEventKind {
     },
     AgentChanged {
         agent_id: String,
+    },
+    ModelTurnStarted {
+        turn_id: String,
+    },
+    ModelTurnFinished {
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        #[serde(default)]
+        message: Option<String>,
     },
 }

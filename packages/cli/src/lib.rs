@@ -2304,5 +2304,19 @@ fn print_session_event(event: &SessionEvent) {
         SessionEventKind::SystemMessage { text } => {
             println!("#{} system: {text}", event.sequence);
         }
+        SessionEventKind::ModelTurnStarted { turn_id } => {
+            println!("#{} model turn started: {turn_id}", event.sequence);
+        }
+        SessionEventKind::ModelTurnFinished {
+            turn_id,
+            outcome,
+            message,
+        } => {
+            println!(
+                "#{} model turn finished: {turn_id} {outcome:?} {}",
+                event.sequence,
+                message.as_deref().unwrap_or("")
+            );
+        }
     }
 }

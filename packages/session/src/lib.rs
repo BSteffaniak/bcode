@@ -9,8 +9,8 @@
 //! Session lifecycle, attachment management, and append-only event history.
 
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionEvent, SessionEventKind, SessionId,
-    SessionSummary,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
+    SessionEventKind, SessionId, SessionSummary,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -431,6 +431,43 @@ impl SessionManager {
             .await
     }
 
+    /// Append a model-turn-started event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_model_turn_started(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, SessionEventKind::ModelTurnStarted { turn_id })
+            .await
+    }
+
+    /// Append a model-turn-finished event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_model_turn_finished(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        message: Option<String>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            },
+        )
+        .await
+    }
+
     /// Append a system message to a session.
     ///
     /// # Errors
@@ -557,6 +594,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn persistent_manager_restores_session_history() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -597,6 +635,19 @@ mod tests {
             .append_agent_changed(session.id, "plan".to_string())
             .await
             .expect("agent change should append");
+        manager
+            .append_model_turn_started(session.id, "turn-1".to_string())
+            .await
+            .expect("turn start should append");
+        manager
+            .append_model_turn_finished(
+                session.id,
+                "turn-1".to_string(),
+                bcode_session_models::ModelTurnOutcome::Completed,
+                None,
+            )
+            .await
+            .expect("turn finish should append");
         manager
             .append_system_message(session.id, "system".to_string())
             .await
@@ -644,6 +695,15 @@ mod tests {
         assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::AgentChanged { agent_id } if agent_id == "plan"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelTurnStarted { turn_id } if turn_id == "turn-1"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelTurnFinished { turn_id, outcome, .. }
+                if turn_id == "turn-1" && *outcome == bcode_session_models::ModelTurnOutcome::Completed
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,

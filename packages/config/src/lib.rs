@@ -311,12 +311,19 @@ pub struct ModelConfig {
     #[serde(default)]
     pub default_thinking_level: Option<bcode_model::ReasoningEffort>,
     #[serde(default)]
+    pub max_tool_rounds: Option<u32>,
+    #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ModelProfileConfig>,
 }
 
 impl ModelConfig {
+    #[must_use]
+    pub fn effective_max_tool_rounds(&self) -> Option<u32> {
+        self.max_tool_rounds.filter(|rounds| *rounds > 0)
+    }
+
     fn merge(&mut self, next: Self) {
         if next.provider_plugin_id.is_some() {
             self.provider_plugin_id = next.provider_plugin_id;
@@ -326,6 +333,9 @@ impl ModelConfig {
         }
         if next.default_thinking_level.is_some() {
             self.default_thinking_level = next.default_thinking_level;
+        }
+        if next.max_tool_rounds.is_some() {
+            self.max_tool_rounds = next.max_tool_rounds;
         }
         if next.profile.is_some() {
             self.profile = next.profile;
@@ -683,6 +693,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
     if model.provider_plugin_id.is_some()
         || model.model_id.is_some()
         || model.default_thinking_level.is_some()
+        || model.max_tool_rounds.is_some()
         || model.profile.is_some()
     {
         output.push_str("[model]\n");
@@ -704,6 +715,10 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         }
         if let Some(level) = &model.default_thinking_level {
             writeln!(output, "default_thinking_level = \"{level:?}\"")
+                .expect("writing to string should not fail");
+        }
+        if let Some(max_tool_rounds) = model.max_tool_rounds {
+            writeln!(output, "max_tool_rounds = {max_tool_rounds}")
                 .expect("writing to string should not fail");
         }
         output.push('\n');
@@ -1099,6 +1114,32 @@ profile = "work"
             selection.settings.get("region"),
             Some(&"us-east-1".to_string())
         );
+    }
+
+    #[test]
+    fn max_tool_rounds_zero_means_unlimited() {
+        let config: BcodeConfig = toml::from_str(
+            r"
+[model]
+max_tool_rounds = 0
+",
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.model.effective_max_tool_rounds(), None);
+    }
+
+    #[test]
+    fn positive_max_tool_rounds_is_effective() {
+        let config: BcodeConfig = toml::from_str(
+            r"
+[model]
+max_tool_rounds = 3
+",
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.model.effective_max_tool_rounds(), Some(3));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use bcode_model::{
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse,
 };
 use bcode_session::SessionManager;
-use bcode_session_models::{ClientId, SessionEventKind, SessionId};
+use bcode_session_models::{ClientId, ModelTurnOutcome, SessionEventKind, SessionId};
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
@@ -74,6 +74,7 @@ struct ServerState {
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
     permission_policy: Mutex<PermissionPolicy>,
+    max_tool_rounds: Option<u32>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -198,6 +199,7 @@ impl ServerState {
         selected_model_id: Option<String>,
         selected_provider_context: bcode_model::ProviderRequestContext,
         permission_policy: PermissionPolicy,
+        max_tool_rounds: Option<u32>,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
@@ -207,6 +209,7 @@ impl ServerState {
             selected_model_id,
             selected_provider_context,
             permission_policy: Mutex::new(permission_policy),
+            max_tool_rounds,
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -286,6 +289,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             settings: resolved_model.settings,
         },
         PermissionPolicy::from(&config.permissions),
+        config.model.effective_max_tool_rounds(),
     ));
     let mut shutdown = state.subscribe_shutdown();
     tracing::info!(target: "bcode_server::startup", "server ready; accepting clients");
@@ -909,14 +913,36 @@ async fn handle_resolve_permission(
     .await
 }
 
-const MAX_MODEL_TOOL_ROUNDS: u8 = 8;
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct ModelPollOutcome {
     stop_reason: Option<bcode_model::StopReason>,
     should_continue: bool,
+    completion: Option<ModelTurnCompletion>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelTurnCompletion {
+    outcome: ModelTurnOutcome,
+    message: Option<String>,
+}
+
+impl ModelTurnCompletion {
+    const fn completed() -> Self {
+        Self {
+            outcome: ModelTurnOutcome::Completed,
+            message: None,
+        }
+    }
+
+    fn with_message(outcome: ModelTurnOutcome, message: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            message: Some(message.into()),
+        }
+    }
 }
 
 async fn run_model_turn(
@@ -924,13 +950,35 @@ async fn run_model_turn(
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
 ) {
+    let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+    append_model_turn_started_event(state, session_id, turn_id.clone()).await;
+    let completion = run_model_turn_inner(state, session_id, trigger_event).await;
+    append_model_turn_finished_event(
+        state,
+        session_id,
+        turn_id,
+        completion.outcome,
+        completion.message,
+    )
+    .await;
+}
+
+async fn run_model_turn_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+) -> ModelTurnCompletion {
     let selection = session_model_selection(state, session_id).await;
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
-        return;
+        return ModelTurnCompletion::with_message(
+            ModelTurnOutcome::ProviderUnavailable,
+            "model provider unavailable",
+        );
     }
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
-    for round in 0..=MAX_MODEL_TOOL_ROUNDS {
+    let mut round = 0_u32;
+    loop {
         let request = match build_model_turn_request(
             state,
             session_id,
@@ -942,27 +990,35 @@ async fn run_model_turn(
         {
             Ok(request) => request,
             Err(error) => {
-                append_system_event(state, session_id, format!("model request error: {error}"))
-                    .await;
-                return;
+                let message = format!("model request error: {error}");
+                append_system_event(state, session_id, message.clone()).await;
+                return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
             }
         };
-        let Some(outcome) =
-            run_model_turn_round(state, session_id, provider_plugin_id.as_deref(), &request).await
-        else {
-            return;
-        };
-        if !outcome.should_continue {
-            return;
+        let outcome =
+            match run_model_turn_round(state, session_id, provider_plugin_id.as_deref(), &request)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(completion) => return completion,
+            };
+        if let Some(completion) = outcome.completion {
+            return completion;
         }
-        if round == MAX_MODEL_TOOL_ROUNDS {
-            append_system_event(
-                state,
-                session_id,
-                "model tool-call round limit reached".to_string(),
-            )
-            .await;
-            return;
+        if !outcome.should_continue {
+            return ModelTurnCompletion::completed();
+        }
+        round = round.saturating_add(1);
+        if state.max_tool_rounds.is_some_and(|max| round > max) {
+            let message = format!(
+                "model tool-call round limit reached ({})",
+                state.max_tool_rounds.unwrap_or_default()
+            );
+            append_system_event(state, session_id, message.clone()).await;
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::ToolRoundLimitReached,
+                message,
+            );
         }
     }
 }
@@ -972,7 +1028,7 @@ async fn run_model_turn_round(
     session_id: SessionId,
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
-) -> Option<ModelPollOutcome> {
+) -> Result<ModelPollOutcome, ModelTurnCompletion> {
     let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
         state,
         provider_plugin_id.map(ToString::to_string),
@@ -983,8 +1039,12 @@ async fn run_model_turn_round(
     let start = match start {
         Ok(start) => start,
         Err(error) => {
-            append_system_event(state, session_id, format!("model provider error: {error}")).await;
-            return None;
+            let message = format!("model provider error: {error}");
+            append_system_event(state, session_id, message.clone()).await;
+            return Err(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                message,
+            ));
         }
     };
 
@@ -1019,7 +1079,7 @@ async fn run_model_turn_round(
         finish,
     )
     .await;
-    Some(outcome)
+    Ok(outcome)
 }
 
 async fn poll_model_turn_events(
@@ -1039,23 +1099,27 @@ async fn poll_model_turn_events(
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                append_system_event(state, session_id, format!("model provider error: {error}"))
-                    .await;
+                let message = format!("model provider error: {error}");
+                append_system_event(state, session_id, message.clone()).await;
+                outcome.completion = Some(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    message,
+                ));
                 break;
             }
         };
         if response.events.is_empty() {
             idle_for += MODEL_POLL_INTERVAL;
             if idle_for > MODEL_IDLE_TIMEOUT {
-                append_system_event(
-                    state,
-                    session_id,
-                    format!(
-                        "model provider was idle for {} seconds before timeout",
-                        MODEL_IDLE_TIMEOUT.as_secs()
-                    ),
-                )
-                .await;
+                let message = format!(
+                    "model provider was idle for {} seconds before timeout",
+                    MODEL_IDLE_TIMEOUT.as_secs()
+                );
+                append_system_event(state, session_id, message.clone()).await;
+                outcome.completion = Some(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::IdleTimeout,
+                    message,
+                ));
                 break;
             }
             tokio::time::sleep(MODEL_POLL_INTERVAL).await;
@@ -1100,21 +1164,37 @@ async fn handle_provider_turn_event(
             append_assistant_delta_event(state, session_id, text).await;
         }
         ProviderTurnEvent::Error { error } => {
-            append_system_event(
-                state,
-                session_id,
-                format!("model error {}: {}", error.code, error.message),
-            )
-            .await;
+            let message = format!("model error {}: {}", error.code, error.message);
+            append_system_event(state, session_id, message.clone()).await;
             outcome.stop_reason = Some(bcode_model::StopReason::Error);
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                message,
+            ));
         }
         ProviderTurnEvent::TurnFinished { stop_reason } => {
             outcome.should_continue = stop_reason == bcode_model::StopReason::ToolCall;
             outcome.stop_reason = Some(stop_reason);
+            if stop_reason == bcode_model::StopReason::Cancelled {
+                outcome.completion = Some(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Cancelled,
+                    "model turn cancelled",
+                ));
+            } else if stop_reason == bcode_model::StopReason::Error {
+                outcome.completion = Some(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    "model turn ended with error",
+                ));
+            }
         }
         ProviderTurnEvent::Cancelled => {
-            append_system_event(state, session_id, "model turn cancelled".to_string()).await;
+            let message = "model turn cancelled".to_string();
+            append_system_event(state, session_id, message.clone()).await;
             outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                message,
+            ));
         }
         ProviderTurnEvent::ToolCallFinished { call } => {
             if !assistant_text.is_empty() {
@@ -1374,7 +1454,7 @@ async fn build_model_turn_request(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
-    round: u8,
+    round: u32,
     selected_model_id: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.session_history(session_id).await?;
@@ -2001,6 +2081,38 @@ async fn append_system_event(state: &ServerState, session_id: SessionId, text: S
     match state.sessions.append_system_message(session_id, text).await {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append system message: {error}"),
+    }
+}
+
+async fn append_model_turn_started_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: String,
+) {
+    match state
+        .sessions
+        .append_model_turn_started(session_id, turn_id)
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append model turn start: {error}"),
+    }
+}
+
+async fn append_model_turn_finished_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: String,
+    outcome: ModelTurnOutcome,
+    message: Option<String>,
+) {
+    match state
+        .sessions
+        .append_model_turn_finished(session_id, turn_id, outcome, message)
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append model turn finish: {error}"),
     }
 }
 
