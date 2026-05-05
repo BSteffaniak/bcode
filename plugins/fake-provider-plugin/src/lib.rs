@@ -9,7 +9,7 @@ use bcode_model::{
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
     OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
-    ProviderCapability, ProviderTurnEvent, StartTurnResponse, StopReason, ToolCall,
+    ProviderCapability, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
     ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
@@ -167,7 +167,16 @@ impl FakeTurnWorker {
 }
 
 fn finish_fake_turn(turn: &FakeTurn, text: String) {
+    let output_tokens = u32::try_from(text.split_whitespace().count()).unwrap_or(u32::MAX);
     turn.push(ProviderTurnEvent::TextDelta { text });
+    turn.push(ProviderTurnEvent::Usage {
+        usage: TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(output_tokens),
+            total_tokens: Some(output_tokens.saturating_add(1)),
+            ..TokenUsage::default()
+        },
+    });
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::EndTurn,
     });

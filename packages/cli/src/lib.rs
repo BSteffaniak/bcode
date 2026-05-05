@@ -2332,5 +2332,16 @@ fn print_session_event(event: &SessionEvent) {
                 message.as_deref().unwrap_or("")
             );
         }
+        SessionEventKind::ModelUsage { turn_id, usage } => {
+            println!(
+                "#{} model usage: {turn_id} input={:?} output={:?} total={:?} cached={:?} reasoning={:?}",
+                event.sequence,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.metered_total_tokens(),
+                usage.cached_input_tokens,
+                usage.reasoning_tokens,
+            );
+        }
     }
 }

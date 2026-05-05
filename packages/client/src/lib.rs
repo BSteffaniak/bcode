@@ -174,6 +174,25 @@ impl BcodeClient {
         }
     }
 
+    /// Return active model metadata for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_model_status(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bcode_ipc::SessionModelStatus, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::SessionModelStatus { session_id })
+            .await?
+        {
+            ResponsePayload::SessionModelStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Request cancellation of the active model turn for a session.
     ///
     /// # Errors

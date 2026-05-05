@@ -10,7 +10,7 @@
 
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
-    SessionEventKind, SessionId, SessionSummary,
+    SessionEventKind, SessionId, SessionSummary, SessionTokenUsage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -468,6 +468,21 @@ impl SessionManager {
         .await
     }
 
+    /// Append provider-neutral token usage to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_model_usage(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        usage: SessionTokenUsage,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, SessionEventKind::ModelUsage { turn_id, usage })
+            .await
+    }
+
     /// Append a system message to a session.
     ///
     /// # Errors
@@ -649,6 +664,20 @@ mod tests {
             .await
             .expect("turn finish should append");
         manager
+            .append_model_usage(
+                session.id,
+                "turn-1".to_string(),
+                bcode_session_models::SessionTokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    total_tokens: Some(15),
+                    cached_input_tokens: Some(3),
+                    reasoning_tokens: Some(2),
+                },
+            )
+            .await
+            .expect("model usage should append");
+        manager
             .append_system_message(session.id, "system".to_string())
             .await
             .expect("system message should append");
@@ -704,6 +733,11 @@ mod tests {
             &event.kind,
             SessionEventKind::ModelTurnFinished { turn_id, outcome, .. }
                 if turn_id == "turn-1" && *outcome == bcode_session_models::ModelTurnOutcome::Completed
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelUsage { turn_id, usage }
+                if turn_id == "turn-1" && usage.metered_total_tokens() == Some(15)
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,

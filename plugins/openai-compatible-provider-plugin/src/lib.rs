@@ -13,7 +13,7 @@ use bcode_model::{
     OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
     ProviderCapability, ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse,
-    StopReason, ToolCall, ValidateConfigResponse,
+    StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -205,6 +205,8 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,6 +219,11 @@ struct ChatCompletionRequest {
     stop: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,6 +317,8 @@ struct ChatMessageToolCallFunction {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
     choices: Vec<ChatChunkChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +359,52 @@ struct ModelsResponseBody {
 #[derive(Debug, Deserialize)]
 struct ModelResponseItem {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokenDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAiCompletionTokenDetails>,
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAiInputTokenDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OpenAiOutputTokenDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletionTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiInputTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiOutputTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -473,6 +528,9 @@ async fn send_chat_completion_request(
         },
         messages: model_messages_to_chat_messages(request),
         stream: true,
+        stream_options: Some(ChatStreamOptions {
+            include_usage: true,
+        }),
         tools: model_tools_to_chat_tools(request),
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
@@ -713,6 +771,9 @@ fn process_responses_stream_line(
             process_responses_function_arguments_delta(&event, tool_calls);
         }
         "response.completed" => {
+            if let Some(usage) = token_usage_from_responses_event(&event) {
+                turn.push(ProviderTurnEvent::Usage { usage });
+            }
             return Ok(if *saw_tool_call {
                 finish_tool_calls(turn, tool_calls, &openai_tool_name_map(request))?;
                 StreamOutcome::ToolCall
@@ -853,6 +914,11 @@ fn process_stream_line(
             error.to_string(),
         )
     })?;
+    if let Some(usage) = chunk.usage {
+        turn.push(ProviderTurnEvent::Usage {
+            usage: token_usage_from_openai_usage(usage),
+        });
+    }
     let name_map = openai_tool_name_map(request);
     for choice in chunk.choices {
         if let Some(content) = choice.delta.content
@@ -870,6 +936,42 @@ fn process_stream_line(
         }
     }
     Ok(StreamOutcome::Cancelled)
+}
+
+fn token_usage_from_openai_usage(usage: OpenAiUsage) -> TokenUsage {
+    let cached_input_tokens = usage
+        .prompt_tokens_details
+        .and_then(|details| details.cached_tokens)
+        .or_else(|| {
+            usage
+                .input_tokens_details
+                .and_then(|details| details.cached_tokens)
+        });
+    let reasoning_tokens = usage
+        .completion_tokens_details
+        .and_then(|details| details.reasoning_tokens)
+        .or_else(|| {
+            usage
+                .output_tokens_details
+                .and_then(|details| details.reasoning_tokens)
+        });
+    TokenUsage {
+        input_tokens: usage.prompt_tokens.or(usage.input_tokens),
+        output_tokens: usage.completion_tokens.or(usage.output_tokens),
+        total_tokens: usage.total_tokens,
+        cached_input_tokens,
+        reasoning_tokens,
+    }
+}
+
+fn token_usage_from_responses_event(event: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = event
+        .get("response")
+        .and_then(|response| response.get("usage"))
+        .or_else(|| event.get("usage"))?;
+    serde_json::from_value::<OpenAiUsage>(usage.clone())
+        .ok()
+        .map(token_usage_from_openai_usage)
 }
 
 fn process_tool_call_deltas(
@@ -2088,6 +2190,52 @@ mod tests {
 
         assert_eq!(body.data.len(), 2);
         assert_eq!(body.data[0].id, "model-a");
+    }
+
+    #[test]
+    fn chat_completion_usage_maps_to_provider_neutral_usage() {
+        let usage = serde_json::from_str::<OpenAiUsage>(
+            r#"{
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": { "cached_tokens": 3 },
+                "completion_tokens_details": { "reasoning_tokens": 2 }
+            }"#,
+        )
+        .expect("usage should decode");
+
+        let usage = token_usage_from_openai_usage(usage);
+
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.total_tokens, Some(15));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+    }
+
+    #[test]
+    fn responses_completed_usage_maps_to_provider_neutral_usage() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 7,
+                    "total_tokens": 27,
+                    "input_tokens_details": { "cached_tokens": 4 },
+                    "output_tokens_details": { "reasoning_tokens": 6 }
+                }
+            }
+        });
+
+        let usage = token_usage_from_responses_event(&event).expect("usage should parse");
+
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.total_tokens, Some(27));
+        assert_eq!(usage.cached_input_tokens, Some(4));
+        assert_eq!(usage.reasoning_tokens, Some(6));
     }
 
     #[test]

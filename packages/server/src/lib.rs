@@ -17,12 +17,14 @@ use bcode_ipc::{
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole,
-    ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderTurnEvent, ReasoningEffort, StartTurnResponse,
+    ModelList, ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN,
+    OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_session::SessionManager;
-use bcode_session_models::{ClientId, ModelTurnOutcome, SessionEventKind, SessionId};
+use bcode_session_models::{
+    ClientId, ModelTurnOutcome, SessionEventKind, SessionId, SessionTokenUsage,
+};
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
@@ -287,9 +289,7 @@ async fn handle_request(
 ) -> Result<(), ServerError> {
     match request {
         Request::Hello { .. } => handle_hello(request_id, client_id, writer).await,
-        Request::Ping => {
-            send_response(writer, request_id, Response::Ok(ResponsePayload::Pong)).await
-        }
+        Request::Ping => handle_ping(request_id, writer).await,
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
         Request::ServerStop => handle_server_stop(request_id, state, writer).await,
         Request::CreateSession { name } => {
@@ -331,6 +331,20 @@ async fn handle_request(
             )
             .await
         }
+        Request::SessionModelStatus { session_id } => {
+            handle_session_model_status(request_id, state, writer, session_id).await
+        }
+        request => handle_agent_permission_plugin_request(request, request_id, state, writer).await,
+    }
+}
+
+async fn handle_agent_permission_plugin_request(
+    request: Request,
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         Request::ListAgents => handle_list_agents(request_id, state, writer).await,
         Request::AgentPolicyStatus => handle_agent_policy_status(request_id, state, writer).await,
         Request::SetSessionAgent {
@@ -382,7 +396,12 @@ async fn handle_request(
         Request::PublishPluginEvent { topic, payload } => {
             handle_publish_plugin_event(request_id, state, writer, &topic, &payload).await
         }
+        _ => unreachable!("primary request routed to agent/permission/plugin handler"),
     }
+}
+
+async fn handle_ping(request_id: u64, writer: &SharedWriter) -> Result<(), ServerError> {
+    send_response(writer, request_id, Response::Ok(ResponsePayload::Pong)).await
 }
 
 async fn handle_hello(
@@ -610,6 +629,53 @@ async fn handle_set_session_model(
             .await
         }
     }
+}
+
+async fn handle_session_model_status(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let selection = session_model_selection(state, session_id).await;
+    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        selection.provider_plugin_id.clone(),
+        OP_MODELS,
+        serde_json::Value::Null,
+    )
+    .await
+    .ok();
+    let model = models
+        .as_ref()
+        .and_then(|models| select_model_info(&models.models, selection.model_id.as_deref()));
+    let model_id = selection
+        .model_id
+        .clone()
+        .or_else(|| model.as_ref().map(|model| model.model_id.clone()));
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionModelStatus {
+            status: bcode_ipc::SessionModelStatus {
+                provider_plugin_id: selection.provider_plugin_id,
+                model_id,
+                model,
+            },
+        }),
+    )
+    .await
+}
+
+fn select_model_info(
+    models: &[bcode_model::ModelInfo],
+    selected_model_id: Option<&str>,
+) -> Option<bcode_model::ModelInfo> {
+    selected_model_id
+        .and_then(|model_id| models.iter().find(|model| model.model_id == model_id))
+        .or_else(|| models.iter().find(|model| model.is_default))
+        .or_else(|| models.first())
+        .cloned()
 }
 
 async fn handle_list_agents(
@@ -974,6 +1040,7 @@ async fn run_model_turn_round(
         session_id,
         provider_plugin_id,
         &start.provider_turn_id,
+        &request.turn_id,
     )
     .await;
 
@@ -1000,6 +1067,7 @@ async fn poll_model_turn_events(
     session_id: SessionId,
     provider_plugin_id: Option<&str>,
     provider_turn_id: &str,
+    turn_id: &str,
 ) -> (String, ModelPollOutcome) {
     let mut assistant_text = String::new();
     let mut outcome = ModelPollOutcome::default();
@@ -1040,8 +1108,15 @@ async fn poll_model_turn_events(
         }
         idle_for = Duration::ZERO;
         for event in response.events {
-            handle_provider_turn_event(state, session_id, event, &mut assistant_text, &mut outcome)
-                .await;
+            handle_provider_turn_event(
+                state,
+                session_id,
+                turn_id,
+                event,
+                &mut assistant_text,
+                &mut outcome,
+            )
+            .await;
         }
         if outcome.stop_reason.is_some() {
             break;
@@ -1067,6 +1142,7 @@ async fn poll_model_turn(
 async fn handle_provider_turn_event(
     state: &ServerState,
     session_id: SessionId,
+    turn_id: &str,
     event: ProviderTurnEvent,
     assistant_text: &mut String,
     outcome: &mut ModelPollOutcome,
@@ -1119,11 +1195,13 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::Warning { message } => {
             append_system_event(state, session_id, format!("model warning: {message}")).await;
         }
+        ProviderTurnEvent::Usage { usage } => {
+            append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
+        }
         ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::ToolCallStarted { .. }
         | ProviderTurnEvent::ReasoningDelta { .. }
-        | ProviderTurnEvent::ToolCallDelta { .. }
-        | ProviderTurnEvent::Usage { .. } => {}
+        | ProviderTurnEvent::ToolCallDelta { .. } => {}
     }
 }
 
@@ -2042,6 +2120,32 @@ async fn append_model_turn_finished_event(
     }
 }
 
+async fn append_model_usage_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: String,
+    usage: TokenUsage,
+) {
+    match state
+        .sessions
+        .append_model_usage(session_id, turn_id, session_token_usage(&usage))
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append model usage: {error}"),
+    }
+}
+
+const fn session_token_usage(usage: &TokenUsage) -> SessionTokenUsage {
+    SessionTokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+    }
+}
+
 async fn handle_list_plugin_services(
     request_id: u64,
     state: &ServerState,
@@ -2231,6 +2335,54 @@ mod tests {
             model_id_for_provider_request(Some("fake-echo")),
             "fake-echo"
         );
+    }
+
+    #[test]
+    fn select_model_info_prefers_selected_model_then_default() {
+        let models = vec![
+            bcode_model::ModelInfo {
+                model_id: "default".to_string(),
+                display_name: "Default".to_string(),
+                is_default: true,
+                context_window: Some(8_000),
+                max_output_tokens: Some(1_000),
+                capabilities: BTreeSet::new(),
+            },
+            bcode_model::ModelInfo {
+                model_id: "selected".to_string(),
+                display_name: "Selected".to_string(),
+                is_default: false,
+                context_window: Some(16_000),
+                max_output_tokens: Some(2_000),
+                capabilities: BTreeSet::new(),
+            },
+        ];
+
+        assert_eq!(
+            select_model_info(&models, Some("selected")).map(|model| model.model_id),
+            Some("selected".to_string())
+        );
+        assert_eq!(
+            select_model_info(&models, None).map(|model| model.model_id),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn session_token_usage_preserves_normalized_fields() {
+        let usage = session_token_usage(&TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            total_tokens: Some(15),
+            cached_input_tokens: Some(3),
+            reasoning_tokens: Some(2),
+        });
+
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.metered_total_tokens(), Some(15));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.reasoning_tokens, Some(2));
     }
 
     #[test]

@@ -104,6 +104,9 @@ pub enum Request {
         provider_plugin_id: Option<String>,
         model_id: String,
     },
+    SessionModelStatus {
+        session_id: SessionId,
+    },
     ListAgents,
     AgentPolicyStatus,
     SetSessionAgent {
@@ -148,6 +151,17 @@ pub struct ServerStatus {
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
     pub selected_model_id: Option<String>,
+}
+
+/// Active model metadata for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelStatus {
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<bcode_model::ModelInfo>,
 }
 
 /// Service interface provided by a loaded plugin.
@@ -216,6 +230,9 @@ pub enum ResponsePayload {
         cancelled: bool,
     },
     SessionModelSet,
+    SessionModelStatus {
+        status: SessionModelStatus,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

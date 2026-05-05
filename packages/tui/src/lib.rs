@@ -22,7 +22,7 @@ use bcode_command::CommandInfo;
 use bcode_ipc::Event;
 use bcode_model::ReasoningEffort;
 use bcode_session_models::{
-    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionSummary,
+    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionSummary, SessionTokenUsage,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
@@ -575,6 +575,7 @@ async fn run_chat(
     });
 
     let status = client.server_status().await.ok();
+    let model_status = client.session_model_status(session_id).await.ok();
     let mut terminal = TerminalGuard::enter()?;
     let mut app = ChatApp::new(session_id, &history, &keymap);
     if let Some(status) = status {
@@ -582,10 +583,18 @@ async fn run_chat(
         app.selected_model_id = status.selected_model_id;
         // thinking loaded via events or future status extension
     }
+    if let Some(model_status) = model_status {
+        app.apply_model_status(model_status);
+    }
 
     loop {
         while let Ok(event) = event_receiver.try_recv() {
             app.push_event(event);
+        }
+        if app.take_model_status_refresh_needed()
+            && let Ok(model_status) = client.session_model_status(session_id).await
+        {
+            app.apply_model_status(model_status);
         }
 
         terminal.draw_frame(|frame| render_chat_frame(frame, &app))?;
@@ -1126,6 +1135,8 @@ struct ChatApp {
     pending_permissions: BTreeMap<String, PendingPermissionView>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
+    token_usage: TokenUsageMeter,
+    model_status_refresh_needed: bool,
     current_agent_id: String,
     current_thinking_level: Option<ReasoningEffort>,
     activity: ActivityState,
@@ -1143,6 +1154,56 @@ struct ChatApp {
     permission_hints: String,
     selected_permission_choice: PermissionChoice,
     command_palette: Option<CommandPaletteState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TokenUsageMeter {
+    session_tokens: u64,
+    latest_context_input_tokens: Option<u32>,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+impl TokenUsageMeter {
+    fn absorb(&mut self, usage: &SessionTokenUsage) {
+        if let Some(tokens) = usage.metered_total_tokens() {
+            self.session_tokens = self.session_tokens.saturating_add(u64::from(tokens));
+        }
+        if let Some(input_tokens) = usage.context_input_tokens() {
+            self.latest_context_input_tokens = Some(input_tokens);
+        }
+    }
+
+    fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
+        if let Some(model) = model {
+            self.context_window = model.context_window;
+            self.max_output_tokens = model.max_output_tokens;
+        }
+    }
+
+    fn footer_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let (Some(input), Some(window)) = (self.latest_context_input_tokens, self.context_window)
+            && window > 0
+        {
+            parts.push(format!(
+                "ctx {}/{} {}%",
+                compact_u64(u64::from(input)),
+                compact_u64(u64::from(window)),
+                context_window_percentage(input, window)
+            ));
+        } else if self.latest_context_input_tokens.is_some() || self.context_window.is_some() {
+            parts.push("ctx window unknown".to_string());
+        }
+        if self.session_tokens > 0 {
+            parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1334,6 +1395,8 @@ impl ChatApp {
             pending_permissions: BTreeMap::new(),
             selected_provider_plugin_id: None,
             selected_model_id: None,
+            token_usage: TokenUsageMeter::default(),
+            model_status_refresh_needed: false,
             current_agent_id: "build".to_string(),
             current_thinking_level: None,
             activity: ActivityState::Idle,
@@ -1368,6 +1431,23 @@ impl ChatApp {
                 self.absorb_session_event(&event);
             }
         }
+    }
+
+    fn apply_model_status(&mut self, status: bcode_ipc::SessionModelStatus) {
+        if status.provider_plugin_id.is_some() {
+            self.selected_provider_plugin_id = status.provider_plugin_id;
+        }
+        if status.model_id.is_some() {
+            self.selected_model_id = status.model_id;
+        }
+        self.token_usage.apply_model_info(status.model.as_ref());
+        self.model_status_refresh_needed = false;
+    }
+
+    fn take_model_status_refresh_needed(&mut self) -> bool {
+        let needed = self.model_status_refresh_needed;
+        self.model_status_refresh_needed = false;
+        needed
     }
 
     fn set_activity(&mut self, activity: ActivityState) {
@@ -1433,7 +1513,8 @@ impl ChatApp {
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ModelChanged { .. }
             | SessionEventKind::AgentChanged { .. }
-            | SessionEventKind::SystemMessage { .. } => {}
+            | SessionEventKind::SystemMessage { .. }
+            | SessionEventKind::ModelUsage { .. } => {}
         }
     }
 
@@ -1649,6 +1730,12 @@ impl ChatApp {
             SessionEventKind::ModelChanged { provider, model } => {
                 self.selected_provider_plugin_id = provider_to_display_selection(provider);
                 self.selected_model_id = model_to_display_selection(model);
+                self.token_usage.context_window = None;
+                self.token_usage.max_output_tokens = None;
+                self.model_status_refresh_needed = true;
+            }
+            SessionEventKind::ModelUsage { usage, .. } => {
+                self.token_usage.absorb(usage);
             }
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent_id.clone_from(agent_id);
@@ -2173,6 +2260,9 @@ fn render_chat_status(
             muted_style(),
         ));
     }
+    if let Some(summary) = app.token_usage.footer_summary() {
+        spans.push(Span::styled(format!("  ·  {summary}"), muted_style()));
+    }
     spans.push(Span::styled("  ·  ", muted_style()));
     spans.extend(key_hint_spans(&app.key_hints));
     Paragraph::new(Line::from(spans)).render(area, buf);
@@ -2216,6 +2306,10 @@ fn activity_label(activity: &ActivityState) -> String {
 }
 
 fn compact_count(value: usize) -> String {
+    compact_u64(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
+fn compact_u64(value: u64) -> String {
     if value >= 1_000_000 {
         let whole = value / 1_000_000;
         let decimal = (value % 1_000_000) / 100_000;
@@ -2227,6 +2321,12 @@ fn compact_count(value: usize) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
+    let numerator = u64::from(input_tokens).saturating_mul(100);
+    let denominator = u64::from(context_window).max(1);
+    u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -3125,9 +3225,10 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         SessionEventKind::SessionCreated { name } => vec![TranscriptBlock::Meta {
             text: format!("session started: {}", name.as_deref().unwrap_or("untitled")),
         }],
-        SessionEventKind::ClientAttached { .. } | SessionEventKind::ClientDetached { .. } => {
-            Vec::new()
-        }
+        SessionEventKind::ClientAttached { .. }
+        | SessionEventKind::ClientDetached { .. }
+        | SessionEventKind::ModelTurnStarted { .. }
+        | SessionEventKind::ModelUsage { .. } => Vec::new(),
         SessionEventKind::UserMessage { text, .. } => {
             vec![TranscriptBlock::User { text: text.clone() }]
         }
@@ -3182,7 +3283,6 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         SessionEventKind::SystemMessage { text } => {
             vec![TranscriptBlock::System { text: text.clone() }]
         }
-        SessionEventKind::ModelTurnStarted { .. } => Vec::new(),
         SessionEventKind::ModelTurnFinished {
             outcome, message, ..
         } => {
@@ -3628,6 +3728,43 @@ mod tests {
         let rendered = buffer_rows(&buffer).join("\n");
 
         assert!(rendered.contains("thinking"));
+    }
+
+    #[test]
+    fn token_usage_history_aggregates_session_spend_and_context_pressure() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let history = vec![session_event(
+            session_id,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_string(),
+                usage: SessionTokenUsage {
+                    input_tokens: Some(2_000),
+                    output_tokens: Some(500),
+                    total_tokens: Some(2_500),
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+        )];
+        let mut app = ChatApp::new(session_id, &history, &keymap);
+        app.apply_model_status(bcode_ipc::SessionModelStatus {
+            provider_plugin_id: Some("provider".to_string()),
+            model_id: Some("model".to_string()),
+            model: Some(bcode_model::ModelInfo {
+                model_id: "model".to_string(),
+                display_name: "Model".to_string(),
+                is_default: true,
+                context_window: Some(8_000),
+                max_output_tokens: Some(1_000),
+                capabilities: std::collections::BTreeSet::new(),
+            }),
+        });
+
+        assert_eq!(
+            app.token_usage.footer_summary(),
+            Some("ctx 2.0k/8.0k 25% · spent 2.5k tok".to_string())
+        );
     }
 
     #[test]

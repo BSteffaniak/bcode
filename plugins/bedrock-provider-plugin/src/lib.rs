@@ -381,6 +381,7 @@ impl StreamAccumulator {
                             cached_input_tokens: usage
                                 .cache_read_input_tokens()
                                 .and_then(nonnegative_i32_to_u32),
+                            ..TokenUsage::default()
                         },
                     });
                 }
