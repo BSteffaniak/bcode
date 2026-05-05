@@ -16,6 +16,14 @@ use thiserror::Error;
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 
 const DEFAULT_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
+const DEFAULT_FILESYSTEM_PLUGIN_ID: &str = "bcode.filesystem";
+const DEFAULT_SHELL_PLUGIN_ID: &str = "bcode.shell";
+const DEFAULT_MODEL_PROVIDER_PLUGIN_ID: &str = "bcode.openai-compatible";
+const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
+    DEFAULT_FILESYSTEM_PLUGIN_ID,
+    DEFAULT_SHELL_PLUGIN_ID,
+    DEFAULT_AGENT_PROFILE_PLUGIN_ID,
+];
 
 struct ProviderEnvironmentSpec {
     plugin_id: &'static str,
@@ -530,32 +538,30 @@ impl From<&PluginConfig> for PluginSelection {
 impl From<&BcodeConfig> for PluginSelection {
     fn from(value: &BcodeConfig) -> Self {
         let mut selection = Self::from(&value.plugins);
+        let had_explicit_enabled_plugins = !selection.enabled.is_empty();
         let env_provider = provider_plugin_id_from_environment();
-        let provider = env_provider.clone().unwrap_or_else(|| {
-            value
-                .resolved_model_selection()
-                .provider_plugin_id
-                .unwrap_or_else(|| "bcode.openai-compatible".to_string())
-        });
-        if selection.enabled.is_empty() {
-            for plugin_id in [
-                "bcode.filesystem",
-                "bcode.shell",
-                DEFAULT_AGENT_PROFILE_PLUGIN_ID,
-                provider.as_str(),
-            ] {
-                enable_plugin_unless_disabled(&mut selection, plugin_id);
-            }
-        } else {
-            enable_plugin_unless_disabled(&mut selection, DEFAULT_AGENT_PROFILE_PLUGIN_ID);
-            if let Some(env_provider) = env_provider
-                && !selection.disabled.contains(&env_provider)
-            {
-                selection.enabled.insert(env_provider.clone());
-                remove_other_model_providers(&mut selection.enabled, &env_provider);
-            }
+        let resolved_provider = value.resolved_model_selection().provider_plugin_id;
+        let provider = env_provider
+            .clone()
+            .or_else(|| resolved_provider.clone())
+            .unwrap_or_else(|| DEFAULT_MODEL_PROVIDER_PLUGIN_ID.to_string());
+
+        enable_default_core_plugins(&mut selection);
+        if !had_explicit_enabled_plugins {
+            enable_plugin_unless_disabled(&mut selection, &provider);
+        } else if let Some(env_provider) = env_provider {
+            enable_plugin_unless_disabled(&mut selection, &env_provider);
+            remove_other_model_providers(&mut selection.enabled, &env_provider);
+        } else if let Some(resolved_provider) = resolved_provider {
+            enable_plugin_unless_disabled(&mut selection, &resolved_provider);
         }
         selection
+    }
+}
+
+fn enable_default_core_plugins(selection: &mut PluginSelection) {
+    for plugin_id in DEFAULT_CORE_PLUGIN_IDS {
+        enable_plugin_unless_disabled(selection, plugin_id);
     }
 }
 
@@ -1339,9 +1345,10 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, DEFAULT_AGENT_PROFILE_PLUGIN_ID, PluginSelection,
-        default_permissions_state_path, load_config_from_paths, load_permissions_state_from,
-        merge_agent_configs, upsert_agent_permission_rule,
+        BcodeConfig, DEFAULT_AGENT_PROFILE_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID,
+        DEFAULT_SHELL_PLUGIN_ID, PluginSelection, default_permissions_state_path,
+        load_config_from_paths, load_permissions_state_from, merge_agent_configs,
+        upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::{Action, AgentConfig, PermissionConfig};
     use std::collections::BTreeMap;
@@ -1349,6 +1356,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn assert_default_core_plugins_enabled(plugin_selection: &PluginSelection) {
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
+        );
+        assert!(plugin_selection.enabled.contains(DEFAULT_SHELL_PLUGIN_ID));
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+        );
+    }
 
     #[test]
     fn merges_plugin_selection_from_existing_files() {
@@ -1572,40 +1593,32 @@ max_tool_rounds = 3
     }
 
     #[test]
-    fn default_plugin_selection_includes_default_agent_profiles() {
+    fn default_plugin_selection_includes_default_core_plugins() {
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let previous_env = clear_provider_env();
         let config = BcodeConfig::default();
         let plugin_selection = PluginSelection::from(&config);
 
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
-        );
+        assert_default_core_plugins_enabled(&plugin_selection);
 
         restore_provider_env(previous_env);
     }
 
     #[test]
-    fn explicit_plugin_selection_still_includes_default_agent_profiles() {
+    fn explicit_plugin_selection_still_includes_default_core_plugins() {
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let previous_env = clear_provider_env();
         let config: BcodeConfig = toml::from_str(
             r#"
 [plugins]
-enabled = ["bcode.bedrock"]
+enabled = ["bcode.openai-compatible"]
 "#,
         )
         .expect("config should parse");
         let plugin_selection = PluginSelection::from(&config);
 
-        assert!(plugin_selection.enabled.contains("bcode.bedrock"));
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
-        );
+        assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
+        assert_default_core_plugins_enabled(&plugin_selection);
 
         restore_provider_env(previous_env);
     }
@@ -1628,6 +1641,41 @@ disabled = ["bcode.default-agents"]
                 .enabled
                 .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
         );
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
+        );
+        assert!(plugin_selection.enabled.contains(DEFAULT_SHELL_PLUGIN_ID));
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn default_tool_plugins_can_be_disabled() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+enabled = ["bcode.openai-compatible"]
+disabled = ["bcode.shell"]
+"#,
+        )
+        .expect("config should parse");
+        let plugin_selection = PluginSelection::from(&config);
+
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
+        );
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+        );
+        assert!(!plugin_selection.enabled.contains(DEFAULT_SHELL_PLUGIN_ID));
 
         restore_provider_env(previous_env);
     }
@@ -1660,11 +1708,7 @@ model_id = "gpt-4.1-mini"
 
         let plugin_selection = PluginSelection::from(&config);
         assert!(plugin_selection.enabled.contains("bcode.bedrock"));
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
-        );
+        assert_default_core_plugins_enabled(&plugin_selection);
         assert!(!plugin_selection.enabled.contains("bcode.openai-compatible"));
 
         restore_provider_env(previous_env);
@@ -1698,11 +1742,7 @@ model_id = "anthropic.claude-test"
 
         let plugin_selection = PluginSelection::from(&config);
         assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
-        );
+        assert_default_core_plugins_enabled(&plugin_selection);
         assert!(!plugin_selection.enabled.contains("bcode.bedrock"));
 
         restore_provider_env(previous_env);
