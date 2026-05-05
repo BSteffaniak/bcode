@@ -1662,7 +1662,10 @@ impl ChatApp {
 
     fn cursor_position(&self, area: Rect) -> Option<Position> {
         match self.current_scope() {
-            TuiScope::Chat => composer_cursor_position(area, &self.input, self.search_mode),
+            TuiScope::Chat => {
+                let chunks = chat_layout(area, &self.input, self.search_mode);
+                composer_layout(chunks[2], &self.input, self.search_mode).cursor_position
+            }
             TuiScope::CommandPalette => self
                 .command_palette
                 .as_ref()
@@ -1914,19 +1917,18 @@ impl ratatui::widgets::Widget for &ChatApp {
         } else {
             " Message "
         };
-        let input = Paragraph::new(composer_text(&self.input, self.search_mode))
-            .block(
-                Block::new()
-                    .title(input_title)
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(if self.search_mode {
-                        accent_style()
-                    } else {
-                        border_style()
-                    }),
-            )
-            .wrap(Wrap { trim: false });
+        let composer = composer_layout(chunks[2], &self.input, self.search_mode);
+        let input = Paragraph::new(composer.text).block(
+            Block::new()
+                .title(input_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(if self.search_mode {
+                    accent_style()
+                } else {
+                    border_style()
+                }),
+        );
         input.render(chunks[2], buf);
 
         let tick = self.render_tick.get().wrapping_add(1);
@@ -2295,6 +2297,11 @@ fn permission_choice_span(choice: PermissionChoice, selected: PermissionChoice) 
     }
 }
 
+struct ComposerLayout {
+    text: Text<'static>,
+    cursor_position: Option<Position>,
+}
+
 fn composer_height(
     input: &str,
     search_mode: bool,
@@ -2304,80 +2311,123 @@ fn composer_height(
     if search_mode {
         return 3.min(terminal_height.max(1));
     }
-    composer_visual_rows(input, content_width)
+    usize_to_u16_saturating(wrapped_composer_lines(input, content_width).len())
         .min(MAX_COMPOSER_ROWS)
         .saturating_add(2)
         .min(terminal_height.saturating_sub(2).max(3))
 }
 
-fn composer_visual_rows(input: &str, content_width: u16) -> u16 {
+fn composer_layout(area: Rect, input: &str, search_mode: bool) -> ComposerLayout {
+    let content_area = inset(area, 1, 1);
+    if content_area.width == 0 || content_area.height == 0 {
+        return ComposerLayout {
+            text: Text::default(),
+            cursor_position: None,
+        };
+    }
+
+    let visible_row_count = usize::from(content_area.height);
+    let wrapped_lines = wrapped_composer_lines(input, content_area.width);
+    let cursor_row = wrapped_lines.len().saturating_sub(1);
+    let scroll = cursor_row
+        .saturating_add(1)
+        .saturating_sub(visible_row_count);
+    let cursor_line = wrapped_lines
+        .get(cursor_row)
+        .map_or(String::new(), Clone::clone);
+    let cursor_column =
+        usize_to_u16_saturating(line_width(&cursor_line)).min(content_area.width.saturating_sub(1));
+    let visible_lines = if input.is_empty() {
+        vec![Line::from(vec![Span::styled(
+            composer_placeholder(search_mode),
+            muted_style(),
+        )])]
+    } else {
+        wrapped_lines
+            .iter()
+            .skip(scroll)
+            .take(visible_row_count)
+            .map(|line| Line::from(vec![Span::styled(line.clone(), normal_style())]))
+            .collect::<Vec<_>>()
+    };
+
+    ComposerLayout {
+        text: Text::from(visible_lines),
+        cursor_position: Some(Position::new(
+            content_area.x + cursor_column,
+            content_area.y + usize_to_u16_saturating(cursor_row.saturating_sub(scroll)),
+        )),
+    }
+}
+
+fn composer_placeholder(search_mode: bool) -> &'static str {
+    if search_mode {
+        "Search transcript…"
+    } else {
+        "Ask Bcode…"
+    }
+}
+
+fn wrapped_composer_lines(input: &str, content_width: u16) -> Vec<String> {
     if input.is_empty() {
-        return 1;
+        return vec![String::new()];
     }
-    input
-        .split('\n')
-        .map(|line| visual_rows_for_width(line_width(line), content_width))
-        .fold(0_u16, u16::saturating_add)
-        .max(1)
+    let mut wrapped = Vec::new();
+    let mut logical_lines = input.split('\n').peekable();
+    while let Some(line) = logical_lines.next() {
+        push_wrapped_composer_line(
+            &mut wrapped,
+            line,
+            content_width,
+            logical_lines.peek().is_none(),
+        );
+    }
+    wrapped
 }
 
-fn visual_rows_for_width(visual_width: usize, content_width: u16) -> u16 {
+fn push_wrapped_composer_line(
+    wrapped: &mut Vec<String>,
+    line: &str,
+    content_width: u16,
+    include_trailing_cursor_line: bool,
+) {
     let content_width = usize::from(content_width.max(1));
-    let rows = visual_width.div_ceil(content_width).max(1);
-    u16::try_from(rows).unwrap_or(u16::MAX)
-}
-
-fn composer_cursor_position(area: Rect, input: &str, search_mode: bool) -> Option<Position> {
-    let chunks = chat_layout(area, input, search_mode);
-    let content = inset(chunks[2], 1, 1);
-    cursor_position_in_wrapped_text(content, input)
-}
-
-fn cursor_position_in_wrapped_text(area: Rect, text: &str) -> Option<Position> {
-    if area.width == 0 || area.height == 0 {
-        return None;
+    if line.is_empty() {
+        wrapped.push(String::new());
+        return;
     }
-    let mut row = 0_u16;
-    let mut lines = text.split('\n').peekable();
-    while let Some(line) = lines.next() {
-        if lines.peek().is_none() {
-            let line_width = line_width(line);
-            row = row.saturating_add(usize_to_u16_saturating(
-                line_width / usize::from(area.width.max(1)),
-            ));
-            let column = usize_to_u16_saturating(line_width % usize::from(area.width.max(1)));
-            return Some(Position::new(
-                area.x + column.min(area.width.saturating_sub(1)),
-                area.y + row.min(area.height.saturating_sub(1)),
-            ));
+
+    let mut current = String::new();
+    let mut current_width = 0_usize;
+    for character in line.chars() {
+        let width = character_width(character);
+        if width > 0 && current_width > 0 && current_width.saturating_add(width) > content_width {
+            wrapped.push(std::mem::take(&mut current));
+            current_width = 0;
         }
-        row = row.saturating_add(visual_rows_for_width(line_width(line), area.width));
+        current.push(character);
+        current_width = current_width.saturating_add(width);
+        if current_width >= content_width {
+            wrapped.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
     }
-    Some(Position::new(area.x, area.y))
+
+    if current.is_empty() {
+        if include_trailing_cursor_line {
+            wrapped.push(String::new());
+        }
+    } else {
+        wrapped.push(current);
+    }
+}
+
+fn character_width(character: char) -> usize {
+    Line::from(character.to_string()).width()
 }
 
 fn line_width(line: &str) -> usize {
     Line::from(line.to_string()).width()
-}
-
-fn composer_text(input: &str, search_mode: bool) -> Text<'static> {
-    if input.is_empty() {
-        let placeholder = if search_mode {
-            "Search transcript…"
-        } else {
-            "Ask Bcode…"
-        };
-        return Text::from(vec![Line::from(vec![Span::styled(
-            placeholder,
-            muted_style(),
-        )])]);
-    }
-    Text::from(
-        input
-            .split('\n')
-            .map(|line| Line::from(vec![Span::styled(line.to_string(), normal_style())]))
-            .collect::<Vec<_>>(),
-    )
 }
 
 fn push_label_value(spans: &mut Vec<Span<'static>>, label: &str, value: &str, value_style: Style) {
@@ -3408,6 +3458,34 @@ mod tests {
             app.cursor_position(Rect::new(0, 0, 80, 20)),
             Some(Position::new(4, 17))
         );
+    }
+
+    #[test]
+    fn composer_cursor_moves_to_blank_row_at_exact_wrap_boundary() {
+        let layout = composer_layout(Rect::new(0, 0, 12, 4), "abcdefghij", false);
+        let lines = layout
+            .text
+            .lines
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["abcdefghij", ""]);
+        assert_eq!(layout.cursor_position, Some(Position::new(1, 2)));
+    }
+
+    #[test]
+    fn composer_layout_scrolls_to_keep_cursor_visible() {
+        let layout = composer_layout(Rect::new(0, 0, 8, 5), "one\ntwo\nthree\nfour", false);
+        let lines = layout
+            .text
+            .lines
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["two", "three", "four"]);
+        assert_eq!(layout.cursor_position, Some(Position::new(5, 3)));
     }
 
     #[test]
