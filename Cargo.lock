@@ -904,7 +904,6 @@ name = "bcode_session_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
- "serde_json",
  "uuid",
 ]
 

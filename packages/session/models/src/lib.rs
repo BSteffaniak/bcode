@@ -5,6 +5,7 @@
 //! Shared session models for bcode.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -193,7 +194,7 @@ pub enum SessionTracePayload {
         prompt_cache_mode: String,
         conversation_reuse_mode: String,
         uses_previous_provider_response: bool,
-        metadata: serde_json::Value,
+        metadata: BTreeMap<String, String>,
         request: Option<TraceBlobRef>,
     },
     ProviderRound {

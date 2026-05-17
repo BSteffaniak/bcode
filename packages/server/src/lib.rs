@@ -2537,7 +2537,7 @@ async fn append_model_request_trace(
                 .conversation_reuse
                 .previous_provider_response_id
                 .is_some(),
-            metadata: serde_json::to_value(&request.metadata).unwrap_or(serde_json::Value::Null),
+            metadata: request.metadata.clone(),
             request: request_blob,
         },
     )
