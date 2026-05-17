@@ -7,7 +7,7 @@
 - `host` string, default `"127.0.0.1"`
 - `port` integer, default `8080`
 - `api_key_env` optional string; enables local API key auth from this environment variable
-- `max_request_body_bytes` integer, default `1048576`
+- `max_request_body_bytes` integer, default `67108864`; set to `0` or `null` to disable the brouter request body limit. This guards buffered JSON parsing memory use and is separate from model context limits.
 - `cors_allowed_origins` array of strings; use `["*"]` for permissive local-browser access
 
 ## `[router]`

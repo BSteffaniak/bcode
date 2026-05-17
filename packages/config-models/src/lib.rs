@@ -32,8 +32,11 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
-    #[serde(default = "default_max_request_body_bytes")]
-    pub max_request_body_bytes: usize,
+    #[serde(
+        default = "default_max_request_body_bytes",
+        deserialize_with = "deserialize_max_request_body_bytes"
+    )]
+    pub max_request_body_bytes: Option<usize>,
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
 }
@@ -66,8 +69,16 @@ const fn default_port() -> u16 {
     8080
 }
 
-const fn default_max_request_body_bytes() -> usize {
-    1_048_576
+#[allow(clippy::unnecessary_wraps)]
+const fn default_max_request_body_bytes() -> Option<usize> {
+    Some(67_108_864)
+}
+
+fn deserialize_max_request_body_bytes<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer).map(|limit| limit.filter(|limit| *limit != 0))
 }
 
 /// Router behavior configuration.

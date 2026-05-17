@@ -14,8 +14,8 @@ use std::time::Instant;
 use futures_util::{StreamExt, stream};
 use tokio::sync::Mutex as AsyncMutex;
 
-use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::body::{Body, to_bytes};
+use axum::extract::{FromRef, FromRequest, Path as AxumPath, Query, Request as AxumRequest, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -49,6 +49,7 @@ use brouter_router_models::{
 };
 use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
 use brouter_telemetry_models::{RoutingEvent, RoutingEventKind, SessionSummary, UsageEvent};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower_http::cors::{Any, CorsLayer};
@@ -268,7 +269,6 @@ fn build_app_with_api_key_and_introspection(
             post(refresh_introspection),
         )
         .route("/v1/brouter/status", get(status))
-        .layer(DefaultBodyLimit::max(config.server.max_request_body_bytes))
         .with_state(state);
     apply_cors(app, &config.server.cors_allowed_origins)
 }
@@ -754,11 +754,11 @@ async fn models(
 async fn route_explain(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    request: LimitedJson<ChatCompletionRequest>,
 ) -> Result<Json<RoutingDecision>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
     let request_id = next_request_id();
-    let decision = route_request(&state, &headers, &request, &request_id).await?;
+    let decision = route_request(&state, &headers, &request.0, &request_id).await?;
     Ok(Json(decision))
 }
 
@@ -933,12 +933,13 @@ async fn metrics(
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    request: LimitedJson<ChatCompletionRequest>,
 ) -> Response {
     if let Err(error) = authorize(&state, &headers) {
         return error.into_response();
     }
 
+    let request = request.0;
     let request_id = next_request_id();
     let decision = match route_request(&state, &headers, &request, &request_id).await {
         Ok(decision) => decision,
@@ -998,12 +999,13 @@ fn reasoning_effort_from_name(value: &str) -> Option<ReasoningEffort> {
 async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<EmbeddingsRequest>,
+    request: LimitedJson<EmbeddingsRequest>,
 ) -> Response {
     if let Err(error) = authorize(&state, &headers) {
         return error.into_response();
     }
 
+    let request = request.0;
     let model = match embedding_model(&state, &request) {
         Ok(model) => model,
         Err(error) => return error.into_response(),
@@ -2475,6 +2477,56 @@ fn telemetry_error_response(error: &TelemetryError) -> (StatusCode, Json<ErrorRe
     )
 }
 
+fn server_body_limit_message(limit: usize) -> String {
+    format!(
+        "request body exceeded brouter server.max_request_body_bytes limit of {limit} bytes; \
+         increase the limit or set it to null for long sessions"
+    )
+}
+
+struct LimitedJson<T>(T);
+
+impl<S, T> FromRequest<S> for LimitedJson<T>
+where
+    AppState: axum::extract::FromRef<S>,
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request(req: AxumRequest, state: &S) -> Result<Self, Self::Rejection> {
+        let app_state = AppState::from_ref(state);
+        let limit = app_state.config.server.max_request_body_bytes;
+        let bytes = match limit {
+            Some(limit) => to_bytes(req.into_body(), limit).await.map_err(|_| {
+                error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    server_body_limit_message(limit),
+                    "request_body_too_large",
+                )
+            })?,
+            None => to_bytes(req.into_body(), usize::MAX)
+                .await
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("failed to read request body: {error}"),
+                        "invalid_request_error",
+                    )
+                })?,
+        };
+        serde_json::from_slice::<T>(&bytes)
+            .map(Self)
+            .map_err(|error| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to parse JSON request body: {error}"),
+                    "invalid_request_error",
+                )
+            })
+    }
+}
+
 fn error_response(
     status: StatusCode,
     message: impl Into<String>,
@@ -3717,6 +3769,43 @@ mod tests {
                 .to_string(),
             ))
             .expect("chat request should build")
+    }
+
+    #[tokio::test]
+    async fn oversized_chat_request_returns_openai_compatible_json_error() {
+        let upstream = spawn_echo_upstream().await;
+        let mut config = single_provider_config(upstream);
+        config.server.max_request_body_bytes = Some(128);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .oneshot(chat_request(&"x".repeat(512), false))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "request_body_too_large");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("server.max_request_body_bytes"))
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_body_limit_allows_large_chat_request() {
+        let upstream = spawn_echo_upstream().await;
+        let mut config = single_provider_config(upstream);
+        config.server.max_request_body_bytes = None;
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .oneshot(chat_request(&"x".repeat(2048), false))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn single_provider_config(base_url: String) -> BrouterConfig {

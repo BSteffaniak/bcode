@@ -3,7 +3,7 @@ host = "127.0.0.1"
 port = 8080
 # Optional local server auth. Requests must send Authorization: Bearer $BROUTER_API_KEY.
 # api_key_env = "BROUTER_API_KEY"
-max_request_body_bytes = 1048576
+max_request_body_bytes = 67108864 # Set to 0 or null to disable the brouter body limit.
 # cors_allowed_origins = ["http://localhost:3000"]
 
 [router]

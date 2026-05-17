@@ -6,6 +6,7 @@
 //! Configuration via environment variables:
 //! - `PROXY_PORT` - Port to listen on (default: 8581)
 //! - `PROXY_BACKEND` - Backend URL to forward to (e.g., `http://127.0.0.1:8582`)
+//! - `PROXY_MAX_REQUEST_BODY_BYTES` - Request body limit (default: 67108864; `0` disables)
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
@@ -34,6 +35,9 @@ const DEFAULT_BACKEND: &str = "http://127.0.0.1:8582";
 
 /// Default brouter backend port used by `up`.
 const DEFAULT_BACKEND_PORT: u16 = 8582;
+
+/// Default request body limit for the proxy. Set `PROXY_MAX_REQUEST_BODY_BYTES=0` for unlimited.
+const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 67_108_864;
 
 #[derive(Debug, Parser)]
 #[command(name = "brouter-proxy", version)]
@@ -75,6 +79,7 @@ enum ProxyCommand {
 struct ProxyOptions {
     port: u16,
     backend_url: String,
+    max_request_body_bytes: Option<usize>,
 }
 
 impl ProxyOptions {
@@ -85,7 +90,12 @@ impl ProxyOptions {
             .unwrap_or(DEFAULT_PORT);
         let backend_url =
             std::env::var("PROXY_BACKEND").unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
-        Self { port, backend_url }
+        let max_request_body_bytes = proxy_max_request_body_bytes();
+        Self {
+            port,
+            backend_url,
+            max_request_body_bytes,
+        }
     }
 
     fn with_overrides(port: Option<u16>, backend_url: Option<String>) -> Self {
@@ -100,18 +110,33 @@ impl ProxyOptions {
     }
 }
 
+fn proxy_max_request_body_bytes() -> Option<usize> {
+    std::env::var("PROXY_MAX_REQUEST_BODY_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(Some(DEFAULT_MAX_REQUEST_BODY_BYTES), |limit| {
+            (limit != 0).then_some(limit)
+        })
+}
+
 #[derive(Clone)]
 struct ProxyState {
     backend_url: String,
+    max_request_body_bytes: Option<usize>,
     client: reqwest::Client,
 }
 
 impl ProxyState {
-    fn new(backend_url: String) -> Self {
-        info!(backend_url = %backend_url, "proxy configuration");
+    fn new(backend_url: String, max_request_body_bytes: Option<usize>) -> Self {
+        info!(
+            backend_url = %backend_url,
+            max_request_body_bytes = ?max_request_body_bytes,
+            "proxy configuration"
+        );
 
         Self {
             backend_url,
+            max_request_body_bytes,
             client: reqwest::Client::builder()
                 .build()
                 .expect("failed to create HTTP client"),
@@ -180,13 +205,31 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
     );
 
     // Convert the request body to bytes
-    let body_bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+    let body_limit = state.max_request_body_bytes.unwrap_or(usize::MAX);
+    let body_bytes = match axum::body::to_bytes(request.into_body(), body_limit).await {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(request_id = %request_id, error = %e, "failed to read request body");
+            let (status, body) = state.max_request_body_bytes.map_or_else(
+                || {
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        format!("Failed to read request body: {e}"),
+                    )
+                },
+                |limit| {
+                    (
+                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "Request body exceeded brouter-proxy max request body limit of \
+                             {limit} bytes"
+                        ),
+                    )
+                },
+            );
             return Response::builder()
-                .status(http::StatusCode::BAD_REQUEST)
-                .body(Body::from("Failed to read request body"))
+                .status(status)
+                .body(Body::from(body))
                 .unwrap();
         }
     };
@@ -318,7 +361,7 @@ async fn run_proxy(
     options: ProxyOptions,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let state = ProxyState::new(options.backend_url);
+    let state = ProxyState::new(options.backend_url, options.max_request_body_bytes);
 
     info!(
         port = options.port,
@@ -364,6 +407,7 @@ async fn run_up(
     let proxy_options = ProxyOptions {
         port: proxy_port,
         backend_url: format!("http://127.0.0.1:{backend_port}"),
+        max_request_body_bytes: proxy_max_request_body_bytes(),
     };
 
     info!(
