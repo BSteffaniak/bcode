@@ -182,7 +182,7 @@ pub enum SessionTracePhase {
 
 /// Structured diagnostic payload for a [`SessionTraceEvent`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum SessionTracePayload {
     ModelRequestBuilt {
         provider: String,

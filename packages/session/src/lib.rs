@@ -866,12 +866,105 @@ fn read_frame_payload(
 #[cfg(test)]
 mod tests {
     use super::SessionManager;
-    use bcode_session_models::{ClientId, SessionEventKind};
+    use bcode_session_models::{
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionEvent, SessionEventKind,
+        SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    };
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn trace_event_round_trips_through_bmux_codec() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("conversation_hash".to_string(), "abc123".to_string());
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 0,
+            session_id: bcode_session_models::SessionId::new(),
+            kind: SessionEventKind::TraceEvent {
+                trace: Box::new(SessionTraceEvent {
+                    timestamp_ms: 1,
+                    turn_id: Some("turn-1".to_string()),
+                    phase: SessionTracePhase::ModelRequestBuilt,
+                    payload: SessionTracePayload::ModelRequestBuilt {
+                        provider: "provider".to_string(),
+                        model: "model".to_string(),
+                        agent_id: "build".to_string(),
+                        message_count: 1,
+                        tool_count: 2,
+                        system_prompt_chars: 3,
+                        prompt_cache_mode: "auto".to_string(),
+                        conversation_reuse_mode: "auto".to_string(),
+                        uses_previous_provider_response: false,
+                        metadata,
+                        request: None,
+                    },
+                }),
+            },
+        };
+
+        let bytes = bmux_codec::to_vec(&event).expect("trace event should encode");
+        let decoded: SessionEvent =
+            bmux_codec::from_bytes(&bytes).expect("trace event should decode");
+
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn all_trace_payload_variants_round_trip_through_bmux_codec() {
+        let payloads = vec![
+            SessionTracePayload::ProviderRound {
+                provider_turn_id: Some("provider-turn".to_string()),
+                provider: "provider".to_string(),
+                round: Some(1),
+                stop_reason: Some("EndTurn".to_string()),
+                duration_ms: Some(42),
+                error: None,
+            },
+            SessionTracePayload::ProviderEvent {
+                event_type: "text_delta".to_string(),
+                detail: Some("detail".to_string()),
+            },
+            SessionTracePayload::ToolInvocationStarted {
+                tool_call_id: "call".to_string(),
+                plugin_id: "plugin".to_string(),
+                tool_name: "tool".to_string(),
+                side_effect: "read_only".to_string(),
+                requires_permission: false,
+                arguments: None,
+            },
+            SessionTracePayload::ToolPolicyEvaluated {
+                tool_call_id: "call".to_string(),
+                agent_id: "build".to_string(),
+                decision: "allow".to_string(),
+                reason: None,
+            },
+            SessionTracePayload::ToolPermissionWait {
+                permission_id: "perm".to_string(),
+                tool_call_id: "call".to_string(),
+                approved: Some(true),
+                duration_ms: Some(7),
+            },
+            SessionTracePayload::ToolInvocationFinished {
+                tool_call_id: "call".to_string(),
+                duration_ms: 9,
+                is_error: false,
+                output_bytes: 12,
+                output: None,
+            },
+        ];
+
+        for payload in payloads {
+            let bytes = bmux_codec::to_vec(&payload).expect("payload should encode");
+            let decoded: SessionTracePayload =
+                bmux_codec::from_bytes(&bytes).expect("payload should decode");
+            assert_eq!(decoded, payload);
+        }
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
