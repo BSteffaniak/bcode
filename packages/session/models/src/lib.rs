@@ -150,6 +150,112 @@ impl SessionTokenUsage {
     }
 }
 
+/// Fine-grained diagnostic event persisted for session post-mortems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTraceEvent {
+    /// Milliseconds since the Unix epoch when this trace event was recorded.
+    pub timestamp_ms: u64,
+    /// Optional model turn associated with this trace event.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Diagnostic phase.
+    pub phase: SessionTracePhase,
+    /// Structured diagnostic payload.
+    pub payload: SessionTracePayload,
+}
+
+/// Diagnostic phase for a [`SessionTraceEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTracePhase {
+    ModelRequestBuilt,
+    ModelProviderRoundStarted,
+    ModelProviderRoundFinished,
+    ModelProviderEvent,
+    ToolInvocationStarted,
+    ToolPolicyEvaluated,
+    ToolPermissionWaitStarted,
+    ToolPermissionWaitFinished,
+    ToolInvocationFinished,
+}
+
+/// Structured diagnostic payload for a [`SessionTraceEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionTracePayload {
+    ModelRequestBuilt {
+        provider: String,
+        model: String,
+        agent_id: String,
+        message_count: usize,
+        tool_count: usize,
+        system_prompt_chars: usize,
+        prompt_cache_mode: String,
+        conversation_reuse_mode: String,
+        uses_previous_provider_response: bool,
+        metadata: serde_json::Value,
+        request: Option<TraceBlobRef>,
+    },
+    ProviderRound {
+        provider_turn_id: Option<String>,
+        provider: String,
+        round: Option<u32>,
+        stop_reason: Option<String>,
+        duration_ms: Option<u64>,
+        error: Option<String>,
+    },
+    ProviderEvent {
+        event_type: String,
+        detail: Option<String>,
+    },
+    ToolInvocationStarted {
+        tool_call_id: String,
+        plugin_id: String,
+        tool_name: String,
+        side_effect: String,
+        requires_permission: bool,
+        arguments: Option<TraceBlobRef>,
+    },
+    ToolPolicyEvaluated {
+        tool_call_id: String,
+        agent_id: String,
+        decision: String,
+        reason: Option<String>,
+    },
+    ToolPermissionWait {
+        permission_id: String,
+        tool_call_id: String,
+        approved: Option<bool>,
+        duration_ms: Option<u64>,
+    },
+    ToolInvocationFinished {
+        tool_call_id: String,
+        duration_ms: u64,
+        is_error: bool,
+        output_bytes: usize,
+        output: Option<TraceBlobRef>,
+    },
+}
+
+/// Reference to a trace payload stored outside the main session event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceBlobRef {
+    pub sha256: String,
+    pub path: String,
+    pub content_type: String,
+    pub byte_len: u64,
+    pub redaction: TraceRedaction,
+}
+
+/// Redaction status for a trace blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceRedaction {
+    None,
+    Automatic,
+    ManualRequired,
+}
+
 /// Session event payload.
 ///
 /// IMPORTANT: This enum is persisted with `bmux_codec`, whose binary enum
@@ -231,5 +337,8 @@ pub enum SessionEventKind {
     },
     SessionRenamed {
         name: Option<String>,
+    },
+    TraceEvent {
+        trace: Box<SessionTraceEvent>,
     },
 }

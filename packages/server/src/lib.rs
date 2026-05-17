@@ -23,7 +23,8 @@ use bcode_model::{
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{
-    ClientId, ModelTurnOutcome, SessionEventKind, SessionId, SessionTokenUsage,
+    ClientId, ModelTurnOutcome, SessionEventKind, SessionId, SessionTokenUsage, SessionTraceEvent,
+    SessionTracePayload, SessionTracePhase, TraceBlobRef, TraceRedaction,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
@@ -33,12 +34,14 @@ use bcode_tool::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -80,6 +83,8 @@ struct ServerState {
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     provider_state: Mutex<ProviderStateStore>,
+    observability: bcode_config::ObservabilityConfig,
+    trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -172,6 +177,93 @@ struct SessionModelSelection {
 }
 
 #[derive(Debug, Clone)]
+struct TraceStore {
+    root: PathBuf,
+}
+
+impl TraceStore {
+    const fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn write_json_blob(
+        &self,
+        session_id: SessionId,
+        name: &str,
+        value: &impl serde::Serialize,
+        max_bytes: usize,
+    ) -> Option<TraceBlobRef> {
+        let bytes = serde_json::to_vec_pretty(value).ok()?;
+        self.write_blob(session_id, name, "application/json", &bytes, max_bytes)
+    }
+
+    fn write_text_blob(
+        &self,
+        session_id: SessionId,
+        name: &str,
+        text: &str,
+        max_bytes: usize,
+    ) -> Option<TraceBlobRef> {
+        self.write_blob(session_id, name, "text/plain", text.as_bytes(), max_bytes)
+    }
+
+    fn write_blob(
+        &self,
+        session_id: SessionId,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Option<TraceBlobRef> {
+        use sha2::{Digest as _, Sha256};
+
+        let bytes = if bytes.len() > max_bytes {
+            &bytes[..max_bytes]
+        } else {
+            bytes
+        };
+        let hash = Sha256::digest(bytes);
+        let mut sha256 = String::with_capacity(hash.len() * 2);
+        for byte in hash {
+            write!(sha256, "{byte:02x}").expect("writing to string should not fail");
+        }
+        let extension = if content_type == "application/json" {
+            "json"
+        } else {
+            "txt"
+        };
+        let safe_name = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let relative = PathBuf::from(session_id.to_string())
+            .join("blobs")
+            .join(format!("{safe_name}-{sha256}.{extension}"));
+        let path = self.root.join(&relative);
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_err()
+        {
+            return None;
+        }
+        let mut file = fs::File::create(&path).ok()?;
+        file.write_all(bytes).ok()?;
+        Some(TraceBlobRef {
+            sha256,
+            path: relative.display().to_string(),
+            content_type: content_type.to_string(),
+            byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            redaction: TraceRedaction::Automatic,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PendingPermission {
     summary: PermissionSummary,
     decision: Arc<Mutex<Option<bool>>>,
@@ -185,6 +277,8 @@ struct ServerStateInit {
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     provider_state: ProviderStateStore,
+    observability: bcode_config::ObservabilityConfig,
+    trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
 }
 
@@ -204,6 +298,8 @@ impl ServerState {
             prompt_cache_mode: init.prompt_cache_mode,
             conversation_reuse_mode: init.conversation_reuse_mode,
             provider_state: Mutex::new(init.provider_state),
+            observability: init.observability,
+            trace_store: init.trace_store,
             max_tool_rounds: init.max_tool_rounds,
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
@@ -288,6 +384,8 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             prompt_cache_mode: config.model.prompt_cache.mode,
             conversation_reuse_mode: config.model.conversation_reuse.mode,
             provider_state: ProviderStateStore::load(default_provider_state_path()),
+            observability: config.observability,
+            trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
         },
     ));
@@ -1552,6 +1650,14 @@ async fn run_model_turn_inner(
                 return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
             }
         };
+        append_model_request_trace(
+            state,
+            session_id,
+            &request,
+            provider_plugin_id.as_deref(),
+            round,
+        )
+        .await;
         let outcome =
             match run_model_turn_round(state, session_id, provider_plugin_id.as_deref(), &request)
                 .await
@@ -1586,6 +1692,8 @@ async fn run_model_turn_round(
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
 ) -> Result<ModelPollOutcome, ModelTurnCompletion> {
+    let round_start = Instant::now();
+    let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
     let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
         state,
         provider_plugin_id.map(ToString::to_string),
@@ -1597,6 +1705,21 @@ async fn run_model_turn_round(
         Ok(start) => start,
         Err(error) => {
             let message = format!("model provider error: {error}");
+            append_trace_event(
+                state,
+                session_id,
+                Some(request.turn_id.clone()),
+                SessionTracePhase::ModelProviderRoundFinished,
+                SessionTracePayload::ProviderRound {
+                    provider_turn_id: None,
+                    provider: provider_label,
+                    round: model_round_from_turn_id(&request.turn_id),
+                    stop_reason: None,
+                    duration_ms: Some(elapsed_ms(round_start)),
+                    error: Some(message.clone()),
+                },
+            )
+            .await;
             append_system_event(state, session_id, message.clone()).await;
             return Err(ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Error,
@@ -1615,6 +1738,22 @@ async fn run_model_turn_round(
         },
     );
 
+    append_trace_event(
+        state,
+        session_id,
+        Some(request.turn_id.clone()),
+        SessionTracePhase::ModelProviderRoundStarted,
+        SessionTracePayload::ProviderRound {
+            provider_turn_id: Some(start.provider_turn_id.clone()),
+            provider: provider_label.clone(),
+            round: model_round_from_turn_id(&request.turn_id),
+            stop_reason: None,
+            duration_ms: None,
+            error: None,
+        },
+    )
+    .await;
+
     let (assistant_text, outcome) = poll_model_turn_events(
         state,
         session_id,
@@ -1632,6 +1771,16 @@ async fn run_model_turn_round(
     let finish = FinishTurnRequest {
         provider_turn_id: start.provider_turn_id,
     };
+    append_model_provider_round_finished_trace(
+        state,
+        session_id,
+        request,
+        finish.provider_turn_id.clone(),
+        provider_label,
+        round_start,
+        &outcome,
+    )
+    .await;
     let _ = invoke_model_provider_json_blocking::<_, bcode_model::AckResponse>(
         state,
         active_turn.and_then(|turn| turn.provider_plugin_id),
@@ -1640,6 +1789,35 @@ async fn run_model_turn_round(
     )
     .await;
     Ok(outcome)
+}
+
+async fn append_model_provider_round_finished_trace(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &ModelTurnRequest,
+    provider_turn_id: String,
+    provider: String,
+    round_start: Instant,
+    outcome: &ModelPollOutcome,
+) {
+    append_trace_event(
+        state,
+        session_id,
+        Some(request.turn_id.clone()),
+        SessionTracePhase::ModelProviderRoundFinished,
+        SessionTracePayload::ProviderRound {
+            provider_turn_id: Some(provider_turn_id),
+            provider,
+            round: model_round_from_turn_id(&request.turn_id),
+            stop_reason: outcome.stop_reason.map(|reason| format!("{reason:?}")),
+            duration_ms: Some(elapsed_ms(round_start)),
+            error: outcome
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.message.clone()),
+        },
+    )
+    .await;
 }
 
 async fn poll_model_turn_events(
@@ -1729,64 +1907,205 @@ async fn handle_provider_turn_event(
 ) {
     match event {
         ProviderTurnEvent::TextDelta { text } => {
+            append_provider_event_trace(state, session_id, turn_id, "text_delta", None).await;
             assistant_text.push_str(&text);
             append_assistant_delta_event(state, session_id, text).await;
         }
         ProviderTurnEvent::Error { error } => {
-            let message = format!("model error {}: {}", error.code, error.message);
-            append_system_event(state, session_id, message.clone()).await;
-            outcome.stop_reason = Some(bcode_model::StopReason::Error);
-            outcome.completion = Some(ModelTurnCompletion::with_message(
-                ModelTurnOutcome::Error,
-                message,
-            ));
+            handle_provider_error_event(state, session_id, turn_id, error, outcome).await;
         }
         ProviderTurnEvent::TurnFinished { stop_reason } => {
-            outcome.should_continue = stop_reason == bcode_model::StopReason::ToolCall;
-            outcome.stop_reason = Some(stop_reason);
-            if stop_reason == bcode_model::StopReason::Cancelled {
-                outcome.completion = Some(ModelTurnCompletion::with_message(
-                    ModelTurnOutcome::Cancelled,
-                    "model turn cancelled",
-                ));
-            } else if stop_reason == bcode_model::StopReason::Error {
-                outcome.completion = Some(ModelTurnCompletion::with_message(
-                    ModelTurnOutcome::Error,
-                    "model turn ended with error",
-                ));
-            }
+            handle_provider_turn_finished_event(state, session_id, turn_id, stop_reason, outcome)
+                .await;
         }
         ProviderTurnEvent::Cancelled => {
-            let message = "model turn cancelled".to_string();
-            append_system_event(state, session_id, message.clone()).await;
-            outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
-            outcome.completion = Some(ModelTurnCompletion::with_message(
-                ModelTurnOutcome::Cancelled,
-                message,
-            ));
+            handle_provider_cancelled_event(state, session_id, turn_id, outcome).await;
         }
         ProviderTurnEvent::ToolCallFinished { call } => {
-            if !assistant_text.is_empty() {
-                append_assistant_message_event(state, session_id, std::mem::take(assistant_text))
-                    .await;
-            }
-            execute_model_tool(state, session_id, call).await;
+            handle_provider_tool_call_finished_event(
+                state,
+                session_id,
+                turn_id,
+                call,
+                assistant_text,
+            )
+            .await;
         }
         ProviderTurnEvent::Warning { message } => {
+            append_provider_event_trace(
+                state,
+                session_id,
+                turn_id,
+                "warning",
+                Some(message.clone()),
+            )
+            .await;
             append_system_event(state, session_id, format!("model warning: {message}")).await;
         }
         ProviderTurnEvent::Usage { usage } => {
+            append_provider_event_trace(state, session_id, turn_id, "usage", None).await;
             update_provider_usage_state(state, session_id, &usage).await;
             append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
         }
         ProviderTurnEvent::ProviderMetadata { key, value } => {
-            update_provider_metadata_state(state, session_id, &key, value).await;
+            handle_provider_metadata_event(state, session_id, turn_id, key, value).await;
         }
-        ProviderTurnEvent::TurnStarted
-        | ProviderTurnEvent::ToolCallStarted { .. }
-        | ProviderTurnEvent::ReasoningDelta { .. }
-        | ProviderTurnEvent::ToolCallDelta { .. } => {}
+        ProviderTurnEvent::TurnStarted => {
+            append_provider_event_trace(state, session_id, turn_id, "turn_started", None).await;
+        }
+        ProviderTurnEvent::ToolCallStarted { call_id, name } => {
+            append_provider_event_trace(
+                state,
+                session_id,
+                turn_id,
+                "tool_call_started",
+                Some(format!("{name} ({call_id})")),
+            )
+            .await;
+        }
+        ProviderTurnEvent::ReasoningDelta { .. } => {
+            append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
+        }
+        ProviderTurnEvent::ToolCallDelta { call_id, .. } => {
+            append_provider_event_trace(
+                state,
+                session_id,
+                turn_id,
+                "tool_call_delta",
+                Some(call_id),
+            )
+            .await;
+        }
     }
+}
+
+async fn handle_provider_error_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    error: bcode_model::ProviderError,
+    outcome: &mut ModelPollOutcome,
+) {
+    let message = format!("model error {}: {}", error.code, error.message);
+    append_provider_event_trace(state, session_id, turn_id, "error", Some(message.clone())).await;
+    append_system_event(state, session_id, message.clone()).await;
+    outcome.stop_reason = Some(bcode_model::StopReason::Error);
+    outcome.completion = Some(ModelTurnCompletion::with_message(
+        ModelTurnOutcome::Error,
+        message,
+    ));
+}
+
+async fn handle_provider_turn_finished_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    stop_reason: bcode_model::StopReason,
+    outcome: &mut ModelPollOutcome,
+) {
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "turn_finished",
+        Some(format!("{stop_reason:?}")),
+    )
+    .await;
+    outcome.should_continue = stop_reason == bcode_model::StopReason::ToolCall;
+    outcome.stop_reason = Some(stop_reason);
+    if stop_reason == bcode_model::StopReason::Cancelled {
+        outcome.completion = Some(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        ));
+    } else if stop_reason == bcode_model::StopReason::Error {
+        outcome.completion = Some(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Error,
+            "model turn ended with error",
+        ));
+    }
+}
+
+async fn handle_provider_cancelled_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    outcome: &mut ModelPollOutcome,
+) {
+    let message = "model turn cancelled".to_string();
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "cancelled",
+        Some(message.clone()),
+    )
+    .await;
+    append_system_event(state, session_id, message.clone()).await;
+    outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+    outcome.completion = Some(ModelTurnCompletion::with_message(
+        ModelTurnOutcome::Cancelled,
+        message,
+    ));
+}
+
+async fn handle_provider_tool_call_finished_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    call: bcode_model::ToolCall,
+    assistant_text: &mut String,
+) {
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "tool_call_finished",
+        Some(call.name.clone()),
+    )
+    .await;
+    if !assistant_text.is_empty() {
+        append_assistant_message_event(state, session_id, std::mem::take(assistant_text)).await;
+    }
+    execute_model_tool(state, session_id, call).await;
+}
+
+async fn handle_provider_metadata_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    key: String,
+    value: String,
+) {
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "provider_metadata",
+        Some(key.clone()),
+    )
+    .await;
+    update_provider_metadata_state(state, session_id, &key, value).await;
+}
+
+async fn append_provider_event_trace(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    event_type: &str,
+    detail: Option<String>,
+) {
+    append_trace_event(
+        state,
+        session_id,
+        Some(turn_id.to_string()),
+        SessionTracePhase::ModelProviderEvent,
+        SessionTracePayload::ProviderEvent {
+            event_type: event_type.to_string(),
+            detail,
+        },
+    )
+    .await;
 }
 
 async fn update_provider_usage_state(
@@ -2172,6 +2491,64 @@ async fn build_model_turn_request(
         conversation_reuse,
         metadata,
     })
+}
+
+async fn append_model_request_trace(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &ModelTurnRequest,
+    provider_plugin_id: Option<&str>,
+    round: u32,
+) {
+    if !state.observability.enabled() {
+        return;
+    }
+    let request_blob = (state.observability.persist_model_requests
+        || state.observability.debug_enabled())
+    .then(|| {
+        state.trace_store.write_json_blob(
+            session_id,
+            &format!("model-request-round-{round}"),
+            request,
+            state.observability.max_blob_bytes,
+        )
+    })
+    .flatten();
+    append_trace_event(
+        state,
+        session_id,
+        Some(request.turn_id.clone()),
+        SessionTracePhase::ModelRequestBuilt,
+        SessionTracePayload::ModelRequestBuilt {
+            provider: provider_plugin_id.unwrap_or("<auto>").to_string(),
+            model: if request.model_id.is_empty() {
+                "<provider-default>".to_string()
+            } else {
+                request.model_id.clone()
+            },
+            agent_id: session_agent_selection(state, session_id).await,
+            message_count: request.messages.len(),
+            tool_count: request.tools.len(),
+            system_prompt_chars: request.system_prompt.as_ref().map_or(0, String::len),
+            prompt_cache_mode: prompt_cache_mode_name(request.prompt_cache.mode).to_string(),
+            conversation_reuse_mode: conversation_reuse_mode_name(request.conversation_reuse.mode)
+                .to_string(),
+            uses_previous_provider_response: request
+                .conversation_reuse
+                .previous_provider_response_id
+                .is_some(),
+            metadata: serde_json::to_value(&request.metadata).unwrap_or(serde_json::Value::Null),
+            request: request_blob,
+        },
+    )
+    .await;
+}
+
+fn model_round_from_turn_id(turn_id: &str) -> Option<u32> {
+    turn_id
+        .rsplit('-')
+        .next()
+        .and_then(|round| round.parse().ok())
 }
 
 #[derive(Debug, Clone)]
@@ -2588,12 +2965,37 @@ async fn execute_model_tool(
         serde_json::to_string(&call.arguments).unwrap_or_default(),
     )
     .await;
+    let tool_start = Instant::now();
     let result = invoke_model_tool(state, session_id, &call)
         .await
         .unwrap_or_else(|error| ToolInvocationResponse {
             output: error,
             is_error: true,
         });
+    let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
+        .then(|| {
+            state.trace_store.write_text_blob(
+                session_id,
+                &format!("tool-output-{}", call.id),
+                &result.output,
+                state.observability.max_blob_bytes,
+            )
+        })
+        .flatten();
+    append_trace_event(
+        state,
+        session_id,
+        None,
+        SessionTracePhase::ToolInvocationFinished,
+        SessionTracePayload::ToolInvocationFinished {
+            tool_call_id: call.id.clone(),
+            duration_ms: elapsed_ms(tool_start),
+            is_error: result.is_error,
+            output_bytes: result.output.len(),
+            output: output_blob,
+        },
+    )
+    .await;
     append_tool_finished_event(state, session_id, call.id, result.output, result.is_error).await;
 }
 
@@ -2605,7 +3007,46 @@ async fn invoke_model_tool(
     let (plugin_id, definition) = find_tool_provider(state, &call.name)
         .await?
         .ok_or_else(|| format!("tool not found: {}", call.name))?;
+    let argument_blob = (state.observability.persist_tool_io
+        || state.observability.debug_enabled())
+    .then(|| {
+        state.trace_store.write_json_blob(
+            session_id,
+            &format!("tool-arguments-{}", call.id),
+            &call.arguments,
+            state.observability.max_blob_bytes,
+        )
+    })
+    .flatten();
+    append_trace_event(
+        state,
+        session_id,
+        None,
+        SessionTracePhase::ToolInvocationStarted,
+        SessionTracePayload::ToolInvocationStarted {
+            tool_call_id: call.id.clone(),
+            plugin_id: plugin_id.clone(),
+            tool_name: definition.name.clone(),
+            side_effect: side_effect_name(definition.side_effect).to_string(),
+            requires_permission: definition.requires_permission,
+            arguments: argument_blob,
+        },
+    )
+    .await;
     let agent_decision = evaluate_agent_tool_policy(state, session_id, call, &definition).await;
+    append_trace_event(
+        state,
+        session_id,
+        None,
+        SessionTracePhase::ToolPolicyEvaluated,
+        SessionTracePayload::ToolPolicyEvaluated {
+            tool_call_id: call.id.clone(),
+            agent_id: session_agent_selection(state, session_id).await,
+            decision: agent_decision_name(agent_decision.decision).to_string(),
+            reason: agent_decision.reason.clone(),
+        },
+    )
+    .await;
     match agent_decision.decision {
         AgentDecision::Deny => {
             return Ok(ToolInvocationResponse {
@@ -2731,6 +3172,20 @@ async fn request_tool_permission(
         arguments_json.clone(),
     )
     .await;
+    append_trace_event(
+        state,
+        session_id,
+        None,
+        SessionTracePhase::ToolPermissionWaitStarted,
+        SessionTracePayload::ToolPermissionWait {
+            permission_id: permission_id.clone(),
+            tool_call_id: call.id.clone(),
+            approved: None,
+            duration_ms: None,
+        },
+    )
+    .await;
+    let wait_start = Instant::now();
     let pending = PendingPermission {
         summary: PermissionSummary {
             permission_id: permission_id.clone(),
@@ -2751,6 +3206,19 @@ async fn request_tool_permission(
     loop {
         let decision = *pending.decision.lock().await;
         if let Some(decision) = decision {
+            append_trace_event(
+                state,
+                session_id,
+                None,
+                SessionTracePhase::ToolPermissionWaitFinished,
+                SessionTracePayload::ToolPermissionWait {
+                    permission_id: pending.summary.permission_id.clone(),
+                    tool_call_id: pending.summary.tool_call_id.clone(),
+                    approved: Some(decision),
+                    duration_ms: Some(elapsed_ms(wait_start)),
+                },
+            )
+            .await;
             return decision;
         }
         pending.notify.notified().await;
@@ -2879,6 +3347,70 @@ fn session_event_to_model_message(
             }],
         }),
         _ => None,
+    }
+}
+
+async fn append_trace_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: Option<String>,
+    phase: SessionTracePhase,
+    payload: SessionTracePayload,
+) {
+    if !state.observability.enabled() {
+        return;
+    }
+    let trace = SessionTraceEvent {
+        timestamp_ms: current_time_ms(),
+        turn_id,
+        phase,
+        payload,
+    };
+    match state.sessions.append_trace_event(session_id, trace).await {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append trace event: {error}"),
+    }
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+const fn side_effect_name(side_effect: bcode_tool::ToolSideEffect) -> &'static str {
+    match side_effect {
+        bcode_tool::ToolSideEffect::ReadOnly => "read_only",
+        bcode_tool::ToolSideEffect::WriteFiles => "write_files",
+        bcode_tool::ToolSideEffect::ExecuteProcess => "execute_process",
+    }
+}
+
+const fn agent_decision_name(decision: AgentDecision) -> &'static str {
+    match decision {
+        AgentDecision::Allow => "allow",
+        AgentDecision::Ask => "ask",
+        AgentDecision::Deny => "deny",
+    }
+}
+
+const fn prompt_cache_mode_name(mode: bcode_model::PromptCacheMode) -> &'static str {
+    match mode {
+        bcode_model::PromptCacheMode::Off => "off",
+        bcode_model::PromptCacheMode::Auto => "auto",
+        bcode_model::PromptCacheMode::Aggressive => "aggressive",
+    }
+}
+
+const fn conversation_reuse_mode_name(mode: bcode_model::ConversationReuseMode) -> &'static str {
+    match mode {
+        bcode_model::ConversationReuseMode::Off => "off",
+        bcode_model::ConversationReuseMode::Auto => "auto",
     }
 }
 
@@ -3203,6 +3735,10 @@ fn default_session_store_dir() -> PathBuf {
 
 fn default_provider_state_path() -> PathBuf {
     bcode_config::default_state_dir().join("provider-state.json")
+}
+
+fn default_trace_store_dir() -> PathBuf {
+    bcode_config::default_state_dir().join("traces")
 }
 
 #[cfg(test)]

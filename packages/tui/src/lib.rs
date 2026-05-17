@@ -1892,7 +1892,8 @@ impl ChatApp {
             | SessionEventKind::AgentChanged { .. }
             | SessionEventKind::SystemMessage { .. }
             | SessionEventKind::ContextCompacted { .. }
-            | SessionEventKind::ModelUsage { .. } => {}
+            | SessionEventKind::ModelUsage { .. }
+            | SessionEventKind::TraceEvent { .. } => {}
         }
     }
 
@@ -3630,7 +3631,8 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
         | SessionEventKind::ModelTurnStarted { .. }
-        | SessionEventKind::ModelUsage { .. } => Vec::new(),
+        | SessionEventKind::ModelUsage { .. }
+        | SessionEventKind::TraceEvent { .. } => Vec::new(),
         SessionEventKind::UserMessage { text, .. } => {
             vec![TranscriptBlock::User { text: text.clone() }]
         }

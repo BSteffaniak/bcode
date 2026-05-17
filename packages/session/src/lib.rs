@@ -10,7 +10,7 @@
 
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
-    SessionEventKind, SessionId, SessionSummary, SessionTokenUsage,
+    SessionEventKind, SessionId, SessionSummary, SessionTokenUsage, SessionTraceEvent,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -621,6 +621,25 @@ impl SessionManager {
             SessionEventKind::ContextCompacted {
                 summary,
                 compacted_through_sequence,
+            },
+        )
+        .await
+    }
+
+    /// Append a diagnostic trace event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_trace_event(
+        &self,
+        session_id: SessionId,
+        trace: SessionTraceEvent,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::TraceEvent {
+                trace: Box::new(trace),
             },
         )
         .await

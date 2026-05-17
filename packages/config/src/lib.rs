@@ -108,6 +108,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
+    pub observability: ObservabilityConfig,
+    #[serde(default)]
     pub tui: TuiConfig,
 }
 
@@ -119,6 +121,7 @@ impl BcodeConfig {
             self.agent.insert(agent_id, agent_config);
         }
         self.auth.merge(next.auth);
+        self.observability.merge(next.observability);
         self.tui.merge(next.tui);
     }
 
@@ -239,6 +242,76 @@ pub fn bedrock_environment_is_configured() -> bool {
         .iter()
         .find(|spec| spec.plugin_id == "bcode.bedrock")
         .is_some_and(|spec| first_env_value_from_slice(spec.signal_env_vars).is_some())
+}
+
+/// Session observability configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    /// Trace detail level.
+    #[serde(default)]
+    pub level: ObservabilityLevel,
+    /// Persist full provider-neutral model requests as trace blobs.
+    #[serde(default)]
+    pub persist_model_requests: bool,
+    /// Persist tool arguments and outputs as trace blobs.
+    #[serde(default = "default_true")]
+    pub persist_tool_io: bool,
+    /// Maximum bytes to keep for a single trace blob.
+    #[serde(default = "default_max_trace_blob_bytes")]
+    pub max_blob_bytes: usize,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            level: ObservabilityLevel::Standard,
+            persist_model_requests: false,
+            persist_tool_io: true,
+            max_blob_bytes: default_max_trace_blob_bytes(),
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    fn merge(&mut self, next: Self) {
+        if next != Self::default() {
+            *self = next;
+        }
+    }
+
+    /// Return true when diagnostic trace events should be persisted.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        !matches!(self.level, ObservabilityLevel::Off)
+    }
+
+    /// Return true when debug-level details should be persisted.
+    #[must_use]
+    pub const fn debug_enabled(&self) -> bool {
+        matches!(
+            self.level,
+            ObservabilityLevel::Debug | ObservabilityLevel::Raw
+        )
+    }
+}
+
+/// Session observability detail level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservabilityLevel {
+    Off,
+    #[default]
+    Standard,
+    Debug,
+    Raw,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_max_trace_blob_bytes() -> usize {
+    10 * 1024 * 1024
 }
 
 /// Terminal UI configuration.
@@ -960,6 +1033,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_model_toml(&mut output, &config.model);
     write_agents_toml(&mut output, &config.agent);
     write_auth_toml(&mut output, &config.auth);
+    write_observability_toml(&mut output, &config.observability);
     write_tui_toml(&mut output, &config.tui);
     output
 }
@@ -1220,6 +1294,39 @@ const fn auth_mode_name(mode: &AuthMode) -> &'static str {
     match mode {
         AuthMode::ApiKey => "api_key",
         AuthMode::ChatGpt => "chatgpt",
+    }
+}
+
+fn write_observability_toml(output: &mut String, observability: &ObservabilityConfig) {
+    if observability == &ObservabilityConfig::default() {
+        return;
+    }
+    output.push_str("[observability]\n");
+    writeln!(
+        output,
+        "level = {}",
+        toml_string(observability_level_name(observability.level))
+    )
+    .expect("writing to string should not fail");
+    if observability.persist_model_requests {
+        output.push_str("persist_model_requests = true\n");
+    }
+    if !observability.persist_tool_io {
+        output.push_str("persist_tool_io = false\n");
+    }
+    if observability.max_blob_bytes != default_max_trace_blob_bytes() {
+        writeln!(output, "max_blob_bytes = {}", observability.max_blob_bytes)
+            .expect("writing to string should not fail");
+    }
+    output.push('\n');
+}
+
+const fn observability_level_name(level: ObservabilityLevel) -> &'static str {
+    match level {
+        ObservabilityLevel::Off => "off",
+        ObservabilityLevel::Standard => "standard",
+        ObservabilityLevel::Debug => "debug",
+        ObservabilityLevel::Raw => "raw",
     }
 }
 

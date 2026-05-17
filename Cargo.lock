@@ -883,6 +883,7 @@ dependencies = [
  "bcode_tool",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -903,6 +904,7 @@ name = "bcode_session_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
+ "serde_json",
  "uuid",
 ]
 

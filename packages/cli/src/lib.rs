@@ -10,7 +10,7 @@ use bcode_client::{BcodeClient, ClientError};
 use bcode_config::AuthMode;
 use bcode_ipc::{Event, PermissionSummary, default_endpoint};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -84,6 +84,10 @@ pub async fn run() -> Result<(), CliError> {
             SessionCommand::Rename { session_id, name } => rename_session(session_id, name).await?,
             SessionCommand::Delete { session_id } => delete_session(session_id).await?,
             SessionCommand::History { session_id } => session_history(session_id).await?,
+            SessionCommand::Export { session_id, format } => {
+                session_export(session_id, format).await?;
+            }
+            SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
         },
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
@@ -251,11 +255,33 @@ enum ServerCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    Create { name: Option<String> },
+    Create {
+        name: Option<String>,
+    },
     List,
-    Rename { session_id: SessionId, name: String },
-    Delete { session_id: SessionId },
-    History { session_id: SessionId },
+    Rename {
+        session_id: SessionId,
+        name: String,
+    },
+    Delete {
+        session_id: SessionId,
+    },
+    History {
+        session_id: SessionId,
+    },
+    Export {
+        session_id: SessionId,
+        #[arg(long, value_enum, default_value_t = SessionExportFormat::Jsonl)]
+        format: SessionExportFormat,
+    },
+    Timeline {
+        session_id: SessionId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SessionExportFormat {
+    Jsonl,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2186,6 +2212,35 @@ async fn session_history(session_id: SessionId) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn session_export(
+    session_id: SessionId,
+    format: SessionExportFormat,
+) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let history = client.session_history(session_id).await?;
+    match format {
+        SessionExportFormat::Jsonl => {
+            for event in history {
+                println!("{}", serde_json::to_string(&event)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let history = client.session_history(session_id).await?;
+    let first_trace_time = history.iter().find_map(|event| match &event.kind {
+        SessionEventKind::TraceEvent { trace } => Some(trace.timestamp_ms),
+        _ => None,
+    });
+    for event in history {
+        print_timeline_event(&event, first_trace_time);
+    }
+    Ok(())
+}
+
 async fn cancel_session_turn(session_id: SessionId) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     if client.cancel_session_turn(session_id).await? {
@@ -2274,6 +2329,13 @@ async fn send_message(session_id: SessionId, message: String) -> Result<(), CliE
 }
 
 fn print_session_event(event: &SessionEvent) {
+    match &event.kind {
+        SessionEventKind::TraceEvent { trace } => print_trace_session_event(event, trace),
+        _ => print_non_trace_session_event(event),
+    }
+}
+
+fn print_non_trace_session_event(event: &SessionEvent) {
     match &event.kind {
         SessionEventKind::SessionCreated { name } => {
             let name = name.as_deref().unwrap_or("<unnamed>");
@@ -2372,7 +2434,161 @@ fn print_session_event(event: &SessionEvent) {
         SessionEventKind::ModelUsage { turn_id, usage } => {
             print_model_usage_event(event.sequence, turn_id, usage);
         }
+        SessionEventKind::TraceEvent { .. } => {}
     }
+}
+
+fn print_trace_session_event(
+    event: &SessionEvent,
+    trace: &bcode_session_models::SessionTraceEvent,
+) {
+    println!(
+        "#{} trace {:?}: {}",
+        event.sequence,
+        trace.phase,
+        trace_payload_summary(&trace.payload)
+    );
+}
+
+fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
+    let prefix = match &event.kind {
+        SessionEventKind::TraceEvent { trace } => first_trace_time.map_or_else(
+            || format!("#{}", event.sequence),
+            |start| {
+                format!(
+                    "+{}.{:03}s #{}",
+                    trace.timestamp_ms.saturating_sub(start) / 1000,
+                    trace.timestamp_ms.saturating_sub(start) % 1000,
+                    event.sequence
+                )
+            },
+        ),
+        _ => format!("          #{}", event.sequence),
+    };
+    match &event.kind {
+        SessionEventKind::UserMessage { text, .. } => println!("{prefix} user: {}", one_line(text)),
+        SessionEventKind::AssistantMessage { text } => {
+            println!("{prefix} assistant: {}", one_line(text));
+        }
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            ..
+        } => {
+            println!("{prefix} tool requested: {tool_name} ({tool_call_id})");
+        }
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            is_error,
+            ..
+        } => {
+            let status = if *is_error { "error" } else { "ok" };
+            println!("{prefix} tool finished: {tool_call_id} {status}");
+        }
+        SessionEventKind::ModelTurnStarted { turn_id } => {
+            println!("{prefix} model turn started: {turn_id}");
+        }
+        SessionEventKind::ModelTurnFinished {
+            turn_id, outcome, ..
+        } => {
+            println!("{prefix} model turn finished: {turn_id} {outcome:?}");
+        }
+        SessionEventKind::ModelUsage { turn_id, usage } => {
+            println!(
+                "{prefix} usage: {turn_id} total={:?} cached={:?}",
+                usage.metered_total_tokens(),
+                usage.cached_input_tokens
+            );
+        }
+        SessionEventKind::TraceEvent { trace } => {
+            println!(
+                "{prefix} trace {:?}: {}",
+                trace.phase,
+                trace_payload_summary(&trace.payload)
+            );
+        }
+        _ => {}
+    }
+}
+
+fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) -> String {
+    match payload {
+        bcode_session_models::SessionTracePayload::ModelRequestBuilt {
+            provider,
+            model,
+            message_count,
+            tool_count,
+            uses_previous_provider_response,
+            ..
+        } => format!(
+            "model request provider={provider} model={model} messages={message_count} tools={tool_count} reuse={uses_previous_provider_response}"
+        ),
+        bcode_session_models::SessionTracePayload::ProviderRound {
+            provider,
+            provider_turn_id,
+            stop_reason,
+            duration_ms,
+            error,
+            ..
+        } => format!(
+            "provider round provider={provider} turn={} stop={} duration_ms={}{}",
+            provider_turn_id.as_deref().unwrap_or("<none>"),
+            stop_reason.as_deref().unwrap_or("<pending>"),
+            duration_ms.map_or_else(|| "<pending>".to_string(), |value| value.to_string()),
+            error
+                .as_ref()
+                .map_or_else(String::new, |error| format!(" error={}", one_line(error)))
+        ),
+        bcode_session_models::SessionTracePayload::ProviderEvent { event_type, detail } => {
+            format!(
+                "provider event {event_type}{}",
+                detail
+                    .as_ref()
+                    .map_or_else(String::new, |detail| format!(" {}", one_line(detail)))
+            )
+        }
+        bcode_session_models::SessionTracePayload::ToolInvocationStarted {
+            tool_call_id,
+            plugin_id,
+            tool_name,
+            ..
+        } => {
+            format!("tool started {tool_name} ({tool_call_id}) plugin={plugin_id}")
+        }
+        bcode_session_models::SessionTracePayload::ToolPolicyEvaluated {
+            tool_call_id,
+            agent_id,
+            decision,
+            reason,
+        } => format!(
+            "tool policy {tool_call_id} agent={agent_id} decision={decision}{}",
+            reason.as_ref().map_or_else(String::new, |reason| format!(
+                " reason={}",
+                one_line(reason)
+            ))
+        ),
+        bcode_session_models::SessionTracePayload::ToolPermissionWait {
+            permission_id,
+            tool_call_id,
+            approved,
+            duration_ms,
+        } => format!(
+            "permission {permission_id} tool={tool_call_id} approved={approved:?} duration_ms={duration_ms:?}"
+        ),
+        bcode_session_models::SessionTracePayload::ToolInvocationFinished {
+            tool_call_id,
+            duration_ms,
+            is_error,
+            output_bytes,
+            ..
+        } => format!(
+            "tool finished {tool_call_id} duration_ms={duration_ms} error={is_error} output_bytes={output_bytes}"
+        ),
+    }
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn print_model_usage_event(
