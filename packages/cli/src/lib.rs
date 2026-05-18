@@ -9,7 +9,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_config::AuthMode;
 use bcode_ipc::{Event, PermissionSummary, default_endpoint};
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
+use bcode_session_models::{
+    SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
+    SessionHistoryQuery, SessionId,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::Deserialize;
@@ -24,6 +27,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use zeroize::Zeroizing;
+
+const SESSION_CLI_PAGE_LIMIT: usize = 500;
 
 /// Errors returned by the CLI.
 #[derive(Debug, Error)]
@@ -90,8 +95,8 @@ pub async fn run() -> Result<(), CliError> {
                 session_export(session_id, format).await?;
             }
             SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
-            SessionCommand::Doctor => session_doctor()?,
-            SessionCommand::Reindex => session_reindex()?,
+            SessionCommand::Doctor { session_id } => session_doctor(session_id)?,
+            SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
             SessionCommand::Repair { session_id } => session_repair(session_id)?,
         },
         Commands::Plugin { command } => match command {
@@ -282,8 +287,12 @@ enum SessionCommand {
     Timeline {
         session_id: SessionId,
     },
-    Doctor,
-    Reindex,
+    Doctor {
+        session_id: Option<SessionId>,
+    },
+    Reindex {
+        session_id: Option<SessionId>,
+    },
     Repair {
         session_id: SessionId,
     },
@@ -2214,9 +2223,7 @@ async fn delete_session(session_id: SessionId) -> Result<(), CliError> {
 }
 
 async fn session_history(session_id: SessionId) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    let history = client.session_history(session_id).await?;
-    for event in history {
+    for event in paged_session_history(session_id).await? {
         print_session_event(&event);
     }
     Ok(())
@@ -2226,11 +2233,9 @@ async fn session_export(
     session_id: SessionId,
     format: SessionExportFormat,
 ) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    let history = client.session_history(session_id).await?;
     match format {
         SessionExportFormat::Jsonl => {
-            for event in history {
+            for event in paged_session_history(session_id).await? {
                 println!("{}", serde_json::to_string(&event)?);
             }
         }
@@ -2239,8 +2244,7 @@ async fn session_export(
 }
 
 async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    let history = client.session_history(session_id).await?;
+    let history = paged_session_history(session_id).await?;
     let first_trace_time = history.iter().find_map(|event| match &event.kind {
         SessionEventKind::TraceEvent { trace } => Some(trace.timestamp_ms),
         _ => None,
@@ -2251,35 +2255,72 @@ async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
     Ok(())
 }
 
-fn session_doctor() -> Result<(), CliError> {
+async fn paged_session_history(session_id: SessionId) -> Result<Vec<SessionEvent>, CliError> {
+    let client = BcodeClient::default_endpoint();
+    let mut cursor = Some(SessionHistoryCursor { sequence: 0 });
+    let mut history = Vec::new();
+    while let Some(page_cursor) = cursor {
+        let page = client
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: Some(page_cursor),
+                    limit: SESSION_CLI_PAGE_LIMIT,
+                    direction: SessionHistoryDirection::Forward,
+                },
+            )
+            .await?;
+        history.extend(page.events);
+        cursor = page.next_cursor;
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(history)
+}
+
+fn session_doctor(session_id: Option<SessionId>) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
-    let health = store.doctor_all()?;
+    let health = if let Some(session_id) = session_id {
+        store.doctor_session(session_id)?.into_iter().collect()
+    } else {
+        store.doctor_all()?
+    };
     if health.is_empty() {
         println!("no persisted sessions found");
         return Ok(());
     }
     for item in health {
-        let state = if item.issue_count == 0 {
-            "ok"
-        } else {
-            "degraded"
-        };
-        let freshness = if item.stale { "rebuilt" } else { "fresh" };
-        println!(
-            "{}\t{}\t{}\tevents={}\tlast_good_offset={}\tissues={}",
-            item.session_id,
-            state,
-            freshness,
-            item.event_count,
-            item.last_good_offset,
-            item.issue_count
-        );
+        print_session_index_health(&item);
     }
     Ok(())
 }
 
-fn session_reindex() -> Result<(), CliError> {
+fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
+    let state = if item.issue_count == 0 {
+        "ok"
+    } else {
+        "degraded"
+    };
+    let freshness = if item.stale { "rebuilt" } else { "fresh" };
+    println!(
+        "{}\t{}\t{}\tevents={}\tlast_good_offset={}\tissues={}",
+        item.session_id,
+        state,
+        freshness,
+        item.event_count,
+        item.last_good_offset,
+        item.issue_count
+    );
+}
+
+fn session_reindex(session_id: Option<SessionId>) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    if let Some(session_id) = session_id {
+        store.reindex_session(session_id)?;
+        println!("reindexed {session_id}");
+        return Ok(());
+    }
     let rebuilt = store.reindex_all()?;
     println!("reindexed {} session(s)", rebuilt.len());
     for session_id in rebuilt {

@@ -22,7 +22,8 @@ use bcode_command::CommandInfo;
 use bcode_ipc::Event;
 use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
-    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionSummary, SessionTokenUsage,
+    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor,
+    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionSummary, SessionTokenUsage,
 };
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
@@ -654,6 +655,22 @@ async fn run_chat(
             && let Ok(model_status) = client.session_model_status(session_id).await
         {
             app.apply_model_status(model_status);
+        }
+        if let Some(cursor) = app.take_older_history_cursor() {
+            match client
+                .session_history_page(
+                    session_id,
+                    SessionHistoryQuery {
+                        cursor: Some(cursor),
+                        limit: INITIAL_HISTORY_EVENT_LIMIT,
+                        direction: SessionHistoryDirection::Backward,
+                    },
+                )
+                .await
+            {
+                Ok(page) => app.prepend_older_history(&page.events, page.has_more),
+                Err(error) => app.status = format!("older history load failed: {error}"),
+            }
         }
 
         terminal.draw_frame(|frame| render_chat_frame(frame, &app))?;
@@ -1552,6 +1569,13 @@ impl ActivityState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OlderHistoryState {
+    More,
+    LoadRequested,
+    Exhausted,
+}
+
 #[derive(Debug)]
 struct ChatApp {
     session_id: SessionId,
@@ -1584,6 +1608,8 @@ struct ChatApp {
     permission_hints: String,
     selected_permission_choice: PermissionChoice,
     command_palette: Option<CommandPaletteState>,
+    oldest_loaded_sequence: Option<u64>,
+    older_history_state: OlderHistoryState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1871,6 +1897,12 @@ impl ChatApp {
             permission_hints: keymap.permission_hints(),
             selected_permission_choice: PermissionChoice::AllowOnce,
             command_palette: None,
+            oldest_loaded_sequence: history.iter().map(|event| event.sequence).min(),
+            older_history_state: if history.len() >= INITIAL_HISTORY_EVENT_LIMIT {
+                OlderHistoryState::More
+            } else {
+                OlderHistoryState::Exhausted
+            },
         };
         app.absorb_history(history);
         app
@@ -2120,6 +2152,9 @@ impl ChatApp {
     fn scroll_rows_up(&mut self, rows: usize) {
         self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_add(rows);
         self.clamp_scroll();
+        if self.older_history_state == OlderHistoryState::More {
+            self.older_history_state = OlderHistoryState::LoadRequested;
+        }
     }
 
     fn scroll_rows_down(&mut self, rows: usize) {
@@ -2144,6 +2179,9 @@ impl ChatApp {
 
     fn scroll_top(&mut self) {
         self.scroll_rows_from_bottom = self.max_scroll_rows_from_bottom();
+        if self.older_history_state == OlderHistoryState::More {
+            self.older_history_state = OlderHistoryState::LoadRequested;
+        }
     }
 
     fn scroll_bottom(&mut self) {
@@ -2173,6 +2211,69 @@ impl ChatApp {
             self.absorb_session_event_with_scroll_clamp(event, false);
         }
         self.clamp_scroll();
+    }
+
+    fn take_older_history_cursor(&mut self) -> Option<SessionHistoryCursor> {
+        if self.older_history_state != OlderHistoryState::LoadRequested {
+            return None;
+        }
+        let oldest = self.oldest_loaded_sequence?;
+        if oldest == 0 {
+            self.older_history_state = OlderHistoryState::Exhausted;
+            return None;
+        }
+        let near_top = self
+            .scroll_rows_from_bottom
+            .saturating_add(self.page_scroll_rows())
+            >= self.max_scroll_rows_from_bottom();
+        self.older_history_state = OlderHistoryState::More;
+        near_top.then_some(SessionHistoryCursor {
+            sequence: oldest.saturating_sub(1),
+        })
+    }
+
+    fn prepend_older_history(&mut self, history: &[SessionEvent], has_more: bool) {
+        if history.is_empty() {
+            self.older_history_state = OlderHistoryState::Exhausted;
+            self.status = "start of session history".to_string();
+            return;
+        }
+        let max_scroll_before = self.max_scroll_rows_from_bottom();
+        let mut blocks = Vec::new();
+        let mut input_messages = Vec::new();
+        for event in history {
+            self.oldest_loaded_sequence = Some(
+                self.oldest_loaded_sequence
+                    .map_or(event.sequence, |oldest| oldest.min(event.sequence)),
+            );
+            if let SessionEventKind::UserMessage { text, .. } = &event.kind {
+                input_messages.push(text.clone());
+            }
+            if let SessionEventKind::ModelUsage { usage, .. } = &event.kind {
+                self.token_usage.absorb(usage);
+            }
+            blocks.extend(transcript_blocks_from_event(event));
+        }
+        self.input_history.splice(0..0, input_messages);
+        if !blocks.is_empty() {
+            self.blocks.splice(0..0, blocks);
+            self.mark_transcript_dirty();
+            let max_scroll_after = self.max_scroll_rows_from_bottom();
+            self.scroll_rows_from_bottom = self
+                .scroll_rows_from_bottom
+                .saturating_add(max_scroll_after.saturating_sub(max_scroll_before));
+            self.clamp_scroll();
+        }
+        self.older_history_state = if has_more {
+            OlderHistoryState::More
+        } else {
+            OlderHistoryState::Exhausted
+        };
+        self.status = if has_more {
+            "loaded older history".to_string()
+        } else {
+            "start of session history".to_string()
+        };
     }
 
     fn absorb_session_event(&mut self, event: &SessionEvent) {

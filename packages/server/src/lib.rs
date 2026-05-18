@@ -1479,7 +1479,7 @@ async fn maybe_auto_compact_session_context(
         return Ok(());
     }
 
-    let history = state.sessions.session_history(session_id).await?;
+    let history = state.sessions.model_context_events(session_id).await?;
     let projected_context_chars =
         projected_model_context_chars(&history, state.tool_output_context_chars);
     if projected_context_chars < state.auto_compaction.context_chars {
@@ -2759,7 +2759,7 @@ async fn build_model_turn_request(
     provider_plugin_id: Option<&str>,
     selected_model_id: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
-    let history = state.sessions.session_history(session_id).await?;
+    let history = state.sessions.model_context_events(session_id).await?;
     let mut messages =
         session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);

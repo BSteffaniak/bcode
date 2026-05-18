@@ -219,6 +219,55 @@ impl SessionEventStore {
         })
     }
 
+    fn read_model_context_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let event_path = self.event_path(session_id);
+        let index = match index::load_fresh_index(&self.root, session_id, &event_path)? {
+            Some(index) => index,
+            None => index::rebuild_index(&self.root, session_id, &event_path)?
+                .0
+                .ok_or_else(|| {
+                    SessionStoreError::InvalidSessionId(format!("empty session log: {session_id}"))
+                })?,
+        };
+        let mut entries = match index::read_entries(&self.root, session_id) {
+            Ok(entries) if entries.len() == index.event_count => entries,
+            _ => {
+                let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
+                index::read_entries(&self.root, session_id)?
+            }
+        };
+        entries.sort_by_key(|entry| entry.sequence);
+        let Some(compaction_entry) = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == "context_compacted")
+        else {
+            return self.read_session_events(session_id);
+        };
+        let compaction_event = reader::read_event_at(&event_path, compaction_entry.offset)?;
+        let compacted_through_sequence = match &compaction_event.kind {
+            SessionEventKind::ContextCompacted {
+                compacted_through_sequence,
+                ..
+            } => *compacted_through_sequence,
+            _ => return self.read_session_events(session_id),
+        };
+        let mut events = vec![compaction_event];
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.sequence > compacted_through_sequence)
+        {
+            if entry.sequence == compaction_entry.sequence {
+                continue;
+            }
+            events.push(reader::read_event_at(&event_path, entry.offset)?);
+        }
+        Ok(events)
+    }
+
     fn write_state_index(&self, state: &SessionState) -> Result<(), SessionStoreError> {
         let path = self.event_path(state.summary.id);
         let file = index::fingerprint(&path)?;
@@ -299,6 +348,28 @@ impl SessionEventStore {
             rebuilt.push(session_id);
         }
         Ok(rebuilt)
+    }
+
+    /// Return index health for one persisted session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session event file or index cannot be read.
+    pub fn doctor_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
+        let path = self.event_path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let index = index::load_fresh_index(&self.root, session_id, &path)?;
+        if let Some(index) = index {
+            Ok(Some(index.health(false)))
+        } else {
+            let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
+            Ok(index.map(|index| index.health(true)))
+        }
     }
 
     /// Return index health for every persisted session.
@@ -578,6 +649,30 @@ impl SessionManager {
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
         Ok(store.read_session_history_page(session_id, query)?)
+    }
+
+    /// Return the model-visible session events, starting at the latest compaction when possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn model_context_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        let inner = self.inner.lock().await;
+        let state = inner
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        if let Some(events) = &state.events {
+            return Ok(model_context_events_from_history(events));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(store.read_model_context_events(session_id)?)
     }
 
     /// Return the latest session-specific model selection if one has been set.
@@ -1132,6 +1227,35 @@ impl SessionState {
     }
 }
 
+fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEvent> {
+    let latest_compaction = history.iter().enumerate().rev().find_map(|(index, event)| {
+        if matches!(event.kind, SessionEventKind::ContextCompacted { .. }) {
+            Some(index)
+        } else {
+            None
+        }
+    });
+    let Some(index) = latest_compaction else {
+        return history.to_vec();
+    };
+    let compacted_through_sequence = match &history[index].kind {
+        SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => *compacted_through_sequence,
+        _ => return history.to_vec(),
+    };
+    std::iter::once(history[index].clone())
+        .chain(
+            history
+                .iter()
+                .filter(|event| event.sequence > compacted_through_sequence)
+                .filter(|event| event.sequence != history[index].sequence)
+                .cloned(),
+        )
+        .collect()
+}
+
 fn history_page_from_events(
     session_id: SessionId,
     history: Vec<SessionEvent>,
@@ -1488,6 +1612,56 @@ mod tests {
             &event.kind,
             SessionEventKind::SystemMessage { text } if text == "system"
         )));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn persistent_manager_reads_legacy_and_v2_frames() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        let session_id = bcode_session_models::SessionId::new();
+        let legacy_event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 0,
+            session_id,
+            kind: SessionEventKind::SessionCreated {
+                name: Some("mixed".to_string()),
+            },
+        };
+        let path = root.join(format!("{session_id}.events"));
+        let mut file = std::fs::File::create(&path).expect("event file should create");
+        let payload = bmux_codec::to_vec(&legacy_event).expect("legacy event should encode");
+        file.write_all(
+            &u32::try_from(payload.len())
+                .expect("payload should fit")
+                .to_le_bytes(),
+        )
+        .expect("legacy len should write");
+        file.write_all(&payload)
+            .expect("legacy payload should write");
+        drop(file);
+
+        let manager = SessionManager::persistent(&root).expect("manager should restore legacy");
+        manager
+            .append_user_message(session_id, ClientId::new(), "new v2 event".to_string())
+            .await
+            .expect("v2 append should work");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore mixed");
+        let history = restored
+            .session_history(session_id)
+            .await
+            .expect("mixed history should load");
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            &history[0].kind,
+            SessionEventKind::SessionCreated { name } if name.as_deref() == Some("mixed")
+        ));
+        assert!(matches!(
+            &history[1].kind,
+            SessionEventKind::UserMessage { text, .. } if text == "new v2 event"
+        ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

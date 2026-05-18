@@ -48,14 +48,14 @@ The legacy full-history APIs remain for compatibility, but new code should prefe
 * client `session_history_page`
 * lightweight selection projections such as current agent and current model
 
-The TUI uses a recent-page attach path for initial load. Full scrollback pagination is the next UI layer: the session/client/server APIs can return bounded pages, and the TUI needs a scrollback loader to prepend older pages when the user scrolls above the loaded window. Model request construction still needs a model-visible projection of history, but it should use projection helpers and compaction boundaries rather than requiring all daemon startup state to be hydrated.
+The TUI uses a recent-page attach path for initial load and requests/prepends older pages when the user scrolls near the top of the loaded transcript. Model request construction uses a session projection that starts at the latest compaction boundary when available instead of hydrating the entire raw log.
 
 ## Maintenance commands
 
 CLI maintenance commands provide operator ergonomics:
 
-* `bcode session doctor` reports index freshness, event counts, offsets, and issue counts.
-* `bcode session reindex` rebuilds all sidecar indexes from canonical event logs.
+* `bcode session doctor [session-id]` reports index freshness, event counts, offsets, and issue counts.
+* `bcode session reindex [session-id]` rebuilds sidecar indexes from canonical event logs.
 * `bcode session repair <session-id>` backs up and truncates only unreadable tails, then rebuilds indexes.
 
 ## Migration stages
@@ -65,4 +65,4 @@ CLI maintenance commands provide operator ergonomics:
 3. Move server hot paths that only need current model/agent to index-backed projections.
 4. Migrate initial TUI attach to recent-page loading.
 5. Introduce a versioned/checksummed v2 event frame while keeping the legacy reader.
-6. Continue with full TUI scrollback paging and model-context projections that jump from index metadata to the latest compaction boundary.
+6. Continue with larger benchmark fixtures and optional incremental stale-index rebuilds for huge logs.
