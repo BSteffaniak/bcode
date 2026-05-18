@@ -24,7 +24,7 @@ use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
     ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionSummary, SessionTokenUsage,
 };
-use bmux_text_edit::{TextEditBuffer, TextMotion};
+use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
     KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -87,6 +87,10 @@ enum TuiAction {
     InputNewLine,
     DeleteCharBackward,
     DeleteCharForward,
+    DeleteWordBackward,
+    DeleteWordForward,
+    DeleteToStart,
+    DeleteToEnd,
     MoveCursorLeft,
     MoveCursorRight,
     MoveCursorWordLeft,
@@ -131,6 +135,10 @@ impl TuiAction {
             "tui.input.newLine" => Self::InputNewLine,
             "tui.editor.deleteCharBackward" => Self::DeleteCharBackward,
             "tui.editor.deleteCharForward" => Self::DeleteCharForward,
+            "tui.editor.deleteWordBackward" => Self::DeleteWordBackward,
+            "tui.editor.deleteWordForward" => Self::DeleteWordForward,
+            "tui.editor.deleteToStart" => Self::DeleteToStart,
+            "tui.editor.deleteToEnd" => Self::DeleteToEnd,
             "tui.editor.moveCursorLeft" => Self::MoveCursorLeft,
             "tui.editor.moveCursorRight" => Self::MoveCursorRight,
             "tui.editor.moveCursorWordLeft" => Self::MoveCursorWordLeft,
@@ -295,6 +303,12 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("shift+enter", TuiAction::InputNewLine),
                 ("backspace", TuiAction::DeleteCharBackward),
                 ("delete", TuiAction::DeleteCharForward),
+                ("alt+backspace", TuiAction::DeleteWordBackward),
+                ("ctrl+w", TuiAction::DeleteWordBackward),
+                ("alt+delete", TuiAction::DeleteWordForward),
+                ("ctrl+delete", TuiAction::DeleteWordForward),
+                ("ctrl+u", TuiAction::DeleteToStart),
+                ("ctrl+k", TuiAction::DeleteToEnd),
                 ("left", TuiAction::MoveCursorLeft),
                 ("right", TuiAction::MoveCursorRight),
                 ("alt+left", TuiAction::MoveCursorWordLeft),
@@ -778,7 +792,31 @@ async fn handle_tui_action(
             }
         }
         TuiAction::DeleteCharForward => {
-            app.input.delete_forward();
+            app.input.delete(TextDelete::Forward);
+            if app.search_mode {
+                app.update_search();
+            }
+        }
+        TuiAction::DeleteWordBackward => {
+            app.input.delete(TextDelete::WordBackward);
+            if app.search_mode {
+                app.update_search();
+            }
+        }
+        TuiAction::DeleteWordForward => {
+            app.input.delete(TextDelete::WordForward);
+            if app.search_mode {
+                app.update_search();
+            }
+        }
+        TuiAction::DeleteToStart => {
+            app.input.delete(TextDelete::ToStart);
+            if app.search_mode {
+                app.update_search();
+            }
+        }
+        TuiAction::DeleteToEnd => {
+            app.input.delete(TextDelete::ToEnd);
             if app.search_mode {
                 app.update_search();
             }
