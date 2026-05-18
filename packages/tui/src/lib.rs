@@ -3859,6 +3859,41 @@ mod tests {
     }
 
     #[test]
+    fn composer_editor_inserts_in_middle() {
+        let mut app = chat_app_with_input("helo");
+
+        apply_chat_action(&mut app, TuiAction::MoveCursorStart);
+        apply_chat_action(&mut app, TuiAction::MoveCursorRight);
+        apply_chat_action(&mut app, TuiAction::MoveCursorRight);
+        app.input.insert_char('l');
+
+        assert_eq!(app.input.text(), "hello");
+        assert_eq!(app.input.cursor_byte_index(), "hel".len());
+    }
+
+    #[test]
+    fn composer_take_input_submits_edited_text_and_clears_buffer() {
+        let mut app = chat_app_with_input("helo world");
+
+        apply_chat_action(&mut app, TuiAction::MoveCursorStart);
+        apply_chat_action(&mut app, TuiAction::MoveCursorWordRight);
+        apply_chat_action(&mut app, TuiAction::MoveCursorLeft);
+        app.input.insert_char('l');
+
+        assert_eq!(app.take_input(), Some("hello world".to_string()));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn composer_take_input_trims_submitted_text_after_editing() {
+        let mut app = chat_app_with_input("  hello  ");
+        apply_chat_action(&mut app, TuiAction::MoveCursorEnd);
+        app.input.insert_char('!');
+
+        assert_eq!(app.take_input(), Some("hello  !".to_string()));
+    }
+
+    #[test]
     fn default_keymap_includes_standard_composer_editor_bindings() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let cases = [
