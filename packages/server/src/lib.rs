@@ -1632,10 +1632,7 @@ fn build_compaction_request(
             }],
         }],
         tools: Vec::new(),
-        parameters: ModelParameters {
-            max_output_tokens: Some(2048),
-            ..ModelParameters::default()
-        },
+        parameters: ModelParameters::default(),
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: BTreeMap::from([("bcode_request_kind".to_string(), "compaction".to_string())]),
@@ -4283,7 +4280,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_request_omits_temperature_for_strict_providers() {
+    fn compaction_request_omits_optional_params_for_strict_providers() {
         let session_id = SessionId::new();
         let selection = SessionModelSelection {
             model_id: Some("model".to_string()),
@@ -4298,7 +4295,8 @@ mod tests {
         let request = build_compaction_request(session_id, &selection, &transcript, "turn".into());
 
         assert_eq!(request.parameters.temperature, None);
-        assert_eq!(request.parameters.max_output_tokens, Some(2048));
+        assert_eq!(request.parameters.max_output_tokens, None);
+        assert_eq!(request.parameters.top_p, None);
     }
 
     #[test]
