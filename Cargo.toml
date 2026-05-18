@@ -57,8 +57,9 @@ bcode_tool                   = { version = "0.0.1-alpha.0", default-features = f
 bcode_tui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 
 # BMUX reuse
-bmux_codec = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_ipc   = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_codec     = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_ipc       = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies
 aws-config = { version = "1.8.16", default-features = false, features = [

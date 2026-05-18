@@ -488,6 +488,10 @@ pub struct ModelConfig {
     #[serde(default)]
     pub conversation_reuse: ConversationReuseConfig,
     #[serde(default)]
+    pub tool_output: ToolOutputConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+    #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ModelProfileConfig>,
@@ -518,6 +522,12 @@ impl ModelConfig {
         if next.conversation_reuse != ConversationReuseConfig::default() {
             self.conversation_reuse = next.conversation_reuse;
         }
+        if next.tool_output != ToolOutputConfig::default() {
+            self.tool_output = next.tool_output;
+        }
+        if next.compaction != CompactionConfig::default() {
+            self.compaction = next.compaction;
+        }
         if next.profile.is_some() {
             self.profile = next.profile;
         }
@@ -539,6 +549,67 @@ impl Default for PromptCacheConfig {
             mode: bcode_model::PromptCacheMode::Auto,
         }
     }
+}
+
+/// Tool output context policy for future model turns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputConfig {
+    /// Maximum characters of each tool result included directly in model context.
+    #[serde(default = "default_tool_output_context_chars")]
+    pub context_chars: usize,
+}
+
+impl Default for ToolOutputConfig {
+    fn default() -> Self {
+        Self {
+            context_chars: default_tool_output_context_chars(),
+        }
+    }
+}
+
+/// Automatic context compaction configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// Automatic compaction mode. Defaults to `auto`.
+    #[serde(default)]
+    pub mode: CompactionMode,
+    /// Projected conversation character count that triggers automatic compaction.
+    #[serde(default = "default_auto_compaction_context_chars")]
+    pub context_chars: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            mode: CompactionMode::Auto,
+            context_chars: default_auto_compaction_context_chars(),
+        }
+    }
+}
+
+/// Automatic context compaction mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    Off,
+    #[default]
+    Auto,
+}
+
+impl CompactionMode {
+    /// Return whether automatic compaction may run.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+const fn default_tool_output_context_chars() -> usize {
+    4_000
+}
+
+const fn default_auto_compaction_context_chars() -> usize {
+    120_000
 }
 
 /// Provider-native conversation reuse configuration.
@@ -1038,6 +1109,22 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     output
 }
 
+fn write_model_compaction_toml(output: &mut String, compaction: &CompactionConfig) {
+    if compaction == &CompactionConfig::default() {
+        return;
+    }
+    output.push_str("[model.compaction]\n");
+    writeln!(
+        output,
+        "mode = {}",
+        toml_string(compaction_mode_name(compaction.mode))
+    )
+    .expect("writing to string should not fail");
+    writeln!(output, "context_chars = {}", compaction.context_chars)
+        .expect("writing to string should not fail");
+    output.push('\n');
+}
+
 fn write_model_toml(output: &mut String, model: &ModelConfig) {
     if model.provider_plugin_id.is_some()
         || model.model_id.is_some()
@@ -1046,6 +1133,8 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         || model.profile.is_some()
         || model.prompt_cache != PromptCacheConfig::default()
         || model.conversation_reuse != ConversationReuseConfig::default()
+        || model.tool_output != ToolOutputConfig::default()
+        || model.compaction != CompactionConfig::default()
     {
         output.push_str("[model]\n");
         if let Some(profile) = &model.profile {
@@ -1093,6 +1182,19 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         )
         .expect("writing to string should not fail");
         output.push('\n');
+    }
+    if model.tool_output != ToolOutputConfig::default() {
+        output.push_str("[model.tool_output]\n");
+        writeln!(
+            output,
+            "context_chars = {}",
+            model.tool_output.context_chars
+        )
+        .expect("writing to string should not fail");
+        output.push('\n');
+    }
+    if model.compaction != CompactionConfig::default() {
+        write_model_compaction_toml(output, &model.compaction);
     }
     for (profile_name, profile) in &model.profiles {
         writeln!(output, "[model.profiles.{}]", toml_key(profile_name))
@@ -1230,6 +1332,13 @@ const fn conversation_reuse_mode_name(mode: bcode_model::ConversationReuseMode) 
     match mode {
         bcode_model::ConversationReuseMode::Off => "off",
         bcode_model::ConversationReuseMode::Auto => "auto",
+    }
+}
+
+const fn compaction_mode_name(mode: CompactionMode) -> &'static str {
+    match mode {
+        CompactionMode::Off => "off",
+        CompactionMode::Auto => "auto",
     }
 }
 
@@ -1452,7 +1561,7 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, DEFAULT_AGENT_PROFILE_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID,
+        BcodeConfig, CompactionMode, DEFAULT_AGENT_PROFILE_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID,
         DEFAULT_SHELL_PLUGIN_ID, PluginSelection, default_permissions_state_path,
         load_config_from_paths, load_permissions_state_from, merge_agent_configs,
         upsert_agent_permission_rule,
@@ -1697,6 +1806,44 @@ max_tool_rounds = 3
         .expect("config should parse");
 
         assert_eq!(config.model.effective_max_tool_rounds(), Some(3));
+    }
+
+    #[test]
+    fn default_model_limits_are_unlimited_and_context_policies_enabled() {
+        let config = BcodeConfig::default();
+
+        assert_eq!(config.model.effective_max_tool_rounds(), None);
+        assert_eq!(config.model.tool_output.context_chars, 4_000);
+        assert_eq!(config.model.compaction.mode, CompactionMode::Auto);
+        assert_eq!(config.model.compaction.context_chars, 120_000);
+    }
+
+    #[test]
+    fn parses_tool_output_context_limit() {
+        let config: BcodeConfig = toml::from_str(
+            r"
+[model.tool_output]
+context_chars = 1200
+",
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.model.tool_output.context_chars, 1_200);
+    }
+
+    #[test]
+    fn parses_auto_compaction_config() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model.compaction]
+mode = "off"
+context_chars = 90000
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.model.compaction.mode, CompactionMode::Off);
+        assert_eq!(config.model.compaction.context_chars, 90_000);
     }
 
     #[test]

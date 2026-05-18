@@ -2584,6 +2584,18 @@ fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) ->
         } => format!(
             "tool finished {tool_call_id} duration_ms={duration_ms} error={is_error} output_bytes={output_bytes}"
         ),
+        bcode_session_models::SessionTracePayload::ContextCompaction {
+            reason,
+            projected_context_chars,
+            compacted,
+            message,
+        } => format!(
+            "context compaction reason={reason} projected_context_chars={projected_context_chars} compacted={compacted}{}",
+            message.as_ref().map_or_else(String::new, |message| format!(
+                " message={}",
+                one_line(message)
+            ))
+        ),
     }
 }
 

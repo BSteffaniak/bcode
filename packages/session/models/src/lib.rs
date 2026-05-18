@@ -11,7 +11,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 7;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 8;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -178,6 +178,9 @@ pub enum SessionTracePhase {
     ToolPermissionWaitStarted,
     ToolPermissionWaitFinished,
     ToolInvocationFinished,
+    ContextCompactionSkipped,
+    ContextCompactionStarted,
+    ContextCompactionFinished,
 }
 
 /// Structured diagnostic payload for a [`SessionTraceEvent`].
@@ -235,6 +238,12 @@ pub enum SessionTracePayload {
         is_error: bool,
         output_bytes: usize,
         output: Option<TraceBlobRef>,
+    },
+    ContextCompaction {
+        reason: String,
+        projected_context_chars: usize,
+        compacted: bool,
+        message: Option<String>,
     },
 }
 

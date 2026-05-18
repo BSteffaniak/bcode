@@ -24,6 +24,7 @@ use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
     ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionSummary, SessionTokenUsage,
 };
+use bmux_text_edit::{TextEditBuffer, TextMotion};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
     KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -85,6 +86,13 @@ enum TuiAction {
     InputSubmit,
     InputNewLine,
     DeleteCharBackward,
+    DeleteCharForward,
+    MoveCursorLeft,
+    MoveCursorRight,
+    MoveCursorWordLeft,
+    MoveCursorWordRight,
+    MoveCursorStart,
+    MoveCursorEnd,
     AppInterrupt,
     AppExit,
     AppClear,
@@ -122,6 +130,13 @@ impl TuiAction {
             "tui.input.submit" => Self::InputSubmit,
             "tui.input.newLine" => Self::InputNewLine,
             "tui.editor.deleteCharBackward" => Self::DeleteCharBackward,
+            "tui.editor.deleteCharForward" => Self::DeleteCharForward,
+            "tui.editor.moveCursorLeft" => Self::MoveCursorLeft,
+            "tui.editor.moveCursorRight" => Self::MoveCursorRight,
+            "tui.editor.moveCursorWordLeft" => Self::MoveCursorWordLeft,
+            "tui.editor.moveCursorWordRight" => Self::MoveCursorWordRight,
+            "tui.editor.moveCursorStart" => Self::MoveCursorStart,
+            "tui.editor.moveCursorEnd" => Self::MoveCursorEnd,
             "app.interrupt" => Self::AppInterrupt,
             "app.exit" => Self::AppExit,
             "app.clear" => Self::AppClear,
@@ -279,6 +294,15 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("enter", TuiAction::InputSubmit),
                 ("shift+enter", TuiAction::InputNewLine),
                 ("backspace", TuiAction::DeleteCharBackward),
+                ("delete", TuiAction::DeleteCharForward),
+                ("left", TuiAction::MoveCursorLeft),
+                ("right", TuiAction::MoveCursorRight),
+                ("alt+left", TuiAction::MoveCursorWordLeft),
+                ("alt+right", TuiAction::MoveCursorWordRight),
+                ("ctrl+left", TuiAction::MoveCursorWordLeft),
+                ("ctrl+right", TuiAction::MoveCursorWordRight),
+                ("ctrl+a", TuiAction::MoveCursorStart),
+                ("ctrl+e", TuiAction::MoveCursorEnd),
                 ("escape", TuiAction::AppInterrupt),
                 ("ctrl+d", TuiAction::AppExit),
                 ("ctrl+c", TuiAction::AppClear),
@@ -634,7 +658,7 @@ async fn run_chat(
                             palette.filter.push(character);
                             palette.selected = 0;
                         } else {
-                            app.input.push(character);
+                            app.input.insert_char(character);
                             if app.search_mode {
                                 app.update_search();
                             }
@@ -737,7 +761,7 @@ async fn handle_tui_action(
             }
         }
         TuiAction::InputNewLine => {
-            app.input.push('\n');
+            app.input.insert_newline();
             if app.search_mode {
                 app.update_search();
             }
@@ -747,12 +771,24 @@ async fn handle_tui_action(
                 palette.filter.pop();
                 palette.selected = 0;
             } else {
-                app.input.pop();
+                app.input.delete_backward();
                 if app.search_mode {
                     app.update_search();
                 }
             }
         }
+        TuiAction::DeleteCharForward => {
+            app.input.delete_forward();
+            if app.search_mode {
+                app.update_search();
+            }
+        }
+        TuiAction::MoveCursorLeft => app.input.move_cursor(TextMotion::Left),
+        TuiAction::MoveCursorRight => app.input.move_cursor(TextMotion::Right),
+        TuiAction::MoveCursorWordLeft => app.input.move_cursor(TextMotion::WordLeft),
+        TuiAction::MoveCursorWordRight => app.input.move_cursor(TextMotion::WordRight),
+        TuiAction::MoveCursorStart => app.input.move_cursor(TextMotion::Start),
+        TuiAction::MoveCursorEnd => app.input.move_cursor(TextMotion::End),
         TuiAction::SelectUp => {
             if scope == TuiScope::Permission {
                 app.previous_permission_choice();
@@ -1462,7 +1498,7 @@ struct ChatApp {
     session_id: SessionId,
     session_title: Option<String>,
     blocks: Vec<TranscriptBlock>,
-    input: String,
+    input: TextEditBuffer,
     status: String,
     pending_permissions: BTreeMap<String, PendingPermissionView>,
     selected_provider_plugin_id: Option<String>,
@@ -1737,7 +1773,7 @@ impl ChatApp {
             session_id,
             session_title: None,
             blocks: Vec::new(),
-            input: String::new(),
+            input: TextEditBuffer::new(),
             status: keymap
                 .warnings
                 .first()
@@ -1906,7 +1942,7 @@ impl ChatApp {
 
     fn finish_search(&mut self) {
         self.search_mode = false;
-        self.search_query = self.input.clone();
+        self.search_query = self.input.text().to_string();
         self.input.clear();
         self.find_next();
     }
@@ -1918,7 +1954,7 @@ impl ChatApp {
     }
 
     fn update_search(&mut self) {
-        self.search_query = self.input.clone();
+        self.search_query = self.input.text().to_string();
         if self.search_query.is_empty() {
             self.status = "search: type query, submit accepts, next/previous jump".to_string();
         } else {
@@ -2311,7 +2347,7 @@ impl ChatApp {
     }
 
     fn take_input(&mut self) -> Option<String> {
-        let input = self.input.trim().to_string();
+        let input = self.input.text().trim().to_string();
         if input.is_empty() {
             return None;
         }
@@ -2513,7 +2549,7 @@ fn render_chat_frame(frame: &mut Frame<'_>, app: &ChatApp) {
     }
 }
 
-fn chat_layout(area: Rect, input: &str, search_mode: bool) -> [Rect; 4] {
+fn chat_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> [Rect; 4] {
     let composer_height = composer_height(
         input,
         search_mode,
@@ -2973,7 +3009,7 @@ struct ComposerLayout {
 }
 
 fn composer_height(
-    input: &str,
+    input: &TextEditBuffer,
     search_mode: bool,
     terminal_height: u16,
     content_width: u16,
@@ -2981,13 +3017,18 @@ fn composer_height(
     if search_mode {
         return 3.min(terminal_height.max(1));
     }
-    usize_to_u16_saturating(wrapped_composer_lines(input, content_width).len())
-        .min(MAX_COMPOSER_ROWS)
-        .saturating_add(2)
-        .min(terminal_height.saturating_sub(2).max(3))
+    usize_to_u16_saturating(
+        input
+            .wrapped_layout(usize::from(content_width.max(1)))
+            .lines
+            .len(),
+    )
+    .min(MAX_COMPOSER_ROWS)
+    .saturating_add(2)
+    .min(terminal_height.saturating_sub(2).max(3))
 }
 
-fn composer_layout(area: Rect, input: &str, search_mode: bool) -> ComposerLayout {
+fn composer_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> ComposerLayout {
     let content_area = inset(area, 1, 1);
     if content_area.width == 0 || content_area.height == 0 {
         return ComposerLayout {
@@ -2997,16 +3038,14 @@ fn composer_layout(area: Rect, input: &str, search_mode: bool) -> ComposerLayout
     }
 
     let visible_row_count = usize::from(content_area.height);
-    let wrapped_lines = wrapped_composer_lines(input, content_area.width);
-    let cursor_row = wrapped_lines.len().saturating_sub(1);
+    let layout = input.wrapped_layout(usize::from(content_area.width.max(1)));
+    let wrapped_lines = layout.lines;
+    let cursor_row = layout.cursor.row;
     let scroll = cursor_row
         .saturating_add(1)
         .saturating_sub(visible_row_count);
-    let cursor_line = wrapped_lines
-        .get(cursor_row)
-        .map_or(String::new(), Clone::clone);
     let cursor_column =
-        usize_to_u16_saturating(line_width(&cursor_line)).min(content_area.width.saturating_sub(1));
+        usize_to_u16_saturating(layout.cursor.col).min(content_area.width.saturating_sub(1));
     let visible_lines = if input.is_empty() {
         vec![Line::from(vec![Span::styled(
             composer_placeholder(search_mode),
@@ -3036,64 +3075,6 @@ fn composer_placeholder(search_mode: bool) -> &'static str {
     } else {
         "Ask Bcode…"
     }
-}
-
-fn wrapped_composer_lines(input: &str, content_width: u16) -> Vec<String> {
-    if input.is_empty() {
-        return vec![String::new()];
-    }
-    let mut wrapped = Vec::new();
-    let mut logical_lines = input.split('\n').peekable();
-    while let Some(line) = logical_lines.next() {
-        push_wrapped_composer_line(
-            &mut wrapped,
-            line,
-            content_width,
-            logical_lines.peek().is_none(),
-        );
-    }
-    wrapped
-}
-
-fn push_wrapped_composer_line(
-    wrapped: &mut Vec<String>,
-    line: &str,
-    content_width: u16,
-    include_trailing_cursor_line: bool,
-) {
-    let content_width = usize::from(content_width.max(1));
-    if line.is_empty() {
-        wrapped.push(String::new());
-        return;
-    }
-
-    let mut current = String::new();
-    let mut current_width = 0_usize;
-    for character in line.chars() {
-        let width = character_width(character);
-        if width > 0 && current_width > 0 && current_width.saturating_add(width) > content_width {
-            wrapped.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        current.push(character);
-        current_width = current_width.saturating_add(width);
-        if current_width >= content_width {
-            wrapped.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-    }
-
-    if current.is_empty() {
-        if include_trailing_cursor_line {
-            wrapped.push(String::new());
-        }
-    } else {
-        wrapped.push(current);
-    }
-}
-
-fn character_width(character: char) -> usize {
-    Line::from(character.to_string()).width()
 }
 
 fn line_width(line: &str) -> usize {
@@ -4262,13 +4243,13 @@ mod tests {
     fn command_palette_filter_is_separate_from_composer_input() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
-        app.input = "draft message".to_string();
+        app.input = TextEditBuffer::from_text("draft message");
         app.open_command_palette();
         if let Some(palette) = &mut app.command_palette {
             palette.filter.push('m');
         }
 
-        assert_eq!(app.input, "draft message");
+        assert_eq!(app.input.text(), "draft message");
         assert_eq!(
             app.command_palette
                 .as_ref()
@@ -4291,7 +4272,7 @@ mod tests {
             .backend_mut()
             .assert_cursor_position(Position::new(1, 17));
 
-        app.input = "Hello".to_string();
+        app.input = TextEditBuffer::from_text("Hello");
         terminal
             .draw(|frame| render_chat_frame(frame, &app))
             .expect("frame should render");
@@ -4304,7 +4285,7 @@ mod tests {
     fn composer_cursor_tracks_multiline_input() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
-        app.input = "one\ntwo".to_string();
+        app.input = TextEditBuffer::from_text("one\ntwo");
 
         assert_eq!(
             app.cursor_position(Rect::new(0, 0, 80, 20)),
@@ -4314,7 +4295,11 @@ mod tests {
 
     #[test]
     fn composer_cursor_moves_to_blank_row_at_exact_wrap_boundary() {
-        let layout = composer_layout(Rect::new(0, 0, 12, 4), "abcdefghij", false);
+        let layout = composer_layout(
+            Rect::new(0, 0, 12, 4),
+            &TextEditBuffer::from_text("abcdefghij"),
+            false,
+        );
         let lines = layout
             .text
             .lines
@@ -4322,13 +4307,17 @@ mod tests {
             .map(line_plain_text)
             .collect::<Vec<_>>();
 
-        assert_eq!(lines, vec!["abcdefghij", ""]);
-        assert_eq!(layout.cursor_position, Some(Position::new(1, 2)));
+        assert_eq!(lines, vec!["abcdefghij"]);
+        assert_eq!(layout.cursor_position, Some(Position::new(10, 1)));
     }
 
     #[test]
     fn composer_layout_scrolls_to_keep_cursor_visible() {
-        let layout = composer_layout(Rect::new(0, 0, 8, 5), "one\ntwo\nthree\nfour", false);
+        let layout = composer_layout(
+            Rect::new(0, 0, 8, 5),
+            &TextEditBuffer::from_text("one\ntwo\nthree\nfour"),
+            false,
+        );
         let lines = layout
             .text
             .lines

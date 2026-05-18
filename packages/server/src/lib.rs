@@ -86,6 +86,8 @@ struct ServerState {
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
+    tool_output_context_chars: usize,
+    auto_compaction: bcode_config::CompactionConfig,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -186,6 +188,10 @@ impl TraceStore {
         Self { root }
     }
 
+    fn blob_path(&self, reference: &TraceBlobRef) -> PathBuf {
+        self.root.join(&reference.path)
+    }
+
     fn write_json_blob(
         &self,
         session_id: SessionId,
@@ -217,7 +223,9 @@ impl TraceStore {
     ) -> Option<TraceBlobRef> {
         use sha2::{Digest as _, Sha256};
 
-        let bytes = if bytes.len() > max_bytes {
+        let bytes = if max_bytes == 0 {
+            bytes
+        } else if bytes.len() > max_bytes {
             &bytes[..max_bytes]
         } else {
             bytes
@@ -280,6 +288,8 @@ struct ServerStateInit {
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
+    tool_output_context_chars: usize,
+    auto_compaction: bcode_config::CompactionConfig,
 }
 
 impl ServerState {
@@ -301,6 +311,8 @@ impl ServerState {
             observability: init.observability,
             trace_store: init.trace_store,
             max_tool_rounds: init.max_tool_rounds,
+            tool_output_context_chars: init.tool_output_context_chars,
+            auto_compaction: init.auto_compaction,
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -387,6 +399,8 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             observability: config.observability,
             trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
+            tool_output_context_chars: config.model.tool_output.context_chars,
+            auto_compaction: config.model.compaction,
         },
     ));
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
@@ -1345,6 +1359,114 @@ async fn compact_session_context(
     ))
 }
 
+async fn maybe_auto_compact_session_context(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<(), CompactionError> {
+    if !state.auto_compaction.mode.is_enabled() || state.auto_compaction.context_chars == 0 {
+        return Ok(());
+    }
+    if state.active_turns.lock().await.contains_key(&session_id) {
+        return Ok(());
+    }
+
+    let history = state.sessions.session_history(session_id).await?;
+    let projected_context_chars =
+        projected_model_context_chars(&history, state.tool_output_context_chars);
+    if projected_context_chars < state.auto_compaction.context_chars {
+        append_context_compaction_trace(
+            state,
+            session_id,
+            "below_threshold",
+            projected_context_chars,
+            false,
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+
+    append_context_compaction_trace(
+        state,
+        session_id,
+        "threshold_exceeded",
+        projected_context_chars,
+        false,
+        Some(format!(
+            "projected context {projected_context_chars} chars >= threshold {} chars",
+            state.auto_compaction.context_chars
+        )),
+    )
+    .await;
+    let message = compact_session_context(state, session_id).await?;
+    append_context_compaction_trace(
+        state,
+        session_id,
+        "threshold_exceeded",
+        projected_context_chars,
+        true,
+        Some(message),
+    )
+    .await;
+    Ok(())
+}
+
+async fn append_context_compaction_trace(
+    state: &ServerState,
+    session_id: SessionId,
+    reason: &str,
+    projected_context_chars: usize,
+    compacted: bool,
+    message: Option<String>,
+) {
+    let phase = if compacted {
+        SessionTracePhase::ContextCompactionFinished
+    } else if reason == "below_threshold" {
+        SessionTracePhase::ContextCompactionSkipped
+    } else {
+        SessionTracePhase::ContextCompactionStarted
+    };
+    append_trace_event(
+        state,
+        session_id,
+        None,
+        phase,
+        SessionTracePayload::ContextCompaction {
+            reason: reason.to_string(),
+            projected_context_chars,
+            compacted,
+            message,
+        },
+    )
+    .await;
+}
+
+fn projected_model_context_chars(
+    history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
+) -> usize {
+    session_events_to_model_messages_with_limit(history, tool_output_context_chars)
+        .iter()
+        .map(model_message_context_chars)
+        .sum()
+}
+
+fn model_message_context_chars(message: &ModelMessage) -> usize {
+    message
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.chars().count(),
+            ContentBlock::ToolCall { call } => {
+                call.name.chars().count() + call.arguments.to_string().chars().count()
+            }
+            ContentBlock::ToolResult { result } => result.output.chars().count(),
+            ContentBlock::CachePoint { .. } => 0,
+            ContentBlock::ProviderExtension { value } => value.to_string().chars().count(),
+        })
+        .sum()
+}
+
 async fn collect_compaction_summary(
     state: &ServerState,
     session_id: SessionId,
@@ -1622,6 +1744,11 @@ async fn run_model_turn_inner(
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
 ) -> ModelTurnCompletion {
+    if let Err(error) = maybe_auto_compact_session_context(state, session_id).await {
+        let message = format!("auto compaction failed: {error}");
+        append_system_event(state, session_id, message).await;
+    }
+
     let selection = session_model_selection(state, session_id).await;
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
         return ModelTurnCompletion::with_message(
@@ -1673,9 +1800,9 @@ async fn run_model_turn_inner(
         }
         round = round.saturating_add(1);
         if state.max_tool_rounds.is_some_and(|max| round > max) {
+            let max = state.max_tool_rounds.unwrap_or_default();
             let message = format!(
-                "model tool-call round limit reached ({})",
-                state.max_tool_rounds.unwrap_or_default()
+                "model tool-call round limit reached ({max}); remove [model].max_tool_rounds or set max_tool_rounds = 0 for unlimited rounds"
             );
             append_system_event(state, session_id, message.clone()).await;
             return ModelTurnCompletion::with_message(
@@ -2434,7 +2561,8 @@ async fn build_model_turn_request(
     selected_model_id: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.session_history(session_id).await?;
-    let mut messages = session_events_to_model_messages(&history);
+    let mut messages =
+        session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
     let selection = session_model_selection(state, session_id).await;
     let agent_id = session_agent_selection(state, session_id).await;
@@ -2726,8 +2854,6 @@ Tool and safety rules:
 const MAX_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
 const MAX_CONTEXT_FILE_CHARS: usize = 6_000;
 const MAX_GIT_STATUS_CHARS: usize = 4_000;
-const MAX_MODEL_TOOL_RESULT_CHARS: usize = 16_000;
-const MODEL_TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 
 fn build_coding_system_prompt_parts(agent_prompt_suffix: Option<&str>) -> (String, String) {
     let (stable_context, dynamic_context) = build_repository_context_parts();
@@ -2856,22 +2982,36 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn tool_result_for_model(result: &str) -> String {
+fn tool_result_for_model(
+    result: &str,
+    full_output_path: Option<PathBuf>,
+    max_context_chars: usize,
+) -> String {
     let char_count = result.chars().count();
-    if char_count <= MAX_MODEL_TOOL_RESULT_CHARS {
+    if char_count <= max_context_chars {
         return result.to_string();
     }
 
-    let marker = "\n\n[tool output truncated before model continuation; full output is preserved in session history]\n\n";
+    let path = full_output_path.map_or_else(
+        || "the session trace blob store".to_string(),
+        |path| path.display().to_string(),
+    );
+    let marker = format!(
+        "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Full output saved at: {path}. Use filesystem.read on that path if more context is needed.]\n\n",
+        result.len()
+    );
+    if max_context_chars == 0 {
+        return marker.trim().to_string();
+    }
+
     let marker_chars = marker.chars().count();
-    let tail_chars = MODEL_TOOL_RESULT_TAIL_CHARS.min(MAX_MODEL_TOOL_RESULT_CHARS / 4);
-    let head_chars = MAX_MODEL_TOOL_RESULT_CHARS
-        .saturating_sub(marker_chars)
-        .saturating_sub(tail_chars);
-    let head = result.chars().take(head_chars).collect::<String>();
-    let mut tail = result.chars().rev().take(tail_chars).collect::<Vec<_>>();
-    tail.reverse();
-    format!("{head}{marker}{}", tail.into_iter().collect::<String>())
+    if marker_chars >= max_context_chars {
+        return marker.chars().take(max_context_chars).collect();
+    }
+    let head_chars = max_context_chars.saturating_sub(marker_chars);
+    let mut output = result.chars().take(head_chars).collect::<String>();
+    output.push_str(&marker);
+    output
 }
 
 fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
@@ -2978,7 +3118,7 @@ async fn execute_model_tool(
                 session_id,
                 &format!("tool-output-{}", call.id),
                 &result.output,
-                state.observability.max_blob_bytes,
+                0,
             )
         })
         .flatten();
@@ -2992,11 +3132,18 @@ async fn execute_model_tool(
             duration_ms: elapsed_ms(tool_start),
             is_error: result.is_error,
             output_bytes: result.output.len(),
-            output: output_blob,
+            output: output_blob.clone(),
         },
     )
     .await;
-    append_tool_finished_event(state, session_id, call.id, result.output, result.is_error).await;
+    let model_result = tool_result_for_model(
+        &result.output,
+        output_blob
+            .as_ref()
+            .map(|blob| state.trace_store.blob_path(blob)),
+        state.tool_output_context_chars,
+    );
+    append_tool_finished_event(state, session_id, call.id, model_result, result.is_error).await;
 }
 
 async fn invoke_model_tool(
@@ -3272,8 +3419,16 @@ async fn append_permission_resolved_event(
     }
 }
 
+#[cfg(test)]
 fn session_events_to_model_messages(
     history: &[bcode_session_models::SessionEvent],
+) -> Vec<ModelMessage> {
+    session_events_to_model_messages_with_limit(history, usize::MAX)
+}
+
+fn session_events_to_model_messages_with_limit(
+    history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
 ) -> Vec<ModelMessage> {
     let history = compact_attach_history(history.to_vec());
     let latest_compaction_index = history.iter().enumerate().rev().find_map(|(index, event)| {
@@ -3282,22 +3437,29 @@ fn session_events_to_model_messages(
 
     let mut messages = Vec::new();
     if let Some(index) = latest_compaction_index {
-        if let Some(message) = session_event_to_model_message(&history[index]) {
+        if let Some(message) =
+            session_event_to_model_message_with_limit(&history[index], tool_output_context_chars)
+        {
             messages.push(message);
         }
         messages.extend(
             history[index.saturating_add(1)..]
                 .iter()
-                .filter_map(session_event_to_model_message),
+                .filter_map(|event| {
+                    session_event_to_model_message_with_limit(event, tool_output_context_chars)
+                }),
         );
     } else {
-        messages.extend(history.iter().filter_map(session_event_to_model_message));
+        messages.extend(history.iter().filter_map(|event| {
+            session_event_to_model_message_with_limit(event, tool_output_context_chars)
+        }));
     }
     messages
 }
 
-fn session_event_to_model_message(
+fn session_event_to_model_message_with_limit(
     event: &bcode_session_models::SessionEvent,
+    tool_output_context_chars: usize,
 ) -> Option<ModelMessage> {
     match &event.kind {
         SessionEventKind::UserMessage { text, .. } => Some(ModelMessage {
@@ -3331,7 +3493,7 @@ fn session_event_to_model_message(
             content: vec![ContentBlock::ToolResult {
                 result: bcode_model::ToolResult {
                     call_id: tool_call_id.clone(),
-                    output: tool_result_for_model(result),
+                    output: tool_result_for_model(result, None, tool_output_context_chars),
                     is_error: *is_error,
                 },
             }],
@@ -4050,29 +4212,27 @@ mod tests {
     fn tool_result_for_model_preserves_small_output() {
         let output = "short tool output";
 
-        assert_eq!(tool_result_for_model(output), output);
+        assert_eq!(tool_result_for_model(output, None, 4_000), output);
     }
 
     #[test]
-    fn tool_result_for_model_truncates_large_output_with_head_and_tail() {
-        let output = format!(
-            "{}middle{}",
-            "a".repeat(MAX_MODEL_TOOL_RESULT_CHARS),
-            "z".repeat(MAX_MODEL_TOOL_RESULT_CHARS),
-        );
+    fn tool_result_for_model_truncates_large_output_with_artifact_path() {
+        let output = format!("{}middle{}", "a".repeat(4_000), "z".repeat(4_000));
 
-        let truncated = tool_result_for_model(&output);
+        let truncated =
+            tool_result_for_model(&output, Some(PathBuf::from("/tmp/full-output.txt")), 1_000);
 
-        assert!(truncated.chars().count() <= MAX_MODEL_TOOL_RESULT_CHARS);
+        assert!(truncated.chars().count() <= 1_000);
         assert!(truncated.starts_with('a'));
-        assert!(truncated.ends_with('z'));
         assert!(truncated.contains("tool output truncated"));
+        assert!(truncated.contains("/tmp/full-output.txt"));
+        assert!(!truncated.ends_with('z'));
     }
 
     #[test]
     fn tool_result_model_message_uses_truncated_output() {
         let session_id = SessionId::new();
-        let output = "x".repeat(MAX_MODEL_TOOL_RESULT_CHARS + 1);
+        let output = "x".repeat(4_001);
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 1,
@@ -4084,12 +4244,13 @@ mod tests {
             },
         };
 
-        let message = session_event_to_model_message(&event).expect("tool result message");
+        let message =
+            session_event_to_model_message_with_limit(&event, 1_000).expect("tool result message");
         let ContentBlock::ToolResult { result } = &message.content[0] else {
             panic!("expected tool result content block");
         };
 
-        assert!(result.output.chars().count() <= MAX_MODEL_TOOL_RESULT_CHARS);
+        assert!(result.output.chars().count() <= 1_000);
         assert!(result.output.contains("tool output truncated"));
     }
 }
