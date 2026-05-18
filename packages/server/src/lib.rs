@@ -1349,6 +1349,8 @@ async fn handle_resolve_permission(
 
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const COMPACTION_POLL_ATTEMPTS: usize = 1_200;
+const COMPACTION_TURN_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Default)]
 struct ModelPollOutcome {
@@ -1402,8 +1404,8 @@ struct CompactionTranscript {
 }
 
 const COMPACTION_SYSTEM_PROMPT: &str = "You compact coding-agent session history. Produce only a durable continuation summary for future model turns. Preserve all facts needed to continue the work, including user goals, decisions, constraints, files changed, commands run, validation results, current blockers, and next steps. Do not invent details. Do not include markdown fences.";
-const COMPACTION_CHUNK_TARGET_CHARS: usize = 32_000;
-const COMPACTION_MIN_CHUNK_CHARS: usize = 4_000;
+const COMPACTION_CHUNK_TARGET_CHARS: usize = 12_000;
+const COMPACTION_MIN_CHUNK_CHARS: usize = 2_000;
 const COMPACTION_MAX_CARRIED_SUMMARY_CHARS: usize = 24_000;
 const COMPACTION_MAX_EVENT_CONTENT_CHARS: usize = 16_000;
 
@@ -1595,11 +1597,24 @@ async fn collect_compaction_summary(
     let mut chunks = compaction_chunks(&transcript.lines, COMPACTION_CHUNK_TARGET_CHARS);
     let mut chunk_index = 0_usize;
     while chunk_index < chunks.len() {
+        let chunk_number = chunk_index.saturating_add(1);
+        let chunk_count = chunks.len();
+        append_context_compaction_trace(
+            state,
+            session_id,
+            "chunk",
+            0,
+            false,
+            Some(format!(
+                "compacting context chunk {chunk_number}/{chunk_count}"
+            )),
+        )
+        .await;
         let prompt_text = compaction_prompt_text(
             summary.trim(),
             &chunks[chunk_index],
             chunk_index,
-            chunks.len(),
+            chunk_count,
         );
         match collect_compaction_summary_chunk(
             state,
@@ -1613,11 +1628,35 @@ async fn collect_compaction_summary(
         {
             Ok(next_summary) => {
                 summary = truncate_text(next_summary.trim(), COMPACTION_MAX_CARRIED_SUMMARY_CHARS);
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    "chunk",
+                    0,
+                    true,
+                    Some(format!(
+                        "compacted context chunk {chunk_number}/{chunk_count}"
+                    )),
+                )
+                .await;
                 chunk_index = chunk_index.saturating_add(1);
             }
             Err(error)
-                if is_context_length_compaction_error(&error)
-                    && split_compaction_chunk_at(&mut chunks, chunk_index) => {}
+                if is_retriable_compaction_chunk_error(&error)
+                    && split_compaction_chunk_at(&mut chunks, chunk_index) =>
+            {
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    "chunk_split",
+                    0,
+                    false,
+                    Some(format!(
+                        "compaction chunk {chunk_number}/{chunk_count} was too large or slow; splitting smaller"
+                    )),
+                )
+                .await;
+            }
             Err(error) => return Err(CompactionError::Provider(error)),
         }
     }
@@ -1648,7 +1687,7 @@ async fn collect_compaction_summary_chunk(
     let provider_turn_id = start.provider_turn_id;
     let result = poll_compaction_summary(state, session_id, selection, &provider_turn_id, &turn_id)
         .await
-        .map_err(|error| error.to_string());
+        .map_err(compaction_error_detail);
     finish_provider_turn(
         state,
         selection.provider_plugin_id.clone(),
@@ -1754,6 +1793,10 @@ fn split_compaction_chunk_at(chunks: &mut Vec<String>, index: usize) -> bool {
     true
 }
 
+fn is_retriable_compaction_chunk_error(error: &str) -> bool {
+    is_context_length_compaction_error(error) || is_timeout_compaction_error(error)
+}
+
 fn is_context_length_compaction_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("context_length")
@@ -1766,6 +1809,20 @@ fn is_context_length_compaction_error(error: &str) -> bool {
         || error.contains("too many tokens")
 }
 
+fn is_timeout_compaction_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("did not finish compaction turn")
+        || error.contains("compaction turn timed out")
+        || error.contains("provider was idle")
+}
+
+fn compaction_error_detail(error: CompactionError) -> String {
+    match error {
+        CompactionError::Provider(message) => message,
+        error => error.to_string(),
+    }
+}
+
 async fn poll_compaction_summary(
     state: &ServerState,
     session_id: SessionId,
@@ -1775,7 +1832,7 @@ async fn poll_compaction_summary(
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
     let mut idle_for = Duration::ZERO;
-    for _ in 0..1_200 {
+    for _ in 0..COMPACTION_POLL_ATTEMPTS {
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
         };
@@ -1795,9 +1852,9 @@ async fn poll_compaction_summary(
             CompactionPollStatus::Failed(error) => return Err(CompactionError::Provider(error)),
         }
     }
-    Err(CompactionError::Provider(
-        "model provider did not finish compaction turn".to_string(),
-    ))
+    Err(CompactionError::Provider(format!(
+        "model provider did not finish compaction turn within {COMPACTION_TURN_TIMEOUT_SECS} seconds"
+    )))
 }
 
 async fn wait_for_compaction_event(idle_for: Duration) -> Result<Duration, CompactionError> {
@@ -4487,6 +4544,21 @@ mod tests {
 
         assert!(prompt.contains("[truncated]"));
         assert!(prompt.contains("next chunk"));
+    }
+
+    #[test]
+    fn compaction_timeout_errors_are_retriable_for_chunk_splitting() {
+        assert!(is_retriable_compaction_chunk_error(
+            "model provider did not finish compaction turn within 120 seconds"
+        ));
+    }
+
+    #[test]
+    fn compaction_provider_error_detail_avoids_nested_provider_prefix() {
+        assert_eq!(
+            compaction_error_detail(CompactionError::Provider("model failed".to_string())),
+            "model failed"
+        );
     }
 
     #[test]

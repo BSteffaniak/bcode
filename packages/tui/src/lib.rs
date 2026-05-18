@@ -24,6 +24,7 @@ use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
     ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionSummary, SessionTokenUsage,
+    SessionTracePayload, SessionTracePhase,
 };
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
@@ -1557,6 +1558,7 @@ enum TranscriptBlock {
 enum ActivityState {
     Idle,
     Thinking,
+    Compacting { detail: String },
     Streaming { chars: usize },
     RunningTool { name: String },
     WaitingPermission { name: String },
@@ -2014,6 +2016,15 @@ impl ChatApp {
                     .clone()
                     .unwrap_or_else(|| model_turn_outcome_label(*outcome).to_string());
             }
+            SessionEventKind::TraceEvent { trace } => {
+                self.update_activity_from_trace(trace);
+            }
+            SessionEventKind::ContextCompacted { .. } => {
+                if matches!(self.activity, ActivityState::Compacting { .. }) {
+                    self.set_activity(ActivityState::Thinking);
+                    self.status = "compaction complete; retrying model turn".to_string();
+                }
+            }
             SessionEventKind::SessionCreated { name }
             | SessionEventKind::SessionRenamed { name } => {
                 self.session_title.clone_from(name);
@@ -2024,9 +2035,49 @@ impl ChatApp {
             | SessionEventKind::ModelChanged { .. }
             | SessionEventKind::AgentChanged { .. }
             | SessionEventKind::SystemMessage { .. }
-            | SessionEventKind::ContextCompacted { .. }
-            | SessionEventKind::ModelUsage { .. }
-            | SessionEventKind::TraceEvent { .. } => {}
+            | SessionEventKind::ModelUsage { .. } => {}
+        }
+    }
+
+    fn update_activity_from_trace(&mut self, trace: &bcode_session_models::SessionTraceEvent) {
+        let SessionTracePayload::ContextCompaction {
+            reason,
+            compacted,
+            message,
+            ..
+        } = &trace.payload
+        else {
+            return;
+        };
+
+        match trace.phase {
+            SessionTracePhase::ContextCompactionStarted => {
+                let detail = message
+                    .clone()
+                    .unwrap_or_else(|| format!("context compaction · {reason}"));
+                self.set_activity(ActivityState::Compacting {
+                    detail: detail.clone(),
+                });
+                self.status = detail;
+            }
+            SessionTracePhase::ContextCompactionFinished => {
+                let detail = message
+                    .clone()
+                    .unwrap_or_else(|| "context compaction finished".to_string());
+                self.status = detail;
+                if *compacted {
+                    self.set_activity(ActivityState::Thinking);
+                }
+            }
+            SessionTracePhase::ContextCompactionSkipped => {
+                if matches!(self.activity, ActivityState::Compacting { .. }) {
+                    self.set_activity(ActivityState::Thinking);
+                }
+                if let Some(message) = message {
+                    self.status.clone_from(message);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2974,6 +3025,9 @@ fn activity_label(activity: &ActivityState) -> String {
     match activity {
         ActivityState::Idle => "ready".to_string(),
         ActivityState::Thinking => "thinking".to_string(),
+        ActivityState::Compacting { detail } => {
+            format!("compacting context · {}", truncate_middle(detail, 36))
+        }
         ActivityState::Streaming { chars } => {
             format!("streaming · {} chars", compact_count(*chars))
         }
@@ -4709,6 +4763,48 @@ mod tests {
         )));
         assert_eq!(app.activity, ActivityState::Idle);
         assert_eq!(app.status, "provider failed");
+    }
+
+    #[test]
+    fn compaction_trace_events_show_progress_activity() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::TraceEvent {
+                trace: Box::new(bcode_session_models::SessionTraceEvent {
+                    timestamp_ms: 0,
+                    turn_id: Some("turn-1".to_string()),
+                    phase: SessionTracePhase::ContextCompactionStarted,
+                    payload: SessionTracePayload::ContextCompaction {
+                        reason: "chunk".to_string(),
+                        projected_context_chars: 0,
+                        compacted: false,
+                        message: Some("compacting context chunk 1/3".to_string()),
+                    },
+                }),
+            },
+        )));
+
+        assert_eq!(
+            app.activity,
+            ActivityState::Compacting {
+                detail: "compacting context chunk 1/3".to_string()
+            }
+        );
+        assert_eq!(app.status, "compacting context chunk 1/3");
+
+        app.push_event(Event::Session(session_event(
+            session_id,
+            SessionEventKind::ContextCompacted {
+                summary: "summary".to_string(),
+                compacted_through_sequence: 1,
+            },
+        )));
+
+        assert_eq!(app.activity, ActivityState::Thinking);
     }
 
     #[test]
