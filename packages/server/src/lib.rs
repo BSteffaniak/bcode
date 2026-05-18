@@ -1273,6 +1273,7 @@ struct ModelPollOutcome {
     stop_reason: Option<bcode_model::StopReason>,
     should_continue: bool,
     completion: Option<ModelTurnCompletion>,
+    provider_error: Option<bcode_model::ProviderError>,
 }
 
 #[derive(Debug, Clone)]
@@ -1323,12 +1324,38 @@ async fn compact_session_context(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<String, CompactionError> {
+    compact_session_context_with_limit(state, session_id, None).await
+}
+
+async fn compact_session_context_before_sequence(
+    state: &ServerState,
+    session_id: SessionId,
+    first_kept_sequence: u64,
+) -> Result<String, CompactionError> {
+    compact_session_context_with_limit(state, session_id, Some(first_kept_sequence)).await
+}
+
+async fn compact_session_context_with_limit(
+    state: &ServerState,
+    session_id: SessionId,
+    first_kept_sequence: Option<u64>,
+) -> Result<String, CompactionError> {
     if state.active_turns.lock().await.contains_key(&session_id) {
         return Err(CompactionError::Busy);
     }
 
     let history = state.sessions.session_history(session_id).await?;
-    let Some(transcript) = compaction_transcript(&history) else {
+    let transcript_history = first_kept_sequence.map_or_else(
+        || history.clone(),
+        |first_kept_sequence| {
+            history
+                .iter()
+                .filter(|event| event.sequence < first_kept_sequence)
+                .cloned()
+                .collect()
+        },
+    );
+    let Some(transcript) = compaction_transcript(&transcript_history) else {
         return Err(CompactionError::NothingToCompact(
             "nothing new to compact".to_string(),
         ));
@@ -1363,7 +1390,9 @@ async fn maybe_auto_compact_session_context(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<(), CompactionError> {
-    if !state.auto_compaction.mode.is_enabled() || state.auto_compaction.context_chars == 0 {
+    if !state.auto_compaction.mode.is_proactive_enabled()
+        || state.auto_compaction.context_chars == 0
+    {
         return Ok(());
     }
     if state.active_turns.lock().await.contains_key(&session_id) {
@@ -1522,7 +1551,6 @@ fn build_compaction_request(
         }],
         tools: Vec::new(),
         parameters: ModelParameters {
-            temperature: Some(0.0),
             max_output_tokens: Some(2048),
             ..ModelParameters::default()
         },
@@ -1759,6 +1787,7 @@ async fn run_model_turn_inner(
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
     let mut round = 0_u32;
+    let mut retried_after_context_overflow = false;
     loop {
         let request = match build_model_turn_request(
             state,
@@ -1792,7 +1821,24 @@ async fn run_model_turn_inner(
                 Ok(outcome) => outcome,
                 Err(completion) => return completion,
             };
-        if let Some(completion) = outcome.completion {
+        if let Some(error) = outcome.provider_error.as_ref()
+            && should_retry_after_context_overflow(state, error, retried_after_context_overflow)
+        {
+            retried_after_context_overflow = true;
+            match compact_session_after_context_overflow(
+                state,
+                session_id,
+                trigger_event.sequence,
+                error,
+            )
+            .await
+            {
+                Ok(()) => continue,
+                Err(completion) => return completion,
+            }
+        }
+        if let Some(completion) = outcome.completion.clone() {
+            append_deferred_provider_error_if_needed(state, session_id, &outcome).await;
             return completion;
         }
         if !outcome.should_continue {
@@ -1811,6 +1857,78 @@ async fn run_model_turn_inner(
             );
         }
     }
+}
+
+fn should_retry_after_context_overflow(
+    state: &ServerState,
+    error: &bcode_model::ProviderError,
+    already_retried: bool,
+) -> bool {
+    !already_retried
+        && state.auto_compaction.mode.is_overflow_recovery_enabled()
+        && is_context_length_provider_error(error)
+}
+
+async fn compact_session_after_context_overflow(
+    state: &ServerState,
+    session_id: SessionId,
+    first_kept_sequence: u64,
+    error: &bcode_model::ProviderError,
+) -> Result<(), ModelTurnCompletion> {
+    append_context_compaction_trace(
+        state,
+        session_id,
+        "overflow",
+        0,
+        false,
+        Some(format!(
+            "provider reported context overflow ({}: {})",
+            error.code, error.message
+        )),
+    )
+    .await;
+    match compact_session_context_before_sequence(state, session_id, first_kept_sequence).await {
+        Ok(message) => {
+            append_context_compaction_trace(
+                state,
+                session_id,
+                "overflow",
+                0,
+                true,
+                Some(format!("{message}; retrying model turn")),
+            )
+            .await;
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("context overflow compaction failed: {error}");
+            append_system_event(state, session_id, message.clone()).await;
+            Err(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                message,
+            ))
+        }
+    }
+}
+
+async fn append_deferred_provider_error_if_needed(
+    state: &ServerState,
+    session_id: SessionId,
+    outcome: &ModelPollOutcome,
+) {
+    if let Some(error) = outcome.provider_error.as_ref()
+        && is_context_length_provider_error(error)
+    {
+        append_system_event(state, session_id, provider_error_message(error)).await;
+    }
+}
+
+fn is_context_length_provider_error(error: &bcode_model::ProviderError) -> bool {
+    error.category == bcode_model::ProviderErrorCategory::ContextLength
+}
+
+fn provider_error_message(error: &bcode_model::ProviderError) -> String {
+    format!("model error {}: {}", error.code, error.message)
 }
 
 async fn run_model_turn_round(
@@ -2113,10 +2231,14 @@ async fn handle_provider_error_event(
     error: bcode_model::ProviderError,
     outcome: &mut ModelPollOutcome,
 ) {
-    let message = format!("model error {}: {}", error.code, error.message);
+    let message = provider_error_message(&error);
+    let defer_visible_message = is_context_length_provider_error(&error);
     append_provider_event_trace(state, session_id, turn_id, "error", Some(message.clone())).await;
-    append_system_event(state, session_id, message.clone()).await;
+    if !defer_visible_message {
+        append_system_event(state, session_id, message.clone()).await;
+    }
     outcome.stop_reason = Some(bcode_model::StopReason::Error);
+    outcome.provider_error = Some(error);
     outcome.completion = Some(ModelTurnCompletion::with_message(
         ModelTurnOutcome::Error,
         message,
@@ -2145,7 +2267,7 @@ async fn handle_provider_turn_finished_event(
             ModelTurnOutcome::Cancelled,
             "model turn cancelled",
         ));
-    } else if stop_reason == bcode_model::StopReason::Error {
+    } else if stop_reason == bcode_model::StopReason::Error && outcome.completion.is_none() {
         outcome.completion = Some(ModelTurnCompletion::with_message(
             ModelTurnOutcome::Error,
             "model turn ended with error",
@@ -3431,22 +3553,39 @@ fn session_events_to_model_messages_with_limit(
     tool_output_context_chars: usize,
 ) -> Vec<ModelMessage> {
     let history = compact_attach_history(history.to_vec());
-    let latest_compaction_index = history.iter().enumerate().rev().find_map(|(index, event)| {
-        matches!(&event.kind, SessionEventKind::ContextCompacted { .. }).then_some(index)
-    });
+    let latest_compaction =
+        history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match &event.kind {
+                SessionEventKind::ContextCompacted {
+                    compacted_through_sequence,
+                    ..
+                } => Some((index, *compacted_through_sequence)),
+                _ => None,
+            });
 
     let mut messages = Vec::new();
-    if let Some(index) = latest_compaction_index {
+    if let Some((index, compacted_through_sequence)) = latest_compaction {
         if let Some(message) =
             session_event_to_model_message_with_limit(&history[index], tool_output_context_chars)
         {
             messages.push(message);
         }
         messages.extend(
-            history[index.saturating_add(1)..]
+            history
                 .iter()
-                .filter_map(|event| {
-                    session_event_to_model_message_with_limit(event, tool_output_context_chars)
+                .enumerate()
+                .filter_map(|(event_index, event)| {
+                    (event_index != index && event.sequence > compacted_through_sequence).then(
+                        || {
+                            session_event_to_model_message_with_limit(
+                                event,
+                                tool_output_context_chars,
+                            )
+                        },
+                    )?
                 }),
         );
     } else {
@@ -4020,6 +4159,80 @@ mod tests {
             &messages[1].content[0],
             ContentBlock::Text { text } if text == "new request"
         ));
+    }
+
+    #[test]
+    fn session_projection_keeps_events_after_compacted_sequence() {
+        let session_id = SessionId::new();
+        let client_id = ClientId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                0,
+                SessionEventKind::UserMessage {
+                    client_id,
+                    text: "old request".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id,
+                    text: "current request".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ContextCompacted {
+                    summary: "summary of old request".to_string(),
+                    compacted_through_sequence: 0,
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&history);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::Text { text } if text == "current request"
+        ));
+    }
+
+    #[test]
+    fn compaction_request_omits_temperature_for_strict_providers() {
+        let session_id = SessionId::new();
+        let selection = SessionModelSelection {
+            model_id: Some("model".to_string()),
+            ..SessionModelSelection::default()
+        };
+        let transcript = CompactionTranscript {
+            text: "old transcript".to_string(),
+            compacted_through_sequence: 42,
+            event_count: 1,
+        };
+
+        let request = build_compaction_request(session_id, &selection, &transcript, "turn".into());
+
+        assert_eq!(request.parameters.temperature, None);
+        assert_eq!(request.parameters.max_output_tokens, Some(2048));
+    }
+
+    #[test]
+    fn context_length_errors_are_retryable_by_compaction_policy() {
+        let error = bcode_model::ProviderError {
+            code: "context_length_exceeded".to_string(),
+            category: bcode_model::ProviderErrorCategory::ContextLength,
+            message: "too many tokens".to_string(),
+            retryable: false,
+            provider_message: None,
+        };
+
+        assert!(is_context_length_provider_error(&error));
     }
 
     #[test]

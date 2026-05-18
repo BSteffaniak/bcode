@@ -581,7 +581,7 @@ pub struct CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            mode: CompactionMode::Auto,
+            mode: CompactionMode::OnOverflow,
             context_chars: default_auto_compaction_context_chars(),
         }
     }
@@ -591,16 +591,36 @@ impl Default for CompactionConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMode {
+    /// Disable automatic compaction entirely. Manual compaction remains available.
     Off,
+    /// Compact only after the provider reports a context-length overflow.
     #[default]
+    OnOverflow,
+    /// Compact before model turns when the projected context character threshold is exceeded.
+    Proactive,
+    /// Compact proactively and also recover from provider context-length overflows.
+    ProactiveAndOverflow,
+    /// Legacy spelling for automatic compaction.
     Auto,
 }
 
 impl CompactionMode {
-    /// Return whether automatic compaction may run.
+    /// Return whether proactive threshold-based compaction may run.
     #[must_use]
-    pub const fn is_enabled(self) -> bool {
-        matches!(self, Self::Auto)
+    pub const fn is_proactive_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::Auto | Self::Proactive | Self::ProactiveAndOverflow
+        )
+    }
+
+    /// Return whether provider context-length overflow should trigger compaction and retry.
+    #[must_use]
+    pub const fn is_overflow_recovery_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::Auto | Self::OnOverflow | Self::ProactiveAndOverflow
+        )
     }
 }
 
@@ -1338,6 +1358,9 @@ const fn conversation_reuse_mode_name(mode: bcode_model::ConversationReuseMode) 
 const fn compaction_mode_name(mode: CompactionMode) -> &'static str {
     match mode {
         CompactionMode::Off => "off",
+        CompactionMode::OnOverflow => "on_overflow",
+        CompactionMode::Proactive => "proactive",
+        CompactionMode::ProactiveAndOverflow => "proactive_and_overflow",
         CompactionMode::Auto => "auto",
     }
 }
@@ -1814,7 +1837,7 @@ max_tool_rounds = 3
 
         assert_eq!(config.model.effective_max_tool_rounds(), None);
         assert_eq!(config.model.tool_output.context_chars, 4_000);
-        assert_eq!(config.model.compaction.mode, CompactionMode::Auto);
+        assert_eq!(config.model.compaction.mode, CompactionMode::OnOverflow);
         assert_eq!(config.model.compaction.context_chars, 120_000);
     }
 
@@ -1844,6 +1867,29 @@ context_chars = 90000
 
         assert_eq!(config.model.compaction.mode, CompactionMode::Off);
         assert_eq!(config.model.compaction.context_chars, 90_000);
+    }
+
+    #[test]
+    fn parses_new_compaction_modes() {
+        for (mode, expected) in [
+            ("on_overflow", CompactionMode::OnOverflow),
+            ("proactive", CompactionMode::Proactive),
+            (
+                "proactive_and_overflow",
+                CompactionMode::ProactiveAndOverflow,
+            ),
+            ("auto", CompactionMode::Auto),
+        ] {
+            let config: BcodeConfig = toml::from_str(&format!(
+                r#"
+[model.compaction]
+mode = "{mode}"
+"#
+            ))
+            .expect("config should parse");
+
+            assert_eq!(config.model.compaction.mode, expected);
+        }
     }
 
     #[test]

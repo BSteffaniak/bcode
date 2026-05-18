@@ -908,9 +908,14 @@ fn process_responses_stream_line(
                 .and_then(serde_json::Value::as_str)
                 .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
                 .unwrap_or("OpenAI Responses stream failed");
+            let code = event
+                .get("error")
+                .and_then(|error| error.get("code").or_else(|| error.get("type")))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("responses_stream_failed");
             return Err(provider_error(
-                "responses_stream_failed",
-                ProviderErrorCategory::ProviderInternal,
+                code,
+                category_from_openai_error(400, code, message),
                 message,
             ));
         }
@@ -1053,13 +1058,12 @@ fn process_stream_line(
     if let Ok(err_body) = serde_json::from_str::<ErrorResponseBody>(data)
         && let Some(err) = err_body.error
     {
-        return Err(provider_error(
-            err.code
-                .or(err.r#type)
-                .unwrap_or_else(|| "api_error".to_string()),
-            category_from_status(400),
-            err.message,
-        ));
+        let code = err
+            .code
+            .or(err.r#type)
+            .unwrap_or_else(|| "api_error".to_string());
+        let category = category_from_openai_error(400, &code, &err.message);
+        return Err(provider_error(code, category, err.message));
     }
 
     let chunk = serde_json::from_str::<ChatCompletionChunk>(data).map_err(|error| {
@@ -2694,7 +2698,15 @@ fn error_from_status(status: u16, body: &str) -> ProviderError {
         .and_then(|body| body.error.as_ref())
         .and_then(|error| error.code.clone().or_else(|| error.r#type.clone()))
         .unwrap_or_else(|| format!("http_{status}"));
-    provider_error(code, category_from_status(status), message)
+    let category = category_from_openai_error(status, &code, &message);
+    provider_error(code, category, message)
+}
+
+fn category_from_openai_error(status: u16, code: &str, message: &str) -> ProviderErrorCategory {
+    if is_context_length_error(code, message) {
+        return ProviderErrorCategory::ContextLength;
+    }
+    category_from_status(status)
 }
 
 const fn category_from_status(status: u16) -> ProviderErrorCategory {
@@ -2706,6 +2718,26 @@ const fn category_from_status(status: u16) -> ProviderErrorCategory {
         400..=499 => ProviderErrorCategory::InvalidRequest,
         _ => ProviderErrorCategory::ProviderInternal,
     }
+}
+
+fn is_context_length_error(code: &str, message: &str) -> bool {
+    let code = code.to_ascii_lowercase();
+    if code.contains("context_length") || code.contains("context_window") {
+        return true;
+    }
+
+    let message = message.to_ascii_lowercase();
+    message.contains("context_length_exceeded")
+        || message.contains("maximum context length")
+        || message.contains("prompt is too long")
+        || message.contains("input is too long")
+        || message.contains("too many tokens")
+        || (message.contains("context length")
+            && (message.contains("exceed") || message.contains("too long")))
+        || (message.contains("context window")
+            && (message.contains("exceed")
+                || message.contains("too long")
+                || message.contains("overflow")))
 }
 
 fn provider_error(
@@ -3249,6 +3281,47 @@ mod tests {
             event,
             ProviderTurnEvent::ProviderMetadata { key, .. } if key == "provider_response_id"
         )));
+    }
+
+    #[test]
+    fn http_context_length_error_is_classified_for_overflow_recovery() {
+        let error = error_from_status(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens.","code":"context_length_exceeded","type":"invalid_request_error"}}"#,
+        );
+
+        assert_eq!(error.category, ProviderErrorCategory::ContextLength);
+        assert_eq!(error.code, "context_length_exceeded");
+    }
+
+    #[test]
+    fn unsupported_temperature_error_stays_invalid_request() {
+        let error = error_from_status(
+            400,
+            r#"{"error":{"message":"Unsupported parameter: temperature","code":"unsupported_parameter","type":"invalid_request_error"}}"#,
+        );
+
+        assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+    }
+
+    #[test]
+    fn responses_stream_context_length_error_is_classified_for_overflow_recovery() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+
+        let error = process_responses_stream_line(
+            r#"data: {"type":"response.failed","error":{"code":"context_length_exceeded","message":"input is too long for the model context window"}}"#,
+            &turn,
+            OpenAiCompatibleDialect::ResponsesApi,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect_err("context error should fail");
+
+        assert_eq!(error.category, ProviderErrorCategory::ContextLength);
     }
 
     #[test]

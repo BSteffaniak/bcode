@@ -1846,6 +1846,8 @@ fn bedrock_sdk_error(
         ProviderErrorCategory::Auth
     } else if message.contains("Throttl") || message.contains("TooManyRequests") {
         ProviderErrorCategory::RateLimit
+    } else if is_context_length_error(&message) {
+        ProviderErrorCategory::ContextLength
     } else if message.contains("ValidationException") {
         ProviderErrorCategory::InvalidRequest
     } else if message.contains("ResourceNotFound") || message.contains("not found") {
@@ -1862,6 +1864,8 @@ fn bedrock_discovery_error(error: &(impl std::fmt::Debug + ToString + ?Sized)) -
         ProviderErrorCategory::Auth
     } else if message.contains("Throttl") || message.contains("TooManyRequests") {
         ProviderErrorCategory::RateLimit
+    } else if is_context_length_error(&message) {
+        ProviderErrorCategory::ContextLength
     } else if message.contains("ValidationException") {
         ProviderErrorCategory::InvalidRequest
     } else {
@@ -1871,11 +1875,27 @@ fn bedrock_discovery_error(error: &(impl std::fmt::Debug + ToString + ?Sized)) -
 }
 
 fn bedrock_stream_error(error: &(impl ToString + ?Sized)) -> ProviderError {
-    provider_error(
-        "bedrock_stream_failed",
-        ProviderErrorCategory::ProviderInternal,
-        error.to_string(),
-    )
+    let message = error.to_string();
+    let category = if is_context_length_error(&message) {
+        ProviderErrorCategory::ContextLength
+    } else {
+        ProviderErrorCategory::ProviderInternal
+    };
+    provider_error("bedrock_stream_failed", category, message)
+}
+
+fn is_context_length_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("maximum context length")
+        || message.contains("prompt is too long")
+        || message.contains("input is too long")
+        || message.contains("too many tokens")
+        || (message.contains("context length")
+            && (message.contains("exceed") || message.contains("too long")))
+        || (message.contains("context window")
+            && (message.contains("exceed")
+                || message.contains("too long")
+                || message.contains("overflow")))
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
