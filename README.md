@@ -10,6 +10,8 @@ TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.
 [tui.keybindings.chat]
 "enter" = "tui.input.submit"
 "shift+enter" = "tui.input.newLine"
+"up" = "tui.input.historyPrevious"
+"down" = "tui.input.historyNext"
 "left" = "tui.editor.moveCursorLeft"
 "right" = "tui.editor.moveCursorRight"
 "alt+left" = "tui.editor.moveCursorWordLeft"
@@ -52,7 +54,7 @@ TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.
 
 Key format follows `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples: `ctrl+d`, `alt+left`, `pageUp`, `escape`, `enter`.
 
-The chat composer uses a Unicode-aware editor buffer. Standard composer defaults include left/right grapheme movement, `alt+left` / `alt+right` and `ctrl+left` / `ctrl+right` word movement, `ctrl+a` / `ctrl+e` start/end movement, `backspace` / `delete` character deletion, `alt+backspace` / `ctrl+w` word-backward deletion, `alt+delete` / `ctrl+delete` word-forward deletion, and `ctrl+u` / `ctrl+k` delete-to-start/end. Plain `home` and `end` remain transcript top/bottom bindings in the chat scope by default.
+The chat composer uses a Unicode-aware editor buffer. Standard composer defaults include `up` / `down` session message history navigation, left/right grapheme movement, `alt+left` / `alt+right` and `ctrl+left` / `ctrl+right` word movement, `ctrl+a` / `ctrl+e` start/end movement, `backspace` / `delete` character deletion, `alt+backspace` / `ctrl+w` word-backward deletion, `alt+delete` / `ctrl+delete` word-forward deletion, and `ctrl+u` / `ctrl+k` delete-to-start/end. Plain `home` and `end` remain transcript top/bottom bindings in the chat scope by default.
 
 Permission prompts are modal by default: permission actions only apply in the permission scope, and hints are generated from the configured permission keymap.
 

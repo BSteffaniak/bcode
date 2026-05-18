@@ -85,6 +85,8 @@ const COLOR_SELECTED_BG: Color = Color::Rgb(38, 52, 64);
 enum TuiAction {
     InputSubmit,
     InputNewLine,
+    InputHistoryPrevious,
+    InputHistoryNext,
     DeleteCharBackward,
     DeleteCharForward,
     DeleteWordBackward,
@@ -133,6 +135,8 @@ impl TuiAction {
         Some(match id {
             "tui.input.submit" => Self::InputSubmit,
             "tui.input.newLine" => Self::InputNewLine,
+            "tui.input.historyPrevious" => Self::InputHistoryPrevious,
+            "tui.input.historyNext" => Self::InputHistoryNext,
             "tui.editor.deleteCharBackward" => Self::DeleteCharBackward,
             "tui.editor.deleteCharForward" => Self::DeleteCharForward,
             "tui.editor.deleteWordBackward" => Self::DeleteWordBackward,
@@ -301,6 +305,8 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
             action_bindings(&[
                 ("enter", TuiAction::InputSubmit),
                 ("shift+enter", TuiAction::InputNewLine),
+                ("up", TuiAction::InputHistoryPrevious),
+                ("down", TuiAction::InputHistoryNext),
                 ("backspace", TuiAction::DeleteCharBackward),
                 ("delete", TuiAction::DeleteCharForward),
                 ("alt+backspace", TuiAction::DeleteWordBackward),
@@ -672,6 +678,7 @@ async fn run_chat(
                             palette.filter.push(character);
                             palette.selected = 0;
                         } else {
+                            app.reset_input_history_navigation();
                             app.input.insert_char(character);
                             if app.search_mode {
                                 app.update_search();
@@ -717,6 +724,7 @@ async fn handle_tui_action(
             if app.input.is_empty() {
                 return true;
             }
+            app.reset_input_history_navigation();
             app.input.clear();
             app.status = "input cleared; press exit again to quit".to_string();
         }
@@ -741,6 +749,7 @@ async fn handle_tui_action(
             }
         }
         TuiAction::AppClear => {
+            app.reset_input_history_navigation();
             app.input.clear();
             app.status = "input cleared".to_string();
         }
@@ -775,16 +784,20 @@ async fn handle_tui_action(
             }
         }
         TuiAction::InputNewLine => {
+            app.reset_input_history_navigation();
             app.input.insert_newline();
             if app.search_mode {
                 app.update_search();
             }
         }
+        TuiAction::InputHistoryPrevious => app.previous_input_history(),
+        TuiAction::InputHistoryNext => app.next_input_history(),
         TuiAction::DeleteCharBackward => {
             if let Some(palette) = &mut app.command_palette {
                 palette.filter.pop();
                 palette.selected = 0;
             } else {
+                app.reset_input_history_navigation();
                 app.input.delete_backward();
                 if app.search_mode {
                     app.update_search();
@@ -792,30 +805,35 @@ async fn handle_tui_action(
             }
         }
         TuiAction::DeleteCharForward => {
+            app.reset_input_history_navigation();
             app.input.delete(TextDelete::Forward);
             if app.search_mode {
                 app.update_search();
             }
         }
         TuiAction::DeleteWordBackward => {
+            app.reset_input_history_navigation();
             app.input.delete(TextDelete::WordBackward);
             if app.search_mode {
                 app.update_search();
             }
         }
         TuiAction::DeleteWordForward => {
+            app.reset_input_history_navigation();
             app.input.delete(TextDelete::WordForward);
             if app.search_mode {
                 app.update_search();
             }
         }
         TuiAction::DeleteToStart => {
+            app.reset_input_history_navigation();
             app.input.delete(TextDelete::ToStart);
             if app.search_mode {
                 app.update_search();
             }
         }
         TuiAction::DeleteToEnd => {
+            app.reset_input_history_navigation();
             app.input.delete(TextDelete::ToEnd);
             if app.search_mode {
                 app.update_search();
@@ -1537,6 +1555,9 @@ struct ChatApp {
     session_title: Option<String>,
     blocks: Vec<TranscriptBlock>,
     input: TextEditBuffer,
+    input_history: Vec<String>,
+    input_history_index: Option<usize>,
+    input_history_draft: Option<String>,
     status: String,
     pending_permissions: BTreeMap<String, PendingPermissionView>,
     selected_provider_plugin_id: Option<String>,
@@ -1812,6 +1833,9 @@ impl ChatApp {
             session_title: None,
             blocks: Vec::new(),
             input: TextEditBuffer::new(),
+            input_history: Vec::new(),
+            input_history_index: None,
+            input_history_draft: None,
             status: keymap
                 .warnings
                 .first()
@@ -1972,6 +1996,7 @@ impl ChatApp {
     }
 
     fn start_search(&mut self) {
+        self.reset_input_history_navigation();
         self.search_mode = true;
         self.search_query.clear();
         self.input.clear();
@@ -1979,6 +2004,7 @@ impl ChatApp {
     }
 
     fn finish_search(&mut self) {
+        self.reset_input_history_navigation();
         self.search_mode = false;
         self.search_query = self.input.text().to_string();
         self.input.clear();
@@ -1986,6 +2012,7 @@ impl ChatApp {
     }
 
     fn cancel_search(&mut self) {
+        self.reset_input_history_navigation();
         self.search_mode = false;
         self.input.clear();
         self.status = "search canceled".to_string();
@@ -2193,6 +2220,9 @@ impl ChatApp {
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent_id.clone_from(agent_id);
             }
+            SessionEventKind::UserMessage { text, .. } => {
+                self.push_input_history_message(text);
+            }
             SessionEventKind::SessionCreated { name }
             | SessionEventKind::SessionRenamed { name } => {
                 self.session_title.clone_from(name);
@@ -2384,7 +2414,75 @@ impl ChatApp {
         }
     }
 
+    fn push_input_history_message(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.input_history.push(text.to_string());
+    }
+
+    fn previous_input_history(&mut self) {
+        if self.search_mode {
+            self.status = "input history unavailable while searching".to_string();
+            return;
+        }
+        if self.input_history.is_empty() {
+            self.status = "no input history in this session".to_string();
+            return;
+        }
+        let index = match self.input_history_index {
+            Some(0) => 0,
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.input_history_draft = Some(self.input.text().to_string());
+                self.input_history.len().saturating_sub(1)
+            }
+        };
+        self.set_input_history_index(index);
+    }
+
+    fn next_input_history(&mut self) {
+        if self.search_mode {
+            self.status = "input history unavailable while searching".to_string();
+            return;
+        }
+        let Some(current_index) = self.input_history_index else {
+            self.status = "not browsing input history".to_string();
+            return;
+        };
+        let next_index = current_index.saturating_add(1);
+        if next_index < self.input_history.len() {
+            self.set_input_history_index(next_index);
+            return;
+        }
+        let draft = self.input_history_draft.take().unwrap_or_default();
+        self.input_history_index = None;
+        self.set_input_text(draft);
+        self.status = "draft restored".to_string();
+    }
+
+    fn set_input_history_index(&mut self, index: usize) {
+        self.input_history_index = Some(index);
+        let text = self.input_history[index].clone();
+        self.set_input_text(text);
+        self.status = format!(
+            "input history {}/{}",
+            index.saturating_add(1),
+            self.input_history.len()
+        );
+    }
+
+    fn reset_input_history_navigation(&mut self) {
+        self.input_history_index = None;
+        self.input_history_draft = None;
+    }
+
+    fn set_input_text(&mut self, text: impl Into<String>) {
+        self.input = TextEditBuffer::from_text(text);
+    }
+
     fn take_input(&mut self) -> Option<String> {
+        self.reset_input_history_navigation();
         let input = self.input.text().trim().to_string();
         if input.is_empty() {
             return None;
@@ -3894,9 +3992,87 @@ mod tests {
     }
 
     #[test]
+    fn input_history_replays_session_user_messages() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "first prompt".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                SessionEventKind::AssistantMessage {
+                    text: "reply".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "second prompt".to_string(),
+                },
+            ),
+        ];
+        let mut app = ChatApp::new(session_id, &history, &keymap);
+
+        app.previous_input_history();
+        assert_eq!(app.input.text(), "second prompt");
+        app.previous_input_history();
+        assert_eq!(app.input.text(), "first prompt");
+    }
+
+    #[test]
+    fn input_history_next_restores_original_draft() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "first prompt".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "second prompt".to_string(),
+                },
+            ),
+        ];
+        let mut app = ChatApp::new(session_id, &history, &keymap);
+        app.input = TextEditBuffer::from_text("draft prompt");
+
+        app.previous_input_history();
+        app.previous_input_history();
+        assert_eq!(app.input.text(), "first prompt");
+        app.next_input_history();
+        assert_eq!(app.input.text(), "second prompt");
+        app.next_input_history();
+
+        assert_eq!(app.input.text(), "draft prompt");
+        assert_eq!(app.input_history_index, None);
+    }
+
+    #[test]
     fn default_keymap_includes_standard_composer_editor_bindings() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let cases = [
+            (
+                KeyCode::Up,
+                KeyModifiers::NONE,
+                TuiAction::InputHistoryPrevious,
+            ),
+            (
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                TuiAction::InputHistoryNext,
+            ),
             (KeyCode::Left, KeyModifiers::NONE, TuiAction::MoveCursorLeft),
             (
                 KeyCode::Right,
@@ -4184,6 +4360,8 @@ mod tests {
         )));
 
         assert_eq!(app.activity, ActivityState::Thinking);
+        app.previous_input_history();
+        assert_eq!(app.input.text(), "hello");
     }
 
     #[test]
