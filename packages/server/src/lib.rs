@@ -906,7 +906,9 @@ async fn handle_attach_session_recent(
                     history: compact_attach_history(attachment.history),
                 }),
             )
-            .await
+            .await?;
+            forward_session_events(writer.clone(), attachment.events);
+            Ok(())
         }
         Err(error) => {
             send_response(
