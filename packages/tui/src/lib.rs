@@ -3788,6 +3788,131 @@ mod tests {
         );
     }
 
+    fn apply_chat_action(app: &mut ChatApp, action: TuiAction) {
+        match action {
+            TuiAction::DeleteCharBackward => app.input.delete(TextDelete::Backward),
+            TuiAction::DeleteCharForward => app.input.delete(TextDelete::Forward),
+            TuiAction::DeleteWordBackward => app.input.delete(TextDelete::WordBackward),
+            TuiAction::DeleteWordForward => app.input.delete(TextDelete::WordForward),
+            TuiAction::DeleteToStart => app.input.delete(TextDelete::ToStart),
+            TuiAction::DeleteToEnd => app.input.delete(TextDelete::ToEnd),
+            TuiAction::MoveCursorLeft => app.input.move_cursor(TextMotion::Left),
+            TuiAction::MoveCursorRight => app.input.move_cursor(TextMotion::Right),
+            TuiAction::MoveCursorWordLeft => app.input.move_cursor(TextMotion::WordLeft),
+            TuiAction::MoveCursorWordRight => app.input.move_cursor(TextMotion::WordRight),
+            TuiAction::MoveCursorStart => app.input.move_cursor(TextMotion::Start),
+            TuiAction::MoveCursorEnd => app.input.move_cursor(TextMotion::End),
+            _ => panic!("unsupported test editor action: {action:?}"),
+        }
+    }
+
+    fn chat_app_with_input(text: &str) -> ChatApp {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = TextEditBuffer::from_text(text);
+        app
+    }
+
+    #[test]
+    fn composer_editor_movement_actions_update_cursor() {
+        let mut app = chat_app_with_input("hello brave world");
+
+        apply_chat_action(&mut app, TuiAction::MoveCursorWordLeft);
+        assert_eq!(app.input.cursor_byte_index(), "hello brave ".len());
+        apply_chat_action(&mut app, TuiAction::MoveCursorLeft);
+        assert_eq!(app.input.cursor_byte_index(), "hello brave".len());
+        apply_chat_action(&mut app, TuiAction::MoveCursorStart);
+        assert_eq!(app.input.cursor_byte_index(), 0);
+        apply_chat_action(&mut app, TuiAction::MoveCursorRight);
+        assert_eq!(app.input.cursor_byte_index(), "h".len());
+        apply_chat_action(&mut app, TuiAction::MoveCursorWordRight);
+        assert_eq!(app.input.cursor_byte_index(), "hello".len());
+        apply_chat_action(&mut app, TuiAction::MoveCursorEnd);
+        assert_eq!(app.input.cursor_byte_index(), app.input.text().len());
+    }
+
+    #[test]
+    fn composer_editor_delete_actions_remove_expected_ranges() {
+        let mut app = chat_app_with_input("hello brave world");
+
+        apply_chat_action(&mut app, TuiAction::DeleteWordBackward);
+        assert_eq!(app.input.text(), "hello brave ");
+        apply_chat_action(&mut app, TuiAction::DeleteCharBackward);
+        assert_eq!(app.input.text(), "hello brave");
+        apply_chat_action(&mut app, TuiAction::MoveCursorStart);
+        apply_chat_action(&mut app, TuiAction::DeleteWordForward);
+        assert_eq!(app.input.text(), " brave");
+        apply_chat_action(&mut app, TuiAction::DeleteCharForward);
+        assert_eq!(app.input.text(), "brave");
+    }
+
+    #[test]
+    fn composer_editor_delete_to_start_and_end_actions_remove_expected_ranges() {
+        let mut app = chat_app_with_input("hello brave world");
+
+        apply_chat_action(&mut app, TuiAction::MoveCursorWordLeft);
+        apply_chat_action(&mut app, TuiAction::DeleteToStart);
+        assert_eq!(app.input.text(), "world");
+        assert_eq!(app.input.cursor_byte_index(), 0);
+        apply_chat_action(&mut app, TuiAction::DeleteToEnd);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn default_keymap_includes_standard_composer_editor_bindings() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let cases = [
+            (KeyCode::Left, KeyModifiers::NONE, TuiAction::MoveCursorLeft),
+            (
+                KeyCode::Right,
+                KeyModifiers::NONE,
+                TuiAction::MoveCursorRight,
+            ),
+            (
+                KeyCode::Left,
+                KeyModifiers::ALT,
+                TuiAction::MoveCursorWordLeft,
+            ),
+            (
+                KeyCode::Right,
+                KeyModifiers::ALT,
+                TuiAction::MoveCursorWordRight,
+            ),
+            (
+                KeyCode::Backspace,
+                KeyModifiers::ALT,
+                TuiAction::DeleteWordBackward,
+            ),
+            (
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+                TuiAction::DeleteWordBackward,
+            ),
+            (
+                KeyCode::Delete,
+                KeyModifiers::ALT,
+                TuiAction::DeleteWordForward,
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                TuiAction::DeleteToStart,
+            ),
+            (
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL,
+                TuiAction::DeleteToEnd,
+            ),
+        ];
+
+        for (code, modifiers, action) in cases {
+            assert_eq!(
+                keymap.action_for_key(TuiScope::Chat, &KeyEvent::new(code, modifiers)),
+                Some(action)
+            );
+        }
+    }
+
     #[test]
     fn keymap_user_config_overrides_and_unbinds_defaults() {
         let config = bcode_config::TuiConfig {
