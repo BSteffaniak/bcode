@@ -2252,7 +2252,9 @@ impl ChatApp {
             if let SessionEventKind::ModelUsage { usage, .. } = &event.kind {
                 self.token_usage.absorb(usage);
             }
-            blocks.extend(transcript_blocks_from_event(event));
+            if !matches!(event.kind, SessionEventKind::AssistantDelta { .. }) {
+                blocks.extend(transcript_blocks_from_event(event));
+            }
         }
         self.input_history.splice(0..0, input_messages);
         if !blocks.is_empty() {
@@ -4446,6 +4448,40 @@ mod tests {
         assert!(matches!(
             app.blocks.as_slice(),
             [TranscriptBlock::Assistant { text, streaming: false }] if text == "complete"
+        ));
+    }
+
+    #[test]
+    fn prepended_older_history_drops_completed_assistant_deltas() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+        let history = vec![
+            session_event(
+                session_id,
+                SessionEventKind::AssistantDelta {
+                    text: "BM".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                SessionEventKind::AssistantDelta {
+                    text: "UX".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                SessionEventKind::AssistantMessage {
+                    text: "BMUX".to_string(),
+                },
+            ),
+        ];
+
+        app.prepend_older_history(&history, false);
+
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [TranscriptBlock::Assistant { text, streaming: false }] if text == "BMUX"
         ));
     }
 
