@@ -79,6 +79,39 @@ pub struct SessionSummary {
     pub client_count: usize,
 }
 
+/// Direction for paged session history reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionHistoryDirection {
+    Forward,
+    Backward,
+}
+
+/// Cursor for paged session history reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHistoryCursor {
+    pub sequence: u64,
+}
+
+/// Query for a bounded page of session history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHistoryQuery {
+    #[serde(default)]
+    pub cursor: Option<SessionHistoryCursor>,
+    pub limit: usize,
+    pub direction: SessionHistoryDirection,
+}
+
+/// Bounded page of replayable session history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHistoryPage {
+    pub session_id: SessionId,
+    pub events: Vec<SessionEvent>,
+    #[serde(default)]
+    pub next_cursor: Option<SessionHistoryCursor>,
+    pub has_more: bool,
+}
+
 /// Replayable event emitted by a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEvent {

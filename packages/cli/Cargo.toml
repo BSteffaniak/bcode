@@ -18,6 +18,7 @@ bcode_ipc            = { workspace = true }
 bcode_model          = { workspace = true }
 bcode_plugin         = { workspace = true }
 bcode_server         = { workspace = true }
+bcode_session        = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tui            = { workspace = true }
 clap                 = { workspace = true, features = ["derive", "help", "std", "usage"] }

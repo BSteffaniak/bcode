@@ -8,19 +8,22 @@
 
 //! Session lifecycle, attachment management, and append-only event history.
 
+pub(crate) mod index;
+pub(crate) mod reader;
+
+pub use index::SessionIndexHealth;
+
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
-    SessionEventKind, SessionId, SessionSummary, SessionTokenUsage, SessionTraceEvent,
+    SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
+    SessionHistoryQuery, SessionId, SessionSummary, SessionTokenUsage, SessionTraceEvent,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
-
-const FRAME_LEN_BYTES: usize = 4;
-const MAX_SESSION_EVENT_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
@@ -42,6 +45,8 @@ pub enum SessionStoreError {
     Encode(#[source] bmux_codec::Error),
     #[error("failed to decode session event: {0}")]
     Decode(#[source] bmux_codec::Error),
+    #[error("session index error: {0}")]
+    Index(#[source] serde_json::Error),
     #[error("session event frame is too large: {0} bytes")]
     FrameTooLarge(usize),
     #[error("session event file has a non-UTF-8 or missing file stem: {0:?}")]
@@ -75,9 +80,12 @@ impl SessionEventStore {
                 continue;
             }
             let session_id = parse_session_file_name(&path)?;
-            let events = read_events(&path)?;
-            if let Some(state) = SessionState::from_events(session_id, events) {
-                sessions.insert(session_id, state);
+            let index = match index::load_fresh_index(&self.root, session_id, &path)? {
+                Some(index) => Some(index),
+                None => index::rebuild_index(&self.root, session_id, &path)?.0,
+            };
+            if let Some(index) = index {
+                sessions.insert(session_id, index.into_state());
             }
         }
 
@@ -87,7 +95,7 @@ impl SessionEventStore {
     fn append(&self, event: &SessionEvent) -> Result<(), SessionStoreError> {
         fs::create_dir_all(&self.root)?;
         let path = self.event_path(event.session_id);
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         let payload = bmux_codec::to_vec(event).map_err(SessionStoreError::Encode)?;
         let payload_len = u32::try_from(payload.len())
             .map_err(|_| SessionStoreError::FrameTooLarge(payload.len()))?;
@@ -97,9 +105,109 @@ impl SessionEventStore {
         Ok(())
     }
 
+    fn read_session_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let path = self.event_path(session_id);
+        Ok(reader::read_events(&path)?.events)
+    }
+
+    fn write_state_index(&self, state: &SessionState) -> Result<(), SessionStoreError> {
+        let path = self.event_path(state.summary.id);
+        let file = index::fingerprint(&path)?;
+        let index = index::SessionIndex {
+            index_version: index::SESSION_INDEX_VERSION,
+            session_id: state.summary.id,
+            last_good_offset: file.len,
+            file,
+            summary: SessionSummary {
+                client_count: 0,
+                ..state.summary.clone()
+            },
+            next_sequence: state.next_sequence,
+            event_count: state.event_count,
+            has_user_message: state.has_user_message,
+            current_provider: state.current_provider.clone(),
+            current_model: state.current_model.clone(),
+            current_agent: state.current_agent.clone(),
+            latest_compaction_sequence: state.latest_compaction_sequence,
+            total_metered_tokens: state.total_metered_tokens,
+            issues: state.index_issues.clone(),
+        };
+        index::write_index(&self.root, &index)
+    }
+
+    /// Rebuild the sidecar index for one session from its canonical event log.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event file cannot be read or the index cannot be written.
+    pub fn reindex_session(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
+        let path = self.event_path(session_id);
+        let _ = index::rebuild_index(&self.root, session_id, &path)?;
+        Ok(())
+    }
+
+    /// Rebuild every session sidecar index under this store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session directory cannot be scanned or any index cannot be rebuilt.
+    pub fn reindex_all(&self) -> Result<Vec<SessionId>, SessionStoreError> {
+        let mut rebuilt = Vec::new();
+        if !self.root.exists() {
+            return Ok(rebuilt);
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
+                continue;
+            }
+            let session_id = parse_session_file_name(&path)?;
+            self.reindex_session(session_id)?;
+            rebuilt.push(session_id);
+        }
+        Ok(rebuilt)
+    }
+
+    /// Return index health for every persisted session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session directory or an index file cannot be read.
+    pub fn doctor_all(&self) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
+        let mut health = Vec::new();
+        if !self.root.exists() {
+            return Ok(health);
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
+                continue;
+            }
+            let session_id = parse_session_file_name(&path)?;
+            let index = index::load_fresh_index(&self.root, session_id, &path)?;
+            if let Some(index) = index {
+                health.push(index.health(false));
+            } else {
+                let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
+                if let Some(index) = index {
+                    health.push(index.health(true));
+                }
+            }
+        }
+        Ok(health)
+    }
+
     fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let path = self.event_path(session_id);
         match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        }
+        match fs::remove_file(index::index_path(&self.root, session_id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(SessionStoreError::Io(error)),
@@ -124,11 +232,19 @@ struct SessionManagerInner {
 }
 
 #[derive(Debug)]
-struct SessionState {
+pub(crate) struct SessionState {
     summary: SessionSummary,
     clients: BTreeSet<ClientId>,
-    events: Vec<SessionEvent>,
+    events: Option<Vec<SessionEvent>>,
     next_sequence: u64,
+    event_count: usize,
+    has_user_message: bool,
+    current_provider: Option<String>,
+    current_model: Option<String>,
+    current_agent: Option<String>,
+    latest_compaction_sequence: Option<u64>,
+    total_metered_tokens: u64,
+    index_issues: Vec<index::SessionIndexIssue>,
     sender: broadcast::Sender<SessionEvent>,
 }
 
@@ -175,8 +291,16 @@ impl SessionManager {
         let mut state = SessionState {
             summary: summary.clone(),
             clients: BTreeSet::new(),
-            events: Vec::new(),
+            events: Some(Vec::new()),
             next_sequence: 0,
+            event_count: 0,
+            has_user_message: false,
+            current_provider: None,
+            current_model: None,
+            current_agent: None,
+            latest_compaction_sequence: None,
+            total_metered_tokens: 0,
+            index_issues: Vec::new(),
             sender,
         };
         state.push_event(
@@ -281,12 +405,120 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionError> {
+        let mut inner = self.inner.lock().await;
+        let state = inner
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        if state.events.is_none() {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or(SessionError::NotFound(session_id))?;
+            state.events = Some(store.read_session_events(session_id)?);
+        }
+        Ok(state.events.clone().unwrap_or_default())
+    }
+
+    /// Return a bounded page of replayable history for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn session_history_page(
+        &self,
+        session_id: SessionId,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage, SessionError> {
+        let history = self.session_history(session_id).await?;
+        let limit = query.limit.max(1);
+        let events = match query.direction {
+            SessionHistoryDirection::Forward => history
+                .into_iter()
+                .filter(|event| {
+                    query
+                        .cursor
+                        .is_none_or(|cursor| event.sequence >= cursor.sequence)
+                })
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>(),
+            SessionHistoryDirection::Backward => {
+                let mut events = history
+                    .into_iter()
+                    .rev()
+                    .filter(|event| {
+                        query
+                            .cursor
+                            .is_none_or(|cursor| event.sequence <= cursor.sequence)
+                    })
+                    .take(limit.saturating_add(1))
+                    .collect::<Vec<_>>();
+                events.reverse();
+                events
+            }
+        };
+        let has_more = events.len() > limit;
+        let page_events = if has_more {
+            match query.direction {
+                SessionHistoryDirection::Forward => events.into_iter().take(limit).collect(),
+                SessionHistoryDirection::Backward => events.into_iter().skip(1).collect(),
+            }
+        } else {
+            events
+        };
+        let next_cursor = if has_more {
+            page_events.last().map(|event| SessionHistoryCursor {
+                sequence: match query.direction {
+                    SessionHistoryDirection::Forward => event.sequence.saturating_add(1),
+                    SessionHistoryDirection::Backward => event.sequence.saturating_sub(1),
+                },
+            })
+        } else {
+            None
+        };
+        Ok(SessionHistoryPage {
+            session_id,
+            events: page_events,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    /// Return the latest session-specific model selection if one has been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn current_model_selection(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<(String, String)>, SessionError> {
         let inner = self.inner.lock().await;
         let state = inner
             .sessions
             .get(&session_id)
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(state.events.clone())
+        Ok(state
+            .current_provider
+            .clone()
+            .zip(state.current_model.clone()))
+    }
+
+    /// Return the latest session-specific agent selection if one has been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn current_agent_selection(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, SessionError> {
+        let inner = self.inner.lock().await;
+        let state = inner
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(state.current_agent.clone())
     }
 
     /// Attach a client to an existing session.
@@ -308,9 +540,16 @@ impl SessionManager {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
+            if state.events.is_none() {
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or(SessionError::NotFound(session_id))?;
+                state.events = Some(store.read_session_events(session_id)?);
+            }
             state.clients.insert(client_id);
             state.summary.client_count = state.clients.len();
-            let history = state.events.clone();
+            let history = state.events.clone().unwrap_or_default();
             let events = state.sender.subscribe();
             let attached_event = state.push_event(
                 SessionEventKind::ClientAttached { client_id },
@@ -370,7 +609,7 @@ impl SessionManager {
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
             let mut events = Vec::new();
-            if state.summary.name.is_none() && !state.has_user_message() {
+            if state.summary.name.is_none() && !state.has_user_message {
                 let title = title_from_first_prompt(&text);
                 state.summary.name = Some(title.clone());
                 events.push(state.push_event(
@@ -671,47 +910,27 @@ impl SessionManager {
 }
 
 impl SessionState {
-    fn from_events(session_id: SessionId, events: Vec<SessionEvent>) -> Option<Self> {
-        if events.is_empty() {
-            return None;
-        }
-        let mut name = None;
-        for event in &events {
-            match &event.kind {
-                SessionEventKind::SessionCreated { name: created_name }
-                | SessionEventKind::SessionRenamed { name: created_name } => {
-                    name.clone_from(created_name);
-                }
-                _ => {}
-            }
-        }
-        let next_sequence = events
-            .iter()
-            .map(|event| event.sequence)
-            .max()
-            .map_or(0, |sequence| sequence + 1);
+    pub(crate) fn from_index(index: index::SessionIndex) -> Self {
         let (sender, _) = broadcast::channel(512);
-        Some(Self {
-            summary: SessionSummary {
-                id: session_id,
-                name,
-                client_count: 0,
-            },
+        Self {
+            summary: index.summary,
             clients: BTreeSet::new(),
-            events,
-            next_sequence,
+            events: None,
+            next_sequence: index.next_sequence,
+            event_count: index.event_count,
+            has_user_message: index.has_user_message,
+            current_provider: index.current_provider,
+            current_model: index.current_model,
+            current_agent: index.current_agent,
+            latest_compaction_sequence: index.latest_compaction_sequence,
+            total_metered_tokens: index.total_metered_tokens,
+            index_issues: index.issues,
             sender,
-        })
+        }
     }
 
     fn summary(&self) -> SessionSummary {
         self.summary.clone()
-    }
-
-    fn has_user_message(&self) -> bool {
-        self.events
-            .iter()
-            .any(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
     }
 
     fn push_event(
@@ -729,7 +948,41 @@ impl SessionState {
             store.append(&event)?;
         }
         self.next_sequence += 1;
-        self.events.push(event.clone());
+        self.event_count = self.event_count.saturating_add(1);
+        match &event.kind {
+            SessionEventKind::UserMessage { .. } => self.has_user_message = true,
+            SessionEventKind::ModelChanged { provider, model } => {
+                self.current_provider = Some(provider.clone());
+                self.current_model = Some(model.clone());
+            }
+            SessionEventKind::AgentChanged { agent_id } => {
+                self.current_agent = Some(agent_id.clone());
+            }
+            SessionEventKind::ContextCompacted {
+                compacted_through_sequence,
+                ..
+            } => {
+                self.latest_compaction_sequence = Some(*compacted_through_sequence);
+            }
+            SessionEventKind::ModelUsage { usage, .. } => {
+                if let Some(total) = usage.metered_total_tokens() {
+                    self.total_metered_tokens =
+                        self.total_metered_tokens.saturating_add(u64::from(total));
+                }
+            }
+            _ => {}
+        }
+        if let Some(events) = &mut self.events {
+            events.push(event.clone());
+        }
+        if let Some(store) = store
+            && let Err(error) = store.write_state_index(self)
+        {
+            eprintln!(
+                "failed to update session index for {}: {error}",
+                self.summary.id
+            );
+        }
         let _ = self.sender.send(event.clone());
         Ok(event)
     }
@@ -780,87 +1033,6 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
         .ok_or_else(|| SessionStoreError::InvalidFileName(path.to_path_buf()))?;
     stem.parse()
         .map_err(|_| SessionStoreError::InvalidSessionId(stem.to_string()))
-}
-
-fn read_events(path: &Path) -> Result<Vec<SessionEvent>, SessionStoreError> {
-    let mut file = File::open(path)?;
-    let mut events = Vec::new();
-    let mut offset = 0_u64;
-    loop {
-        let frame_offset = offset;
-        let Some(payload_len) = read_frame_len(path, &mut file, &mut offset, frame_offset)? else {
-            break;
-        };
-        if payload_len > MAX_SESSION_EVENT_FRAME_BYTES {
-            eprintln!(
-                "ignoring unreadable tail in session event file {} at byte {frame_offset}: frame length {payload_len} exceeds safety limit",
-                path.display()
-            );
-            break;
-        }
-        let Some(payload) =
-            read_frame_payload(path, &mut file, payload_len, &mut offset, frame_offset)?
-        else {
-            break;
-        };
-        match bmux_codec::from_bytes(&payload) {
-            Ok(event) => events.push(event),
-            Err(error) => eprintln!(
-                "ignoring corrupt session event frame in {} at byte {frame_offset}: {error}",
-                path.display()
-            ),
-        }
-    }
-    Ok(events)
-}
-
-fn read_frame_len(
-    path: &Path,
-    file: &mut File,
-    offset: &mut u64,
-    frame_offset: u64,
-) -> Result<Option<usize>, SessionStoreError> {
-    let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
-    let mut bytes_read = 0_usize;
-    while bytes_read < FRAME_LEN_BYTES {
-        let read = file.read(&mut len_bytes[bytes_read..])?;
-        if read == 0 {
-            if bytes_read > 0 {
-                eprintln!(
-                    "ignoring truncated session event length in {} at byte {frame_offset}",
-                    path.display()
-                );
-            }
-            return Ok(None);
-        }
-        bytes_read += read;
-        *offset = offset.saturating_add(read.try_into().unwrap_or(u64::MAX));
-    }
-    Ok(Some(u32::from_le_bytes(len_bytes) as usize))
-}
-
-fn read_frame_payload(
-    path: &Path,
-    file: &mut File,
-    payload_len: usize,
-    offset: &mut u64,
-    frame_offset: u64,
-) -> Result<Option<Vec<u8>>, SessionStoreError> {
-    let mut payload = vec![0_u8; payload_len];
-    let mut bytes_read = 0_usize;
-    while bytes_read < payload_len {
-        let read = file.read(&mut payload[bytes_read..])?;
-        if read == 0 {
-            eprintln!(
-                "ignoring truncated session event payload in {} at byte {frame_offset}: expected {payload_len} bytes, got {bytes_read}",
-                path.display()
-            );
-            return Ok(None);
-        }
-        bytes_read += read;
-        *offset = offset.saturating_add(read.try_into().unwrap_or(u64::MAX));
-    }
-    Ok(Some(payload))
 }
 
 #[cfg(test)]

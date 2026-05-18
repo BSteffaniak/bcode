@@ -10,7 +10,9 @@ use bcode_ipc::{
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, decode,
     default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
-use bcode_session_models::{ClientId, SessionEvent, SessionId, SessionSummary};
+use bcode_session_models::{
+    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
+};
 use thiserror::Error;
 
 /// Errors returned by the Bcode client.
@@ -170,6 +172,26 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionHistory { history, .. } => Ok(history),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return a bounded page of session history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_history_page(
+        &self,
+        session_id: SessionId,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::SessionHistoryPage { session_id, query })
+            .await?
+        {
+            ResponsePayload::SessionHistoryPage { page } => Ok(page),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

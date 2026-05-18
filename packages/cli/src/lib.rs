@@ -34,6 +34,8 @@ pub enum CliError {
     Config(#[from] bcode_config::ConfigError),
     #[error("server error: {0}")]
     Server(#[from] bcode_server::ServerError),
+    #[error("session store error: {0}")]
+    SessionStore(#[from] bcode_session::SessionStoreError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("TUI error: {0}")]
@@ -88,6 +90,8 @@ pub async fn run() -> Result<(), CliError> {
                 session_export(session_id, format).await?;
             }
             SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
+            SessionCommand::Doctor => session_doctor()?,
+            SessionCommand::Reindex => session_reindex()?,
         },
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
@@ -277,6 +281,8 @@ enum SessionCommand {
     Timeline {
         session_id: SessionId,
     },
+    Doctor,
+    Reindex,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2239,6 +2245,47 @@ async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
         print_timeline_event(&event, first_trace_time);
     }
     Ok(())
+}
+
+fn session_doctor() -> Result<(), CliError> {
+    let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    let health = store.doctor_all()?;
+    if health.is_empty() {
+        println!("no persisted sessions found");
+        return Ok(());
+    }
+    for item in health {
+        let state = if item.issue_count == 0 {
+            "ok"
+        } else {
+            "degraded"
+        };
+        let freshness = if item.stale { "rebuilt" } else { "fresh" };
+        println!(
+            "{}\t{}\t{}\tevents={}\tlast_good_offset={}\tissues={}",
+            item.session_id,
+            state,
+            freshness,
+            item.event_count,
+            item.last_good_offset,
+            item.issue_count
+        );
+    }
+    Ok(())
+}
+
+fn session_reindex() -> Result<(), CliError> {
+    let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    let rebuilt = store.reindex_all()?;
+    println!("reindexed {} session(s)", rebuilt.len());
+    for session_id in rebuilt {
+        println!("{session_id}");
+    }
+    Ok(())
+}
+
+fn default_session_store_dir() -> PathBuf {
+    bcode_config::default_state_dir().join("sessions")
 }
 
 async fn cancel_session_turn(session_id: SessionId) -> Result<(), CliError> {

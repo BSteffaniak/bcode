@@ -504,6 +504,9 @@ async fn handle_request(
         Request::SessionHistory { session_id } => {
             handle_session_history(request_id, state, writer, session_id).await
         }
+        Request::SessionHistoryPage { session_id, query } => {
+            handle_session_history_page(request_id, state, writer, session_id, query).await
+        }
         Request::AttachSession { session_id } => {
             handle_attach_session(
                 request_id,
@@ -790,6 +793,33 @@ async fn handle_session_history(
                     session_id,
                     history,
                 }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_history_page(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    query: bcode_session_models::SessionHistoryQuery,
+) -> Result<(), ServerError> {
+    match state.sessions.session_history_page(session_id, query).await {
+        Ok(page) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionHistoryPage { page }),
             )
             .await
         }
@@ -2490,14 +2520,12 @@ async fn session_agent_selection(state: &ServerState, session_id: SessionId) -> 
     if let Some(agent_id) = state.session_agent_selections.lock().await.get(&session_id) {
         return agent_id.clone();
     }
-    let mut selected = default_agent_id(&list_agent_profiles(state).await);
-    if let Ok(history) = state.sessions.session_history(session_id).await {
-        for event in history {
-            if let SessionEventKind::AgentChanged { agent_id } = event.kind {
-                selected = agent_id;
-            }
-        }
-    }
+    let selected =
+        if let Ok(Some(agent_id)) = state.sessions.current_agent_selection(session_id).await {
+            agent_id
+        } else {
+            default_agent_id(&list_agent_profiles(state).await)
+        };
     state
         .session_agent_selections
         .lock()
@@ -2542,24 +2570,23 @@ async fn session_model_selection(
     if let Some(selection) = state.session_model_selections.lock().await.get(&session_id) {
         return selection.clone();
     }
-    let mut selection = SessionModelSelection {
-        provider_plugin_id: state.selected_provider_plugin_id.clone(),
-        model_id: state.selected_model_id.clone(),
-        thinking_level: None,
-        provider_context: state.selected_provider_context.clone(),
-    };
-    if let Ok(history) = state.sessions.session_history(session_id).await {
-        for event in history {
-            if let SessionEventKind::ModelChanged { provider, model } = event.kind {
-                selection = SessionModelSelection {
-                    provider_plugin_id: provider_to_selection(&provider),
-                    model_id: model_to_selection(&model),
-                    thinking_level: None,
-                    provider_context: state.selected_provider_context.clone(),
-                };
-            }
+    let selection = if let Ok(Some((provider, model))) =
+        state.sessions.current_model_selection(session_id).await
+    {
+        SessionModelSelection {
+            provider_plugin_id: provider_to_selection(&provider),
+            model_id: model_to_selection(&model),
+            thinking_level: None,
+            provider_context: state.selected_provider_context.clone(),
         }
-    }
+    } else {
+        SessionModelSelection {
+            provider_plugin_id: state.selected_provider_plugin_id.clone(),
+            model_id: state.selected_model_id.clone(),
+            thinking_level: None,
+            provider_context: state.selected_provider_context.clone(),
+        }
+    };
     state
         .session_model_selections
         .lock()

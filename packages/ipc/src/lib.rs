@@ -5,7 +5,9 @@
 //! Client/server IPC protocol for bcode.
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
-use bcode_session_models::{ClientId, SessionEvent, SessionId, SessionSummary};
+use bcode_session_models::{
+    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::env;
 use std::path::PathBuf;
@@ -99,6 +101,10 @@ pub enum Request {
     },
     SessionHistory {
         session_id: SessionId,
+    },
+    SessionHistoryPage {
+        session_id: SessionId,
+        query: SessionHistoryQuery,
     },
     AttachSession {
         session_id: SessionId,
@@ -240,6 +246,9 @@ pub enum ResponsePayload {
     SessionHistory {
         session_id: SessionId,
         history: Vec<SessionEvent>,
+    },
+    SessionHistoryPage {
+        page: SessionHistoryPage,
     },
     Attached {
         session_id: SessionId,
