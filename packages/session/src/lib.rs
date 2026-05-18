@@ -18,12 +18,17 @@ use bcode_session_models::{
     SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
     SessionHistoryQuery, SessionId, SessionSummary, SessionTokenUsage, SessionTraceEvent,
 };
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
+
+const FRAME_V2_MAGIC: &[u8; 4] = b"BSE2";
+const FRAME_V2_VERSION: u16 = 2;
 
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
@@ -49,6 +54,10 @@ pub enum SessionStoreError {
     Index(#[source] serde_json::Error),
     #[error("session event frame is too large: {0} bytes")]
     FrameTooLarge(usize),
+    #[error("unsupported session event frame version: {0}")]
+    UnsupportedFrameVersion(u16),
+    #[error("session event frame checksum mismatch")]
+    ChecksumMismatch,
     #[error("session event file has a non-UTF-8 or missing file stem: {0:?}")]
     InvalidFileName(PathBuf),
     #[error("session event file name is not a session ID: {0}")]
@@ -92,17 +101,35 @@ impl SessionEventStore {
         Ok(sessions)
     }
 
-    fn append(&self, event: &SessionEvent) -> Result<(), SessionStoreError> {
+    fn append(&self, event: &SessionEvent) -> Result<index::SessionIndexEntry, SessionStoreError> {
         fs::create_dir_all(&self.root)?;
         let path = self.event_path(event.session_id);
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
+        let offset = file.seek(SeekFrom::End(0))?;
         let payload = bmux_codec::to_vec(event).map_err(SessionStoreError::Encode)?;
         let payload_len = u32::try_from(payload.len())
             .map_err(|_| SessionStoreError::FrameTooLarge(payload.len()))?;
+        let checksum = Sha256::digest(&payload);
+        file.write_all(FRAME_V2_MAGIC)?;
+        file.write_all(&FRAME_V2_VERSION.to_le_bytes())?;
+        file.write_all(&CURRENT_SESSION_EVENT_SCHEMA_VERSION.to_le_bytes())?;
         file.write_all(&payload_len.to_le_bytes())?;
+        file.write_all(&checksum)?;
         file.write_all(&payload)?;
         file.flush()?;
-        Ok(())
+        let frame_len = u64::from(payload_len).saturating_add(44);
+        let entry = index::SessionIndexEntry::from_event(event, offset, frame_len);
+        if let Err(error) = index::append_entry(&self.root, event.session_id, &entry) {
+            eprintln!(
+                "failed to update session entry index for {}: {error}",
+                event.session_id
+            );
+        }
+        Ok(entry)
     }
 
     fn read_session_events(
@@ -111,6 +138,85 @@ impl SessionEventStore {
     ) -> Result<Vec<SessionEvent>, SessionStoreError> {
         let path = self.event_path(session_id);
         Ok(reader::read_events(&path)?.events)
+    }
+
+    fn read_session_history_page(
+        &self,
+        session_id: SessionId,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage, SessionStoreError> {
+        let event_path = self.event_path(session_id);
+        let index = match index::load_fresh_index(&self.root, session_id, &event_path)? {
+            Some(index) => index,
+            None => index::rebuild_index(&self.root, session_id, &event_path)?
+                .0
+                .ok_or_else(|| {
+                    SessionStoreError::InvalidSessionId(format!("empty session log: {session_id}"))
+                })?,
+        };
+        let mut entries = match index::read_entries(&self.root, session_id) {
+            Ok(entries) if entries.len() == index.event_count => entries,
+            _ => {
+                let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
+                index::read_entries(&self.root, session_id)?
+            }
+        };
+        entries.sort_by_key(|entry| entry.sequence);
+        let limit = query.limit.max(1);
+        let selected = match query.direction {
+            SessionHistoryDirection::Forward => entries
+                .into_iter()
+                .filter(|entry| {
+                    query
+                        .cursor
+                        .is_none_or(|cursor| entry.sequence >= cursor.sequence)
+                })
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>(),
+            SessionHistoryDirection::Backward => {
+                let mut selected = entries
+                    .into_iter()
+                    .rev()
+                    .filter(|entry| {
+                        query
+                            .cursor
+                            .is_none_or(|cursor| entry.sequence <= cursor.sequence)
+                    })
+                    .take(limit.saturating_add(1))
+                    .collect::<Vec<_>>();
+                selected.reverse();
+                selected
+            }
+        };
+        let has_more = selected.len() > limit;
+        let page_entries = if has_more {
+            match query.direction {
+                SessionHistoryDirection::Forward => selected.into_iter().take(limit).collect(),
+                SessionHistoryDirection::Backward => selected.into_iter().skip(1).collect(),
+            }
+        } else {
+            selected
+        };
+        let mut events = Vec::with_capacity(page_entries.len());
+        for entry in &page_entries {
+            events.push(reader::read_event_at(&event_path, entry.offset)?);
+        }
+        let next_cursor = if has_more {
+            events.last().map(|event| SessionHistoryCursor {
+                sequence: match query.direction {
+                    SessionHistoryDirection::Forward => event.sequence.saturating_add(1),
+                    SessionHistoryDirection::Backward => event.sequence.saturating_sub(1),
+                },
+            })
+        } else {
+            None
+        };
+        Ok(SessionHistoryPage {
+            session_id,
+            events,
+            next_cursor,
+            has_more,
+        })
     }
 
     fn write_state_index(&self, state: &SessionState) -> Result<(), SessionStoreError> {
@@ -136,6 +242,30 @@ impl SessionEventStore {
             issues: state.index_issues.clone(),
         };
         index::write_index(&self.root, &index)
+    }
+
+    /// Repair a session log by backing up and truncating an unreadable tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event file cannot be read, backed up, truncated, or reindexed.
+    pub fn repair_session_tail(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<PathBuf>, SessionStoreError> {
+        let path = self.event_path(session_id);
+        let report = reader::read_events(&path)?;
+        let file_len = fs::metadata(&path)?.len();
+        if report.last_good_offset >= file_len {
+            self.reindex_session(session_id)?;
+            return Ok(None);
+        }
+        let backup = corrupt_backup_path(&path);
+        fs::copy(&path, &backup)?;
+        let file = OpenOptions::new().write(true).open(&path)?;
+        file.set_len(report.last_good_offset)?;
+        self.reindex_session(session_id)?;
+        Ok(Some(backup))
     }
 
     /// Rebuild the sidecar index for one session from its canonical event log.
@@ -208,6 +338,11 @@ impl SessionEventStore {
             Err(error) => return Err(SessionStoreError::Io(error)),
         }
         match fs::remove_file(index::index_path(&self.root, session_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        }
+        match fs::remove_file(index::entries_path(&self.root, session_id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(SessionStoreError::Io(error)),
@@ -405,19 +540,19 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        let mut inner = self.inner.lock().await;
+        let inner = self.inner.lock().await;
         let state = inner
             .sessions
-            .get_mut(&session_id)
+            .get(&session_id)
             .ok_or(SessionError::NotFound(session_id))?;
-        if state.events.is_none() {
-            let store = self
-                .store
-                .as_ref()
-                .ok_or(SessionError::NotFound(session_id))?;
-            state.events = Some(store.read_session_events(session_id)?);
+        if let Some(events) = &state.events {
+            return Ok(events.clone());
         }
-        Ok(state.events.clone().unwrap_or_default())
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(store.read_session_events(session_id)?)
     }
 
     /// Return a bounded page of replayable history for a session.
@@ -430,58 +565,19 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
-        let history = self.session_history(session_id).await?;
-        let limit = query.limit.max(1);
-        let events = match query.direction {
-            SessionHistoryDirection::Forward => history
-                .into_iter()
-                .filter(|event| {
-                    query
-                        .cursor
-                        .is_none_or(|cursor| event.sequence >= cursor.sequence)
-                })
-                .take(limit.saturating_add(1))
-                .collect::<Vec<_>>(),
-            SessionHistoryDirection::Backward => {
-                let mut events = history
-                    .into_iter()
-                    .rev()
-                    .filter(|event| {
-                        query
-                            .cursor
-                            .is_none_or(|cursor| event.sequence <= cursor.sequence)
-                    })
-                    .take(limit.saturating_add(1))
-                    .collect::<Vec<_>>();
-                events.reverse();
-                events
-            }
-        };
-        let has_more = events.len() > limit;
-        let page_events = if has_more {
-            match query.direction {
-                SessionHistoryDirection::Forward => events.into_iter().take(limit).collect(),
-                SessionHistoryDirection::Backward => events.into_iter().skip(1).collect(),
-            }
-        } else {
-            events
-        };
-        let next_cursor = if has_more {
-            page_events.last().map(|event| SessionHistoryCursor {
-                sequence: match query.direction {
-                    SessionHistoryDirection::Forward => event.sequence.saturating_add(1),
-                    SessionHistoryDirection::Backward => event.sequence.saturating_sub(1),
-                },
-            })
-        } else {
-            None
-        };
-        Ok(SessionHistoryPage {
-            session_id,
-            events: page_events,
-            next_cursor,
-            has_more,
-        })
+        let inner = self.inner.lock().await;
+        let state = inner
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        if let Some(events) = &state.events {
+            return Ok(history_page_from_events(session_id, events.clone(), query));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(store.read_session_history_page(session_id, query)?)
     }
 
     /// Return the latest session-specific model selection if one has been set.
@@ -540,16 +636,64 @@ impl SessionManager {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
-            if state.events.is_none() {
+            let history = if let Some(events) = &state.events {
+                events.clone()
+            } else {
                 let store = self
                     .store
                     .as_ref()
                     .ok_or(SessionError::NotFound(session_id))?;
-                state.events = Some(store.read_session_events(session_id)?);
-            }
+                store.read_session_events(session_id)?
+            };
             state.clients.insert(client_id);
             state.summary.client_count = state.clients.len();
-            let history = state.events.clone().unwrap_or_default();
+            let events = state.sender.subscribe();
+            let attached_event = state.push_event(
+                SessionEventKind::ClientAttached { client_id },
+                self.store.as_ref(),
+            )?;
+            SessionAttachment {
+                history,
+                attached_event,
+                events,
+            }
+        };
+        Ok(attachment)
+    }
+
+    /// Attach a client and return only the most recent replayable history events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the session does not exist
+    /// * the client-attached event cannot be persisted
+    pub async fn attach_session_recent(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        limit: usize,
+    ) -> Result<SessionAttachment, SessionError> {
+        let history = self
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await?
+            .events;
+        let attachment = {
+            let mut inner = self.inner.lock().await;
+            let state = inner
+                .sessions
+                .get_mut(&session_id)
+                .ok_or(SessionError::NotFound(session_id))?;
+            state.clients.insert(client_id);
+            state.summary.client_count = state.clients.len();
             let events = state.sender.subscribe();
             let attached_event = state.push_event(
                 SessionEventKind::ClientAttached { client_id },
@@ -988,6 +1132,64 @@ impl SessionState {
     }
 }
 
+fn history_page_from_events(
+    session_id: SessionId,
+    history: Vec<SessionEvent>,
+    query: SessionHistoryQuery,
+) -> SessionHistoryPage {
+    let limit = query.limit.max(1);
+    let events = match query.direction {
+        SessionHistoryDirection::Forward => history
+            .into_iter()
+            .filter(|event| {
+                query
+                    .cursor
+                    .is_none_or(|cursor| event.sequence >= cursor.sequence)
+            })
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>(),
+        SessionHistoryDirection::Backward => {
+            let mut events = history
+                .into_iter()
+                .rev()
+                .filter(|event| {
+                    query
+                        .cursor
+                        .is_none_or(|cursor| event.sequence <= cursor.sequence)
+                })
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>();
+            events.reverse();
+            events
+        }
+    };
+    let has_more = events.len() > limit;
+    let page_events = if has_more {
+        match query.direction {
+            SessionHistoryDirection::Forward => events.into_iter().take(limit).collect(),
+            SessionHistoryDirection::Backward => events.into_iter().skip(1).collect(),
+        }
+    } else {
+        events
+    };
+    let next_cursor = if has_more {
+        page_events.last().map(|event| SessionHistoryCursor {
+            sequence: match query.direction {
+                SessionHistoryDirection::Forward => event.sequence.saturating_add(1),
+                SessionHistoryDirection::Backward => event.sequence.saturating_sub(1),
+            },
+        })
+    } else {
+        None
+    };
+    SessionHistoryPage {
+        session_id,
+        events: page_events,
+        next_cursor,
+        has_more,
+    }
+}
+
 fn normalize_session_name(name: Option<String>) -> Option<String> {
     name.map(|value| squish_whitespace(&value))
         .filter(|value| !value.is_empty())
@@ -1026,6 +1228,17 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "session.events".to_string(), ToString::to_string);
+    path.with_file_name(format!("{file_name}.corrupt.{timestamp}"))
+}
+
 fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> {
     let stem = path
         .file_stem()
@@ -1040,7 +1253,8 @@ mod tests {
     use super::SessionManager;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionEvent, SessionEventKind,
-        SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+        SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent, SessionTracePayload,
+        SessionTracePhase,
     };
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -1311,6 +1525,78 @@ mod tests {
             &event.kind,
             SessionEventKind::UserMessage { text, .. } if text == "hello"
         )));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn restored_session_history_page_reads_from_disk_index() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("paged".to_string()))
+            .await
+            .expect("session should be created");
+        for index in 0..5 {
+            manager
+                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
+                .await
+                .expect("message should append");
+        }
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let page = restored
+            .session_history_page(
+                session.id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 2,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("history page should load");
+
+        assert_eq!(page.events.len(), 2);
+        assert!(page.has_more);
+        assert!(matches!(
+            &page.events[0].kind,
+            SessionEventKind::UserMessage { text, .. } if text == "message 3"
+        ));
+        assert!(matches!(
+            &page.events[1].kind,
+            SessionEventKind::UserMessage { text, .. } if text == "message 4"
+        ));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn attach_session_recent_avoids_full_replay() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("recent".to_string()))
+            .await
+            .expect("session should be created");
+        for index in 0..4 {
+            manager
+                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
+                .await
+                .expect("message should append");
+        }
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let attachment = restored
+            .attach_session_recent(session.id, ClientId::new(), 1)
+            .await
+            .expect("recent attach should succeed");
+
+        assert_eq!(attachment.history.len(), 1);
+        assert!(matches!(
+            &attachment.history[0].kind,
+            SessionEventKind::UserMessage { text, .. } if text == "message 3"
+        ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

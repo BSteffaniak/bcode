@@ -23,7 +23,7 @@ Startup now loads session catalog state from fresh sidecar indexes when possible
 * metered token total
 * corruption/degradation records from index rebuild
 
-Full event history is loaded lazily when a caller asks for history or attaches to a session. Newly created or already-loaded sessions keep an in-memory history cache; catalog-only sessions do not.
+Full event history is loaded lazily only for legacy full-history calls. Paged history reads use a per-event JSONL entry index (`sequence`, byte offset, frame length, event kind, schema version) and seek directly to requested frames. Newly created sessions keep an in-memory history cache until restart; catalog-only restored sessions do not hydrate full histories for listing, status, paged history, or recent attach.
 
 ## Correctness rules
 
@@ -31,7 +31,7 @@ Full event history is loaded lazily when a caller asks for history or attaches t
 * Index writes are atomic temp-file + rename writes.
 * Event appends happen before index refresh; if the index refresh fails, the event remains durable and the next startup can rebuild the cache.
 * `SessionEventKind` variant order is persisted by `bmux_codec` and must not be reordered. New variants are append-only and require a schema-version bump.
-* Future frame formats should add explicit magic/version/checksum metadata instead of relying only on enum order.
+* New appends use a v2 frame envelope with magic bytes, frame version, event schema version, payload length, and SHA-256 checksum. The reader remains dual-format and can read legacy length-prefixed frames.
 
 ## Corruption handling
 
@@ -48,7 +48,7 @@ The legacy full-history APIs remain for compatibility, but new code should prefe
 * client `session_history_page`
 * lightweight selection projections such as current agent and current model
 
-The TUI can migrate to recent-page attach plus scrollback paging. Model request construction still needs a model-visible projection of history, but it should use projection helpers and compaction boundaries rather than requiring all daemon startup state to be hydrated.
+The TUI uses a recent-page attach path for initial load. Full scrollback pagination is the next UI layer: the session/client/server APIs can return bounded pages, and the TUI needs a scrollback loader to prepend older pages when the user scrolls above the loaded window. Model request construction still needs a model-visible projection of history, but it should use projection helpers and compaction boundaries rather than requiring all daemon startup state to be hydrated.
 
 ## Maintenance commands
 
@@ -56,11 +56,13 @@ CLI maintenance commands provide operator ergonomics:
 
 * `bcode session doctor` reports index freshness, event counts, offsets, and issue counts.
 * `bcode session reindex` rebuilds all sidecar indexes from canonical event logs.
+* `bcode session repair <session-id>` backs up and truncates only unreadable tails, then rebuilds indexes.
 
 ## Migration stages
 
 1. Add sidecar indexes and lazy catalog startup.
 2. Add bounded history APIs over IPC/client/session.
 3. Move server hot paths that only need current model/agent to index-backed projections.
-4. Migrate TUI attach to recent-page loading and scrollback paging.
+4. Migrate initial TUI attach to recent-page loading.
 5. Introduce a versioned/checksummed v2 event frame while keeping the legacy reader.
+6. Continue with full TUI scrollback paging and model-context projections that jump from index metadata to the latest compaction boundary.

@@ -2,11 +2,13 @@ use crate::reader::{SessionReadIssue, SessionReadIssueKind, SessionReadReport};
 use crate::{SessionState, SessionStoreError};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionSummary};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub const SESSION_INDEX_VERSION: u16 = 1;
+pub const SESSION_ENTRY_INDEX_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventFileFingerprint {
@@ -37,6 +39,30 @@ pub struct SessionIndex {
 pub struct SessionIndexIssue {
     pub offset: u64,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIndexEntry {
+    pub entry_index_version: u16,
+    pub sequence: u64,
+    pub offset: u64,
+    pub frame_len: u64,
+    pub kind: String,
+    pub schema_version: u16,
+}
+
+impl SessionIndexEntry {
+    #[must_use]
+    pub fn from_event(event: &SessionEvent, offset: u64, frame_len: u64) -> Self {
+        Self {
+            entry_index_version: SESSION_ENTRY_INDEX_VERSION,
+            sequence: event.sequence,
+            offset,
+            frame_len,
+            kind: event_kind_tag(&event.kind).to_string(),
+            schema_version: event.schema_version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +187,11 @@ pub fn index_path(root: &Path, session_id: SessionId) -> PathBuf {
     root.join("index").join(format!("{session_id}.index.json"))
 }
 
+pub fn entries_path(root: &Path, session_id: SessionId) -> PathBuf {
+    root.join("index")
+        .join(format!("{session_id}.entries.jsonl"))
+}
+
 pub fn load_fresh_index(
     root: &Path,
     session_id: SessionId,
@@ -196,6 +227,64 @@ pub fn write_index(root: &Path, index: &SessionIndex) -> Result<(), SessionStore
     Ok(())
 }
 
+pub fn append_entry(
+    root: &Path,
+    session_id: SessionId,
+    entry: &SessionIndexEntry,
+) -> Result<(), SessionStoreError> {
+    let path = entries_path(root, session_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, entry).map_err(SessionStoreError::Index)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
+
+pub fn read_entries(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<Vec<SessionIndexEntry>, SessionStoreError> {
+    let path = entries_path(root, session_id);
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry =
+            serde_json::from_str::<SessionIndexEntry>(&line).map_err(SessionStoreError::Index)?;
+        if entry.entry_index_version == SESSION_ENTRY_INDEX_VERSION {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+pub fn write_entries(
+    root: &Path,
+    session_id: SessionId,
+    entries: &[SessionIndexEntry],
+) -> Result<(), SessionStoreError> {
+    let path = entries_path(root, session_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("entries.jsonl.tmp");
+    let mut file = fs::File::create(&tmp_path)?;
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry).map_err(SessionStoreError::Index)?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
 pub fn rebuild_index(
     root: &Path,
     session_id: SessionId,
@@ -206,8 +295,33 @@ pub fn rebuild_index(
     let index = SessionIndex::from_report(session_id, file, &report);
     if let Some(index) = &index {
         write_index(root, index)?;
+        write_entries(root, session_id, &report.entries)?;
     }
     Ok((index, report.events))
+}
+
+const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
+    match kind {
+        SessionEventKind::SessionCreated { .. } => "session_created",
+        SessionEventKind::ClientAttached { .. } => "client_attached",
+        SessionEventKind::ClientDetached { .. } => "client_detached",
+        SessionEventKind::UserMessage { .. } => "user_message",
+        SessionEventKind::AssistantDelta { .. } => "assistant_delta",
+        SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
+        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::PermissionRequested { .. } => "permission_requested",
+        SessionEventKind::PermissionResolved { .. } => "permission_resolved",
+        SessionEventKind::ModelChanged { .. } => "model_changed",
+        SessionEventKind::SystemMessage { .. } => "system_message",
+        SessionEventKind::AgentChanged { .. } => "agent_changed",
+        SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
+        SessionEventKind::ModelUsage { .. } => "model_usage",
+        SessionEventKind::ContextCompacted { .. } => "context_compacted",
+        SessionEventKind::SessionRenamed { .. } => "session_renamed",
+        SessionEventKind::TraceEvent { .. } => "trace_event",
+    }
 }
 
 fn issue_message(kind: &SessionReadIssueKind) -> String {

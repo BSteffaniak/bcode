@@ -68,6 +68,7 @@ const DEFAULT_TRANSCRIPT_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_HEIGHT: u16 = 20;
 const TRANSCRIPT_WINDOW_OVERSCAN_LINES: usize = 2;
 const MOUSE_SCROLL_ROWS: usize = 3;
+const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const MAX_COMPOSER_ROWS: u16 = 6;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MODAL_MARGIN_X: u16 = 4;
@@ -611,7 +612,9 @@ async fn run_chat(
     keymap: KeyMap,
 ) -> Result<(), TuiError> {
     let mut connection = client.connect("bcode-tui").await?;
-    let history = connection.attach_session(session_id).await?;
+    let history = connection
+        .attach_session_recent(session_id, INITIAL_HISTORY_EVENT_LIMIT)
+        .await?;
 
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {

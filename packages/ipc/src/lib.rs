@@ -109,6 +109,10 @@ pub enum Request {
     AttachSession {
         session_id: SessionId,
     },
+    AttachSessionRecent {
+        session_id: SessionId,
+        limit: usize,
+    },
     SendUserMessage {
         session_id: SessionId,
         text: String,

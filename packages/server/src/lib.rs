@@ -518,6 +518,18 @@ async fn handle_request(
             )
             .await
         }
+        Request::AttachSessionRecent { session_id, limit } => {
+            handle_attach_session_recent(
+                request_id,
+                client_id,
+                state,
+                writer,
+                attached_session,
+                session_id,
+                limit,
+            )
+            .await
+        }
         Request::SendUserMessage { session_id, text } => {
             handle_user_message(request_id, client_id, state, writer, session_id, text).await
         }
@@ -857,6 +869,44 @@ async fn handle_attach_session(
             .await?;
             forward_session_events(writer.clone(), attachment.events);
             Ok(())
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_attach_session_recent(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    attached_session: &mut Option<SessionId>,
+    session_id: SessionId,
+    limit: usize,
+) -> Result<(), ServerError> {
+    match state
+        .sessions
+        .attach_session_recent(session_id, client_id, limit)
+        .await
+    {
+        Ok(attachment) => {
+            *attached_session = Some(session_id);
+            publish_session_event(state, &attachment.attached_event).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::Attached {
+                    session_id,
+                    history: compact_attach_history(attachment.history),
+                }),
+            )
+            .await
         }
         Err(error) => {
             send_response(

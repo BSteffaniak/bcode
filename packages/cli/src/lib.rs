@@ -92,6 +92,7 @@ pub async fn run() -> Result<(), CliError> {
             SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
             SessionCommand::Doctor => session_doctor()?,
             SessionCommand::Reindex => session_reindex()?,
+            SessionCommand::Repair { session_id } => session_repair(session_id)?,
         },
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
@@ -283,6 +284,9 @@ enum SessionCommand {
     },
     Doctor,
     Reindex,
+    Repair {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2280,6 +2284,18 @@ fn session_reindex() -> Result<(), CliError> {
     println!("reindexed {} session(s)", rebuilt.len());
     for session_id in rebuilt {
         println!("{session_id}");
+    }
+    Ok(())
+}
+
+fn session_repair(session_id: SessionId) -> Result<(), CliError> {
+    let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    match store.repair_session_tail(session_id)? {
+        Some(backup) => println!(
+            "repaired {session_id}; original backed up at {}",
+            backup.display()
+        ),
+        None => println!("{session_id} has no unreadable tail; index rebuilt"),
     }
     Ok(())
 }

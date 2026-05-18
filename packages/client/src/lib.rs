@@ -546,6 +546,25 @@ impl ClientConnection {
         }
     }
 
+    /// Attach to a session and return a recent history window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn attach_session_recent(
+        &mut self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>, ClientError> {
+        match self
+            .send_request(Request::AttachSessionRecent { session_id, limit })
+            .await?
+        {
+            ResponsePayload::Attached { history, .. } => Ok(history),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Send a user message to a session.
     ///
     /// # Errors
