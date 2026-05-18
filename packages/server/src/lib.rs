@@ -1395,12 +1395,17 @@ enum CompactionError {
 }
 
 struct CompactionTranscript {
-    text: String,
+    previous_summary: Option<String>,
+    lines: Vec<String>,
     compacted_through_sequence: u64,
     event_count: usize,
 }
 
 const COMPACTION_SYSTEM_PROMPT: &str = "You compact coding-agent session history. Produce only a durable continuation summary for future model turns. Preserve all facts needed to continue the work, including user goals, decisions, constraints, files changed, commands run, validation results, current blockers, and next steps. Do not invent details. Do not include markdown fences.";
+const COMPACTION_CHUNK_TARGET_CHARS: usize = 32_000;
+const COMPACTION_MIN_CHUNK_CHARS: usize = 4_000;
+const COMPACTION_MAX_CARRIED_SUMMARY_CHARS: usize = 24_000;
+const COMPACTION_MAX_EVENT_CONTENT_CHARS: usize = 16_000;
 
 async fn compact_session_context(
     state: &ServerState,
@@ -1437,7 +1442,9 @@ async fn compact_session_context_with_limit(
                 .collect()
         },
     );
-    let Some(transcript) = compaction_transcript(&transcript_history) else {
+    let Some(transcript) =
+        compaction_transcript(&transcript_history, state.tool_output_context_chars)
+    else {
         return Err(CompactionError::NothingToCompact(
             "nothing new to compact".to_string(),
         ));
@@ -1584,23 +1591,64 @@ async fn collect_compaction_summary(
     selection: &SessionModelSelection,
     transcript: &CompactionTranscript,
 ) -> Result<String, CompactionError> {
+    let mut summary = transcript.previous_summary.clone().unwrap_or_default();
+    let mut chunks = compaction_chunks(&transcript.lines, COMPACTION_CHUNK_TARGET_CHARS);
+    let mut chunk_index = 0_usize;
+    while chunk_index < chunks.len() {
+        let prompt_text = compaction_prompt_text(
+            summary.trim(),
+            &chunks[chunk_index],
+            chunk_index,
+            chunks.len(),
+        );
+        match collect_compaction_summary_chunk(
+            state,
+            session_id,
+            selection,
+            transcript.compacted_through_sequence,
+            chunk_index,
+            &prompt_text,
+        )
+        .await
+        {
+            Ok(next_summary) => {
+                summary = truncate_text(next_summary.trim(), COMPACTION_MAX_CARRIED_SUMMARY_CHARS);
+                chunk_index = chunk_index.saturating_add(1);
+            }
+            Err(error)
+                if is_context_length_compaction_error(&error)
+                    && split_compaction_chunk_at(&mut chunks, chunk_index) => {}
+            Err(error) => return Err(CompactionError::Provider(error)),
+        }
+    }
+    Ok(summary)
+}
+
+async fn collect_compaction_summary_chunk(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    compacted_through_sequence: u64,
+    chunk_index: usize,
+    prompt_text: &str,
+) -> Result<String, String> {
     let turn_id = format!(
-        "{}-compact-{}",
-        session_id, transcript.compacted_through_sequence
+        "{session_id}-compact-{compacted_through_sequence}-{}",
+        chunk_index.saturating_add(1)
     );
-    let request = build_compaction_request(session_id, selection, transcript, turn_id.clone());
+    let request = build_compaction_request(session_id, selection, prompt_text, turn_id.clone());
     let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
         state,
         selection.provider_plugin_id.clone(),
         OP_START_TURN,
         request,
     )
-    .await
-    .map_err(CompactionError::Provider)?;
+    .await?;
 
     let provider_turn_id = start.provider_turn_id;
-    let result =
-        poll_compaction_summary(state, session_id, selection, &provider_turn_id, &turn_id).await;
+    let result = poll_compaction_summary(state, session_id, selection, &provider_turn_id, &turn_id)
+        .await
+        .map_err(|error| error.to_string());
     finish_provider_turn(
         state,
         selection.provider_plugin_id.clone(),
@@ -1613,7 +1661,7 @@ async fn collect_compaction_summary(
 fn build_compaction_request(
     session_id: SessionId,
     selection: &SessionModelSelection,
-    transcript: &CompactionTranscript,
+    prompt_text: &str,
     turn_id: String,
 ) -> ModelTurnRequest {
     ModelTurnRequest {
@@ -1625,10 +1673,7 @@ fn build_compaction_request(
         messages: vec![ModelMessage {
             role: MessageRole::User,
             content: vec![ContentBlock::Text {
-                text: format!(
-                    "Compact this Bcode session transcript for future continuation. Return only the summary.\n\n{}",
-                    transcript.text
-                ),
+                text: prompt_text.to_string(),
             }],
         }],
         tools: Vec::new(),
@@ -1637,6 +1682,88 @@ fn build_compaction_request(
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: BTreeMap::from([("bcode_request_kind".to_string(), "compaction".to_string())]),
     }
+}
+
+fn compaction_chunks(lines: &[String], target_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in lines {
+        let separator_chars = usize::from(!current.is_empty()) * 2;
+        if !current.is_empty()
+            && current
+                .chars()
+                .count()
+                .saturating_add(separator_chars)
+                .saturating_add(line.chars().count())
+                > target_chars
+        {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn compaction_prompt_text(
+    previous_summary: &str,
+    chunk: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+) -> String {
+    let previous_summary = previous_summary.trim();
+    let carried_summary = truncate_text(previous_summary, COMPACTION_MAX_CARRIED_SUMMARY_CHARS);
+    if carried_summary.is_empty() {
+        return format!(
+            "Compact this Bcode session transcript chunk for future continuation. This is chunk {}/{}. Return only the durable rolling summary.\n\nTranscript chunk:\n\n{chunk}",
+            chunk_index.saturating_add(1),
+            total_chunks
+        );
+    }
+    format!(
+        "Update the existing compacted Bcode session summary with the next transcript chunk. This is chunk {}/{}. Return only the updated durable summary.\n\nExisting summary:\n\n{carried_summary}\n\nNext transcript chunk:\n\n{chunk}",
+        chunk_index.saturating_add(1),
+        total_chunks
+    )
+}
+
+fn split_compaction_chunk_at(chunks: &mut Vec<String>, index: usize) -> bool {
+    let Some(chunk) = chunks.get(index) else {
+        return false;
+    };
+    let char_count = chunk.chars().count();
+    if char_count <= COMPACTION_MIN_CHUNK_CHARS {
+        return false;
+    }
+    let midpoint = char_count / 2;
+    let split_byte = chunk
+        .char_indices()
+        .nth(midpoint)
+        .map_or_else(|| chunk.len(), |(byte_index, _)| byte_index);
+    let second = chunk[split_byte..].trim_start().to_string();
+    let first = chunk[..split_byte].trim_end().to_string();
+    if first.is_empty() || second.is_empty() {
+        return false;
+    }
+    chunks.splice(index..=index, [first, second]);
+    true
+}
+
+fn is_context_length_compaction_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("context_length")
+        || error.contains("context length")
+        || error.contains("context window")
+        || error.contains("maximum context")
+        || error.contains("input exceeds")
+        || error.contains("prompt is too long")
+        || error.contains("input is too long")
+        || error.contains("too many tokens")
 }
 
 async fn poll_compaction_summary(
@@ -1757,6 +1884,7 @@ async fn finish_provider_turn(
 
 fn compaction_transcript(
     history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
 ) -> Option<CompactionTranscript> {
     let history = compact_attach_history(history.to_vec());
     let compacted_through_sequence = history.last()?.sequence;
@@ -1770,17 +1898,12 @@ fn compaction_transcript(
                 _ => None,
             });
 
-    let mut lines = Vec::new();
-    if let Some((_, summary)) = latest_compaction {
-        lines.push("Previous compacted summary:".to_string());
-        lines.push(summary.clone());
-        lines.push("Events since previous compaction:".to_string());
-    }
-
+    let previous_summary = latest_compaction.map(|(_, summary)| summary.clone());
     let start_index = latest_compaction.map_or(0, |(index, _)| index.saturating_add(1));
+    let mut lines = Vec::new();
     let mut event_count = 0_usize;
     for event in &history[start_index..] {
-        if let Some(line) = session_event_compaction_line(event) {
+        if let Some(line) = session_event_compaction_line(event, tool_output_context_chars) {
             event_count = event_count.saturating_add(1);
             lines.push(line);
         }
@@ -1791,39 +1914,55 @@ fn compaction_transcript(
     }
 
     Some(CompactionTranscript {
-        text: lines.join("\n\n"),
+        previous_summary,
+        lines,
         compacted_through_sequence,
         event_count,
     })
 }
 
-fn session_event_compaction_line(event: &bcode_session_models::SessionEvent) -> Option<String> {
+fn session_event_compaction_line(
+    event: &bcode_session_models::SessionEvent,
+    tool_output_context_chars: usize,
+) -> Option<String> {
     match &event.kind {
-        SessionEventKind::UserMessage { text, .. } => {
-            Some(format!("#{} user:\n{text}", event.sequence))
-        }
-        SessionEventKind::AssistantMessage { text } => {
-            Some(format!("#{} assistant:\n{text}", event.sequence))
-        }
+        SessionEventKind::UserMessage { text, .. } => Some(format!(
+            "#{} user:\n{}",
+            event.sequence,
+            truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
+        )),
+        SessionEventKind::AssistantMessage { text } => Some(format!(
+            "#{} assistant:\n{}",
+            event.sequence,
+            truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
+        )),
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
             arguments_json,
         } => Some(format!(
-            "#{} assistant tool call {tool_call_id} ({tool_name}):\n{arguments_json}",
-            event.sequence
+            "#{} assistant tool call {tool_call_id} ({tool_name}):\n{}",
+            event.sequence,
+            truncate_text(arguments_json, COMPACTION_MAX_EVENT_CONTENT_CHARS)
         )),
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
             is_error,
         } => Some(format!(
-            "#{} tool result {tool_call_id} (error={is_error}):\n{result}",
-            event.sequence
+            "#{} tool result {tool_call_id} (error={is_error}):\n{}",
+            event.sequence,
+            tool_result_for_model(
+                result,
+                None,
+                tool_output_context_chars.min(COMPACTION_MAX_EVENT_CONTENT_CHARS),
+            )
         )),
-        SessionEventKind::SystemMessage { text } => {
-            Some(format!("#{} system:\n{text}", event.sequence))
-        }
+        SessionEventKind::SystemMessage { text } => Some(format!(
+            "#{} system:\n{}",
+            event.sequence,
+            truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
+        )),
         _ => None,
     }
 }
@@ -4286,17 +4425,68 @@ mod tests {
             model_id: Some("model".to_string()),
             ..SessionModelSelection::default()
         };
-        let transcript = CompactionTranscript {
-            text: "old transcript".to_string(),
-            compacted_through_sequence: 42,
-            event_count: 1,
-        };
+        let prompt_text = "old transcript";
 
-        let request = build_compaction_request(session_id, &selection, &transcript, "turn".into());
+        let request = build_compaction_request(session_id, &selection, prompt_text, "turn".into());
 
         assert_eq!(request.parameters.temperature, None);
         assert_eq!(request.parameters.max_output_tokens, None);
         assert_eq!(request.parameters.top_p, None);
+    }
+
+    #[test]
+    fn compaction_transcript_truncates_large_tool_results() {
+        let session_id = SessionId::new();
+        let transcript = compaction_transcript(
+            &[session_event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_string(),
+                    result: format!("{}tail", "x".repeat(4_000)),
+                    is_error: false,
+                },
+            )],
+            1_000,
+        )
+        .expect("compaction transcript");
+
+        let text = transcript.lines.join("\n\n");
+        assert!(text.contains("tool output truncated"));
+        assert!(!text.contains("tail"));
+        assert!(text.chars().count() < 1_200);
+    }
+
+    #[test]
+    fn compaction_chunks_stay_under_target_when_lines_fit() {
+        let lines = vec!["a".repeat(10), "b".repeat(10), "c".repeat(10)];
+
+        let chunks = compaction_chunks(&lines, 25);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 25));
+    }
+
+    #[test]
+    fn compaction_chunk_split_halves_oversized_chunk() {
+        let mut chunks = vec!["x".repeat(COMPACTION_MIN_CHUNK_CHARS + 2)];
+
+        assert!(split_compaction_chunk_at(&mut chunks, 0));
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn compaction_prompt_truncates_carried_summary() {
+        let prompt = compaction_prompt_text(
+            &"s".repeat(COMPACTION_MAX_CARRIED_SUMMARY_CHARS + 100),
+            "next chunk",
+            0,
+            1,
+        );
+
+        assert!(prompt.contains("[truncated]"));
+        assert!(prompt.contains("next chunk"));
     }
 
     #[test]
