@@ -1572,7 +1572,7 @@ impl ActivityState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OlderHistoryState {
     More,
-    LoadRequested,
+    LoadRequested { reveal_rows: usize },
     Exhausted,
 }
 
@@ -2150,10 +2150,12 @@ impl ChatApp {
     }
 
     fn scroll_rows_up(&mut self, rows: usize) {
-        self.scroll_rows_from_bottom = self.scroll_rows_from_bottom.saturating_add(rows);
-        self.clamp_scroll();
-        if self.older_history_state == OlderHistoryState::More {
-            self.older_history_state = OlderHistoryState::LoadRequested;
+        let max_scroll = self.max_scroll_rows_from_bottom();
+        let desired = self.scroll_rows_from_bottom.saturating_add(rows);
+        let reveal_rows = desired.saturating_sub(max_scroll);
+        self.scroll_rows_from_bottom = desired.min(max_scroll);
+        if reveal_rows > 0 && self.older_history_state == OlderHistoryState::More {
+            self.older_history_state = OlderHistoryState::LoadRequested { reveal_rows };
         }
     }
 
@@ -2178,9 +2180,11 @@ impl ChatApp {
     }
 
     fn scroll_top(&mut self) {
-        self.scroll_rows_from_bottom = self.max_scroll_rows_from_bottom();
+        let max_scroll = self.max_scroll_rows_from_bottom();
+        let reveal_rows = self.page_scroll_rows();
+        self.scroll_rows_from_bottom = max_scroll;
         if self.older_history_state == OlderHistoryState::More {
-            self.older_history_state = OlderHistoryState::LoadRequested;
+            self.older_history_state = OlderHistoryState::LoadRequested { reveal_rows };
         }
     }
 
@@ -2214,20 +2218,15 @@ impl ChatApp {
     }
 
     fn take_older_history_cursor(&mut self) -> Option<SessionHistoryCursor> {
-        if self.older_history_state != OlderHistoryState::LoadRequested {
+        let OlderHistoryState::LoadRequested { .. } = self.older_history_state else {
             return None;
-        }
+        };
         let oldest = self.oldest_loaded_sequence?;
         if oldest == 0 {
             self.older_history_state = OlderHistoryState::Exhausted;
             return None;
         }
-        let near_top = self
-            .scroll_rows_from_bottom
-            .saturating_add(self.page_scroll_rows())
-            >= self.max_scroll_rows_from_bottom();
-        self.older_history_state = OlderHistoryState::More;
-        near_top.then_some(SessionHistoryCursor {
+        Some(SessionHistoryCursor {
             sequence: oldest.saturating_sub(1),
         })
     }
@@ -2238,6 +2237,10 @@ impl ChatApp {
             self.status = "start of session history".to_string();
             return;
         }
+        let reveal_rows = match self.older_history_state {
+            OlderHistoryState::LoadRequested { reveal_rows } => reveal_rows,
+            OlderHistoryState::More | OlderHistoryState::Exhausted => 0,
+        };
         let max_scroll_before = self.max_scroll_rows_from_bottom();
         let mut blocks = Vec::new();
         let mut input_messages = Vec::new();
@@ -2261,9 +2264,10 @@ impl ChatApp {
             self.blocks.splice(0..0, blocks);
             self.mark_transcript_dirty();
             let max_scroll_after = self.max_scroll_rows_from_bottom();
+            let inserted_rows = max_scroll_after.saturating_sub(max_scroll_before);
             self.scroll_rows_from_bottom = self
                 .scroll_rows_from_bottom
-                .saturating_add(max_scroll_after.saturating_sub(max_scroll_before));
+                .saturating_add(reveal_rows.min(inserted_rows));
             self.clamp_scroll();
         }
         self.older_history_state = if has_more {
@@ -4483,6 +4487,59 @@ mod tests {
             app.blocks.as_slice(),
             [TranscriptBlock::Assistant { text, streaming: false }] if text == "BMUX"
         ));
+    }
+
+    #[test]
+    fn prepending_older_history_without_overscroll_preserves_scroll_position() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+        app.blocks.push(TranscriptBlock::System {
+            text: "current\n".repeat(20),
+        });
+        app.last_transcript_width.set(80);
+        app.last_transcript_height.set(5);
+        app.scroll_rows_from_bottom = 3;
+        app.older_history_state = OlderHistoryState::More;
+
+        app.prepend_older_history(
+            &[session_event(
+                session_id,
+                SessionEventKind::SystemMessage {
+                    text: "older\n".repeat(10),
+                },
+            )],
+            true,
+        );
+
+        assert_eq!(app.scroll_rows_from_bottom, 3);
+    }
+
+    #[test]
+    fn prepending_older_history_reveals_only_requested_overscroll_rows() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let mut app = ChatApp::new(session_id, &[], &keymap);
+        app.blocks.push(TranscriptBlock::System {
+            text: "current\n".repeat(20),
+        });
+        app.last_transcript_width.set(80);
+        app.last_transcript_height.set(5);
+        app.scroll_rows_from_bottom = app.max_scroll_rows_from_bottom();
+        app.older_history_state = OlderHistoryState::LoadRequested { reveal_rows: 2 };
+        let before = app.scroll_rows_from_bottom;
+
+        app.prepend_older_history(
+            &[session_event(
+                session_id,
+                SessionEventKind::SystemMessage {
+                    text: "older\n".repeat(10),
+                },
+            )],
+            true,
+        );
+
+        assert_eq!(app.scroll_rows_from_bottom, before.saturating_add(2));
     }
 
     #[test]
