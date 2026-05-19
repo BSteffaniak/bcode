@@ -5173,6 +5173,22 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_unicode_cursor_uses_display_width() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.open_command_palette();
+        if let Some(palette) = &mut app.command_palette {
+            palette.filter = TextEditBuffer::from_text("a界👋🏽e\u{301}");
+            palette.filter.move_cursor(TextMotion::Left);
+        }
+
+        assert_eq!(
+            app.cursor_position(Rect::new(0, 0, 100, 30)),
+            Some(Position::new(16, 7))
+        );
+    }
+
+    #[test]
     fn chat_frame_sets_cursor_at_composer_insert_position() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
@@ -5193,6 +5209,35 @@ mod tests {
         terminal
             .backend_mut()
             .assert_cursor_position(Position::new(6, 17));
+    }
+
+    #[test]
+    fn composer_unicode_cursor_uses_display_width() {
+        let layout = composer_layout(
+            Rect::new(0, 0, 20, 4),
+            &TextEditBuffer::from_text("a界👋🏽e\u{301}"),
+            false,
+        );
+
+        assert_eq!(layout.cursor_position, Some(Position::new(7, 1)));
+    }
+
+    #[test]
+    fn composer_unicode_wrapping_keeps_cursor_visible() {
+        let layout = composer_layout(
+            Rect::new(0, 0, 6, 5),
+            &TextEditBuffer::from_text("a界👋🏽e\u{301}b"),
+            false,
+        );
+        let lines = layout
+            .text
+            .lines
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["a界", "👋🏽e\u{301}b"]);
+        assert_eq!(layout.cursor_position, Some(Position::new(4, 2)));
     }
 
     #[test]
@@ -5435,6 +5480,21 @@ mod tests {
         assert_eq!(
             app.cursor_position(Rect::new(0, 0, 100, 40)),
             Some(Position::new(20, 34))
+        );
+    }
+
+    #[test]
+    fn session_rename_unicode_cursor_uses_display_width() {
+        let mut app = SessionPickerApp::new(&[session_summary_with_name("a界👋🏽e\u{301}")]);
+        app.selected = 1;
+        app.start_rename();
+        if let SessionPickerMode::Renaming { input } = &mut app.mode {
+            input.move_cursor(TextMotion::Left);
+        }
+
+        assert_eq!(
+            app.cursor_position(Rect::new(0, 0, 100, 40)),
+            Some(Position::new(22, 34))
         );
     }
 
