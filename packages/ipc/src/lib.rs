@@ -329,6 +329,10 @@ pub enum ResponsePayload {
     PluginEventPublished {
         delivered: usize,
     },
+    MessageAccepted {
+        queued: bool,
+        queue_position: Option<u32>,
+    },
 }
 
 /// Structured error response.

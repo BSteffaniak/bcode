@@ -48,6 +48,24 @@ impl From<ErrorResponse> for ClientError {
     }
 }
 
+/// Result returned after a user message or skill invocation is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageAcceptance {
+    pub queued: bool,
+    pub queue_position: Option<u32>,
+}
+
+impl MessageAcceptance {
+    /// Acceptance for legacy servers that only report message delivery.
+    #[must_use]
+    pub const fn sent() -> Self {
+        Self {
+            queued: false,
+            queue_position: None,
+        }
+    }
+}
+
 /// Client configured for a local Bcode server endpoint.
 #[derive(Debug, Clone)]
 pub struct BcodeClient {
@@ -214,7 +232,7 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
         text: String,
-    ) -> Result<(), ClientError> {
+    ) -> Result<MessageAcceptance, ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         connection.send_user_message(session_id, text).await
     }
@@ -348,7 +366,7 @@ impl BcodeClient {
         skill_id: SkillId,
         arguments: String,
         display_text: String,
-    ) -> Result<(), ClientError> {
+    ) -> Result<MessageAcceptance, ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         match connection
             .send_request(Request::InvokeSkill {
@@ -359,7 +377,14 @@ impl BcodeClient {
             })
             .await?
         {
-            ResponsePayload::MessageSent => Ok(()),
+            ResponsePayload::MessageAccepted {
+                queued,
+                queue_position,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+            }),
+            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -630,7 +655,7 @@ impl BcodeClient {
         };
         match connection
             .send_request(Request::Hello {
-                client_name: client_name.to_string(),
+                client_name: format!("{client_name};cap=message_accepted"),
             })
             .await?
         {
@@ -747,12 +772,19 @@ impl ClientConnection {
         &mut self,
         session_id: SessionId,
         text: String,
-    ) -> Result<(), ClientError> {
+    ) -> Result<MessageAcceptance, ClientError> {
         match self
             .send_request(Request::SendUserMessage { session_id, text })
             .await?
         {
-            ResponsePayload::MessageSent => Ok(()),
+            ResponsePayload::MessageAccepted {
+                queued,
+                queue_position,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+            }),
+            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

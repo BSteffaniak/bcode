@@ -45,7 +45,10 @@ use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
@@ -105,12 +108,20 @@ struct ServerState {
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
+    message_accepted_clients: Mutex<BTreeSet<ClientId>>,
     shutdown: broadcast::Sender<()>,
 }
 
 #[derive(Debug, Clone)]
 struct SessionRuntimeHandle {
     commands: mpsc::Sender<SessionCommand>,
+    queued_commands: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MessageQueueStatus {
+    queued: bool,
+    queue_position: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -393,6 +404,7 @@ impl ServerState {
             pending_permissions: Mutex::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
+            message_accepted_clients: Mutex::default(),
             shutdown,
         }
     }
@@ -403,6 +415,21 @@ impl ServerState {
 
     async fn unregister_client(&self, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
+        self.message_accepted_clients
+            .lock()
+            .await
+            .remove(&client_id);
+    }
+
+    async fn register_message_accepted_client(&self, client_id: ClientId) {
+        self.message_accepted_clients.lock().await.insert(client_id);
+    }
+
+    async fn client_supports_message_accepted(&self, client_id: ClientId) -> bool {
+        self.message_accepted_clients
+            .lock()
+            .await
+            .contains(&client_id)
     }
 
     async fn status(&self) -> ServerStatus {
@@ -565,7 +592,9 @@ async fn handle_request(
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
     match request {
-        Request::Hello { .. } => handle_hello(request_id, client_id, writer).await,
+        Request::Hello { client_name } => {
+            handle_hello(request_id, client_id, state, writer, &client_name).await
+        }
         Request::Ping => handle_ping(request_id, writer).await,
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
         Request::ServerStop => handle_server_stop(request_id, state, writer).await,
@@ -738,11 +767,22 @@ async fn handle_ping(request_id: u64, writer: &SharedWriter) -> Result<(), Serve
     send_response(writer, request_id, Response::Ok(ResponsePayload::Pong)).await
 }
 
+fn client_name_supports_message_accepted(client_name: &str) -> bool {
+    client_name
+        .split(';')
+        .any(|part| part.trim() == "cap=message_accepted")
+}
+
 async fn handle_hello(
     request_id: u64,
     client_id: ClientId,
+    state: &ServerState,
     writer: &SharedWriter,
+    client_name: &str,
 ) -> Result<(), ServerError> {
+    if client_name_supports_message_accepted(client_name) {
+        state.register_message_accepted_client(client_id).await;
+    }
     send_response(
         writer,
         request_id,
@@ -1040,15 +1080,26 @@ async fn enqueue_session_command(
     state: &Arc<ServerState>,
     session_id: SessionId,
     command: SessionCommand,
-) -> Result<(), ServerError> {
+) -> Result<MessageQueueStatus, ServerError> {
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
+    let pending_before = handle.queued_commands.fetch_add(1, Ordering::AcqRel);
+    let queued = pending_before > 0 || state.active_turns.lock().await.contains_key(&session_id);
+    let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
     if handle.commands.send(command).await.is_ok() {
-        return Ok(());
+        return Ok(MessageQueueStatus {
+            queued,
+            queue_position,
+        });
     }
+    handle.queued_commands.fetch_sub(1, Ordering::AcqRel);
 
     state.session_runtimes.lock().await.remove(&session_id);
     Err(bcode_session::SessionError::NotFound(session_id).into())
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 async fn session_runtime_handle(
@@ -1061,12 +1112,16 @@ async fn session_runtime_handle(
     }
 
     let (commands, receiver) = mpsc::channel(128);
-    let handle = SessionRuntimeHandle { commands };
+    let queued_commands = Arc::new(AtomicUsize::new(0));
+    let handle = SessionRuntimeHandle {
+        commands,
+        queued_commands: Arc::clone(&queued_commands),
+    };
     runtimes.insert(session_id, handle.clone());
     drop(runtimes);
     let state_for_runtime = Arc::clone(state);
     tokio::spawn(async move {
-        run_session_runtime(state_for_runtime, session_id, receiver).await;
+        run_session_runtime(state_for_runtime, session_id, receiver, queued_commands).await;
     });
     handle
 }
@@ -1075,9 +1130,11 @@ async fn run_session_runtime(
     state: Arc<ServerState>,
     session_id: SessionId,
     mut commands: mpsc::Receiver<SessionCommand>,
+    queued_commands: Arc<AtomicUsize>,
 ) {
     let mut permit = SessionTurnPermit::new(session_id);
     while let Some(command) = commands.recv().await {
+        queued_commands.fetch_sub(1, Ordering::AcqRel);
         match command {
             SessionCommand::UserMessage { client_id, text } => {
                 process_user_message_command(&state, &mut permit, client_id, text).await;
@@ -1217,6 +1274,25 @@ async fn append_turn_user_message(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn send_message_acceptance_response(
+    state: &ServerState,
+    writer: &SharedWriter,
+    request_id: u64,
+    client_id: ClientId,
+    status: MessageQueueStatus,
+) -> Result<(), ServerError> {
+    let payload = if state.client_supports_message_accepted(client_id).await {
+        ResponsePayload::MessageAccepted {
+            queued: status.queued,
+            queue_position: status.queue_position,
+        }
+    } else {
+        ResponsePayload::MessageSent
+    };
+    send_response(writer, request_id, Response::Ok(payload)).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_invoke_skill(
     request_id: u64,
     client_id: ClientId,
@@ -1254,13 +1330,8 @@ async fn handle_invoke_skill(
         display_text,
     };
     match enqueue_session_command(state, session_id, command).await {
-        Ok(()) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::MessageSent),
-            )
-            .await
+        Ok(status) => {
+            send_message_acceptance_response(state, writer, request_id, client_id, status).await
         }
         Err(error) => {
             send_response(
@@ -1288,13 +1359,8 @@ async fn handle_user_message(
     )
     .await
     {
-        Ok(()) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::MessageSent),
-            )
-            .await
+        Ok(status) => {
+            send_message_acceptance_response(state, writer, request_id, client_id, status).await
         }
         Err(error) => {
             send_response(

@@ -18,7 +18,7 @@
 //! Terminal user interface for Bcode.
 
 use arboard::Clipboard;
-use bcode_client::{BcodeClient, ClientError};
+use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
 use bcode_command::CommandInfo;
 use bcode_config::{TuiMouseClickSelection, TuiMouseConfig};
 use bcode_ipc::Event;
@@ -50,7 +50,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::rc::Rc;
@@ -81,6 +81,7 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 const MOUSE_CLICK_COUNT_MAX: u8 = 3;
 const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const MAX_COMPOSER_ROWS: u16 = 6;
+const MAX_QUEUED_MESSAGE_ROWS: u16 = 5;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MODAL_MARGIN_X: u16 = 4;
 const MODAL_MARGIN_Y: u16 = 2;
@@ -893,14 +894,19 @@ async fn submit_chat_input(
             }
             outcome => outcome,
         }
-    } else if let Err(error) = client.send_user_message(session_id, message).await {
-        app.set_activity(ActivityState::Idle);
-        app.status = format!("send failed: {error}");
-        SlashCommandOutcome::Handled
     } else {
-        app.set_activity(ActivityState::Thinking);
-        app.status = "sent".to_string();
-        SlashCommandOutcome::Handled
+        let submitted = message.clone();
+        match client.send_user_message(session_id, message).await {
+            Ok(acceptance) => {
+                app.accept_submitted_message(submitted, acceptance);
+                SlashCommandOutcome::Handled
+            }
+            Err(error) => {
+                app.set_activity(ActivityState::Idle);
+                app.status = format!("send failed: {error}");
+                SlashCommandOutcome::Handled
+            }
+        }
     }
 }
 
@@ -1823,9 +1829,13 @@ async fn invoke_skill_from_tui(
                 )
                 .await
             {
-                Ok(()) => {
-                    app.set_activity(ActivityState::Thinking);
-                    app.status = format!("invoked skill {skill_id}");
+                Ok(acceptance) => {
+                    app.accept_submitted_message(display_text.to_string(), acceptance);
+                    app.status = if acceptance.queued {
+                        format!("queued skill {skill_id}")
+                    } else {
+                        format!("invoked skill {skill_id}")
+                    };
                 }
                 Err(error) => {
                     app.set_activity(ActivityState::Idle);
@@ -2709,7 +2719,12 @@ enum OlderHistoryState {
     Exhausted,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingUserMessage {
+    text: String,
+    queue_position: Option<u32>,
+}
+
 struct ChatApp {
     session_id: SessionId,
     session_title: Option<String>,
@@ -2720,6 +2735,7 @@ struct ChatApp {
     input_history_index: Option<usize>,
     input_history_draft: Option<String>,
     status: String,
+    pending_user_messages: VecDeque<PendingUserMessage>,
     pending_permissions: BTreeMap<String, PendingPermissionView>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
@@ -3099,6 +3115,7 @@ impl ChatApp {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "ready".to_string()),
+            pending_user_messages: VecDeque::new(),
             pending_permissions: BTreeMap::new(),
             selected_provider_plugin_id: None,
             selected_model_id: None,
@@ -3190,6 +3207,40 @@ impl ChatApp {
         self.mark_transcript_dirty();
         self.scroll_rows_from_bottom = 0;
         self.status = format!("listed {} models", models.len());
+    }
+
+    fn accept_submitted_message(&mut self, text: String, acceptance: MessageAcceptance) {
+        self.set_activity(ActivityState::Thinking);
+        if acceptance.queued {
+            self.pending_user_messages.push_back(PendingUserMessage {
+                text,
+                queue_position: acceptance.queue_position,
+            });
+            self.status = acceptance.queue_position.map_or_else(
+                || "queued message".to_string(),
+                |position| format!("queued message at position {position}"),
+            );
+        } else {
+            self.status = "sent".to_string();
+        }
+    }
+
+    fn remove_committed_pending_user_message(&mut self, text: &str) {
+        let Some(index) = self
+            .pending_user_messages
+            .iter()
+            .position(|message| message.text == text)
+        else {
+            return;
+        };
+        self.pending_user_messages.remove(index);
+        self.renumber_pending_user_messages();
+    }
+
+    fn renumber_pending_user_messages(&mut self) {
+        for (index, message) in self.pending_user_messages.iter_mut().enumerate() {
+            message.queue_position = Some(usize_to_u32_saturating(index.saturating_add(1)));
+        }
     }
 
     fn take_model_status_refresh_needed(&mut self) -> bool {
@@ -3672,6 +3723,7 @@ impl ChatApp {
                 self.current_agent_id.clone_from(agent_id);
             }
             SessionEventKind::UserMessage { text, .. } => {
+                self.remove_committed_pending_user_message(text);
                 self.push_input_history_message(event.sequence, text);
             }
             SessionEventKind::SessionCreated { name }
@@ -3854,8 +3906,13 @@ impl ChatApp {
     fn cursor_position(&self, area: Rect) -> Option<Position> {
         match self.current_scope() {
             TuiScope::Chat => {
-                let chunks = chat_layout(area, &self.input, self.search_mode);
-                composer_layout(chunks[2], &self.input, self.search_mode).cursor_position
+                let chunks = chat_layout(
+                    area,
+                    &self.input,
+                    self.search_mode,
+                    self.pending_user_messages.len(),
+                );
+                composer_layout(chunks[3], &self.input, self.search_mode).cursor_position
             }
             TuiScope::CommandPalette => self
                 .command_palette
@@ -4559,18 +4616,25 @@ fn render_chat_frame(frame: &mut Frame<'_>, app: &ChatApp) {
     }
 }
 
-fn chat_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> [Rect; 4] {
+fn chat_layout(
+    area: Rect,
+    input: &TextEditBuffer,
+    search_mode: bool,
+    queued_message_count: usize,
+) -> [Rect; 5] {
     let composer_height = composer_height(
         input,
         search_mode,
         area.height,
         area.width.saturating_sub(2),
     );
+    let queued_height = queued_messages_height(queued_message_count, area.height, composer_height);
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(queued_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -4580,7 +4644,12 @@ fn chat_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> [Rect; 
 impl ratatui::widgets::Widget for &ChatApp {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         self.last_frame_area.set(area);
-        let chunks = chat_layout(area, &self.input, self.search_mode);
+        let chunks = chat_layout(
+            area,
+            &self.input,
+            self.search_mode,
+            self.pending_user_messages.len(),
+        );
 
         render_chat_header(self, chunks[0], buf);
 
@@ -4612,12 +4681,14 @@ impl ratatui::widgets::Widget for &ChatApp {
         };
         transcript.render(chunks[1], buf);
 
+        render_queued_messages(self, chunks[2], buf);
+
         let input_title = if self.search_mode {
             " Search "
         } else {
             " Message "
         };
-        let composer = composer_layout(chunks[2], &self.input, self.search_mode);
+        let composer = composer_layout(chunks[3], &self.input, self.search_mode);
         self.last_composer_area.set(composer.content_area);
         let input = Paragraph::new(composer.text).block(
             Block::new()
@@ -4630,13 +4701,13 @@ impl ratatui::widgets::Widget for &ChatApp {
                     border_style()
                 }),
         );
-        input.render(chunks[2], buf);
+        input.render(chunks[3], buf);
 
         let tick = self.render_tick.get().wrapping_add(1);
         self.render_tick.set(tick);
         render_chat_status(
             self,
-            chunks[3],
+            chunks[4],
             buf,
             viewport.effective_scroll_rows_from_bottom,
             tick,
@@ -4656,11 +4727,62 @@ impl ratatui::widgets::Widget for &ChatApp {
             && self.command_palette.is_none()
             && !self.search_mode
         {
-            render_slash_completion(area, chunks[2], buf, completion);
+            render_slash_completion(area, chunks[4], buf, completion);
         }
         if let Some(palette) = &self.command_palette {
             render_command_palette(area, buf, palette);
         }
+    }
+}
+
+fn queued_messages_height(count: usize, terminal_height: u16, composer_height: u16) -> u16 {
+    if count == 0 {
+        return 0;
+    }
+    let visible = usize_to_u16_saturating(count).min(MAX_QUEUED_MESSAGE_ROWS);
+    visible.min(
+        terminal_height
+            .saturating_sub(composer_height)
+            .saturating_sub(2),
+    )
+}
+
+fn render_queued_messages(app: &ChatApp, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    if area.height == 0 || app.pending_user_messages.is_empty() {
+        return;
+    }
+    let visible_rows = usize::from(area.height);
+    let hidden_count = app.pending_user_messages.len().saturating_sub(visible_rows);
+    let mut lines = Vec::new();
+    if hidden_count > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("+{hidden_count} more queued"),
+            muted_style(),
+        )]));
+    }
+    let shown = visible_rows.saturating_sub(lines.len());
+    let start = app.pending_user_messages.len().saturating_sub(shown);
+    for message in app.pending_user_messages.iter().skip(start) {
+        let label = message.queue_position.map_or_else(
+            || "queued".to_string(),
+            |position| format!("queued {position}"),
+        );
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label}: "), warning_style()),
+            Span::styled(single_line_preview(&message.text), normal_style()),
+        ]));
+    }
+    Paragraph::new(Text::from(lines)).render(area, buf);
+}
+
+fn single_line_preview(text: &str) -> String {
+    let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.chars().count() > 120 {
+        let mut truncated: String = preview.chars().take(117).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        preview
     }
 }
 
@@ -5056,7 +5178,7 @@ fn render_permission_modal(
         "Selected choice is highlighted. Enter confirms; escape denies once.",
         muted_style(),
     )]))
-    .render(chunks[3], buf);
+    .render(chunks[2], buf);
 }
 
 fn command_palette_item(command: &CommandInfo) -> ListItem<'static> {
@@ -5497,6 +5619,10 @@ fn danger_bold_style() -> Style {
     danger_style().add_modifier(Modifier::BOLD)
 }
 
+fn warning_style() -> Style {
+    Style::default().fg(COLOR_WARNING)
+}
+
 fn border_style() -> Style {
     Style::default().fg(COLOR_BORDER)
 }
@@ -5675,6 +5801,10 @@ fn line_plain_text(line: &Line<'_>) -> String {
 
 fn usize_to_u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 impl TranscriptBlock {
