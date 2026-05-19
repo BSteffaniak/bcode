@@ -70,9 +70,10 @@ Skill discovery should be layered and deterministic:
 1. Repository-local skills: `.bcode/skills/`
 2. Generic repository skills: `skills/`
 3. Compatibility repository skills: `.claude/skills/` when enabled
-4. User skills: `${state_dir}/bcode/skills/` or `${BCODE_STATE_DIR}/skills/`
-5. Explicit configured paths from `bcode.toml`
-6. Bundled skills from Bcode/plugin distributions
+4. User config skills: `${XDG_CONFIG_HOME}/bcode/skills/` or `~/.config/bcode/skills/`
+5. User state skills: `${BCODE_STATE_DIR}/skills/`, `${XDG_STATE_HOME}/bcode/skills/`, or `~/.local/state/bcode/skills/`
+6. Explicit configured paths from `bcode.toml`
+7. Bundled skills from Bcode/plugin distributions
 
 When duplicate IDs exist, higher-precedence sources shadow lower-precedence sources. Shadowed skills should appear in diagnostics rather than causing startup failure.
 

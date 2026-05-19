@@ -4889,10 +4889,16 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
     }
     if config.skills.include_user_skills {
         roots.push(SkillSourceRoot::new(
+            bcode_config::default_config_dir().join("skills"),
+            SkillSourceKind::User,
+            "user-config:skills",
+            30,
+        ));
+        roots.push(SkillSourceRoot::new(
             bcode_config::default_state_dir().join("skills"),
             SkillSourceKind::User,
-            "user:skills",
-            30,
+            "user-state:skills",
+            35,
         ));
     }
     for (index, path) in config.skills.sources.paths.iter().enumerate() {

@@ -1310,22 +1310,23 @@ fn parse_action(action: &str) -> Result<bcode_agent_policy_models::Action, Confi
     }
 }
 
+/// Return the default Bcode config directory.
+#[must_use]
+pub fn default_config_dir() -> PathBuf {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(config_home).join("bcode");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join(".config").join("bcode");
+    }
+    env::temp_dir().join("bcode")
+}
+
 fn writable_config_path() -> PathBuf {
     if let Ok(path) = env::var("BCODE_CONFIG") {
         return PathBuf::from(path);
     }
-    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home)
-            .join("bcode")
-            .join(DEFAULT_CONFIG_FILE_NAME);
-    }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("bcode")
-            .join(DEFAULT_CONFIG_FILE_NAME);
-    }
-    env::temp_dir().join(DEFAULT_CONFIG_FILE_NAME)
+    default_config_dir().join(DEFAULT_CONFIG_FILE_NAME)
 }
 
 fn config_to_toml(config: &BcodeConfig) -> String {
