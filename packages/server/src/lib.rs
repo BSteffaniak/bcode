@@ -29,7 +29,7 @@ use bcode_session_models::{
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
-    SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSourceKind,
+    SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillSourceKind,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
@@ -98,6 +98,7 @@ struct ServerState {
     skill_context_bytes: usize,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
+    session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -105,6 +106,54 @@ struct ServerState {
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     shutdown: broadcast::Sender<()>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRuntimeHandle {
+    commands: mpsc::Sender<SessionCommand>,
+}
+
+#[derive(Debug)]
+enum SessionCommand {
+    UserMessage {
+        client_id: ClientId,
+        text: String,
+    },
+    SkillInvocation {
+        client_id: ClientId,
+        skill_id: SkillId,
+        arguments: String,
+        source: Option<SkillSource>,
+        display_text: String,
+    },
+}
+
+#[derive(Debug)]
+struct SessionTurnPermit {
+    session_id: SessionId,
+    turn_entries: u64,
+    _private: (),
+}
+
+impl SessionTurnPermit {
+    #[must_use]
+    const fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            turn_entries: 0,
+            _private: (),
+        }
+    }
+
+    #[must_use]
+    const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    const fn enter_turn(&mut self) -> SessionId {
+        self.turn_entries = self.turn_entries.saturating_add(1);
+        self.session_id
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +386,7 @@ impl ServerState {
             skill_context_bytes: init.skill_context_bytes,
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
+            session_runtimes: Mutex::default(),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -986,6 +1036,186 @@ async fn handle_attach_session_recent(
     }
 }
 
+async fn enqueue_session_command(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    command: SessionCommand,
+) -> Result<(), ServerError> {
+    state.sessions.session_summary(session_id).await?;
+    let handle = session_runtime_handle(state, session_id).await;
+    if handle.commands.send(command).await.is_ok() {
+        return Ok(());
+    }
+
+    state.session_runtimes.lock().await.remove(&session_id);
+    Err(bcode_session::SessionError::NotFound(session_id).into())
+}
+
+async fn session_runtime_handle(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> SessionRuntimeHandle {
+    let mut runtimes = state.session_runtimes.lock().await;
+    if let Some(handle) = runtimes.get(&session_id) {
+        return handle.clone();
+    }
+
+    let (commands, receiver) = mpsc::channel(128);
+    let handle = SessionRuntimeHandle { commands };
+    runtimes.insert(session_id, handle.clone());
+    drop(runtimes);
+    let state_for_runtime = Arc::clone(state);
+    tokio::spawn(async move {
+        run_session_runtime(state_for_runtime, session_id, receiver).await;
+    });
+    handle
+}
+
+async fn run_session_runtime(
+    state: Arc<ServerState>,
+    session_id: SessionId,
+    mut commands: mpsc::Receiver<SessionCommand>,
+) {
+    let mut permit = SessionTurnPermit::new(session_id);
+    while let Some(command) = commands.recv().await {
+        match command {
+            SessionCommand::UserMessage { client_id, text } => {
+                process_user_message_command(&state, &mut permit, client_id, text).await;
+            }
+            SessionCommand::SkillInvocation {
+                client_id,
+                skill_id,
+                arguments,
+                source,
+                display_text,
+            } => {
+                process_skill_invocation_command(
+                    &state,
+                    &mut permit,
+                    client_id,
+                    skill_id,
+                    arguments,
+                    source,
+                    display_text,
+                )
+                .await;
+            }
+        }
+    }
+    state.session_runtimes.lock().await.remove(&session_id);
+}
+
+async fn process_user_message_command(
+    state: &ServerState,
+    permit: &mut SessionTurnPermit,
+    client_id: ClientId,
+    text: String,
+) {
+    match append_turn_user_message(state, permit, client_id, text).await {
+        Ok(Some(user_event)) => {
+            suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
+            run_model_turn(state, permit, &user_event).await;
+        }
+        Ok(None) => {
+            append_system_event(
+                state,
+                permit.session_id(),
+                "no user message event was appended".to_string(),
+            )
+            .await;
+        }
+        Err(error) => {
+            append_system_event(
+                state,
+                permit.session_id(),
+                format!("failed to append user message: {error}"),
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_skill_invocation_command(
+    state: &ServerState,
+    permit: &mut SessionTurnPermit,
+    client_id: ClientId,
+    skill_id: SkillId,
+    arguments: String,
+    source: Option<SkillSource>,
+    display_text: String,
+) {
+    let invocation = state
+        .sessions
+        .append_event(
+            permit.session_id(),
+            SessionEventKind::SkillInvoked {
+                skill_id: skill_id.clone(),
+                arguments: arguments.clone(),
+                source,
+                invoked_at_ms: current_time_ms(),
+            },
+        )
+        .await;
+    match invocation {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => {
+            append_system_event(
+                state,
+                permit.session_id(),
+                format!("failed to append skill invocation: {error}"),
+            )
+            .await;
+            return;
+        }
+    }
+
+    match append_turn_user_message(state, permit, client_id, display_text).await {
+        Ok(Some(user_event)) => {
+            state.turn_skills.lock().await.insert(
+                (permit.session_id(), user_event.sequence),
+                SkillTurnInvocation {
+                    skill_id,
+                    arguments,
+                },
+            );
+            run_model_turn(state, permit, &user_event).await;
+        }
+        Ok(None) => {
+            append_system_event(
+                state,
+                permit.session_id(),
+                "no user message event was appended".to_string(),
+            )
+            .await;
+        }
+        Err(error) => {
+            append_system_event(
+                state,
+                permit.session_id(),
+                format!("failed to append skill user message: {error}"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn append_turn_user_message(
+    state: &ServerState,
+    permit: &mut SessionTurnPermit,
+    client_id: ClientId,
+    text: String,
+) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    let events = state
+        .sessions
+        .append_user_message(permit.enter_turn(), client_id, text)
+        .await?;
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    Ok(events.last().cloned())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_invoke_skill(
     request_id: u64,
@@ -1016,55 +1246,31 @@ async fn handle_invoke_skill(
         )
         .await;
     };
-    let invocation = state
-        .sessions
-        .append_event(
-            session_id,
-            SessionEventKind::SkillInvoked {
-                skill_id: skill_id.clone(),
-                arguments: arguments.clone(),
-                source: Some(summary.source),
-                invoked_at_ms: current_time_ms(),
-            },
-        )
-        .await?;
-    publish_session_event(state, &invocation).await;
-    let text = display_text;
-    let events = state
-        .sessions
-        .append_user_message(session_id, client_id, text)
-        .await?;
-    for event in &events {
-        publish_session_event(state, event).await;
-    }
-    let Some(user_event) = events.last().cloned() else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "message_not_appended",
-                "no user message event was appended",
-            )),
-        )
-        .await;
+    let command = SessionCommand::SkillInvocation {
+        client_id,
+        skill_id,
+        arguments,
+        source: Some(summary.source),
+        display_text,
     };
-    state.turn_skills.lock().await.insert(
-        (session_id, user_event.sequence),
-        SkillTurnInvocation {
-            skill_id,
-            arguments,
-        },
-    );
-    let state_for_turn = Arc::clone(state);
-    tokio::spawn(async move {
-        run_model_turn(&state_for_turn, session_id, &user_event).await;
-    });
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::MessageSent),
-    )
-    .await
+    match enqueue_session_command(state, session_id, command).await {
+        Ok(()) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::MessageSent),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_user_message(
@@ -1075,31 +1281,14 @@ async fn handle_user_message(
     session_id: SessionId,
     text: String,
 ) -> Result<(), ServerError> {
-    match state
-        .sessions
-        .append_user_message(session_id, client_id, text)
-        .await
+    match enqueue_session_command(
+        state,
+        session_id,
+        SessionCommand::UserMessage { client_id, text },
+    )
+    .await
     {
-        Ok(events) => {
-            for event in &events {
-                publish_session_event(state, event).await;
-            }
-            let Some(user_event) = events.last().cloned() else {
-                return send_response(
-                    writer,
-                    request_id,
-                    Response::Err(ErrorResponse::new(
-                        "message_not_appended",
-                        "no user message event was appended",
-                    )),
-                )
-                .await;
-            };
-            suggest_skills_for_prompt(state, session_id, &user_event).await;
-            let state_for_turn = Arc::clone(state);
-            tokio::spawn(async move {
-                run_model_turn(&state_for_turn, session_id, &user_event).await;
-            });
+        Ok(()) => {
             send_response(
                 writer,
                 request_id,
@@ -2459,9 +2648,10 @@ fn session_event_compaction_line(
 
 async fn run_model_turn(
     state: &ServerState,
-    session_id: SessionId,
+    permit: &mut SessionTurnPermit,
     trigger_event: &bcode_session_models::SessionEvent,
 ) {
+    let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
     let completion = run_model_turn_inner(state, session_id, trigger_event).await;
