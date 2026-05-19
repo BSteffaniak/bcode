@@ -28,6 +28,7 @@ ratatui = { workspace = true, features = [
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+unicode-segmentation = { workspace = true }
 
 [features]
 default          = []

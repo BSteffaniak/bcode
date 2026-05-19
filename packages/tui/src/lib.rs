@@ -52,6 +52,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Errors returned by the TUI.
 #[derive(Debug, Error)]
@@ -1638,12 +1639,17 @@ impl SessionPickerApp {
     }
 
     fn start_rename(&mut self) {
-        let Some(session) = self.selected_session() else {
-            self.status = "select an existing session to rename".to_string();
+        let title = if self.mode == SessionPickerMode::Browsing {
+            let Some(session) = self.selected_session() else {
+                self.status = "select an existing session to rename".to_string();
+                return;
+            };
+            session.name.clone().unwrap_or_default()
+        } else {
             return;
         };
         self.mode = SessionPickerMode::Renaming {
-            input: TextEditBuffer::from_text(session.name.clone().unwrap_or_default()),
+            input: TextEditBuffer::from_text(title),
         };
         self.status = "type a new title and press enter".to_string();
     }
@@ -1698,7 +1704,7 @@ impl SessionPickerApp {
 }
 
 fn session_picker_layout(area: Rect, renaming: bool) -> Rc<[Rect]> {
-    let panel = centered_rect(area, 70, 70);
+    let panel = centered_rect(area, area.width.min(96), area.height.min(26));
     let inner = inset(panel, 2, 1);
     let rename_rows = if renaming { 2 } else { 0 };
     Layout::default()
@@ -1779,7 +1785,14 @@ impl ratatui::widgets::Widget for &SessionPickerApp {
                 .border_type(BorderType::Rounded)
                 .border_style(border_style())
                 .title(Span::styled(" rename ", muted_style()));
-            Paragraph::new(input.text().to_string())
+            let line = Line::from(render_text_edit_line_with_selection(
+                input.text(),
+                0,
+                input.selection().map_or(0, |selection| selection.start),
+                input.selection().map_or(0, |selection| selection.end),
+                normal_style(),
+            ));
+            Paragraph::new(line)
                 .style(normal_style())
                 .block(rename_block)
                 .render(chunks[2], buf);
@@ -3445,10 +3458,21 @@ fn render_command_palette(
             Span::styled("Type to filter commands", muted_style()),
         ])
     } else {
-        Line::from(vec![
-            Span::styled("› ", accent_style()),
-            Span::styled(palette.filter.text().to_string(), normal_style()),
-        ])
+        let mut spans = vec![Span::styled("› ", accent_style())];
+        spans.extend(render_text_edit_line_with_selection(
+            palette.filter.text(),
+            0,
+            palette
+                .filter
+                .selection()
+                .map_or(0, |selection| selection.start),
+            palette
+                .filter
+                .selection()
+                .map_or(0, |selection| selection.end),
+            normal_style(),
+        ));
+        Line::from(spans)
     };
     Paragraph::new(Text::from(vec![
         search,
@@ -3629,6 +3653,105 @@ struct ComposerLayout {
     scroll: usize,
 }
 
+fn render_text_edit_lines(
+    input: &TextEditBuffer,
+    visible_lines: &[String],
+    scroll: usize,
+    base_style: Style,
+) -> Text<'static> {
+    Text::from(
+        render_text_edit_wrapped_lines(input, visible_lines, scroll, base_style)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn render_text_edit_wrapped_lines(
+    input: &TextEditBuffer,
+    visible_lines: &[String],
+    scroll: usize,
+    base_style: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let Some(selection) = input.selection() else {
+        return visible_lines
+            .iter()
+            .map(|line| vec![Span::styled(line.clone(), base_style)])
+            .collect();
+    };
+    let mut byte_index = wrapped_row_start_byte_index(input.text(), visible_lines, scroll);
+    visible_lines
+        .iter()
+        .map(|line| {
+            let rendered = render_text_edit_line_with_selection(
+                line,
+                byte_index,
+                selection.start,
+                selection.end,
+                base_style,
+            );
+            byte_index = byte_index.saturating_add(line.len());
+            rendered
+        })
+        .collect()
+}
+
+fn wrapped_row_start_byte_index(text: &str, visible_lines: &[String], scroll: usize) -> usize {
+    if scroll == 0 {
+        return 0;
+    }
+    let mut row = 0usize;
+    let mut byte_index = 0usize;
+    for line in visible_lines {
+        if row == scroll {
+            return byte_index;
+        }
+        byte_index = byte_index.saturating_add(line.len());
+        row = row.saturating_add(1);
+        if text.as_bytes().get(byte_index) == Some(&b'\n') {
+            byte_index = byte_index.saturating_add(1);
+            row = row.saturating_add(1);
+        }
+    }
+    text.len()
+}
+
+fn render_text_edit_line_with_selection(
+    line: &str,
+    line_start: usize,
+    selection_start: usize,
+    selection_end: usize,
+    base_style: Style,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut selected = String::new();
+    for (offset, grapheme) in line.grapheme_indices(true) {
+        let start = line_start.saturating_add(offset);
+        if start >= selection_start && start < selection_end {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), base_style));
+            }
+            selected.push_str(grapheme);
+        } else {
+            if !selected.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut selected),
+                    text_selection_style(),
+                ));
+            }
+            plain.push_str(grapheme);
+        }
+    }
+    if !plain.is_empty() {
+        spans.push(Span::styled(plain, base_style));
+    }
+    if !selected.is_empty() {
+        spans.push(Span::styled(selected, text_selection_style()));
+    }
+    spans
+}
+
 fn composer_height(
     input: &TextEditBuffer,
     search_mode: bool,
@@ -3670,21 +3793,22 @@ fn composer_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> Com
     let cursor_column =
         usize_to_u16_saturating(layout.cursor.col).min(content_area.width.saturating_sub(1));
     let visible_lines = if input.is_empty() {
-        vec![Line::from(vec![Span::styled(
+        Text::from(vec![Line::from(vec![Span::styled(
             composer_placeholder(search_mode),
             muted_style(),
-        )])]
+        )])])
     } else {
-        wrapped_lines
+        let visible_lines = wrapped_lines
             .iter()
             .skip(scroll)
             .take(visible_row_count)
-            .map(|line| Line::from(vec![Span::styled(line.clone(), normal_style())]))
-            .collect::<Vec<_>>()
+            .cloned()
+            .collect::<Vec<_>>();
+        render_text_edit_lines(input, &visible_lines, scroll, normal_style())
     };
 
     ComposerLayout {
-        text: Text::from(visible_lines),
+        text: visible_lines,
         cursor_position: Some(Position::new(
             content_area.x + cursor_column,
             content_area.y + usize_to_u16_saturating(cursor_row.saturating_sub(scroll)),
@@ -3860,6 +3984,10 @@ fn status_style(status: &str) -> Style {
     } else {
         normal_style()
     }
+}
+
+fn text_selection_style() -> Style {
+    Style::default().fg(Color::Black).bg(COLOR_ACCENT)
 }
 
 fn selected_style() -> Style {
@@ -5617,7 +5745,7 @@ mod tests {
 
         assert_eq!(
             app.cursor_position(Rect::new(0, 0, 100, 40)),
-            Some(Position::new(20, 34))
+            Some(Position::new(9, 29))
         );
     }
 
@@ -5632,7 +5760,7 @@ mod tests {
 
         assert_eq!(
             app.cursor_position(Rect::new(0, 0, 100, 40)),
-            Some(Position::new(22, 34))
+            Some(Position::new(11, 29))
         );
     }
 
@@ -5714,18 +5842,82 @@ mod tests {
     }
 
     #[test]
+    fn selected_composer_text_is_highlighted() {
+        let mut input = TextEditBuffer::from_text("hello world");
+        input.move_cursor(TextMotion::Start);
+        input.move_cursor_with_selection(
+            TextMotion::WordRight,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+
+        let layout = composer_layout(Rect::new(0, 0, 20, 4), &input, false);
+        let first_line = &layout.text.lines[0];
+
+        assert!(first_line.spans.iter().any(|span| {
+            span.content.as_ref() == "hello" && span.style.bg == Some(COLOR_ACCENT)
+        }));
+    }
+
+    #[test]
+    fn selected_command_palette_filter_text_is_highlighted() {
+        let mut palette = CommandPaletteState::new();
+        palette.filter = TextEditBuffer::from_text("hello world");
+        palette.filter.move_cursor(TextMotion::Start);
+        palette.filter.move_cursor_with_selection(
+            TextMotion::WordRight,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        render_command_palette(area, &mut buffer, &palette);
+
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| { cell.symbol() == "h" && cell.style().bg == Some(COLOR_ACCENT) })
+        );
+    }
+
+    #[test]
+    fn selected_session_rename_text_is_highlighted() {
+        let mut input = TextEditBuffer::from_text("hello world");
+        input.move_cursor(TextMotion::Start);
+        input.move_cursor_with_selection(
+            TextMotion::WordRight,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+
+        let spans = render_text_edit_line_with_selection(
+            input.text(),
+            0,
+            input.selection().map_or(0, |selection| selection.start),
+            input.selection().map_or(0, |selection| selection.end),
+            normal_style(),
+        );
+
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref() == "hello" && span.style.bg == Some(COLOR_ACCENT)
+        }));
+    }
+
+    #[test]
     fn mouse_click_moves_session_rename_cursor() {
         let mut app = SessionPickerApp::new(&[session_summary_with_name("hello world")]);
         app.selected = 1;
         app.start_rename();
         app.last_frame_area.set(Rect::new(0, 0, 100, 40));
 
+        let input_area = session_picker_rename_input_area(app.last_frame_area.get())
+            .expect("rename input area should exist");
+
         handle_session_picker_mouse_event(
             &mut app,
             MouseEvent {
                 kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column: 22,
-                row: 34,
+                column: input_area.x + 5,
+                row: input_area.y,
                 modifiers: KeyModifiers::NONE,
             },
         );
