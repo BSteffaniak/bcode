@@ -95,7 +95,7 @@ pub async fn run() -> Result<(), CliError> {
                 session_export(session_id, format).await?;
             }
             SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
-            SessionCommand::Doctor { session_id } => session_doctor(session_id)?,
+            SessionCommand::Doctor { session_id, fix } => session_doctor(session_id, fix)?,
             SessionCommand::Migrate { command } => handle_session_migrate_command(command)?,
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
             SessionCommand::Repair { session_id } => session_repair(session_id)?,
@@ -307,6 +307,8 @@ enum SessionCommand {
     },
     Doctor {
         session_id: Option<SessionId>,
+        #[arg(long)]
+        fix: bool,
     },
     Migrate {
         #[command(subcommand)]
@@ -2313,12 +2315,15 @@ async fn paged_session_history(session_id: SessionId) -> Result<Vec<SessionEvent
     Ok(history)
 }
 
-fn session_doctor(session_id: Option<SessionId>) -> Result<(), CliError> {
+fn session_doctor(session_id: Option<SessionId>, fix: bool) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
     let health = if let Some(session_id) = session_id {
-        store.doctor_session(session_id)?.into_iter().collect()
+        store
+            .doctor_session_with_fix(session_id, fix)?
+            .into_iter()
+            .collect()
     } else {
-        store.doctor_all()?
+        store.doctor_all_with_fix(fix)?
     };
     if health.is_empty() {
         println!("no persisted sessions found");
@@ -2336,7 +2341,7 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
     } else {
         "degraded"
     };
-    let freshness = if item.stale { "rebuilt" } else { "fresh" };
+    let freshness = if item.stale { "stale" } else { "fresh" };
     println!(
         "{}\t{}\t{}\tevents={}\tlast_good_offset={}\tissues={}",
         item.session_id,

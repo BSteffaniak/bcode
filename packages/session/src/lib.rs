@@ -50,6 +50,31 @@ pub enum SessionError {
     Store(#[from] SessionStoreError),
     #[error("session has connected clients: {0}")]
     ConnectedClients(SessionId),
+    #[error("session is not writable: {session_id} ({status:?})")]
+    NotWritable {
+        session_id: SessionId,
+        status: SessionAccessStatus,
+    },
+}
+
+/// Canonical session access status used to gate reads and writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAccessStatus {
+    /// Canonical events are readable and writable by this version.
+    ReadWrite,
+    /// Canonical events are readable, but writes require a migration first.
+    ReadOnlyMigrationRequired,
+    /// Canonical events were written by a newer unsupported version.
+    BlockedFutureVersion,
+    /// Canonical events are corrupt and require repair before safe access.
+    RepairRequired,
+}
+
+impl SessionAccessStatus {
+    #[must_use]
+    pub const fn writable(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
 }
 
 /// Errors returned by the append-only session event store.
@@ -436,16 +461,34 @@ impl SessionEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
+        self.doctor_session_with_fix(session_id, false)
+    }
+
+    /// Return index health for one persisted session, optionally rebuilding stale indexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session event file or index cannot be read.
+    pub fn doctor_session_with_fix(
+        &self,
+        session_id: SessionId,
+        fix: bool,
+    ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
         let path = self.event_path(session_id);
         if !path.exists() {
             return Ok(None);
         }
-        let index = index::load_fresh_index(&self.root, session_id, &path)?;
-        if let Some(index) = index {
-            Ok(Some(index.health(false)))
-        } else {
+        if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
+            return Ok(Some(index.health(false)));
+        }
+        if fix {
             let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
             Ok(index.map(|index| index.health(true)))
+        } else {
+            Ok(
+                index::rebuild_index_metadata(&self.root, session_id, &path)?
+                    .map(|index| index.health(true)),
+            )
         }
     }
 
@@ -455,6 +498,18 @@ impl SessionEventStore {
     ///
     /// Returns an error if the session directory or an index file cannot be read.
     pub fn doctor_all(&self) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
+        self.doctor_all_with_fix(false)
+    }
+
+    /// Return index health for every persisted session, optionally rebuilding stale indexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session directory or an index file cannot be read.
+    pub fn doctor_all_with_fix(
+        &self,
+        fix: bool,
+    ) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
         let mut health = Vec::new();
         if !self.root.exists() {
             return Ok(health);
@@ -465,14 +520,8 @@ impl SessionEventStore {
                 continue;
             }
             let session_id = parse_session_file_name(&path)?;
-            let index = index::load_fresh_index(&self.root, session_id, &path)?;
-            if let Some(index) = index {
-                health.push(index.health(false));
-            } else {
-                let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
-                if let Some(index) = index {
-                    health.push(index.health(true));
-                }
+            if let Some(item) = self.doctor_session_with_fix(session_id, fix)? {
+                health.push(item);
             }
         }
         Ok(health)
@@ -808,6 +857,7 @@ pub(crate) struct SessionState {
     total_metered_tokens: u64,
     index_issues: Vec<index::SessionIndexIssue>,
     index_status: SessionIndexStatusKind,
+    access_status: SessionAccessStatus,
     sender: broadcast::Sender<SessionEvent>,
 }
 
@@ -873,6 +923,7 @@ impl SessionManager {
             total_metered_tokens: 0,
             index_issues: Vec::new(),
             index_status: SessionIndexStatusKind::Current,
+            access_status: SessionAccessStatus::ReadWrite,
             sender,
         };
         state.push_event(
@@ -920,6 +971,7 @@ impl SessionManager {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
+            state.ensure_writable()?;
             state.summary.name.clone_from(&normalized_name);
             state.push_event(
                 SessionEventKind::SessionRenamed {
@@ -1151,6 +1203,7 @@ impl SessionManager {
                 store.read_session_events(session_id)?
             };
             let input_history = input_history_from_events(&history);
+            state.ensure_writable()?;
             state.clients.insert(client_id);
             state.summary.client_count = state.clients.len();
             let events = state.sender.subscribe();
@@ -1202,6 +1255,7 @@ impl SessionManager {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
+            state.ensure_writable()?;
             state.clients.insert(client_id);
             state.summary.client_count = state.clients.len();
             let events = state.sender.subscribe();
@@ -1235,6 +1289,7 @@ impl SessionManager {
         let Some(state) = inner.sessions.get_mut(&session_id) else {
             return Ok(None);
         };
+        state.ensure_writable()?;
         if state.clients.remove(&client_id) {
             state.summary.client_count = state.clients.len();
             return Ok(Some(state.push_event(
@@ -1267,6 +1322,7 @@ impl SessionManager {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
+            state.ensure_writable()?;
             let mut events = Vec::new();
             if state.summary.name.is_none() && !state.has_user_message {
                 let title = title_from_first_prompt(&text);
@@ -1565,6 +1621,7 @@ impl SessionManager {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
+            state.ensure_writable()?;
             state.push_event(kind, self.store.as_ref(), activity_timestamp_ms)?
         };
         Ok(event)
@@ -1651,12 +1708,24 @@ impl SessionState {
             total_metered_tokens: index.total_metered_tokens,
             index_issues: index.issues,
             index_status: SessionIndexStatusKind::Current,
+            access_status: SessionAccessStatus::ReadWrite,
             sender,
         }
     }
 
     fn summary(&self) -> SessionSummary {
         self.summary.clone()
+    }
+
+    const fn ensure_writable(&self) -> Result<(), SessionError> {
+        if self.access_status.writable() {
+            Ok(())
+        } else {
+            Err(SessionError::NotWritable {
+                session_id: self.summary.id,
+                status: self.access_status,
+            })
+        }
     }
 
     fn push_event(
@@ -2460,6 +2529,35 @@ mod tests {
                 .migration_for_action(super::SessionMigrationAction::RebuildDerivedIndex)
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn session_doctor_is_read_only_without_fix() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("doctor".to_string()))
+            .await
+            .expect("session should create");
+        let index_path = root
+            .join("index")
+            .join(format!("{}.index.json", session.id));
+        std::fs::remove_file(&index_path).expect("index should remove");
+
+        let store = super::SessionEventStore::new(&root);
+        let health = store
+            .doctor_session(session.id)
+            .expect("doctor should inspect")
+            .expect("session should exist");
+        assert!(health.stale);
+        assert!(!index_path.exists());
+
+        store
+            .doctor_session_with_fix(session.id, true)
+            .expect("doctor fix should run");
+        assert!(index_path.exists());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
     #[tokio::test]
