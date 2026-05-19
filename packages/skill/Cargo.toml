@@ -1,11 +1,11 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Session protocol models for bcode"
+description = "Skill discovery, parsing, and registry for bcode"
 edition     = { workspace = true }
-keywords    = ["bcode", "session", "models"]
+keywords    = ["bcode", "skill", "registry"]
 license     = { workspace = true }
-name        = "bcode_session_models"
+name        = "bcode_skill"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
@@ -13,7 +13,8 @@ version     = { workspace = true }
 [dependencies]
 bcode_skill_models = { workspace = true }
 serde              = { workspace = true, features = ["derive", "std"] }
-uuid               = { workspace = true, features = ["serde", "std", "v4"] }
+thiserror          = { workspace = true }
+toml               = { workspace = true }
 
 [features]
 default          = []

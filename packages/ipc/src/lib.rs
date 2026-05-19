@@ -9,6 +9,7 @@ use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
     SessionInputHistoryEntry, SessionSummary,
 };
+use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::env;
 use std::path::PathBuf;
@@ -133,6 +134,21 @@ pub enum Request {
         session_id: SessionId,
     },
     ListAgents,
+    ListSkills,
+    DescribeSkill {
+        skill_id: SkillId,
+    },
+    ActivateSkill {
+        session_id: SessionId,
+        skill_id: SkillId,
+    },
+    DeactivateSkill {
+        session_id: SessionId,
+        skill_id: SkillId,
+    },
+    ActiveSkills {
+        session_id: SessionId,
+    },
     AgentPolicyStatus,
     SetSessionAgent {
         session_id: SessionId,
@@ -275,6 +291,15 @@ pub enum ResponsePayload {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+    },
+    SkillList {
+        skills: Box<SkillList>,
+    },
+    SkillManifest {
+        skill: Box<SkillManifest>,
+    },
+    ActiveSkills {
+        skills: Vec<SkillContextResponse>,
     },
     AgentPolicyStatus {
         status: PolicyStatusResponse,

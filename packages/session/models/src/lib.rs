@@ -4,6 +4,7 @@
 
 //! Shared session models for bcode.
 
+use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -11,7 +12,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 8;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 9;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -220,6 +221,11 @@ pub enum SessionTracePhase {
     ToolPermissionWaitStarted,
     ToolPermissionWaitFinished,
     ToolInvocationFinished,
+    SkillSuggested,
+    SkillActivated,
+    SkillDeactivated,
+    SkillContextLoaded,
+    SkillInvocationFailed,
     ContextCompactionSkipped,
     ContextCompactionStarted,
     ContextCompactionFinished,
@@ -392,5 +398,33 @@ pub enum SessionEventKind {
     },
     TraceEvent {
         trace: Box<SessionTraceEvent>,
+    },
+    SkillSuggested {
+        skill_id: SkillId,
+        #[serde(default)]
+        reason: Option<String>,
+        suggested_at_ms: u64,
+    },
+    SkillActivated {
+        skill_id: SkillId,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        mode: SkillActivationMode,
+        activated_at_ms: u64,
+    },
+    SkillDeactivated {
+        skill_id: SkillId,
+        deactivated_at_ms: u64,
+    },
+    SkillContextLoaded {
+        skill_id: SkillId,
+        bytes_loaded: usize,
+        truncated: bool,
+        loaded_at_ms: u64,
+    },
+    SkillInvocationFailed {
+        skill_id: SkillId,
+        error: String,
+        failed_at_ms: u64,
     },
 }

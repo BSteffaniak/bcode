@@ -466,6 +466,11 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
         SessionEventKind::SessionRenamed { .. } => "session_renamed",
         SessionEventKind::TraceEvent { .. } => "trace_event",
+        SessionEventKind::SkillSuggested { .. } => "skill_suggested",
+        SessionEventKind::SkillActivated { .. } => "skill_activated",
+        SessionEventKind::SkillDeactivated { .. } => "skill_deactivated",
+        SessionEventKind::SkillContextLoaded { .. } => "skill_context_loaded",
+        SessionEventKind::SkillInvocationFailed { .. } => "skill_invocation_failed",
     }
 }
 

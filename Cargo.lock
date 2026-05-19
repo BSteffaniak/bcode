@@ -769,6 +769,7 @@ dependencies = [
  "bcode_command",
  "bcode_model",
  "bcode_plugin",
+ "bcode_skill_models",
  "serde",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
@@ -823,6 +824,7 @@ dependencies = [
  "bcode_command",
  "bcode_model",
  "bcode_session_models",
+ "bcode_skill_models",
  "bmux_codec",
  "bmux_ipc",
  "serde",
@@ -924,6 +926,7 @@ dependencies = [
 name = "bcode_session_models"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_skill_models",
  "serde",
  "uuid",
 ]
@@ -936,6 +939,24 @@ dependencies = [
  "bcode_tool",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bcode_skill"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_skill_models",
+ "serde",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "bcode_skill_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -2758,6 +2758,11 @@ impl ChatApp {
             | SessionEventKind::ModelChanged { .. }
             | SessionEventKind::AgentChanged { .. }
             | SessionEventKind::SystemMessage { .. }
+            | SessionEventKind::SkillSuggested { .. }
+            | SessionEventKind::SkillActivated { .. }
+            | SessionEventKind::SkillDeactivated { .. }
+            | SessionEventKind::SkillContextLoaded { .. }
+            | SessionEventKind::SkillInvocationFailed { .. }
             | SessionEventKind::ModelUsage { .. } => {}
         }
     }
@@ -4894,6 +4899,7 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         | SessionEventKind::ClientDetached { .. }
         | SessionEventKind::ModelTurnStarted { .. }
         | SessionEventKind::ModelUsage { .. }
+        | SessionEventKind::SkillContextLoaded { .. }
         | SessionEventKind::TraceEvent { .. } => Vec::new(),
         SessionEventKind::UserMessage { text, .. } => {
             vec![TranscriptBlock::User { text: text.clone() }]
@@ -4954,6 +4960,25 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
             ..
         } => vec![TranscriptBlock::Meta {
             text: format!("context compacted through #{compacted_through_sequence}"),
+        }],
+        SessionEventKind::SkillSuggested {
+            skill_id, reason, ..
+        } => vec![TranscriptBlock::Meta {
+            text: reason.clone().map_or_else(
+                || format!("skill suggested: {skill_id}"),
+                |reason| format!("skill suggested: {skill_id} ({reason})"),
+            ),
+        }],
+        SessionEventKind::SkillActivated { skill_id, .. } => vec![TranscriptBlock::Meta {
+            text: format!("skill activated: {skill_id}"),
+        }],
+        SessionEventKind::SkillDeactivated { skill_id, .. } => vec![TranscriptBlock::Meta {
+            text: format!("skill deactivated: {skill_id}"),
+        }],
+        SessionEventKind::SkillInvocationFailed {
+            skill_id, error, ..
+        } => vec![TranscriptBlock::System {
+            text: format!("skill invocation failed: {skill_id}: {error}"),
         }],
         SessionEventKind::ModelTurnFinished {
             outcome, message, ..

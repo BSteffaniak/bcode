@@ -5,6 +5,7 @@
 //! Configuration loading for Bcode.
 
 use bcode_plugin::PluginSelection;
+use bcode_skill_models::SkillId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -110,6 +111,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
     pub tui: TuiConfig,
 }
 
@@ -122,6 +125,7 @@ impl BcodeConfig {
         }
         self.auth.merge(next.auth);
         self.observability.merge(next.observability);
+        self.skills.merge(next.skills);
         self.tui.merge(next.tui);
     }
 
@@ -244,6 +248,109 @@ pub fn bedrock_environment_is_configured() -> bool {
         .is_some_and(|spec| first_env_value_from_slice(spec.signal_env_vars).is_some())
 }
 
+/// Skill discovery and activation configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SkillsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_activate: SkillAutoActivateMode,
+    #[serde(default = "default_true")]
+    pub include_repo_skills: bool,
+    #[serde(default = "default_true")]
+    pub include_user_skills: bool,
+    #[serde(default = "default_true")]
+    pub include_compat_claude_skills: bool,
+    #[serde(default = "default_skill_context_bytes")]
+    pub max_context_bytes: usize,
+    #[serde(default = "default_skill_file_bytes")]
+    pub max_skill_file_bytes: u64,
+    #[serde(default = "default_skill_resource_file_bytes")]
+    pub max_resource_file_bytes: u64,
+    #[serde(default)]
+    pub follow_symlinks: bool,
+    #[serde(default)]
+    pub sources: SkillSourceConfig,
+    #[serde(default)]
+    pub disabled: DisabledSkillsConfig,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_activate: SkillAutoActivateMode::Suggest,
+            include_repo_skills: true,
+            include_user_skills: true,
+            include_compat_claude_skills: true,
+            max_context_bytes: default_skill_context_bytes(),
+            max_skill_file_bytes: default_skill_file_bytes(),
+            max_resource_file_bytes: default_skill_resource_file_bytes(),
+            follow_symlinks: false,
+            sources: SkillSourceConfig::default(),
+            disabled: DisabledSkillsConfig::default(),
+        }
+    }
+}
+
+impl SkillsConfig {
+    fn merge(&mut self, next: Self) {
+        *self = next;
+    }
+
+    /// Return disabled skill IDs in registry form.
+    #[must_use]
+    pub fn disabled_skill_ids(&self) -> BTreeSet<SkillId> {
+        self.disabled
+            .ids
+            .iter()
+            .cloned()
+            .map(SkillId::new)
+            .collect()
+    }
+}
+
+/// Skill auto-activation behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillAutoActivateMode {
+    Off,
+    #[default]
+    Suggest,
+    On,
+}
+
+/// Additional skill source paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSourceConfig {
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+}
+
+/// Disabled skill IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisabledSkillsConfig {
+    #[serde(default)]
+    pub ids: BTreeSet<String>,
+}
+
+const fn default_skill_context_bytes() -> usize {
+    24 * 1024
+}
+
+const fn default_skill_file_bytes() -> u64 {
+    256 * 1024
+}
+
+const fn default_skill_resource_file_bytes() -> u64 {
+    1024 * 1024
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 /// Session observability configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
@@ -304,10 +411,6 @@ pub enum ObservabilityLevel {
     Standard,
     Debug,
     Raw,
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 const fn default_max_trace_blob_bytes() -> usize {
@@ -1229,6 +1332,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_agents_toml(&mut output, &config.agent);
     write_auth_toml(&mut output, &config.auth);
     write_observability_toml(&mut output, &config.observability);
+    write_skills_toml(&mut output, &config.skills);
     write_tui_toml(&mut output, &config.tui);
     output
 }
@@ -1565,6 +1669,82 @@ const fn auth_mode_name(mode: &AuthMode) -> &'static str {
     match mode {
         AuthMode::ApiKey => "api_key",
         AuthMode::ChatGpt => "chatgpt",
+    }
+}
+
+fn write_skills_toml(output: &mut String, skills: &SkillsConfig) {
+    if skills == &SkillsConfig::default() {
+        return;
+    }
+    output.push_str("[skills]\n");
+    if !skills.enabled {
+        output.push_str("enabled = false\n");
+    }
+    if skills.auto_activate != SkillAutoActivateMode::Suggest {
+        writeln!(
+            output,
+            "auto_activate = {}",
+            toml_string(skill_auto_activate_mode_name(skills.auto_activate))
+        )
+        .expect("write to string");
+    }
+    if !skills.include_repo_skills {
+        output.push_str("include_repo_skills = false\n");
+    }
+    if !skills.include_user_skills {
+        output.push_str("include_user_skills = false\n");
+    }
+    if !skills.include_compat_claude_skills {
+        output.push_str("include_compat_claude_skills = false\n");
+    }
+    if skills.max_context_bytes != default_skill_context_bytes() {
+        writeln!(output, "max_context_bytes = {}", skills.max_context_bytes)
+            .expect("write to string");
+    }
+    if skills.max_skill_file_bytes != default_skill_file_bytes() {
+        writeln!(
+            output,
+            "max_skill_file_bytes = {}",
+            skills.max_skill_file_bytes
+        )
+        .expect("write to string");
+    }
+    if skills.max_resource_file_bytes != default_skill_resource_file_bytes() {
+        writeln!(
+            output,
+            "max_resource_file_bytes = {}",
+            skills.max_resource_file_bytes
+        )
+        .expect("write to string");
+    }
+    if skills.follow_symlinks {
+        output.push_str("follow_symlinks = true\n");
+    }
+    output.push('\n');
+
+    if !skills.sources.paths.is_empty() {
+        output.push_str("[skills.sources]\npaths = [");
+        for (index, path) in skills.sources.paths.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&toml_string(&path.to_string_lossy()));
+        }
+        output.push_str("]\n\n");
+    }
+
+    if !skills.disabled.ids.is_empty() {
+        output.push_str("[skills.disabled]\n");
+        write_string_set(output, "ids", &skills.disabled.ids);
+        output.push('\n');
+    }
+}
+
+const fn skill_auto_activate_mode_name(mode: SkillAutoActivateMode) -> &'static str {
+    match mode {
+        SkillAutoActivateMode::Off => "off",
+        SkillAutoActivateMode::Suggest => "suggest",
+        SkillAutoActivateMode::On => "on",
     }
 }
 

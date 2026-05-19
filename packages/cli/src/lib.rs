@@ -2612,6 +2612,7 @@ fn print_session_event(event: &SessionEvent) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_non_trace_session_event(event: &SessionEvent) {
     match &event.kind {
         SessionEventKind::SessionCreated { name } => {
@@ -2711,6 +2712,34 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::ModelUsage { turn_id, usage } => {
             print_model_usage_event(event.sequence, turn_id, usage);
         }
+        SessionEventKind::SkillSuggested {
+            skill_id, reason, ..
+        } => println!(
+            "#{} skill suggested: {skill_id} {}",
+            event.sequence,
+            reason.as_deref().unwrap_or("")
+        ),
+        SessionEventKind::SkillActivated { skill_id, .. } => {
+            println!("#{} skill activated: {skill_id}", event.sequence);
+        }
+        SessionEventKind::SkillDeactivated { skill_id, .. } => {
+            println!("#{} skill deactivated: {skill_id}", event.sequence);
+        }
+        SessionEventKind::SkillContextLoaded {
+            skill_id,
+            bytes_loaded,
+            truncated,
+            ..
+        } => println!(
+            "#{} skill context loaded: {skill_id} bytes={bytes_loaded} truncated={truncated}",
+            event.sequence
+        ),
+        SessionEventKind::SkillInvocationFailed {
+            skill_id, error, ..
+        } => println!(
+            "#{} skill invocation failed: {skill_id}: {error}",
+            event.sequence
+        ),
         SessionEventKind::TraceEvent { .. } => {}
     }
 }
