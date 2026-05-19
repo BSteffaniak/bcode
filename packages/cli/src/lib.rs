@@ -95,7 +95,11 @@ pub async fn run() -> Result<(), CliError> {
                 session_export(session_id, format).await?;
             }
             SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
-            SessionCommand::Doctor { session_id, fix } => session_doctor(session_id, fix)?,
+            SessionCommand::Doctor {
+                session_id,
+                fix,
+                json,
+            } => session_doctor(session_id, fix, json)?,
             SessionCommand::Migrate { command } => handle_session_migrate_command(command)?,
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
             SessionCommand::Repair { session_id } => session_repair(session_id)?,
@@ -271,8 +275,14 @@ enum ServerCommand {
 
 #[derive(Debug, Clone, Copy, Subcommand)]
 enum MigrateCommand {
-    Status,
-    Plan,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Plan {
+        #[arg(long)]
+        json: bool,
+    },
     Apply {
         #[arg(long)]
         dry_run: bool,
@@ -309,6 +319,8 @@ enum SessionCommand {
         session_id: Option<SessionId>,
         #[arg(long)]
         fix: bool,
+        #[arg(long)]
+        json: bool,
     },
     Migrate {
         #[command(subcommand)]
@@ -324,8 +336,14 @@ enum SessionCommand {
 
 #[derive(Debug, Clone, Copy, Subcommand)]
 enum SessionMigrateCommand {
-    Status,
-    Plan,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Plan {
+        #[arg(long)]
+        json: bool,
+    },
     Apply {
         #[arg(long)]
         dry_run: bool,
@@ -2315,7 +2333,7 @@ async fn paged_session_history(session_id: SessionId) -> Result<Vec<SessionEvent
     Ok(history)
 }
 
-fn session_doctor(session_id: Option<SessionId>, fix: bool) -> Result<(), CliError> {
+fn session_doctor(session_id: Option<SessionId>, fix: bool, json: bool) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
     let health = if let Some(session_id) = session_id {
         store
@@ -2325,6 +2343,10 @@ fn session_doctor(session_id: Option<SessionId>, fix: bool) -> Result<(), CliErr
     } else {
         store.doctor_all_with_fix(fix)?
     };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&health)?);
+        return Ok(());
+    }
     if health.is_empty() {
         println!("no persisted sessions found");
         return Ok(());
@@ -2355,23 +2377,50 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
 
 fn handle_migrate_command(command: MigrateCommand) -> Result<(), CliError> {
     match command {
-        MigrateCommand::Status | MigrateCommand::Plan => session_migration_plan(),
+        MigrateCommand::Status { json } | MigrateCommand::Plan { json } => {
+            session_migration_plan(json)
+        }
         MigrateCommand::Apply { dry_run, backup } => session_migration_apply(dry_run, backup),
     }
 }
 
 fn handle_session_migrate_command(command: SessionMigrateCommand) -> Result<(), CliError> {
     match command {
-        SessionMigrateCommand::Status | SessionMigrateCommand::Plan => session_migration_plan(),
+        SessionMigrateCommand::Status { json } | SessionMigrateCommand::Plan { json } => {
+            session_migration_plan(json)
+        }
         SessionMigrateCommand::Apply { dry_run, backup } => {
             session_migration_apply(dry_run, backup)
         }
     }
 }
 
-fn session_migration_plan() -> Result<(), CliError> {
+fn session_migration_plan(json: bool) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
     let plan = store.migration_plan()?;
+    let recovery = store.migration_recovery_status()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "plan": format!("{:?}", plan),
+                "recovery": format!("{:?}", recovery),
+            })
+        );
+        return Ok(());
+    }
+    match recovery {
+        bcode_session::SessionMigrationRecoveryStatus::Clean => {}
+        bcode_session::SessionMigrationRecoveryStatus::NeedsAttention(items) => {
+            println!("migration recovery: {} run(s) need attention", items.len());
+            for item in items {
+                println!(
+                    "{}	{}	{:?}	{:?}",
+                    item.run_id, item.domain, item.status, item.error
+                );
+            }
+        }
+    }
     if plan.is_empty() {
         println!("{}: current", plan.domain);
         return Ok(());

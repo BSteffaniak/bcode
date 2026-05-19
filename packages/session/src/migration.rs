@@ -1,6 +1,6 @@
 use bcode_session_models::SessionId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -292,14 +292,14 @@ pub enum SessionMigrationJournalStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMigrationJournalEntry {
     pub run_id: String,
-    pub domain: &'static str,
+    pub domain: String,
     pub status: SessionMigrationJournalStatus,
     pub dry_run: bool,
     pub backup: bool,
     pub backup_dir: Option<String>,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
-    pub migration_ids: Vec<&'static str>,
+    pub migration_ids: Vec<String>,
     pub session_ids: Vec<SessionId>,
     pub error: Option<String>,
 }
@@ -315,4 +315,96 @@ pub(crate) fn append_journal_entry(
     file.write_all(b"\n")?;
     file.flush()?;
     Ok(())
+}
+
+/// Recovery status derived from the migration journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMigrationRecoveryStatus {
+    /// No incomplete or failed migration runs were found.
+    Clean,
+    /// One or more migration runs need attention.
+    NeedsAttention(Vec<SessionMigrationRecoveryItem>),
+}
+
+/// Migration run requiring operator attention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrationRecoveryItem {
+    pub run_id: String,
+    pub domain: String,
+    pub status: SessionMigrationJournalStatus,
+    pub backup_dir: Option<String>,
+    pub migration_ids: Vec<String>,
+    pub session_ids: Vec<SessionId>,
+    pub error: Option<String>,
+}
+
+/// Read the session migration journal.
+///
+/// # Errors
+///
+/// Returns an error if the journal exists but cannot be read or decoded.
+pub fn read_journal_entries(
+    root: &Path,
+) -> Result<Vec<SessionMigrationJournalEntry>, crate::SessionStoreError> {
+    let path = root.join("migrations.jsonl");
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(crate::SessionStoreError::Io(error)),
+    };
+    let mut entries = Vec::new();
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        entries.push(serde_json::from_str(line).map_err(crate::SessionStoreError::Index)?);
+    }
+    Ok(entries)
+}
+
+/// Derive recovery status from journal entries.
+#[must_use]
+pub fn recovery_status_from_entries(
+    entries: &[SessionMigrationJournalEntry],
+) -> SessionMigrationRecoveryStatus {
+    let mut runs = BTreeMap::new();
+    for entry in entries {
+        runs.insert(entry.run_id.clone(), entry.clone());
+    }
+    let items = runs
+        .into_values()
+        .filter(|entry| entry.status != SessionMigrationJournalStatus::Completed)
+        .map(|entry| SessionMigrationRecoveryItem {
+            run_id: entry.run_id,
+            domain: entry.domain.clone(),
+            status: entry.status,
+            backup_dir: entry.backup_dir,
+            migration_ids: entry.migration_ids,
+            session_ids: entry.session_ids,
+            error: entry.error,
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        SessionMigrationRecoveryStatus::Clean
+    } else {
+        SessionMigrationRecoveryStatus::NeedsAttention(items)
+    }
+}
+
+/// Root-relative fixture path for session migration tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrationFixture {
+    /// Human-readable fixture name.
+    pub name: &'static str,
+    /// Path to the fixture directory or file relative to the session crate.
+    pub path: &'static str,
+}
+
+/// Built-in session migration fixture declarations.
+#[must_use]
+pub const fn session_migration_fixtures() -> &'static [SessionMigrationFixture] {
+    &[SessionMigrationFixture {
+        name: "session-migration-fixture-readme",
+        path: "fixtures/migrations/README.md",
+    }]
 }

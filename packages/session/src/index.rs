@@ -98,7 +98,7 @@ impl SessionIndexEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionIndexHealth {
     pub session_id: SessionId,
     pub event_count: usize,
