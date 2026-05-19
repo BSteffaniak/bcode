@@ -380,6 +380,22 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("k", TuiAction::CommandPaletteUp),
                 ("down", TuiAction::CommandPaletteDown),
                 ("j", TuiAction::CommandPaletteDown),
+                ("left", TuiAction::MoveCursorLeft),
+                ("right", TuiAction::MoveCursorRight),
+                ("alt+left", TuiAction::MoveCursorWordLeft),
+                ("alt+right", TuiAction::MoveCursorWordRight),
+                ("ctrl+left", TuiAction::MoveCursorWordLeft),
+                ("ctrl+right", TuiAction::MoveCursorWordRight),
+                ("ctrl+a", TuiAction::MoveCursorStart),
+                ("ctrl+e", TuiAction::MoveCursorEnd),
+                ("backspace", TuiAction::DeleteCharBackward),
+                ("delete", TuiAction::DeleteCharForward),
+                ("alt+backspace", TuiAction::DeleteWordBackward),
+                ("ctrl+w", TuiAction::DeleteWordBackward),
+                ("alt+delete", TuiAction::DeleteWordForward),
+                ("ctrl+delete", TuiAction::DeleteWordForward),
+                ("ctrl+u", TuiAction::DeleteToStart),
+                ("ctrl+k", TuiAction::DeleteToEnd),
                 ("enter", TuiAction::CommandPaletteConfirm),
                 ("escape", TuiAction::CommandPaletteClose),
                 ("ctrl+c", TuiAction::CommandPaletteClose),
@@ -696,7 +712,7 @@ async fn run_chat(
                     }
                     if let Some(character) = key_is_text_input(&key) {
                         if let Some(palette) = &mut app.command_palette {
-                            palette.filter.push(character);
+                            palette.filter.insert_char(character);
                             palette.selected = 0;
                         } else {
                             app.reset_input_history_navigation();
@@ -815,7 +831,7 @@ async fn handle_tui_action(
         TuiAction::InputHistoryNext => app.next_input_history(),
         TuiAction::DeleteCharBackward => {
             if let Some(palette) = &mut app.command_palette {
-                palette.filter.pop();
+                palette.filter.delete_backward();
                 palette.selected = 0;
             } else {
                 app.reset_input_history_navigation();
@@ -826,46 +842,107 @@ async fn handle_tui_action(
             }
         }
         TuiAction::DeleteCharForward => {
-            app.reset_input_history_navigation();
-            app.input.delete(TextDelete::Forward);
-            if app.search_mode {
-                app.update_search();
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.delete_forward();
+                palette.selected = 0;
+            } else {
+                app.reset_input_history_navigation();
+                app.input.delete(TextDelete::Forward);
+                if app.search_mode {
+                    app.update_search();
+                }
             }
         }
         TuiAction::DeleteWordBackward => {
-            app.reset_input_history_navigation();
-            app.input.delete(TextDelete::WordBackward);
-            if app.search_mode {
-                app.update_search();
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.delete(TextDelete::WordBackward);
+                palette.selected = 0;
+            } else {
+                app.reset_input_history_navigation();
+                app.input.delete(TextDelete::WordBackward);
+                if app.search_mode {
+                    app.update_search();
+                }
             }
         }
         TuiAction::DeleteWordForward => {
-            app.reset_input_history_navigation();
-            app.input.delete(TextDelete::WordForward);
-            if app.search_mode {
-                app.update_search();
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.delete(TextDelete::WordForward);
+                palette.selected = 0;
+            } else {
+                app.reset_input_history_navigation();
+                app.input.delete(TextDelete::WordForward);
+                if app.search_mode {
+                    app.update_search();
+                }
             }
         }
         TuiAction::DeleteToStart => {
-            app.reset_input_history_navigation();
-            app.input.delete(TextDelete::ToStart);
-            if app.search_mode {
-                app.update_search();
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.delete(TextDelete::ToStart);
+                palette.selected = 0;
+            } else {
+                app.reset_input_history_navigation();
+                app.input.delete(TextDelete::ToStart);
+                if app.search_mode {
+                    app.update_search();
+                }
             }
         }
         TuiAction::DeleteToEnd => {
-            app.reset_input_history_navigation();
-            app.input.delete(TextDelete::ToEnd);
-            if app.search_mode {
-                app.update_search();
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.delete(TextDelete::ToEnd);
+                palette.selected = 0;
+            } else {
+                app.reset_input_history_navigation();
+                app.input.delete(TextDelete::ToEnd);
+                if app.search_mode {
+                    app.update_search();
+                }
             }
         }
-        TuiAction::MoveCursorLeft => app.input.move_cursor(TextMotion::Left),
-        TuiAction::MoveCursorRight => app.input.move_cursor(TextMotion::Right),
-        TuiAction::MoveCursorWordLeft => app.input.move_cursor(TextMotion::WordLeft),
-        TuiAction::MoveCursorWordRight => app.input.move_cursor(TextMotion::WordRight),
-        TuiAction::MoveCursorStart => app.input.move_cursor(TextMotion::Start),
-        TuiAction::MoveCursorEnd => app.input.move_cursor(TextMotion::End),
+        TuiAction::MoveCursorLeft => {
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.move_cursor(TextMotion::Left);
+            } else {
+                app.input.move_cursor(TextMotion::Left);
+            }
+        }
+        TuiAction::MoveCursorRight => {
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.move_cursor(TextMotion::Right);
+            } else {
+                app.input.move_cursor(TextMotion::Right);
+            }
+        }
+        TuiAction::MoveCursorWordLeft => {
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.move_cursor(TextMotion::WordLeft);
+            } else {
+                app.input.move_cursor(TextMotion::WordLeft);
+            }
+        }
+        TuiAction::MoveCursorWordRight => {
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.move_cursor(TextMotion::WordRight);
+            } else {
+                app.input.move_cursor(TextMotion::WordRight);
+            }
+        }
+        TuiAction::MoveCursorStart => {
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.move_cursor(TextMotion::Start);
+            } else {
+                app.input.move_cursor(TextMotion::Start);
+            }
+        }
+        TuiAction::MoveCursorEnd => {
+            if let Some(palette) = &mut app.command_palette {
+                palette.filter.move_cursor(TextMotion::End);
+            } else {
+                app.input.move_cursor(TextMotion::End);
+            }
+        }
         TuiAction::SelectUp => {
             if scope == TuiScope::Permission {
                 app.previous_permission_choice();
@@ -1721,7 +1798,7 @@ impl PermissionChoice {
 
 #[derive(Debug, Clone)]
 struct CommandPaletteState {
-    filter: String,
+    filter: TextEditBuffer,
     selected: usize,
     commands: Vec<CommandInfo>,
     is_loading: bool,
@@ -1730,7 +1807,7 @@ struct CommandPaletteState {
 impl CommandPaletteState {
     fn new() -> Self {
         Self {
-            filter: String::new(),
+            filter: TextEditBuffer::new(),
             selected: 0,
             commands: Vec::new(),
             is_loading: true,
@@ -1738,19 +1815,21 @@ impl CommandPaletteState {
     }
 
     fn filtered_commands(&self) -> Vec<&CommandInfo> {
-        if self.filter.is_empty() {
+        let filter = self.filter.text();
+        if filter.is_empty() {
             return self.commands.iter().collect();
         }
+        let filter = filter.to_lowercase();
         self.commands
             .iter()
             .filter(|c| {
-                c.name.to_lowercase().contains(&self.filter.to_lowercase())
-                    || c.id.to_lowercase().contains(&self.filter.to_lowercase())
+                c.name.to_lowercase().contains(&filter)
+                    || c.id.to_lowercase().contains(&filter)
                     || c.description
                         .as_deref()
                         .unwrap_or("")
                         .to_lowercase()
-                        .contains(&self.filter.to_lowercase())
+                        .contains(&filter)
             })
             .collect()
     }
@@ -3096,7 +3175,9 @@ fn command_palette_cursor_position(area: Rect, palette: &CommandPaletteState) ->
     if search_area.width == 0 || search_area.height == 0 {
         return None;
     }
-    let column = line_width("› ").saturating_add(line_width(&palette.filter));
+    let column = line_width("› ").saturating_add(line_width(
+        &palette.filter.text()[..palette.filter.cursor_byte_index()],
+    ));
     Some(Position::new(
         search_area.x + usize_to_u16_saturating(column).min(search_area.width.saturating_sub(1)),
         search_area.y,
@@ -3128,7 +3209,7 @@ fn render_command_palette(
     } else {
         Line::from(vec![
             Span::styled("› ", accent_style()),
-            Span::styled(palette.filter.clone(), normal_style()),
+            Span::styled(palette.filter.text().to_string(), normal_style()),
         ])
     };
     Paragraph::new(Text::from(vec![
@@ -4068,6 +4149,25 @@ mod tests {
         }
     }
 
+    fn apply_command_palette_action(palette: &mut CommandPaletteState, action: TuiAction) {
+        match action {
+            TuiAction::DeleteCharBackward => palette.filter.delete(TextDelete::Backward),
+            TuiAction::DeleteCharForward => palette.filter.delete(TextDelete::Forward),
+            TuiAction::DeleteWordBackward => palette.filter.delete(TextDelete::WordBackward),
+            TuiAction::DeleteWordForward => palette.filter.delete(TextDelete::WordForward),
+            TuiAction::DeleteToStart => palette.filter.delete(TextDelete::ToStart),
+            TuiAction::DeleteToEnd => palette.filter.delete(TextDelete::ToEnd),
+            TuiAction::MoveCursorLeft => palette.filter.move_cursor(TextMotion::Left),
+            TuiAction::MoveCursorRight => palette.filter.move_cursor(TextMotion::Right),
+            TuiAction::MoveCursorWordLeft => palette.filter.move_cursor(TextMotion::WordLeft),
+            TuiAction::MoveCursorWordRight => palette.filter.move_cursor(TextMotion::WordRight),
+            TuiAction::MoveCursorStart => palette.filter.move_cursor(TextMotion::Start),
+            TuiAction::MoveCursorEnd => palette.filter.move_cursor(TextMotion::End),
+            _ => panic!("unsupported test palette action: {action:?}"),
+        }
+        palette.selected = 0;
+    }
+
     fn chat_app_with_input(text: &str) -> ChatApp {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
@@ -4915,15 +5015,61 @@ mod tests {
         app.input = TextEditBuffer::from_text("draft message");
         app.open_command_palette();
         if let Some(palette) = &mut app.command_palette {
-            palette.filter.push('m');
+            palette.filter.insert_char('m');
         }
 
         assert_eq!(app.input.text(), "draft message");
         assert_eq!(
             app.command_palette
                 .as_ref()
-                .map(|palette| palette.filter.as_str()),
+                .map(|palette| palette.filter.text()),
             Some("m")
+        );
+    }
+
+    #[test]
+    fn command_palette_filter_supports_cursor_editing() {
+        let mut palette = CommandPaletteState::new();
+        palette.filter = TextEditBuffer::from_text("model switch");
+
+        apply_command_palette_action(&mut palette, TuiAction::MoveCursorWordLeft);
+        apply_command_palette_action(&mut palette, TuiAction::MoveCursorLeft);
+        apply_command_palette_action(&mut palette, TuiAction::DeleteCharForward);
+        palette.filter.insert_char('-');
+
+        assert_eq!(palette.filter.text(), "model-switch");
+        assert_eq!(palette.selected, 0);
+    }
+
+    #[test]
+    fn command_palette_filter_supports_word_and_range_deletion() {
+        let mut palette = CommandPaletteState::new();
+        palette.filter = TextEditBuffer::from_text("switch provider bedrock");
+
+        apply_command_palette_action(&mut palette, TuiAction::MoveCursorWordLeft);
+        apply_command_palette_action(&mut palette, TuiAction::DeleteWordBackward);
+        assert_eq!(palette.filter.text(), "switch bedrock");
+
+        apply_command_palette_action(&mut palette, TuiAction::MoveCursorStart);
+        apply_command_palette_action(&mut palette, TuiAction::MoveCursorWordRight);
+        apply_command_palette_action(&mut palette, TuiAction::DeleteToEnd);
+        assert_eq!(palette.filter.text(), "switch");
+    }
+
+    #[test]
+    fn command_palette_cursor_tracks_mid_filter_cursor() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.open_command_palette();
+        if let Some(palette) = &mut app.command_palette {
+            palette.filter = TextEditBuffer::from_text("model");
+            palette.filter.move_cursor(TextMotion::Left);
+            palette.filter.move_cursor(TextMotion::Left);
+        }
+
+        assert_eq!(
+            app.cursor_position(Rect::new(0, 0, 100, 30)),
+            Some(Position::new(14, 7))
         );
     }
 
@@ -5004,7 +5150,7 @@ mod tests {
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
         app.open_command_palette();
         if let Some(palette) = &mut app.command_palette {
-            palette.filter = "mo".to_string();
+            palette.filter = TextEditBuffer::from_text("mo");
         }
 
         assert_eq!(
@@ -5033,7 +5179,7 @@ mod tests {
     #[test]
     fn command_palette_renders_empty_state() {
         let mut palette = CommandPaletteState::new();
-        palette.filter = "missing".to_string();
+        palette.filter = TextEditBuffer::from_text("missing");
         palette.commands = Vec::new();
         palette.is_loading = false;
         let area = Rect::new(0, 0, 80, 20);
