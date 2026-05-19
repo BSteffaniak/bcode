@@ -836,8 +836,8 @@ async fn handle_tui_action(
                 app.update_search();
             }
         }
-        TuiAction::InputHistoryPrevious => app.previous_input_history(),
-        TuiAction::InputHistoryNext => app.next_input_history(),
+        TuiAction::InputHistoryPrevious => app.move_input_or_history_previous(),
+        TuiAction::InputHistoryNext => app.move_input_or_history_next(),
         TuiAction::DeleteCharBackward => {
             if let Some(palette) = &mut app.command_palette {
                 palette.filter.delete_backward();
@@ -2958,6 +2958,25 @@ impl ChatApp {
         self.input_history.push(text.to_string());
     }
 
+    fn move_input_or_history_previous(&mut self) {
+        if self.input.wrapped_layout(usize::MAX / 4).cursor.row > 0 {
+            self.reset_input_history_navigation();
+            self.input.move_cursor(TextMotion::VisualUp);
+        } else {
+            self.previous_input_history();
+        }
+    }
+
+    fn move_input_or_history_next(&mut self) {
+        let layout = self.input.wrapped_layout(usize::MAX / 4);
+        if layout.cursor.row.saturating_add(1) < layout.lines.len() {
+            self.reset_input_history_navigation();
+            self.input.move_cursor(TextMotion::VisualDown);
+        } else {
+            self.next_input_history();
+        }
+    }
+
     fn previous_input_history(&mut self) {
         if self.search_mode {
             self.status = "input history unavailable while searching".to_string();
@@ -4768,6 +4787,33 @@ mod tests {
             false,
         );
         assert_eq!(app.input_history.len(), 2);
+    }
+
+    #[test]
+    fn multiline_up_down_moves_cursor_before_history_navigation() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let history = vec![session_event(
+            session_id,
+            SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "history prompt".to_string(),
+            },
+        )];
+        let mut app = ChatApp::new(session_id, &history, &keymap);
+        app.input = TextEditBuffer::from_text("one\ntwo");
+
+        app.move_input_or_history_previous();
+        assert_eq!(app.input.text(), "one\ntwo");
+        assert_eq!(app.input.cursor_byte_index(), "one".len());
+
+        app.move_input_or_history_next();
+        assert_eq!(app.input.text(), "one\ntwo");
+        assert_eq!(app.input.cursor_byte_index(), app.input.text().len());
+
+        app.move_input_or_history_previous();
+        app.move_input_or_history_previous();
+        assert_eq!(app.input.text(), "history prompt");
     }
 
     #[test]
