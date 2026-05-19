@@ -1847,10 +1847,10 @@ impl SessionManagerInner {
 impl SessionState {
     pub(crate) fn from_index(index: index::SessionIndex) -> Self {
         let (sender, _) = broadcast::channel(512);
-        let access_status = access_status_from_schema_versions(
+        let access_status = access_status_from_index(
             index.min_event_schema_version,
             index.max_event_schema_version,
-            !index.issues.is_empty(),
+            &index.issues,
         );
         let mut summary = index.summary;
         summary.created_at_ms = index.created_at_ms;
@@ -2054,8 +2054,38 @@ fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAcces
     access_status_from_schema_versions(
         report.min_schema_version,
         report.max_schema_version,
-        !report.issues.is_empty(),
+        report.issues.iter().any(read_issue_blocks_access),
     )
+}
+
+fn access_status_from_index(
+    min_schema_version: Option<u16>,
+    max_schema_version: Option<u16>,
+    issues: &[index::SessionIndexIssue],
+) -> SessionAccessStatus {
+    access_status_from_schema_versions(
+        min_schema_version,
+        max_schema_version,
+        issues.iter().any(index_issue_blocks_access),
+    )
+}
+
+fn read_issue_blocks_access(issue: &reader::SessionReadIssue) -> bool {
+    match &issue.kind {
+        reader::SessionReadIssueKind::Decode { message } => decode_issue_blocks_access(message),
+        reader::SessionReadIssueKind::TruncatedLength { .. }
+        | reader::SessionReadIssueKind::TruncatedPayload { .. }
+        | reader::SessionReadIssueKind::OversizedFrame { .. } => true,
+    }
+}
+
+fn index_issue_blocks_access(issue: &index::SessionIndexIssue) -> bool {
+    decode_issue_blocks_access(&issue.message)
+}
+
+fn decode_issue_blocks_access(message: &str) -> bool {
+    message.contains("session event frame checksum mismatch")
+        || message.contains("unsupported session frame version")
 }
 
 fn access_status_from_schema_versions(
@@ -2143,12 +2173,13 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::SessionManager;
+    use super::{SessionAccessStatus, SessionManager, access_status_from_report, reader};
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionEvent, SessionEventKind,
-        SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent, SessionTracePayload,
-        SessionTracePhase,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, SessionEvent,
+        SessionEventKind, SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent,
+        SessionTracePayload, SessionTracePhase, TraceBlobRef,
     };
+    use serde::Serialize;
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2194,6 +2225,67 @@ mod tests {
     }
 
     #[test]
+    fn old_order_trace_payload_tool_events_decode_as_same_variant() {
+        #[allow(dead_code)]
+        #[derive(Serialize)]
+        enum OldOrderSessionTracePayload {
+            ModelRequestBuilt,
+            ProviderRound,
+            ProviderEvent,
+            ToolInvocationStarted {
+                tool_call_id: String,
+                plugin_id: String,
+                tool_name: String,
+                side_effect: String,
+                requires_permission: bool,
+                arguments: Option<TraceBlobRef>,
+            },
+        }
+
+        let old_payload = OldOrderSessionTracePayload::ToolInvocationStarted {
+            tool_call_id: "call".to_string(),
+            plugin_id: "plugin".to_string(),
+            tool_name: "tool".to_string(),
+            side_effect: "read_only".to_string(),
+            requires_permission: false,
+            arguments: None,
+        };
+
+        let bytes = bmux_codec::to_vec(&old_payload).expect("old payload should encode");
+        let decoded: SessionTracePayload =
+            bmux_codec::from_bytes(&bytes).expect("old payload should decode");
+
+        assert!(matches!(
+            decoded,
+            SessionTracePayload::ToolInvocationStarted { tool_call_id, .. }
+                if tool_call_id == "call"
+        ));
+    }
+
+    #[test]
+    fn intact_decode_issues_do_not_make_session_read_only() {
+        let report = reader::SessionReadReport {
+            events: Vec::new(),
+            entries: Vec::new(),
+            last_good_offset: 0,
+            issues: vec![reader::SessionReadIssue {
+                offset: 0,
+                kind: reader::SessionReadIssueKind::Decode {
+                    message: "invalid value: integer `29`, expected variant index 0 <= i < 5"
+                        .to_string(),
+                },
+            }],
+            min_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            max_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+        };
+
+        assert_eq!(
+            access_status_from_report(&report),
+            SessionAccessStatus::ReadWrite
+        );
+    }
+
+    #[test]
     fn all_trace_payload_variants_round_trip_through_bmux_codec() {
         let payloads = vec![
             SessionTracePayload::ProviderRound {
@@ -2208,6 +2300,12 @@ mod tests {
                 event_type: "text_delta".to_string(),
                 detail: Some("detail".to_string()),
             },
+            SessionTracePayload::ProviderStreamEvent(ProviderStreamEvent::ToolCallProgress {
+                tool_call_id: "call".to_string(),
+                tool_name: "tool".to_string(),
+                argument_bytes: 12,
+                chunk_count: 2,
+            }),
             SessionTracePayload::ToolInvocationStarted {
                 tool_call_id: "call".to_string(),
                 plugin_id: "plugin".to_string(),

@@ -7,7 +7,7 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-pub const SESSION_INDEX_VERSION: u16 = 2;
+pub const SESSION_INDEX_VERSION: u16 = 4;
 pub const SESSION_ENTRY_INDEX_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

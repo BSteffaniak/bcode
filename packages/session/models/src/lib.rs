@@ -233,7 +233,7 @@ pub enum SessionTracePhase {
 
 /// Structured model-provider streaming event for user-facing progress and debug correlation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
     /// Provider turn started.
     TurnStarted,
@@ -285,6 +285,11 @@ pub struct ProviderToolCallProgress {
 }
 
 /// Structured diagnostic payload for a [`SessionTraceEvent`].
+///
+/// IMPORTANT: This enum is persisted with `bmux_codec`, whose binary enum
+/// representation is order-sensitive. Do not reorder existing variants or
+/// insert new variants between existing ones. Add new variants only at the end,
+/// and bump `CURRENT_SESSION_EVENT_SCHEMA_VERSION` when doing so.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionTracePayload {
@@ -313,7 +318,6 @@ pub enum SessionTracePayload {
         event_type: String,
         detail: Option<String>,
     },
-    ProviderStreamEvent(ProviderStreamEvent),
     ToolInvocationStarted {
         tool_call_id: String,
         plugin_id: String,
@@ -347,6 +351,7 @@ pub enum SessionTracePayload {
         compacted: bool,
         message: Option<String>,
     },
+    ProviderStreamEvent(ProviderStreamEvent),
 }
 
 /// Reference to a trace payload stored outside the main session event stream.
