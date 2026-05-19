@@ -890,6 +890,7 @@ async fn handle_attach_session(
 ) -> Result<(), ServerError> {
     match state.sessions.attach_session(session_id, client_id).await {
         Ok(attachment) => {
+            restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             publish_session_event(state, &attachment.attached_event).await;
             send_response(
@@ -931,6 +932,7 @@ async fn handle_attach_session_recent(
         .await
     {
         Ok(attachment) => {
+            restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             publish_session_event(state, &attachment.attached_event).await;
             send_response(
@@ -985,6 +987,7 @@ async fn handle_user_message(
                 )
                 .await;
             };
+            suggest_skills_for_prompt(state, session_id, &user_event).await;
             let state_for_turn = Arc::clone(state);
             tokio::spawn(async move {
                 run_model_turn(&state_for_turn, session_id, &user_event).await;
@@ -4899,10 +4902,97 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
         disabled_ids: config.skills.disabled_skill_ids(),
     };
     match SkillRegistry::discover(&roots, options) {
-        Ok(registry) => Some(registry),
+        Ok(mut registry) => {
+            add_plugin_skills(&mut registry);
+            Some(registry)
+        }
         Err(error) => {
             eprintln!("failed to build skill registry: {error}");
             None
+        }
+    }
+}
+
+fn rebuild_active_skills_from_history(
+    events: &[bcode_session_models::SessionEvent],
+) -> BTreeSet<SkillId> {
+    let mut active = BTreeSet::new();
+    for event in events {
+        match &event.kind {
+            SessionEventKind::SkillActivated { skill_id, .. } => {
+                active.insert(skill_id.clone());
+            }
+            SessionEventKind::SkillDeactivated { skill_id, .. } => {
+                active.remove(skill_id);
+            }
+            _ => {}
+        }
+    }
+    active
+}
+
+async fn restore_active_skills_from_history(
+    events: &[bcode_session_models::SessionEvent],
+    state: &ServerState,
+    session_id: SessionId,
+) {
+    let active = rebuild_active_skills_from_history(events);
+    if !active.is_empty() {
+        state.active_skills.lock().await.insert(session_id, active);
+    }
+}
+
+const fn add_plugin_skills(_registry: &mut SkillRegistry) {
+    // Plugin-provided skills use the same `bcode.skill/v1` contract types as folder skills.
+    // Provider invocation routing is intentionally kept out of the folder registry; once a
+    // bundled/external plugin declares the interface, server handlers can merge `list` results
+    // here and delegate `describe`/`context` to that provider by source/plugin ID.
+}
+
+async fn suggest_skills_for_prompt(
+    state: &ServerState,
+    session_id: SessionId,
+    user_event: &bcode_session_models::SessionEvent,
+) {
+    let SessionEventKind::UserMessage { text, .. } = &user_event.kind else {
+        return;
+    };
+    let Some(registry) = &state.skills else {
+        return;
+    };
+    let lower_text = text.to_lowercase();
+    let active = state
+        .active_skills
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    for skill in registry.list().skills {
+        if active.contains(&skill.id) {
+            continue;
+        }
+        let Some(keyword) = skill
+            .activation
+            .keywords
+            .iter()
+            .find(|keyword| lower_text.contains(&keyword.to_lowercase()))
+        else {
+            continue;
+        };
+        let event = state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::SkillSuggested {
+                    skill_id: skill.id,
+                    reason: Some(format!("matched keyword '{keyword}'")),
+                    suggested_at_ms: current_time_ms(),
+                },
+            )
+            .await;
+        if let Ok(event) = event {
+            publish_session_event(state, &event).await;
         }
     }
 }

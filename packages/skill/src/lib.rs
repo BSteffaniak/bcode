@@ -142,6 +142,12 @@ impl SkillRegistry {
     /// Returns an error when the skill is unknown, disabled, too large, unreadable, or malformed.
     pub fn describe(&self, skill_id: &SkillId) -> Result<SkillManifest, SkillRegistryError> {
         let entry = self.entry(skill_id)?;
+        if entry.path.as_os_str().is_empty() {
+            return Err(SkillError::InvalidMetadata(
+                "plugin-provided skill context must be loaded through its provider".to_string(),
+            )
+            .into());
+        }
         parse_skill_file(
             &entry.path,
             &entry.summary.source,
@@ -249,6 +255,14 @@ impl SkillRegistry {
                 Some(&skill_file),
             )),
         }
+    }
+
+    /// Insert a plugin-provided skill summary.
+    pub fn insert_plugin_skill(&mut self, summary: SkillSummary) {
+        self.insert_skill(SkillEntry {
+            summary,
+            path: PathBuf::new(),
+        });
     }
 
     fn insert_skill(&mut self, entry: SkillEntry) {

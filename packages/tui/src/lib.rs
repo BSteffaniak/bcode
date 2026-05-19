@@ -1431,6 +1431,9 @@ async fn handle_slash_command(
             true
         }
         "skills" => list_skills_from_tui(client, app).await,
+        "skill" if parts.get(1) == Some(&"describe") && parts.len() > 2 => {
+            describe_skill_from_tui(client, app, parts[2]).await
+        }
         "skill" if parts.len() == 1 || parts.get(1) == Some(&"active") => {
             active_skills_from_tui(client, app, session_id).await
         }
@@ -1460,6 +1463,32 @@ async fn list_skills_from_tui(client: &BcodeClient, app: &mut ChatApp) -> bool {
             }
         }
         Err(error) => app.status = format!("skill list failed: {error}"),
+    }
+    true
+}
+
+async fn describe_skill_from_tui(client: &BcodeClient, app: &mut ChatApp, skill_id: &str) -> bool {
+    match client
+        .describe_skill(SkillId::new(skill_id.to_string()))
+        .await
+    {
+        Ok(skill) => {
+            let description = skill
+                .summary
+                .description
+                .as_deref()
+                .unwrap_or("no description");
+            let keywords = if skill.summary.activation.keywords.is_empty() {
+                "none".to_string()
+            } else {
+                skill.summary.activation.keywords.join(", ")
+            };
+            app.status = format!(
+                "skill {}: {description}; keywords: {keywords}; source: {}",
+                skill.summary.id, skill.summary.source.label
+            );
+        }
+        Err(error) => app.status = format!("skill describe failed: {error}"),
     }
     true
 }
