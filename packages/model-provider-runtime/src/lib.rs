@@ -99,9 +99,11 @@ impl TurnStore {
         }
     }
 
-    /// Remove a provider turn from the active store.
+    /// Cancel and remove a provider turn from the active store.
     pub fn finish(&mut self, provider_turn_id: &str) {
-        self.turns.remove(provider_turn_id);
+        if let Some(turn) = self.turns.remove(provider_turn_id) {
+            turn.cancel();
+        }
     }
 }
 

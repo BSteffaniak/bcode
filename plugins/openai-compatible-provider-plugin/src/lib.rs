@@ -161,7 +161,9 @@ impl OpenAiCompatibleProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        self.turns.remove(&request.provider_turn_id);
+        if let Some(turn) = self.turns.remove(&request.provider_turn_id) {
+            turn.cancel();
+        }
         json_response(&AckResponse::default())
     }
 }

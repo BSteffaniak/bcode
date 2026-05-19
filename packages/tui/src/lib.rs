@@ -2233,6 +2233,7 @@ enum ActivityState {
     Thinking,
     Compacting { detail: String },
     Streaming { chars: usize },
+    ProviderStream { detail: String },
     RunningTool { name: String },
     WaitingPermission { name: String },
     Cancelling,
@@ -2762,6 +2763,27 @@ impl ChatApp {
     }
 
     fn update_activity_from_trace(&mut self, trace: &bcode_session_models::SessionTraceEvent) {
+        if let SessionTracePayload::ProviderEvent { event_type, detail } = &trace.payload {
+            match event_type.as_str() {
+                "tool_call_started" | "tool_call_progress" | "no_progress_warning" => {
+                    let detail = detail
+                        .clone()
+                        .unwrap_or_else(|| "provider stream in progress".to_string());
+                    self.set_activity(ActivityState::ProviderStream {
+                        detail: detail.clone(),
+                    });
+                    self.status = detail;
+                }
+                "tool_call_finished" | "turn_finished" => {
+                    if matches!(self.activity, ActivityState::ProviderStream { .. }) {
+                        self.set_activity(ActivityState::Thinking);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let SessionTracePayload::ContextCompaction {
             reason,
             compacted,
@@ -3858,6 +3880,9 @@ fn activity_label(activity: &ActivityState) -> String {
         }
         ActivityState::Streaming { chars } => {
             format!("streaming · {} chars", compact_count(*chars))
+        }
+        ActivityState::ProviderStream { detail } => {
+            format!("provider stream · {}", truncate_middle(detail, 48))
         }
         ActivityState::RunningTool { name } => {
             format!("running tool · {}", truncate_middle(name, 24))

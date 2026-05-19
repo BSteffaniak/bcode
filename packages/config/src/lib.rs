@@ -545,6 +545,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub tool_output: ToolOutputConfig,
     #[serde(default)]
+    pub streaming: StreamingConfig,
+    #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub profile: Option<String>,
@@ -579,6 +581,9 @@ impl ModelConfig {
         }
         if next.tool_output != ToolOutputConfig::default() {
             self.tool_output = next.tool_output;
+        }
+        if next.streaming != StreamingConfig::default() {
+            self.streaming = next.streaming;
         }
         if next.compaction != CompactionConfig::default() {
             self.compaction = next.compaction;
@@ -618,6 +623,34 @@ impl Default for ToolOutputConfig {
     fn default() -> Self {
         Self {
             context_chars: default_tool_output_context_chars(),
+        }
+    }
+}
+
+/// Provider streaming progress and timeout configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingConfig {
+    /// Seconds without meaningful provider progress before Bcode shows a warning.
+    #[serde(default = "default_streaming_no_progress_warning_secs")]
+    pub no_progress_warning_secs: u64,
+    /// Seconds without meaningful provider progress before Bcode times out the turn.
+    #[serde(default = "default_streaming_no_progress_timeout_secs")]
+    pub no_progress_timeout_secs: u64,
+    /// Minimum streamed argument bytes between visible progress updates.
+    #[serde(default = "default_streaming_progress_event_interval_bytes")]
+    pub progress_event_interval_bytes: usize,
+    /// Minimum seconds between visible progress updates.
+    #[serde(default = "default_streaming_progress_event_interval_secs")]
+    pub progress_event_interval_secs: u64,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            no_progress_warning_secs: default_streaming_no_progress_warning_secs(),
+            no_progress_timeout_secs: default_streaming_no_progress_timeout_secs(),
+            progress_event_interval_bytes: default_streaming_progress_event_interval_bytes(),
+            progress_event_interval_secs: default_streaming_progress_event_interval_secs(),
         }
     }
 }
@@ -681,6 +714,22 @@ impl CompactionMode {
 
 const fn default_tool_output_context_chars() -> usize {
     4_000
+}
+
+const fn default_streaming_no_progress_warning_secs() -> u64 {
+    30
+}
+
+const fn default_streaming_no_progress_timeout_secs() -> u64 {
+    300
+}
+
+const fn default_streaming_progress_event_interval_bytes() -> usize {
+    256 * 1024
+}
+
+const fn default_streaming_progress_event_interval_secs() -> u64 {
+    2
 }
 
 const fn default_auto_compaction_context_chars() -> usize {
@@ -1200,6 +1249,48 @@ fn write_model_compaction_toml(output: &mut String, compaction: &CompactionConfi
     output.push('\n');
 }
 
+fn write_model_tool_output_toml(output: &mut String, tool_output: &ToolOutputConfig) {
+    if tool_output == &ToolOutputConfig::default() {
+        return;
+    }
+    output.push_str("[model.tool_output]\n");
+    writeln!(output, "context_chars = {}", tool_output.context_chars)
+        .expect("writing to string should not fail");
+    output.push('\n');
+}
+
+fn write_model_streaming_toml(output: &mut String, streaming: &StreamingConfig) {
+    if streaming == &StreamingConfig::default() {
+        return;
+    }
+    output.push_str("[model.streaming]\n");
+    writeln!(
+        output,
+        "no_progress_warning_secs = {}",
+        streaming.no_progress_warning_secs
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "no_progress_timeout_secs = {}",
+        streaming.no_progress_timeout_secs
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "progress_event_interval_bytes = {}",
+        streaming.progress_event_interval_bytes
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "progress_event_interval_secs = {}",
+        streaming.progress_event_interval_secs
+    )
+    .expect("writing to string should not fail");
+    output.push('\n');
+}
+
 fn write_model_toml(output: &mut String, model: &ModelConfig) {
     if model.provider_plugin_id.is_some()
         || model.model_id.is_some()
@@ -1209,6 +1300,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         || model.prompt_cache != PromptCacheConfig::default()
         || model.conversation_reuse != ConversationReuseConfig::default()
         || model.tool_output != ToolOutputConfig::default()
+        || model.streaming != StreamingConfig::default()
         || model.compaction != CompactionConfig::default()
     {
         output.push_str("[model]\n");
@@ -1258,16 +1350,8 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         .expect("writing to string should not fail");
         output.push('\n');
     }
-    if model.tool_output != ToolOutputConfig::default() {
-        output.push_str("[model.tool_output]\n");
-        writeln!(
-            output,
-            "context_chars = {}",
-            model.tool_output.context_chars
-        )
-        .expect("writing to string should not fail");
-        output.push('\n');
-    }
+    write_model_tool_output_toml(output, &model.tool_output);
+    write_model_streaming_toml(output, &model.streaming);
     if model.compaction != CompactionConfig::default() {
         write_model_compaction_toml(output, &model.compaction);
     }

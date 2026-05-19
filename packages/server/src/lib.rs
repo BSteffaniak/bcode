@@ -87,6 +87,7 @@ struct ServerState {
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
     tool_output_context_chars: usize,
+    model_streaming: bcode_config::StreamingConfig,
     auto_compaction: bcode_config::CompactionConfig,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -289,6 +290,7 @@ struct ServerStateInit {
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
     tool_output_context_chars: usize,
+    model_streaming: bcode_config::StreamingConfig,
     auto_compaction: bcode_config::CompactionConfig,
 }
 
@@ -312,6 +314,7 @@ impl ServerState {
             trace_store: init.trace_store,
             max_tool_rounds: init.max_tool_rounds,
             tool_output_context_chars: init.tool_output_context_chars,
+            model_streaming: init.model_streaming,
             auto_compaction: init.auto_compaction,
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
@@ -400,6 +403,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
             tool_output_context_chars: config.model.tool_output.context_chars,
+            model_streaming: config.model.streaming,
             auto_compaction: config.model.compaction,
         },
     ));
@@ -1350,7 +1354,6 @@ async fn handle_resolve_permission(
 }
 
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 
@@ -1359,6 +1362,85 @@ struct ModelPollOutcome {
     stop_reason: Option<bcode_model::StopReason>,
     completion: Option<ModelTurnCompletion>,
     provider_error: Option<bcode_model::ProviderError>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolArgumentStreamProgress {
+    call_id: String,
+    name: String,
+    argument_bytes: usize,
+    delta_count: usize,
+    last_reported_bytes: usize,
+    last_reported_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ModelStreamProgress {
+    active_tool_call: Option<ToolArgumentStreamProgress>,
+}
+
+impl ModelStreamProgress {
+    fn start_tool_call(&mut self, call_id: String, name: String) {
+        self.active_tool_call = Some(ToolArgumentStreamProgress {
+            call_id,
+            name,
+            argument_bytes: 0,
+            delta_count: 0,
+            last_reported_bytes: 0,
+            last_reported_at: Instant::now(),
+        });
+    }
+
+    fn record_tool_delta(&mut self, call_id: &str, delta: &str) {
+        let Some(active) = self.active_tool_call.as_mut() else {
+            return;
+        };
+        if active.call_id != call_id {
+            return;
+        }
+        active.argument_bytes = active.argument_bytes.saturating_add(delta.len());
+        active.delta_count = active.delta_count.saturating_add(1);
+    }
+
+    fn should_report_tool_progress(&self, streaming: &bcode_config::StreamingConfig) -> bool {
+        let Some(active) = self.active_tool_call.as_ref() else {
+            return false;
+        };
+        active
+            .argument_bytes
+            .saturating_sub(active.last_reported_bytes)
+            >= streaming.progress_event_interval_bytes
+            || active.last_reported_at.elapsed()
+                >= Duration::from_secs(streaming.progress_event_interval_secs)
+    }
+
+    fn mark_tool_progress_reported(&mut self) {
+        if let Some(active) = self.active_tool_call.as_mut() {
+            active.last_reported_bytes = active.argument_bytes;
+            active.last_reported_at = Instant::now();
+        }
+    }
+
+    fn finish_tool_call(&mut self, call_id: &str) {
+        if self
+            .active_tool_call
+            .as_ref()
+            .is_some_and(|active| active.call_id == call_id)
+        {
+            self.active_tool_call = None;
+        }
+    }
+
+    fn tool_progress_detail(&self) -> Option<String> {
+        let active = self.active_tool_call.as_ref()?;
+        Some(format!(
+            "streaming {} arguments ({}) · {} received · {} chunks",
+            active.name,
+            active.call_id,
+            format_bytes(active.argument_bytes),
+            active.delta_count
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -1372,6 +1454,22 @@ enum ModelTurnRetry {
     None,
     Continue,
     Return(ModelTurnCompletion),
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        let whole = bytes / MIB;
+        let decimal = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{decimal} MiB")
+    } else if bytes >= KIB {
+        let whole = bytes / KIB;
+        let decimal = (bytes % KIB) * 10 / KIB;
+        format!("{whole}.{decimal} KiB")
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1813,7 +1911,7 @@ async fn poll_compaction_summary(
             .await
             .map_err(CompactionError::Provider)?;
         if response.events.is_empty() {
-            idle_for = wait_for_compaction_progress(idle_for).await?;
+            idle_for = wait_for_compaction_progress(&state.model_streaming, idle_for).await?;
             continue;
         }
         let saw_progress = compaction_events_include_progress(&response.events);
@@ -1824,7 +1922,8 @@ async fn poll_compaction_summary(
                 if saw_progress {
                     idle_for = Duration::ZERO;
                 } else {
-                    idle_for = wait_for_compaction_progress(idle_for).await?;
+                    idle_for =
+                        wait_for_compaction_progress(&state.model_streaming, idle_for).await?;
                 }
             }
             CompactionPollStatus::Finished => return Ok(summary),
@@ -1846,12 +1945,16 @@ const fn compaction_event_is_progress(event: &ProviderTurnEvent) -> bool {
     }
 }
 
-async fn wait_for_compaction_progress(idle_for: Duration) -> Result<Duration, CompactionError> {
+async fn wait_for_compaction_progress(
+    streaming: &bcode_config::StreamingConfig,
+    idle_for: Duration,
+) -> Result<Duration, CompactionError> {
     let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
-    if idle_for > MODEL_IDLE_TIMEOUT {
+    let timeout = Duration::from_secs(streaming.no_progress_timeout_secs);
+    if idle_for > timeout {
         return Err(CompactionError::Provider(format!(
-            "model provider was idle for {} seconds before timeout",
-            MODEL_IDLE_TIMEOUT.as_secs()
+            "model provider made no compaction progress for {} seconds before timeout",
+            timeout.as_secs()
         )));
     }
     tokio::time::sleep(MODEL_POLL_INTERVAL).await;
@@ -2465,7 +2568,9 @@ async fn poll_model_turn_events(
 ) -> (String, ModelPollOutcome) {
     let mut assistant_text = String::new();
     let mut outcome = ModelPollOutcome::default();
+    let mut stream_progress = ModelStreamProgress::default();
     let mut idle_for = Duration::ZERO;
+    let mut no_progress_warned = false;
     loop {
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
@@ -2484,8 +2589,15 @@ async fn poll_model_turn_events(
             }
         };
         if response.events.is_empty() {
-            let Some(next_idle_for) =
-                wait_for_model_progress_or_timeout(state, session_id, idle_for, &mut outcome).await
+            let Some(next_idle_for) = wait_for_model_progress_or_timeout(
+                state,
+                session_id,
+                idle_for,
+                &mut no_progress_warned,
+                stream_progress.tool_progress_detail(),
+                &mut outcome,
+            )
+            .await
             else {
                 break;
             };
@@ -2501,6 +2613,7 @@ async fn poll_model_turn_events(
                 event,
                 &mut assistant_text,
                 &mut outcome,
+                &mut stream_progress,
             )
             .await;
         }
@@ -2509,9 +2622,17 @@ async fn poll_model_turn_events(
         }
         if saw_progress {
             idle_for = Duration::ZERO;
+            no_progress_warned = false;
         } else {
-            let Some(next_idle_for) =
-                wait_for_model_progress_or_timeout(state, session_id, idle_for, &mut outcome).await
+            let Some(next_idle_for) = wait_for_model_progress_or_timeout(
+                state,
+                session_id,
+                idle_for,
+                &mut no_progress_warned,
+                stream_progress.tool_progress_detail(),
+                &mut outcome,
+            )
+            .await
             else {
                 break;
             };
@@ -2547,13 +2668,37 @@ async fn wait_for_model_progress_or_timeout(
     state: &ServerState,
     session_id: SessionId,
     idle_for: Duration,
+    warned: &mut bool,
+    progress_detail: Option<String>,
     outcome: &mut ModelPollOutcome,
 ) -> Option<Duration> {
     let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
-    if idle_for > MODEL_IDLE_TIMEOUT {
+    let warning_after = Duration::from_secs(state.model_streaming.no_progress_warning_secs);
+    let timeout_after = Duration::from_secs(state.model_streaming.no_progress_timeout_secs);
+    if !*warned && idle_for >= warning_after {
+        let detail = progress_detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(" while {detail}"));
+        append_provider_event_trace(
+            state,
+            session_id,
+            "model-stream",
+            "no_progress_warning",
+            Some(format!(
+                "no provider progress for {} seconds{detail}",
+                idle_for.as_secs()
+            )),
+        )
+        .await;
+        *warned = true;
+    }
+    if idle_for > timeout_after {
+        let detail = progress_detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(" while {detail}"));
         let message = format!(
-            "model provider was idle for {} seconds before timeout",
-            MODEL_IDLE_TIMEOUT.as_secs()
+            "model provider made no progress for {} seconds before timeout{detail}",
+            timeout_after.as_secs()
         );
         append_system_event(state, session_id, message.clone()).await;
         outcome.completion = Some(ModelTurnCompletion::with_message(
@@ -2587,6 +2732,7 @@ async fn handle_provider_turn_event(
     event: ProviderTurnEvent,
     assistant_text: &mut String,
     outcome: &mut ModelPollOutcome,
+    stream_progress: &mut ModelStreamProgress,
 ) {
     match event {
         ProviderTurnEvent::TextDelta { text } => {
@@ -2605,6 +2751,7 @@ async fn handle_provider_turn_event(
             handle_provider_cancelled_event(state, session_id, turn_id, outcome).await;
         }
         ProviderTurnEvent::ToolCallFinished { call } => {
+            let call_id = call.id.clone();
             handle_provider_tool_call_finished_event(
                 state,
                 session_id,
@@ -2613,6 +2760,7 @@ async fn handle_provider_turn_event(
                 assistant_text,
             )
             .await;
+            stream_progress.finish_tool_call(&call_id);
         }
         ProviderTurnEvent::Warning { message } => {
             append_provider_event_trace(
@@ -2637,6 +2785,7 @@ async fn handle_provider_turn_event(
             append_provider_event_trace(state, session_id, turn_id, "turn_started", None).await;
         }
         ProviderTurnEvent::ToolCallStarted { call_id, name } => {
+            stream_progress.start_tool_call(call_id.clone(), name.clone());
             append_provider_event_trace(
                 state,
                 session_id,
@@ -2649,15 +2798,19 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::ReasoningDelta { .. } => {
             append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
         }
-        ProviderTurnEvent::ToolCallDelta { call_id, .. } => {
-            append_provider_event_trace(
-                state,
-                session_id,
-                turn_id,
-                "tool_call_delta",
-                Some(call_id),
-            )
-            .await;
+        ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
+            stream_progress.record_tool_delta(&call_id, &delta);
+            if stream_progress.should_report_tool_progress(&state.model_streaming) {
+                append_provider_event_trace(
+                    state,
+                    session_id,
+                    turn_id,
+                    "tool_call_progress",
+                    stream_progress.tool_progress_detail(),
+                )
+                .await;
+                stream_progress.mark_tool_progress_reported();
+            }
         }
     }
 }
