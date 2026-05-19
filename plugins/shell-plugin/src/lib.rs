@@ -13,10 +13,14 @@ use serde::Deserialize;
 use serde_json::json;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const TERMINATION_GRACE_MS: u64 = 500;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Bundled shell plugin.
@@ -118,6 +122,7 @@ fn run_shell_tool(arguments: serde_json::Value) -> ToolInvocationResponse {
 fn run_shell_command(arguments: &ShellRunArguments) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let mut command = shell_command(&arguments.command);
+    configure_command_for_timeout(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = &arguments.cwd {
         command.current_dir(cwd);
@@ -142,8 +147,7 @@ fn run_shell_command(arguments: &ShellRunArguments) -> Result<ToolInvocationResp
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            child.kill().map_err(|error| error.to_string())?;
-            break child.wait().map_err(|error| error.to_string())?;
+            break terminate_child_after_timeout(&mut child)?;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -169,6 +173,71 @@ fn shell_command(command: &str) -> Command {
     let mut shell = Command::new("cmd");
     shell.arg("/C").arg(command);
     shell
+}
+
+#[cfg(unix)]
+fn configure_command_for_timeout(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_command_for_timeout(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child_after_timeout(child: &mut Child) -> Result<ExitStatus, String> {
+    let process_group_id = i32::try_from(child.id()).map_err(|error| error.to_string())?;
+    send_signal_to_process_group(process_group_id, SIGTERM)?;
+    let grace_started = Instant::now();
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait().map_err(|error| error.to_string())?;
+        }
+        if status.is_some()
+            || grace_started.elapsed() >= Duration::from_millis(TERMINATION_GRACE_MS)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    send_signal_to_process_group(process_group_id, SIGKILL)?;
+    status.map_or_else(|| child.wait().map_err(|error| error.to_string()), Ok)
+}
+
+#[cfg(not(unix))]
+fn terminate_child_after_timeout(child: &mut Child) -> Result<ExitStatus, String> {
+    child.kill().map_err(|error| error.to_string())?;
+    child.wait().map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group(process_group_id: i32, signal: i32) -> Result<(), String> {
+    let target = process_group_id
+        .checked_neg()
+        .ok_or_else(|| "process group id cannot be negated".to_string())?;
+    // SAFETY: `kill` is called with a negative process id to target the child process group
+    // created by `CommandExt::process_group(0)`. The signal constants are valid POSIX signals.
+    let result = unsafe { kill(target, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        return Ok(());
+    }
+    Err(error.to_string())
 }
 
 fn read_limited<R>(mut reader: R) -> Result<String, String>
@@ -210,6 +279,27 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
 
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_shell_process_group() {
+        let started = Instant::now();
+        let response = run_shell_command(&ShellRunArguments {
+            command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),
+            cwd: None,
+            timeout_ms: Some(100),
+        })
+        .expect("shell command should return timeout output");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(response.is_error);
+        assert!(response.output.contains("timed_out: true"));
+    }
 }
 
 bcode_plugin_sdk::export_plugin!(ShellPlugin, include_str!("../bcode-plugin.toml"));
