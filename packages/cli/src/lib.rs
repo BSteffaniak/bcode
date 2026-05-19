@@ -100,6 +100,7 @@ pub async fn run() -> Result<(), CliError> {
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
             SessionCommand::Repair { session_id } => session_repair(session_id)?,
         },
+        Commands::Migrate { command } => handle_migrate_command(command)?,
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
             PluginCommand::Services { root, daemon } => {
@@ -212,6 +213,10 @@ enum Commands {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
@@ -262,6 +267,18 @@ enum ServerCommand {
     Run,
     Status,
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum MigrateCommand {
+    Status,
+    Plan,
+    Apply {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        backup: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2329,6 +2346,13 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
         item.last_good_offset,
         item.issue_count
     );
+}
+
+fn handle_migrate_command(command: MigrateCommand) -> Result<(), CliError> {
+    match command {
+        MigrateCommand::Status | MigrateCommand::Plan => session_migration_plan(),
+        MigrateCommand::Apply { dry_run, backup } => session_migration_apply(dry_run, backup),
+    }
 }
 
 fn handle_session_migrate_command(command: SessionMigrateCommand) -> Result<(), CliError> {
