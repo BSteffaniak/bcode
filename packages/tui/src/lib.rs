@@ -90,10 +90,13 @@ const COLOR_SUCCESS: Color = Color::Green;
 const COLOR_WARNING: Color = Color::Yellow;
 const COLOR_DANGER: Color = Color::Red;
 const COLOR_SELECTED_BG: Color = Color::Rgb(38, 52, 64);
+const MAX_SLASH_COMPLETIONS: usize = 8;
+const SLASH_COMPLETION_POPUP_HEIGHT: u16 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TuiAction {
     InputSubmit,
+    InputComplete,
     ClipboardCopy,
     ClipboardCut,
     ClipboardPaste,
@@ -153,6 +156,7 @@ impl TuiAction {
     fn from_id(id: &str) -> Option<Self> {
         Some(match id {
             "tui.input.submit" => Self::InputSubmit,
+            "tui.input.complete" => Self::InputComplete,
             "tui.clipboard.copy" => Self::ClipboardCopy,
             "tui.clipboard.cut" => Self::ClipboardCut,
             "tui.clipboard.paste" => Self::ClipboardPaste,
@@ -332,6 +336,7 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
             TuiScope::Chat,
             action_bindings(&[
                 ("enter", TuiAction::InputSubmit),
+                ("tab", TuiAction::InputComplete),
                 ("shift+enter", TuiAction::InputNewLine),
                 ("up", TuiAction::InputHistoryPrevious),
                 ("down", TuiAction::InputHistoryNext),
@@ -717,6 +722,7 @@ async fn run_chat(
     if let Some(model_status) = model_status {
         app.apply_model_status(model_status);
     }
+    refresh_slash_completion_caches(&client, &mut app, session_id).await;
 
     loop {
         while let Ok(event) = event_receiver.try_recv() {
@@ -773,6 +779,8 @@ async fn run_chat(
                             app.input.insert_char(character);
                             if app.search_mode {
                                 app.update_search();
+                            } else {
+                                app.update_slash_completion();
                             }
                         }
                     }
@@ -785,6 +793,88 @@ async fn run_chat(
     }
 
     Ok(())
+}
+
+async fn refresh_slash_completion_caches(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+) {
+    if let Ok(services) = client.plugin_services().await {
+        app.cached_provider_ids = services
+            .iter()
+            .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
+            .map(|service| service.plugin_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    if let Ok(agents) = client.list_agents().await {
+        app.cached_agent_ids = agents.into_iter().map(|agent| agent.id).collect();
+    }
+    if let Ok(list) = client.list_skills().await {
+        app.cached_skill_ids = list
+            .skills
+            .into_iter()
+            .map(|skill| skill.id.as_str().to_string())
+            .collect();
+    }
+    refresh_model_completion_cache(client, app, session_id).await;
+}
+
+async fn refresh_model_completion_cache(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+) {
+    let provider_plugin_id = app.selected_provider_plugin_id.clone();
+    let response = if let Some(provider_plugin_id) = provider_plugin_id {
+        client
+            .invoke_plugin_service(
+                provider_plugin_id,
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                bcode_model::OP_MODELS.to_string(),
+                Vec::new(),
+            )
+            .await
+    } else if let Ok(status) = client.session_model_status(session_id).await {
+        if let Some(provider_plugin_id) = status.provider_plugin_id {
+            client
+                .invoke_plugin_service(
+                    provider_plugin_id,
+                    bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    bcode_model::OP_MODELS.to_string(),
+                    Vec::new(),
+                )
+                .await
+        } else {
+            client
+                .call_plugin_service(
+                    bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    bcode_model::OP_MODELS.to_string(),
+                    Vec::new(),
+                )
+                .await
+        }
+    } else {
+        client
+            .call_plugin_service(
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                bcode_model::OP_MODELS.to_string(),
+                Vec::new(),
+            )
+            .await
+    };
+    if let Ok(response) = response
+        && response.error.is_none()
+        && let Ok(models) = serde_json::from_slice::<ModelList>(&response.payload)
+    {
+        app.cached_model_ids = models
+            .models
+            .into_iter()
+            .map(|model| model.model_id)
+            .collect();
+    }
 }
 
 async fn execute_selected_permission_choice(client: &BcodeClient, app: &mut ChatApp) {
@@ -823,6 +913,9 @@ async fn handle_tui_action(
         TuiAction::AppInterrupt => {
             if app.search_mode {
                 app.cancel_search();
+            } else if app.slash_completion.is_some() {
+                app.slash_completion = None;
+                app.status = "slash completions hidden".to_string();
             } else {
                 match client.cancel_session_turn(session_id).await {
                     Ok(true) => {
@@ -843,6 +936,7 @@ async fn handle_tui_action(
         TuiAction::AppClear => {
             app.reset_input_history_navigation();
             app.input.clear();
+            app.slash_completion = None;
             app.status = "input cleared".to_string();
         }
         TuiAction::PermissionApprove => resolve_first_permission(client, app, true).await,
@@ -864,6 +958,7 @@ async fn handle_tui_action(
         TuiAction::InputSubmit => {
             if app.search_mode {
                 app.finish_search();
+            } else if app.slash_completion.is_some() && app.accept_slash_completion() {
             } else if let Some(message) = app.take_input() {
                 if message.starts_with('/') {
                     if !handle_slash_command(client, app, session_id, &message).await {
@@ -878,8 +973,19 @@ async fn handle_tui_action(
                 }
             }
         }
+        TuiAction::InputComplete => {
+            if !app.search_mode {
+                if app.slash_completion.is_none() {
+                    app.update_slash_completion();
+                }
+                if !app.accept_slash_completion() {
+                    app.status = "no slash completion available".to_string();
+                }
+            }
+        }
         TuiAction::InputNewLine => {
             app.reset_input_history_navigation();
+            app.slash_completion = None;
             app.input.insert_newline();
             if app.search_mode {
                 app.update_search();
@@ -896,6 +1002,8 @@ async fn handle_tui_action(
                 app.input.delete_backward();
                 if app.search_mode {
                     app.update_search();
+                } else {
+                    app.update_slash_completion();
                 }
             }
         }
@@ -908,6 +1016,8 @@ async fn handle_tui_action(
                 app.input.delete(TextDelete::Forward);
                 if app.search_mode {
                     app.update_search();
+                } else {
+                    app.update_slash_completion();
                 }
             }
         }
@@ -920,6 +1030,8 @@ async fn handle_tui_action(
                 app.input.delete(TextDelete::WordBackward);
                 if app.search_mode {
                     app.update_search();
+                } else {
+                    app.update_slash_completion();
                 }
             }
         }
@@ -932,6 +1044,8 @@ async fn handle_tui_action(
                 app.input.delete(TextDelete::WordForward);
                 if app.search_mode {
                     app.update_search();
+                } else {
+                    app.update_slash_completion();
                 }
             }
         }
@@ -944,6 +1058,8 @@ async fn handle_tui_action(
                 app.input.delete(TextDelete::ToStart);
                 if app.search_mode {
                     app.update_search();
+                } else {
+                    app.update_slash_completion();
                 }
             }
         }
@@ -956,6 +1072,8 @@ async fn handle_tui_action(
                 app.input.delete(TextDelete::ToEnd);
                 if app.search_mode {
                     app.update_search();
+                } else {
+                    app.update_slash_completion();
                 }
             }
         }
@@ -964,6 +1082,7 @@ async fn handle_tui_action(
                 palette.filter.move_cursor(TextMotion::Left);
             } else {
                 app.input.move_cursor(TextMotion::Left);
+                app.update_slash_completion();
             }
         }
         TuiAction::MoveCursorRight => {
@@ -971,6 +1090,7 @@ async fn handle_tui_action(
                 palette.filter.move_cursor(TextMotion::Right);
             } else {
                 app.input.move_cursor(TextMotion::Right);
+                app.update_slash_completion();
             }
         }
         TuiAction::MoveCursorWordLeft => {
@@ -978,6 +1098,7 @@ async fn handle_tui_action(
                 palette.filter.move_cursor(TextMotion::WordLeft);
             } else {
                 app.input.move_cursor(TextMotion::WordLeft);
+                app.update_slash_completion();
             }
         }
         TuiAction::MoveCursorWordRight => {
@@ -985,6 +1106,7 @@ async fn handle_tui_action(
                 palette.filter.move_cursor(TextMotion::WordRight);
             } else {
                 app.input.move_cursor(TextMotion::WordRight);
+                app.update_slash_completion();
             }
         }
         TuiAction::MoveCursorStart => {
@@ -992,6 +1114,7 @@ async fn handle_tui_action(
                 palette.filter.move_cursor(TextMotion::Start);
             } else {
                 app.input.move_cursor(TextMotion::Start);
+                app.update_slash_completion();
             }
         }
         TuiAction::MoveCursorEnd => {
@@ -999,6 +1122,7 @@ async fn handle_tui_action(
                 palette.filter.move_cursor(TextMotion::End);
             } else {
                 app.input.move_cursor(TextMotion::End);
+                app.update_slash_completion();
             }
         }
         TuiAction::SelectCursorLeft => app.extend_text_selection(TextMotion::Left),
@@ -1412,6 +1536,7 @@ async fn handle_slash_command(
         "agent" => {
             match client.list_agents().await {
                 Ok(agents) => {
+                    app.cached_agent_ids = agents.iter().map(|agent| agent.id.clone()).collect();
                     let names = agents
                         .iter()
                         .map(|agent| agent.id.as_str())
@@ -1450,6 +1575,11 @@ async fn handle_slash_command(
 async fn list_skills_from_tui(client: &BcodeClient, app: &mut ChatApp) -> bool {
     match client.list_skills().await {
         Ok(list) => {
+            app.cached_skill_ids = list
+                .skills
+                .iter()
+                .map(|skill| skill.id.as_str().to_string())
+                .collect();
             if list.skills.is_empty() {
                 app.status = "no skills available".to_string();
             } else {
@@ -2400,6 +2530,11 @@ struct ChatApp {
     permission_hints: String,
     selected_permission_choice: PermissionChoice,
     command_palette: Option<CommandPaletteState>,
+    slash_completion: Option<SlashCompletionState>,
+    cached_model_ids: Vec<String>,
+    cached_provider_ids: Vec<String>,
+    cached_agent_ids: Vec<String>,
+    cached_skill_ids: Vec<String>,
     oldest_loaded_sequence: Option<u64>,
     older_history_state: OlderHistoryState,
 }
@@ -2550,6 +2685,51 @@ impl CommandPaletteState {
     fn selected_command(&self) -> Option<&CommandInfo> {
         let filtered = self.filtered_commands();
         filtered.get(self.selected).copied()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashCompletionItem {
+    replacement: String,
+    label: String,
+    description: Option<String>,
+    kind: SlashCompletionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCompletionKind {
+    Command,
+    Argument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashCompletionState {
+    selected: usize,
+    range: std::ops::Range<usize>,
+    items: Vec<SlashCompletionItem>,
+}
+
+impl SlashCompletionState {
+    fn selected_item(&self) -> Option<&SlashCompletionItem> {
+        self.items.get(self.selected)
+    }
+
+    fn move_previous(&mut self) {
+        if self.items.is_empty() {
+            self.selected = 0;
+        } else if self.selected == 0 {
+            self.selected = self.items.len().saturating_sub(1);
+        } else {
+            self.selected -= 1;
+        }
+    }
+
+    fn move_next(&mut self) {
+        if self.items.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = (self.selected + 1) % self.items.len();
+        }
     }
 }
 
@@ -2734,6 +2914,11 @@ impl ChatApp {
             permission_hints: keymap.permission_hints(),
             selected_permission_choice: PermissionChoice::AllowOnce,
             command_palette: None,
+            slash_completion: None,
+            cached_model_ids: Vec::new(),
+            cached_provider_ids: Vec::new(),
+            cached_agent_ids: Vec::new(),
+            cached_skill_ids: Vec::new(),
             oldest_loaded_sequence: history.iter().map(|event| event.sequence).min(),
             older_history_state: if history.len() >= INITIAL_HISTORY_EVENT_LIMIT {
                 OlderHistoryState::More
@@ -2766,6 +2951,7 @@ impl ChatApp {
     }
 
     fn show_model_list(&mut self, models: &[bcode_model::ModelInfo]) {
+        self.cached_model_ids = models.iter().map(|model| model.model_id.clone()).collect();
         if models.is_empty() {
             self.status = "no models returned by provider".to_string();
             return;
@@ -3465,6 +3651,10 @@ impl ChatApp {
     }
 
     fn move_input_or_history_previous(&mut self) {
+        if let Some(completion) = &mut self.slash_completion {
+            completion.move_previous();
+            return;
+        }
         if self.input.wrapped_layout(usize::MAX / 4).cursor.row > 0 {
             self.reset_input_history_navigation();
             self.input.move_cursor(TextMotion::VisualUp);
@@ -3474,6 +3664,10 @@ impl ChatApp {
     }
 
     fn move_input_or_history_next(&mut self) {
+        if let Some(completion) = &mut self.slash_completion {
+            completion.move_next();
+            return;
+        }
         let layout = self.input.wrapped_layout(usize::MAX / 4);
         if layout.cursor.row.saturating_add(1) < layout.lines.len() {
             self.reset_input_history_navigation();
@@ -3548,6 +3742,8 @@ impl ChatApp {
             self.input.paste(text);
             if self.search_mode {
                 self.update_search();
+            } else {
+                self.update_slash_completion();
             }
         }
     }
@@ -3597,6 +3793,7 @@ impl ChatApp {
         match get_system_clipboard_text() {
             Ok(text) => {
                 self.paste_text(&text);
+                self.update_slash_completion();
                 self.status = "pasted from clipboard".to_string();
             }
             Err(error) => self.status = format!("clipboard paste failed: {error}"),
@@ -3605,6 +3802,50 @@ impl ChatApp {
 
     fn set_input_text(&mut self, text: impl Into<String>) {
         self.input = TextEditBuffer::from_text(text);
+        self.update_slash_completion();
+    }
+
+    fn update_slash_completion(&mut self) {
+        let input = self.input.text().to_string();
+        let cursor = self.input.cursor_byte_index();
+        let previous = self.slash_completion.as_ref().and_then(|completion| {
+            completion
+                .selected_item()
+                .map(|item| item.replacement.clone())
+        });
+        self.slash_completion = slash_completion_matches(
+            &input,
+            cursor,
+            &self.cached_model_ids,
+            &self.cached_provider_ids,
+            &self.cached_agent_ids,
+            &self.cached_skill_ids,
+        );
+        if let (Some(previous), Some(completion)) = (previous, &mut self.slash_completion)
+            && let Some(index) = completion
+                .items
+                .iter()
+                .position(|item| item.replacement == previous)
+        {
+            completion.selected = index;
+        }
+    }
+
+    fn accept_slash_completion(&mut self) -> bool {
+        let Some(completion) = self.slash_completion.clone() else {
+            return false;
+        };
+        let Some(item) = completion.selected_item() else {
+            self.slash_completion = None;
+            return false;
+        };
+        let replacement = item.replacement.clone();
+        let text = replace_range(self.input.text(), completion.range, &replacement);
+        let cursor = text.len();
+        self.input = TextEditBuffer::from_text(text);
+        self.input.move_cursor(TextMotion::Absolute(cursor));
+        self.update_slash_completion();
+        true
     }
 
     fn take_input(&mut self) -> Option<String> {
@@ -3614,55 +3855,14 @@ impl ChatApp {
             return None;
         }
         self.input.clear();
+        self.slash_completion = None;
         Some(input)
     }
 
     fn open_command_palette(&mut self) {
+        self.slash_completion = None;
         let mut p = CommandPaletteState::new();
-        p.commands = vec![
-            CommandInfo {
-                id: "switch-model".into(),
-                name: "Switch Model".into(),
-                description: Some("Change active model ID".into()),
-                requires_args: true,
-                category: Some("model".into()),
-            },
-            CommandInfo {
-                id: "switch-provider".into(),
-                name: "Switch Provider".into(),
-                description: Some("Change model provider plugin".into()),
-                requires_args: true,
-                category: Some("model".into()),
-            },
-            CommandInfo {
-                id: "set-thinking".into(),
-                name: "Set Thinking Level".into(),
-                description: Some("low | medium | high (for reasoning models)".into()),
-                requires_args: true,
-                category: Some("model".into()),
-            },
-            CommandInfo {
-                id: "help".into(),
-                name: "Help".into(),
-                description: Some("Show slash command reference".into()),
-                requires_args: false,
-                category: Some("general".into()),
-            },
-            CommandInfo {
-                id: "compact".into(),
-                name: "Compact Context".into(),
-                description: Some("Summarize older context for future model turns".into()),
-                requires_args: false,
-                category: Some("general".into()),
-            },
-            CommandInfo {
-                id: "clear".into(),
-                name: "Clear Transcript".into(),
-                description: Some("Clear chat transcript display in TUI".into()),
-                requires_args: false,
-                category: Some("general".into()),
-            },
-        ];
+        p.commands = builtin_commands();
         p.is_loading = false;
         self.command_palette = Some(p);
         self.status = "command palette: type to filter, enter to run, esc close".to_string();
@@ -3759,9 +3959,17 @@ impl ChatApp {
                 true
             }
             "help" => {
-                self.status =
-                    "Commands: /models, /model <id>, /provider <id>, /thinking <level>, /compact, /clear, /help"
-                        .to_string();
+                let commands = builtin_commands()
+                    .iter()
+                    .map(|command| {
+                        slash_command_usage(&command.id).map_or_else(
+                            || format!("/{}", command.id),
+                            |usage| format!("/{} {usage}", command.id),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status = format!("Commands: {commands}");
                 true
             }
             "clear" => {
@@ -3774,6 +3982,275 @@ impl ChatApp {
             _ => false,
         }
     }
+}
+
+fn builtin_commands() -> Vec<CommandInfo> {
+    vec![
+        CommandInfo {
+            id: "models".into(),
+            name: "/models".into(),
+            description: Some("List models from the active provider".into()),
+            requires_args: false,
+            category: Some("model".into()),
+        },
+        CommandInfo {
+            id: "model".into(),
+            name: "/model".into(),
+            description: Some("Change active model ID".into()),
+            requires_args: true,
+            category: Some("model".into()),
+        },
+        CommandInfo {
+            id: "provider".into(),
+            name: "/provider".into(),
+            description: Some("Change model provider plugin".into()),
+            requires_args: true,
+            category: Some("model".into()),
+        },
+        CommandInfo {
+            id: "thinking".into(),
+            name: "/thinking".into(),
+            description: Some("low | medium | high (for reasoning models)".into()),
+            requires_args: true,
+            category: Some("model".into()),
+        },
+        CommandInfo {
+            id: "agent".into(),
+            name: "/agent".into(),
+            description: Some("Show or switch active agent".into()),
+            requires_args: false,
+            category: Some("agent".into()),
+        },
+        CommandInfo {
+            id: "plan".into(),
+            name: "/plan".into(),
+            description: Some("Switch to the plan agent".into()),
+            requires_args: false,
+            category: Some("agent".into()),
+        },
+        CommandInfo {
+            id: "build".into(),
+            name: "/build".into(),
+            description: Some("Switch to the build agent".into()),
+            requires_args: false,
+            category: Some("agent".into()),
+        },
+        CommandInfo {
+            id: "skills".into(),
+            name: "/skills".into(),
+            description: Some("List available skills".into()),
+            requires_args: false,
+            category: Some("skill".into()),
+        },
+        CommandInfo {
+            id: "skill".into(),
+            name: "/skill".into(),
+            description: Some("Show, activate, describe, or deactivate skills".into()),
+            requires_args: true,
+            category: Some("skill".into()),
+        },
+        CommandInfo {
+            id: "compact".into(),
+            name: "/compact".into(),
+            description: Some("Summarize older context for future model turns".into()),
+            requires_args: false,
+            category: Some("general".into()),
+        },
+        CommandInfo {
+            id: "clear".into(),
+            name: "/clear".into(),
+            description: Some("Clear chat transcript display in TUI".into()),
+            requires_args: false,
+            category: Some("general".into()),
+        },
+        CommandInfo {
+            id: "help".into(),
+            name: "/help".into(),
+            description: Some("Show slash command reference".into()),
+            requires_args: false,
+            category: Some("general".into()),
+        },
+    ]
+}
+
+fn slash_command_usage(command_id: &str) -> Option<&'static str> {
+    match command_id {
+        "model" => Some("<model-id> [--provider <plugin-id>]"),
+        "provider" => Some("<plugin-id>"),
+        "thinking" => Some("low|medium|high"),
+        "agent" => Some("[agent-id]"),
+        "skill" => Some("active | describe <id> | off <id> | <id>"),
+        _ => None,
+    }
+}
+
+fn slash_completion_context(
+    input: &str,
+    cursor: usize,
+) -> Option<(std::ops::Range<usize>, Vec<&str>)> {
+    if cursor > input.len() || !input.is_char_boundary(cursor) {
+        return None;
+    }
+    let before_cursor = &input[..cursor];
+    if before_cursor.contains('\n') || !before_cursor.starts_with('/') {
+        return None;
+    }
+    let token_start = before_cursor
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            character
+                .is_whitespace()
+                .then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    let token_end = input[cursor..]
+        .char_indices()
+        .find_map(|(index, character)| character.is_whitespace().then_some(cursor + index))
+        .unwrap_or(input.len());
+    let tokens = before_cursor.split_whitespace().collect::<Vec<_>>();
+    Some((token_start..token_end, tokens))
+}
+
+fn slash_completion_matches(
+    input: &str,
+    cursor: usize,
+    model_ids: &[String],
+    provider_ids: &[String],
+    agent_ids: &[String],
+    skill_ids: &[String],
+) -> Option<SlashCompletionState> {
+    let (range, tokens) = slash_completion_context(input, cursor)?;
+    let query = &input[range.clone()];
+    let items = if tokens.len() <= 1 {
+        slash_command_completion_items(query)
+    } else {
+        slash_argument_completion_items(
+            &tokens,
+            query,
+            model_ids,
+            provider_ids,
+            agent_ids,
+            skill_ids,
+        )
+    };
+    if items.is_empty() {
+        None
+    } else {
+        Some(SlashCompletionState {
+            selected: 0,
+            range,
+            items: items.into_iter().take(MAX_SLASH_COMPLETIONS).collect(),
+        })
+    }
+}
+
+fn slash_command_completion_items(query: &str) -> Vec<SlashCompletionItem> {
+    let normalized = query.trim_start_matches('/').to_lowercase();
+    builtin_commands()
+        .into_iter()
+        .filter(|command| {
+            normalized.is_empty()
+                || command.id.to_lowercase().starts_with(&normalized)
+                || command.id.to_lowercase().contains(&normalized)
+                || command
+                    .name
+                    .trim_start_matches('/')
+                    .to_lowercase()
+                    .contains(&normalized)
+        })
+        .map(|command| {
+            let replacement = slash_command_replacement(&command.id);
+            let label = if let Some(usage) = slash_command_usage(&command.id) {
+                format!("/{} {usage}", command.id)
+            } else {
+                format!("/{}", command.id)
+            };
+            SlashCompletionItem {
+                replacement,
+                label,
+                description: command.description,
+                kind: SlashCompletionKind::Command,
+            }
+        })
+        .collect()
+}
+
+fn slash_command_replacement(command_id: &str) -> String {
+    let trailing = if slash_command_usage(command_id).is_some() {
+        " "
+    } else {
+        ""
+    };
+    format!("/{command_id}{trailing}")
+}
+
+fn slash_argument_completion_items(
+    tokens: &[&str],
+    query: &str,
+    model_ids: &[String],
+    provider_ids: &[String],
+    agent_ids: &[String],
+    skill_ids: &[String],
+) -> Vec<SlashCompletionItem> {
+    let command = tokens[0].trim_start_matches('/');
+    let candidates = match command {
+        "model" | "set-model" if tokens.len() == 2 => model_ids,
+        "model" | "set-model" if tokens.last() == Some(&"--provider") || tokens.len() >= 4 => {
+            provider_ids
+        }
+        "provider" | "set-provider" => provider_ids,
+        "thinking" | "set-thinking" => {
+            return static_argument_items(query, &["low", "medium", "high"]);
+        }
+        "agent" => agent_ids,
+        "skill" if tokens.len() == 2 => return skill_subcommand_or_id_items(query, skill_ids),
+        "skill" if tokens.get(1) == Some(&"describe") || tokens.get(1) == Some(&"off") => skill_ids,
+        _ => return Vec::new(),
+    };
+    dynamic_argument_items(query, candidates)
+}
+
+fn static_argument_items(query: &str, values: &[&str]) -> Vec<SlashCompletionItem> {
+    values
+        .iter()
+        .copied()
+        .filter(|value| value.starts_with(query) || value.contains(query))
+        .map(|value| SlashCompletionItem {
+            replacement: format!("{value} "),
+            label: value.to_string(),
+            description: None,
+            kind: SlashCompletionKind::Argument,
+        })
+        .collect()
+}
+
+fn dynamic_argument_items(query: &str, values: &[String]) -> Vec<SlashCompletionItem> {
+    values
+        .iter()
+        .filter(|value| query.is_empty() || value.starts_with(query) || value.contains(query))
+        .map(|value| SlashCompletionItem {
+            replacement: format!("{value} "),
+            label: value.clone(),
+            description: None,
+            kind: SlashCompletionKind::Argument,
+        })
+        .collect()
+}
+
+fn skill_subcommand_or_id_items(query: &str, skill_ids: &[String]) -> Vec<SlashCompletionItem> {
+    let mut items = static_argument_items(query, &["active", "describe", "off"]);
+    items.extend(dynamic_argument_items(query, skill_ids));
+    items
+}
+
+fn replace_range(input: &str, range: std::ops::Range<usize>, replacement: &str) -> String {
+    let mut text =
+        String::with_capacity(input.len() - (range.end - range.start) + replacement.len());
+    text.push_str(&input[..range.start]);
+    text.push_str(replacement);
+    text.push_str(&input[range.end..]);
+    text
 }
 
 fn provider_to_display_selection(provider: &str) -> Option<String> {
@@ -3903,6 +4380,12 @@ impl ratatui::widgets::Widget for &ChatApp {
                 self.selected_permission_choice,
                 self.pending_permissions.len(),
             );
+        }
+        if let Some(completion) = &self.slash_completion
+            && self.command_palette.is_none()
+            && !self.search_mode
+        {
+            render_slash_completion(area, chunks[2], buf, completion);
         }
         if let Some(palette) = &self.command_palette {
             render_command_palette(area, buf, palette);
@@ -4079,6 +4562,79 @@ fn command_palette_cursor_position(area: Rect, palette: &CommandPaletteState) ->
         search_area.x + usize_to_u16_saturating(column).min(search_area.width.saturating_sub(1)),
         search_area.y,
     ))
+}
+
+fn slash_completion_area(
+    area: Rect,
+    composer_area: Rect,
+    completion: &SlashCompletionState,
+) -> Option<Rect> {
+    if completion.items.is_empty() || composer_area.y == 0 || area.width < 8 {
+        return None;
+    }
+    let height = SLASH_COMPLETION_POPUP_HEIGHT
+        .min(usize_to_u16_saturating(completion.items.len()).saturating_add(2))
+        .min(composer_area.y);
+    if height == 0 {
+        return None;
+    }
+    let width = area.width.saturating_sub(4).clamp(8, 88);
+    let x = composer_area
+        .x
+        .saturating_add(2)
+        .min(area.width.saturating_sub(width));
+    let y = composer_area.y.saturating_sub(height);
+    Some(Rect::new(x, y, width, height))
+}
+
+fn render_slash_completion(
+    area: Rect,
+    composer_area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    completion: &SlashCompletionState,
+) {
+    let Some(popup) = slash_completion_area(area, composer_area, completion) else {
+        return;
+    };
+    ratatui::widgets::Widget::render(Clear, popup, buf);
+    let block = Block::new()
+        .title(Line::from(vec![
+            Span::styled(" Slash Commands ", title_style()),
+            Span::styled("tab/enter accept · ↑/↓ select · esc hide ", muted_style()),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(accent_style());
+    let inner = inset(popup, 1, 1);
+    ratatui::widgets::Widget::render(block, popup, buf);
+    let items = completion
+        .items
+        .iter()
+        .map(slash_completion_item)
+        .collect::<Vec<_>>();
+    let selected = completion
+        .selected
+        .min(completion.items.len().saturating_sub(1));
+    let list = List::new(items)
+        .highlight_symbol("› ")
+        .highlight_style(selected_style());
+    let mut state = ListState::default().with_selected(Some(selected));
+    StatefulWidget::render(list, inner, buf, &mut state);
+}
+
+fn slash_completion_item(item: &SlashCompletionItem) -> ListItem<'static> {
+    let kind = match item.kind {
+        SlashCompletionKind::Command => "cmd",
+        SlashCompletionKind::Argument => "arg",
+    };
+    let description = item.description.as_deref().unwrap_or("");
+    ListItem::new(Line::from(vec![
+        Span::styled(format!(" {:<3} ", kind), badge_style()),
+        Span::raw("  "),
+        Span::styled(truncate_end(&item.label, 30), normal_bold_style()),
+        Span::raw("  "),
+        Span::styled(truncate_end(description, 42), muted_style()),
+    ]))
 }
 
 fn render_command_palette(
@@ -7048,5 +7604,89 @@ mod tests {
         let rules = view("shell.run", r#"{"command":""}"#).policy_rules();
 
         assert_eq!(rules, vec![("bash", "shell.run".to_string())]);
+    }
+    #[test]
+    fn slash_completion_lists_commands_for_empty_slash() {
+        let completion = slash_completion_matches("/", 1, &[], &[], &[], &[])
+            .expect("slash should show command completions");
+
+        assert!(
+            completion
+                .items
+                .iter()
+                .any(|item| item.replacement == "/model ")
+        );
+        assert!(
+            completion
+                .items
+                .iter()
+                .any(|item| item.replacement == "/models")
+        );
+    }
+
+    #[test]
+    fn slash_completion_filters_model_commands() {
+        let completion = slash_completion_matches("/m", 2, &[], &[], &[], &[])
+            .expect("prefix should match model commands");
+
+        assert_eq!(completion.range, 0..2);
+        assert!(
+            completion
+                .items
+                .iter()
+                .all(|item| item.replacement.contains('m'))
+        );
+        assert_eq!(completion.items[0].replacement, "/models");
+    }
+
+    #[test]
+    fn slash_completion_returns_none_for_unknown_prefix() {
+        assert!(slash_completion_matches("/zz", 3, &[], &[], &[], &[]).is_none());
+    }
+
+    #[test]
+    fn slash_completion_accept_replaces_current_token() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.set_input_text("/mod");
+        app.update_slash_completion();
+
+        assert!(app.accept_slash_completion());
+        assert_eq!(app.input.text(), "/models");
+    }
+
+    #[test]
+    fn slash_argument_completion_uses_cached_models() {
+        let completion = slash_completion_matches(
+            "/model gpt",
+            "/model gpt".len(),
+            &["gpt-4.1".to_string(), "claude-sonnet".to_string()],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("cached model should match argument");
+
+        assert_eq!(completion.range, "/model ".len().."/model gpt".len());
+        assert_eq!(completion.items[0].replacement, "gpt-4.1 ");
+    }
+
+    #[test]
+    fn slash_completion_render_popup_contains_items() {
+        let completion = slash_completion_matches("/thi", 4, &[], &[], &[], &[])
+            .expect("thinking command should match");
+        let area = Rect::new(0, 0, 80, 20);
+        let composer = Rect::new(0, 16, 80, 3);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        render_slash_completion(area, composer, &mut buffer, &completion);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("Slash Commands"));
+        assert!(rendered.contains("/thinking"));
     }
 }
