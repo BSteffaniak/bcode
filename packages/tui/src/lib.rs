@@ -1002,7 +1002,14 @@ async fn handle_tui_action(
 }
 
 fn handle_mouse_event(app: &mut ChatApp, mouse: MouseEvent) {
-    if app.command_palette.is_some() || app.first_pending_permission().is_some() {
+    if app.command_palette.is_some() {
+        let _ = handle_command_palette_mouse_event(app, mouse);
+        return;
+    }
+    if app.first_pending_permission().is_some() {
+        return;
+    }
+    if handle_composer_mouse_event(app, mouse) {
         return;
     }
     if !rect_contains(app.last_transcript_area.get(), mouse.column, mouse.row) {
@@ -1013,6 +1020,76 @@ fn handle_mouse_event(app: &mut ChatApp, mouse: MouseEvent) {
         MouseEventKind::ScrollDown => app.scroll_rows_down(MOUSE_SCROLL_ROWS),
         _ => {}
     }
+}
+
+fn handle_composer_mouse_event(app: &mut ChatApp, mouse: MouseEvent) -> bool {
+    let area = app.last_composer_area.get();
+    if !rect_contains(area, mouse.column, mouse.row) {
+        if !matches!(mouse.kind, MouseEventKind::Drag(_)) {
+            app.mouse_selection_active = false;
+        }
+        return false;
+    }
+    let layout = composer_layout(expand_rect(area, 1, 1), &app.input, app.search_mode);
+    let row = usize::from(mouse.row.saturating_sub(area.y)).saturating_add(layout.scroll);
+    let col = usize::from(mouse.column.saturating_sub(area.x));
+    match mouse.kind {
+        MouseEventKind::Down(_) => {
+            app.reset_input_history_navigation();
+            app.input
+                .move_cursor_to_wrapped_position(usize::from(area.width.max(1)), row, col);
+            app.mouse_selection_active = true;
+            true
+        }
+        MouseEventKind::Drag(_) if app.mouse_selection_active => {
+            app.input
+                .select_to_wrapped_position(usize::from(area.width.max(1)), row, col);
+            true
+        }
+        MouseEventKind::Up(_) => {
+            app.mouse_selection_active = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_command_palette_mouse_event(app: &mut ChatApp, mouse: MouseEvent) -> bool {
+    let Some(palette) = &mut app.command_palette else {
+        return false;
+    };
+    let Some(search_area) = command_palette_search_area(app.last_frame_area.get()) else {
+        return false;
+    };
+    if !rect_contains(search_area, mouse.column, mouse.row) {
+        return false;
+    }
+    let prefix_width = line_width("› ");
+    let col = usize::from(mouse.column.saturating_sub(search_area.x)).saturating_sub(prefix_width);
+    match mouse.kind {
+        MouseEventKind::Down(_) => {
+            palette
+                .filter
+                .move_cursor_to_line_viewport_col(usize::from(search_area.width), col);
+            true
+        }
+        MouseEventKind::Drag(_) => {
+            palette
+                .filter
+                .select_to_line_viewport_col(usize::from(search_area.width), col);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn expand_rect(rect: Rect, horizontal: u16, vertical: u16) -> Rect {
+    Rect::new(
+        rect.x.saturating_sub(horizontal),
+        rect.y.saturating_sub(vertical),
+        rect.width.saturating_add(horizontal.saturating_mul(2)),
+        rect.height.saturating_add(vertical.saturating_mul(2)),
+    )
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -1303,30 +1380,58 @@ async fn pick_session(client: &BcodeClient, keymap: &KeyMap) -> Result<SessionId
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let CrosstermEvent::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if handle_session_picker_text_key(client, &mut app, &key).await? {
-            continue;
-        }
-        match keymap.action_for_key(TuiScope::SessionPicker, &key) {
-            Some(TuiAction::SelectCancel) => return Err(TuiError::Canceled),
-            Some(TuiAction::SelectUp) => app.previous(),
-            Some(TuiAction::SelectDown) => app.next(),
-            Some(TuiAction::SelectConfirm) => {
-                if let Some(session_id) = app.selected_session_id() {
-                    return Ok(session_id);
+        let event = event::read()?;
+        match event {
+            CrosstermEvent::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
                 }
-                return Ok(client.create_session(None).await?.id);
+                if handle_session_picker_text_key(client, &mut app, &key).await? {
+                    continue;
+                }
+                match keymap.action_for_key(TuiScope::SessionPicker, &key) {
+                    Some(TuiAction::SelectCancel) => return Err(TuiError::Canceled),
+                    Some(TuiAction::SelectUp) => app.previous(),
+                    Some(TuiAction::SelectDown) => app.next(),
+                    Some(TuiAction::SelectConfirm) => {
+                        if let Some(session_id) = app.selected_session_id() {
+                            return Ok(session_id);
+                        }
+                        return Ok(client.create_session(None).await?.id);
+                    }
+                    Some(TuiAction::SessionNew) => {
+                        return Ok(client.create_session(None).await?.id);
+                    }
+                    Some(TuiAction::SessionRename) => app.start_rename(),
+                    Some(TuiAction::SessionDelete) => app.start_delete_confirmation(),
+                    _ => {}
+                }
             }
-            Some(TuiAction::SessionNew) => return Ok(client.create_session(None).await?.id),
-            Some(TuiAction::SessionRename) => app.start_rename(),
-            Some(TuiAction::SessionDelete) => app.start_delete_confirmation(),
+            CrosstermEvent::Mouse(mouse) => handle_session_picker_mouse_event(&mut app, mouse),
             _ => {}
         }
+    }
+}
+
+fn handle_session_picker_mouse_event(app: &mut SessionPickerApp, mouse: MouseEvent) {
+    let SessionPickerMode::Renaming { input } = &mut app.mode else {
+        return;
+    };
+    let Some(input_area) = session_picker_rename_input_area(app.last_frame_area.get()) else {
+        return;
+    };
+    if !rect_contains(input_area, mouse.column, mouse.row) {
+        return;
+    }
+    let col = usize::from(mouse.column.saturating_sub(input_area.x));
+    match mouse.kind {
+        MouseEventKind::Down(_) => {
+            input.move_cursor_to_line_viewport_col(usize::from(input_area.width), col);
+        }
+        MouseEventKind::Drag(_) => {
+            input.select_to_line_viewport_col(usize::from(input_area.width), col);
+        }
+        _ => {}
     }
 }
 
@@ -1490,6 +1595,7 @@ struct SessionPickerApp {
     selected: usize,
     mode: SessionPickerMode,
     status: String,
+    last_frame_area: Cell<Rect>,
 }
 
 impl SessionPickerApp {
@@ -1499,6 +1605,7 @@ impl SessionPickerApp {
             selected: 0,
             mode: SessionPickerMode::Browsing,
             status: "choose a session or create a new one".to_string(),
+            last_frame_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
     }
 
@@ -1605,8 +1712,19 @@ fn session_picker_layout(area: Rect, renaming: bool) -> Rc<[Rect]> {
         .split(inner)
 }
 
+fn session_picker_rename_input_area(area: Rect) -> Option<Rect> {
+    let chunks = session_picker_layout(area, true);
+    let input_area = chunks[2];
+    if input_area.width == 0 || input_area.height == 0 {
+        None
+    } else {
+        Some(input_area)
+    }
+}
+
 impl ratatui::widgets::Widget for &SessionPickerApp {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        self.last_frame_area.set(area);
         let panel = centered_rect(area, area.width.min(96), area.height.min(26));
         ratatui::widgets::Widget::render(Clear, panel, buf);
         let block = Block::new()
@@ -1787,6 +1905,9 @@ struct ChatApp {
     last_transcript_width: Cell<u16>,
     last_transcript_height: Cell<u16>,
     last_transcript_area: Cell<Rect>,
+    last_composer_area: Cell<Rect>,
+    last_frame_area: Cell<Rect>,
+    mouse_selection_active: bool,
     search_mode: bool,
     search_query: String,
     key_hints: String,
@@ -2078,6 +2199,9 @@ impl ChatApp {
                 DEFAULT_TRANSCRIPT_WIDTH,
                 DEFAULT_TRANSCRIPT_HEIGHT,
             )),
+            last_composer_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_frame_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            mouse_selection_active: false,
             search_mode: false,
             search_query: String::new(),
             key_hints: keymap.chat_hints(),
@@ -3051,6 +3175,7 @@ fn chat_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> [Rect; 
 
 impl ratatui::widgets::Widget for &ChatApp {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        self.last_frame_area.set(area);
         let chunks = chat_layout(area, &self.input, self.search_mode);
 
         render_chat_header(self, chunks[0], buf);
@@ -3089,6 +3214,7 @@ impl ratatui::widgets::Widget for &ChatApp {
             " Message "
         };
         let composer = composer_layout(chunks[2], &self.input, self.search_mode);
+        self.last_composer_area.set(composer.content_area);
         let input = Paragraph::new(composer.text).block(
             Block::new()
                 .title(input_title)
@@ -3275,12 +3401,18 @@ fn command_palette_layout(area: Rect) -> (Rect, [Rect; 3]) {
     (modal, chunks)
 }
 
-fn command_palette_cursor_position(area: Rect, palette: &CommandPaletteState) -> Option<Position> {
+fn command_palette_search_area(area: Rect) -> Option<Rect> {
     let (_, chunks) = command_palette_layout(area);
     let search_area = chunks[0];
     if search_area.width == 0 || search_area.height == 0 {
-        return None;
+        None
+    } else {
+        Some(search_area)
     }
+}
+
+fn command_palette_cursor_position(area: Rect, palette: &CommandPaletteState) -> Option<Position> {
+    let search_area = command_palette_search_area(area)?;
     let column = line_width("› ").saturating_add(line_width(
         &palette.filter.text()[..palette.filter.cursor_byte_index()],
     ));
@@ -3493,6 +3625,8 @@ fn permission_choice_span(choice: PermissionChoice, selected: PermissionChoice) 
 struct ComposerLayout {
     text: Text<'static>,
     cursor_position: Option<Position>,
+    content_area: Rect,
+    scroll: usize,
 }
 
 fn composer_height(
@@ -3521,6 +3655,8 @@ fn composer_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> Com
         return ComposerLayout {
             text: Text::default(),
             cursor_position: None,
+            content_area,
+            scroll: 0,
         };
     }
 
@@ -3553,6 +3689,8 @@ fn composer_layout(area: Rect, input: &TextEditBuffer, search_mode: bool) -> Com
             content_area.x + cursor_column,
             content_area.y + usize_to_u16_saturating(cursor_row.saturating_sub(scroll)),
         )),
+        content_area,
+        scroll,
     }
 }
 
@@ -5495,6 +5633,109 @@ mod tests {
         assert_eq!(
             app.cursor_position(Rect::new(0, 0, 100, 40)),
             Some(Position::new(22, 34))
+        );
+    }
+
+    #[test]
+    fn mouse_click_moves_composer_cursor() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = TextEditBuffer::from_text("hello world");
+        app.last_composer_area.set(Rect::new(1, 10, 20, 3));
+
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 6,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.input.cursor_byte_index(), "hello".len());
+    }
+
+    #[test]
+    fn mouse_drag_selects_composer_text() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = TextEditBuffer::from_text("hello world");
+        app.last_composer_area.set(Rect::new(1, 10, 20, 3));
+
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 1,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                column: 6,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.input.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn mouse_click_moves_command_palette_filter_cursor() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.last_frame_area.set(Rect::new(0, 0, 100, 30));
+        app.open_command_palette();
+        if let Some(palette) = &mut app.command_palette {
+            palette.filter = TextEditBuffer::from_text("hello world");
+        }
+
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 16,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(
+            app.command_palette
+                .as_ref()
+                .map(|palette| palette.filter.cursor_byte_index()),
+            Some("hello".len())
+        );
+    }
+
+    #[test]
+    fn mouse_click_moves_session_rename_cursor() {
+        let mut app = SessionPickerApp::new(&[session_summary_with_name("hello world")]);
+        app.selected = 1;
+        app.start_rename();
+        app.last_frame_area.set(Rect::new(0, 0, 100, 40));
+
+        handle_session_picker_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 22,
+                row: 34,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(
+            match &app.mode {
+                SessionPickerMode::Renaming { input } => input.cursor_byte_index(),
+                SessionPickerMode::Browsing | SessionPickerMode::ConfirmDelete => 0,
+            },
+            "hello".len()
         );
     }
 
