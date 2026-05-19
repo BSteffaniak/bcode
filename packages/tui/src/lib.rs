@@ -6364,6 +6364,8 @@ mod tests {
             id: SessionId::new(),
             name: Some(name.to_string()),
             client_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
         }
     }
 

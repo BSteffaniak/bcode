@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
-pub const SESSION_INDEX_VERSION: u16 = 1;
+pub const SESSION_INDEX_VERSION: u16 = 2;
 pub const SESSION_ENTRY_INDEX_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +15,8 @@ pub struct EventFileFingerprint {
     pub len: u64,
     pub modified_unix_secs: u64,
     pub modified_nanos: u32,
+    pub created_unix_secs: u64,
+    pub created_nanos: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +27,8 @@ pub struct SessionIndex {
     pub summary: SessionSummary,
     pub next_sequence: u64,
     pub event_count: usize,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
     pub has_user_message: bool,
     pub last_good_offset: u64,
     pub current_provider: Option<String>,
@@ -72,6 +76,23 @@ pub struct SessionIndexHealth {
     pub last_good_offset: u64,
     pub issue_count: usize,
     pub stale: bool,
+}
+
+impl EventFileFingerprint {
+    #[must_use]
+    pub const fn modified_at_ms(&self) -> u64 {
+        timestamp_ms(self.modified_unix_secs, self.modified_nanos)
+    }
+
+    #[must_use]
+    pub const fn created_at_ms(&self) -> u64 {
+        let created_at_ms = timestamp_ms(self.created_unix_secs, self.created_nanos);
+        if created_at_ms == 0 {
+            self.modified_at_ms()
+        } else {
+            created_at_ms
+        }
+    }
 }
 
 impl SessionIndex {
@@ -124,6 +145,9 @@ impl SessionIndex {
             return None;
         }
 
+        let created_at_ms = file.created_at_ms();
+        let updated_at_ms = file.modified_at_ms();
+
         Some(Self {
             index_version: SESSION_INDEX_VERSION,
             session_id,
@@ -132,9 +156,13 @@ impl SessionIndex {
                 id: session_id,
                 name,
                 client_count: 0,
+                created_at_ms,
+                updated_at_ms,
             },
             next_sequence,
             event_count: report.events.len(),
+            created_at_ms,
+            updated_at_ms,
             has_user_message,
             last_good_offset: report.last_good_offset,
             current_provider,
@@ -176,10 +204,16 @@ pub fn fingerprint(path: &Path) -> Result<EventFileFingerprint, SessionStoreErro
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok());
+    let created = metadata
+        .created()
+        .ok()
+        .and_then(|created| created.duration_since(UNIX_EPOCH).ok());
     Ok(EventFileFingerprint {
         len: metadata.len(),
-        modified_unix_secs: modified.as_ref().map_or(0, std::time::Duration::as_secs),
+        modified_unix_secs: modified.as_ref().map_or(0, Duration::as_secs),
         modified_nanos: modified.map_or(0, |duration| duration.subsec_nanos()),
+        created_unix_secs: created.as_ref().map_or(0, Duration::as_secs),
+        created_nanos: created.map_or(0, |duration| duration.subsec_nanos()),
     })
 }
 
@@ -337,4 +371,9 @@ fn issue_message(kind: &SessionReadIssueKind) -> String {
         }
         SessionReadIssueKind::Decode { message } => format!("decode error: {message}"),
     }
+}
+
+const fn timestamp_ms(secs: u64, nanos: u32) -> u64 {
+    secs.saturating_mul(1_000)
+        .saturating_add((nanos / 1_000_000) as u64)
 }

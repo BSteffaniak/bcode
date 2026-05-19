@@ -77,6 +77,8 @@ pub struct SessionSummary {
     pub id: SessionId,
     pub name: Option<String>,
     pub client_count: usize,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
 }
 
 /// Direction for paged session history reads.

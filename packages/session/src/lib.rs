@@ -321,6 +321,8 @@ impl SessionEventStore {
             },
             next_sequence: state.next_sequence,
             event_count: state.event_count,
+            created_at_ms: state.summary.created_at_ms,
+            updated_at_ms: state.summary.updated_at_ms,
             has_user_message: state.has_user_message,
             current_provider: state.current_provider.clone(),
             current_model: state.current_model.clone(),
@@ -474,6 +476,7 @@ pub struct SessionManager {
 #[derive(Debug, Default)]
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionState>,
+    activity_clock_ms: u64,
 }
 
 #[derive(Debug)]
@@ -512,7 +515,10 @@ impl SessionManager {
         let store = SessionEventStore::new(root);
         let sessions = store.load_sessions()?;
         Ok(Self {
-            inner: Mutex::new(SessionManagerInner { sessions }),
+            inner: Mutex::new(SessionManagerInner {
+                sessions,
+                activity_clock_ms: current_unix_millis(),
+            }),
             store: Some(store),
         })
     }
@@ -529,10 +535,13 @@ impl SessionManager {
         let mut inner = self.inner.lock().await;
         let id = SessionId::new();
         let (sender, _) = broadcast::channel(512);
+        let now_ms = inner.next_activity_timestamp_ms();
         let summary = SessionSummary {
             id,
             name: name.clone(),
             client_count: 0,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
         };
         let mut state = SessionState {
             summary: summary.clone(),
@@ -552,6 +561,7 @@ impl SessionManager {
         state.push_event(
             SessionEventKind::SessionCreated { name },
             self.store.as_ref(),
+            now_ms,
         )?;
         inner.sessions.insert(id, state);
         Ok(summary)
@@ -560,7 +570,15 @@ impl SessionManager {
     /// List known sessions.
     pub async fn list_sessions(&self) -> Vec<SessionSummary> {
         let inner = self.inner.lock().await;
-        inner.sessions.values().map(SessionState::summary).collect()
+        let mut sessions: Vec<_> = inner.sessions.values().map(SessionState::summary).collect();
+        sessions.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        sessions
     }
 
     /// Rename a session.
@@ -579,6 +597,7 @@ impl SessionManager {
         let normalized_name = normalize_session_name(name);
         let event = {
             let mut inner = self.inner.lock().await;
+            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
             let state = inner
                 .sessions
                 .get_mut(&session_id)
@@ -589,6 +608,7 @@ impl SessionManager {
                     name: normalized_name,
                 },
                 self.store.as_ref(),
+                activity_timestamp_ms,
             )?
         };
         Ok(event)
@@ -791,6 +811,7 @@ impl SessionManager {
     ) -> Result<SessionAttachment, SessionError> {
         let attachment = {
             let mut inner = self.inner.lock().await;
+            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
             let state = inner
                 .sessions
                 .get_mut(&session_id)
@@ -811,6 +832,7 @@ impl SessionManager {
             let attached_event = state.push_event(
                 SessionEventKind::ClientAttached { client_id },
                 self.store.as_ref(),
+                activity_timestamp_ms,
             )?;
             SessionAttachment {
                 history,
@@ -850,6 +872,7 @@ impl SessionManager {
         let input_history = self.session_input_history(session_id).await?;
         let attachment = {
             let mut inner = self.inner.lock().await;
+            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
             let state = inner
                 .sessions
                 .get_mut(&session_id)
@@ -860,6 +883,7 @@ impl SessionManager {
             let attached_event = state.push_event(
                 SessionEventKind::ClientAttached { client_id },
                 self.store.as_ref(),
+                activity_timestamp_ms,
             )?;
             SessionAttachment {
                 history,
@@ -882,6 +906,7 @@ impl SessionManager {
         client_id: ClientId,
     ) -> Result<Option<SessionEvent>, SessionError> {
         let mut inner = self.inner.lock().await;
+        let activity_timestamp_ms = inner.next_activity_timestamp_ms();
         let Some(state) = inner.sessions.get_mut(&session_id) else {
             return Ok(None);
         };
@@ -890,6 +915,7 @@ impl SessionManager {
             return Ok(Some(state.push_event(
                 SessionEventKind::ClientDetached { client_id },
                 self.store.as_ref(),
+                activity_timestamp_ms,
             )?));
         }
         Ok(None)
@@ -911,6 +937,7 @@ impl SessionManager {
     ) -> Result<Vec<SessionEvent>, SessionError> {
         let events = {
             let mut inner = self.inner.lock().await;
+            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
             let state = inner
                 .sessions
                 .get_mut(&session_id)
@@ -922,11 +949,13 @@ impl SessionManager {
                 events.push(state.push_event(
                     SessionEventKind::SessionRenamed { name: Some(title) },
                     self.store.as_ref(),
+                    activity_timestamp_ms,
                 )?);
             }
             events.push(state.push_event(
                 SessionEventKind::UserMessage { client_id, text },
                 self.store.as_ref(),
+                activity_timestamp_ms,
             )?);
             events
         };
@@ -1206,21 +1235,33 @@ impl SessionManager {
     ) -> Result<SessionEvent, SessionError> {
         let event = {
             let mut inner = self.inner.lock().await;
+            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
             let state = inner
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
-            state.push_event(kind, self.store.as_ref())?
+            state.push_event(kind, self.store.as_ref(), activity_timestamp_ms)?
         };
         Ok(event)
+    }
+}
+
+impl SessionManagerInner {
+    fn next_activity_timestamp_ms(&mut self) -> u64 {
+        let now_ms = current_unix_millis();
+        self.activity_clock_ms = self.activity_clock_ms.max(now_ms).saturating_add(1);
+        self.activity_clock_ms
     }
 }
 
 impl SessionState {
     pub(crate) fn from_index(index: index::SessionIndex) -> Self {
         let (sender, _) = broadcast::channel(512);
+        let mut summary = index.summary;
+        summary.created_at_ms = index.created_at_ms;
+        summary.updated_at_ms = index.updated_at_ms;
         Self {
-            summary: index.summary,
+            summary,
             clients: BTreeSet::new(),
             events: None,
             next_sequence: index.next_sequence,
@@ -1244,6 +1285,7 @@ impl SessionState {
         &mut self,
         kind: SessionEventKind,
         store: Option<&SessionEventStore>,
+        activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionStoreError> {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -1254,6 +1296,7 @@ impl SessionState {
         if let Some(store) = store {
             store.append(&event)?;
         }
+        self.summary.updated_at_ms = activity_timestamp_ms;
         self.next_sequence += 1;
         self.event_count = self.event_count.saturating_add(1);
         match &event.kind {
@@ -1396,6 +1439,14 @@ fn history_page_from_events(
         next_cursor,
         has_more,
     }
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn normalize_session_name(name: Option<String>) -> Option<String> {
@@ -1941,6 +1992,59 @@ mod tests {
         let restored = SessionManager::persistent(&root).expect("manager should restore");
         let sessions = restored.list_sessions().await;
         assert_eq!(sessions[0].name.as_deref(), Some("New title"));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_orders_by_latest_activity() {
+        let manager = SessionManager::default();
+        let older = manager
+            .create_session(Some("older".to_string()))
+            .await
+            .expect("older session should create");
+        let newer = manager
+            .create_session(Some("newer".to_string()))
+            .await
+            .expect("newer session should create");
+
+        let sessions = manager.list_sessions().await;
+        assert_eq!(sessions[0].id, newer.id);
+        assert_eq!(sessions[1].id, older.id);
+
+        manager
+            .append_user_message(older.id, ClientId::new(), "wake older".to_string())
+            .await
+            .expect("message should append");
+
+        let sessions = manager.list_sessions().await;
+        assert_eq!(sessions[0].id, older.id);
+        assert_eq!(sessions[1].id, newer.id);
+    }
+
+    #[tokio::test]
+    async fn restored_sessions_order_by_index_activity() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let older = manager
+            .create_session(Some("older".to_string()))
+            .await
+            .expect("older session should create");
+        let newer = manager
+            .create_session(Some("newer".to_string()))
+            .await
+            .expect("newer session should create");
+
+        manager
+            .append_user_message(older.id, ClientId::new(), "wake older".to_string())
+            .await
+            .expect("message should append");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let sessions = restored.list_sessions().await;
+        assert_eq!(sessions[0].id, older.id);
+        assert_eq!(sessions[1].id, newer.id);
+        assert!(sessions[0].updated_at_ms >= sessions[0].created_at_ms);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
