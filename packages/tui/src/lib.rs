@@ -26,7 +26,7 @@ use bcode_session_models::{
     SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
     SessionSummary, SessionTokenUsage, SessionTracePayload, SessionTracePhase,
 };
-use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
+use bmux_text_edit::{SelectionMode, TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
@@ -105,6 +105,12 @@ enum TuiAction {
     MoveCursorWordRight,
     MoveCursorStart,
     MoveCursorEnd,
+    SelectCursorLeft,
+    SelectCursorRight,
+    SelectCursorWordLeft,
+    SelectCursorWordRight,
+    SelectCursorUp,
+    SelectCursorDown,
     AppInterrupt,
     AppExit,
     AppClear,
@@ -155,6 +161,12 @@ impl TuiAction {
             "tui.editor.moveCursorWordRight" => Self::MoveCursorWordRight,
             "tui.editor.moveCursorStart" => Self::MoveCursorStart,
             "tui.editor.moveCursorEnd" => Self::MoveCursorEnd,
+            "tui.editor.selectCursorLeft" => Self::SelectCursorLeft,
+            "tui.editor.selectCursorRight" => Self::SelectCursorRight,
+            "tui.editor.selectCursorWordLeft" => Self::SelectCursorWordLeft,
+            "tui.editor.selectCursorWordRight" => Self::SelectCursorWordRight,
+            "tui.editor.selectCursorUp" => Self::SelectCursorUp,
+            "tui.editor.selectCursorDown" => Self::SelectCursorDown,
             "app.interrupt" => Self::AppInterrupt,
             "app.exit" => Self::AppExit,
             "app.clear" => Self::AppClear,
@@ -329,6 +341,14 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("ctrl+right", TuiAction::MoveCursorWordRight),
                 ("ctrl+a", TuiAction::MoveCursorStart),
                 ("ctrl+e", TuiAction::MoveCursorEnd),
+                ("shift+left", TuiAction::SelectCursorLeft),
+                ("shift+right", TuiAction::SelectCursorRight),
+                ("shift+alt+left", TuiAction::SelectCursorWordLeft),
+                ("shift+alt+right", TuiAction::SelectCursorWordRight),
+                ("shift+ctrl+left", TuiAction::SelectCursorWordLeft),
+                ("shift+ctrl+right", TuiAction::SelectCursorWordRight),
+                ("shift+up", TuiAction::SelectCursorUp),
+                ("shift+down", TuiAction::SelectCursorDown),
                 ("escape", TuiAction::AppInterrupt),
                 ("ctrl+d", TuiAction::AppExit),
                 ("ctrl+c", TuiAction::AppClear),
@@ -391,6 +411,14 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("ctrl+right", TuiAction::MoveCursorWordRight),
                 ("ctrl+a", TuiAction::MoveCursorStart),
                 ("ctrl+e", TuiAction::MoveCursorEnd),
+                ("shift+left", TuiAction::SelectCursorLeft),
+                ("shift+right", TuiAction::SelectCursorRight),
+                ("shift+alt+left", TuiAction::SelectCursorWordLeft),
+                ("shift+alt+right", TuiAction::SelectCursorWordRight),
+                ("shift+ctrl+left", TuiAction::SelectCursorWordLeft),
+                ("shift+ctrl+right", TuiAction::SelectCursorWordRight),
+                ("shift+up", TuiAction::SelectCursorUp),
+                ("shift+down", TuiAction::SelectCursorDown),
                 ("backspace", TuiAction::DeleteCharBackward),
                 ("delete", TuiAction::DeleteCharForward),
                 ("alt+backspace", TuiAction::DeleteWordBackward),
@@ -952,6 +980,12 @@ async fn handle_tui_action(
                 app.input.move_cursor(TextMotion::End);
             }
         }
+        TuiAction::SelectCursorLeft => app.extend_text_selection(TextMotion::Left),
+        TuiAction::SelectCursorRight => app.extend_text_selection(TextMotion::Right),
+        TuiAction::SelectCursorWordLeft => app.extend_text_selection(TextMotion::WordLeft),
+        TuiAction::SelectCursorWordRight => app.extend_text_selection(TextMotion::WordRight),
+        TuiAction::SelectCursorUp => app.extend_text_selection(TextMotion::VisualUp),
+        TuiAction::SelectCursorDown => app.extend_text_selection(TextMotion::VisualDown),
         TuiAction::SelectUp => {
             if scope == TuiScope::Permission {
                 app.previous_permission_choice();
@@ -1496,6 +1530,34 @@ async fn handle_session_picker_text_key(
                 } else {
                     input.delete_forward();
                 }
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                input.move_cursor_with_selection(
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        TextMotion::WordLeft
+                    } else {
+                        TextMotion::Left
+                    },
+                    SelectionMode::Extend,
+                );
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                input.move_cursor_with_selection(
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        TextMotion::WordRight
+                    } else {
+                        TextMotion::Right
+                    },
+                    SelectionMode::Extend,
+                );
                 app.mode = SessionPickerMode::Renaming { input };
                 Ok(true)
             }
@@ -2956,6 +3018,21 @@ impl ChatApp {
             return;
         }
         self.input_history.push(text.to_string());
+    }
+
+    fn extend_text_selection(&mut self, motion: TextMotion) {
+        if let Some(palette) = &mut self.command_palette {
+            palette
+                .filter
+                .move_cursor_with_selection(motion, SelectionMode::Extend);
+        } else {
+            self.reset_input_history_navigation();
+            self.input
+                .move_cursor_with_selection(motion, SelectionMode::Extend);
+            if self.search_mode {
+                self.update_search();
+            }
+        }
     }
 
     fn move_input_or_history_previous(&mut self) {
@@ -4602,6 +4679,24 @@ mod tests {
             TuiAction::MoveCursorWordRight => app.input.move_cursor(TextMotion::WordRight),
             TuiAction::MoveCursorStart => app.input.move_cursor(TextMotion::Start),
             TuiAction::MoveCursorEnd => app.input.move_cursor(TextMotion::End),
+            TuiAction::SelectCursorLeft => app
+                .input
+                .move_cursor_with_selection(TextMotion::Left, SelectionMode::Extend),
+            TuiAction::SelectCursorRight => app
+                .input
+                .move_cursor_with_selection(TextMotion::Right, SelectionMode::Extend),
+            TuiAction::SelectCursorWordLeft => app
+                .input
+                .move_cursor_with_selection(TextMotion::WordLeft, SelectionMode::Extend),
+            TuiAction::SelectCursorWordRight => app
+                .input
+                .move_cursor_with_selection(TextMotion::WordRight, SelectionMode::Extend),
+            TuiAction::SelectCursorUp => app
+                .input
+                .move_cursor_with_selection(TextMotion::VisualUp, SelectionMode::Extend),
+            TuiAction::SelectCursorDown => app
+                .input
+                .move_cursor_with_selection(TextMotion::VisualDown, SelectionMode::Extend),
             _ => panic!("unsupported test editor action: {action:?}"),
         }
     }
@@ -4620,6 +4715,18 @@ mod tests {
             TuiAction::MoveCursorWordRight => palette.filter.move_cursor(TextMotion::WordRight),
             TuiAction::MoveCursorStart => palette.filter.move_cursor(TextMotion::Start),
             TuiAction::MoveCursorEnd => palette.filter.move_cursor(TextMotion::End),
+            TuiAction::SelectCursorLeft => palette
+                .filter
+                .move_cursor_with_selection(TextMotion::Left, SelectionMode::Extend),
+            TuiAction::SelectCursorRight => palette
+                .filter
+                .move_cursor_with_selection(TextMotion::Right, SelectionMode::Extend),
+            TuiAction::SelectCursorWordLeft => palette
+                .filter
+                .move_cursor_with_selection(TextMotion::WordLeft, SelectionMode::Extend),
+            TuiAction::SelectCursorWordRight => palette
+                .filter
+                .move_cursor_with_selection(TextMotion::WordRight, SelectionMode::Extend),
             _ => panic!("unsupported test palette action: {action:?}"),
         }
         palette.selected = 0;
@@ -4630,6 +4737,47 @@ mod tests {
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
         app.input = TextEditBuffer::from_text(text);
         app
+    }
+
+    #[test]
+    fn keyboard_selection_extends_composer_selection() {
+        let mut app = chat_app_with_input("hello world");
+
+        apply_chat_action(&mut app, TuiAction::MoveCursorStart);
+        apply_chat_action(&mut app, TuiAction::SelectCursorWordRight);
+
+        assert_eq!(app.input.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn keyboard_selection_extends_command_palette_selection() {
+        let mut palette = CommandPaletteState::new();
+        palette.filter = TextEditBuffer::from_text("hello world");
+
+        apply_command_palette_action(&mut palette, TuiAction::MoveCursorStart);
+        apply_command_palette_action(&mut palette, TuiAction::SelectCursorWordRight);
+
+        assert_eq!(palette.filter.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn keyboard_selection_extends_session_rename_selection() {
+        let mut app = SessionPickerApp::new(&[session_summary_with_name("hello world")]);
+        app.selected = 1;
+        app.start_rename();
+
+        apply_session_rename_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT | KeyModifiers::ALT),
+        );
+
+        assert_eq!(
+            match &app.mode {
+                SessionPickerMode::Renaming { input } => input.selected_text(),
+                SessionPickerMode::Browsing | SessionPickerMode::ConfirmDelete => None,
+            },
+            Some("world".to_string())
+        );
     }
 
     #[test]
