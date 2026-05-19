@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
+use tokio::task::JoinHandle;
 
 const FRAME_V2_MAGIC: &[u8; 4] = b"BSE2";
 const FRAME_V2_VERSION: u16 = 2;
@@ -115,12 +116,14 @@ impl SessionEventStore {
                 continue;
             }
             let session_id = parse_session_file_name(&path)?;
-            let index = match index::load_fresh_index(&self.root, session_id, &path)? {
-                Some(index) => Some(index),
-                None => index::rebuild_index(&self.root, session_id, &path)?.0,
-            };
-            if let Some(index) = index {
+            if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
                 sessions.insert(session_id, index.into_state());
+            } else if let Some(index) =
+                index::rebuild_index_metadata(&self.root, session_id, &path)?
+            {
+                let mut state = index.into_state();
+                state.index_status = SessionIndexStatusKind::Stale;
+                sessions.insert(session_id, state);
             }
         }
 
@@ -166,20 +169,28 @@ impl SessionEventStore {
         Ok(reader::read_events(&path)?.events)
     }
 
+    fn ensure_fresh_index(
+        &self,
+        session_id: SessionId,
+    ) -> Result<index::SessionIndex, SessionStoreError> {
+        let event_path = self.event_path(session_id);
+        match index::load_fresh_index(&self.root, session_id, &event_path)? {
+            Some(index) => Ok(index),
+            None => index::rebuild_index(&self.root, session_id, &event_path)?
+                .0
+                .ok_or_else(|| {
+                    SessionStoreError::InvalidSessionId(format!("empty session log: {session_id}"))
+                }),
+        }
+    }
+
     fn read_session_history_page(
         &self,
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionStoreError> {
         let event_path = self.event_path(session_id);
-        let index = match index::load_fresh_index(&self.root, session_id, &event_path)? {
-            Some(index) => index,
-            None => index::rebuild_index(&self.root, session_id, &event_path)?
-                .0
-                .ok_or_else(|| {
-                    SessionStoreError::InvalidSessionId(format!("empty session log: {session_id}"))
-                })?,
-        };
+        let index = self.ensure_fresh_index(session_id)?;
         let mut entries = match index::read_entries(&self.root, session_id) {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
@@ -773,6 +784,13 @@ pub struct SessionManager {
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionState>,
     activity_clock_ms: u64,
+    index_rebuilds: BTreeMap<SessionId, JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionIndexStatusKind {
+    Current,
+    Stale,
 }
 
 #[derive(Debug)]
@@ -789,6 +807,7 @@ pub(crate) struct SessionState {
     latest_compaction_sequence: Option<u64>,
     total_metered_tokens: u64,
     index_issues: Vec<index::SessionIndexIssue>,
+    index_status: SessionIndexStatusKind,
     sender: broadcast::Sender<SessionEvent>,
 }
 
@@ -814,6 +833,7 @@ impl SessionManager {
             inner: Mutex::new(SessionManagerInner {
                 sessions,
                 activity_clock_ms: current_unix_millis(),
+                index_rebuilds: BTreeMap::new(),
             }),
             store: Some(store),
         })
@@ -852,6 +872,7 @@ impl SessionManager {
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
             index_issues: Vec::new(),
+            index_status: SessionIndexStatusKind::Current,
             sender,
         };
         state.push_event(
@@ -865,7 +886,8 @@ impl SessionManager {
 
     /// List known sessions.
     pub async fn list_sessions(&self) -> Vec<SessionSummary> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        inner.schedule_stale_index_rebuilds(self.store.as_ref());
         let mut sessions: Vec<_> = inner.sessions.values().map(SessionState::summary).collect();
         sessions.sort_by(|left, right| {
             right
@@ -992,19 +1014,26 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
-        let inner = self.inner.lock().await;
-        let state = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
-        if let Some(events) = &state.events {
-            return Ok(history_page_from_events(session_id, events.clone(), query));
-        }
+        let should_mark_current = {
+            let inner = self.inner.lock().await;
+            let state = inner
+                .sessions
+                .get(&session_id)
+                .ok_or(SessionError::NotFound(session_id))?;
+            if let Some(events) = &state.events {
+                return Ok(history_page_from_events(session_id, events.clone(), query));
+            }
+            state.index_status == SessionIndexStatusKind::Stale
+        };
         let store = self
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(store.read_session_history_page(session_id, query)?)
+        let page = store.read_session_history_page(session_id, query)?;
+        if should_mark_current {
+            self.inner.lock().await.mark_index_current(session_id);
+        }
+        Ok(page)
     }
 
     /// Return user-submitted prompts for input-history navigation.
@@ -1543,6 +1572,58 @@ impl SessionManager {
 }
 
 impl SessionManagerInner {
+    fn mark_index_current(&mut self, session_id: SessionId) {
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.index_status = SessionIndexStatusKind::Current;
+        }
+        if self
+            .index_rebuilds
+            .get(&session_id)
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            self.index_rebuilds.remove(&session_id);
+        }
+    }
+
+    fn schedule_index_rebuild(&mut self, store: Option<&SessionEventStore>, session_id: SessionId) {
+        let Some(store) = store.cloned() else {
+            return;
+        };
+        if self
+            .sessions
+            .get(&session_id)
+            .is_none_or(|state| state.index_status == SessionIndexStatusKind::Current)
+        {
+            return;
+        }
+        if self
+            .index_rebuilds
+            .get(&session_id)
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
+        let handle = tokio::spawn(async move {
+            if let Err(error) = store.reindex_session(session_id) {
+                eprintln!("failed to rebuild session index for {session_id}: {error}");
+            }
+        });
+        self.index_rebuilds.insert(session_id, handle);
+    }
+
+    fn schedule_stale_index_rebuilds(&mut self, store: Option<&SessionEventStore>) {
+        let session_ids = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, state)| {
+                (state.index_status == SessionIndexStatusKind::Stale).then_some(*session_id)
+            })
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.schedule_index_rebuild(store, session_id);
+        }
+    }
+
     fn next_activity_timestamp_ms(&mut self) -> u64 {
         let now_ms = current_unix_millis();
         self.activity_clock_ms = self.activity_clock_ms.max(now_ms).saturating_add(1);
@@ -1569,6 +1650,7 @@ impl SessionState {
             latest_compaction_sequence: index.latest_compaction_sequence,
             total_metered_tokens: index.total_metered_tokens,
             index_issues: index.issues,
+            index_status: SessionIndexStatusKind::Current,
             sender,
         }
     }
@@ -1621,13 +1703,14 @@ impl SessionState {
         if let Some(events) = &mut self.events {
             events.push(event.clone());
         }
-        if let Some(store) = store
-            && let Err(error) = store.write_state_index(self)
-        {
-            eprintln!(
-                "failed to update session index for {}: {error}",
-                self.summary.id
-            );
+        if let Some(store) = store {
+            match store.write_state_index(self) {
+                Ok(()) => self.index_status = SessionIndexStatusKind::Current,
+                Err(error) => eprintln!(
+                    "failed to update session index for {}: {error}",
+                    self.summary.id
+                ),
+            }
         }
         let _ = self.sender.send(event.clone());
         Ok(event)
@@ -2377,6 +2460,45 @@ mod tests {
                 .migration_for_action(super::SessionMigrationAction::RebuildDerivedIndex)
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_restore_defers_stale_index_rebuild_until_access() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("lazy".to_string()))
+            .await
+            .expect("session should create");
+        manager
+            .append_user_message(session.id, ClientId::new(), "hello".to_string())
+            .await
+            .expect("message should append");
+        let index_path = root
+            .join("index")
+            .join(format!("{}.index.json", session.id));
+        std::fs::remove_file(&index_path).expect("index should remove");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        assert!(
+            !index_path.exists(),
+            "persistent restore should not eagerly rewrite missing indexes"
+        );
+
+        restored
+            .session_history_page(
+                session.id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 10,
+                    direction: SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+            .expect("history page should rebuild lazily");
+        assert!(index_path.exists());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
     #[tokio::test]

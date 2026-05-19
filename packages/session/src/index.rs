@@ -201,6 +201,16 @@ impl SessionIndex {
         })
     }
 
+    pub fn from_report_metadata(
+        session_id: SessionId,
+        file: EventFileFingerprint,
+        report: &SessionReadReport,
+    ) -> Option<Self> {
+        let mut index = Self::from_report(session_id, file, report)?;
+        index.event_count = report.entries.len();
+        Some(index)
+    }
+
     pub(crate) fn into_state(self) -> SessionState {
         SessionState::from_index(self)
     }
@@ -417,6 +427,18 @@ pub fn rebuild_index(
         write_entries(root, session_id, &report.entries)?;
     }
     Ok((index, report.events))
+}
+
+pub fn rebuild_index_metadata(
+    _root: &Path,
+    session_id: SessionId,
+    event_path: &Path,
+) -> Result<Option<SessionIndex>, SessionStoreError> {
+    let report = crate::reader::read_events(event_path)?;
+    let file = fingerprint(event_path)?;
+    Ok(SessionIndex::from_report_metadata(
+        session_id, file, &report,
+    ))
 }
 
 const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
