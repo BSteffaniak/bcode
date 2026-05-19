@@ -28,8 +28,9 @@ use bcode_session_models::{
 };
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -730,6 +731,7 @@ async fn run_chat(
                         }
                     }
                 }
+                CrosstermEvent::Paste(text) => app.paste_text(&text),
                 CrosstermEvent::Mouse(mouse) => handle_mouse_event(&mut app, mouse),
                 _ => {}
             }
@@ -1413,6 +1415,7 @@ async fn pick_session(client: &BcodeClient, keymap: &KeyMap) -> Result<SessionId
                     _ => {}
                 }
             }
+            CrosstermEvent::Paste(text) => handle_session_picker_paste(&mut app, &text),
             CrosstermEvent::Mouse(mouse) => handle_session_picker_mouse_event(&mut app, mouse),
             _ => {}
         }
@@ -1438,6 +1441,12 @@ fn handle_session_picker_mouse_event(app: &mut SessionPickerApp, mouse: MouseEve
             input.select_to_line_viewport_col(usize::from(input_area.width), col);
         }
         _ => {}
+    }
+}
+
+fn handle_session_picker_paste(app: &mut SessionPickerApp, text: &str) {
+    if let SessionPickerMode::Renaming { input } = &mut app.mode {
+        input.paste(text);
     }
 }
 
@@ -3005,6 +3014,19 @@ impl ChatApp {
         self.input_history_draft = None;
     }
 
+    fn paste_text(&mut self, text: &str) {
+        if let Some(palette) = &mut self.command_palette {
+            palette.filter.paste(text);
+            palette.selected = 0;
+        } else {
+            self.reset_input_history_navigation();
+            self.input.paste(text);
+            if self.search_mode {
+                self.update_search();
+            }
+        }
+    }
+
     fn set_input_text(&mut self, text: impl Into<String>) {
         self.input = TextEditBuffer::from_text(text);
     }
@@ -4365,7 +4387,12 @@ impl TerminalGuard {
     fn enter() -> Result<Self, io::Error> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -4385,6 +4412,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -5966,6 +5994,57 @@ mod tests {
                 .iter()
                 .any(|cell| { cell.symbol() == "h" && cell.style().bg == Some(COLOR_ACCENT) })
         );
+    }
+
+    #[test]
+    fn bracketed_paste_replaces_composer_selection() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = TextEditBuffer::from_text("hello world");
+        app.input.move_cursor(TextMotion::Start);
+        app.input.move_cursor_with_selection(
+            TextMotion::WordRight,
+            bmux_text_edit::SelectionMode::Extend,
+        );
+
+        app.paste_text("goodbye");
+
+        assert_eq!(app.input.text(), "goodbye world");
+        assert_eq!(app.input.selection(), None);
+    }
+
+    #[test]
+    fn bracketed_paste_updates_command_palette_filter() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.open_command_palette();
+
+        app.paste_text("model");
+
+        assert_eq!(
+            app.command_palette
+                .as_ref()
+                .map(|palette| palette.filter.text()),
+            Some("model")
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_replaces_session_rename_selection() {
+        let mut app = SessionPickerApp::new(&[session_summary_with_name("hello world")]);
+        app.selected = 1;
+        app.start_rename();
+        if let SessionPickerMode::Renaming { input } = &mut app.mode {
+            input.move_cursor(TextMotion::Start);
+            input.move_cursor_with_selection(
+                TextMotion::WordRight,
+                bmux_text_edit::SelectionMode::Extend,
+            );
+        }
+
+        handle_session_picker_paste(&mut app, "goodbye");
+
+        assert_eq!(rename_input_text(&app), Some("goodbye world"));
     }
 
     #[test]
