@@ -796,6 +796,22 @@ async fn run_chat(
     Ok(())
 }
 
+async fn submit_chat_input(client: &BcodeClient, app: &mut ChatApp, session_id: SessionId) {
+    if let Some(message) = app.take_input() {
+        if message.starts_with('/') {
+            if !handle_slash_command(client, app, session_id, &message).await {
+                app.status = format!("unknown slash command: {message}");
+            }
+        } else if let Err(error) = client.send_user_message(session_id, message).await {
+            app.set_activity(ActivityState::Idle);
+            app.status = format!("send failed: {error}");
+        } else {
+            app.set_activity(ActivityState::Thinking);
+            app.status = "sent".to_string();
+        }
+    }
+}
+
 async fn refresh_slash_completion_caches(
     client: &BcodeClient,
     app: &mut ChatApp,
@@ -959,19 +975,12 @@ async fn handle_tui_action(
         TuiAction::InputSubmit => {
             if app.search_mode {
                 app.finish_search();
+            } else if app.slash_completion_has_exact_selected_match() {
+                app.slash_completion = None;
+                submit_chat_input(client, app, session_id).await;
             } else if app.slash_completion.is_some() && app.accept_slash_completion() {
-            } else if let Some(message) = app.take_input() {
-                if message.starts_with('/') {
-                    if !handle_slash_command(client, app, session_id, &message).await {
-                        app.status = format!("unknown slash command: {}", message);
-                    }
-                } else if let Err(error) = client.send_user_message(session_id, message).await {
-                    app.set_activity(ActivityState::Idle);
-                    app.status = format!("send failed: {error}");
-                } else {
-                    app.set_activity(ActivityState::Thinking);
-                    app.status = "sent".to_string();
-                }
+            } else {
+                submit_chat_input(client, app, session_id).await;
             }
         }
         TuiAction::InputComplete => {
@@ -3845,6 +3854,18 @@ impl ChatApp {
         {
             completion.selected = index;
         }
+    }
+
+    fn slash_completion_has_exact_selected_match(&self) -> bool {
+        let Some(completion) = &self.slash_completion else {
+            return false;
+        };
+        let Some(item) = completion.selected_item() else {
+            return false;
+        };
+        let input = self.input.text();
+        let typed = input.get(completion.range.clone()).unwrap_or_default();
+        typed == item.replacement.trim_end()
     }
 
     fn accept_slash_completion(&mut self) -> bool {
@@ -7829,6 +7850,36 @@ mod tests {
         assert!(app.accept_slash_completion());
         assert_eq!(app.input.text(), "/model ");
         assert!(app.slash_completion.is_none());
+    }
+
+    #[test]
+    fn slash_completion_exact_selected_command_match_is_submit_ready() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.set_input_text("/help");
+        app.update_slash_completion();
+
+        assert!(app.slash_completion_has_exact_selected_match());
+    }
+
+    #[test]
+    fn slash_completion_partial_selected_command_match_is_not_submit_ready() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.set_input_text("/he");
+        app.update_slash_completion();
+
+        assert!(!app.slash_completion_has_exact_selected_match());
+    }
+
+    #[test]
+    fn slash_completion_exact_selected_argument_match_is_submit_ready() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.set_input_text("/thinking high");
+        app.update_slash_completion();
+
+        assert!(app.slash_completion_has_exact_selected_match());
     }
 
     #[test]
