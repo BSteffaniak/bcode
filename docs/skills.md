@@ -224,6 +224,8 @@ Rules:
 * Skill scripts are inert resources until explicitly invoked.
 * Script execution, if added, must use a dedicated permission category such as `skill.script.execute` and should ask by default.
 * Discovery must canonicalize paths and reject traversal outside the skill root.
+* Skill context includes the exact `Skill file`, `Skill directory`, and `Skill resource root` so the model can read relative references on demand instead of Bcode eagerly inlining them.
+* When applying a skill, Bcode instructs the model to resolve relative files/scripts/assets from the skill directory and to map common external tool names (`Bash`, `Read`, `Edit`, `Write`) to Bcode tools.
 * Symlinks are followed by default for compatibility with Nix/Home Manager and similar config managers. Set `follow_symlinks = false` to opt out.
 * For directory skills such as `skills/commit-message/SKILL.md`, Bcode infers `commit-message` from the parent directory when front matter omits `id`.
 * For flat skills such as `skills/commit-message.md`, Bcode infers `commit-message` from the file stem when front matter omits `id`.

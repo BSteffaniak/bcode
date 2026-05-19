@@ -165,12 +165,26 @@ impl SkillRegistry {
         skill_id: &SkillId,
         max_bytes: Option<usize>,
     ) -> Result<String, SkillRegistryError> {
+        let entry = self.entry(skill_id)?;
         let manifest = self.describe(skill_id)?;
         let budget = max_bytes.unwrap_or(self.options.max_context_bytes);
+        let skill_file = entry.path.to_string_lossy();
+        let skill_directory = entry
+            .path
+            .parent()
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+        let resource_root = entry
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
         let mut context = format!(
-            "Active Bcode skill: {}\nSource: {}\nVersion: {}\n\nInstructions:\n{}",
+            "Bcode skill invocation: {}\nSource label: {}\nSkill file: {}\nSkill directory: {}\nSkill resource root: {}\nVersion: {}\n\nWhen these instructions reference relative files, scripts, references, assets, or markdown links, use available Bcode filesystem tools to read them relative to the skill directory before applying the skill. Map common skill tool names to Bcode tools when needed: Bash -> shell.run, Read -> filesystem.read, Edit -> filesystem.edit, Write -> filesystem.write.\n\nInstructions:\n{}",
             manifest.summary.id,
             manifest.summary.source.label,
+            skill_file,
+            skill_directory,
+            resource_root,
             manifest.summary.version.as_deref().unwrap_or("unknown"),
             manifest.instructions
         );
