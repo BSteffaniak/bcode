@@ -48,6 +48,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -1293,7 +1294,12 @@ async fn pick_session(client: &BcodeClient, keymap: &KeyMap) -> Result<SessionId
     let mut terminal = TerminalGuard::enter()?;
     let mut app = SessionPickerApp::new(&sessions);
     loop {
-        terminal.draw(&app)?;
+        terminal.draw_frame(|frame| {
+            frame.render_widget(&app, frame.area());
+            if let Some(position) = app.cursor_position(frame.area()) {
+                frame.set_cursor_position(position);
+            }
+        })?;
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
@@ -1337,7 +1343,8 @@ async fn handle_session_picker_text_key(
                     app.mode = SessionPickerMode::Browsing;
                     return Ok(true);
                 };
-                match client.rename_session(session_id, Some(input)).await {
+                let name = input.text().trim().to_string();
+                match client.rename_session(session_id, Some(name)).await {
                     Ok(session) => {
                         app.upsert_session(session);
                         app.mode = SessionPickerMode::Browsing;
@@ -1353,13 +1360,89 @@ async fn handle_session_picker_text_key(
                 Ok(true)
             }
             KeyCode::Backspace => {
-                input.pop();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    input.delete(TextDelete::WordBackward);
+                } else {
+                    input.delete_backward();
+                }
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    input.delete(TextDelete::WordForward);
+                } else {
+                    input.delete_forward();
+                }
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Left => {
+                input.move_cursor(
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        TextMotion::WordLeft
+                    } else {
+                        TextMotion::Left
+                    },
+                );
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Right => {
+                input.move_cursor(
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        TextMotion::WordRight
+                    } else {
+                        TextMotion::Right
+                    },
+                );
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Home => {
+                input.move_cursor(TextMotion::Start);
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::End => {
+                input.move_cursor(TextMotion::End);
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_cursor(TextMotion::Start);
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_cursor(TextMotion::End);
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.delete(TextDelete::WordBackward);
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.delete(TextDelete::ToStart);
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.delete(TextDelete::ToEnd);
                 app.mode = SessionPickerMode::Renaming { input };
                 Ok(true)
             }
             _ => {
                 if let Some(character) = key_is_text_input(key) {
-                    input.push(character);
+                    input.insert_char(character);
                     app.mode = SessionPickerMode::Renaming { input };
                 }
                 Ok(true)
@@ -1397,7 +1480,7 @@ async fn handle_session_picker_text_key(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionPickerMode {
     Browsing,
-    Renaming { input: String },
+    Renaming { input: TextEditBuffer },
     ConfirmDelete,
 }
 
@@ -1453,9 +1536,28 @@ impl SessionPickerApp {
             return;
         };
         self.mode = SessionPickerMode::Renaming {
-            input: session.name.clone().unwrap_or_default(),
+            input: TextEditBuffer::from_text(session.name.clone().unwrap_or_default()),
         };
         self.status = "type a new title and press enter".to_string();
+    }
+
+    fn cursor_position(&self, area: Rect) -> Option<Position> {
+        let SessionPickerMode::Renaming { input } = &self.mode else {
+            return None;
+        };
+        let chunks = session_picker_layout(
+            area,
+            matches!(self.mode, SessionPickerMode::Renaming { .. }),
+        );
+        let input_area = chunks[2];
+        if input_area.width == 0 || input_area.height == 0 {
+            return None;
+        }
+        let column = line_width(&input.text()[..input.cursor_byte_index()]);
+        Some(Position::new(
+            input_area.x + usize_to_u16_saturating(column).min(input_area.width.saturating_sub(1)),
+            input_area.y,
+        ))
     }
 
     fn start_delete_confirmation(&mut self) {
@@ -1488,6 +1590,21 @@ impl SessionPickerApp {
     }
 }
 
+fn session_picker_layout(area: Rect, renaming: bool) -> Rc<[Rect]> {
+    let panel = centered_rect(area, 70, 70);
+    let inner = inset(panel, 2, 1);
+    let rename_rows = if renaming { 2 } else { 0 };
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(rename_rows),
+            Constraint::Length(1),
+        ])
+        .split(inner)
+}
+
 impl ratatui::widgets::Widget for &SessionPickerApp {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         let panel = centered_rect(area, area.width.min(96), area.height.min(26));
@@ -1500,23 +1617,12 @@ impl ratatui::widgets::Widget for &SessionPickerApp {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style());
-        let inner = inset(panel, 2, 1);
         ratatui::widgets::Widget::render(block, panel, buf);
 
-        let rename_rows = if matches!(self.mode, SessionPickerMode::Renaming { .. }) {
-            2
-        } else {
-            0
-        };
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(3),
-                Constraint::Length(rename_rows),
-                Constraint::Length(1),
-            ])
-            .split(inner);
+        let chunks = session_picker_layout(
+            area,
+            matches!(self.mode, SessionPickerMode::Renaming { .. }),
+        );
 
         Paragraph::new(Text::from(vec![
             Line::from(vec![Span::styled("Select a session", title_style())]),
@@ -1555,7 +1661,7 @@ impl ratatui::widgets::Widget for &SessionPickerApp {
                 .border_type(BorderType::Rounded)
                 .border_style(border_style())
                 .title(Span::styled(" rename ", muted_style()));
-            Paragraph::new(input.as_str())
+            Paragraph::new(input.text().to_string())
                 .style(normal_style())
                 .block(rename_block)
                 .render(chunks[2], buf);
@@ -3954,13 +4060,6 @@ impl TerminalGuard {
         Ok(Self { terminal })
     }
 
-    fn draw<W>(&mut self, widget: W) -> Result<(), io::Error>
-    where
-        W: ratatui::widgets::Widget,
-    {
-        self.draw_frame(|frame| frame.render_widget(widget, frame.area()))
-    }
-
     fn draw_frame<F>(&mut self, render: F) -> Result<(), io::Error>
     where
         F: FnOnce(&mut Frame<'_>),
@@ -5275,6 +5374,68 @@ mod tests {
             },
         );
         assert_eq!(app.scroll_rows_from_bottom, 0);
+    }
+
+    fn session_summary_with_name(name: &str) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(),
+            name: Some(name.to_string()),
+            client_count: 0,
+        }
+    }
+
+    fn rename_input_text(app: &SessionPickerApp) -> Option<&str> {
+        match &app.mode {
+            SessionPickerMode::Renaming { input } => Some(input.text()),
+            SessionPickerMode::Browsing | SessionPickerMode::ConfirmDelete => None,
+        }
+    }
+
+    fn apply_session_rename_key(app: &mut SessionPickerApp, key: KeyEvent) {
+        let client = BcodeClient::new(bcode_ipc::IpcEndpoint::unix_socket(
+            "/tmp/bcode-unused-test.sock",
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime
+            .block_on(handle_session_picker_text_key(&client, app, &key))
+            .expect("rename key should be handled");
+    }
+
+    #[test]
+    fn session_rename_input_supports_cursor_editing() {
+        let mut app = SessionPickerApp::new(&[session_summary_with_name("hello world")]);
+        app.selected = 1;
+        app.start_rename();
+
+        apply_session_rename_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        apply_session_rename_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+        apply_session_rename_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(rename_input_text(&app), Some("bworld"));
+    }
+
+    #[test]
+    fn session_rename_cursor_position_tracks_editor_cursor() {
+        let mut app = SessionPickerApp::new(&[session_summary_with_name("model")]);
+        app.selected = 1;
+        app.start_rename();
+        if let SessionPickerMode::Renaming { input } = &mut app.mode {
+            input.move_cursor(TextMotion::Left);
+            input.move_cursor(TextMotion::Left);
+        }
+
+        assert_eq!(
+            app.cursor_position(Rect::new(0, 0, 100, 40)),
+            Some(Position::new(20, 34))
+        );
     }
 
     #[test]
