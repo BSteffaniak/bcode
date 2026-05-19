@@ -2712,6 +2712,11 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::ModelUsage { turn_id, usage } => {
             print_model_usage_event(event.sequence, turn_id, usage);
         }
+        SessionEventKind::SkillInvoked {
+            skill_id,
+            arguments,
+            ..
+        } => println!("#{} skill invoked: {skill_id} {arguments}", event.sequence),
         SessionEventKind::SkillSuggested {
             skill_id, reason, ..
         } => println!(

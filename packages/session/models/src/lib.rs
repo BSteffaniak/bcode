@@ -221,6 +221,7 @@ pub enum SessionTracePhase {
     ToolPermissionWaitStarted,
     ToolPermissionWaitFinished,
     ToolInvocationFinished,
+    SkillInvoked,
     SkillSuggested,
     SkillActivated,
     SkillDeactivated,
@@ -457,6 +458,13 @@ pub enum SessionEventKind {
     },
     TraceEvent {
         trace: Box<SessionTraceEvent>,
+    },
+    SkillInvoked {
+        skill_id: SkillId,
+        arguments: String,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        invoked_at_ms: u64,
     },
     SkillSuggested {
         skill_id: SkillId,

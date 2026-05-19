@@ -97,6 +97,7 @@ struct ServerState {
     skills: Option<SkillRegistry>,
     skill_context_bytes: usize,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
+    turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillId>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -329,6 +330,7 @@ impl ServerState {
             skills: init.skills,
             skill_context_bytes: init.skill_context_bytes,
             active_skills: Mutex::default(),
+            turn_skills: Mutex::default(),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -552,6 +554,16 @@ async fn handle_request(
         }
         Request::SendUserMessage { session_id, text } => {
             handle_user_message(request_id, client_id, state, writer, session_id, text).await
+        }
+        Request::InvokeSkill {
+            session_id,
+            skill_id,
+            arguments,
+        } => {
+            handle_invoke_skill(
+                request_id, client_id, state, writer, session_id, skill_id, arguments,
+            )
+            .await
         }
         Request::CancelSessionTurn { session_id } => {
             handle_cancel_session_turn(request_id, state, writer, session_id).await
@@ -958,6 +970,87 @@ async fn handle_attach_session_recent(
             .await
         }
     }
+}
+
+async fn handle_invoke_skill(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    skill_id: SkillId,
+    arguments: String,
+) -> Result<(), ServerError> {
+    let Some(registry) = &state.skills else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("skills_disabled", "skills are disabled")),
+        )
+        .await;
+    };
+    let Some(summary) = registry.summary(&skill_id).cloned() else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "unknown_skill",
+                format!("unknown skill: {skill_id}"),
+            )),
+        )
+        .await;
+    };
+    let invocation = state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::SkillInvoked {
+                skill_id: skill_id.clone(),
+                arguments: arguments.clone(),
+                source: Some(summary.source),
+                invoked_at_ms: current_time_ms(),
+            },
+        )
+        .await?;
+    publish_session_event(state, &invocation).await;
+    let text = if arguments.trim().is_empty() {
+        format!("Use the {skill_id} skill with no additional arguments.")
+    } else {
+        arguments
+    };
+    let events = state
+        .sessions
+        .append_user_message(session_id, client_id, text)
+        .await?;
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    let Some(user_event) = events.last().cloned() else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "message_not_appended",
+                "no user message event was appended",
+            )),
+        )
+        .await;
+    };
+    state
+        .turn_skills
+        .lock()
+        .await
+        .insert((session_id, user_event.sequence), skill_id);
+    let state_for_turn = Arc::clone(state);
+    tokio::spawn(async move {
+        run_model_turn(&state_for_turn, session_id, &user_event).await;
+    });
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::MessageSent),
+    )
+    .await
 }
 
 async fn handle_user_message(
@@ -3543,7 +3636,7 @@ async fn build_model_turn_request(
         );
         system_prefix_len += 1;
     }
-    let skill_contexts = active_skill_contexts(state, session_id).await;
+    let skill_contexts = turn_skill_contexts(state, session_id, trigger_event.sequence).await;
     for skill_context in skill_contexts {
         messages.insert(
             system_prefix_len,
@@ -5044,6 +5137,53 @@ async fn suggest_skills_for_prompt(
             publish_session_event(state, &event).await;
         }
     }
+}
+
+async fn turn_skill_contexts(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_sequence: u64,
+) -> Vec<SkillContextResponse> {
+    let Some(registry) = &state.skills else {
+        return Vec::new();
+    };
+    let Some(skill_id) = state
+        .turn_skills
+        .lock()
+        .await
+        .remove(&(session_id, trigger_sequence))
+    else {
+        return Vec::new();
+    };
+    let Some(summary) = registry.summary(&skill_id) else {
+        return Vec::new();
+    };
+    let context = match registry.context(&skill_id, Some(state.skill_context_bytes)) {
+        Ok(context) => context,
+        Err(error) => {
+            let _ = state
+                .sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::SkillInvocationFailed {
+                        skill_id,
+                        error: error.to_string(),
+                        failed_at_ms: current_time_ms(),
+                    },
+                )
+                .await;
+            return Vec::new();
+        }
+    };
+    let bytes_loaded = context.len();
+    let truncated = bytes_loaded >= state.skill_context_bytes;
+    vec![SkillContextResponse {
+        skill_id,
+        context,
+        source: summary.source.clone(),
+        bytes_loaded,
+        truncated,
+    }]
 }
 
 async fn active_skill_contexts(

@@ -337,6 +337,31 @@ impl BcodeClient {
         }
     }
 
+    /// Invoke a skill for one model turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn invoke_skill(
+        &self,
+        session_id: SessionId,
+        skill_id: SkillId,
+        arguments: String,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::InvokeSkill {
+                session_id,
+                skill_id,
+                arguments,
+            })
+            .await?
+        {
+            ResponsePayload::MessageSent => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Activate a skill for a session.
     ///
     /// # Errors

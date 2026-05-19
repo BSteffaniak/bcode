@@ -119,6 +119,11 @@ pub enum Request {
         session_id: SessionId,
         text: String,
     },
+    InvokeSkill {
+        session_id: SessionId,
+        skill_id: SkillId,
+        arguments: String,
+    },
     CancelSessionTurn {
         session_id: SessionId,
     },

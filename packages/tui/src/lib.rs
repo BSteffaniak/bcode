@@ -1569,16 +1569,20 @@ async fn handle_slash_command(
         "skill" if parts.get(1) == Some(&"describe") && parts.len() > 2 => {
             describe_skill_from_tui(client, app, parts[2]).await
         }
-        "skill" if parts.len() == 1 || parts.get(1) == Some(&"active") => {
-            active_skills_from_tui(client, app, session_id).await
-        }
-        "skill" if parts.get(1) == Some(&"off") && parts.len() > 2 => {
-            deactivate_skill_from_tui(client, app, session_id, parts[2]).await
-        }
         "skill" if parts.len() > 1 => {
-            activate_skill_from_tui(client, app, session_id, parts[1]).await
+            invoke_skill_from_tui(client, app, session_id, parts[1], &parts[2..]).await
         }
-        _ => app.parse_and_execute_slash(message, client),
+        "skill" => {
+            app.status = "use /skill <id> [arguments] or /skill describe <id>".to_string();
+            true
+        }
+        _ => {
+            if app.parse_and_execute_slash(message, client) {
+                true
+            } else {
+                invoke_skill_alias_from_tui(client, app, session_id, command, &parts[1..]).await
+            }
+        }
     }
 }
 
@@ -1633,56 +1637,43 @@ async fn describe_skill_from_tui(client: &BcodeClient, app: &mut ChatApp, skill_
     true
 }
 
-async fn active_skills_from_tui(
-    client: &BcodeClient,
-    app: &mut ChatApp,
-    session_id: SessionId,
-) -> bool {
-    match client.active_skills(session_id).await {
-        Ok(skills) if skills.is_empty() => app.status = "no active skills".to_string(),
-        Ok(skills) => {
-            let ids = skills
-                .iter()
-                .map(|skill| skill.skill_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            app.status = format!("active skills: {ids}");
-        }
-        Err(error) => app.status = format!("active skills failed: {error}"),
-    }
-    true
-}
-
-async fn activate_skill_from_tui(
+async fn invoke_skill_from_tui(
     client: &BcodeClient,
     app: &mut ChatApp,
     session_id: SessionId,
     skill_id: &str,
+    args: &[&str],
 ) -> bool {
+    let arguments = args.join(" ");
     match client
-        .activate_skill(session_id, SkillId::new(skill_id.to_string()))
+        .invoke_skill(session_id, SkillId::new(skill_id.to_string()), arguments)
         .await
     {
-        Ok(()) => app.status = format!("skill activated: {skill_id}"),
-        Err(error) => app.status = format!("skill activation failed: {error}"),
+        Ok(()) => app.status = format!("skill invoked: {skill_id}"),
+        Err(error) => app.status = format!("skill invocation failed: {error}"),
     }
     true
 }
 
-async fn deactivate_skill_from_tui(
+async fn invoke_skill_alias_from_tui(
     client: &BcodeClient,
     app: &mut ChatApp,
     session_id: SessionId,
     skill_id: &str,
+    args: &[&str],
 ) -> bool {
-    match client
-        .deactivate_skill(session_id, SkillId::new(skill_id.to_string()))
-        .await
+    let Ok(skills) = client.list_skills().await else {
+        return false;
+    };
+    if skills
+        .skills
+        .iter()
+        .any(|skill| skill.id.as_str() == skill_id)
     {
-        Ok(()) => app.status = format!("skill deactivated: {skill_id}"),
-        Err(error) => app.status = format!("skill deactivation failed: {error}"),
+        invoke_skill_from_tui(client, app, session_id, skill_id, args).await
+    } else {
+        false
     }
-    true
 }
 
 async fn list_models_from_tui(
@@ -3063,6 +3054,7 @@ impl ChatApp {
             | SessionEventKind::ModelChanged { .. }
             | SessionEventKind::AgentChanged { .. }
             | SessionEventKind::SystemMessage { .. }
+            | SessionEventKind::SkillInvoked { .. }
             | SessionEventKind::SkillSuggested { .. }
             | SessionEventKind::SkillActivated { .. }
             | SessionEventKind::SkillDeactivated { .. }
@@ -5725,6 +5717,13 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
             ..
         } => vec![TranscriptBlock::Meta {
             text: format!("context compacted through #{compacted_through_sequence}"),
+        }],
+        SessionEventKind::SkillInvoked {
+            skill_id,
+            arguments,
+            ..
+        } => vec![TranscriptBlock::Meta {
+            text: format!("skill invoked: {skill_id} {arguments}"),
         }],
         SessionEventKind::SkillSuggested {
             skill_id, reason, ..
