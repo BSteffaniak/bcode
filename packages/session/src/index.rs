@@ -55,6 +55,33 @@ pub struct SessionIndexEntry {
     pub schema_version: u16,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawIndexVersion {
+    index_version: u16,
+    session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionIndexStatus {
+    Current(Box<SessionIndex>),
+    Missing {
+        current_version: u16,
+    },
+    Stale {
+        found_version: Option<u16>,
+        current_version: u16,
+        reason: String,
+    },
+    Future {
+        found_version: u16,
+        current_version: u16,
+    },
+    Corrupt {
+        current_version: u16,
+        reason: String,
+    },
+}
+
 impl SessionIndexEntry {
     #[must_use]
     pub fn from_event(event: &SessionEvent, offset: u64, frame_len: u64) -> Self {
@@ -174,7 +201,7 @@ impl SessionIndex {
         })
     }
 
-    pub fn into_state(self) -> SessionState {
+    pub(crate) fn into_state(self) -> SessionState {
         SessionState::from_index(self)
     }
 
@@ -231,21 +258,79 @@ pub fn load_fresh_index(
     session_id: SessionId,
     event_path: &Path,
 ) -> Result<Option<SessionIndex>, SessionStoreError> {
+    match inspect_index(root, session_id, event_path)? {
+        SessionIndexStatus::Current(index) => Ok(Some(*index)),
+        SessionIndexStatus::Missing { .. }
+        | SessionIndexStatus::Stale { .. }
+        | SessionIndexStatus::Future { .. }
+        | SessionIndexStatus::Corrupt { .. } => Ok(None),
+    }
+}
+
+pub fn inspect_index(
+    root: &Path,
+    session_id: SessionId,
+    event_path: &Path,
+) -> Result<SessionIndexStatus, SessionStoreError> {
     let index_path = index_path(root, session_id);
-    let Ok(contents) = fs::read_to_string(index_path) else {
-        return Ok(None);
+    let contents = match fs::read_to_string(index_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SessionIndexStatus::Missing {
+                current_version: SESSION_INDEX_VERSION,
+            });
+        }
+        Err(error) => return Err(SessionStoreError::Io(error)),
     };
-    let Ok(index) = serde_json::from_str::<SessionIndex>(&contents) else {
-        return Ok(None);
+    let version = match serde_json::from_str::<RawIndexVersion>(&contents) {
+        Ok(version) => version,
+        Err(error) => {
+            return Ok(SessionIndexStatus::Corrupt {
+                current_version: SESSION_INDEX_VERSION,
+                reason: error.to_string(),
+            });
+        }
+    };
+    if let Some(index_session_id) = version.session_id
+        && index_session_id != session_id
+    {
+        return Ok(SessionIndexStatus::Stale {
+            found_version: Some(version.index_version),
+            current_version: SESSION_INDEX_VERSION,
+            reason: format!("index session id {index_session_id} does not match {session_id}"),
+        });
+    }
+    if version.index_version > SESSION_INDEX_VERSION {
+        return Ok(SessionIndexStatus::Future {
+            found_version: version.index_version,
+            current_version: SESSION_INDEX_VERSION,
+        });
+    }
+    if version.index_version != SESSION_INDEX_VERSION {
+        return Ok(SessionIndexStatus::Stale {
+            found_version: Some(version.index_version),
+            current_version: SESSION_INDEX_VERSION,
+            reason: "index version is stale".to_string(),
+        });
+    }
+    let index = match serde_json::from_str::<SessionIndex>(&contents) {
+        Ok(index) => index,
+        Err(error) => {
+            return Ok(SessionIndexStatus::Corrupt {
+                current_version: SESSION_INDEX_VERSION,
+                reason: error.to_string(),
+            });
+        }
     };
     let file = fingerprint(event_path)?;
-    if index.index_version == SESSION_INDEX_VERSION
-        && index.session_id == session_id
-        && index.file == file
-    {
-        Ok(Some(index))
+    if index.session_id == session_id && index.file == file {
+        Ok(SessionIndexStatus::Current(Box::new(index)))
     } else {
-        Ok(None)
+        Ok(SessionIndexStatus::Stale {
+            found_version: Some(version.index_version),
+            current_version: SESSION_INDEX_VERSION,
+            reason: "event file fingerprint changed".to_string(),
+        })
     }
 }
 

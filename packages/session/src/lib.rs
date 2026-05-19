@@ -11,7 +11,7 @@
 pub(crate) mod index;
 pub(crate) mod reader;
 
-pub use index::SessionIndexHealth;
+pub use index::{SessionIndexHealth, SessionIndexStatus};
 
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
@@ -63,6 +63,40 @@ pub enum SessionStoreError {
     InvalidFileName(PathBuf),
     #[error("session event file name is not a session ID: {0}")]
     InvalidSessionId(String),
+}
+
+/// Action a migration plan would perform for session persistence metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMigrationAction {
+    /// No action is needed.
+    None,
+    /// Rebuild derived session indexes from canonical event logs.
+    RebuildDerivedIndex,
+}
+
+/// Migration status for a single session persistence target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrationPlanItem {
+    pub session_id: SessionId,
+    pub current_version: u16,
+    pub found_version: Option<u16>,
+    pub action: SessionMigrationAction,
+    pub reason: String,
+    pub automatic: bool,
+}
+
+/// Migration plan for session persistence metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrationPlan {
+    pub domain: &'static str,
+    pub items: Vec<SessionMigrationPlanItem>,
+}
+
+impl SessionMigrationPlan {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 /// Append-only event store for session histories.
@@ -440,6 +474,85 @@ impl SessionEventStore {
             }
         }
         Ok(health)
+    }
+
+    /// Plan safe session persistence migrations without applying them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session directory or event metadata cannot be read.
+    pub fn migration_plan(&self) -> Result<SessionMigrationPlan, SessionStoreError> {
+        let mut items = Vec::new();
+        if !self.root.exists() {
+            return Ok(SessionMigrationPlan {
+                domain: "sessions/index",
+                items,
+            });
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
+                continue;
+            }
+            let session_id = parse_session_file_name(&path)?;
+            match index::inspect_index(&self.root, session_id, &path)? {
+                index::SessionIndexStatus::Current(_) => {}
+                index::SessionIndexStatus::Missing { current_version } => {
+                    items.push(SessionMigrationPlanItem {
+                        session_id,
+                        current_version,
+                        found_version: None,
+                        action: SessionMigrationAction::RebuildDerivedIndex,
+                        reason: "index is missing".to_string(),
+                        automatic: true,
+                    });
+                }
+                index::SessionIndexStatus::Stale {
+                    found_version,
+                    current_version,
+                    reason,
+                } => {
+                    items.push(SessionMigrationPlanItem {
+                        session_id,
+                        current_version,
+                        found_version,
+                        action: SessionMigrationAction::RebuildDerivedIndex,
+                        reason,
+                        automatic: true,
+                    });
+                }
+                index::SessionIndexStatus::Corrupt {
+                    current_version,
+                    reason,
+                } => {
+                    items.push(SessionMigrationPlanItem {
+                        session_id,
+                        current_version,
+                        found_version: None,
+                        action: SessionMigrationAction::RebuildDerivedIndex,
+                        reason: format!("index is corrupt: {reason}"),
+                        automatic: true,
+                    });
+                }
+                index::SessionIndexStatus::Future {
+                    found_version,
+                    current_version,
+                } => {
+                    items.push(SessionMigrationPlanItem {
+                        session_id,
+                        current_version,
+                        found_version: Some(found_version),
+                        action: SessionMigrationAction::None,
+                        reason: "index was written by a newer Bcode version".to_string(),
+                        automatic: false,
+                    });
+                }
+            }
+        }
+        Ok(SessionMigrationPlan {
+            domain: "sessions/index",
+            items,
+        })
     }
 
     fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {

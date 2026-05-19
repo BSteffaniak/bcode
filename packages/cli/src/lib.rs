@@ -96,6 +96,7 @@ pub async fn run() -> Result<(), CliError> {
             }
             SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
             SessionCommand::Doctor { session_id } => session_doctor(session_id)?,
+            SessionCommand::Migrate { command } => handle_session_migrate_command(command)?,
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
             SessionCommand::Repair { session_id } => session_repair(session_id)?,
         },
@@ -290,12 +291,22 @@ enum SessionCommand {
     Doctor {
         session_id: Option<SessionId>,
     },
+    Migrate {
+        #[command(subcommand)]
+        command: SessionMigrateCommand,
+    },
     Reindex {
         session_id: Option<SessionId>,
     },
     Repair {
         session_id: SessionId,
     },
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum SessionMigrateCommand {
+    Status,
+    Plan,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2312,6 +2323,41 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
         item.last_good_offset,
         item.issue_count
     );
+}
+
+fn handle_session_migrate_command(command: SessionMigrateCommand) -> Result<(), CliError> {
+    match command {
+        SessionMigrateCommand::Status | SessionMigrateCommand::Plan => session_migration_plan(),
+    }
+}
+
+fn session_migration_plan() -> Result<(), CliError> {
+    let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    let plan = store.migration_plan()?;
+    if plan.is_empty() {
+        println!("{}: current", plan.domain);
+        return Ok(());
+    }
+    println!("{}: {} migration item(s)", plan.domain, plan.items.len());
+    for item in plan.items {
+        let found_version = item
+            .found_version
+            .map_or_else(|| "none".to_string(), |version| version.to_string());
+        let action = match item.action {
+            bcode_session::SessionMigrationAction::None => "none",
+            bcode_session::SessionMigrationAction::RebuildDerivedIndex => "rebuild-derived-index",
+        };
+        let mode = if item.automatic {
+            "automatic"
+        } else {
+            "manual"
+        };
+        println!(
+            "{}\t{}\tfound={}\tcurrent={}\t{}\t{}",
+            item.session_id, action, found_version, item.current_version, mode, item.reason
+        );
+    }
+    Ok(())
 }
 
 fn session_reindex(session_id: Option<SessionId>) -> Result<(), CliError> {
