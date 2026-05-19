@@ -151,6 +151,8 @@ impl SessionEventStore {
             return Ok(sessions);
         }
 
+        self.migrate_all_event_logs_to_current()?;
+
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
@@ -2004,7 +2006,7 @@ fn history_page_from_events(
     }
 }
 
-const fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAccessStatus {
+fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAccessStatus {
     access_status_from_schema_versions(
         report.min_schema_version,
         report.max_schema_version,
@@ -2012,23 +2014,21 @@ const fn access_status_from_report(report: &reader::SessionReadReport) -> Sessio
     )
 }
 
-const fn access_status_from_schema_versions(
-    _min_schema_version: Option<u16>,
+fn access_status_from_schema_versions(
+    min_schema_version: Option<u16>,
     max_schema_version: Option<u16>,
     has_issues: bool,
 ) -> SessionAccessStatus {
     if has_issues {
         return SessionAccessStatus::RepairRequired;
     }
-    match max_schema_version {
-        Some(version) if version > CURRENT_SESSION_EVENT_SCHEMA_VERSION => {
-            SessionAccessStatus::BlockedFutureVersion
-        }
-        Some(version) if version < CURRENT_SESSION_EVENT_SCHEMA_VERSION => {
-            SessionAccessStatus::ReadOnlyMigrationRequired
-        }
-        Some(_) | None => SessionAccessStatus::ReadWrite,
+    if max_schema_version.is_some_and(|version| version > CURRENT_SESSION_EVENT_SCHEMA_VERSION) {
+        return SessionAccessStatus::BlockedFutureVersion;
     }
+    if min_schema_version.is_some_and(|version| version < CURRENT_SESSION_EVENT_SCHEMA_VERSION) {
+        return SessionAccessStatus::ReadOnlyMigrationRequired;
+    }
+    SessionAccessStatus::ReadWrite
 }
 
 fn current_unix_millis() -> u64 {
@@ -2482,6 +2482,121 @@ mod tests {
         assert_eq!(
             second.items[0].status,
             super::SessionMigrationApplyStatus::Skipped
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn built_in_event_log_migration_handles_mixed_schema_events() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        let session_id = bcode_session_models::SessionId::new();
+        let path = root.join(format!("{session_id}.events"));
+        write_legacy_event(
+            &path,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 2,
+                sequence: 0,
+                session_id,
+                kind: SessionEventKind::SessionCreated {
+                    name: Some("mixed old".to_string()),
+                },
+            },
+        );
+        append_legacy_event(
+            &path,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
+                sequence: 1,
+                session_id,
+                kind: SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "hello".to_string(),
+                },
+            },
+        );
+        append_legacy_event(
+            &path,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                session_id,
+                kind: SessionEventKind::SystemMessage {
+                    text: "current".to_string(),
+                },
+            },
+        );
+
+        let store = super::SessionEventStore::new(&root);
+        let report = store
+            .migrate_event_log_to_current(session_id)
+            .expect("mixed event migration should apply");
+        assert_eq!(
+            report.items[0].status,
+            super::SessionMigrationApplyStatus::Applied
+        );
+        assert!(report.backup_dir.expect("backup should exist").exists());
+        let history = store
+            .read_session_events(session_id)
+            .expect("history should read");
+        assert_eq!(history.len(), 3);
+        assert!(
+            history
+                .iter()
+                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION)
+        );
+        assert_eq!(history[0].sequence, 0);
+        assert_eq!(history[1].sequence, 1);
+        assert_eq!(history[2].sequence, 2);
+
+        let second = store
+            .migrate_event_log_to_current(session_id)
+            .expect("second migration should skip");
+        assert_eq!(
+            second.items[0].status,
+            super::SessionMigrationApplyStatus::Skipped
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn persistent_manager_auto_migrates_old_schema_sessions() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        let session_id = bcode_session_models::SessionId::new();
+        let path = root.join(format!("{session_id}.events"));
+        write_legacy_event(
+            &path,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
+                sequence: 0,
+                session_id,
+                kind: SessionEventKind::SessionCreated {
+                    name: Some("auto".to_string()),
+                },
+            },
+        );
+
+        let manager =
+            SessionManager::persistent(&root).expect("manager should migrate and restore");
+        assert_eq!(
+            manager
+                .session_access_status(session_id)
+                .await
+                .expect("status should load"),
+            super::SessionAccessStatus::ReadWrite
+        );
+        let attachment = manager
+            .attach_session_recent(session_id, ClientId::new(), 10)
+            .await
+            .expect("migrated session should attach");
+        assert!(
+            attachment
+                .history
+                .iter()
+                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION)
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
@@ -3010,6 +3125,19 @@ mod tests {
 
     fn write_legacy_event(path: &std::path::Path, event: &SessionEvent) {
         let mut file = std::fs::File::create(path).expect("event file should create");
+        write_legacy_event_payload(&mut file, event);
+    }
+
+    fn append_legacy_event(path: &std::path::Path, event: &SessionEvent) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("event file should open");
+        write_legacy_event_payload(&mut file, event);
+    }
+
+    fn write_legacy_event_payload(file: &mut std::fs::File, event: &SessionEvent) {
         let payload = bmux_codec::to_vec(event).expect("legacy event should encode");
         file.write_all(
             &u32::try_from(payload.len())
