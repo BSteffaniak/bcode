@@ -2384,6 +2384,9 @@ fn session_migration_plan() -> Result<(), CliError> {
         let action = match item.action {
             bcode_session::SessionMigrationAction::None => "none",
             bcode_session::SessionMigrationAction::RebuildDerivedIndex => "rebuild-derived-index",
+            bcode_session::SessionMigrationAction::RewriteCanonicalEvents => {
+                "rewrite-canonical-events"
+            }
         };
         let mode = if item.automatic {
             "automatic"
@@ -2418,6 +2421,9 @@ fn session_migration_apply(dry_run: bool, backup: bool) -> Result<(), CliError> 
         let action = match item.action {
             bcode_session::SessionMigrationAction::None => "none",
             bcode_session::SessionMigrationAction::RebuildDerivedIndex => "rebuild-derived-index",
+            bcode_session::SessionMigrationAction::RewriteCanonicalEvents => {
+                "rewrite-canonical-events"
+            }
         };
         let status = match item.status {
             bcode_session::SessionMigrationApplyStatus::Planned => "planned",

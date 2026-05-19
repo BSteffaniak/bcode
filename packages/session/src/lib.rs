@@ -123,6 +123,20 @@ struct SessionMigrationBackupFile {
     backup: String,
 }
 
+fn write_event_frame(file: &mut fs::File, event: &SessionEvent) -> Result<u64, SessionStoreError> {
+    let payload = bmux_codec::to_vec(event).map_err(SessionStoreError::Encode)?;
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| SessionStoreError::FrameTooLarge(payload.len()))?;
+    let checksum = Sha256::digest(&payload);
+    file.write_all(FRAME_V2_MAGIC)?;
+    file.write_all(&FRAME_V2_VERSION.to_le_bytes())?;
+    file.write_all(&CURRENT_SESSION_EVENT_SCHEMA_VERSION.to_le_bytes())?;
+    file.write_all(&payload_len.to_le_bytes())?;
+    file.write_all(&checksum)?;
+    file.write_all(&payload)?;
+    Ok(u64::from(payload_len).saturating_add(44))
+}
+
 impl SessionEventStore {
     /// Create an event store rooted at the provided directory.
     #[must_use]
@@ -166,18 +180,8 @@ impl SessionEventStore {
             .read(true)
             .open(&path)?;
         let offset = file.seek(SeekFrom::End(0))?;
-        let payload = bmux_codec::to_vec(event).map_err(SessionStoreError::Encode)?;
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| SessionStoreError::FrameTooLarge(payload.len()))?;
-        let checksum = Sha256::digest(&payload);
-        file.write_all(FRAME_V2_MAGIC)?;
-        file.write_all(&FRAME_V2_VERSION.to_le_bytes())?;
-        file.write_all(&CURRENT_SESSION_EVENT_SCHEMA_VERSION.to_le_bytes())?;
-        file.write_all(&payload_len.to_le_bytes())?;
-        file.write_all(&checksum)?;
-        file.write_all(&payload)?;
+        let frame_len = write_event_frame(&mut file, event)?;
         file.flush()?;
-        let frame_len = u64::from(payload_len).saturating_add(44);
         let entry = index::SessionIndexEntry::from_event(event, offset, frame_len);
         if let Err(error) = index::append_entry(&self.root, event.session_id, &entry) {
             eprintln!(
@@ -742,6 +746,16 @@ impl SessionEventStore {
                         message: item.reason.clone(),
                     });
                 }
+                SessionMigrationAction::RewriteCanonicalEvents => {
+                    items.push(SessionMigrationReportItem {
+                        migration_id: item.migration_id,
+                        session_id: item.session_id,
+                        action: item.action,
+                        status: SessionMigrationApplyStatus::Skipped,
+                        message: "canonical event migrations require the typed executor"
+                            .to_string(),
+                    });
+                }
                 SessionMigrationAction::RebuildDerivedIndex => {
                     if options.dry_run {
                         items.push(SessionMigrationReportItem {
@@ -769,6 +783,182 @@ impl SessionEventStore {
             dry_run: options.dry_run,
             backup_dir,
             items,
+        })
+    }
+
+    /// Rewrite a canonical session event log through a registered event migration.
+    ///
+    /// The executor owns backup, temp writes, validation, atomic replacement, and
+    /// derived index rebuild. The migration implementation only transforms events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log cannot be read, backed up, migrated, validated,
+    /// atomically replaced, or reindexed.
+    pub fn migrate_event_log<M: SessionEventLogMigration>(
+        &self,
+        session_id: SessionId,
+        migration: &M,
+    ) -> Result<SessionMigrationReport, SessionStoreError> {
+        let started_at_ms = current_unix_millis();
+        let run_id = format!("session-event-migration-{started_at_ms}");
+        let migration_id = M::ID;
+        let session_ids = vec![session_id];
+        let migration_ids = vec![migration_id];
+        migration::append_journal_entry(
+            &self.root,
+            &SessionMigrationJournalEntry {
+                run_id: run_id.clone(),
+                domain: "sessions/events",
+                status: SessionMigrationJournalStatus::Started,
+                dry_run: false,
+                backup: true,
+                backup_dir: None,
+                started_at_ms,
+                finished_at_ms: None,
+                migration_ids: migration_ids.clone(),
+                session_ids: session_ids.clone(),
+                error: None,
+            },
+        )?;
+
+        let result = self.migrate_event_log_inner(session_id, migration_id, migration);
+        let finished_at_ms = current_unix_millis();
+        match &result {
+            Ok(report) => {
+                migration::append_journal_entry(
+                    &self.root,
+                    &SessionMigrationJournalEntry {
+                        run_id,
+                        domain: "sessions/events",
+                        status: SessionMigrationJournalStatus::Completed,
+                        dry_run: false,
+                        backup: true,
+                        backup_dir: report
+                            .backup_dir
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                        started_at_ms,
+                        finished_at_ms: Some(finished_at_ms),
+                        migration_ids,
+                        session_ids,
+                        error: None,
+                    },
+                )?;
+            }
+            Err(error) => {
+                let _ = migration::append_journal_entry(
+                    &self.root,
+                    &SessionMigrationJournalEntry {
+                        run_id,
+                        domain: "sessions/events",
+                        status: SessionMigrationJournalStatus::Failed,
+                        dry_run: false,
+                        backup: true,
+                        backup_dir: None,
+                        started_at_ms,
+                        finished_at_ms: Some(finished_at_ms),
+                        migration_ids,
+                        session_ids,
+                        error: Some(error.to_string()),
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    fn migrate_event_log_inner<M: SessionEventLogMigration>(
+        &self,
+        session_id: SessionId,
+        migration_id: &'static str,
+        migration: &M,
+    ) -> Result<SessionMigrationReport, SessionStoreError> {
+        let path = self.event_path(session_id);
+        let report = reader::read_events(&path)?;
+        if report.max_schema_version == Some(M::TO_SCHEMA)
+            && report.min_schema_version == Some(M::TO_SCHEMA)
+        {
+            return Ok(SessionMigrationReport {
+                domain: "sessions/events",
+                dry_run: false,
+                backup_dir: None,
+                items: vec![SessionMigrationReportItem {
+                    migration_id,
+                    session_id,
+                    action: SessionMigrationAction::RewriteCanonicalEvents,
+                    status: SessionMigrationApplyStatus::Skipped,
+                    message: "already at target schema".to_string(),
+                }],
+            });
+        }
+        if report.max_schema_version != Some(M::FROM_SCHEMA)
+            || report.min_schema_version != Some(M::FROM_SCHEMA)
+        {
+            return Err(SessionStoreError::InvalidSessionId(format!(
+                "session {session_id} schema range {:?}..{:?} does not match migration {migration_id} {}->{}",
+                report.min_schema_version,
+                report.max_schema_version,
+                M::FROM_SCHEMA,
+                M::TO_SCHEMA
+            )));
+        }
+
+        let plan_item = SessionMigrationPlanItem {
+            migration_id,
+            session_id,
+            current_version: M::TO_SCHEMA,
+            found_version: Some(M::FROM_SCHEMA),
+            action: SessionMigrationAction::RewriteCanonicalEvents,
+            reason: format!(
+                "canonical event migration {}->{}",
+                M::FROM_SCHEMA,
+                M::TO_SCHEMA
+            ),
+            automatic: false,
+            backup_policy: SessionMigrationBackupPolicy::Required,
+        };
+        let backup_dir = self.backup_canonical_events(&[plan_item])?;
+        let tmp_path = path.with_extension("events.tmp");
+        let mut tmp = fs::File::create(&tmp_path)?;
+        let mut migrated_events = Vec::with_capacity(report.events.len());
+        for mut event in report.events {
+            event = migration
+                .migrate_event(event)
+                .map_err(|error| SessionStoreError::InvalidSessionId(error.to_string()))?;
+            event.schema_version = M::TO_SCHEMA;
+            write_event_frame(&mut tmp, &event)?;
+            migrated_events.push(event);
+        }
+        tmp.flush()?;
+        drop(tmp);
+        let validation = reader::read_events(&tmp_path)?;
+        if validation.events.len() != migrated_events.len()
+            || validation.min_schema_version != Some(M::TO_SCHEMA)
+            || validation.max_schema_version != Some(M::TO_SCHEMA)
+            || !validation.issues.is_empty()
+        {
+            return Err(SessionStoreError::InvalidSessionId(format!(
+                "migrated session log validation failed for {session_id}"
+            )));
+        }
+        fs::rename(&tmp_path, &path)?;
+        self.reindex_session(session_id)?;
+        Ok(SessionMigrationReport {
+            domain: "sessions/events",
+            dry_run: false,
+            backup_dir: Some(backup_dir),
+            items: vec![SessionMigrationReportItem {
+                migration_id,
+                session_id,
+                action: SessionMigrationAction::RewriteCanonicalEvents,
+                status: SessionMigrationApplyStatus::Applied,
+                message: format!(
+                    "migrated canonical events {}->{}",
+                    M::FROM_SCHEMA,
+                    M::TO_SCHEMA
+                ),
+            }],
         })
     }
 
@@ -2257,6 +2447,75 @@ mod tests {
             &event.kind,
             SessionEventKind::SystemMessage { text } if text == "system"
         )));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    struct TestV7ToCurrentMigration;
+
+    impl super::SessionEventLogMigration for TestV7ToCurrentMigration {
+        const ID: &'static str = "test-session-events-v7-to-current";
+        const FROM_SCHEMA: u16 = CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1;
+        const TO_SCHEMA: u16 = CURRENT_SESSION_EVENT_SCHEMA_VERSION;
+
+        fn migrate_event(
+            &self,
+            event: SessionEvent,
+        ) -> Result<SessionEvent, super::SessionEventLogMigrationError> {
+            Ok(event)
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_event_log_migration_rewrites_validates_and_reindexes() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        let session_id = bcode_session_models::SessionId::new();
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
+            sequence: 0,
+            session_id,
+            kind: SessionEventKind::SessionCreated {
+                name: Some("old".to_string()),
+            },
+        };
+        let path = root.join(format!("{session_id}.events"));
+        write_legacy_event(&path, &event);
+
+        let store = super::SessionEventStore::new(&root);
+        let report = store
+            .migrate_event_log(session_id, &TestV7ToCurrentMigration)
+            .expect("migration should apply");
+        assert_eq!(
+            report.items[0].status,
+            super::SessionMigrationApplyStatus::Applied
+        );
+        assert!(report.backup_dir.expect("backup should exist").exists());
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        assert_eq!(
+            restored
+                .session_access_status(session_id)
+                .await
+                .expect("status should load"),
+            super::SessionAccessStatus::ReadWrite
+        );
+        let history = restored
+            .session_history(session_id)
+            .await
+            .expect("history should load");
+        assert_eq!(
+            history[0].schema_version,
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION
+        );
+
+        let second = store
+            .migrate_event_log(session_id, &TestV7ToCurrentMigration)
+            .expect("second migration should be idempotent");
+        assert_eq!(
+            second.items[0].status,
+            super::SessionMigrationApplyStatus::Skipped
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

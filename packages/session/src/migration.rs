@@ -13,6 +13,8 @@ pub enum SessionMigrationAction {
     None,
     /// Rebuild derived session indexes from canonical event logs.
     RebuildDerivedIndex,
+    /// Rewrite canonical session event logs to a newer schema.
+    RewriteCanonicalEvents,
 }
 
 /// How a migration handles backups.
