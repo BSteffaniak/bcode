@@ -62,6 +62,7 @@ bmux_ipc       = { default-features = false, git = "https://github.com/BSteffani
 bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies
+arboard = { version = "3.6.1", default-features = false }
 aws-config = { version = "1.8.16", default-features = false, features = [
     "credentials-process",
     "rt-tokio",

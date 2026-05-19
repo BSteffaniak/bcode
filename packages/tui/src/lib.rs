@@ -17,6 +17,7 @@
 
 //! Terminal user interface for Bcode.
 
+use arboard::Clipboard;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_command::CommandInfo;
 use bcode_ipc::Event;
@@ -90,6 +91,9 @@ const COLOR_SELECTED_BG: Color = Color::Rgb(38, 52, 64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TuiAction {
     InputSubmit,
+    ClipboardCopy,
+    ClipboardCut,
+    ClipboardPaste,
     InputNewLine,
     InputHistoryPrevious,
     InputHistoryNext,
@@ -146,6 +150,9 @@ impl TuiAction {
     fn from_id(id: &str) -> Option<Self> {
         Some(match id {
             "tui.input.submit" => Self::InputSubmit,
+            "tui.clipboard.copy" => Self::ClipboardCopy,
+            "tui.clipboard.cut" => Self::ClipboardCut,
+            "tui.clipboard.paste" => Self::ClipboardPaste,
             "tui.input.newLine" => Self::InputNewLine,
             "tui.input.historyPrevious" => Self::InputHistoryPrevious,
             "tui.input.historyNext" => Self::InputHistoryNext,
@@ -349,6 +356,9 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("shift+ctrl+right", TuiAction::SelectCursorWordRight),
                 ("shift+up", TuiAction::SelectCursorUp),
                 ("shift+down", TuiAction::SelectCursorDown),
+                ("ctrl+shift+c", TuiAction::ClipboardCopy),
+                ("ctrl+x", TuiAction::ClipboardCut),
+                ("ctrl+v", TuiAction::ClipboardPaste),
                 ("escape", TuiAction::AppInterrupt),
                 ("ctrl+d", TuiAction::AppExit),
                 ("ctrl+c", TuiAction::AppClear),
@@ -419,6 +429,9 @@ fn default_keybindings() -> BTreeMap<TuiScope, BTreeMap<String, TuiAction>> {
                 ("shift+ctrl+right", TuiAction::SelectCursorWordRight),
                 ("shift+up", TuiAction::SelectCursorUp),
                 ("shift+down", TuiAction::SelectCursorDown),
+                ("ctrl+shift+c", TuiAction::ClipboardCopy),
+                ("ctrl+x", TuiAction::ClipboardCut),
+                ("ctrl+v", TuiAction::ClipboardPaste),
                 ("backspace", TuiAction::DeleteCharBackward),
                 ("delete", TuiAction::DeleteCharForward),
                 ("alt+backspace", TuiAction::DeleteWordBackward),
@@ -840,6 +853,9 @@ async fn handle_tui_action(
         TuiAction::TranscriptBottom => app.scroll_bottom(),
         TuiAction::TranscriptLineUp => app.scroll_line_up(),
         TuiAction::TranscriptLineDown => app.scroll_line_down(),
+        TuiAction::ClipboardCopy => app.copy_selection_to_clipboard(),
+        TuiAction::ClipboardCut => app.cut_selection_to_clipboard(),
+        TuiAction::ClipboardPaste => app.paste_from_clipboard(),
         TuiAction::InputSubmit => {
             if app.search_mode {
                 app.finish_search();
@@ -1513,6 +1529,47 @@ async fn handle_session_picker_text_key(
                 app.status = "rename canceled".to_string();
                 Ok(true)
             }
+            KeyCode::Char('c')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if let Some(text) = input.selected_text() {
+                    match set_system_clipboard_text(&text) {
+                        Ok(()) => app.status = "copied selection to clipboard".to_string(),
+                        Err(error) => app.status = format!("clipboard copy failed: {error}"),
+                    }
+                } else {
+                    app.status = "no selected text to copy".to_string();
+                }
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(text) = input.selected_text() {
+                    match set_system_clipboard_text(&text) {
+                        Ok(()) => {
+                            let _ = input.delete_selection();
+                            app.status = "cut selection to clipboard".to_string();
+                        }
+                        Err(error) => app.status = format!("clipboard cut failed: {error}"),
+                    }
+                } else {
+                    app.status = "no selected text to cut".to_string();
+                }
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match get_system_clipboard_text() {
+                    Ok(text) => {
+                        input.paste(&text);
+                        app.status = "pasted from clipboard".to_string();
+                    }
+                    Err(error) => app.status = format!("clipboard paste failed: {error}"),
+                }
+                app.mode = SessionPickerMode::Renaming { input };
+                Ok(true)
+            }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     input.delete(TextDelete::WordBackward);
@@ -1906,6 +1963,14 @@ impl ratatui::widgets::Widget for &SessionPickerApp {
         };
         Paragraph::new(hint).render(chunks[3], buf);
     }
+}
+
+fn get_system_clipboard_text() -> Result<String, arboard::Error> {
+    Clipboard::new()?.get_text()
+}
+
+fn set_system_clipboard_text(text: &str) -> Result<(), arboard::Error> {
+    Clipboard::new()?.set_text(text.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -3120,6 +3185,57 @@ impl ChatApp {
             if self.search_mode {
                 self.update_search();
             }
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.command_palette
+            .as_ref()
+            .and_then(|palette| palette.filter.selected_text())
+            .or_else(|| self.input.selected_text())
+    }
+
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(text) = self.selected_text() else {
+            self.status = "no selected text to copy".to_string();
+            return;
+        };
+        match set_system_clipboard_text(&text) {
+            Ok(()) => self.status = "copied selection to clipboard".to_string(),
+            Err(error) => self.status = format!("clipboard copy failed: {error}"),
+        }
+    }
+
+    fn cut_selection_to_clipboard(&mut self) {
+        let Some(text) = self.selected_text() else {
+            self.status = "no selected text to cut".to_string();
+            return;
+        };
+        match set_system_clipboard_text(&text) {
+            Ok(()) => {
+                if let Some(palette) = &mut self.command_palette {
+                    let _ = palette.filter.delete_selection();
+                    palette.selected = 0;
+                } else {
+                    self.reset_input_history_navigation();
+                    let _ = self.input.delete_selection();
+                    if self.search_mode {
+                        self.update_search();
+                    }
+                }
+                self.status = "cut selection to clipboard".to_string();
+            }
+            Err(error) => self.status = format!("clipboard cut failed: {error}"),
+        }
+    }
+
+    fn paste_from_clipboard(&mut self) {
+        match get_system_clipboard_text() {
+            Ok(text) => {
+                self.paste_text(&text);
+                self.status = "pasted from clipboard".to_string();
+            }
+            Err(error) => self.status = format!("clipboard paste failed: {error}"),
         }
     }
 
@@ -4737,6 +4853,19 @@ mod tests {
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
         app.input = TextEditBuffer::from_text(text);
         app
+    }
+
+    #[test]
+    fn cut_selection_removes_composer_selection_after_successful_copy() {
+        let mut app = chat_app_with_input("hello world");
+
+        apply_chat_action(&mut app, TuiAction::MoveCursorStart);
+        apply_chat_action(&mut app, TuiAction::SelectCursorWordRight);
+        let selected = app.selected_text().expect("selection should exist");
+        assert!(set_system_clipboard_text(&selected).is_ok());
+        let _ = app.input.delete_selection();
+
+        assert_eq!(app.input.text(), " world");
     }
 
     #[test]

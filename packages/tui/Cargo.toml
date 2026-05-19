@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+arboard = { workspace = true }
 bcode_client = { workspace = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
