@@ -19,6 +19,7 @@ use bcode_session_models::{
     SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary, SessionTokenUsage,
     SessionTraceEvent,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -99,10 +100,62 @@ impl SessionMigrationPlan {
     }
 }
 
+/// Options for applying session persistence migrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionMigrationOptions {
+    /// Report actions without modifying files.
+    pub dry_run: bool,
+    /// Back up canonical event logs before applying migrations.
+    pub backup: bool,
+}
+
+/// Result status for one migration item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMigrationApplyStatus {
+    /// The item would be applied, but dry-run mode was requested.
+    Planned,
+    /// The item was applied.
+    Applied,
+    /// The item was skipped because it requires manual handling.
+    Skipped,
+}
+
+/// Result for one migration item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrationReportItem {
+    pub session_id: SessionId,
+    pub action: SessionMigrationAction,
+    pub status: SessionMigrationApplyStatus,
+    pub message: String,
+}
+
+/// Result from applying a session migration plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrationReport {
+    pub domain: &'static str,
+    pub dry_run: bool,
+    pub backup_dir: Option<PathBuf>,
+    pub items: Vec<SessionMigrationReportItem>,
+}
+
 /// Append-only event store for session histories.
 #[derive(Debug, Clone)]
 pub struct SessionEventStore {
     root: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionMigrationBackupManifest {
+    created_at_ms: u64,
+    domain: &'static str,
+    files: Vec<SessionMigrationBackupFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionMigrationBackupFile {
+    session_id: SessionId,
+    source: String,
+    backup: String,
 }
 
 impl SessionEventStore {
@@ -553,6 +606,103 @@ impl SessionEventStore {
             domain: "sessions/index",
             items,
         })
+    }
+
+    /// Apply safe session persistence migrations.
+    ///
+    /// Derived index migrations are rebuilt from canonical event logs. When
+    /// `backup` is set, canonical event logs are copied to a migration backup
+    /// directory before any derived files are rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if migration planning, backup creation, or index rebuilds fail.
+    pub fn apply_migration_plan(
+        &self,
+        options: SessionMigrationOptions,
+    ) -> Result<SessionMigrationReport, SessionStoreError> {
+        let plan = self.migration_plan()?;
+        let backup_dir = if options.backup && !options.dry_run && !plan.items.is_empty() {
+            Some(self.backup_canonical_events(&plan.items)?)
+        } else {
+            None
+        };
+        let mut items = Vec::new();
+        for item in plan.items {
+            match item.action {
+                SessionMigrationAction::None => {
+                    items.push(SessionMigrationReportItem {
+                        session_id: item.session_id,
+                        action: item.action,
+                        status: SessionMigrationApplyStatus::Skipped,
+                        message: item.reason,
+                    });
+                }
+                SessionMigrationAction::RebuildDerivedIndex => {
+                    if options.dry_run {
+                        items.push(SessionMigrationReportItem {
+                            session_id: item.session_id,
+                            action: item.action,
+                            status: SessionMigrationApplyStatus::Planned,
+                            message: item.reason,
+                        });
+                    } else {
+                        self.reindex_session(item.session_id)?;
+                        items.push(SessionMigrationReportItem {
+                            session_id: item.session_id,
+                            action: item.action,
+                            status: SessionMigrationApplyStatus::Applied,
+                            message: item.reason,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(SessionMigrationReport {
+            domain: plan.domain,
+            dry_run: options.dry_run,
+            backup_dir,
+            items,
+        })
+    }
+
+    fn backup_canonical_events(
+        &self,
+        items: &[SessionMigrationPlanItem],
+    ) -> Result<PathBuf, SessionStoreError> {
+        let backup_dir = self
+            .root
+            .join("backups")
+            .join(format!("migration-{}", current_unix_millis()));
+        fs::create_dir_all(&backup_dir)?;
+        let mut manifest = SessionMigrationBackupManifest {
+            created_at_ms: current_unix_millis(),
+            domain: "sessions/events",
+            files: Vec::new(),
+        };
+        for item in items {
+            if item.action == SessionMigrationAction::None {
+                continue;
+            }
+            let source = self.event_path(item.session_id);
+            if !source.exists() {
+                continue;
+            }
+            let file_name = format!("{}.events", item.session_id);
+            let destination = backup_dir.join(&file_name);
+            fs::copy(&source, &destination)?;
+            manifest.files.push(SessionMigrationBackupFile {
+                session_id: item.session_id,
+                source: source.display().to_string(),
+                backup: file_name,
+            });
+        }
+        let manifest_path = backup_dir.join("manifest.json");
+        let tmp_path = backup_dir.join("manifest.json.tmp");
+        let contents = serde_json::to_vec_pretty(&manifest).map_err(SessionStoreError::Index)?;
+        fs::write(&tmp_path, contents)?;
+        fs::rename(tmp_path, manifest_path)?;
+        Ok(backup_dir)
     }
 
     fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {

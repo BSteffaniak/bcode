@@ -307,6 +307,12 @@ enum SessionCommand {
 enum SessionMigrateCommand {
     Status,
     Plan,
+    Apply {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        backup: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2328,6 +2334,9 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
 fn handle_session_migrate_command(command: SessionMigrateCommand) -> Result<(), CliError> {
     match command {
         SessionMigrateCommand::Status | SessionMigrateCommand::Plan => session_migration_plan(),
+        SessionMigrateCommand::Apply { dry_run, backup } => {
+            session_migration_apply(dry_run, backup)
+        }
     }
 }
 
@@ -2355,6 +2364,40 @@ fn session_migration_plan() -> Result<(), CliError> {
         println!(
             "{}\t{}\tfound={}\tcurrent={}\t{}\t{}",
             item.session_id, action, found_version, item.current_version, mode, item.reason
+        );
+    }
+    Ok(())
+}
+
+fn session_migration_apply(dry_run: bool, backup: bool) -> Result<(), CliError> {
+    let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    let report =
+        store.apply_migration_plan(bcode_session::SessionMigrationOptions { dry_run, backup })?;
+    if report.items.is_empty() {
+        println!("{}: current", report.domain);
+        return Ok(());
+    }
+    if let Some(backup_dir) = &report.backup_dir {
+        println!("backup: {}", backup_dir.display());
+    }
+    println!(
+        "{}: {} migration item(s)",
+        report.domain,
+        report.items.len()
+    );
+    for item in report.items {
+        let action = match item.action {
+            bcode_session::SessionMigrationAction::None => "none",
+            bcode_session::SessionMigrationAction::RebuildDerivedIndex => "rebuild-derived-index",
+        };
+        let status = match item.status {
+            bcode_session::SessionMigrationApplyStatus::Planned => "planned",
+            bcode_session::SessionMigrationApplyStatus::Applied => "applied",
+            bcode_session::SessionMigrationApplyStatus::Skipped => "skipped",
+        };
+        println!(
+            "{}\t{}\t{}\t{}",
+            item.session_id, action, status, item.message
         );
     }
     Ok(())
