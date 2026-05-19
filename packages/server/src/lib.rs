@@ -1353,13 +1353,10 @@ const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
-const COMPACTION_POLL_ATTEMPTS: usize = 1_200;
-const COMPACTION_TURN_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Default)]
 struct ModelPollOutcome {
     stop_reason: Option<bcode_model::StopReason>,
-    should_continue: bool,
     completion: Option<ModelTurnCompletion>,
     provider_error: Option<bcode_model::ProviderError>,
 }
@@ -1808,7 +1805,7 @@ async fn poll_compaction_summary(
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
     let mut idle_for = Duration::ZERO;
-    for _ in 0..COMPACTION_POLL_ATTEMPTS {
+    loop {
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
         };
@@ -1816,24 +1813,40 @@ async fn poll_compaction_summary(
             .await
             .map_err(CompactionError::Provider)?;
         if response.events.is_empty() {
-            idle_for = wait_for_compaction_event(idle_for).await?;
+            idle_for = wait_for_compaction_progress(idle_for).await?;
             continue;
         }
-        idle_for = Duration::ZERO;
+        let saw_progress = compaction_events_include_progress(&response.events);
         match handle_compaction_events(state, session_id, turn_id, &mut summary, response.events)
             .await
         {
-            CompactionPollStatus::Continue => {}
+            CompactionPollStatus::Continue => {
+                if saw_progress {
+                    idle_for = Duration::ZERO;
+                } else {
+                    idle_for = wait_for_compaction_progress(idle_for).await?;
+                }
+            }
             CompactionPollStatus::Finished => return Ok(summary),
             CompactionPollStatus::Failed(error) => return Err(CompactionError::Provider(error)),
         }
     }
-    Err(CompactionError::Provider(format!(
-        "model provider did not finish compaction turn within {COMPACTION_TURN_TIMEOUT_SECS} seconds"
-    )))
 }
 
-async fn wait_for_compaction_event(idle_for: Duration) -> Result<Duration, CompactionError> {
+fn compaction_events_include_progress(events: &[ProviderTurnEvent]) -> bool {
+    events.iter().any(compaction_event_is_progress)
+}
+
+const fn compaction_event_is_progress(event: &ProviderTurnEvent) -> bool {
+    match event {
+        ProviderTurnEvent::TextDelta { text } | ProviderTurnEvent::ReasoningDelta { text } => {
+            !text.is_empty()
+        }
+        _ => false,
+    }
+}
+
+async fn wait_for_compaction_progress(idle_for: Duration) -> Result<Duration, CompactionError> {
     let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
     if idle_for > MODEL_IDLE_TIMEOUT {
         return Err(CompactionError::Provider(format!(
@@ -1885,15 +1898,15 @@ async fn handle_compaction_events(
                 }
                 _ => return CompactionPollStatus::Finished,
             },
-            ProviderTurnEvent::ToolCallFinished { .. } => {
+            ProviderTurnEvent::ToolCallStarted { .. }
+            | ProviderTurnEvent::ToolCallDelta { .. }
+            | ProviderTurnEvent::ToolCallFinished { .. } => {
                 return CompactionPollStatus::Failed(
                     "compaction summary unexpectedly requested a tool".to_string(),
                 );
             }
             ProviderTurnEvent::TurnStarted
             | ProviderTurnEvent::ReasoningDelta { .. }
-            | ProviderTurnEvent::ToolCallStarted { .. }
-            | ProviderTurnEvent::ToolCallDelta { .. }
             | ProviderTurnEvent::ProviderMetadata { .. } => {}
         }
     }
@@ -2130,8 +2143,14 @@ async fn run_model_turn_inner(
             append_deferred_provider_error_if_needed(state, session_id, &outcome).await;
             return completion;
         }
-        if !outcome.should_continue {
-            return ModelTurnCompletion::completed();
+        match outcome.stop_reason {
+            Some(bcode_model::StopReason::ToolCall) => {}
+            Some(_) => return ModelTurnCompletion::completed(),
+            None => {
+                let message = "model provider polling ended without a terminal event".to_string();
+                append_system_event(state, session_id, message.clone()).await;
+                return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+            }
         }
         round = round.saturating_add(1);
         if state.max_tool_rounds.is_some_and(|max| round > max) {
@@ -2353,7 +2372,7 @@ async fn run_model_turn_round(
     )
     .await;
 
-    let (assistant_text, outcome) = poll_model_turn_events(
+    let (assistant_text, mut outcome) = poll_model_turn_events(
         state,
         session_id,
         provider_plugin_id,
@@ -2361,6 +2380,8 @@ async fn run_model_turn_round(
         &request.turn_id,
     )
     .await;
+
+    ensure_terminal_poll_outcome(state, session_id, &mut outcome).await;
 
     if !assistant_text.is_empty() {
         append_assistant_message_event(state, session_id, assistant_text).await;
@@ -2388,6 +2409,22 @@ async fn run_model_turn_round(
     )
     .await;
     Ok(outcome)
+}
+
+async fn ensure_terminal_poll_outcome(
+    state: &ServerState,
+    session_id: SessionId,
+    outcome: &mut ModelPollOutcome,
+) {
+    if outcome.stop_reason.is_some() || outcome.completion.is_some() {
+        return;
+    }
+    let message = "model provider polling ended without a terminal event".to_string();
+    append_system_event(state, session_id, message.clone()).await;
+    outcome.completion = Some(ModelTurnCompletion::with_message(
+        ModelTurnOutcome::Error,
+        message,
+    ));
 }
 
 async fn append_model_provider_round_finished_trace(
@@ -2429,7 +2466,7 @@ async fn poll_model_turn_events(
     let mut assistant_text = String::new();
     let mut outcome = ModelPollOutcome::default();
     let mut idle_for = Duration::ZERO;
-    for _ in 0..1_200 {
+    loop {
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
         };
@@ -2447,23 +2484,15 @@ async fn poll_model_turn_events(
             }
         };
         if response.events.is_empty() {
-            idle_for += MODEL_POLL_INTERVAL;
-            if idle_for > MODEL_IDLE_TIMEOUT {
-                let message = format!(
-                    "model provider was idle for {} seconds before timeout",
-                    MODEL_IDLE_TIMEOUT.as_secs()
-                );
-                append_system_event(state, session_id, message.clone()).await;
-                outcome.completion = Some(ModelTurnCompletion::with_message(
-                    ModelTurnOutcome::IdleTimeout,
-                    message,
-                ));
+            let Some(next_idle_for) =
+                wait_for_model_progress_or_timeout(state, session_id, idle_for, &mut outcome).await
+            else {
                 break;
-            }
-            tokio::time::sleep(MODEL_POLL_INTERVAL).await;
+            };
+            idle_for = next_idle_for;
             continue;
         }
-        idle_for = Duration::ZERO;
+        let saw_progress = model_events_include_progress(&response.events);
         for event in response.events {
             handle_provider_turn_event(
                 state,
@@ -2475,11 +2504,66 @@ async fn poll_model_turn_events(
             )
             .await;
         }
-        if outcome.stop_reason.is_some() {
+        if outcome.stop_reason.is_some() || outcome.completion.is_some() {
             break;
+        }
+        if saw_progress {
+            idle_for = Duration::ZERO;
+        } else {
+            let Some(next_idle_for) =
+                wait_for_model_progress_or_timeout(state, session_id, idle_for, &mut outcome).await
+            else {
+                break;
+            };
+            idle_for = next_idle_for;
         }
     }
     (assistant_text, outcome)
+}
+
+fn model_events_include_progress(events: &[ProviderTurnEvent]) -> bool {
+    events.iter().any(model_event_is_progress)
+}
+
+const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
+    match event {
+        ProviderTurnEvent::TextDelta { text }
+        | ProviderTurnEvent::ReasoningDelta { text }
+        | ProviderTurnEvent::ToolCallDelta { delta: text, .. } => !text.is_empty(),
+        ProviderTurnEvent::ToolCallStarted { .. } | ProviderTurnEvent::ToolCallFinished { .. } => {
+            true
+        }
+        ProviderTurnEvent::TurnStarted
+        | ProviderTurnEvent::Usage { .. }
+        | ProviderTurnEvent::Warning { .. }
+        | ProviderTurnEvent::ProviderMetadata { .. }
+        | ProviderTurnEvent::Error { .. }
+        | ProviderTurnEvent::Cancelled
+        | ProviderTurnEvent::TurnFinished { .. } => false,
+    }
+}
+
+async fn wait_for_model_progress_or_timeout(
+    state: &ServerState,
+    session_id: SessionId,
+    idle_for: Duration,
+    outcome: &mut ModelPollOutcome,
+) -> Option<Duration> {
+    let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
+    if idle_for > MODEL_IDLE_TIMEOUT {
+        let message = format!(
+            "model provider was idle for {} seconds before timeout",
+            MODEL_IDLE_TIMEOUT.as_secs()
+        );
+        append_system_event(state, session_id, message.clone()).await;
+        outcome.completion = Some(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::IdleTimeout,
+            message,
+        ));
+        return None;
+    }
+    tokio::time::sleep(MODEL_POLL_INTERVAL).await;
+    Some(idle_for)
 }
 
 async fn poll_model_turn(
@@ -2614,7 +2698,6 @@ async fn handle_provider_turn_finished_event(
         Some(format!("{stop_reason:?}")),
     )
     .await;
-    outcome.should_continue = stop_reason == bcode_model::StopReason::ToolCall;
     outcome.stop_reason = Some(stop_reason);
     if stop_reason == bcode_model::StopReason::Cancelled {
         outcome.completion = Some(ModelTurnCompletion::with_message(
@@ -4421,6 +4504,86 @@ mod tests {
             session_id,
             kind,
         }
+    }
+
+    fn test_tool_call() -> bcode_model::ToolCall {
+        bcode_model::ToolCall {
+            id: "call-test".to_string(),
+            name: "filesystem.read".to_string(),
+            arguments: serde_json::json!({ "path": "Cargo.toml" }),
+        }
+    }
+
+    #[test]
+    fn model_poll_progress_requires_meaningful_stream_events() {
+        assert!(model_event_is_progress(&ProviderTurnEvent::TextDelta {
+            text: "hello".to_string(),
+        }));
+        assert!(model_event_is_progress(
+            &ProviderTurnEvent::ReasoningDelta {
+                text: "thinking".to_string(),
+            }
+        ));
+        assert!(model_event_is_progress(&ProviderTurnEvent::ToolCallDelta {
+            call_id: "call-test".to_string(),
+            delta: "{\"path\"".to_string(),
+        }));
+        assert!(model_event_is_progress(
+            &ProviderTurnEvent::ToolCallStarted {
+                call_id: "call-test".to_string(),
+                name: "filesystem.read".to_string(),
+            }
+        ));
+        assert!(model_event_is_progress(
+            &ProviderTurnEvent::ToolCallFinished {
+                call: test_tool_call(),
+            }
+        ));
+
+        assert!(!model_event_is_progress(&ProviderTurnEvent::TextDelta {
+            text: String::new(),
+        }));
+        assert!(!model_event_is_progress(
+            &ProviderTurnEvent::ToolCallDelta {
+                call_id: "call-test".to_string(),
+                delta: String::new(),
+            }
+        ));
+        assert!(!model_event_is_progress(&ProviderTurnEvent::Usage {
+            usage: bcode_model::TokenUsage::default(),
+        }));
+        assert!(!model_event_is_progress(
+            &ProviderTurnEvent::ProviderMetadata {
+                key: "response_id".to_string(),
+                value: "resp-test".to_string(),
+            }
+        ));
+        assert!(!model_event_is_progress(&ProviderTurnEvent::Warning {
+            message: "warning".to_string(),
+        }));
+    }
+
+    #[test]
+    fn compaction_poll_progress_only_counts_summary_content() {
+        assert!(compaction_event_is_progress(
+            &ProviderTurnEvent::TextDelta {
+                text: "summary".to_string(),
+            }
+        ));
+        assert!(compaction_event_is_progress(
+            &ProviderTurnEvent::ReasoningDelta {
+                text: "thinking".to_string(),
+            }
+        ));
+        assert!(!compaction_event_is_progress(&ProviderTurnEvent::Usage {
+            usage: bcode_model::TokenUsage::default(),
+        }));
+        assert!(!compaction_event_is_progress(
+            &ProviderTurnEvent::ToolCallStarted {
+                call_id: "call-test".to_string(),
+                name: "filesystem.read".to_string(),
+            }
+        ));
     }
 
     #[test]
