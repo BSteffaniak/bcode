@@ -673,8 +673,9 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
     let config = bcode_config::load_config()?;
     let keymap = KeyMap::from_config(&config.tui);
-    let session_id = resolve_session(&client, session_id, &keymap).await?;
-    run_chat(client, session_id, keymap, config.tui.mouse).await
+    let mut terminal = TerminalGuard::enter()?;
+    let session_id = resolve_session(&client, session_id, &keymap, &mut terminal).await?;
+    run_chat(client, session_id, keymap, config.tui.mouse, terminal).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -683,6 +684,7 @@ async fn run_chat(
     session_id: SessionId,
     keymap: KeyMap,
     mouse_config: TuiMouseConfig,
+    mut terminal: TerminalGuard,
 ) -> Result<(), TuiError> {
     let mut session_id = session_id;
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
@@ -691,7 +693,6 @@ async fn run_chat(
 
     let status = client.server_status().await.ok();
     let model_status = client.session_model_status(session_id).await.ok();
-    let mut terminal = TerminalGuard::enter()?;
     let mut app = ChatApp::new_with_input_history(
         session_id,
         &attached.history,
@@ -2039,16 +2040,20 @@ async fn resolve_session(
     client: &BcodeClient,
     session_id: Option<SessionId>,
     keymap: &KeyMap,
+    terminal: &mut TerminalGuard,
 ) -> Result<SessionId, TuiError> {
     if let Some(session_id) = session_id {
         return Ok(session_id);
     }
-    pick_session(client, keymap).await
+    pick_session(client, keymap, terminal).await
 }
 
-async fn pick_session(client: &BcodeClient, keymap: &KeyMap) -> Result<SessionId, TuiError> {
+async fn pick_session(
+    client: &BcodeClient,
+    keymap: &KeyMap,
+    terminal: &mut TerminalGuard,
+) -> Result<SessionId, TuiError> {
     let sessions = client.list_sessions().await?;
-    let mut terminal = TerminalGuard::enter()?;
     let mut app = SessionPickerApp::new(&sessions);
     loop {
         terminal.draw_frame(|frame| {
