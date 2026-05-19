@@ -92,7 +92,7 @@ include_compat_claude_skills = true
 max_context_bytes = 24000
 max_skill_file_bytes = 262144
 max_resource_file_bytes = 1048576
-follow_symlinks = false
+follow_symlinks = true
 
 [skills.sources]
 paths = []
@@ -224,8 +224,10 @@ Rules:
 * Skill scripts are inert resources until explicitly invoked.
 * Script execution, if added, must use a dedicated permission category such as `skill.script.execute` and should ask by default.
 * Discovery must canonicalize paths and reject traversal outside the skill root.
-* Symlinks should not be followed by default.
-* Malformed skills should produce diagnostics and be skipped, not crash startup.
+* Symlinks are followed by default for compatibility with Nix/Home Manager and similar config managers. Set `follow_symlinks = false` to opt out.
+* For directory skills such as `skills/commit-message/SKILL.md`, Bcode infers `commit-message` from the parent directory when front matter omits `id`.
+* For flat skills such as `skills/commit-message.md`, Bcode infers `commit-message` from the file stem when front matter omits `id`.
+* malformed skills should produce diagnostics and be skipped, not crash startup.
 * Session traces should record loaded skill source and byte counts.
 
 ## TUI UX

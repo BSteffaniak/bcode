@@ -290,7 +290,7 @@ impl Default for SkillsConfig {
             max_context_bytes: default_skill_context_bytes(),
             max_skill_file_bytes: default_skill_file_bytes(),
             max_resource_file_bytes: default_skill_resource_file_bytes(),
-            follow_symlinks: false,
+            follow_symlinks: true,
             sources: SkillSourceConfig::default(),
             disabled: DisabledSkillsConfig::default(),
         }
@@ -1724,8 +1724,8 @@ fn write_skills_toml(output: &mut String, skills: &SkillsConfig) {
         )
         .expect("write to string");
     }
-    if skills.follow_symlinks {
-        output.push_str("follow_symlinks = true\n");
+    if !skills.follow_symlinks {
+        output.push_str("follow_symlinks = false\n");
     }
     output.push('\n');
 

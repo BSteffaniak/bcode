@@ -78,7 +78,7 @@ impl Default for SkillRegistryOptions {
         Self {
             max_skill_file_bytes: DEFAULT_MAX_SKILL_FILE_BYTES,
             max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
-            follow_symlinks: false,
+            follow_symlinks: true,
             disabled_ids: BTreeSet::new(),
         }
     }
@@ -247,7 +247,13 @@ impl SkillRegistry {
             precedence: root.precedence,
         };
         let skill_file = skill_file.to_path_buf();
-        match parse_skill_file(&skill_file, &source, self.options.max_skill_file_bytes) {
+        let fallback_id = skill_fallback_id(skill_path, &skill_file);
+        match parse_skill_file_with_fallback(
+            &skill_file,
+            &source,
+            self.options.max_skill_file_bytes,
+            fallback_id.as_deref(),
+        ) {
             Ok(manifest) => self.insert_skill(SkillEntry {
                 summary: manifest.summary,
                 path: skill_file,
@@ -299,6 +305,20 @@ fn find_skill_file(path: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+fn skill_fallback_id(skill_path: &Path, skill_file: &Path) -> Option<String> {
+    if skill_path == skill_file {
+        skill_file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(ToString::to_string)
+    } else {
+        skill_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string)
+    }
+}
+
 /// Parse a `SKILL.md` file.
 ///
 /// # Errors
@@ -317,8 +337,25 @@ pub fn parse_skill_file(
         ))
         .into());
     }
-    let contents = fs::read_to_string(path)?;
     let fallback_id = path.file_stem().and_then(|stem| stem.to_str());
+    parse_skill_file_with_fallback(path, source, max_skill_file_bytes, fallback_id)
+}
+
+fn parse_skill_file_with_fallback(
+    path: &Path,
+    source: &SkillSource,
+    max_skill_file_bytes: u64,
+    fallback_id: Option<&str>,
+) -> Result<SkillManifest, SkillRegistryError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > max_skill_file_bytes {
+        return Err(SkillError::InvalidMetadata(format!(
+            "skill file exceeds max size: {} bytes",
+            metadata.len()
+        ))
+        .into());
+    }
+    let contents = fs::read_to_string(path)?;
     parse_skill_markdown(&contents, source, fallback_id)
 }
 
@@ -500,6 +537,17 @@ mod tests {
         assert_eq!(manifest.permissions.tools, vec!["shell.run"]);
         assert_eq!(manifest.instructions, "# Instructions\nDo things.");
     }
+    #[test]
+    fn infers_directory_skill_id_from_parent_directory() {
+        let skill_path = Path::new("skills/commit-message");
+        let skill_file = Path::new("skills/commit-message/SKILL.md");
+
+        assert_eq!(
+            skill_fallback_id(skill_path, skill_file).as_deref(),
+            Some("commit-message")
+        );
+    }
+
     #[test]
     fn infers_flat_markdown_skill_id_from_file_name() {
         let source = SkillSource {
