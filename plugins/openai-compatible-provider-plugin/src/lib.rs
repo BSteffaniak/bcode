@@ -1221,7 +1221,10 @@ fn parse_tool_arguments(
         provider_error(
             "tool_arguments_decode_failed",
             ProviderErrorCategory::ProviderInternal,
-            format!("failed to decode arguments for tool call {call_id} ({tool_name}): {error}"),
+            format!(
+                "failed to decode arguments for tool call {call_id} ({tool_name}): {error}; received {} bytes",
+                arguments.len()
+            ),
         )
     })
 }

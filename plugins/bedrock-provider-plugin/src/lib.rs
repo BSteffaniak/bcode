@@ -487,7 +487,10 @@ impl StreamAccumulator {
                     provider_error(
                         "tool_arguments_decode_failed",
                         ProviderErrorCategory::ProviderInternal,
-                        error.to_string(),
+                        format!(
+                            "failed to decode arguments for tool call {id} ({name}): {error}; received {} bytes",
+                            accumulator.arguments.len()
+                        ),
                     )
                 })?
             };

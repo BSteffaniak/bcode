@@ -1351,6 +1351,8 @@ async fn handle_resolve_permission(
 
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
+const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 const COMPACTION_POLL_ATTEMPTS: usize = 1_200;
 const COMPACTION_TURN_TIMEOUT_SECS: u64 = 120;
 
@@ -1360,6 +1362,19 @@ struct ModelPollOutcome {
     should_continue: bool,
     completion: Option<ModelTurnCompletion>,
     provider_error: Option<bcode_model::ProviderError>,
+}
+
+#[derive(Default)]
+struct ModelTurnRecoveryState {
+    retried_after_context_overflow: bool,
+    retried_after_malformed_tool_arguments: bool,
+    retry_instruction: Option<&'static str>,
+}
+
+enum ModelTurnRetry {
+    None,
+    Continue,
+    Return(ModelTurnCompletion),
 }
 
 #[derive(Debug, Clone)]
@@ -2059,7 +2074,7 @@ async fn run_model_turn_inner(
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
     let mut round = 0_u32;
-    let mut retried_after_context_overflow = false;
+    let mut recovery = ModelTurnRecoveryState::default();
     loop {
         let request = match build_model_turn_request(
             state,
@@ -2068,6 +2083,7 @@ async fn run_model_turn_inner(
             round,
             provider_plugin_id.as_deref(),
             selection.model_id.as_deref(),
+            recovery.retry_instruction,
         )
         .await
         {
@@ -2093,21 +2109,22 @@ async fn run_model_turn_inner(
                 Ok(outcome) => outcome,
                 Err(completion) => return completion,
             };
-        if let Some(error) = outcome.provider_error.as_ref()
-            && should_retry_after_context_overflow(state, error, retried_after_context_overflow)
+        match maybe_retry_after_provider_error(
+            state,
+            session_id,
+            trigger_event.sequence,
+            &request.turn_id,
+            &outcome,
+            &mut recovery,
+        )
+        .await
         {
-            retried_after_context_overflow = true;
-            match compact_session_after_context_overflow(
-                state,
-                session_id,
-                trigger_event.sequence,
-                error,
-            )
-            .await
-            {
-                Ok(()) => continue,
-                Err(completion) => return completion,
-            }
+            ModelTurnRetry::Continue => continue,
+            ModelTurnRetry::Return(completion) => return completion,
+            ModelTurnRetry::None => {}
+        }
+        if outcome.provider_error.is_none() {
+            recovery.retry_instruction = None;
         }
         if let Some(completion) = outcome.completion.clone() {
             append_deferred_provider_error_if_needed(state, session_id, &outcome).await;
@@ -2131,6 +2148,56 @@ async fn run_model_turn_inner(
     }
 }
 
+async fn maybe_retry_after_provider_error(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event_sequence: u64,
+    turn_id: &str,
+    outcome: &ModelPollOutcome,
+    recovery: &mut ModelTurnRecoveryState,
+) -> ModelTurnRetry {
+    let Some(error) = outcome.provider_error.as_ref() else {
+        return ModelTurnRetry::None;
+    };
+
+    if should_retry_after_malformed_tool_arguments(
+        error,
+        recovery.retried_after_malformed_tool_arguments,
+    ) {
+        recovery.retried_after_malformed_tool_arguments = true;
+        recovery.retry_instruction = Some(MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION);
+        append_provider_event_trace(
+            state,
+            session_id,
+            turn_id,
+            "recoverable_error_retry",
+            Some(format!(
+                "model emitted malformed tool arguments ({}: {}); retrying once",
+                error.code, error.message
+            )),
+        )
+        .await;
+        return ModelTurnRetry::Continue;
+    }
+
+    if should_retry_after_context_overflow(state, error, recovery.retried_after_context_overflow) {
+        recovery.retried_after_context_overflow = true;
+        return match compact_session_after_context_overflow(
+            state,
+            session_id,
+            trigger_event_sequence,
+            error,
+        )
+        .await
+        {
+            Ok(()) => ModelTurnRetry::Continue,
+            Err(completion) => ModelTurnRetry::Return(completion),
+        };
+    }
+
+    ModelTurnRetry::None
+}
+
 fn should_retry_after_context_overflow(
     state: &ServerState,
     error: &bcode_model::ProviderError,
@@ -2139,6 +2206,13 @@ fn should_retry_after_context_overflow(
     !already_retried
         && state.auto_compaction.mode.is_overflow_recovery_enabled()
         && is_context_length_provider_error(error)
+}
+
+fn should_retry_after_malformed_tool_arguments(
+    error: &bcode_model::ProviderError,
+    already_retried: bool,
+) -> bool {
+    !already_retried && is_tool_arguments_decode_provider_error(error)
 }
 
 async fn compact_session_after_context_overflow(
@@ -2189,14 +2263,22 @@ async fn append_deferred_provider_error_if_needed(
     outcome: &ModelPollOutcome,
 ) {
     if let Some(error) = outcome.provider_error.as_ref()
-        && is_context_length_provider_error(error)
+        && should_defer_visible_provider_error(error)
     {
         append_system_event(state, session_id, provider_error_message(error)).await;
     }
 }
 
+fn should_defer_visible_provider_error(error: &bcode_model::ProviderError) -> bool {
+    is_context_length_provider_error(error) || is_tool_arguments_decode_provider_error(error)
+}
+
 fn is_context_length_provider_error(error: &bcode_model::ProviderError) -> bool {
     error.category == bcode_model::ProviderErrorCategory::ContextLength
+}
+
+fn is_tool_arguments_decode_provider_error(error: &bcode_model::ProviderError) -> bool {
+    error.code == TOOL_ARGUMENTS_DECODE_FAILED_CODE
 }
 
 fn provider_error_message(error: &bcode_model::ProviderError) -> String {
@@ -2504,7 +2586,7 @@ async fn handle_provider_error_event(
     outcome: &mut ModelPollOutcome,
 ) {
     let message = provider_error_message(&error);
-    let defer_visible_message = is_context_length_provider_error(&error);
+    let defer_visible_message = should_defer_visible_provider_error(&error);
     append_provider_event_trace(state, session_id, turn_id, "error", Some(message.clone())).await;
     if !defer_visible_message {
         append_system_event(state, session_id, message.clone()).await;
@@ -2950,6 +3032,7 @@ async fn build_model_turn_request(
     round: u32,
     provider_plugin_id: Option<&str>,
     selected_model_id: Option<&str>,
+    retry_instruction: Option<&str>,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.model_context_events(session_id).await?;
     let mut messages =
@@ -2963,13 +3046,28 @@ async fn build_model_turn_request(
             .as_ref()
             .and_then(|context| context.system_prompt_suffix.as_deref()),
     );
+    let mut system_prefix_len = 0;
     if !dynamic_system_context.trim().is_empty() {
         messages.insert(
-            0,
+            system_prefix_len,
             ModelMessage {
                 role: MessageRole::System,
                 content: vec![ContentBlock::Text {
                     text: dynamic_system_context,
+                }],
+            },
+        );
+        system_prefix_len += 1;
+    }
+    if let Some(instruction) = retry_instruction
+        && !instruction.trim().is_empty()
+    {
+        messages.insert(
+            system_prefix_len,
+            ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text {
+                    text: instruction.to_string(),
                 }],
             },
         );
@@ -4600,6 +4698,42 @@ mod tests {
         };
 
         assert!(is_context_length_provider_error(&error));
+    }
+
+    #[test]
+    fn malformed_tool_arguments_are_retryable_once() {
+        let error = bcode_model::ProviderError {
+            code: TOOL_ARGUMENTS_DECODE_FAILED_CODE.to_string(),
+            category: bcode_model::ProviderErrorCategory::ProviderInternal,
+            message: "EOF while parsing a string".to_string(),
+            retryable: false,
+            provider_message: None,
+        };
+
+        assert!(is_tool_arguments_decode_provider_error(&error));
+        assert!(should_retry_after_malformed_tool_arguments(&error, false));
+        assert!(!should_retry_after_malformed_tool_arguments(&error, true));
+    }
+
+    #[test]
+    fn recoverable_provider_errors_are_deferred_until_retry_exhaustion() {
+        let malformed_tool_error = bcode_model::ProviderError {
+            code: TOOL_ARGUMENTS_DECODE_FAILED_CODE.to_string(),
+            category: bcode_model::ProviderErrorCategory::ProviderInternal,
+            message: "invalid JSON".to_string(),
+            retryable: false,
+            provider_message: None,
+        };
+        let invalid_request_error = bcode_model::ProviderError {
+            code: "bad_request".to_string(),
+            category: bcode_model::ProviderErrorCategory::InvalidRequest,
+            message: "bad request".to_string(),
+            retryable: false,
+            provider_message: None,
+        };
+
+        assert!(should_defer_visible_provider_error(&malformed_tool_error));
+        assert!(!should_defer_visible_provider_error(&invalid_request_error));
     }
 
     #[test]
