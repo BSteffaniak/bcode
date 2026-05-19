@@ -23,8 +23,8 @@ use bcode_ipc::Event;
 use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
     ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor,
-    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionSummary, SessionTokenUsage,
-    SessionTracePayload, SessionTracePhase,
+    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
+    SessionSummary, SessionTokenUsage, SessionTracePayload, SessionTracePhase,
 };
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
@@ -45,7 +45,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::rc::Rc;
@@ -632,8 +632,8 @@ async fn run_chat(
     keymap: KeyMap,
 ) -> Result<(), TuiError> {
     let mut connection = client.connect("bcode-tui").await?;
-    let history = connection
-        .attach_session_recent(session_id, INITIAL_HISTORY_EVENT_LIMIT)
+    let attached = connection
+        .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
         .await?;
 
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
@@ -656,7 +656,12 @@ async fn run_chat(
     let status = client.server_status().await.ok();
     let model_status = client.session_model_status(session_id).await.ok();
     let mut terminal = TerminalGuard::enter()?;
-    let mut app = ChatApp::new(session_id, &history, &keymap);
+    let mut app = ChatApp::new_with_input_history(
+        session_id,
+        &attached.history,
+        &attached.input_history,
+        &keymap,
+    );
     if let Some(status) = status {
         app.selected_provider_plugin_id = status.selected_provider_plugin_id;
         app.selected_model_id = status.selected_model_id;
@@ -1899,6 +1904,7 @@ struct ChatApp {
     blocks: Vec<TranscriptBlock>,
     input: TextEditBuffer,
     input_history: Vec<String>,
+    input_history_sequences: BTreeSet<u64>,
     input_history_index: Option<usize>,
     input_history_draft: Option<String>,
     status: String,
@@ -2176,14 +2182,47 @@ impl PendingPermissionView {
     }
 }
 
+#[cfg(test)]
+fn input_history_entries_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistoryEntry> {
+    history
+        .iter()
+        .filter_map(|event| {
+            if let SessionEventKind::UserMessage { text, .. } = &event.kind {
+                Some(SessionInputHistoryEntry {
+                    sequence: event.sequence,
+                    text: text.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 impl ChatApp {
+    #[cfg(test)]
     fn new(session_id: SessionId, history: &[SessionEvent], keymap: &KeyMap) -> Self {
+        let input_history = input_history_entries_from_events(history);
+        Self::new_with_input_history(session_id, history, &input_history, keymap)
+    }
+
+    fn new_with_input_history(
+        session_id: SessionId,
+        history: &[SessionEvent],
+        input_history: &[SessionInputHistoryEntry],
+        keymap: &KeyMap,
+    ) -> Self {
         let mut app = Self {
             session_id,
             session_title: None,
             blocks: Vec::new(),
             input: TextEditBuffer::new(),
-            input_history: Vec::new(),
+            input_history: input_history
+                .iter()
+                .filter(|entry| !entry.text.trim().is_empty())
+                .map(|entry| entry.text.clone())
+                .collect(),
+            input_history_sequences: input_history.iter().map(|entry| entry.sequence).collect(),
             input_history_index: None,
             input_history_draft: None,
             status: keymap
@@ -2622,8 +2661,11 @@ impl ChatApp {
                 self.oldest_loaded_sequence
                     .map_or(event.sequence, |oldest| oldest.min(event.sequence)),
             );
-            if let SessionEventKind::UserMessage { text, .. } = &event.kind {
-                input_messages.push(text.clone());
+            if let SessionEventKind::UserMessage { text, .. } = &event.kind
+                && !text.trim().is_empty()
+                && !self.input_history_sequences.contains(&event.sequence)
+            {
+                input_messages.push((event.sequence, text.clone()));
             }
             if let SessionEventKind::ModelUsage { usage, .. } = &event.kind {
                 self.token_usage.absorb(usage);
@@ -2632,7 +2674,10 @@ impl ChatApp {
                 blocks.extend(transcript_blocks_from_event(event));
             }
         }
-        self.input_history.splice(0..0, input_messages);
+        self.input_history_sequences
+            .extend(input_messages.iter().map(|(sequence, _)| *sequence));
+        self.input_history
+            .splice(0..0, input_messages.into_iter().map(|(_, text)| text));
         if !blocks.is_empty() {
             self.blocks.splice(0..0, blocks);
             self.mark_transcript_dirty();
@@ -2704,7 +2749,7 @@ impl ChatApp {
                 self.current_agent_id.clone_from(agent_id);
             }
             SessionEventKind::UserMessage { text, .. } => {
-                self.push_input_history_message(text);
+                self.push_input_history_message(event.sequence, text);
             }
             SessionEventKind::SessionCreated { name }
             | SessionEventKind::SessionRenamed { name } => {
@@ -2897,8 +2942,8 @@ impl ChatApp {
         }
     }
 
-    fn push_input_history_message(&mut self, text: &str) {
-        if text.trim().is_empty() {
+    fn push_input_history_message(&mut self, sequence: u64, text: &str) {
+        if text.trim().is_empty() || !self.input_history_sequences.insert(sequence) {
             return;
         }
         self.input_history.push(text.to_string());
@@ -4655,6 +4700,49 @@ mod tests {
     }
 
     #[test]
+    fn input_history_uses_complete_attach_prompt_list() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let input_history = vec![
+            SessionInputHistoryEntry {
+                sequence: 1,
+                text: "older prompt".to_string(),
+            },
+            SessionInputHistoryEntry {
+                sequence: 5,
+                text: "recent prompt".to_string(),
+            },
+        ];
+        let recent_history = vec![session_event_with_sequence(
+            session_id,
+            5,
+            SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "recent prompt".to_string(),
+            },
+        )];
+        let mut app =
+            ChatApp::new_with_input_history(session_id, &recent_history, &input_history, &keymap);
+
+        app.previous_input_history();
+        assert_eq!(app.input.text(), "recent prompt");
+        app.previous_input_history();
+        assert_eq!(app.input.text(), "older prompt");
+        app.prepend_older_history(
+            &[session_event_with_sequence(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "older prompt".to_string(),
+                },
+            )],
+            false,
+        );
+        assert_eq!(app.input_history.len(), 2);
+    }
+
+    #[test]
     fn input_history_next_restores_original_draft() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let session_id = SessionId::new();
@@ -5959,9 +6047,17 @@ mod tests {
     }
 
     fn session_event(session_id: SessionId, kind: SessionEventKind) -> SessionEvent {
+        session_event_with_sequence(session_id, 1, kind)
+    }
+
+    fn session_event_with_sequence(
+        session_id: SessionId,
+        sequence: u64,
+        kind: SessionEventKind,
+    ) -> SessionEvent {
         SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
+            sequence,
             session_id,
             kind,
         }

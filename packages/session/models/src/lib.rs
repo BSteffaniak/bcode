@@ -112,6 +112,13 @@ pub struct SessionHistoryPage {
     pub has_more: bool,
 }
 
+/// User-submitted prompt entry used for composer input-history navigation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInputHistoryEntry {
+    pub sequence: u64,
+    pub text: String,
+}
+
 /// Replayable event emitted by a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEvent {

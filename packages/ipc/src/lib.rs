@@ -6,7 +6,8 @@
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
+    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionInputHistoryEntry, SessionSummary,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::env;
@@ -257,6 +258,8 @@ pub enum ResponsePayload {
     Attached {
         session_id: SessionId,
         history: Vec<SessionEvent>,
+        #[serde(default)]
+        input_history: Vec<SessionInputHistoryEntry>,
     },
     MessageSent,
     TurnCancellationRequested {

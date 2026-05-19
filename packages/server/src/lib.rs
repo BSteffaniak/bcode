@@ -864,6 +864,7 @@ async fn handle_attach_session(
                 Response::Ok(ResponsePayload::Attached {
                     session_id,
                     history: compact_attach_history(attachment.history),
+                    input_history: attachment.input_history,
                 }),
             )
             .await?;
@@ -904,6 +905,7 @@ async fn handle_attach_session_recent(
                 Response::Ok(ResponsePayload::Attached {
                     session_id,
                     history: compact_attach_history(attachment.history),
+                    input_history: attachment.input_history,
                 }),
             )
             .await?;

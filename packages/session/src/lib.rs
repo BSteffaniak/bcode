@@ -16,7 +16,8 @@ pub use index::SessionIndexHealth;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
     SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionSummary, SessionTokenUsage, SessionTraceEvent,
+    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary, SessionTokenUsage,
+    SessionTraceEvent,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -217,6 +218,44 @@ impl SessionEventStore {
             next_cursor,
             has_more,
         })
+    }
+
+    fn read_session_input_history(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
+        let event_path = self.event_path(session_id);
+        let index =
+            if let Some(index) = index::load_fresh_index(&self.root, session_id, &event_path)? {
+                index
+            } else {
+                let (index, events) = index::rebuild_index(&self.root, session_id, &event_path)?;
+                let Some(index) = index else {
+                    return Ok(input_history_from_events(&events));
+                };
+                index
+            };
+        let entries = match index::read_entries(&self.root, session_id) {
+            Ok(entries) if entries.len() == index.event_count => entries,
+            _ => {
+                let (_, events) = index::rebuild_index(&self.root, session_id, &event_path)?;
+                return Ok(input_history_from_events(&events));
+            }
+        };
+        let mut input_history = Vec::new();
+        for entry in entries {
+            if entry.kind != "user_message" {
+                continue;
+            }
+            let event = reader::read_event_at(&event_path, entry.offset)?;
+            if let SessionEventKind::UserMessage { text, .. } = event.kind {
+                input_history.push(SessionInputHistoryEntry {
+                    sequence: event.sequence,
+                    text,
+                });
+            }
+        }
+        Ok(input_history)
     }
 
     fn read_model_context_events(
@@ -458,6 +497,7 @@ pub(crate) struct SessionState {
 #[derive(Debug)]
 pub struct SessionAttachment {
     pub history: Vec<SessionEvent>,
+    pub input_history: Vec<SessionInputHistoryEntry>,
     pub attached_event: SessionEvent,
     pub events: broadcast::Receiver<SessionEvent>,
 }
@@ -651,6 +691,30 @@ impl SessionManager {
         Ok(store.read_session_history_page(session_id, query)?)
     }
 
+    /// Return user-submitted prompts for input-history navigation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn session_input_history(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+        let inner = self.inner.lock().await;
+        let state = inner
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        if let Some(events) = &state.events {
+            return Ok(input_history_from_events(events));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(store.read_session_input_history(session_id)?)
+    }
+
     /// Return the model-visible session events, starting at the latest compaction when possible.
     ///
     /// # Errors
@@ -740,6 +804,7 @@ impl SessionManager {
                     .ok_or(SessionError::NotFound(session_id))?;
                 store.read_session_events(session_id)?
             };
+            let input_history = input_history_from_events(&history);
             state.clients.insert(client_id);
             state.summary.client_count = state.clients.len();
             let events = state.sender.subscribe();
@@ -749,6 +814,7 @@ impl SessionManager {
             )?;
             SessionAttachment {
                 history,
+                input_history,
                 attached_event,
                 events,
             }
@@ -781,6 +847,7 @@ impl SessionManager {
             )
             .await?
             .events;
+        let input_history = self.session_input_history(session_id).await?;
         let attachment = {
             let mut inner = self.inner.lock().await;
             let state = inner
@@ -796,6 +863,7 @@ impl SessionManager {
             )?;
             SessionAttachment {
                 history,
+                input_history,
                 attached_event,
                 events,
             }
@@ -1225,6 +1293,22 @@ impl SessionState {
         let _ = self.sender.send(event.clone());
         Ok(event)
     }
+}
+
+fn input_history_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistoryEntry> {
+    history
+        .iter()
+        .filter_map(|event| {
+            if let SessionEventKind::UserMessage { text, .. } = &event.kind {
+                Some(SessionInputHistoryEntry {
+                    sequence: event.sequence,
+                    text: text.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEvent> {
@@ -1771,6 +1855,14 @@ mod tests {
             &attachment.history[0].kind,
             SessionEventKind::UserMessage { text, .. } if text == "message 3"
         ));
+        assert_eq!(
+            attachment
+                .input_history
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 0", "message 1", "message 2", "message 3"]
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

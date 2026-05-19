@@ -11,7 +11,8 @@ use bcode_ipc::{
     default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
+    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionInputHistoryEntry, SessionSummary,
 };
 use thiserror::Error;
 
@@ -28,6 +29,13 @@ pub enum ClientError {
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
     UnexpectedEnvelope,
+}
+
+/// History returned when attaching to a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedSessionHistory {
+    pub history: Vec<SessionEvent>,
+    pub input_history: Vec<SessionInputHistoryEntry>,
 }
 
 impl From<ErrorResponse> for ClientError {
@@ -537,11 +545,32 @@ impl ClientConnection {
         &mut self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, ClientError> {
+        self.attach_session_with_input_history(session_id)
+            .await
+            .map(|attached| attached.history)
+    }
+
+    /// Attach to a session and return replayed history plus input-history entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn attach_session_with_input_history(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<AttachedSessionHistory, ClientError> {
         match self
             .send_request(Request::AttachSession { session_id })
             .await?
         {
-            ResponsePayload::Attached { history, .. } => Ok(history),
+            ResponsePayload::Attached {
+                history,
+                input_history,
+                ..
+            } => Ok(AttachedSessionHistory {
+                history,
+                input_history,
+            }),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -556,11 +585,33 @@ impl ClientConnection {
         session_id: SessionId,
         limit: usize,
     ) -> Result<Vec<SessionEvent>, ClientError> {
+        self.attach_session_recent_with_input_history(session_id, limit)
+            .await
+            .map(|attached| attached.history)
+    }
+
+    /// Attach to a session and return a recent history window plus input-history entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn attach_session_recent_with_input_history(
+        &mut self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<AttachedSessionHistory, ClientError> {
         match self
             .send_request(Request::AttachSessionRecent { session_id, limit })
             .await?
         {
-            ResponsePayload::Attached { history, .. } => Ok(history),
+            ResponsePayload::Attached {
+                history,
+                input_history,
+                ..
+            } => Ok(AttachedSessionHistory {
+                history,
+                input_history,
+            }),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
