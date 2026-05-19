@@ -164,7 +164,7 @@ fn run_shell_command(arguments: &ShellRunArguments) -> Result<ToolInvocationResp
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
     let mut shell = Command::new("sh");
-    shell.arg("-lc").arg(command);
+    shell.arg("-c").arg(command);
     shell
 }
 
@@ -284,6 +284,19 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_command_preserves_inherited_path() {
+        let inherited_path = "/tmp/bcode-path-sentinel:/usr/bin:/bin";
+        let output = shell_command("printf '%s' \"$PATH\"")
+            .env("PATH", inherited_path)
+            .output()
+            .expect("shell command should run");
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), inherited_path);
+    }
 
     #[cfg(unix)]
     #[test]
