@@ -151,8 +151,6 @@ impl SessionEventStore {
             return Ok(sessions);
         }
 
-        self.migrate_all_event_logs_to_current()?;
-
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
@@ -952,6 +950,46 @@ impl SessionManager {
         })
     }
 
+    async fn migrate_session_to_current_if_required(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionError> {
+        let should_migrate = {
+            let inner = self.inner.lock().await;
+            let state = inner
+                .sessions
+                .get(&session_id)
+                .ok_or(SessionError::NotFound(session_id))?;
+            match state.access_status {
+                SessionAccessStatus::ReadWrite => false,
+                SessionAccessStatus::ReadOnlyMigrationRequired => true,
+                status => {
+                    return Err(SessionError::NotWritable { session_id, status });
+                }
+            }
+        };
+        if !should_migrate {
+            return Ok(());
+        }
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        store.migrate_event_log_to_current(session_id)?;
+        let index = store.ensure_fresh_index(session_id)?;
+        let mut inner = self.inner.lock().await;
+        let clients = inner
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?
+            .clients
+            .clone();
+        let mut state = SessionState::from_index(index);
+        state.clients = clients;
+        state.summary.client_count = state.clients.len();
+        inner.sessions.insert(session_id, state);
+        Ok(())
+    }
+
     /// Create a new session.
     ///
     /// # Errors
@@ -1267,12 +1305,15 @@ impl SessionManager {
     /// Returns an error when:
     ///
     /// * the session does not exist
+    /// * required session event migration fails
     /// * the client-attached event cannot be persisted
     pub async fn attach_session(
         &self,
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<SessionAttachment, SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
         let attachment = {
             let mut inner = self.inner.lock().await;
             let activity_timestamp_ms = inner.next_activity_timestamp_ms();
@@ -1316,6 +1357,7 @@ impl SessionManager {
     /// Returns an error when:
     ///
     /// * the session does not exist
+    /// * required session event migration fails
     /// * the client-attached event cannot be persisted
     pub async fn attach_session_recent(
         &self,
@@ -1323,6 +1365,8 @@ impl SessionManager {
         client_id: ClientId,
         limit: usize,
     ) -> Result<SessionAttachment, SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
         let history = self
             .session_history_page(
                 session_id,
@@ -2562,7 +2606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_manager_auto_migrates_old_schema_sessions() {
+    async fn attach_session_recent_lazy_migrates_old_schema_sessions() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("session dir should create");
         let session_id = bcode_session_models::SessionId::new();
@@ -2579,24 +2623,30 @@ mod tests {
             },
         );
 
-        let manager =
-            SessionManager::persistent(&root).expect("manager should migrate and restore");
+        let manager = SessionManager::persistent(&root).expect("manager should restore");
         assert_eq!(
             manager
                 .session_access_status(session_id)
                 .await
                 .expect("status should load"),
-            super::SessionAccessStatus::ReadWrite
+            super::SessionAccessStatus::ReadOnlyMigrationRequired
         );
         let attachment = manager
             .attach_session_recent(session_id, ClientId::new(), 10)
             .await
-            .expect("migrated session should attach");
+            .expect("old session should migrate lazily on attach");
         assert!(
             attachment
                 .history
                 .iter()
                 .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            manager
+                .session_access_status(session_id)
+                .await
+                .expect("status should update"),
+            super::SessionAccessStatus::ReadWrite
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
