@@ -57,6 +57,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Errors returned by the TUI.
@@ -683,27 +684,10 @@ async fn run_chat(
     keymap: KeyMap,
     mouse_config: TuiMouseConfig,
 ) -> Result<(), TuiError> {
-    let mut connection = client.connect("bcode-tui").await?;
-    let attached = connection
-        .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
-        .await?;
-
+    let mut session_id = session_id;
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        loop {
-            match connection.recv_event().await {
-                Ok(event) => {
-                    if event_sender.send(event).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    eprintln!("TUI event stream ended: {error}");
-                    break;
-                }
-            }
-        }
-    });
+    let (attached, mut event_task) =
+        attach_session_event_stream(&client, session_id, event_sender.clone()).await?;
 
     let status = client.server_status().await.ok();
     let model_status = client.session_model_status(session_id).await.ok();
@@ -713,7 +697,7 @@ async fn run_chat(
         &attached.history,
         &attached.input_history,
         &keymap,
-        mouse_config,
+        mouse_config.clone(),
     );
     if let Some(status) = status {
         app.selected_provider_plugin_id = status.selected_provider_plugin_id;
@@ -761,8 +745,42 @@ async fn run_chat(
                     }
                     let scope = app.current_scope();
                     if let Some(action) = keymap.action_for_key(scope, &key) {
-                        if handle_tui_action(&client, &mut app, session_id, scope, action).await {
-                            break;
+                        match handle_tui_action(&client, &mut app, session_id, scope, action).await
+                        {
+                            TuiActionOutcome::Continue => {}
+                            TuiActionOutcome::Exit => break,
+                            TuiActionOutcome::SwitchSession(next_session_id) => {
+                                event_task.abort();
+                                event_task = switch_chat_session(
+                                    &client,
+                                    &event_sender,
+                                    &mut app,
+                                    &keymap,
+                                    mouse_config.clone(),
+                                    next_session_id,
+                                )
+                                .await?;
+                                session_id = next_session_id;
+                            }
+                            TuiActionOutcome::PickSession => {
+                                if let Some(next_session_id) =
+                                    pick_session_overlay(&client, &keymap, &mut terminal).await?
+                                {
+                                    event_task.abort();
+                                    event_task = switch_chat_session(
+                                        &client,
+                                        &event_sender,
+                                        &mut app,
+                                        &keymap,
+                                        mouse_config.clone(),
+                                        next_session_id,
+                                    )
+                                    .await?;
+                                    session_id = next_session_id;
+                                } else {
+                                    app.status = "session switch canceled".to_string();
+                                }
+                            }
                         }
                         continue;
                     }
@@ -793,22 +811,95 @@ async fn run_chat(
         }
     }
 
+    event_task.abort();
     Ok(())
 }
 
-async fn submit_chat_input(client: &BcodeClient, app: &mut ChatApp, session_id: SessionId) {
-    if let Some(message) = app.take_input() {
-        if message.starts_with('/') {
-            if !handle_slash_command(client, app, session_id, &message).await {
-                app.status = format!("unknown slash command: {message}");
+async fn attach_session_event_stream(
+    client: &BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<Event>,
+) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
+    let mut connection = client.connect("bcode-tui").await?;
+    let attached = connection
+        .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
+        .await?;
+    let event_task = tokio::spawn(async move {
+        loop {
+            match connection.recv_event().await {
+                Ok(event) => {
+                    if event_sender.send(event).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("TUI event stream ended: {error}");
+                    break;
+                }
             }
-        } else if let Err(error) = client.send_user_message(session_id, message).await {
-            app.set_activity(ActivityState::Idle);
-            app.status = format!("send failed: {error}");
-        } else {
-            app.set_activity(ActivityState::Thinking);
-            app.status = "sent".to_string();
         }
+    });
+    Ok((attached, event_task))
+}
+
+async fn switch_chat_session(
+    client: &BcodeClient,
+    event_sender: &mpsc::UnboundedSender<Event>,
+    app: &mut ChatApp,
+    keymap: &KeyMap,
+    mouse_config: TuiMouseConfig,
+    session_id: SessionId,
+) -> Result<JoinHandle<()>, TuiError> {
+    let (attached, event_task) =
+        attach_session_event_stream(client, session_id, event_sender.clone()).await?;
+    let status = client.server_status().await.ok();
+    let model_status = client.session_model_status(session_id).await.ok();
+    *app = ChatApp::new_with_input_history(
+        session_id,
+        &attached.history,
+        &attached.input_history,
+        keymap,
+        mouse_config,
+    );
+    if let Some(status) = status {
+        app.selected_provider_plugin_id = status.selected_provider_plugin_id;
+        app.selected_model_id = status.selected_model_id;
+    }
+    if let Some(model_status) = model_status {
+        app.apply_model_status(model_status);
+    }
+    refresh_slash_completion_caches(client, app, session_id).await;
+    app.status = format!(
+        "switched to session {}",
+        truncate_middle(&session_id.to_string(), 12)
+    );
+    Ok(event_task)
+}
+
+async fn submit_chat_input(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+) -> SlashCommandOutcome {
+    let Some(message) = app.take_input() else {
+        return SlashCommandOutcome::Handled;
+    };
+    if message.starts_with('/') {
+        match handle_slash_command(client, app, session_id, &message).await {
+            SlashCommandOutcome::Unknown => {
+                app.status = format!("unknown slash command: {message}");
+                SlashCommandOutcome::Handled
+            }
+            outcome => outcome,
+        }
+    } else if let Err(error) = client.send_user_message(session_id, message).await {
+        app.set_activity(ActivityState::Idle);
+        app.status = format!("send failed: {error}");
+        SlashCommandOutcome::Handled
+    } else {
+        app.set_activity(ActivityState::Thinking);
+        app.status = "sent".to_string();
+        SlashCommandOutcome::Handled
     }
 }
 
@@ -911,17 +1002,33 @@ async fn execute_permission_choice(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiActionOutcome {
+    Continue,
+    Exit,
+    PickSession,
+    SwitchSession(SessionId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCommandOutcome {
+    Handled,
+    Unknown,
+    PickSession,
+    SwitchSession(SessionId),
+}
+
 async fn handle_tui_action(
     client: &BcodeClient,
     app: &mut ChatApp,
     session_id: SessionId,
     scope: TuiScope,
     action: TuiAction,
-) -> bool {
+) -> TuiActionOutcome {
     match action {
         TuiAction::AppExit => {
             if app.input.is_empty() {
-                return true;
+                return TuiActionOutcome::Exit;
             }
             app.reset_input_history_navigation();
             app.input.clear();
@@ -977,10 +1084,22 @@ async fn handle_tui_action(
                 app.finish_search();
             } else if app.slash_completion_has_exact_selected_match() {
                 app.slash_completion = None;
-                submit_chat_input(client, app, session_id).await;
+                match submit_chat_input(client, app, session_id).await {
+                    SlashCommandOutcome::PickSession => return TuiActionOutcome::PickSession,
+                    SlashCommandOutcome::SwitchSession(next_session_id) => {
+                        return TuiActionOutcome::SwitchSession(next_session_id);
+                    }
+                    SlashCommandOutcome::Handled | SlashCommandOutcome::Unknown => {}
+                }
             } else if app.slash_completion.is_some() && app.accept_slash_completion() {
             } else {
-                submit_chat_input(client, app, session_id).await;
+                match submit_chat_input(client, app, session_id).await {
+                    SlashCommandOutcome::PickSession => return TuiActionOutcome::PickSession,
+                    SlashCommandOutcome::SwitchSession(next_session_id) => {
+                        return TuiActionOutcome::SwitchSession(next_session_id);
+                    }
+                    SlashCommandOutcome::Handled | SlashCommandOutcome::Unknown => {}
+                }
             }
         }
         TuiAction::InputComplete => {
@@ -1195,7 +1314,7 @@ async fn handle_tui_action(
             // filter/session-picker-only actions are handled outside this chat action path
         }
     }
-    false
+    TuiActionOutcome::Continue
 }
 
 fn handle_mouse_event(app: &mut ChatApp, mouse: MouseEvent) {
@@ -1515,12 +1634,20 @@ async fn handle_slash_command(
     app: &mut ChatApp,
     session_id: SessionId,
     message: &str,
-) -> bool {
+) -> SlashCommandOutcome {
     let parts = message.split_whitespace().collect::<Vec<_>>();
     let Some(command) = parts.first().map(|part| part.trim_start_matches('/')) else {
-        return false;
+        return SlashCommandOutcome::Unknown;
     };
-    match command {
+    let handled = match command {
+        "sessions" => return SlashCommandOutcome::PickSession,
+        "new" => match client.create_session(None).await {
+            Ok(session) => return SlashCommandOutcome::SwitchSession(session.id),
+            Err(error) => {
+                app.status = format!("new session failed: {error}");
+                true
+            }
+        },
         "plan" => set_session_agent_from_tui(client, app, session_id, "plan").await,
         "build" => set_session_agent_from_tui(client, app, session_id, "build").await,
         "compact" => compact_session_from_tui(client, app, session_id).await,
@@ -1584,82 +1711,12 @@ async fn handle_slash_command(
                     .await
             }
         }
+    };
+    if handled {
+        SlashCommandOutcome::Handled
+    } else {
+        SlashCommandOutcome::Unknown
     }
-}
-
-async fn list_skills_from_tui(client: &BcodeClient, app: &mut ChatApp) -> bool {
-    match client.list_skills().await {
-        Ok(list) => {
-            app.cached_skill_ids = list
-                .skills
-                .iter()
-                .map(|skill| skill.id.as_str().to_string())
-                .collect();
-            if list.skills.is_empty() {
-                app.status = "no skills available".to_string();
-            } else {
-                let skills = list
-                    .skills
-                    .iter()
-                    .map(|skill| skill.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                app.status = format!("available skills: {skills}");
-            }
-        }
-        Err(error) => app.status = format!("skill list failed: {error}"),
-    }
-    true
-}
-
-async fn describe_skill_from_tui(client: &BcodeClient, app: &mut ChatApp, skill_id: &str) -> bool {
-    match client
-        .describe_skill(SkillId::new(skill_id.to_string()))
-        .await
-    {
-        Ok(skill) => {
-            let description = skill
-                .summary
-                .description
-                .as_deref()
-                .unwrap_or("no description");
-            let keywords = if skill.summary.activation.keywords.is_empty() {
-                "none".to_string()
-            } else {
-                skill.summary.activation.keywords.join(", ")
-            };
-            app.status = format!(
-                "skill {}: {description}; keywords: {keywords}; source: {}",
-                skill.summary.id, skill.summary.source.label
-            );
-        }
-        Err(error) => app.status = format!("skill describe failed: {error}"),
-    }
-    true
-}
-
-async fn invoke_skill_from_tui(
-    client: &BcodeClient,
-    app: &mut ChatApp,
-    session_id: SessionId,
-    display_text: &str,
-    skill_id: &str,
-    args: &[&str],
-) -> bool {
-    let arguments = args.join(" ");
-    match client
-        .invoke_skill(
-            session_id,
-            SkillId::new(skill_id.to_string()),
-            arguments,
-            display_text.to_string(),
-        )
-        .await
-    {
-        Ok(()) => app.status = format!("skill invoked: {skill_id}"),
-        Err(error) => app.status = format!("skill invocation failed: {error}"),
-    }
-    true
 }
 
 async fn invoke_skill_alias_from_tui(
@@ -1682,6 +1739,102 @@ async fn invoke_skill_alias_from_tui(
     } else {
         false
     }
+}
+
+async fn list_skills_from_tui(client: &BcodeClient, app: &mut ChatApp) -> bool {
+    match client.list_skills().await {
+        Ok(list) => {
+            app.cached_skill_ids = list
+                .skills
+                .iter()
+                .map(|skill| skill.id.to_string())
+                .collect();
+            if list.skills.is_empty() {
+                app.status = "no skills available".to_string();
+                return true;
+            }
+            let mut lines = vec!["Available skills:".to_string()];
+            lines.extend(list.skills.iter().take(40).map(|skill| {
+                let description = skill.description.as_deref().unwrap_or("no description");
+                format!("{} — {description}", skill.id)
+            }));
+            if list.skills.len() > 40 {
+                lines.push(format!("… {} more", list.skills.len() - 40));
+            }
+            lines.push("Use /skill <id> [arguments] or /skill describe <id>.".to_string());
+            app.finish_streaming_block_if_needed();
+            app.blocks.push(TranscriptBlock::System {
+                text: lines.join("\n"),
+            });
+            app.scroll_rows_from_bottom = 0;
+            app.mark_transcript_dirty();
+            app.status = format!("{} skills available", list.skills.len());
+        }
+        Err(error) => app.status = format!("skill list failed: {error}"),
+    }
+    true
+}
+
+async fn describe_skill_from_tui(client: &BcodeClient, app: &mut ChatApp, skill_id: &str) -> bool {
+    match skill_id.parse::<SkillId>() {
+        Ok(skill_id) => match client.describe_skill(skill_id).await {
+            Ok(skill) => {
+                let description = skill
+                    .summary
+                    .description
+                    .as_deref()
+                    .unwrap_or("no description");
+                app.finish_streaming_block_if_needed();
+                app.blocks.push(TranscriptBlock::System {
+                    text: format!(
+                        "Skill: {}\n{}\n\n{}",
+                        skill.summary.id, description, skill.instructions
+                    ),
+                });
+                app.scroll_rows_from_bottom = 0;
+                app.mark_transcript_dirty();
+                app.status = format!("described skill {}", skill.summary.id);
+            }
+            Err(error) => app.status = format!("skill describe failed: {error}"),
+        },
+        Err(error) => app.status = format!("invalid skill id: {error}"),
+    }
+    true
+}
+
+async fn invoke_skill_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+    display_text: &str,
+    skill_id: &str,
+    args: &[&str],
+) -> bool {
+    match skill_id.parse::<SkillId>() {
+        Ok(skill_id) => {
+            let arguments = args.join(" ");
+            match client
+                .invoke_skill(
+                    session_id,
+                    skill_id.clone(),
+                    arguments,
+                    display_text.to_string(),
+                )
+                .await
+            {
+                Ok(()) => {
+                    app.set_activity(ActivityState::Thinking);
+                    app.status = format!("invoked skill {skill_id}");
+                }
+                Err(error) => {
+                    app.set_activity(ActivityState::Idle);
+                    app.status = format!("skill invoke failed: {error}");
+                }
+            }
+        }
+        Err(error) => app.status = format!("invalid skill id: {error}"),
+    }
+    true
 }
 
 async fn list_models_from_tui(
@@ -1928,6 +2081,57 @@ async fn pick_session(client: &BcodeClient, keymap: &KeyMap) -> Result<SessionId
                     }
                     Some(TuiAction::SessionNew) => {
                         return Ok(client.create_session(None).await?.id);
+                    }
+                    Some(TuiAction::SessionRename) => app.start_rename(),
+                    Some(TuiAction::SessionDelete) => app.start_delete_confirmation(),
+                    _ => {}
+                }
+            }
+            CrosstermEvent::Paste(text) => handle_session_picker_paste(&mut app, &text),
+            CrosstermEvent::Mouse(mouse) => handle_session_picker_mouse_event(&mut app, mouse),
+            _ => {}
+        }
+    }
+}
+
+async fn pick_session_overlay(
+    client: &BcodeClient,
+    keymap: &KeyMap,
+    terminal: &mut TerminalGuard,
+) -> Result<Option<SessionId>, TuiError> {
+    let sessions = client.list_sessions().await?;
+    let mut app = SessionPickerApp::new(&sessions);
+    app.status = "choose a session; esc returns to current session".to_string();
+    loop {
+        terminal.draw_frame(|frame| {
+            frame.render_widget(&app, frame.area());
+            if let Some(position) = app.cursor_position(frame.area()) {
+                frame.set_cursor_position(position);
+            }
+        })?;
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        match event::read()? {
+            CrosstermEvent::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if handle_session_picker_text_key(client, &mut app, &key).await? {
+                    continue;
+                }
+                match keymap.action_for_key(TuiScope::SessionPicker, &key) {
+                    Some(TuiAction::SelectCancel) => return Ok(None),
+                    Some(TuiAction::SelectUp) => app.previous(),
+                    Some(TuiAction::SelectDown) => app.next(),
+                    Some(TuiAction::SelectConfirm) => {
+                        if let Some(session_id) = app.selected_session_id() {
+                            return Ok(Some(session_id));
+                        }
+                        return Ok(Some(client.create_session(None).await?.id));
+                    }
+                    Some(TuiAction::SessionNew) => {
+                        return Ok(Some(client.create_session(None).await?.id));
                     }
                     Some(TuiAction::SessionRename) => app.start_rename(),
                     Some(TuiAction::SessionDelete) => app.start_delete_confirmation(),
@@ -2939,6 +3143,9 @@ impl ChatApp {
     fn push_event(&mut self, event: Event) {
         match event {
             Event::Session(event) => {
+                if event.session_id != self.session_id {
+                    return;
+                }
                 self.update_activity_from_live_event(&event);
                 self.absorb_session_event(&event);
             }
@@ -3931,7 +4138,7 @@ impl ChatApp {
             }
             "help" => {
                 self.status =
-                    "Slash: /models, /model <id>, /provider <id>, /thinking low|medium|high, /compact, /clear, /help"
+                    "Slash: /sessions, /new, /models, /model <id>, /provider <id>, /thinking low|medium|high, /compact, /clear, /help"
                         .to_string();
             }
             "compact" => {
@@ -3995,6 +4202,14 @@ impl ChatApp {
                 }
                 true
             }
+            "sessions" => {
+                self.status = "use slash /sessions".to_string();
+                true
+            }
+            "new" => {
+                self.status = "use slash /new".to_string();
+                true
+            }
             "help" => {
                 let commands = builtin_commands()
                     .iter()
@@ -4023,6 +4238,20 @@ impl ChatApp {
 
 fn builtin_commands() -> Vec<CommandInfo> {
     vec![
+        CommandInfo {
+            id: "sessions".into(),
+            name: "/sessions".into(),
+            description: Some("View, select, or switch sessions".into()),
+            requires_args: false,
+            category: Some("session".into()),
+        },
+        CommandInfo {
+            id: "new".into(),
+            name: "/new".into(),
+            description: Some("Create and switch to a new session".into()),
+            requires_args: false,
+            category: Some("session".into()),
+        },
         CommandInfo {
             id: "models".into(),
             name: "/models".into(),
