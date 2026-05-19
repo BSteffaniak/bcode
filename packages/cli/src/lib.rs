@@ -2817,6 +2817,45 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
     }
 }
 
+fn provider_stream_event_summary(event: &bcode_session_models::ProviderStreamEvent) -> String {
+    match event {
+        bcode_session_models::ProviderStreamEvent::TurnStarted => {
+            "provider stream turn started".to_string()
+        }
+        bcode_session_models::ProviderStreamEvent::ToolCallStarted {
+            tool_call_id,
+            tool_name,
+        } => format!("provider stream tool started {tool_name} ({tool_call_id})"),
+        bcode_session_models::ProviderStreamEvent::ToolCallProgress {
+            tool_call_id,
+            tool_name,
+            argument_bytes,
+            chunk_count,
+        } => format!(
+            "provider stream tool progress {tool_name} ({tool_call_id}) bytes={argument_bytes} chunks={chunk_count}"
+        ),
+        bcode_session_models::ProviderStreamEvent::ToolCallFinished {
+            tool_call_id,
+            tool_name,
+        } => format!("provider stream tool finished {tool_name} ({tool_call_id})"),
+        bcode_session_models::ProviderStreamEvent::NoProgressWarning {
+            idle_seconds,
+            active_tool_call,
+        } => active_tool_call.as_ref().map_or_else(
+            || format!("provider stream no progress idle_seconds={idle_seconds}"),
+            |progress| {
+                format!(
+                    "provider stream no progress idle_seconds={idle_seconds} tool={} ({}) bytes={} chunks={}",
+                    progress.tool_name,
+                    progress.tool_call_id,
+                    progress.argument_bytes,
+                    progress.chunk_count
+                )
+            },
+        ),
+    }
+}
+
 fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) -> String {
     match payload {
         bcode_session_models::SessionTracePayload::ModelRequestBuilt {
@@ -2852,6 +2891,9 @@ fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) ->
                     .as_ref()
                     .map_or_else(String::new, |detail| format!(" {}", one_line(detail)))
             )
+        }
+        bcode_session_models::SessionTracePayload::ProviderStreamEvent(event) => {
+            provider_stream_event_summary(event)
         }
         bcode_session_models::SessionTracePayload::ToolInvocationStarted {
             tool_call_id,

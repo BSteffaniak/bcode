@@ -24,9 +24,10 @@ use bcode_config::{TuiMouseClickSelection, TuiMouseConfig};
 use bcode_ipc::Event;
 use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
-    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor,
-    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionSummary, SessionTokenUsage, SessionTracePayload, SessionTracePhase,
+    ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, SessionEvent,
+    SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryQuery,
+    SessionId, SessionInputHistoryEntry, SessionSummary, SessionTokenUsage, SessionTracePayload,
+    SessionTracePhase,
 };
 use bcode_skill_models::SkillId;
 use bmux_text_edit::{SelectionMode, TextDelete, TextEditBuffer, TextMotion};
@@ -3063,12 +3064,29 @@ impl ChatApp {
     }
 
     fn update_activity_from_trace(&mut self, trace: &bcode_session_models::SessionTraceEvent) {
+        if let SessionTracePayload::ProviderStreamEvent(event) = &trace.payload {
+            match provider_stream_event_activity_detail(event) {
+                ProviderActivityUpdate::Progress(detail) => {
+                    self.set_activity(ActivityState::ProviderStream {
+                        detail: detail.clone(),
+                    });
+                    self.status = detail;
+                }
+                ProviderActivityUpdate::Finished => {
+                    if matches!(self.activity, ActivityState::ProviderStream { .. }) {
+                        self.set_activity(ActivityState::Thinking);
+                    }
+                }
+                ProviderActivityUpdate::Ignore => {}
+            }
+            return;
+        }
+
         if let SessionTracePayload::ProviderEvent { event_type, detail } = &trace.payload {
             match event_type.as_str() {
                 "tool_call_started" | "tool_call_progress" | "no_progress_warning" => {
                     let detail = detail
-                        .as_deref()
-                        .map(user_facing_provider_detail)
+                        .clone()
                         .unwrap_or_else(|| "provider stream in progress".to_string());
                     self.set_activity(ActivityState::ProviderStream {
                         detail: detail.clone(),
@@ -5131,81 +5149,69 @@ fn truncate_end(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn user_facing_provider_detail(detail: &str) -> String {
-    let without_parentheticals = remove_tool_call_id_parentheticals(detail);
-    let redacted = redact_tool_call_id_tokens(&without_parentheticals);
-    normalize_detail_separators(&redacted)
+enum ProviderActivityUpdate {
+    Progress(String),
+    Finished,
+    Ignore,
 }
 
-fn remove_tool_call_id_parentheticals(detail: &str) -> String {
-    let mut output = String::new();
-    let mut rest = detail;
-    loop {
-        let Some(open_index) = rest.find('(') else {
-            output.push_str(rest);
-            break;
-        };
-        output.push_str(&rest[..open_index]);
-        let after_open = &rest[open_index + 1..];
-        let Some(close_index) = after_open.find(')') else {
-            output.push_str(&rest[open_index..]);
-            break;
-        };
-        let parenthetical = after_open[..close_index].trim();
-        if !is_tool_call_id(parenthetical) {
-            output.push('(');
-            output.push_str(&after_open[..=close_index]);
+fn provider_stream_event_activity_detail(event: &ProviderStreamEvent) -> ProviderActivityUpdate {
+    match event {
+        ProviderStreamEvent::TurnStarted => ProviderActivityUpdate::Ignore,
+        ProviderStreamEvent::ToolCallStarted { tool_name, .. } => {
+            ProviderActivityUpdate::Progress(tool_name.clone())
         }
-        rest = &after_open[close_index + 1..];
+        ProviderStreamEvent::ToolCallProgress {
+            tool_name,
+            argument_bytes,
+            chunk_count,
+            ..
+        } => ProviderActivityUpdate::Progress(format!(
+            "streaming {tool_name} arguments · {} received · {chunk_count} chunks",
+            format_bytes(*argument_bytes)
+        )),
+        ProviderStreamEvent::ToolCallFinished { .. } => ProviderActivityUpdate::Finished,
+        ProviderStreamEvent::NoProgressWarning {
+            idle_seconds,
+            active_tool_call,
+        } => ProviderActivityUpdate::Progress(no_progress_warning_detail(
+            *idle_seconds,
+            active_tool_call.as_ref(),
+        )),
     }
-    output
 }
 
-fn redact_tool_call_id_tokens(detail: &str) -> String {
-    let mut output = String::new();
-    let mut chars = detail.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
-        if detail[index..].starts_with("call_") {
-            while let Some((_, next_ch)) = chars.peek().copied() {
-                if next_ch.is_ascii_alphanumeric() || next_ch == '_' || next_ch == '-' {
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
+fn no_progress_warning_detail(
+    idle_seconds: u64,
+    active_tool_call: Option<&ProviderToolCallProgress>,
+) -> String {
+    active_tool_call.map_or_else(
+        || format!("no provider progress for {idle_seconds} seconds"),
+        |progress| {
+            format!(
+                "no provider progress for {idle_seconds} seconds while streaming {} arguments · {} received · {} chunks",
+                progress.tool_name,
+                format_bytes(progress.argument_bytes),
+                progress.chunk_count
+            )
+        },
+    )
 }
 
-fn is_tool_call_id(value: &str) -> bool {
-    value.strip_prefix("call_").is_some_and(|suffix| {
-        !suffix.is_empty()
-            && suffix
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    })
-}
-
-fn normalize_detail_separators(detail: &str) -> String {
-    let mut parts = detail
-        .split('·')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return "provider stream in progress".to_string();
+fn format_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        let whole = bytes / MIB;
+        let decimal = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{decimal} MiB")
+    } else if bytes >= KIB {
+        let whole = bytes / KIB;
+        let decimal = (bytes % KIB) * 10 / KIB;
+        format!("{whole}.{decimal} KiB")
+    } else {
+        format!("{bytes} B")
     }
-    for part in &mut parts {
-        *part = part.trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '(' || ch == ')');
-    }
-    parts
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
 }
 
 fn normal_style() -> Style {
@@ -6733,21 +6739,34 @@ mod tests {
     }
 
     #[test]
-    fn provider_progress_hides_tool_call_ids() {
-        let detail = user_facing_provider_detail(
-            "streaming shell.run arguments (call_SEoqRPALXAx5pXe2tJSXdVzD) · 12 KiB received · 4 chunks",
-        );
+    fn structured_provider_progress_hides_tool_call_ids() {
+        let update =
+            provider_stream_event_activity_detail(&ProviderStreamEvent::ToolCallProgress {
+                tool_call_id: "call_SEoqRPALXAx5pXe2tJSXdVzD".to_string(),
+                tool_name: "shell.run".to_string(),
+                argument_bytes: 12 * 1024,
+                chunk_count: 4,
+            });
+        let ProviderActivityUpdate::Progress(detail) = update else {
+            panic!("expected provider progress detail");
+        };
 
         assert_eq!(
             detail,
-            "streaming shell.run arguments · 12 KiB received · 4 chunks"
+            "streaming shell.run arguments · 12.0 KiB received · 4 chunks"
         );
         assert!(!detail.contains("call_"));
     }
 
     #[test]
-    fn provider_started_hides_parenthetical_tool_call_id() {
-        let detail = user_facing_provider_detail("shell.run (call_SEoqRPALXAx5pXe2tJSXdVzD)");
+    fn structured_provider_started_uses_tool_name_without_id() {
+        let update = provider_stream_event_activity_detail(&ProviderStreamEvent::ToolCallStarted {
+            tool_call_id: "call_SEoqRPALXAx5pXe2tJSXdVzD".to_string(),
+            tool_name: "shell.run".to_string(),
+        });
+        let ProviderActivityUpdate::Progress(detail) = update else {
+            panic!("expected provider progress detail");
+        };
 
         assert_eq!(detail, "shell.run");
         assert!(!detail.contains("call_"));

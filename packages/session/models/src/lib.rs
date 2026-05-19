@@ -231,6 +231,59 @@ pub enum SessionTracePhase {
     ContextCompactionFinished,
 }
 
+/// Structured model-provider streaming event for user-facing progress and debug correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ProviderStreamEvent {
+    /// Provider turn started.
+    TurnStarted,
+    /// Provider started streaming a tool call.
+    ToolCallStarted {
+        /// Internal provider tool-call identifier for debugging and event correlation.
+        tool_call_id: String,
+        /// User-facing tool name.
+        tool_name: String,
+    },
+    /// Provider is streaming tool-call arguments.
+    ToolCallProgress {
+        /// Internal provider tool-call identifier for debugging and event correlation.
+        tool_call_id: String,
+        /// User-facing tool name.
+        tool_name: String,
+        /// Total argument bytes received so far.
+        argument_bytes: usize,
+        /// Total streamed argument chunks received so far.
+        chunk_count: usize,
+    },
+    /// Provider finished a tool call.
+    ToolCallFinished {
+        /// Internal provider tool-call identifier for debugging and event correlation.
+        tool_call_id: String,
+        /// User-facing tool name.
+        tool_name: String,
+    },
+    /// Provider stream has not produced meaningful progress for a warning threshold.
+    NoProgressWarning {
+        /// Seconds without meaningful provider progress.
+        idle_seconds: u64,
+        /// Active tool-call progress, when the provider was streaming tool arguments.
+        active_tool_call: Option<ProviderToolCallProgress>,
+    },
+}
+
+/// Structured provider tool-call argument progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCallProgress {
+    /// Internal provider tool-call identifier for debugging and event correlation.
+    pub tool_call_id: String,
+    /// User-facing tool name.
+    pub tool_name: String,
+    /// Total argument bytes received so far.
+    pub argument_bytes: usize,
+    /// Total streamed argument chunks received so far.
+    pub chunk_count: usize,
+}
+
 /// Structured diagnostic payload for a [`SessionTraceEvent`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,6 +313,7 @@ pub enum SessionTracePayload {
         event_type: String,
         detail: Option<String>,
     },
+    ProviderStreamEvent(ProviderStreamEvent),
     ToolInvocationStarted {
         tool_call_id: String,
         plugin_id: String,

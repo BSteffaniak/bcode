@@ -23,8 +23,9 @@ use bcode_model::{
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{
-    ClientId, ModelTurnOutcome, SessionEventKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    SessionTracePayload, SessionTracePhase, TraceBlobRef, TraceRedaction,
+    ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, SessionEventKind,
+    SessionId, SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -1629,15 +1630,14 @@ impl ModelStreamProgress {
         }
     }
 
-    fn tool_progress_detail(&self) -> Option<String> {
+    fn tool_progress_snapshot(&self) -> Option<ProviderToolCallProgress> {
         let active = self.active_tool_call.as_ref()?;
-        Some(format!(
-            "streaming {} arguments ({}) · {} received · {} chunks",
-            active.name,
-            active.call_id,
-            format_bytes(active.argument_bytes),
-            active.delta_count
-        ))
+        Some(ProviderToolCallProgress {
+            tool_call_id: active.call_id.clone(),
+            tool_name: active.name.clone(),
+            argument_bytes: active.argument_bytes,
+            chunk_count: active.delta_count,
+        })
     }
 }
 
@@ -2792,7 +2792,7 @@ async fn poll_model_turn_events(
                 session_id,
                 idle_for,
                 &mut no_progress_warned,
-                stream_progress.tool_progress_detail(),
+                stream_progress.tool_progress_snapshot(),
                 &mut outcome,
             )
             .await
@@ -2827,7 +2827,7 @@ async fn poll_model_turn_events(
                 session_id,
                 idle_for,
                 &mut no_progress_warned,
-                stream_progress.tool_progress_detail(),
+                stream_progress.tool_progress_snapshot(),
                 &mut outcome,
             )
             .await
@@ -2867,33 +2867,36 @@ async fn wait_for_model_progress_or_timeout(
     session_id: SessionId,
     idle_for: Duration,
     warned: &mut bool,
-    progress_detail: Option<String>,
+    active_tool_call: Option<ProviderToolCallProgress>,
     outcome: &mut ModelPollOutcome,
 ) -> Option<Duration> {
     let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
     let warning_after = Duration::from_secs(state.model_streaming.no_progress_warning_secs);
     let timeout_after = Duration::from_secs(state.model_streaming.no_progress_timeout_secs);
     if !*warned && idle_for >= warning_after {
-        let detail = progress_detail
-            .as_deref()
-            .map_or_else(String::new, |detail| format!(" while {detail}"));
-        append_provider_event_trace(
+        append_provider_stream_event_trace(
             state,
             session_id,
             "model-stream",
-            "no_progress_warning",
-            Some(format!(
-                "no provider progress for {} seconds{detail}",
-                idle_for.as_secs()
-            )),
+            ProviderStreamEvent::NoProgressWarning {
+                idle_seconds: idle_for.as_secs(),
+                active_tool_call: active_tool_call.clone(),
+            },
         )
         .await;
         *warned = true;
     }
     if idle_for > timeout_after {
-        let detail = progress_detail
-            .as_deref()
-            .map_or_else(String::new, |detail| format!(" while {detail}"));
+        let detail = active_tool_call
+            .as_ref()
+            .map_or_else(String::new, |progress| {
+                format!(
+                    " while streaming {} arguments · {} received · {} chunks",
+                    progress.tool_name,
+                    format_bytes(progress.argument_bytes),
+                    progress.chunk_count
+                )
+            });
         let message = format!(
             "model provider made no progress for {} seconds before timeout{detail}",
             timeout_after.as_secs()
@@ -2980,16 +2983,24 @@ async fn handle_provider_turn_event(
             handle_provider_metadata_event(state, session_id, turn_id, key, value).await;
         }
         ProviderTurnEvent::TurnStarted => {
-            append_provider_event_trace(state, session_id, turn_id, "turn_started", None).await;
-        }
-        ProviderTurnEvent::ToolCallStarted { call_id, name } => {
-            stream_progress.start_tool_call(call_id.clone(), name.clone());
-            append_provider_event_trace(
+            append_provider_stream_event_trace(
                 state,
                 session_id,
                 turn_id,
-                "tool_call_started",
-                Some(format!("{name} ({call_id})")),
+                ProviderStreamEvent::TurnStarted,
+            )
+            .await;
+        }
+        ProviderTurnEvent::ToolCallStarted { call_id, name } => {
+            stream_progress.start_tool_call(call_id.clone(), name.clone());
+            append_provider_stream_event_trace(
+                state,
+                session_id,
+                turn_id,
+                ProviderStreamEvent::ToolCallStarted {
+                    tool_call_id: call_id,
+                    tool_name: name,
+                },
             )
             .await;
         }
@@ -2999,14 +3010,20 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
             stream_progress.record_tool_delta(&call_id, &delta);
             if stream_progress.should_report_tool_progress(&state.model_streaming) {
-                append_provider_event_trace(
-                    state,
-                    session_id,
-                    turn_id,
-                    "tool_call_progress",
-                    stream_progress.tool_progress_detail(),
-                )
-                .await;
+                if let Some(progress) = stream_progress.tool_progress_snapshot() {
+                    append_provider_stream_event_trace(
+                        state,
+                        session_id,
+                        turn_id,
+                        ProviderStreamEvent::ToolCallProgress {
+                            tool_call_id: progress.tool_call_id,
+                            tool_name: progress.tool_name,
+                            argument_bytes: progress.argument_bytes,
+                            chunk_count: progress.chunk_count,
+                        },
+                    )
+                    .await;
+                }
                 stream_progress.mark_tool_progress_reported();
             }
         }
@@ -3093,12 +3110,14 @@ async fn handle_provider_tool_call_finished_event(
     call: bcode_model::ToolCall,
     assistant_text: &mut String,
 ) {
-    append_provider_event_trace(
+    append_provider_stream_event_trace(
         state,
         session_id,
         turn_id,
-        "tool_call_finished",
-        Some(call.name.clone()),
+        ProviderStreamEvent::ToolCallFinished {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+        },
     )
     .await;
     if !assistant_text.is_empty() {
@@ -3123,6 +3142,22 @@ async fn handle_provider_metadata_event(
     )
     .await;
     update_provider_metadata_state(state, session_id, &key, value).await;
+}
+
+async fn append_provider_stream_event_trace(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    event: ProviderStreamEvent,
+) {
+    append_trace_event(
+        state,
+        session_id,
+        Some(turn_id.to_string()),
+        SessionTracePhase::ModelProviderEvent,
+        SessionTracePayload::ProviderStreamEvent(event),
+    )
+    .await;
 }
 
 async fn append_provider_event_trace(
