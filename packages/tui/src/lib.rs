@@ -3842,7 +3842,7 @@ impl ChatApp {
         let cursor = text.len();
         self.input = TextEditBuffer::from_text(text);
         self.input.move_cursor(TextMotion::Absolute(cursor));
-        self.update_slash_completion();
+        self.slash_completion = None;
         true
     }
 
@@ -7793,6 +7793,23 @@ mod tests {
 
         assert!(app.accept_slash_completion());
         assert_eq!(app.input.text(), "/models");
+        assert!(app.slash_completion.is_none());
+    }
+
+    #[test]
+    fn slash_completion_accept_uses_selected_item_and_closes_menu() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.set_input_text("/m");
+        app.update_slash_completion();
+        app.slash_completion
+            .as_mut()
+            .expect("completion should be visible")
+            .move_next();
+
+        assert!(app.accept_slash_completion());
+        assert_eq!(app.input.text(), "/model ");
+        assert!(app.slash_completion.is_none());
     }
 
     #[test]
