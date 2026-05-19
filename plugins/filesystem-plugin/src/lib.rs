@@ -11,9 +11,22 @@ use bcode_tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const FILESYSTEM_INTERFACE_ID: &str = "bcode.filesystem/v1";
+const DEFAULT_SEARCH_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_GREP_MAX_MATCHES: usize = 100;
+const DEFAULT_FIND_MAX_RESULTS: usize = 1_000;
+const DEFAULT_LIST_MAX_ENTRIES: usize = 1_000;
+const MAX_EXTERNAL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RUST_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const TERMINATION_GRACE_MS: u64 = 500;
 
 /// Bundled filesystem plugin.
 #[derive(Default)]
@@ -82,6 +95,8 @@ struct ListRequest {
     recursive: bool,
     #[serde(default)]
     max_entries: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +108,11 @@ struct ListEntry {
 #[derive(Debug, Serialize)]
 struct ListResponse {
     entries: Vec<ListEntry>,
+    backend: String,
+    timed_out: bool,
+    partial: bool,
+    visited_entries: usize,
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,11 +121,18 @@ struct FindRequest {
     pattern: String,
     #[serde(default)]
     max_results: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
 struct FindResponse {
     paths: Vec<String>,
+    backend: String,
+    timed_out: bool,
+    partial: bool,
+    visited_entries: usize,
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +145,8 @@ struct GrepRequest {
     ignore_case: bool,
     #[serde(default)]
     max_matches: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +159,11 @@ struct GrepMatch {
 #[derive(Debug, Serialize)]
 struct GrepResponse {
     matches: Vec<GrepMatch>,
+    backend: String,
+    timed_out: bool,
+    partial: bool,
+    visited_entries: usize,
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,7 +297,8 @@ fn list_tool_definition() -> ToolDefinition {
             "properties": {
                 "path": { "type": "string" },
                 "recursive": { "type": "boolean" },
-                "max_entries": { "type": "integer", "minimum": 1 }
+                "max_entries": { "type": "integer", "minimum": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
         side_effect: ToolSideEffect::ReadOnly,
@@ -281,7 +316,8 @@ fn find_tool_definition() -> ToolDefinition {
             "properties": {
                 "path": { "type": "string" },
                 "pattern": { "type": "string" },
-                "max_results": { "type": "integer", "minimum": 1 }
+                "max_results": { "type": "integer", "minimum": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
         side_effect: ToolSideEffect::ReadOnly,
@@ -301,7 +337,8 @@ fn grep_tool_definition() -> ToolDefinition {
                 "pattern": { "type": "string" },
                 "glob": { "type": "string" },
                 "ignore_case": { "type": "boolean" },
-                "max_matches": { "type": "integer", "minimum": 1 }
+                "max_matches": { "type": "integer", "minimum": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
         side_effect: ToolSideEffect::ReadOnly,
@@ -512,28 +549,85 @@ fn stat_path_service(request: &ServiceRequest) -> ServiceResponse {
     )
 }
 
+#[derive(Debug)]
+struct SearchBudget {
+    started: Instant,
+    timeout: Duration,
+    visited_entries: usize,
+    timed_out: bool,
+}
+
+impl SearchBudget {
+    fn new(timeout_ms: Option<u64>) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout: Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS)),
+            visited_entries: 0,
+            timed_out: false,
+        }
+    }
+
+    fn check(&mut self) -> bool {
+        if self.started.elapsed() >= self.timeout {
+            self.timed_out = true;
+            return false;
+        }
+        true
+    }
+
+    fn visit(&mut self) -> bool {
+        self.visited_entries = self.visited_entries.saturating_add(1);
+        self.check()
+    }
+
+    fn elapsed_timeout_ms(&self) -> u64 {
+        u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+fn timeout_message(kind: &str, timeout_ms: u64) -> String {
+    format!("{kind} timed out after {timeout_ms}ms; results are partial")
+}
+
 fn list_directory(request: &ListRequest) -> Result<ListResponse, std::io::Error> {
+    let mut budget = SearchBudget::new(request.timeout_ms);
+    let max_entries = request.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
     let mut entries = Vec::new();
     collect_entries(
         &request.path,
         request.recursive,
-        request.max_entries,
+        max_entries,
+        &mut budget,
         &mut entries,
     )?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(ListResponse { entries })
+    let partial = budget.timed_out || entries.len() >= max_entries;
+    Ok(ListResponse {
+        entries,
+        backend: "rust".to_string(),
+        timed_out: budget.timed_out,
+        partial,
+        visited_entries: budget.visited_entries,
+        message: budget
+            .timed_out
+            .then(|| timeout_message("list", budget.elapsed_timeout_ms())),
+    })
 }
 
 fn collect_entries(
     path: &Path,
     recursive: bool,
-    max_entries: Option<usize>,
+    max_entries: usize,
+    budget: &mut SearchBudget,
     entries: &mut Vec<ListEntry>,
 ) -> Result<(), std::io::Error> {
-    if max_entries.is_some_and(|max| entries.len() >= max) {
+    if entries.len() >= max_entries || !budget.check() {
         return Ok(());
     }
     for entry in std::fs::read_dir(path)? {
+        if entries.len() >= max_entries || !budget.visit() {
+            break;
+        }
         let entry = entry?;
         let entry_path = entry.path();
         let kind = path_kind(&entry_path)?;
@@ -542,39 +636,66 @@ fn collect_entries(
             kind,
         });
         if recursive && entry_path.is_dir() {
-            collect_entries(&entry_path, recursive, max_entries, entries)?;
-        }
-        if max_entries.is_some_and(|max| entries.len() >= max) {
-            break;
+            collect_entries(&entry_path, recursive, max_entries, budget, entries)?;
         }
     }
     Ok(())
 }
 
 fn find_paths(request: &FindRequest) -> Result<FindResponse, std::io::Error> {
+    let max_results = request.max_results.unwrap_or(DEFAULT_FIND_MAX_RESULTS);
+    if let Some(response) = find_paths_with_fd(request, max_results)? {
+        return Ok(response);
+    }
+    if let Some(response) = find_paths_with_find(request, max_results)? {
+        return Ok(response);
+    }
+    find_paths_with_rust(request, max_results)
+}
+
+fn find_paths_with_rust(
+    request: &FindRequest,
+    max_results: usize,
+) -> Result<FindResponse, std::io::Error> {
+    let mut budget = SearchBudget::new(request.timeout_ms);
     let mut paths = Vec::new();
     collect_find_matches(
         &request.path,
         &request.path,
         &request.pattern,
-        request.max_results,
+        max_results,
+        &mut budget,
         &mut paths,
     )?;
     paths.sort();
-    Ok(FindResponse { paths })
+    let partial = budget.timed_out || paths.len() >= max_results;
+    Ok(FindResponse {
+        paths,
+        backend: "rust".to_string(),
+        timed_out: budget.timed_out,
+        partial,
+        visited_entries: budget.visited_entries,
+        message: budget
+            .timed_out
+            .then(|| timeout_message("find", budget.elapsed_timeout_ms())),
+    })
 }
 
 fn collect_find_matches(
     root: &Path,
     path: &Path,
     pattern: &str,
-    max_results: Option<usize>,
+    max_results: usize,
+    budget: &mut SearchBudget,
     paths: &mut Vec<String>,
 ) -> Result<(), std::io::Error> {
-    if max_results.is_some_and(|max| paths.len() >= max) {
+    if paths.len() >= max_results || !budget.check() {
         return Ok(());
     }
     for entry in std::fs::read_dir(path)? {
+        if paths.len() >= max_results || !budget.visit() {
+            break;
+        }
         let entry = entry?;
         let entry_path = entry.path();
         let relative = entry_path.strip_prefix(root).unwrap_or(&entry_path);
@@ -584,39 +705,70 @@ fn collect_find_matches(
             paths.push(entry_path.display().to_string());
         }
         if entry_path.is_dir() {
-            collect_find_matches(root, &entry_path, pattern, max_results, paths)?;
-        }
-        if max_results.is_some_and(|max| paths.len() >= max) {
-            break;
+            collect_find_matches(root, &entry_path, pattern, max_results, budget, paths)?;
         }
     }
     Ok(())
 }
 
 fn grep_files(request: &GrepRequest) -> Result<GrepResponse, std::io::Error> {
+    let max_matches = request.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
+    if let Some(response) = grep_files_with_rg(request, max_matches)? {
+        return Ok(response);
+    }
+    grep_files_with_rust(request, max_matches)
+}
+
+fn grep_files_with_rust(
+    request: &GrepRequest,
+    max_matches: usize,
+) -> Result<GrepResponse, std::io::Error> {
+    let mut budget = SearchBudget::new(request.timeout_ms);
     let mut matches = Vec::new();
-    collect_grep_matches(&request.path, request, &mut matches)?;
-    Ok(GrepResponse { matches })
+    collect_grep_matches(
+        &request.path,
+        request,
+        max_matches,
+        &mut budget,
+        &mut matches,
+    )?;
+    let partial = budget.timed_out || matches.len() >= max_matches;
+    Ok(GrepResponse {
+        matches,
+        backend: "rust".to_string(),
+        timed_out: budget.timed_out,
+        partial,
+        visited_entries: budget.visited_entries,
+        message: budget
+            .timed_out
+            .then(|| timeout_message("grep", budget.elapsed_timeout_ms())),
+    })
 }
 
 fn collect_grep_matches(
     path: &Path,
     request: &GrepRequest,
+    max_matches: usize,
+    budget: &mut SearchBudget,
     matches: &mut Vec<GrepMatch>,
 ) -> Result<(), std::io::Error> {
-    if request.max_matches.is_some_and(|max| matches.len() >= max) {
+    if matches.len() >= max_matches || !budget.check() {
         return Ok(());
     }
     if path.is_dir() {
         for entry in std::fs::read_dir(path)? {
-            collect_grep_matches(&entry?.path(), request, matches)?;
-            if request.max_matches.is_some_and(|max| matches.len() >= max) {
+            if matches.len() >= max_matches || !budget.visit() {
                 break;
             }
+            collect_grep_matches(&entry?.path(), request, max_matches, budget, matches)?;
         }
         return Ok(());
     }
     if !path.is_file() || !path_matches_optional_glob(path, request.glob.as_deref()) {
+        return Ok(());
+    }
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_RUST_GREP_FILE_BYTES {
         return Ok(());
     }
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -628,6 +780,9 @@ fn collect_grep_matches(
         request.pattern.clone()
     };
     for (line_index, line) in contents.lines().enumerate() {
+        if matches.len() >= max_matches || !budget.check() {
+            break;
+        }
         let haystack = if request.ignore_case {
             line.to_lowercase()
         } else {
@@ -639,12 +794,325 @@ fn collect_grep_matches(
                 line_number: line_index.saturating_add(1),
                 line: line.to_string(),
             });
-            if request.max_matches.is_some_and(|max| matches.len() >= max) {
-                break;
-            }
         }
     }
     Ok(())
+}
+
+struct ExternalCommandOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+}
+
+fn grep_files_with_rg(
+    request: &GrepRequest,
+    max_matches: usize,
+) -> Result<Option<GrepResponse>, std::io::Error> {
+    if !command_exists("rg") {
+        return Ok(None);
+    }
+    let mut command = Command::new("rg");
+    configure_command_for_timeout(&mut command);
+    command
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .arg("--fixed-strings")
+        .arg("--line-number");
+    if request.ignore_case {
+        command.arg("--ignore-case");
+    }
+    if let Some(glob) = &request.glob {
+        command.arg("--glob").arg(glob);
+    }
+    command.arg(&request.pattern).arg(&request.path);
+    let output = run_external_command(command, request.timeout_ms)?;
+    if output.exit_code == Some(127) {
+        return Ok(None);
+    }
+    let mut matches = parse_rg_json_matches(&output.stdout, max_matches);
+    let limit_reached = matches.len() >= max_matches;
+    if matches.len() > max_matches {
+        matches.truncate(max_matches);
+    }
+    let partial = output.timed_out || limit_reached;
+    Ok(Some(GrepResponse {
+        matches,
+        backend: "rg".to_string(),
+        timed_out: output.timed_out,
+        partial,
+        visited_entries: 0,
+        message: external_message("grep", &output, partial, max_matches, request.timeout_ms),
+    }))
+}
+
+fn parse_rg_json_matches(output: &str, max_matches: usize) -> Vec<GrepMatch> {
+    let mut matches = Vec::new();
+    for line in output.lines() {
+        if matches.len() >= max_matches {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("match") {
+            continue;
+        }
+        let Some(data) = value.get("data") else {
+            continue;
+        };
+        let path = data
+            .get("path")
+            .and_then(|path| path.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let line_number = data
+            .get("line_number")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok())
+            .unwrap_or_default();
+        let line = data
+            .get("lines")
+            .and_then(|lines| lines.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        matches.push(GrepMatch {
+            path,
+            line_number,
+            line,
+        });
+    }
+    matches
+}
+
+fn find_paths_with_fd(
+    request: &FindRequest,
+    max_results: usize,
+) -> Result<Option<FindResponse>, std::io::Error> {
+    if !command_exists("fd") {
+        return Ok(None);
+    }
+    let mut command = Command::new("fd");
+    configure_command_for_timeout(&mut command);
+    command
+        .arg("--color")
+        .arg("never")
+        .arg("--glob")
+        .arg("--max-results")
+        .arg(max_results.to_string())
+        .arg(&request.pattern)
+        .arg(&request.path);
+    let output = run_external_command(command, request.timeout_ms)?;
+    let paths = output
+        .stdout
+        .lines()
+        .take(max_results)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let partial = output.timed_out || paths.len() >= max_results;
+    Ok(Some(FindResponse {
+        paths,
+        backend: "fd".to_string(),
+        timed_out: output.timed_out,
+        partial,
+        visited_entries: 0,
+        message: external_message("find", &output, partial, max_results, request.timeout_ms),
+    }))
+}
+
+fn find_paths_with_find(
+    request: &FindRequest,
+    max_results: usize,
+) -> Result<Option<FindResponse>, std::io::Error> {
+    if !command_exists("find") {
+        return Ok(None);
+    }
+    let mut command = Command::new("find");
+    configure_command_for_timeout(&mut command);
+    command
+        .arg(&request.path)
+        .arg("(")
+        .arg("-name")
+        .arg(&request.pattern)
+        .arg("-o")
+        .arg("-path")
+        .arg(&request.pattern)
+        .arg(")")
+        .arg("-print");
+    let output = run_external_command(command, request.timeout_ms)?;
+    let mut paths = output
+        .stdout
+        .lines()
+        .take(max_results)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    paths.sort();
+    let partial = output.timed_out || paths.len() >= max_results;
+    Ok(Some(FindResponse {
+        paths,
+        backend: "find".to_string(),
+        timed_out: output.timed_out,
+        partial,
+        visited_entries: 0,
+        message: external_message("find", &output, partial, max_results, request.timeout_ms),
+    }))
+}
+
+fn external_message(
+    kind: &str,
+    output: &ExternalCommandOutput,
+    partial: bool,
+    max_results: usize,
+    timeout_ms: Option<u64>,
+) -> Option<String> {
+    if output.timed_out {
+        return Some(timeout_message(
+            kind,
+            timeout_ms.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS),
+        ));
+    }
+    if partial {
+        return Some(format!(
+            "{kind} stopped after reaching limit {max_results}; results are partial"
+        ));
+    }
+    if !output.stderr.trim().is_empty() && !matches!(output.exit_code, Some(0 | 1)) {
+        return Some(output.stderr.trim().to_string());
+    }
+    None
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn run_external_command(
+    mut command: Command,
+    timeout_ms: Option<u64>,
+) -> Result<ExternalCommandOutput, std::io::Error> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture stderr"))?;
+    let stdout_reader = std::thread::spawn(move || read_limited(stdout, MAX_EXTERNAL_OUTPUT_BYTES));
+    let stderr_reader = std::thread::spawn(move || read_limited(stderr, MAX_EXTERNAL_OUTPUT_BYTES));
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS));
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            break terminate_child_after_timeout(&mut child)?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok(ExternalCommandOutput {
+        stdout: join_reader(stdout_reader)?,
+        stderr: join_reader(stderr_reader)?,
+        exit_code: status.code(),
+        timed_out,
+    })
+}
+
+#[cfg(unix)]
+fn configure_command_for_timeout(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_command_for_timeout(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child_after_timeout(child: &mut Child) -> Result<ExitStatus, std::io::Error> {
+    let process_group_id = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+    send_signal_to_process_group(process_group_id, SIGTERM)?;
+    let grace_started = Instant::now();
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some()
+            || grace_started.elapsed() >= Duration::from_millis(TERMINATION_GRACE_MS)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    send_signal_to_process_group(process_group_id, SIGKILL)?;
+    status.map_or_else(|| child.wait(), Ok)
+}
+
+#[cfg(not(unix))]
+fn terminate_child_after_timeout(child: &mut Child) -> Result<ExitStatus, std::io::Error> {
+    child.kill()?;
+    child.wait()
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group(process_group_id: i32, signal: i32) -> Result<(), std::io::Error> {
+    let target = process_group_id
+        .checked_neg()
+        .ok_or_else(|| std::io::Error::other("process group id cannot be negated"))?;
+    // SAFETY: `kill` targets the process group created by `CommandExt::process_group(0)`.
+    let result = unsafe { kill(target, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+fn read_limited<R>(mut reader: R, max_bytes: usize) -> Result<String, std::io::Error>
+where
+    R: Read,
+{
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_bytes).map_err(std::io::Error::other)?;
+    reader.by_ref().take(limit).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn join_reader(
+    handle: std::thread::JoinHandle<Result<String, std::io::Error>>,
+) -> Result<String, std::io::Error> {
+    handle
+        .join()
+        .map_err(|_| std::io::Error::other("output reader thread panicked"))?
 }
 
 fn stat_path(request: &StatRequest) -> Result<StatResponse, std::io::Error> {
@@ -777,6 +1245,91 @@ where
             output: error.to_string(),
             is_error: true,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bcode-filesystem-plugin-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn rust_grep_enforces_timeout() {
+        let root = temp_dir("grep-timeout");
+        std::fs::write(root.join("file.txt"), "needle\n").expect("write file");
+
+        let response = grep_files_with_rust(
+            &GrepRequest {
+                path: root.clone(),
+                pattern: "needle".to_string(),
+                glob: None,
+                ignore_case: false,
+                max_matches: Some(10),
+                timeout_ms: Some(0),
+            },
+            10,
+        )
+        .expect("grep response");
+
+        assert_eq!(response.backend, "rust");
+        assert!(response.timed_out);
+        assert!(response.partial);
+        assert!(
+            response
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("timed out"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rust_find_uses_default_result_limit() {
+        let root = temp_dir("find-limit");
+        for index in 0..3 {
+            std::fs::write(root.join(format!("file-{index}.txt")), "x").expect("write file");
+        }
+
+        let response = find_paths_with_rust(
+            &FindRequest {
+                path: root.clone(),
+                pattern: "*.txt".to_string(),
+                max_results: Some(1),
+                timeout_ms: Some(30_000),
+            },
+            1,
+        )
+        .expect("find response");
+
+        assert_eq!(response.backend, "rust");
+        assert_eq!(response.paths.len(), 1);
+        assert!(response.partial);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_command_timeout_kills_process_group() {
+        let mut command = Command::new("sh");
+        configure_command_for_timeout(&mut command);
+        command
+            .arg("-c")
+            .arg("sh -c 'trap \"\" HUP TERM; sleep 5' | cat");
+        let started = Instant::now();
+
+        let output = run_external_command(command, Some(100)).expect("external output");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(output.timed_out);
     }
 }
 
