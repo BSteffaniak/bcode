@@ -14,6 +14,7 @@ use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
     SessionInputHistoryEntry, SessionSummary,
 };
+use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use thiserror::Error;
 
 /// Errors returned by the Bcode client.
@@ -303,6 +304,100 @@ impl BcodeClient {
         let mut connection = self.connect("bcode-cli").await?;
         match connection.send_request(Request::ListAgents).await? {
             ResponsePayload::AgentList { agents } => Ok(agents),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List available skills.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_skills(&self) -> Result<SkillList, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::ListSkills).await? {
+            ResponsePayload::SkillList { skills } => Ok(*skills),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Describe a skill.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn describe_skill(&self, skill_id: SkillId) -> Result<SkillManifest, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::DescribeSkill { skill_id })
+            .await?
+        {
+            ResponsePayload::SkillManifest { skill } => Ok(*skill),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Activate a skill for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn activate_skill(
+        &self,
+        session_id: SessionId,
+        skill_id: SkillId,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::ActivateSkill {
+                session_id,
+                skill_id,
+            })
+            .await?
+        {
+            ResponsePayload::SessionAgentSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Deactivate a skill for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn deactivate_skill(
+        &self,
+        session_id: SessionId,
+        skill_id: SkillId,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::DeactivateSkill {
+                session_id,
+                skill_id,
+            })
+            .await?
+        {
+            ResponsePayload::SessionAgentSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return active skills for a session as loaded contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn active_skills(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<bcode_skill_models::SkillContextResponse>, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::ActiveSkills { session_id })
+            .await?
+        {
+            ResponsePayload::ActiveSkills { skills } => Ok(skills),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

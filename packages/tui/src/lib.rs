@@ -28,6 +28,7 @@ use bcode_session_models::{
     SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
     SessionSummary, SessionTokenUsage, SessionTracePayload, SessionTracePhase,
 };
+use bcode_skill_models::SkillId;
 use bmux_text_edit::{SelectionMode, TextDelete, TextEditBuffer, TextMotion};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -1429,8 +1430,90 @@ async fn handle_slash_command(
             }
             true
         }
+        "skills" => list_skills_from_tui(client, app).await,
+        "skill" if parts.len() == 1 || parts.get(1) == Some(&"active") => {
+            active_skills_from_tui(client, app, session_id).await
+        }
+        "skill" if parts.get(1) == Some(&"off") && parts.len() > 2 => {
+            deactivate_skill_from_tui(client, app, session_id, parts[2]).await
+        }
+        "skill" if parts.len() > 1 => {
+            activate_skill_from_tui(client, app, session_id, parts[1]).await
+        }
         _ => app.parse_and_execute_slash(message, client),
     }
+}
+
+async fn list_skills_from_tui(client: &BcodeClient, app: &mut ChatApp) -> bool {
+    match client.list_skills().await {
+        Ok(list) => {
+            if list.skills.is_empty() {
+                app.status = "no skills available".to_string();
+            } else {
+                let skills = list
+                    .skills
+                    .iter()
+                    .map(|skill| skill.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                app.status = format!("available skills: {skills}");
+            }
+        }
+        Err(error) => app.status = format!("skill list failed: {error}"),
+    }
+    true
+}
+
+async fn active_skills_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+) -> bool {
+    match client.active_skills(session_id).await {
+        Ok(skills) if skills.is_empty() => app.status = "no active skills".to_string(),
+        Ok(skills) => {
+            let ids = skills
+                .iter()
+                .map(|skill| skill.skill_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            app.status = format!("active skills: {ids}");
+        }
+        Err(error) => app.status = format!("active skills failed: {error}"),
+    }
+    true
+}
+
+async fn activate_skill_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+    skill_id: &str,
+) -> bool {
+    match client
+        .activate_skill(session_id, SkillId::new(skill_id.to_string()))
+        .await
+    {
+        Ok(()) => app.status = format!("skill activated: {skill_id}"),
+        Err(error) => app.status = format!("skill activation failed: {error}"),
+    }
+    true
+}
+
+async fn deactivate_skill_from_tui(
+    client: &BcodeClient,
+    app: &mut ChatApp,
+    session_id: SessionId,
+    skill_id: &str,
+) -> bool {
+    match client
+        .deactivate_skill(session_id, SkillId::new(skill_id.to_string()))
+        .await
+    {
+        Ok(()) => app.status = format!("skill deactivated: {skill_id}"),
+        Err(error) => app.status = format!("skill deactivation failed: {error}"),
+    }
+    true
 }
 
 async fn list_models_from_tui(

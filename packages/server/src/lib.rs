@@ -26,6 +26,10 @@ use bcode_session_models::{
     ClientId, ModelTurnOutcome, SessionEventKind, SessionId, SessionTokenUsage, SessionTraceEvent,
     SessionTracePayload, SessionTracePhase, TraceBlobRef, TraceRedaction,
 };
+use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
+use bcode_skill_models::{
+    SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSourceKind,
+};
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
@@ -89,6 +93,9 @@ struct ServerState {
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     auto_compaction: bcode_config::CompactionConfig,
+    skills: Option<SkillRegistry>,
+    skill_context_bytes: usize,
+    active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -292,6 +299,8 @@ struct ServerStateInit {
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     auto_compaction: bcode_config::CompactionConfig,
+    skills: Option<SkillRegistry>,
+    skill_context_bytes: usize,
 }
 
 impl ServerState {
@@ -316,6 +325,9 @@ impl ServerState {
             tool_output_context_chars: init.tool_output_context_chars,
             model_streaming: init.model_streaming,
             auto_compaction: init.auto_compaction,
+            skills: init.skills,
+            skill_context_bytes: init.skill_context_bytes,
+            active_skills: Mutex::default(),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -385,6 +397,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         "model selection resolved"
     );
     let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
+    let skills = build_skill_registry(&config);
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
@@ -405,6 +418,8 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             tool_output_context_chars: config.model.tool_output.context_chars,
             model_streaming: config.model.streaming,
             auto_compaction: config.model.compaction,
+            skill_context_bytes: config.skills.max_context_bytes,
+            skills,
         },
     ));
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
@@ -573,6 +588,21 @@ async fn handle_agent_permission_plugin_request(
 ) -> Result<(), ServerError> {
     match request {
         Request::ListAgents => handle_list_agents(request_id, state, writer).await,
+        Request::ListSkills => handle_list_skills(request_id, state, writer).await,
+        Request::DescribeSkill { skill_id } => {
+            handle_describe_skill(request_id, state, writer, &skill_id).await
+        }
+        Request::ActivateSkill {
+            session_id,
+            skill_id,
+        } => handle_activate_skill(request_id, state, writer, session_id, skill_id).await,
+        Request::DeactivateSkill {
+            session_id,
+            skill_id,
+        } => handle_deactivate_skill(request_id, state, writer, session_id, skill_id).await,
+        Request::ActiveSkills { session_id } => {
+            handle_active_skills(request_id, state, writer, session_id).await
+        }
         Request::AgentPolicyStatus => handle_agent_policy_status(request_id, state, writer).await,
         Request::SetSessionAgent {
             session_id,
@@ -1079,6 +1109,171 @@ async fn handle_list_agents(
         writer,
         request_id,
         Response::Ok(ResponsePayload::AgentList { agents }),
+    )
+    .await
+}
+
+async fn handle_list_skills(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let skills = state.skills.as_ref().map_or_else(
+        || SkillList {
+            skills: Vec::new(),
+            diagnostics: Vec::new(),
+        },
+        SkillRegistry::list,
+    );
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SkillList {
+            skills: Box::new(skills),
+        }),
+    )
+    .await
+}
+
+async fn handle_describe_skill(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    skill_id: &SkillId,
+) -> Result<(), ServerError> {
+    let Some(registry) = &state.skills else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse {
+                code: "skills_disabled".to_string(),
+                message: "skills are disabled".to_string(),
+            }),
+        )
+        .await;
+    };
+    match registry.describe(skill_id) {
+        Ok(skill) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SkillManifest {
+                    skill: Box::new(skill),
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse {
+                    code: "skill_describe_failed".to_string(),
+                    message: error.to_string(),
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_activate_skill(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    skill_id: SkillId,
+) -> Result<(), ServerError> {
+    let Some(registry) = &state.skills else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse {
+                code: "skills_disabled".to_string(),
+                message: "skills are disabled".to_string(),
+            }),
+        )
+        .await;
+    };
+    let Some(summary) = registry.summary(&skill_id).cloned() else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse {
+                code: "unknown_skill".to_string(),
+                message: format!("unknown skill: {skill_id}"),
+            }),
+        )
+        .await;
+    };
+    state
+        .active_skills
+        .lock()
+        .await
+        .entry(session_id)
+        .or_default()
+        .insert(skill_id.clone());
+    let event = state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::SkillActivated {
+                skill_id,
+                source: Some(summary.source),
+                mode: SkillActivationMode::Explicit,
+                activated_at_ms: current_time_ms(),
+            },
+        )
+        .await?;
+    publish_session_event(state, &event).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionAgentSet),
+    )
+    .await
+}
+
+async fn handle_deactivate_skill(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    skill_id: SkillId,
+) -> Result<(), ServerError> {
+    if let Some(skills) = state.active_skills.lock().await.get_mut(&session_id) {
+        skills.remove(&skill_id);
+    }
+    let event = state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms: current_time_ms(),
+            },
+        )
+        .await?;
+    publish_session_event(state, &event).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionAgentSet),
+    )
+    .await
+}
+
+async fn handle_active_skills(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let skills = active_skill_contexts(state, session_id).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ActiveSkills { skills }),
     )
     .await
 }
@@ -3261,6 +3456,7 @@ where
     .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn build_model_turn_request(
     state: &ServerState,
     session_id: SessionId,
@@ -3307,6 +3503,32 @@ async fn build_model_turn_request(
                 }],
             },
         );
+        system_prefix_len += 1;
+    }
+    let skill_contexts = active_skill_contexts(state, session_id).await;
+    for skill_context in skill_contexts {
+        messages.insert(
+            system_prefix_len,
+            ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text {
+                    text: skill_context.context,
+                }],
+            },
+        );
+        system_prefix_len += 1;
+        let _ = state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::SkillContextLoaded {
+                    skill_id: skill_context.skill_id,
+                    bytes_loaded: skill_context.bytes_loaded,
+                    truncated: skill_context.truncated,
+                    loaded_at_ms: current_time_ms(),
+                },
+            )
+            .await;
     }
     let enabled_tools = agent_context
         .as_ref()
@@ -4631,6 +4853,110 @@ async fn send_response(
     send_envelope(&mut *writer, &envelope).await?;
     drop(writer);
     Ok(())
+}
+
+fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegistry> {
+    let mut roots = Vec::new();
+    if !config.skills.enabled {
+        return None;
+    }
+    if config.skills.include_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from(".bcode/skills"),
+            SkillSourceKind::Repository,
+            "repo:.bcode/skills",
+            10,
+        ));
+    }
+    if config.skills.include_compat_claude_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from(".claude/skills"),
+            SkillSourceKind::Compatibility,
+            "repo:.claude/skills",
+            20,
+        ));
+    }
+    if config.skills.include_user_skills {
+        roots.push(SkillSourceRoot::new(
+            bcode_config::default_state_dir().join("skills"),
+            SkillSourceKind::User,
+            "user:skills",
+            30,
+        ));
+    }
+    for (index, path) in config.skills.sources.paths.iter().enumerate() {
+        roots.push(SkillSourceRoot::new(
+            path.clone(),
+            SkillSourceKind::Configured,
+            format!("configured:{index}"),
+            40 + u16::try_from(index).unwrap_or(u16::MAX - 40),
+        ));
+    }
+    let options = SkillRegistryOptions {
+        max_skill_file_bytes: config.skills.max_skill_file_bytes,
+        max_context_bytes: config.skills.max_context_bytes,
+        follow_symlinks: config.skills.follow_symlinks,
+        disabled_ids: config.skills.disabled_skill_ids(),
+    };
+    match SkillRegistry::discover(&roots, options) {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            eprintln!("failed to build skill registry: {error}");
+            None
+        }
+    }
+}
+
+async fn active_skill_contexts(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Vec<SkillContextResponse> {
+    let Some(registry) = &state.skills else {
+        return Vec::new();
+    };
+    let skill_ids = state
+        .active_skills
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    let per_skill_budget = state
+        .skill_context_bytes
+        .checked_div(skill_ids.len().max(1));
+    let mut contexts = Vec::new();
+    for skill_id in skill_ids {
+        let Some(summary) = registry.summary(&skill_id) else {
+            continue;
+        };
+        let context = match registry.context(&skill_id, per_skill_budget) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = state
+                    .sessions
+                    .append_event(
+                        session_id,
+                        SessionEventKind::SkillInvocationFailed {
+                            skill_id,
+                            error: error.to_string(),
+                            failed_at_ms: current_time_ms(),
+                        },
+                    )
+                    .await;
+                continue;
+            }
+        };
+        let bytes_loaded = context.len();
+        let truncated = per_skill_budget.is_some_and(|budget| bytes_loaded >= budget);
+        contexts.push(SkillContextResponse {
+            skill_id,
+            context,
+            source: summary.source.clone(),
+            bytes_loaded,
+            truncated,
+        });
+    }
+    contexts
 }
 
 fn default_session_store_dir() -> PathBuf {

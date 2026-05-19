@@ -18,6 +18,7 @@ bcode_config = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_model = { workspace = true }
 bcode_session_models = { workspace = true }
+bcode_skill_models = { workspace = true }
 bmux_text_edit = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
 ratatui = { workspace = true, features = [

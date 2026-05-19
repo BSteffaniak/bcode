@@ -748,6 +748,7 @@ dependencies = [
  "bcode_ipc",
  "bcode_model",
  "bcode_session_models",
+ "bcode_skill_models",
  "thiserror 2.0.18",
 ]
 
@@ -900,6 +901,8 @@ dependencies = [
  "bcode_plugin",
  "bcode_session",
  "bcode_session_models",
+ "bcode_skill",
+ "bcode_skill_models",
  "bcode_tool",
  "serde",
  "serde_json",
@@ -978,6 +981,7 @@ dependencies = [
  "bcode_ipc",
  "bcode_model",
  "bcode_session_models",
+ "bcode_skill_models",
  "bmux_text_edit",
  "crossterm",
  "ratatui",
