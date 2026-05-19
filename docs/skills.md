@@ -12,6 +12,14 @@ Bcode skills are planned as reusable, discoverable capability packs that provide
 
 ## Skill package format
 
+Bcode recognizes skill directories using the following instruction-file priority:
+
+```text
+SKILL.md > skill.md > README.md
+```
+
+It also accepts flat markdown files directly under a skill source root, for example `skills/rust-debugging.md`; the skill ID is inferred from the file name when front matter omits `id`.
+
 The baseline portable format is a directory with `SKILL.md`:
 
 ```text
@@ -60,10 +68,11 @@ Use this skill when investigating Rust build, clippy, test, or runtime failures.
 Skill discovery should be layered and deterministic:
 
 1. Repository-local skills: `.bcode/skills/`
-2. Compatibility repository skills: `.claude/skills/` when enabled
-3. User skills: `${config_dir}/bcode/skills/`
-4. Explicit configured paths from `bcode.toml`
-5. Bundled skills from Bcode/plugin distributions
+2. Generic repository skills: `skills/`
+3. Compatibility repository skills: `.claude/skills/` when enabled
+4. User skills: `${state_dir}/bcode/skills/` or `${BCODE_STATE_DIR}/skills/`
+5. Explicit configured paths from `bcode.toml`
+6. Bundled skills from Bcode/plugin distributions
 
 When duplicate IDs exist, higher-precedence sources shadow lower-precedence sources. Shadowed skills should appear in diagnostics rather than causing startup failure.
 
@@ -76,6 +85,7 @@ Initial global config shape:
 enabled = true
 auto_activate = "suggest" # off | suggest | on
 include_repo_skills = true
+include_generic_repo_skills = true
 include_user_skills = true
 include_compat_claude_skills = true
 max_context_bytes = 24000

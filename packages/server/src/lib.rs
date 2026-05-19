@@ -4871,6 +4871,14 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
             10,
         ));
     }
+    if config.skills.include_generic_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from("skills"),
+            SkillSourceKind::Repository,
+            "repo:skills",
+            15,
+        ));
+    }
     if config.skills.include_compat_claude_skills {
         roots.push(SkillSourceRoot::new(
             PathBuf::from(".claude/skills"),

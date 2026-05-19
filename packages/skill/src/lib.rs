@@ -16,7 +16,7 @@ use thiserror::Error;
 
 const DEFAULT_MAX_SKILL_FILE_BYTES: u64 = 256 * 1024;
 const DEFAULT_MAX_CONTEXT_BYTES: usize = 24 * 1024;
-const SKILL_FILE_NAME: &str = "SKILL.md";
+const SKILL_FILE_NAMES: &[&str] = &["SKILL.md", "skill.md", "README.md"];
 
 /// Errors returned by skill registry operations.
 #[derive(Debug, Error)]
@@ -211,8 +211,8 @@ impl SkillRegistry {
             return;
         }
 
-        if root.path.join(SKILL_FILE_NAME).is_file() {
-            self.scan_skill_dir(root, &root.path);
+        if let Some(skill_file) = find_skill_file(&root.path) {
+            self.scan_skill_file(root, &root.path, &skill_file);
             return;
         }
 
@@ -230,20 +230,23 @@ impl SkillRegistry {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.join(SKILL_FILE_NAME).is_file() {
-                self.scan_skill_dir(root, &path);
+            if let Some(skill_file) = find_skill_file(&path) {
+                self.scan_skill_file(root, &path, &skill_file);
+            } else if path.is_file() && path.extension().is_some_and(|extension| extension == "md")
+            {
+                self.scan_skill_file(root, &path, &path);
             }
         }
     }
 
-    fn scan_skill_dir(&mut self, root: &SkillSourceRoot, skill_dir: &Path) {
+    fn scan_skill_file(&mut self, root: &SkillSourceRoot, skill_path: &Path, skill_file: &Path) {
         let source = SkillSource {
             kind: root.kind,
             label: root.label.clone(),
-            path: Some(skill_dir.to_string_lossy().into_owned()),
+            path: Some(skill_path.to_string_lossy().into_owned()),
             precedence: root.precedence,
         };
-        let skill_file = skill_dir.join(SKILL_FILE_NAME);
+        let skill_file = skill_file.to_path_buf();
         match parse_skill_file(&skill_file, &source, self.options.max_skill_file_bytes) {
             Ok(manifest) => self.insert_skill(SkillEntry {
                 summary: manifest.summary,
@@ -289,6 +292,13 @@ struct SkillEntry {
     path: PathBuf,
 }
 
+fn find_skill_file(path: &Path) -> Option<PathBuf> {
+    SKILL_FILE_NAMES
+        .iter()
+        .map(|file_name| path.join(file_name))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Parse a `SKILL.md` file.
 ///
 /// # Errors
@@ -308,18 +318,21 @@ pub fn parse_skill_file(
         .into());
     }
     let contents = fs::read_to_string(path)?;
-    parse_skill_markdown(&contents, source)
+    let fallback_id = path.file_stem().and_then(|stem| stem.to_str());
+    parse_skill_markdown(&contents, source, fallback_id)
 }
 
 fn parse_skill_markdown(
     contents: &str,
     source: &SkillSource,
+    fallback_id: Option<&str>,
 ) -> Result<SkillManifest, SkillRegistryError> {
     let (frontmatter, instructions) = split_frontmatter(contents)?;
     let raw: RawSkillFrontmatter = toml::from_str(&yamlish_to_toml(frontmatter))
         .map_err(|error| SkillError::InvalidMetadata(error.to_string()))?;
     let id = raw
         .id
+        .or_else(|| fallback_id.map(ToString::to_string))
         .ok_or_else(|| SkillError::InvalidMetadata("missing skill id".to_string()))?;
     let name = raw.name.clone().unwrap_or_else(|| id.clone());
     let summary = SkillSummary {
@@ -478,6 +491,7 @@ mod tests {
         let manifest = parse_skill_markdown(
             "---\nid: rust-debugging\nname: Rust Debugging\ndescription: Debug Rust\nversion: 0.1.0\nactivation:\n  keywords:\n    - rust\n    - cargo\npermissions:\n  tools:\n    - shell.run\n---\n# Instructions\nDo things.",
             &source,
+            None,
         )
         .expect("skill parses");
 
@@ -485,5 +499,30 @@ mod tests {
         assert_eq!(manifest.summary.activation.keywords, vec!["rust", "cargo"]);
         assert_eq!(manifest.permissions.tools, vec!["shell.run"]);
         assert_eq!(manifest.instructions, "# Instructions\nDo things.");
+    }
+    #[test]
+    fn infers_flat_markdown_skill_id_from_file_name() {
+        let source = SkillSource {
+            kind: SkillSourceKind::Repository,
+            label: "repo:skills".to_string(),
+            path: None,
+            precedence: 15,
+        };
+        let manifest = parse_skill_markdown(
+            "---
+name: Code Review
+activation:
+  keywords:
+    - review
+---
+# Review
+Check the code.",
+            &source,
+            Some("code-review"),
+        )
+        .expect("skill parses");
+
+        assert_eq!(manifest.summary.id.as_str(), "code-review");
+        assert_eq!(manifest.summary.name, "Code Review");
     }
 }

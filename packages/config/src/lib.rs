@@ -259,6 +259,8 @@ pub struct SkillsConfig {
     #[serde(default = "default_true")]
     pub include_repo_skills: bool,
     #[serde(default = "default_true")]
+    pub include_generic_repo_skills: bool,
+    #[serde(default = "default_true")]
     pub include_user_skills: bool,
     #[serde(default = "default_true")]
     pub include_compat_claude_skills: bool,
@@ -282,6 +284,7 @@ impl Default for SkillsConfig {
             enabled: true,
             auto_activate: SkillAutoActivateMode::Suggest,
             include_repo_skills: true,
+            include_generic_repo_skills: true,
             include_user_skills: true,
             include_compat_claude_skills: true,
             max_context_bytes: default_skill_context_bytes(),
@@ -1690,6 +1693,9 @@ fn write_skills_toml(output: &mut String, skills: &SkillsConfig) {
     }
     if !skills.include_repo_skills {
         output.push_str("include_repo_skills = false\n");
+    }
+    if !skills.include_generic_repo_skills {
+        output.push_str("include_generic_repo_skills = false\n");
     }
     if !skills.include_user_skills {
         output.push_str("include_user_skills = false\n");
