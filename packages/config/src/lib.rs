@@ -320,12 +320,67 @@ pub struct TuiConfig {
     /// Scoped keybindings keyed by key stroke. Values are action IDs.
     #[serde(default)]
     pub keybindings: TuiKeyBindingConfig,
+    /// Mouse interaction configuration.
+    #[serde(default)]
+    pub mouse: TuiMouseConfig,
 }
 
 impl TuiConfig {
     fn merge(&mut self, next: Self) {
         self.keybindings.merge(next.keybindings);
+        self.mouse = next.mouse;
     }
+}
+
+/// Terminal UI mouse interaction configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiMouseConfig {
+    /// Maximum milliseconds between clicks in the same sequence.
+    #[serde(default = "default_mouse_multi_click_ms")]
+    pub multi_click_ms: u64,
+    /// Maximum terminal-cell distance between clicks in the same sequence.
+    #[serde(default)]
+    pub multi_click_max_distance: u16,
+    /// Double-click selection behavior.
+    #[serde(default)]
+    pub double_click_select: TuiMouseClickSelection,
+    /// Triple-click selection behavior.
+    #[serde(default = "default_triple_click_select")]
+    pub triple_click_select: TuiMouseClickSelection,
+}
+
+impl Default for TuiMouseConfig {
+    fn default() -> Self {
+        Self {
+            multi_click_ms: default_mouse_multi_click_ms(),
+            multi_click_max_distance: 0,
+            double_click_select: TuiMouseClickSelection::Word,
+            triple_click_select: default_triple_click_select(),
+        }
+    }
+}
+
+const fn default_mouse_multi_click_ms() -> u64 {
+    500
+}
+
+const fn default_triple_click_select() -> TuiMouseClickSelection {
+    TuiMouseClickSelection::All
+}
+
+/// Selection behavior for a mouse click count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiMouseClickSelection {
+    /// Do not select on this click count.
+    Disabled,
+    /// Select a word.
+    #[default]
+    Word,
+    /// Select the current line.
+    Line,
+    /// Select the whole editable buffer.
+    All,
 }
 
 /// Scoped terminal UI keybindings.
@@ -1595,6 +1650,31 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn tui_mouse_config_loads_from_toml() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[tui.mouse]
+multi_click_ms = 300
+multi_click_max_distance = 1
+double_click_select = "word"
+triple_click_select = "all"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.tui.mouse.multi_click_ms, 300);
+        assert_eq!(config.tui.mouse.multi_click_max_distance, 1);
+        assert_eq!(
+            config.tui.mouse.double_click_select,
+            super::TuiMouseClickSelection::Word
+        );
+        assert_eq!(
+            config.tui.mouse.triple_click_select,
+            super::TuiMouseClickSelection::All
+        );
+    }
 
     fn assert_default_core_plugins_enabled(plugin_selection: &PluginSelection) {
         assert!(

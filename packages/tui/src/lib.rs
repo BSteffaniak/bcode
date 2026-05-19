@@ -20,6 +20,7 @@
 use arboard::Clipboard;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_command::CommandInfo;
+use bcode_config::{TuiMouseClickSelection, TuiMouseConfig};
 use bcode_ipc::Event;
 use bcode_model::{ModelList, ReasoningEffort};
 use bcode_session_models::{
@@ -74,6 +75,7 @@ const DEFAULT_TRANSCRIPT_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_HEIGHT: u16 = 20;
 const TRANSCRIPT_WINDOW_OVERSCAN_LINES: usize = 2;
 const MOUSE_SCROLL_ROWS: usize = 3;
+const MOUSE_CLICK_COUNT_MAX: u8 = 3;
 const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const MAX_COMPOSER_ROWS: u16 = 6;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -664,7 +666,7 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     let config = bcode_config::load_config()?;
     let keymap = KeyMap::from_config(&config.tui);
     let session_id = resolve_session(&client, session_id, &keymap).await?;
-    run_chat(client, session_id, keymap).await
+    run_chat(client, session_id, keymap, config.tui.mouse).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -672,6 +674,7 @@ async fn run_chat(
     client: BcodeClient,
     session_id: SessionId,
     keymap: KeyMap,
+    mouse_config: TuiMouseConfig,
 ) -> Result<(), TuiError> {
     let mut connection = client.connect("bcode-tui").await?;
     let attached = connection
@@ -703,6 +706,7 @@ async fn run_chat(
         &attached.history,
         &attached.input_history,
         &keymap,
+        mouse_config,
     );
     if let Some(status) = status {
         app.selected_provider_plugin_id = status.selected_provider_plugin_id;
@@ -1084,28 +1088,49 @@ fn handle_composer_mouse_event(app: &mut ChatApp, mouse: MouseEvent) -> bool {
     let area = app.last_composer_area.get();
     if !rect_contains(area, mouse.column, mouse.row) {
         if !matches!(mouse.kind, MouseEventKind::Drag(_)) {
-            app.mouse_selection_active = false;
+            app.mouse_selection.active = MouseSelectionGranularity::Disabled;
         }
         return false;
     }
     let layout = composer_layout(expand_rect(area, 1, 1), &app.input, app.search_mode);
     let row = usize::from(mouse.row.saturating_sub(area.y)).saturating_add(layout.scroll);
     let col = usize::from(mouse.column.saturating_sub(area.x));
+    let width = usize::from(area.width.max(1));
     match mouse.kind {
         MouseEventKind::Down(_) => {
             app.reset_input_history_navigation();
-            app.input
-                .move_cursor_to_wrapped_position(usize::from(area.width.max(1)), row, col);
-            app.mouse_selection_active = true;
+            let byte_index = app.input.byte_index_for_wrapped_position(width, row, col);
+            let count = app
+                .mouse_selection
+                .click_count(mouse.column, mouse.row, Instant::now());
+            app.mouse_selection.active = app.mouse_selection.granularity_for_click_count(count);
+            match app.mouse_selection.active {
+                MouseSelectionGranularity::Character | MouseSelectionGranularity::Disabled => {
+                    app.input.move_cursor(TextMotion::Absolute(byte_index));
+                }
+                MouseSelectionGranularity::Word => {
+                    select_buffer_word_at(&mut app.input, byte_index);
+                }
+                MouseSelectionGranularity::Line => {
+                    select_buffer_line_at(&mut app.input, byte_index);
+                }
+                MouseSelectionGranularity::All => app.input.select_all(),
+            }
             true
         }
-        MouseEventKind::Drag(_) if app.mouse_selection_active => {
-            app.input
-                .select_to_wrapped_position(usize::from(area.width.max(1)), row, col);
+        MouseEventKind::Drag(_)
+            if app.mouse_selection.active != MouseSelectionGranularity::Disabled =>
+        {
+            let byte_index = app.input.byte_index_for_wrapped_position(width, row, col);
+            extend_buffer_selection_to_granularity(
+                &mut app.input,
+                byte_index,
+                app.mouse_selection.active,
+            );
             true
         }
         MouseEventKind::Up(_) => {
-            app.mouse_selection_active = false;
+            app.mouse_selection.active = MouseSelectionGranularity::Disabled;
             true
         }
         _ => false,
@@ -1124,17 +1149,40 @@ fn handle_command_palette_mouse_event(app: &mut ChatApp, mouse: MouseEvent) -> b
     }
     let prefix_width = line_width("› ");
     let col = usize::from(mouse.column.saturating_sub(search_area.x)).saturating_sub(prefix_width);
+    let width = usize::from(search_area.width);
+    let byte_index = palette.filter.byte_index_for_line_viewport_col(width, col);
     match mouse.kind {
         MouseEventKind::Down(_) => {
-            palette
-                .filter
-                .move_cursor_to_line_viewport_col(usize::from(search_area.width), col);
+            let count = app
+                .mouse_selection
+                .click_count(mouse.column, mouse.row, Instant::now());
+            app.mouse_selection.active = app.mouse_selection.granularity_for_click_count(count);
+            match app.mouse_selection.active {
+                MouseSelectionGranularity::Character | MouseSelectionGranularity::Disabled => {
+                    palette.filter.move_cursor(TextMotion::Absolute(byte_index));
+                }
+                MouseSelectionGranularity::Word => {
+                    select_buffer_word_at(&mut palette.filter, byte_index);
+                }
+                MouseSelectionGranularity::Line => {
+                    select_buffer_line_at(&mut palette.filter, byte_index);
+                }
+                MouseSelectionGranularity::All => palette.filter.select_all(),
+            }
             true
         }
-        MouseEventKind::Drag(_) => {
-            palette
-                .filter
-                .select_to_line_viewport_col(usize::from(search_area.width), col);
+        MouseEventKind::Drag(_)
+            if app.mouse_selection.active != MouseSelectionGranularity::Disabled =>
+        {
+            extend_buffer_selection_to_granularity(
+                &mut palette.filter,
+                byte_index,
+                app.mouse_selection.active,
+            );
+            true
+        }
+        MouseEventKind::Up(_) => {
+            app.mouse_selection.active = MouseSelectionGranularity::Disabled;
             true
         }
         _ => false,
@@ -1155,6 +1203,176 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
+}
+
+#[derive(Debug, Clone)]
+struct MouseSelectionState {
+    config: TuiMouseConfig,
+    last_click: Option<MouseClickState>,
+    active: MouseSelectionGranularity,
+}
+
+impl MouseSelectionState {
+    fn new(config: TuiMouseConfig) -> Self {
+        Self {
+            config,
+            last_click: None,
+            active: MouseSelectionGranularity::Character,
+        }
+    }
+
+    fn click_count(&mut self, column: u16, row: u16, now: Instant) -> u8 {
+        let count = self
+            .last_click
+            .as_ref()
+            .filter(|click| {
+                now.duration_since(click.time) <= Duration::from_millis(self.config.multi_click_ms)
+                    && click.column.abs_diff(column).max(click.row.abs_diff(row))
+                        <= self.config.multi_click_max_distance
+            })
+            .map_or(1, |click| {
+                click.count.saturating_add(1).min(MOUSE_CLICK_COUNT_MAX)
+            });
+        self.last_click = Some(MouseClickState {
+            column,
+            row,
+            time: now,
+            count,
+        });
+        count
+    }
+
+    fn granularity_for_click_count(&self, count: u8) -> MouseSelectionGranularity {
+        match count {
+            2 => MouseSelectionGranularity::from_config(self.config.double_click_select),
+            3.. => MouseSelectionGranularity::from_config(self.config.triple_click_select),
+            _ => MouseSelectionGranularity::Character,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MouseClickState {
+    column: u16,
+    row: u16,
+    time: Instant,
+    count: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseSelectionGranularity {
+    Character,
+    Word,
+    Line,
+    All,
+    Disabled,
+}
+
+impl MouseSelectionGranularity {
+    const fn from_config(selection: TuiMouseClickSelection) -> Self {
+        match selection {
+            TuiMouseClickSelection::Disabled => Self::Disabled,
+            TuiMouseClickSelection::Word => Self::Word,
+            TuiMouseClickSelection::Line => Self::Line,
+            TuiMouseClickSelection::All => Self::All,
+        }
+    }
+}
+
+fn select_buffer_range(input: &mut TextEditBuffer, start: usize, end: usize) {
+    input.move_cursor(TextMotion::Absolute(start));
+    input.move_cursor_with_selection(TextMotion::Absolute(end), SelectionMode::Extend);
+}
+
+fn select_buffer_word_at(input: &mut TextEditBuffer, byte_index: usize) {
+    if let Some((start, end)) = word_range_at(input.text(), byte_index) {
+        select_buffer_range(input, start, end);
+    } else {
+        input.move_cursor(TextMotion::Absolute(byte_index));
+    }
+}
+
+fn select_buffer_line_at(input: &mut TextEditBuffer, byte_index: usize) {
+    let text = input.text();
+    let index = byte_index.min(text.len());
+    let start = text[..index].rfind('\n').map_or(0, |position| position + 1);
+    let end = text[index..]
+        .find('\n')
+        .map_or(text.len(), |position| index + position);
+    select_buffer_range(input, start, end);
+}
+
+fn extend_buffer_selection_to_granularity(
+    input: &mut TextEditBuffer,
+    byte_index: usize,
+    granularity: MouseSelectionGranularity,
+) {
+    match granularity {
+        MouseSelectionGranularity::Character => {
+            input.move_cursor_with_selection(
+                TextMotion::Absolute(byte_index),
+                SelectionMode::Extend,
+            );
+        }
+        MouseSelectionGranularity::Word => {
+            let target = word_range_at(input.text(), byte_index).map_or(byte_index, |(_, end)| end);
+            input.move_cursor_with_selection(TextMotion::Absolute(target), SelectionMode::Extend);
+        }
+        MouseSelectionGranularity::Line => {
+            let text = input.text();
+            let index = byte_index.min(text.len());
+            let target = text[index..]
+                .find('\n')
+                .map_or(text.len(), |position| index + position);
+            input.move_cursor_with_selection(TextMotion::Absolute(target), SelectionMode::Extend);
+        }
+        MouseSelectionGranularity::All => input.select_all(),
+        MouseSelectionGranularity::Disabled => {
+            input.move_cursor(TextMotion::Absolute(byte_index));
+        }
+    }
+}
+
+fn word_range_at(text: &str, byte_index: usize) -> Option<(usize, usize)> {
+    if text.is_empty() {
+        return None;
+    }
+    let index = snap_to_char_boundary(text, byte_index.min(text.len()));
+    let spans = text
+        .grapheme_indices(true)
+        .map(|(start, grapheme)| (start, start + grapheme.len(), grapheme))
+        .collect::<Vec<_>>();
+    let mut span_index = spans
+        .iter()
+        .position(|(start, end, _)| *start <= index && index < *end)
+        .or_else(|| spans.iter().rposition(|(_, end, _)| *end <= index))?;
+    if is_word_separator(spans[span_index].2) && span_index > 0 {
+        span_index -= 1;
+    }
+    if is_word_separator(spans[span_index].2) {
+        return None;
+    }
+    let mut start_index = span_index;
+    while start_index > 0 && !is_word_separator(spans[start_index - 1].2) {
+        start_index -= 1;
+    }
+    let mut end_index = span_index + 1;
+    while end_index < spans.len() && !is_word_separator(spans[end_index].2) {
+        end_index += 1;
+    }
+    Some((spans[start_index].0, spans[end_index - 1].1))
+}
+
+fn is_word_separator(grapheme: &str) -> bool {
+    grapheme.chars().all(char::is_whitespace)
+        || grapheme.chars().all(|ch| ch.is_ascii_punctuation())
+}
+
+fn snap_to_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 async fn handle_slash_command(
@@ -2062,7 +2280,7 @@ struct ChatApp {
     last_transcript_area: Cell<Rect>,
     last_composer_area: Cell<Rect>,
     last_frame_area: Cell<Rect>,
-    mouse_selection_active: bool,
+    mouse_selection: MouseSelectionState,
     search_mode: bool,
     search_query: String,
     key_hints: String,
@@ -2339,7 +2557,13 @@ impl ChatApp {
     #[cfg(test)]
     fn new(session_id: SessionId, history: &[SessionEvent], keymap: &KeyMap) -> Self {
         let input_history = input_history_entries_from_events(history);
-        Self::new_with_input_history(session_id, history, &input_history, keymap)
+        Self::new_with_input_history(
+            session_id,
+            history,
+            &input_history,
+            keymap,
+            TuiMouseConfig::default(),
+        )
     }
 
     fn new_with_input_history(
@@ -2347,6 +2571,7 @@ impl ChatApp {
         history: &[SessionEvent],
         input_history: &[SessionInputHistoryEntry],
         keymap: &KeyMap,
+        mouse_config: TuiMouseConfig,
     ) -> Self {
         let mut app = Self {
             session_id,
@@ -2389,7 +2614,7 @@ impl ChatApp {
             )),
             last_composer_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_frame_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            mouse_selection_active: false,
+            mouse_selection: MouseSelectionState::new(mouse_config),
             search_mode: false,
             search_query: String::new(),
             key_hints: keymap.chat_hints(),
@@ -5045,8 +5270,13 @@ mod tests {
                 text: "recent prompt".to_string(),
             },
         )];
-        let mut app =
-            ChatApp::new_with_input_history(session_id, &recent_history, &input_history, &keymap);
+        let mut app = ChatApp::new_with_input_history(
+            session_id,
+            &recent_history,
+            &input_history,
+            &keymap,
+            TuiMouseConfig::default(),
+        );
 
         app.previous_input_history();
         assert_eq!(app.input.text(), "recent prompt");
@@ -5204,6 +5434,7 @@ mod tests {
                 .collect(),
                 ..bcode_config::TuiKeyBindingConfig::default()
             },
+            ..bcode_config::TuiConfig::default()
         };
         let keymap = KeyMap::from_config(&config);
 
@@ -5257,6 +5488,7 @@ mod tests {
                 .collect(),
                 ..bcode_config::TuiKeyBindingConfig::default()
             },
+            ..bcode_config::TuiConfig::default()
         };
         let keymap = KeyMap::from_config(&config);
 
@@ -5302,6 +5534,7 @@ mod tests {
                 .collect(),
                 ..bcode_config::TuiKeyBindingConfig::default()
             },
+            ..bcode_config::TuiConfig::default()
         };
         let keymap = KeyMap::from_config(&config);
 
@@ -6250,6 +6483,81 @@ mod tests {
         );
 
         assert_eq!(app.input.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn mouse_double_click_selects_composer_word() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = TextEditBuffer::from_text("hello world");
+        app.last_composer_area.set(Rect::new(1, 10, 20, 3));
+
+        for _ in 0..2 {
+            handle_mouse_event(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 3,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        }
+
+        assert_eq!(app.input.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn mouse_triple_click_selects_all_composer_text() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = TextEditBuffer::from_text("hello world");
+        app.last_composer_area.set(Rect::new(1, 10, 20, 3));
+
+        for _ in 0..3 {
+            handle_mouse_event(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 3,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        }
+
+        assert_eq!(app.input.selected_text(), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn mouse_double_click_drag_extends_composer_selection_by_word() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
+        app.input = TextEditBuffer::from_text("hello brave world");
+        app.last_composer_area.set(Rect::new(1, 10, 30, 3));
+
+        for _ in 0..2 {
+            handle_mouse_event(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 3,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        }
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                column: 12,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.input.selected_text(), Some("hello brave".to_string()));
     }
 
     #[test]
