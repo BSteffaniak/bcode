@@ -2443,7 +2443,6 @@ enum TranscriptBlock {
         streaming: bool,
     },
     ToolCall {
-        id: String,
         name: String,
         arguments_json: String,
     },
@@ -2453,8 +2452,6 @@ enum TranscriptBlock {
         is_error: bool,
     },
     PermissionRequest {
-        id: String,
-        tool_call_id: String,
         name: String,
         arguments_json: String,
     },
@@ -3070,7 +3067,8 @@ impl ChatApp {
             match event_type.as_str() {
                 "tool_call_started" | "tool_call_progress" | "no_progress_warning" => {
                     let detail = detail
-                        .clone()
+                        .as_deref()
+                        .map(user_facing_provider_detail)
                         .unwrap_or_else(|| "provider stream in progress".to_string());
                     self.set_activity(ActivityState::ProviderStream {
                         detail: detail.clone(),
@@ -5133,6 +5131,83 @@ fn truncate_end(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn user_facing_provider_detail(detail: &str) -> String {
+    let without_parentheticals = remove_tool_call_id_parentheticals(detail);
+    let redacted = redact_tool_call_id_tokens(&without_parentheticals);
+    normalize_detail_separators(&redacted)
+}
+
+fn remove_tool_call_id_parentheticals(detail: &str) -> String {
+    let mut output = String::new();
+    let mut rest = detail;
+    loop {
+        let Some(open_index) = rest.find('(') else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..open_index]);
+        let after_open = &rest[open_index + 1..];
+        let Some(close_index) = after_open.find(')') else {
+            output.push_str(&rest[open_index..]);
+            break;
+        };
+        let parenthetical = after_open[..close_index].trim();
+        if !is_tool_call_id(parenthetical) {
+            output.push('(');
+            output.push_str(&after_open[..=close_index]);
+        }
+        rest = &after_open[close_index + 1..];
+    }
+    output
+}
+
+fn redact_tool_call_id_tokens(detail: &str) -> String {
+    let mut output = String::new();
+    let mut chars = detail.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if detail[index..].starts_with("call_") {
+            while let Some((_, next_ch)) = chars.peek().copied() {
+                if next_ch.is_ascii_alphanumeric() || next_ch == '_' || next_ch == '-' {
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn is_tool_call_id(value: &str) -> bool {
+    value.strip_prefix("call_").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    })
+}
+
+fn normalize_detail_separators(detail: &str) -> String {
+    let mut parts = detail
+        .split('·')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return "provider stream in progress".to_string();
+    }
+    for part in &mut parts {
+        *part = part.trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '(' || ch == ')');
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 fn normal_style() -> Style {
     Style::default().fg(COLOR_TEXT)
 }
@@ -5356,12 +5431,11 @@ impl TranscriptBlock {
                 search_query,
             ),
             Self::ToolCall {
-                id,
                 name,
                 arguments_json,
             } => render_detail_block(
                 &format!("Tool · {name}"),
-                &format!("id: {id}\n{}", pretty_jsonish(arguments_json)),
+                &pretty_jsonish(arguments_json),
                 Color::Yellow,
                 search_query,
             ),
@@ -5369,26 +5443,26 @@ impl TranscriptBlock {
                 id,
                 result,
                 is_error,
-            } => render_detail_block(
-                &format!(
-                    "Tool result · {id} · {}",
-                    if *is_error { "failed" } else { "ok" }
-                ),
-                &tool_result_preview(result),
-                if *is_error { Color::Red } else { Color::Yellow },
-                search_query,
-            ),
+            } => {
+                let preview = tool_result_preview(result);
+                let body = if *is_error {
+                    format!("{preview}\ntool call: {id}")
+                } else {
+                    preview
+                };
+                render_detail_block(
+                    &format!("Tool result · {}", if *is_error { "failed" } else { "ok" }),
+                    &body,
+                    if *is_error { Color::Red } else { Color::Yellow },
+                    search_query,
+                )
+            }
             Self::PermissionRequest {
-                id,
-                tool_call_id,
                 name,
                 arguments_json,
             } => render_detail_block(
                 &format!("Permission required · {name}"),
-                &format!(
-                    "permission: {id}\ntool call: {tool_call_id}\n{}",
-                    pretty_jsonish(arguments_json)
-                ),
+                &pretty_jsonish(arguments_json),
                 Color::Red,
                 search_query,
             ),
@@ -5581,11 +5655,10 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
             streaming: false,
         }],
         SessionEventKind::ToolCallRequested {
-            tool_call_id,
             tool_name,
             arguments_json,
+            ..
         } => vec![TranscriptBlock::ToolCall {
-            id: tool_call_id.clone(),
             name: tool_name.clone(),
             arguments_json: arguments_json.clone(),
         }],
@@ -5599,13 +5672,10 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
             is_error: *is_error,
         }],
         SessionEventKind::PermissionRequested {
-            permission_id,
-            tool_call_id,
             tool_name,
             arguments_json,
+            ..
         } => vec![TranscriptBlock::PermissionRequest {
-            id: permission_id.clone(),
-            tool_call_id: tool_call_id.clone(),
             name: tool_name.clone(),
             arguments_json: arguments_json.clone(),
         }],
@@ -6660,6 +6730,76 @@ mod tests {
         )));
 
         assert_eq!(app.activity, ActivityState::Thinking);
+    }
+
+    #[test]
+    fn provider_progress_hides_tool_call_ids() {
+        let detail = user_facing_provider_detail(
+            "streaming shell.run arguments (call_SEoqRPALXAx5pXe2tJSXdVzD) · 12 KiB received · 4 chunks",
+        );
+
+        assert_eq!(
+            detail,
+            "streaming shell.run arguments · 12 KiB received · 4 chunks"
+        );
+        assert!(!detail.contains("call_"));
+    }
+
+    #[test]
+    fn provider_started_hides_parenthetical_tool_call_id() {
+        let detail = user_facing_provider_detail("shell.run (call_SEoqRPALXAx5pXe2tJSXdVzD)");
+
+        assert_eq!(detail, "shell.run");
+        assert!(!detail.contains("call_"));
+    }
+
+    #[test]
+    fn normal_tool_transcript_blocks_hide_internal_ids() {
+        let blocks = [
+            TranscriptBlock::ToolCall {
+                name: "shell.run".to_string(),
+                arguments_json: r#"{"command":"cargo check"}"#.to_string(),
+            },
+            TranscriptBlock::ToolResult {
+                id: "call_SEoqRPALXAx5pXe2tJSXdVzD".to_string(),
+                result: "ok".to_string(),
+                is_error: false,
+            },
+            TranscriptBlock::PermissionRequest {
+                name: "shell.run".to_string(),
+                arguments_json: r#"{"command":"cargo check"}"#.to_string(),
+            },
+        ];
+        let rendered = blocks
+            .iter()
+            .flat_map(|block| block.render_lines(""))
+            .map(|line| line_plain_text(&line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Tool · shell.run"));
+        assert!(rendered.contains("Tool result · ok"));
+        assert!(rendered.contains("Permission required · shell.run"));
+        assert!(!rendered.contains("call_SEoq"));
+        assert!(!rendered.contains("permission-1"));
+    }
+
+    #[test]
+    fn failed_tool_result_keeps_call_id_for_troubleshooting() {
+        let block = TranscriptBlock::ToolResult {
+            id: "call_SEoqRPALXAx5pXe2tJSXdVzD".to_string(),
+            result: "permission denied".to_string(),
+            is_error: true,
+        };
+        let rendered = block
+            .render_lines("")
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Tool result · failed"));
+        assert!(rendered.contains("tool call: call_SEoqRPALXAx5pXe2tJSXdVzD"));
     }
 
     #[test]
