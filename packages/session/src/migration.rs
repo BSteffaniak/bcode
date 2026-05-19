@@ -52,6 +52,38 @@ impl SessionMigrationDefinition {
     }
 }
 
+/// Canonical session event-log migration authoring interface.
+///
+/// Implementations provide only event transformation metadata/logic; the
+/// session store owns backup, journaling, atomic replacement, validation, and
+/// derived-index rebuilds when canonical migrations are introduced.
+pub trait SessionEventLogMigration {
+    /// Stable migration identifier.
+    const ID: &'static str;
+    /// Source event schema version.
+    const FROM_SCHEMA: u16;
+    /// Target event schema version.
+    const TO_SCHEMA: u16;
+
+    /// Migrate one event to the target schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event cannot be represented in the target schema.
+    fn migrate_event(
+        &self,
+        event: bcode_session_models::SessionEvent,
+    ) -> Result<bcode_session_models::SessionEvent, SessionEventLogMigrationError>;
+}
+
+/// Error returned by canonical event-log migrations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SessionEventLogMigrationError {
+    /// The event cannot be migrated.
+    #[error("session event migration failed: {0}")]
+    Message(String),
+}
+
 const SESSION_INDEX_REBUILD_MIGRATION: SessionMigrationDefinition = SessionMigrationDefinition {
     id: "sessions-index-rebuild-v2",
     domain: "sessions/index",

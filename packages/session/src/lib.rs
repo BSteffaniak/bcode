@@ -14,11 +14,12 @@ pub(crate) mod reader;
 
 pub use index::{SessionIndexHealth, SessionIndexStatus};
 pub use migration::{
-    SessionMigrationAction, SessionMigrationApplyPolicy, SessionMigrationApplyStatus,
-    SessionMigrationBackupPolicy, SessionMigrationDefinition, SessionMigrationJournalEntry,
-    SessionMigrationJournalStatus, SessionMigrationOptions, SessionMigrationPlan,
-    SessionMigrationPlanItem, SessionMigrationRegistry, SessionMigrationRegistryError,
-    SessionMigrationReport, SessionMigrationReportItem,
+    SessionEventLogMigration, SessionEventLogMigrationError, SessionMigrationAction,
+    SessionMigrationApplyPolicy, SessionMigrationApplyStatus, SessionMigrationBackupPolicy,
+    SessionMigrationDefinition, SessionMigrationJournalEntry, SessionMigrationJournalStatus,
+    SessionMigrationOptions, SessionMigrationPlan, SessionMigrationPlanItem,
+    SessionMigrationRegistry, SessionMigrationRegistryError, SessionMigrationReport,
+    SessionMigrationReportItem,
 };
 
 use bcode_session_models::{
@@ -148,6 +149,7 @@ impl SessionEventStore {
             {
                 let mut state = index.into_state();
                 state.index_status = SessionIndexStatusKind::Stale;
+                state.access_status = self.inspect_access_status(session_id)?;
                 sessions.insert(session_id, state);
             }
         }
@@ -192,6 +194,15 @@ impl SessionEventStore {
     ) -> Result<Vec<SessionEvent>, SessionStoreError> {
         let path = self.event_path(session_id);
         Ok(reader::read_events(&path)?.events)
+    }
+
+    fn inspect_access_status(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionAccessStatus, SessionStoreError> {
+        let path = self.event_path(session_id);
+        let report = reader::read_events(&path)?;
+        Ok(access_status_from_report(&report))
     }
 
     fn ensure_fresh_index(
@@ -390,6 +401,8 @@ impl SessionEventStore {
             current_agent: state.current_agent.clone(),
             latest_compaction_sequence: state.latest_compaction_sequence,
             total_metered_tokens: state.total_metered_tokens,
+            min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             issues: state.index_issues.clone(),
         };
         index::write_index(&self.root, &index)
@@ -1029,6 +1042,23 @@ impl SessionManager {
             .sessions
             .get(&session_id)
             .map(SessionState::summary)
+            .ok_or(SessionError::NotFound(session_id))
+    }
+
+    /// Return canonical access status for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn session_access_status(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionAccessStatus, SessionError> {
+        let inner = self.inner.lock().await;
+        inner
+            .sessions
+            .get(&session_id)
+            .map(|state| state.access_status)
             .ok_or(SessionError::NotFound(session_id))
     }
 
@@ -1691,6 +1721,11 @@ impl SessionManagerInner {
 impl SessionState {
     pub(crate) fn from_index(index: index::SessionIndex) -> Self {
         let (sender, _) = broadcast::channel(512);
+        let access_status = access_status_from_schema_versions(
+            index.min_event_schema_version,
+            index.max_event_schema_version,
+            !index.issues.is_empty(),
+        );
         let mut summary = index.summary;
         summary.created_at_ms = index.created_at_ms;
         summary.updated_at_ms = index.updated_at_ms;
@@ -1708,7 +1743,7 @@ impl SessionState {
             total_metered_tokens: index.total_metered_tokens,
             index_issues: index.issues,
             index_status: SessionIndexStatusKind::Current,
-            access_status: SessionAccessStatus::ReadWrite,
+            access_status,
             sender,
         }
     }
@@ -1886,6 +1921,33 @@ fn history_page_from_events(
         events: page_events,
         next_cursor,
         has_more,
+    }
+}
+
+const fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAccessStatus {
+    access_status_from_schema_versions(
+        report.min_schema_version,
+        report.max_schema_version,
+        !report.issues.is_empty(),
+    )
+}
+
+const fn access_status_from_schema_versions(
+    _min_schema_version: Option<u16>,
+    max_schema_version: Option<u16>,
+    has_issues: bool,
+) -> SessionAccessStatus {
+    if has_issues {
+        return SessionAccessStatus::RepairRequired;
+    }
+    match max_schema_version {
+        Some(version) if version > CURRENT_SESSION_EVENT_SCHEMA_VERSION => {
+            SessionAccessStatus::BlockedFutureVersion
+        }
+        Some(version) if version < CURRENT_SESSION_EVENT_SCHEMA_VERSION => {
+            SessionAccessStatus::ReadOnlyMigrationRequired
+        }
+        Some(_) | None => SessionAccessStatus::ReadWrite,
     }
 }
 
@@ -2200,6 +2262,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn future_schema_session_is_not_writable() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        let session_id = bcode_session_models::SessionId::new();
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION.saturating_add(1),
+            sequence: 0,
+            session_id,
+            kind: SessionEventKind::SessionCreated {
+                name: Some("future".to_string()),
+            },
+        };
+        let path = root.join(format!("{session_id}.events"));
+        write_legacy_event(&path, &event);
+
+        let manager = SessionManager::persistent(&root).expect("manager should restore");
+        assert_eq!(
+            manager
+                .session_access_status(session_id)
+                .await
+                .expect("status should load"),
+            super::SessionAccessStatus::BlockedFutureVersion
+        );
+        let error = manager
+            .append_user_message(session_id, ClientId::new(), "nope".to_string())
+            .await
+            .expect_err("future schema should block writes");
+        assert!(matches!(error, super::SessionError::NotWritable { .. }));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn persistent_manager_reads_legacy_and_v2_frames() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("session dir should create");
@@ -2213,17 +2308,7 @@ mod tests {
             },
         };
         let path = root.join(format!("{session_id}.events"));
-        let mut file = std::fs::File::create(&path).expect("event file should create");
-        let payload = bmux_codec::to_vec(&legacy_event).expect("legacy event should encode");
-        file.write_all(
-            &u32::try_from(payload.len())
-                .expect("payload should fit")
-                .to_le_bytes(),
-        )
-        .expect("legacy len should write");
-        file.write_all(&payload)
-            .expect("legacy payload should write");
-        drop(file);
+        write_legacy_event(&path, &legacy_event);
 
         let manager = SessionManager::persistent(&root).expect("manager should restore legacy");
         manager
@@ -2695,6 +2780,19 @@ mod tests {
         assert!(backup_dir.join(format!("{}.events", session.id)).exists());
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    fn write_legacy_event(path: &std::path::Path, event: &SessionEvent) {
+        let mut file = std::fs::File::create(path).expect("event file should create");
+        let payload = bmux_codec::to_vec(event).expect("legacy event should encode");
+        file.write_all(
+            &u32::try_from(payload.len())
+                .expect("payload should fit")
+                .to_le_bytes(),
+        )
+        .expect("legacy len should write");
+        file.write_all(&payload)
+            .expect("legacy payload should write");
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

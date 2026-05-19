@@ -36,6 +36,8 @@ pub struct SessionIndex {
     pub current_agent: Option<String>,
     pub latest_compaction_sequence: Option<u64>,
     pub total_metered_tokens: u64,
+    pub min_event_schema_version: Option<u16>,
+    pub max_event_schema_version: Option<u16>,
     pub issues: Vec<SessionIndexIssue>,
 }
 
@@ -197,6 +199,8 @@ impl SessionIndex {
             current_agent,
             latest_compaction_sequence,
             total_metered_tokens,
+            min_event_schema_version: report.min_schema_version,
+            max_event_schema_version: report.max_schema_version,
             issues: report.issues.iter().map(SessionIndexIssue::from).collect(),
         })
     }

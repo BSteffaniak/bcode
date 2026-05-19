@@ -33,6 +33,8 @@ pub struct SessionReadReport {
     pub entries: Vec<SessionIndexEntry>,
     pub last_good_offset: u64,
     pub issues: Vec<SessionReadIssue>,
+    pub min_schema_version: Option<u16>,
+    pub max_schema_version: Option<u16>,
 }
 
 pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> {
@@ -70,11 +72,15 @@ pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> 
         last_good_offset = offset;
     }
 
+    let min_schema_version = events.iter().map(|event| event.schema_version).min();
+    let max_schema_version = events.iter().map(|event| event.schema_version).max();
     Ok(SessionReadReport {
         events,
         entries,
         last_good_offset,
         issues,
+        min_schema_version,
+        max_schema_version,
     })
 }
 
