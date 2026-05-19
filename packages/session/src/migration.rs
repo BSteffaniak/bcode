@@ -7,7 +7,8 @@ use std::path::Path;
 use thiserror::Error;
 
 /// Action a migration plan would perform for session persistence metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionMigrationAction {
     /// No action is needed.
     None,
@@ -18,7 +19,8 @@ pub enum SessionMigrationAction {
 }
 
 /// How a migration handles backups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionMigrationBackupPolicy {
     /// No backup is needed because canonical data is not rewritten.
     NotRequired,
@@ -27,7 +29,8 @@ pub enum SessionMigrationBackupPolicy {
 }
 
 /// How a migration may be applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionMigrationApplyPolicy {
     /// The migration is safe for automatic/background execution.
     Automatic,
@@ -36,7 +39,7 @@ pub enum SessionMigrationApplyPolicy {
 }
 
 /// Registered session migration metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SessionMigrationDefinition {
     pub id: &'static str,
     pub domain: &'static str,
@@ -211,7 +214,7 @@ pub enum SessionMigrationRegistryError {
 }
 
 /// Migration status for a single session persistence target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionMigrationPlanItem {
     pub migration_id: &'static str,
     pub session_id: SessionId,
@@ -224,7 +227,7 @@ pub struct SessionMigrationPlanItem {
 }
 
 /// Migration plan for session persistence metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionMigrationPlan {
     pub domain: &'static str,
     pub items: Vec<SessionMigrationPlanItem>,
@@ -238,7 +241,7 @@ impl SessionMigrationPlan {
 }
 
 /// Options for applying session persistence migrations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct SessionMigrationOptions {
     /// Report actions without modifying files.
     pub dry_run: bool,
@@ -247,7 +250,8 @@ pub struct SessionMigrationOptions {
 }
 
 /// Result status for one migration item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionMigrationApplyStatus {
     /// The item would be applied, but dry-run mode was requested.
     Planned,
@@ -258,7 +262,7 @@ pub enum SessionMigrationApplyStatus {
 }
 
 /// Result for one migration item.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionMigrationReportItem {
     pub migration_id: &'static str,
     pub session_id: SessionId,
@@ -268,7 +272,7 @@ pub struct SessionMigrationReportItem {
 }
 
 /// Result from applying a session migration plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionMigrationReport {
     pub domain: &'static str,
     pub dry_run: bool,
@@ -318,7 +322,8 @@ pub(crate) fn append_journal_entry(
 }
 
 /// Recovery status derived from the migration journal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionMigrationRecoveryStatus {
     /// No incomplete or failed migration runs were found.
     Clean,
@@ -327,7 +332,7 @@ pub enum SessionMigrationRecoveryStatus {
 }
 
 /// Migration run requiring operator attention.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionMigrationRecoveryItem {
     pub run_id: String,
     pub domain: String,
@@ -392,7 +397,7 @@ pub fn recovery_status_from_entries(
 }
 
 /// Root-relative fixture path for session migration tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionMigrationFixture {
     /// Human-readable fixture name.
     pub name: &'static str,
@@ -407,4 +412,77 @@ pub const fn session_migration_fixtures() -> &'static [SessionMigrationFixture] 
         name: "session-migration-fixture-readme",
         path: "fixtures/migrations/README.md",
     }]
+}
+
+/// Derive recovery status from journal entries and leftover migration temp files.
+///
+/// # Errors
+///
+/// Returns an error if the session directory cannot be scanned.
+pub fn recovery_status(
+    root: &Path,
+    entries: &[SessionMigrationJournalEntry],
+) -> Result<SessionMigrationRecoveryStatus, crate::SessionStoreError> {
+    let mut items = match recovery_status_from_entries(entries) {
+        SessionMigrationRecoveryStatus::Clean => Vec::new(),
+        SessionMigrationRecoveryStatus::NeedsAttention(items) => items,
+    };
+    if root.exists() {
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("tmp")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".events.tmp"))
+            {
+                items.push(SessionMigrationRecoveryItem {
+                    run_id: "leftover-temp-file".to_string(),
+                    domain: "sessions/events".to_string(),
+                    status: SessionMigrationJournalStatus::Failed,
+                    backup_dir: None,
+                    migration_ids: Vec::new(),
+                    session_ids: Vec::new(),
+                    error: Some(format!("leftover migration temp file: {}", path.display())),
+                });
+            }
+        }
+    }
+    if items.is_empty() {
+        Ok(SessionMigrationRecoveryStatus::Clean)
+    } else {
+        Ok(SessionMigrationRecoveryStatus::NeedsAttention(items))
+    }
+}
+
+/// Register a derived session rebuild migration definition.
+#[macro_export]
+macro_rules! register_session_derived_rebuild {
+    (id = $id:literal, domain = $domain:literal, version = $version:expr $(,)?) => {
+        $crate::SessionMigrationDefinition {
+            id: $id,
+            domain: $domain,
+            from_version: 0,
+            to_version: $version,
+            action: $crate::SessionMigrationAction::RebuildDerivedIndex,
+            backup_policy: $crate::SessionMigrationBackupPolicy::NotRequired,
+            apply_policy: $crate::SessionMigrationApplyPolicy::Automatic,
+        }
+    };
+}
+
+/// Register a canonical session event migration definition.
+#[macro_export]
+macro_rules! register_session_event_migration {
+    (id = $id:literal, from = $from:expr, to = $to:expr $(,)?) => {
+        $crate::SessionMigrationDefinition {
+            id: $id,
+            domain: "sessions/events",
+            from_version: $from,
+            to_version: $to,
+            action: $crate::SessionMigrationAction::RewriteCanonicalEvents,
+            backup_policy: $crate::SessionMigrationBackupPolicy::Required,
+            apply_policy: $crate::SessionMigrationApplyPolicy::Manual,
+        }
+    };
 }

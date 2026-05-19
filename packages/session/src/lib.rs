@@ -554,7 +554,7 @@ impl SessionEventStore {
         &self,
     ) -> Result<SessionMigrationRecoveryStatus, SessionStoreError> {
         let entries = migration::read_journal_entries(&self.root)?;
-        Ok(migration::recovery_status_from_entries(&entries))
+        migration::recovery_status(&self.root, &entries)
     }
 
     /// Plan safe session persistence migrations without applying them.
@@ -882,12 +882,23 @@ struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionState>,
     activity_clock_ms: u64,
     index_rebuilds: BTreeMap<SessionId, JoinHandle<()>>,
+    completed_rebuilds: usize,
+    failed_rebuilds: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionIndexStatusKind {
     Current,
     Stale,
+}
+
+/// Background session maintenance status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SessionMaintenanceStatus {
+    pub stale_indexes: usize,
+    pub running_rebuilds: usize,
+    pub completed_rebuilds: usize,
+    pub failed_rebuilds: usize,
 }
 
 #[derive(Debug)]
@@ -932,6 +943,8 @@ impl SessionManager {
                 sessions,
                 activity_clock_ms: current_unix_millis(),
                 index_rebuilds: BTreeMap::new(),
+                completed_rebuilds: 0,
+                failed_rebuilds: 0,
             }),
             store: Some(store),
         })
@@ -996,6 +1009,13 @@ impl SessionManager {
                 .then_with(|| left.id.cmp(&right.id))
         });
         sessions
+    }
+
+    /// Return background maintenance status.
+    pub async fn maintenance_status(&self) -> SessionMaintenanceStatus {
+        let mut inner = self.inner.lock().await;
+        inner.collect_finished_rebuilds();
+        inner.maintenance_status()
     }
 
     /// Rename a session.
@@ -1698,12 +1718,36 @@ impl SessionManagerInner {
         if let Some(state) = self.sessions.get_mut(&session_id) {
             state.index_status = SessionIndexStatusKind::Current;
         }
-        if self
+        self.collect_finished_rebuilds();
+    }
+
+    fn collect_finished_rebuilds(&mut self) {
+        let finished = self
             .index_rebuilds
-            .get(&session_id)
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            self.index_rebuilds.remove(&session_id);
+            .iter()
+            .filter_map(|(session_id, handle)| handle.is_finished().then_some(*session_id))
+            .collect::<Vec<_>>();
+        for session_id in finished {
+            if let Some(handle) = self.index_rebuilds.remove(&session_id) {
+                drop(handle);
+                self.completed_rebuilds = self.completed_rebuilds.saturating_add(1);
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.index_status = SessionIndexStatusKind::Current;
+                }
+            }
+        }
+    }
+
+    fn maintenance_status(&self) -> SessionMaintenanceStatus {
+        SessionMaintenanceStatus {
+            stale_indexes: self
+                .sessions
+                .values()
+                .filter(|state| state.index_status == SessionIndexStatusKind::Stale)
+                .count(),
+            running_rebuilds: self.index_rebuilds.len(),
+            completed_rebuilds: self.completed_rebuilds,
+            failed_rebuilds: self.failed_rebuilds,
         }
     }
 
@@ -1734,6 +1778,7 @@ impl SessionManagerInner {
     }
 
     fn schedule_stale_index_rebuilds(&mut self, store: Option<&SessionEventStore>) {
+        self.collect_finished_rebuilds();
         let session_ids = self
             .sessions
             .iter()
@@ -2309,6 +2354,49 @@ mod tests {
         ) -> Result<SessionEvent, super::SessionEventLogMigrationError> {
             Ok(event)
         }
+    }
+
+    #[test]
+    fn session_migration_fixture_declarations_exist() {
+        let fixtures = super::migration::session_migration_fixtures();
+        assert!(!fixtures.is_empty());
+        for fixture in fixtures {
+            assert!(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(fixture.path)
+                    .exists(),
+                "fixture should exist: {}",
+                fixture.path
+            );
+        }
+    }
+
+    #[test]
+    fn migration_authoring_macros_create_expected_definitions() {
+        let derived = super::register_session_derived_rebuild!(
+            id = "test-derived",
+            domain = "sessions/test-index",
+            version = 7,
+        );
+        assert_eq!(
+            derived.action,
+            super::SessionMigrationAction::RebuildDerivedIndex
+        );
+        assert_eq!(
+            derived.backup_policy,
+            super::SessionMigrationBackupPolicy::NotRequired
+        );
+
+        let canonical =
+            super::register_session_event_migration!(id = "test-events", from = 1, to = 2,);
+        assert_eq!(
+            canonical.action,
+            super::SessionMigrationAction::RewriteCanonicalEvents
+        );
+        assert_eq!(
+            canonical.backup_policy,
+            super::SessionMigrationBackupPolicy::Required
+        );
     }
 
     #[test]

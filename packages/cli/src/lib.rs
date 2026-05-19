@@ -2402,10 +2402,10 @@ fn session_migration_plan(json: bool) -> Result<(), CliError> {
     if json {
         println!(
             "{}",
-            serde_json::json!({
-                "plan": format!("{:?}", plan),
-                "recovery": format!("{:?}", recovery),
-            })
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": plan,
+                "recovery": recovery,
+            }))?
         );
         return Ok(());
     }
