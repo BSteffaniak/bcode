@@ -123,6 +123,7 @@ pub enum Request {
         session_id: SessionId,
         skill_id: SkillId,
         arguments: String,
+        display_text: String,
     },
     CancelSessionTurn {
         session_id: SessionId,

@@ -1570,7 +1570,7 @@ async fn handle_slash_command(
             describe_skill_from_tui(client, app, parts[2]).await
         }
         "skill" if parts.len() > 1 => {
-            invoke_skill_from_tui(client, app, session_id, parts[1], &parts[2..]).await
+            invoke_skill_from_tui(client, app, session_id, message, parts[1], &parts[2..]).await
         }
         "skill" => {
             app.status = "use /skill <id> [arguments] or /skill describe <id>".to_string();
@@ -1580,7 +1580,8 @@ async fn handle_slash_command(
             if app.parse_and_execute_slash(message, client) {
                 true
             } else {
-                invoke_skill_alias_from_tui(client, app, session_id, command, &parts[1..]).await
+                invoke_skill_alias_from_tui(client, app, session_id, message, command, &parts[1..])
+                    .await
             }
         }
     }
@@ -1641,12 +1642,18 @@ async fn invoke_skill_from_tui(
     client: &BcodeClient,
     app: &mut ChatApp,
     session_id: SessionId,
+    display_text: &str,
     skill_id: &str,
     args: &[&str],
 ) -> bool {
     let arguments = args.join(" ");
     match client
-        .invoke_skill(session_id, SkillId::new(skill_id.to_string()), arguments)
+        .invoke_skill(
+            session_id,
+            SkillId::new(skill_id.to_string()),
+            arguments,
+            display_text.to_string(),
+        )
         .await
     {
         Ok(()) => app.status = format!("skill invoked: {skill_id}"),
@@ -1659,6 +1666,7 @@ async fn invoke_skill_alias_from_tui(
     client: &BcodeClient,
     app: &mut ChatApp,
     session_id: SessionId,
+    display_text: &str,
     skill_id: &str,
     args: &[&str],
 ) -> bool {
@@ -1670,7 +1678,7 @@ async fn invoke_skill_alias_from_tui(
         .iter()
         .any(|skill| skill.id.as_str() == skill_id)
     {
-        invoke_skill_from_tui(client, app, session_id, skill_id, args).await
+        invoke_skill_from_tui(client, app, session_id, display_text, skill_id, args).await
     } else {
         false
     }

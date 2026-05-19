@@ -97,7 +97,7 @@ struct ServerState {
     skills: Option<SkillRegistry>,
     skill_context_bytes: usize,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
-    turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillId>>,
+    turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -113,6 +113,12 @@ struct ActiveModelTurn {
     provider_turn_id: String,
     reuse_key: Option<String>,
     request_message_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SkillTurnInvocation {
+    skill_id: SkillId,
+    arguments: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -559,9 +565,17 @@ async fn handle_request(
             session_id,
             skill_id,
             arguments,
+            display_text,
         } => {
             handle_invoke_skill(
-                request_id, client_id, state, writer, session_id, skill_id, arguments,
+                request_id,
+                client_id,
+                state,
+                writer,
+                session_id,
+                skill_id,
+                arguments,
+                display_text,
             )
             .await
         }
@@ -972,6 +986,7 @@ async fn handle_attach_session_recent(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_invoke_skill(
     request_id: u64,
     client_id: ClientId,
@@ -980,6 +995,7 @@ async fn handle_invoke_skill(
     session_id: SessionId,
     skill_id: SkillId,
     arguments: String,
+    display_text: String,
 ) -> Result<(), ServerError> {
     let Some(registry) = &state.skills else {
         return send_response(
@@ -1013,11 +1029,7 @@ async fn handle_invoke_skill(
         )
         .await?;
     publish_session_event(state, &invocation).await;
-    let text = if arguments.trim().is_empty() {
-        format!("Use the {skill_id} skill with no additional arguments.")
-    } else {
-        arguments
-    };
+    let text = display_text;
     let events = state
         .sessions
         .append_user_message(session_id, client_id, text)
@@ -1036,11 +1048,13 @@ async fn handle_invoke_skill(
         )
         .await;
     };
-    state
-        .turn_skills
-        .lock()
-        .await
-        .insert((session_id, user_event.sequence), skill_id);
+    state.turn_skills.lock().await.insert(
+        (session_id, user_event.sequence),
+        SkillTurnInvocation {
+            skill_id,
+            arguments,
+        },
+    );
     let state_for_turn = Arc::clone(state);
     tokio::spawn(async move {
         run_model_turn(&state_for_turn, session_id, &user_event).await;
@@ -5147,7 +5161,7 @@ async fn turn_skill_contexts(
     let Some(registry) = &state.skills else {
         return Vec::new();
     };
-    let Some(skill_id) = state
+    let Some(invocation) = state
         .turn_skills
         .lock()
         .await
@@ -5155,6 +5169,7 @@ async fn turn_skill_contexts(
     else {
         return Vec::new();
     };
+    let skill_id = invocation.skill_id;
     let Some(summary) = registry.summary(&skill_id) else {
         return Vec::new();
     };
@@ -5175,6 +5190,13 @@ async fn turn_skill_contexts(
             return Vec::new();
         }
     };
+    let mut context = context;
+    let arguments = if invocation.arguments.trim().is_empty() {
+        "<empty>".to_string()
+    } else {
+        invocation.arguments
+    };
+    write!(context, "\n\nSkill invocation arguments:\n{arguments}").expect("write to string");
     let bytes_loaded = context.len();
     let truncated = bytes_loaded >= state.skill_context_bytes;
     vec![SkillContextResponse {

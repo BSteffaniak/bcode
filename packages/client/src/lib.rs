@@ -347,6 +347,7 @@ impl BcodeClient {
         session_id: SessionId,
         skill_id: SkillId,
         arguments: String,
+        display_text: String,
     ) -> Result<(), ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         match connection
@@ -354,6 +355,7 @@ impl BcodeClient {
                 session_id,
                 skill_id,
                 arguments,
+                display_text,
             })
             .await?
         {
