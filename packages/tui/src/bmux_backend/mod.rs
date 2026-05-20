@@ -463,7 +463,7 @@ async fn handle_event<W: Write>(
                 *palette = Some(BmuxCommandPalette::new());
                 return Ok(true);
             }
-            let outcome = input::handle_key(&mut chat.app, stroke);
+            let outcome = input::handle_key(&mut chat.app, keymap, stroke);
             if outcome.submitted {
                 submit_composer(client, &mut chat.app).await?;
             }
