@@ -1,7 +1,7 @@
 //! BMUX backend rendering.
 
 use bmux_tui::chrome::{Border, Panel};
-use bmux_tui::diff::{DiffFileList, DiffFileListState};
+use bmux_tui::diff::{DiffFileList, DiffFileListState, DiffView, DiffViewMode, DiffViewState};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::input::TextInput;
@@ -67,7 +67,7 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     let diff_height = if app.changed_files().is_empty() {
         0
     } else {
-        area.height.min(5)
+        area.height.min(9)
     };
     let transcript_area = Rect::new(
         area.x,
@@ -114,15 +114,38 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     let panel = Panel::new()
         .border(Border::single().style(Style::new().fg(Color::BrightBlack)))
-        .title(" Changed files ")
+        .title(" Changed files / diff preview ")
         .padding(Insets::new(0, 1, 0, 1));
     panel.render(area, frame);
     let inner = panel.inner_area(area);
+    if inner.is_empty() {
+        return;
+    }
+    let split = if app.diff_lines().is_empty() {
+        inner.width
+    } else {
+        inner.width.min(32)
+    };
+    let list_area = Rect::new(inner.x, inner.y, split, inner.height);
     let mut state = DiffFileListState::new();
     if !app.changed_files().is_empty() {
         state.select(Some(0));
     }
-    DiffFileList::new(app.changed_files()).render(inner, frame, &mut state);
+    DiffFileList::new(app.changed_files()).render(list_area, frame, &mut state);
+    if app.diff_lines().is_empty() || split >= inner.width.saturating_sub(1) {
+        return;
+    }
+    let detail_area = Rect::new(
+        inner.x.saturating_add(split).saturating_add(1),
+        inner.y,
+        inner.width.saturating_sub(split).saturating_sub(1),
+        inner.height,
+    );
+    let mut diff_state = DiffViewState::default();
+    DiffView::new(app.diff_lines())
+        .mode(DiffViewMode::Responsive)
+        .fold_context(20, 3)
+        .render(detail_area, frame, &mut diff_state);
 }
 
 fn transcript_render_rows(app: &BmuxApp, width: u16) -> Vec<Line> {

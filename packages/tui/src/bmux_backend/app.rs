@@ -8,7 +8,7 @@ use bcode_session_models::{
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::TextEditBuffer;
-use bmux_tui::diff::DiffFileSummary;
+use bmux_tui::diff::{DiffFileSummary, DiffLine, DiffLineKind};
 
 use super::IDLE_REDRAW_INTERVAL;
 
@@ -22,6 +22,7 @@ pub(super) struct BmuxApp {
     input_history_draft: Option<String>,
     transcript: Vec<TranscriptItem>,
     changed_files: Vec<DiffFileSummary>,
+    diff_lines: Vec<DiffLine>,
     pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
     scroll_offset: usize,
@@ -53,6 +54,7 @@ impl BmuxApp {
             input_history_draft: None,
             transcript: Vec::new(),
             changed_files: Vec::new(),
+            diff_lines: Vec::new(),
             pending_submissions: Vec::new(),
             pending_submission: None,
             scroll_offset: 0,
@@ -97,6 +99,12 @@ impl BmuxApp {
     #[must_use]
     pub(super) fn changed_files(&self) -> &[DiffFileSummary] {
         &self.changed_files
+    }
+
+    /// Return detailed diff lines inferred from edit tool calls.
+    #[must_use]
+    pub(super) fn diff_lines(&self) -> &[DiffLine] {
+        &self.diff_lines
     }
 
     /// Return pending submissions that have not been committed by the session stream.
@@ -498,7 +506,7 @@ impl BmuxApp {
     }
 
     fn record_diff_summary(&mut self, tool_name: &str, arguments_json: &str) {
-        let Some(summary) = diff_summary_from_tool_request(tool_name, arguments_json) else {
+        let Some((summary, lines)) = diff_from_tool_request(tool_name, arguments_json) else {
             return;
         };
         let path = summary.display_path();
@@ -511,6 +519,7 @@ impl BmuxApp {
         } else {
             self.changed_files.push(summary);
         }
+        self.diff_lines.extend(lines);
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
@@ -742,9 +751,9 @@ fn optional_u32(value: Option<u32>) -> String {
 }
 
 fn tool_request_item(tool_call_id: &str, tool_name: &str, arguments_json: &str) -> TranscriptItem {
-    let diff_note = diff_summary_from_tool_request(tool_name, arguments_json).map_or_else(
+    let diff_note = diff_from_tool_request(tool_name, arguments_json).map_or_else(
         String::new,
-        |summary| {
+        |(summary, _lines)| {
             format!(
                 "\nDiff: {} (+{} -{})",
                 summary.display_path(),
@@ -762,10 +771,10 @@ fn tool_request_item(tool_call_id: &str, tool_name: &str, arguments_json: &str) 
     )
 }
 
-fn diff_summary_from_tool_request(
+fn diff_from_tool_request(
     tool_name: &str,
     arguments_json: &str,
-) -> Option<DiffFileSummary> {
+) -> Option<(DiffFileSummary, Vec<DiffLine>)> {
     let normalized_tool = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
     if !matches!(
         normalized_tool.as_str(),
@@ -780,7 +789,55 @@ fn diff_summary_from_tool_request(
         .or_else(|| value.get("file"))?
         .as_str()?;
     let (added, removed) = count_edit_lines(&value);
-    Some(DiffFileSummary::new(path, added, removed))
+    let summary = DiffFileSummary::new(path, added, removed);
+    let lines = diff_lines_from_value(path, &value);
+    Some((summary, lines))
+}
+
+fn diff_lines_from_value(path: &str, value: &serde_json::Value) -> Vec<DiffLine> {
+    let old_text = value
+        .get("old_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let new_text = value
+        .get("new_text")
+        .or_else(|| value.get("contents"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut lines = vec![
+        DiffLine::new(DiffLineKind::FileHeader, None, None, format!("--- {path}")),
+        DiffLine::new(DiffLineKind::FileHeader, None, None, format!("+++ {path}")),
+        DiffLine::new(DiffLineKind::HunkHeader, None, None, "@@ inferred edit @@"),
+    ];
+    let mut old_line = 1_u32;
+    for line in old_text.lines().take(200) {
+        lines.push(DiffLine::new(
+            DiffLineKind::Removed,
+            Some(old_line),
+            None,
+            line.to_owned(),
+        ));
+        old_line = old_line.saturating_add(1);
+    }
+    let mut new_line = 1_u32;
+    for line in new_text.lines().take(200) {
+        lines.push(DiffLine::new(
+            DiffLineKind::Added,
+            None,
+            Some(new_line),
+            line.to_owned(),
+        ));
+        new_line = new_line.saturating_add(1);
+    }
+    if old_text.lines().count() > 200 || new_text.lines().count() > 200 {
+        lines.push(DiffLine::new(
+            DiffLineKind::Context,
+            None,
+            None,
+            "… diff preview truncated …",
+        ));
+    }
+    lines
 }
 
 fn count_edit_lines(value: &serde_json::Value) -> (u32, u32) {
