@@ -145,6 +145,8 @@ async fn pick_session<W: Write>(
             Event::Key(stroke) => match handle_picker_key(&mut picker, stroke) {
                 PickerKeyOutcome::Continue => {}
                 PickerKeyOutcome::Create => return Ok(client.create_session(None).await?.id),
+                PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
+                PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Selected => {
                     if let Some(session_id) = picker.selected_session_id() {
                         return Ok(session_id);
@@ -165,6 +167,8 @@ async fn pick_session<W: Write>(
 enum PickerKeyOutcome {
     Continue,
     Create,
+    Rename,
+    Delete,
     Selected,
     Canceled,
 }
@@ -173,11 +177,32 @@ fn handle_picker_key(
     picker: &mut session_picker::SessionPickerApp,
     stroke: KeyStroke,
 ) -> PickerKeyOutcome {
+    match picker.mode() {
+        session_picker::SessionPickerMode::Filter => handle_picker_filter_key(picker, stroke),
+        session_picker::SessionPickerMode::Rename => handle_picker_rename_key(picker, stroke),
+        session_picker::SessionPickerMode::DeleteConfirm => {
+            handle_picker_delete_key(picker, stroke)
+        }
+    }
+}
+
+fn handle_picker_filter_key(
+    picker: &mut session_picker::SessionPickerApp,
+    stroke: KeyStroke,
+) -> PickerKeyOutcome {
     if stroke.key == KeyCode::Escape {
         return PickerKeyOutcome::Canceled;
     }
     if matches!(stroke.key, KeyCode::Char('n' | 'N')) && stroke.modifiers.ctrl {
         return PickerKeyOutcome::Create;
+    }
+    if matches!(stroke.key, KeyCode::Char('r' | 'R')) && stroke.modifiers.ctrl {
+        picker.start_rename();
+        return PickerKeyOutcome::Continue;
+    }
+    if matches!(stroke.key, KeyCode::Char('d' | 'D')) && stroke.modifiers.ctrl {
+        picker.start_delete_confirmation();
+        return PickerKeyOutcome::Continue;
     }
     match stroke.key {
         KeyCode::Enter => PickerKeyOutcome::Selected,
@@ -201,6 +226,78 @@ fn handle_picker_key(
             PickerKeyOutcome::Continue
         }
     }
+}
+
+fn handle_picker_rename_key(
+    picker: &mut session_picker::SessionPickerApp,
+    stroke: KeyStroke,
+) -> PickerKeyOutcome {
+    if stroke.key == KeyCode::Escape {
+        picker.cancel_rename();
+        return PickerKeyOutcome::Continue;
+    }
+    if stroke.key == KeyCode::Enter {
+        return PickerKeyOutcome::Rename;
+    }
+    let outcome = TextInputKeyHandler::new(TextKeymap::default(), TextInputEnterBehavior::Submit)
+        .handle_key(picker.rename_mut(), stroke);
+    if outcome == TextInputKeyOutcome::Submitted {
+        PickerKeyOutcome::Rename
+    } else {
+        PickerKeyOutcome::Continue
+    }
+}
+
+fn handle_picker_delete_key(
+    picker: &mut session_picker::SessionPickerApp,
+    stroke: KeyStroke,
+) -> PickerKeyOutcome {
+    match stroke.key {
+        KeyCode::Escape | KeyCode::Char('n' | 'N') => {
+            picker.cancel_delete();
+            PickerKeyOutcome::Continue
+        }
+        KeyCode::Char('y' | 'Y') => PickerKeyOutcome::Delete,
+        _ => PickerKeyOutcome::Continue,
+    }
+}
+
+async fn rename_picker_session(
+    client: &BcodeClient,
+    picker: &mut session_picker::SessionPickerApp,
+) -> Result<(), TuiError> {
+    let Some(session_id) = picker.selected_session_id() else {
+        picker.finish_mutation("No session selected to rename".to_owned());
+        return Ok(());
+    };
+    let name = picker.rename().text().trim();
+    let name = (!name.is_empty()).then(|| name.to_owned());
+    match client.rename_session(session_id, name).await {
+        Ok(_) => {
+            picker.replace_sessions(client.list_sessions().await?);
+            picker.finish_mutation("Session renamed".to_owned());
+        }
+        Err(error) => picker.finish_mutation(format!("rename failed: {error}")),
+    }
+    Ok(())
+}
+
+async fn delete_picker_session(
+    client: &BcodeClient,
+    picker: &mut session_picker::SessionPickerApp,
+) -> Result<(), TuiError> {
+    let Some(session_id) = picker.selected_session_id() else {
+        picker.finish_mutation("No session selected to delete".to_owned());
+        return Ok(());
+    };
+    match client.delete_session(session_id).await {
+        Ok(_) => {
+            picker.replace_sessions(client.list_sessions().await?);
+            picker.finish_mutation("Session deleted".to_owned());
+        }
+        Err(error) => picker.finish_mutation(format!("delete failed: {error}")),
+    }
+    Ok(())
 }
 
 async fn attach_session_event_stream(

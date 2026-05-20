@@ -8,7 +8,7 @@ use bmux_tui::list::List;
 use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 
-use super::session_picker::SessionPickerApp;
+use super::session_picker::{SessionPickerApp, SessionPickerMode};
 
 /// Render the session picker.
 pub(super) fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
@@ -25,18 +25,21 @@ pub(super) fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
 
     let inner = panel.inner_area(area);
     let header = Rect::new(inner.x, inner.y, inner.width, 1);
-    frame.write_line(
-        header,
-        &Line::from_spans(vec![
-            Span::styled("Bcode sessions", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw("  Enter selects  Ctrl-N creates  Esc cancels"),
-        ]),
-    );
+    frame.write_line(header, &header_line(app.mode()));
 
     let filter = Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1);
-    TextInput::new(app.filter())
-        .placeholder("Filter sessions")
-        .render(filter, frame);
+    match app.mode() {
+        SessionPickerMode::Filter | SessionPickerMode::DeleteConfirm => {
+            TextInput::new(app.filter())
+                .placeholder("Filter sessions")
+                .render(filter, frame);
+        }
+        SessionPickerMode::Rename => {
+            TextInput::new(app.rename())
+                .placeholder("New session name")
+                .render(filter, frame);
+        }
+    }
 
     let status = Rect::new(
         inner.x,
@@ -48,7 +51,7 @@ pub(super) fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
         status,
         &Line::from_spans(vec![Span::styled(
             app.status().to_owned(),
-            Style::new().fg(Color::BrightBlack),
+            status_style(app.mode()),
         )]),
     );
 
@@ -65,4 +68,27 @@ pub(super) fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
         .highlight_symbol("> ")
         .render(list_area, frame, &mut state);
     *app.list_state_mut() = state;
+}
+
+fn header_line(mode: SessionPickerMode) -> Line {
+    let help = match mode {
+        SessionPickerMode::Filter => {
+            "  Enter selects  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels"
+        }
+        SessionPickerMode::Rename => "  Enter saves rename  Esc cancels",
+        SessionPickerMode::DeleteConfirm => "  Y confirms delete  N/Esc cancels",
+    };
+    Line::from_spans(vec![
+        Span::styled("Bcode sessions", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(help),
+    ])
+}
+
+const fn status_style(mode: SessionPickerMode) -> Style {
+    match mode {
+        SessionPickerMode::DeleteConfirm => Style::new().fg(Color::Red),
+        SessionPickerMode::Filter | SessionPickerMode::Rename => {
+            Style::new().fg(Color::BrightBlack)
+        }
+    }
 }

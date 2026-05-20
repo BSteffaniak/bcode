@@ -6,14 +6,27 @@ use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 
+/// Session picker mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionPickerMode {
+    /// Filtering/selecting sessions.
+    Filter,
+    /// Editing the selected session name.
+    Rename,
+    /// Confirming deletion of the selected session.
+    DeleteConfirm,
+}
+
 /// Session picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SessionPickerApp {
     sessions: Vec<SessionSummary>,
     filter: TextEditBuffer,
+    rename: TextEditBuffer,
     list_state: ListState,
     filtered_indices: Vec<usize>,
     status: String,
+    mode: SessionPickerMode,
 }
 
 impl SessionPickerApp {
@@ -28,10 +41,18 @@ impl SessionPickerApp {
         Self {
             sessions,
             filter: TextEditBuffer::new(),
+            rename: TextEditBuffer::new(),
             list_state,
             filtered_indices,
             status: "Select a session or press Ctrl-N to create one".to_owned(),
+            mode: SessionPickerMode::Filter,
         }
+    }
+
+    /// Return picker mode.
+    #[must_use]
+    pub(super) const fn mode(&self) -> SessionPickerMode {
+        self.mode
     }
 
     /// Return the filter input.
@@ -43,6 +64,17 @@ impl SessionPickerApp {
     /// Return the filter input mutably.
     pub(super) const fn filter_mut(&mut self) -> &mut TextEditBuffer {
         &mut self.filter
+    }
+
+    /// Return the rename input.
+    #[must_use]
+    pub(super) const fn rename(&self) -> &TextEditBuffer {
+        &self.rename
+    }
+
+    /// Return the rename input mutably.
+    pub(super) const fn rename_mut(&mut self) -> &mut TextEditBuffer {
+        &mut self.rename
     }
 
     /// Return list state.
@@ -59,6 +91,12 @@ impl SessionPickerApp {
     /// Set picker status.
     pub(super) fn set_status(&mut self, status: String) {
         self.status = status;
+    }
+
+    /// Replace all sessions and refresh the filter.
+    pub(super) fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        self.sessions = sessions;
+        self.refresh_filter();
     }
 
     /// Return visible list items.
@@ -83,6 +121,55 @@ impl SessionPickerApp {
         let selected = self.list_state.selected?;
         let index = *self.filtered_indices.get(selected)?;
         Some(self.sessions[index].id)
+    }
+
+    /// Return selected session name.
+    #[must_use]
+    pub(super) fn selected_session_name(&self) -> Option<&str> {
+        let selected = self.list_state.selected?;
+        let index = *self.filtered_indices.get(selected)?;
+        self.sessions[index].name.as_deref()
+    }
+
+    /// Enter rename mode for the selected session.
+    pub(super) fn start_rename(&mut self) -> bool {
+        let Some(name) = self.selected_session_name() else {
+            "No session selected to rename".clone_into(&mut self.status);
+            return false;
+        };
+        self.rename = TextEditBuffer::from_text(name);
+        self.mode = SessionPickerMode::Rename;
+        "Enter saves rename; Esc cancels".clone_into(&mut self.status);
+        true
+    }
+
+    /// Exit rename mode without saving.
+    pub(super) fn cancel_rename(&mut self) {
+        self.mode = SessionPickerMode::Filter;
+        "Rename canceled".clone_into(&mut self.status);
+    }
+
+    /// Enter delete confirmation mode for the selected session.
+    pub(super) fn start_delete_confirmation(&mut self) -> bool {
+        if self.selected_session_id().is_none() {
+            "No session selected to delete".clone_into(&mut self.status);
+            return false;
+        }
+        self.mode = SessionPickerMode::DeleteConfirm;
+        "Delete selected session? y/N".clone_into(&mut self.status);
+        true
+    }
+
+    /// Exit delete confirmation mode without deleting.
+    pub(super) fn cancel_delete(&mut self) {
+        self.mode = SessionPickerMode::Filter;
+        "Delete canceled".clone_into(&mut self.status);
+    }
+
+    /// Return to filter mode after a mutation.
+    pub(super) fn finish_mutation(&mut self, status: String) {
+        self.mode = SessionPickerMode::Filter;
+        self.status = status;
     }
 
     /// Recompute filtered sessions after filter edits.
