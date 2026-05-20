@@ -2179,6 +2179,7 @@ mod tests {
         SessionEventKind, SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent,
         SessionTracePayload, SessionTracePhase, TraceBlobRef,
     };
+    use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -2269,6 +2270,64 @@ mod tests {
             bmux_codec::from_bytes(&bytes).expect("trace event should decode");
 
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn session_event_kind_binary_tags_are_append_only() {
+        let cases = session_event_kind_tag_cases();
+        for (expected_tag, name, kind) in cases {
+            let bytes = bmux_codec::to_vec(&kind).expect("event kind should encode");
+            let (actual_tag, _) =
+                bmux_codec::varint::decode_u32(&bytes).expect("event kind tag should decode");
+            assert_eq!(
+                actual_tag, expected_tag,
+                "persisted SessionEventKind tag changed for {name}; append new variants only or add compatibility decoding/migration plus binary fixtures"
+            );
+        }
+    }
+
+    #[test]
+    fn session_event_binary_golden_fixture_decodes_stable_variant_order() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("fixture root should create");
+        let fixture_path = stable_order_binary_fixture_path();
+        let event_path = root.join("fixture.events");
+        std::fs::copy(&fixture_path, &event_path).expect("fixture should copy");
+
+        let report = reader::read_events(&event_path).expect("fixture should decode");
+        assert!(report.issues.is_empty());
+        assert_eq!(report.events.len(), 4);
+        assert!(matches!(
+            &report.events[0].kind,
+            SessionEventKind::SessionCreated { name } if name.as_deref() == Some("stable-order")
+        ));
+        assert!(matches!(
+            &report.events[1].kind,
+            SessionEventKind::AssistantDelta { text } if text == "partial"
+        ));
+        assert!(matches!(
+            &report.events[2].kind,
+            SessionEventKind::ToolCallRequested { tool_name, .. } if tool_name == "read"
+        ));
+        assert!(matches!(
+            &report.events[3].kind,
+            SessionEventKind::SkillInvocationFailed { skill_id, .. } if skill_id.as_str() == "fixture"
+        ));
+
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
+    }
+
+    #[test]
+    #[ignore = "fixture regeneration is intentional and writes to the repository"]
+    fn write_session_event_binary_golden_fixture() {
+        let path = stable_order_binary_fixture_path();
+        let parent = path.parent().expect("fixture should have parent");
+        std::fs::create_dir_all(parent).expect("fixture dir should create");
+        let mut file = std::fs::File::create(&path).expect("fixture should create");
+        for event in stable_order_binary_fixture_events() {
+            super::write_event_frame(&mut file, &event).expect("fixture event should write");
+        }
     }
 
     #[test]
@@ -3316,6 +3375,292 @@ mod tests {
         assert!(backup_dir.join(format!("{}.events", session.id)).exists());
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn session_event_kind_tag_cases() -> Vec<(u32, &'static str, SessionEventKind)> {
+        let client_id = ClientId::new();
+        let skill_id = SkillId::new("compatibility-test");
+        vec![
+            (
+                0,
+                "SessionCreated",
+                SessionEventKind::SessionCreated {
+                    name: Some("created".to_string()),
+                },
+            ),
+            (
+                1,
+                "ClientAttached",
+                SessionEventKind::ClientAttached { client_id },
+            ),
+            (
+                2,
+                "ClientDetached",
+                SessionEventKind::ClientDetached { client_id },
+            ),
+            (
+                3,
+                "UserMessage",
+                SessionEventKind::UserMessage {
+                    client_id,
+                    text: "user".to_string(),
+                },
+            ),
+            (
+                4,
+                "AssistantDelta",
+                SessionEventKind::AssistantDelta {
+                    text: "delta".to_string(),
+                },
+            ),
+            (
+                5,
+                "AssistantMessage",
+                SessionEventKind::AssistantMessage {
+                    text: "message".to_string(),
+                },
+            ),
+            (
+                6,
+                "ToolCallRequested",
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call".to_string(),
+                    tool_name: "tool".to_string(),
+                    arguments_json: "{}".to_string(),
+                },
+            ),
+            (
+                7,
+                "ToolCallFinished",
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call".to_string(),
+                    result: "ok".to_string(),
+                    is_error: false,
+                },
+            ),
+            (
+                8,
+                "PermissionRequested",
+                SessionEventKind::PermissionRequested {
+                    permission_id: "permission".to_string(),
+                    tool_call_id: "call".to_string(),
+                    tool_name: "tool".to_string(),
+                    arguments_json: "{}".to_string(),
+                },
+            ),
+            (
+                9,
+                "PermissionResolved",
+                SessionEventKind::PermissionResolved {
+                    permission_id: "permission".to_string(),
+                    approved: true,
+                },
+            ),
+            (
+                10,
+                "ModelChanged",
+                SessionEventKind::ModelChanged {
+                    provider: "provider".to_string(),
+                    model: "model".to_string(),
+                },
+            ),
+            (
+                11,
+                "SystemMessage",
+                SessionEventKind::SystemMessage {
+                    text: "system".to_string(),
+                },
+            ),
+            (
+                12,
+                "AgentChanged",
+                SessionEventKind::AgentChanged {
+                    agent_id: "build".to_string(),
+                },
+            ),
+            (
+                13,
+                "ModelTurnStarted",
+                SessionEventKind::ModelTurnStarted {
+                    turn_id: "turn".to_string(),
+                },
+            ),
+            (
+                14,
+                "ModelTurnFinished",
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: "turn".to_string(),
+                    outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            ),
+            (
+                15,
+                "ModelUsage",
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn".to_string(),
+                    usage: bcode_session_models::SessionTokenUsage {
+                        input_tokens: Some(1),
+                        output_tokens: Some(2),
+                        total_tokens: Some(3),
+                        cached_input_tokens: None,
+                        cache_write_input_tokens: None,
+                        reasoning_tokens: None,
+                    },
+                },
+            ),
+            (
+                16,
+                "ContextCompacted",
+                SessionEventKind::ContextCompacted {
+                    summary: "summary".to_string(),
+                    compacted_through_sequence: 1,
+                },
+            ),
+            (
+                17,
+                "SessionRenamed",
+                SessionEventKind::SessionRenamed {
+                    name: Some("renamed".to_string()),
+                },
+            ),
+            (
+                18,
+                "TraceEvent",
+                SessionEventKind::TraceEvent {
+                    trace: Box::new(SessionTraceEvent {
+                        timestamp_ms: 1,
+                        turn_id: None,
+                        phase: SessionTracePhase::ModelProviderEvent,
+                        payload: SessionTracePayload::ProviderEvent {
+                            event_type: "event".to_string(),
+                            detail: None,
+                        },
+                    }),
+                },
+            ),
+            (
+                19,
+                "SkillInvoked",
+                SessionEventKind::SkillInvoked {
+                    skill_id: skill_id.clone(),
+                    arguments: String::new(),
+                    source: None,
+                    invoked_at_ms: 1,
+                },
+            ),
+            (
+                20,
+                "SkillSuggested",
+                SessionEventKind::SkillSuggested {
+                    skill_id: skill_id.clone(),
+                    reason: None,
+                    suggested_at_ms: 1,
+                },
+            ),
+            (
+                21,
+                "SkillActivated",
+                SessionEventKind::SkillActivated {
+                    skill_id: skill_id.clone(),
+                    source: None,
+                    mode: SkillActivationMode::Explicit,
+                    activated_at_ms: 1,
+                },
+            ),
+            (
+                22,
+                "SkillDeactivated",
+                SessionEventKind::SkillDeactivated {
+                    skill_id: skill_id.clone(),
+                    deactivated_at_ms: 1,
+                },
+            ),
+            (
+                23,
+                "SkillContextLoaded",
+                SessionEventKind::SkillContextLoaded {
+                    skill_id: skill_id.clone(),
+                    bytes_loaded: 1,
+                    truncated: false,
+                    loaded_at_ms: 1,
+                },
+            ),
+            (
+                24,
+                "SkillInvocationFailed",
+                SessionEventKind::SkillInvocationFailed {
+                    skill_id,
+                    error: "error".to_string(),
+                    failed_at_ms: 1,
+                },
+            ),
+            (
+                25,
+                "AssistantReasoningDelta",
+                SessionEventKind::AssistantReasoningDelta {
+                    text: "reasoning".to_string(),
+                },
+            ),
+            (
+                26,
+                "AssistantReasoningMessage",
+                SessionEventKind::AssistantReasoningMessage {
+                    text: "reasoning".to_string(),
+                },
+            ),
+        ]
+    }
+
+    fn stable_order_binary_fixture_events() -> Vec<SessionEvent> {
+        let session_id = "11111111-1111-4111-8111-111111111111"
+            .parse()
+            .expect("fixture session id should parse");
+        vec![
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                session_id,
+                kind: SessionEventKind::SessionCreated {
+                    name: Some("stable-order".to_string()),
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                session_id,
+                kind: SessionEventKind::AssistantDelta {
+                    text: "partial".to_string(),
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                session_id,
+                kind: SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"README.md"}"#.to_string(),
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 3,
+                session_id,
+                kind: SessionEventKind::SkillInvocationFailed {
+                    skill_id: SkillId::new("fixture"),
+                    error: "failed".to_string(),
+                    failed_at_ms: 1,
+                },
+            },
+        ]
+    }
+
+    fn stable_order_binary_fixture_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("fixtures/session-events/binary/stable-order-v9.events")
     }
 
     fn write_legacy_event(path: &std::path::Path, event: &SessionEvent) {
