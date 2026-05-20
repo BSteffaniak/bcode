@@ -14,6 +14,8 @@ pub(super) enum BmuxScope {
     Permission,
     /// Session picker.
     SessionPicker,
+    /// Skill picker.
+    SkillPicker,
 }
 
 /// Actions used by the BMUX backend.
@@ -53,6 +55,10 @@ pub(super) enum BmuxAction {
     EditorDeleteWordForward,
     EditorDeleteToStart,
     EditorDeleteToEnd,
+    SkillInvoke,
+    SkillActivate,
+    SkillDeactivate,
+    SkillHelp,
 }
 
 impl BmuxAction {
@@ -92,6 +98,10 @@ impl BmuxAction {
             "tui.editor.deleteWordForward" => Self::EditorDeleteWordForward,
             "tui.editor.deleteToStart" => Self::EditorDeleteToStart,
             "tui.editor.deleteToEnd" => Self::EditorDeleteToEnd,
+            "tui.skill.invoke" => Self::SkillInvoke,
+            "tui.skill.activate" => Self::SkillActivate,
+            "tui.skill.deactivate" => Self::SkillDeactivate,
+            "tui.skill.help" => Self::SkillHelp,
             _ => return None,
         })
     }
@@ -117,6 +127,11 @@ impl BmuxKeyMap {
         apply_scope(
             &mut bindings,
             BmuxScope::SessionPicker,
+            &config.keybindings.session_picker,
+        );
+        apply_scope(
+            &mut bindings,
+            BmuxScope::SkillPicker,
             &config.keybindings.session_picker,
         );
         Self { bindings }
@@ -176,7 +191,11 @@ impl BmuxKeyMap {
             | BmuxAction::SelectCancel
             | BmuxAction::SessionNew
             | BmuxAction::SessionRename
-            | BmuxAction::SessionDelete => return None,
+            | BmuxAction::SessionDelete
+            | BmuxAction::SkillInvoke
+            | BmuxAction::SkillActivate
+            | BmuxAction::SkillDeactivate
+            | BmuxAction::SkillHelp => return None,
         })
     }
 }
@@ -228,6 +247,21 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
                 bind("n", BmuxAction::SessionNew),
                 bind("r", BmuxAction::SessionRename),
                 bind("d", BmuxAction::SessionDelete),
+                bind("escape", BmuxAction::SelectCancel),
+                bind("ctrl+c", BmuxAction::SelectCancel),
+            ],
+        ),
+        (
+            BmuxScope::SkillPicker,
+            vec![
+                bind("up", BmuxAction::SelectUp),
+                bind("k", BmuxAction::SelectUp),
+                bind("down", BmuxAction::SelectDown),
+                bind("j", BmuxAction::SelectDown),
+                bind("enter", BmuxAction::SkillInvoke),
+                bind("a", BmuxAction::SkillActivate),
+                bind("d", BmuxAction::SkillDeactivate),
+                bind("?", BmuxAction::SkillHelp),
                 bind("escape", BmuxAction::SelectCancel),
                 bind("ctrl+c", BmuxAction::SelectCancel),
             ],

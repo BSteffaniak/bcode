@@ -111,7 +111,11 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
         | BmuxAction::EditorDeleteWordBackward
         | BmuxAction::EditorDeleteWordForward
         | BmuxAction::EditorDeleteToStart
-        | BmuxAction::EditorDeleteToEnd => return None,
+        | BmuxAction::EditorDeleteToEnd
+        | BmuxAction::SkillInvoke
+        | BmuxAction::SkillActivate
+        | BmuxAction::SkillDeactivate
+        | BmuxAction::SkillHelp => return None,
     };
     Some(outcome)
 }

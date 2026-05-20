@@ -95,6 +95,7 @@ async fn run_event_loop<W: Write>(
         event_receiver,
         event_task,
     };
+    hydrate_status(&client, &mut chat.app).await;
     let result = run_with_client(terminal, &client, &keymap, &mut chat).await;
     chat.event_task.abort();
     result
@@ -106,6 +107,24 @@ struct ActiveChat {
     event_sender: mpsc::UnboundedSender<BcodeEvent>,
     event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
     event_task: JoinHandle<()>,
+}
+
+async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
+    let Some(session_id) = app.session_id() else {
+        return;
+    };
+    let model = client.session_model_status(session_id).await.ok();
+    let active_skills = client.active_skills(session_id).await.ok();
+    let model_text = model.as_ref().map_or_else(
+        || "model unknown".to_owned(),
+        |status| {
+            let provider = status.provider_plugin_id.as_deref().unwrap_or("auto");
+            let model = status.model_id.as_deref().unwrap_or("default");
+            format!("{provider}/{model}")
+        },
+    );
+    let skill_count = active_skills.as_ref().map_or(0, Vec::len);
+    app.set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
 
 async fn run_with_client<W: Write>(
@@ -387,7 +406,11 @@ fn handle_picker_filter_key(
             | BmuxAction::EditorDeleteWordBackward
             | BmuxAction::EditorDeleteWordForward
             | BmuxAction::EditorDeleteToStart
-            | BmuxAction::EditorDeleteToEnd => PickerKeyOutcome::Continue,
+            | BmuxAction::EditorDeleteToEnd
+            | BmuxAction::SkillInvoke
+            | BmuxAction::SkillActivate
+            | BmuxAction::SkillDeactivate
+            | BmuxAction::SkillHelp => PickerKeyOutcome::Continue,
         };
     }
     match stroke.key {
@@ -533,7 +556,7 @@ async fn handle_event<W: Write>(
                     .await;
             }
             if palette.is_some() {
-                return handle_palette_key(client, chat, palette, terminal, stroke).await;
+                return handle_palette_key(client, keymap, chat, palette, terminal, stroke).await;
             }
             if is_palette_open_key(keymap, stroke) {
                 *palette = Some(BmuxCommandPalette::new());
@@ -646,7 +669,11 @@ async fn handle_permission_key(
         | BmuxAction::EditorDeleteWordBackward
         | BmuxAction::EditorDeleteWordForward
         | BmuxAction::EditorDeleteToStart
-        | BmuxAction::EditorDeleteToEnd => Ok(false),
+        | BmuxAction::EditorDeleteToEnd
+        | BmuxAction::SkillInvoke
+        | BmuxAction::SkillActivate
+        | BmuxAction::SkillDeactivate
+        | BmuxAction::SkillHelp => Ok(false),
     }
 }
 
@@ -677,6 +704,7 @@ async fn resolve_permission_dialog(
 
 async fn handle_palette_key<W: Write>(
     client: &BcodeClient,
+    keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
@@ -693,7 +721,8 @@ async fn handle_palette_key<W: Write>(
             let command = active_palette.command_at(index);
             *palette = None;
             if let Some(command) = command
-                && let Err(error) = execute_palette_command(client, chat, terminal, command).await
+                && let Err(error) =
+                    execute_palette_command(client, chat, terminal, keymap, command).await
             {
                 report_client_error(&mut chat.app, "command failed", &error);
             }
@@ -714,6 +743,7 @@ async fn execute_palette_command<W: Write>(
     client: &BcodeClient,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
+    keymap: &BmuxKeyMap,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
@@ -740,7 +770,7 @@ async fn execute_palette_command<W: Write>(
             pick_model_for_session(terminal, client, chat).await?;
         }
         PaletteCommand::ListSkills => {
-            pick_skill_for_session(terminal, client, chat).await?;
+            pick_skill_for_session(terminal, client, chat, keymap).await?;
         }
         PaletteCommand::ActiveSkills => {
             show_active_skills(client, chat).await?;
@@ -952,6 +982,7 @@ async fn pick_skill_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     chat: &mut ActiveChat,
+    keymap: &BmuxKeyMap,
 ) -> Result<(), TuiError> {
     let skills = client.list_skills().await?;
     if skills.skills.is_empty() {
@@ -976,7 +1007,7 @@ async fn pick_skill_for_session<W: Write>(
                 }
                 skill_picker::SkillPickerMode::Argument => picker.argument_mut().insert_str(&text),
             },
-            Event::Key(stroke) => match handle_skill_picker_key(&mut picker, stroke) {
+            Event::Key(stroke) => match handle_skill_picker_key(&mut picker, keymap, stroke) {
                 skill_picker::SkillPickerAction::Continue => {}
                 skill_picker::SkillPickerAction::Cancel => return Ok(()),
                 skill_picker::SkillPickerAction::Help(skill_id) => {
@@ -1009,18 +1040,23 @@ async fn pick_skill_for_session<W: Write>(
 
 fn handle_skill_picker_key(
     picker: &mut skill_picker::SkillPickerApp,
+    keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> skill_picker::SkillPickerAction {
     match picker.mode() {
-        skill_picker::SkillPickerMode::Filter => handle_skill_filter_key(picker, stroke),
+        skill_picker::SkillPickerMode::Filter => handle_skill_filter_key(picker, keymap, stroke),
         skill_picker::SkillPickerMode::Argument => handle_skill_argument_key(picker, stroke),
     }
 }
 
 fn handle_skill_filter_key(
     picker: &mut skill_picker::SkillPickerApp,
+    keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> skill_picker::SkillPickerAction {
+    if let Some(action) = keymap.action_for_key(BmuxScope::SkillPicker, stroke) {
+        return handle_skill_picker_action(picker, action);
+    }
     match stroke.key {
         KeyCode::Escape => skill_picker::SkillPickerAction::Cancel,
         KeyCode::Enter => {
@@ -1060,6 +1096,71 @@ fn handle_skill_filter_key(
             }
             skill_picker::SkillPickerAction::Continue
         }
+    }
+}
+
+fn handle_skill_picker_action(
+    picker: &mut skill_picker::SkillPickerApp,
+    action: BmuxAction,
+) -> skill_picker::SkillPickerAction {
+    match action {
+        BmuxAction::SelectCancel => skill_picker::SkillPickerAction::Cancel,
+        BmuxAction::SelectUp => {
+            picker.select_previous();
+            skill_picker::SkillPickerAction::Continue
+        }
+        BmuxAction::SelectDown => {
+            picker.select_next();
+            skill_picker::SkillPickerAction::Continue
+        }
+        BmuxAction::SelectConfirm | BmuxAction::SkillInvoke => {
+            if picker.selected_skill_id().is_some() {
+                picker.start_argument();
+            }
+            skill_picker::SkillPickerAction::Continue
+        }
+        BmuxAction::SkillActivate => picker.selected_skill_id().map_or(
+            skill_picker::SkillPickerAction::Continue,
+            skill_picker::SkillPickerAction::Activate,
+        ),
+        BmuxAction::SkillDeactivate => picker.selected_skill_id().map_or(
+            skill_picker::SkillPickerAction::Continue,
+            skill_picker::SkillPickerAction::Deactivate,
+        ),
+        BmuxAction::SkillHelp => picker.selected_skill_id().map_or(
+            skill_picker::SkillPickerAction::Continue,
+            skill_picker::SkillPickerAction::Help,
+        ),
+        BmuxAction::InputSubmit
+        | BmuxAction::InputHistoryPrevious
+        | BmuxAction::InputHistoryNext
+        | BmuxAction::AppExit
+        | BmuxAction::AppInterrupt
+        | BmuxAction::CommandPaletteOpen
+        | BmuxAction::TranscriptPageUp
+        | BmuxAction::TranscriptPageDown
+        | BmuxAction::TranscriptTop
+        | BmuxAction::TranscriptBottom
+        | BmuxAction::TranscriptLineUp
+        | BmuxAction::TranscriptLineDown
+        | BmuxAction::PermissionApprove
+        | BmuxAction::PermissionDeny
+        | BmuxAction::SessionNew
+        | BmuxAction::SessionRename
+        | BmuxAction::SessionDelete
+        | BmuxAction::InputNewLine
+        | BmuxAction::EditorMoveLeft
+        | BmuxAction::EditorMoveRight
+        | BmuxAction::EditorMoveWordLeft
+        | BmuxAction::EditorMoveWordRight
+        | BmuxAction::EditorMoveStart
+        | BmuxAction::EditorMoveEnd
+        | BmuxAction::EditorDeleteBackward
+        | BmuxAction::EditorDeleteForward
+        | BmuxAction::EditorDeleteWordBackward
+        | BmuxAction::EditorDeleteWordForward
+        | BmuxAction::EditorDeleteToStart
+        | BmuxAction::EditorDeleteToEnd => skill_picker::SkillPickerAction::Continue,
     }
 }
 
@@ -1224,8 +1325,7 @@ async fn switch_session(
         &attached.history,
         &attached.input_history,
     );
-    chat.app
-        .set_status(format!("attached session {next_session_id}"));
+    hydrate_status(client, &mut chat.app).await;
     Ok(())
 }
 
