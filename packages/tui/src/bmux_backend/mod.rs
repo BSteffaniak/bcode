@@ -12,6 +12,8 @@ mod permission_dialog_render;
 mod render;
 mod session_picker;
 mod session_picker_render;
+mod skill_picker;
+mod skill_picker_render;
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -706,7 +708,7 @@ async fn execute_palette_command<W: Write>(
             pick_model_for_session(terminal, client, chat).await?;
         }
         PaletteCommand::ListSkills => {
-            list_skills(client, chat).await?;
+            pick_skill_for_session(terminal, client, chat).await?;
         }
         PaletteCommand::ActiveSkills => {
             show_active_skills(client, chat).await?;
@@ -848,23 +850,231 @@ async fn pick_model_for_session<W: Write>(
     }
 }
 
-async fn list_skills(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+async fn pick_skill_for_session<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
     let skills = client.list_skills().await?;
-    let mut lines = vec![format!("Available skills: {}", skills.skills.len())];
-    lines.extend(skills.skills.iter().take(40).map(|skill| {
-        let description = skill.description.as_deref().unwrap_or("no description");
-        format!("* {} — {description}", skill.id)
-    }));
-    if skills.skills.len() > 40 {
-        lines.push(format!("… {} more", skills.skills.len() - 40));
+    if skills.skills.is_empty() {
+        chat.app.set_status("no skills available".to_owned());
+        chat.app
+            .push_system_note("No skills are available.".to_owned());
+        return Ok(());
     }
-    if !skills.diagnostics.is_empty() {
-        lines.push(format!("Diagnostics: {}", skills.diagnostics.len()));
+    let mut picker = skill_picker::SkillPickerApp::new(skills.skills);
+    loop {
+        terminal.resize(terminal_area()?);
+        terminal.draw(|frame| skill_picker_render::render_skill_picker(&mut picker, frame))?;
+        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => match picker.mode() {
+                skill_picker::SkillPickerMode::Filter => {
+                    picker.filter_mut().insert_str(&text);
+                    picker.refresh_filter();
+                }
+                skill_picker::SkillPickerMode::Argument => picker.argument_mut().insert_str(&text),
+            },
+            Event::Key(stroke) => match handle_skill_picker_key(&mut picker, stroke) {
+                skill_picker::SkillPickerAction::Continue => {}
+                skill_picker::SkillPickerAction::Cancel => return Ok(()),
+                skill_picker::SkillPickerAction::Help(skill_id) => {
+                    describe_skill(client, chat, skill_id).await?;
+                    return Ok(());
+                }
+                skill_picker::SkillPickerAction::Activate(skill_id) => {
+                    activate_skill(client, chat, skill_id).await?;
+                    return Ok(());
+                }
+                skill_picker::SkillPickerAction::Deactivate(skill_id) => {
+                    deactivate_skill(client, chat, skill_id).await?;
+                    return Ok(());
+                }
+                skill_picker::SkillPickerAction::Invoke {
+                    skill_id,
+                    arguments,
+                } => {
+                    invoke_skill(client, chat, skill_id, arguments).await?;
+                    return Ok(());
+                }
+            },
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Mouse(_)
+            | Event::Tick
+            | Event::User(_) => {}
+        }
     }
-    chat.app
-        .set_status(format!("listed {} skills", skills.skills.len()));
-    chat.app.push_system_note(lines.join("\n"));
+}
+
+fn handle_skill_picker_key(
+    picker: &mut skill_picker::SkillPickerApp,
+    stroke: KeyStroke,
+) -> skill_picker::SkillPickerAction {
+    match picker.mode() {
+        skill_picker::SkillPickerMode::Filter => handle_skill_filter_key(picker, stroke),
+        skill_picker::SkillPickerMode::Argument => handle_skill_argument_key(picker, stroke),
+    }
+}
+
+fn handle_skill_filter_key(
+    picker: &mut skill_picker::SkillPickerApp,
+    stroke: KeyStroke,
+) -> skill_picker::SkillPickerAction {
+    match stroke.key {
+        KeyCode::Escape => skill_picker::SkillPickerAction::Cancel,
+        KeyCode::Enter => {
+            if picker.selected_skill_id().is_some() {
+                picker.start_argument();
+            }
+            skill_picker::SkillPickerAction::Continue
+        }
+        KeyCode::Up if stroke.modifiers.is_empty() => {
+            picker.select_previous();
+            skill_picker::SkillPickerAction::Continue
+        }
+        KeyCode::Down if stroke.modifiers.is_empty() => {
+            picker.select_next();
+            skill_picker::SkillPickerAction::Continue
+        }
+        KeyCode::Char('a') if stroke.modifiers.is_empty() => picker.selected_skill_id().map_or(
+            skill_picker::SkillPickerAction::Continue,
+            skill_picker::SkillPickerAction::Activate,
+        ),
+        KeyCode::Char('d') if stroke.modifiers.is_empty() => picker.selected_skill_id().map_or(
+            skill_picker::SkillPickerAction::Continue,
+            skill_picker::SkillPickerAction::Deactivate,
+        ),
+        KeyCode::Char('?') if stroke.modifiers.is_empty() => picker.selected_skill_id().map_or(
+            skill_picker::SkillPickerAction::Continue,
+            skill_picker::SkillPickerAction::Help,
+        ),
+        _ => {
+            let outcome = TextInputKeyHandler::new(
+                TextKeymap::default(),
+                TextInputEnterBehavior::InsertNewline,
+            )
+            .handle_key(picker.filter_mut(), stroke);
+            if outcome == TextInputKeyOutcome::Edited {
+                picker.refresh_filter();
+            }
+            skill_picker::SkillPickerAction::Continue
+        }
+    }
+}
+
+fn handle_skill_argument_key(
+    picker: &mut skill_picker::SkillPickerApp,
+    stroke: KeyStroke,
+) -> skill_picker::SkillPickerAction {
+    match stroke.key {
+        KeyCode::Escape => skill_picker::SkillPickerAction::Cancel,
+        KeyCode::Enter => picker.selected_skill_id().map_or(
+            skill_picker::SkillPickerAction::Continue,
+            |skill_id| skill_picker::SkillPickerAction::Invoke {
+                skill_id,
+                arguments: picker.argument().text().to_owned(),
+            },
+        ),
+        _ => {
+            let _outcome = TextInputKeyHandler::new(
+                TextKeymap::default(),
+                TextInputEnterBehavior::InsertNewline,
+            )
+            .handle_key(picker.argument_mut(), stroke);
+            skill_picker::SkillPickerAction::Continue
+        }
+    }
+}
+
+async fn describe_skill(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    skill_id: bcode_skill_models::SkillId,
+) -> Result<(), TuiError> {
+    let manifest = client.describe_skill(skill_id.clone()).await?;
+    let description = manifest
+        .summary
+        .description
+        .as_deref()
+        .unwrap_or("no description");
+    chat.app.push_system_note(format!(
+        "Skill: {}\nName: {}\nDescription: {description}\nSource: {}\nInstructions:\n{}",
+        manifest.summary.id,
+        manifest.summary.name,
+        manifest.summary.source.label,
+        truncate_for_status(&manifest.instructions, 2_000)
+    ));
+    chat.app.set_status(format!("shown skill {skill_id}"));
     Ok(())
+}
+
+async fn activate_skill(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    skill_id: bcode_skill_models::SkillId,
+) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    client.activate_skill(session_id, skill_id.clone()).await?;
+    chat.app.set_status(format!("activated skill {skill_id}"));
+    Ok(())
+}
+
+async fn deactivate_skill(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    skill_id: bcode_skill_models::SkillId,
+) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    client
+        .deactivate_skill(session_id, skill_id.clone())
+        .await?;
+    chat.app.set_status(format!("deactivated skill {skill_id}"));
+    Ok(())
+}
+
+async fn invoke_skill(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    skill_id: bcode_skill_models::SkillId,
+    arguments: String,
+) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    let display_text = if arguments.trim().is_empty() {
+        format!("Invoke skill {skill_id}")
+    } else {
+        format!("Invoke skill {skill_id}: {arguments}")
+    };
+    let acceptance = client
+        .invoke_skill(session_id, skill_id.clone(), arguments, display_text)
+        .await?;
+    chat.app.set_status(if acceptance.queued {
+        format!("skill {skill_id} queued")
+    } else {
+        format!("skill {skill_id} invoked")
+    });
+    Ok(())
+}
+
+fn truncate_for_status(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}\n…")
+    } else {
+        truncated
+    }
 }
 
 async fn show_active_skills(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
