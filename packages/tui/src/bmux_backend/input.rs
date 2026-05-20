@@ -22,5 +22,5 @@ pub(super) fn handle_key(app: &mut BmuxApp, stroke: KeyStroke) {
 
 fn should_exit(stroke: KeyStroke) -> bool {
     stroke.key == KeyCode::Escape
-        || (matches!(stroke.key, KeyCode::Char('c') | KeyCode::Char('C')) && stroke.modifiers.ctrl)
+        || (matches!(stroke.key, KeyCode::Char('c' | 'C')) && stroke.modifiers.ctrl)
 }

@@ -14,7 +14,7 @@ pub(super) struct BmuxApp {
 impl BmuxApp {
     /// Create BMUX backend state.
     #[must_use]
-    pub(super) fn new(session_id: Option<SessionId>) -> Self {
+    pub(super) const fn new(session_id: Option<SessionId>) -> Self {
         Self {
             session_id,
             composer: TextEditBuffer::new(),
@@ -35,7 +35,7 @@ impl BmuxApp {
     }
 
     /// Return the composer buffer mutably.
-    pub(super) fn composer_mut(&mut self) -> &mut TextEditBuffer {
+    pub(super) const fn composer_mut(&mut self) -> &mut TextEditBuffer {
         &mut self.composer
     }
 

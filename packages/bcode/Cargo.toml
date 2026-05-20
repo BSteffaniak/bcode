@@ -19,5 +19,7 @@ bcode_cli = { workspace = true }
 tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-default          = []
+default          = ["tui-ratatui", "tui-bmux"]
 fail-on-warnings = []
+tui-bmux         = ["bcode_cli/tui-bmux"]
+tui-ratatui      = ["bcode_cli/tui-ratatui"]

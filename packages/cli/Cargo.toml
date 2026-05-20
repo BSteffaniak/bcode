@@ -35,5 +35,7 @@ tracing-subscriber   = { workspace = true }
 zeroize              = { workspace = true }
 
 [features]
-default          = []
+default          = ["tui-ratatui", "tui-bmux"]
 fail-on-warnings = []
+tui-bmux         = ["bcode_tui/tui-bmux"]
+tui-ratatui      = ["bcode_tui/tui-ratatui"]

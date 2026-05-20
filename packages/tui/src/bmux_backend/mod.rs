@@ -37,7 +37,7 @@ pub fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
         terminal.resize(terminal_area()?);
         terminal.draw(|frame| render::render(&app, frame))?;
         if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
-            handle_event(&mut app, &mut terminal, event)?;
+            handle_event(&mut app, &mut terminal, event);
         }
     }
 
@@ -46,11 +46,7 @@ pub fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     Ok(())
 }
 
-fn handle_event<W: Write>(
-    app: &mut BmuxApp,
-    terminal: &mut Terminal<W>,
-    event: Event,
-) -> io::Result<()> {
+fn handle_event<W: Write>(app: &mut BmuxApp, terminal: &mut Terminal<W>, event: Event) {
     match event {
         Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
         Event::Key(stroke) => input::handle_key(app, stroke),
@@ -60,7 +56,6 @@ fn handle_event<W: Write>(
         | Event::Tick
         | Event::User(_) => {}
     }
-    Ok(())
 }
 
 fn terminal_area() -> io::Result<Rect> {

@@ -20,7 +20,7 @@ pub(super) fn render(app: &BmuxApp, frame: &mut Frame<'_>) {
     let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(app, header, frame);
 
-    let composer_height = area.height.min(6).max(3);
+    let composer_height = area.height.clamp(3, 6);
     let composer = Rect::new(
         area.x,
         area.bottom().saturating_sub(composer_height),
