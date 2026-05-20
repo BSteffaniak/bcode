@@ -4,6 +4,8 @@ mod app;
 mod command_palette;
 mod command_palette_render;
 mod input;
+mod permission_dialog;
+mod permission_dialog_render;
 mod render;
 mod session_picker;
 mod session_picker_render;
@@ -28,6 +30,7 @@ use tokio::task::JoinHandle;
 
 use self::app::BmuxApp;
 use self::command_palette::{BmuxCommandPalette, PaletteCommand};
+use self::permission_dialog::PermissionDialogState;
 use super::TuiError;
 
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
@@ -100,6 +103,7 @@ async fn run_with_client<W: Write>(
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
     let mut palette: Option<BmuxCommandPalette> = None;
+    let mut permission_dialog: Option<PermissionDialogState> = None;
     let mut needs_redraw = true;
 
     while !chat.app.should_exit() {
@@ -113,6 +117,17 @@ async fn run_with_client<W: Write>(
             }
         }
 
+        if permission_dialog.is_none()
+            && let Some(permission) = client
+                .list_permissions()
+                .await?
+                .into_iter()
+                .find(|permission| permission.session_id == chat.session_id)
+        {
+            permission_dialog = Some(PermissionDialogState::new(permission));
+            needs_redraw = true;
+        }
+
         if resize_from_terminal(terminal)? {
             needs_redraw = true;
         }
@@ -123,12 +138,24 @@ async fn run_with_client<W: Write>(
                 if let Some(palette) = &mut palette {
                     command_palette_render::render_palette(palette, frame);
                 }
+                if let Some(dialog) = &mut permission_dialog {
+                    permission_dialog_render::render_permission_dialog(dialog, frame);
+                }
             })?;
             needs_redraw = false;
         }
 
         if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
-            if handle_event(client, chat, &mut palette, terminal, event).await? {
+            if handle_event(
+                client,
+                chat,
+                &mut permission_dialog,
+                &mut palette,
+                terminal,
+                event,
+            )
+            .await?
+            {
                 needs_redraw = true;
             }
         } else if chat.app.tick() {
@@ -345,6 +372,7 @@ async fn attach_session_event_stream(
 async fn handle_event<W: Write>(
     client: &BcodeClient,
     chat: &mut ActiveChat,
+    permission_dialog: &mut Option<PermissionDialogState>,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
     event: Event,
@@ -355,6 +383,9 @@ async fn handle_event<W: Write>(
             Ok(true)
         }
         Event::Key(stroke) => {
+            if permission_dialog.is_some() {
+                return handle_permission_key(client, chat, permission_dialog, stroke).await;
+            }
             if palette.is_some() {
                 return handle_palette_key(client, chat, palette, terminal, stroke).await;
             }
@@ -380,6 +411,63 @@ async fn handle_event<W: Write>(
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
         Event::Mouse(_) | Event::User(_) => Ok(false),
     }
+}
+
+async fn handle_permission_key(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    permission_dialog: &mut Option<PermissionDialogState>,
+    stroke: KeyStroke,
+) -> Result<bool, TuiError> {
+    let Some(dialog) = permission_dialog else {
+        return Ok(false);
+    };
+    match stroke.key {
+        KeyCode::Left | KeyCode::Up => {
+            dialog.focus_previous();
+            Ok(true)
+        }
+        KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+            dialog.focus_next();
+            Ok(true)
+        }
+        KeyCode::Char('a' | 'A') => {
+            resolve_permission_dialog(client, chat, permission_dialog, true).await
+        }
+        KeyCode::Char('d' | 'D') | KeyCode::Escape => {
+            resolve_permission_dialog(client, chat, permission_dialog, false).await
+        }
+        KeyCode::Enter => {
+            let approved = dialog.focused_approval();
+            resolve_permission_dialog(client, chat, permission_dialog, approved).await
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn resolve_permission_dialog(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    permission_dialog: &mut Option<PermissionDialogState>,
+    approved: bool,
+) -> Result<bool, TuiError> {
+    let Some(dialog) = permission_dialog.take() else {
+        return Ok(false);
+    };
+    let permission_id = dialog.permission().permission_id.clone();
+    let resolved = client
+        .resolve_permission(permission_id.clone(), approved)
+        .await?;
+    chat.app.set_status(if resolved {
+        if approved {
+            format!("approved permission {permission_id}")
+        } else {
+            format!("denied permission {permission_id}")
+        }
+    } else {
+        format!("permission {permission_id} was already resolved")
+    });
+    Ok(true)
 }
 
 async fn handle_palette_key<W: Write>(
