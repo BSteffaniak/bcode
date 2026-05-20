@@ -3949,9 +3949,15 @@ impl ChatApp {
             completion.move_previous();
             return;
         }
-        if self.input.wrapped_layout(usize::MAX / 4).cursor.row > 0 {
+        let width = self.composer_content_width();
+        let layout = self.input.wrapped_layout(width);
+        if layout.cursor.row > 0 {
             self.reset_input_history_navigation();
-            self.input.move_cursor(TextMotion::VisualUp);
+            self.input.move_cursor_to_wrapped_position(
+                width,
+                layout.cursor.row.saturating_sub(1),
+                layout.cursor.col,
+            );
         } else {
             self.previous_input_history();
         }
@@ -3962,12 +3968,27 @@ impl ChatApp {
             completion.move_next();
             return;
         }
-        let layout = self.input.wrapped_layout(usize::MAX / 4);
+        let width = self.composer_content_width();
+        let layout = self.input.wrapped_layout(width);
         if layout.cursor.row.saturating_add(1) < layout.lines.len() {
             self.reset_input_history_navigation();
-            self.input.move_cursor(TextMotion::VisualDown);
+            self.input.move_cursor_to_wrapped_position(
+                width,
+                layout.cursor.row.saturating_add(1),
+                layout.cursor.col,
+            );
         } else {
             self.next_input_history();
+        }
+    }
+
+    fn composer_content_width(&self) -> usize {
+        let width = self.last_composer_area.get().width;
+        if width > 0 {
+            usize::from(width.max(1))
+        } else {
+            let frame_width = self.last_frame_area.get().width;
+            usize::from(frame_width.saturating_sub(2).max(1))
         }
     }
 
@@ -6494,6 +6515,7 @@ mod tests {
             },
         )];
         let mut app = ChatApp::new(session_id, &history, &keymap);
+        app.last_composer_area.set(Rect::new(1, 10, 78, 3));
         app.input = TextEditBuffer::from_text("one\ntwo");
 
         app.move_input_or_history_previous();
@@ -6505,6 +6527,29 @@ mod tests {
         assert_eq!(app.input.cursor_byte_index(), app.input.text().len());
 
         app.move_input_or_history_previous();
+        app.move_input_or_history_previous();
+        assert_eq!(app.input.text(), "history prompt");
+    }
+
+    #[test]
+    fn soft_wrapped_up_down_moves_cursor_before_history_navigation() {
+        let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
+        let session_id = SessionId::new();
+        let history = vec![session_event(
+            session_id,
+            SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "history prompt".to_string(),
+            },
+        )];
+        let mut app = ChatApp::new(session_id, &history, &keymap);
+        app.last_composer_area.set(Rect::new(1, 10, 3, 3));
+        app.input = TextEditBuffer::from_text("abcdef");
+
+        app.move_input_or_history_previous();
+        assert_eq!(app.input.text(), "abcdef");
+        assert_eq!(app.input.cursor_byte_index(), "abc".len());
+
         app.move_input_or_history_previous();
         assert_eq!(app.input.text(), "history prompt");
     }
