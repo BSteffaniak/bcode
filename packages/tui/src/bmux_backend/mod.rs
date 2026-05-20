@@ -609,7 +609,8 @@ async fn handle_event<W: Write>(
             if palette.is_some() {
                 return handle_palette_mouse(client, keymap, chat, palette, terminal, mouse).await;
             }
-            handle_mouse(client, chat, permission_dialog, mouse).await
+            let hit_id = mouse_hit_id(terminal.hits(), mouse);
+            handle_mouse(hit_id, client, chat, permission_dialog, mouse).await
         }
         Event::User(_) => Ok(false),
     }
@@ -695,38 +696,28 @@ fn permission_click_approval(mouse: MouseEvent) -> Option<bool> {
     }
 }
 
-enum MouseRegion {
-    Composer,
-    Diff,
-    Transcript,
-}
-
-fn mouse_region(mouse: MouseEvent) -> MouseRegion {
-    if composer_position_from_mouse(mouse).is_some() {
-        return MouseRegion::Composer;
-    }
-    if diff_file_row_from_mouse(mouse).is_some() {
-        return MouseRegion::Diff;
-    }
-    MouseRegion::Transcript
+fn mouse_hit_id(hits: &bmux_tui::hit::HitMap, mouse: MouseEvent) -> Option<String> {
+    hits.hit_mouse(mouse)
+        .map(|hit| hit.id().as_str().to_owned())
 }
 
 async fn handle_mouse(
+    hit_id: Option<String>,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     permission_dialog: &mut Option<PermissionDialogState>,
     mouse: MouseEvent,
 ) -> Result<bool, TuiError> {
     match mouse.kind {
-        MouseEventKind::ScrollUp => match mouse_region(mouse) {
-            MouseRegion::Composer => Ok(chat.app.previous_input_history()),
-            MouseRegion::Diff => Ok(chat.app.scroll_diff_up(MOUSE_WHEEL_ROWS)),
-            MouseRegion::Transcript => Ok(chat.app.scroll_transcript_up(MOUSE_WHEEL_ROWS)),
+        MouseEventKind::ScrollUp => match hit_id.as_deref() {
+            Some("composer") => Ok(chat.app.previous_input_history()),
+            Some("diff-files" | "diff-detail") => Ok(chat.app.scroll_diff_up(MOUSE_WHEEL_ROWS)),
+            _ => Ok(chat.app.scroll_transcript_up(MOUSE_WHEEL_ROWS)),
         },
-        MouseEventKind::ScrollDown => match mouse_region(mouse) {
-            MouseRegion::Composer => Ok(chat.app.next_input_history()),
-            MouseRegion::Diff => Ok(chat.app.scroll_diff_down(MOUSE_WHEEL_ROWS)),
-            MouseRegion::Transcript => Ok(chat.app.scroll_transcript_down(MOUSE_WHEEL_ROWS)),
+        MouseEventKind::ScrollDown => match hit_id.as_deref() {
+            Some("composer") => Ok(chat.app.next_input_history()),
+            Some("diff-files" | "diff-detail") => Ok(chat.app.scroll_diff_down(MOUSE_WHEEL_ROWS)),
+            _ => Ok(chat.app.scroll_transcript_down(MOUSE_WHEEL_ROWS)),
         },
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
             if let Some(approve) = permission_click_approval(mouse) {
@@ -736,12 +727,20 @@ async fn handle_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some((row, col)) = composer_position_from_mouse(mouse) {
-                let width = usize::from(terminal_area()?.width.saturating_sub(4));
-                chat.app.move_composer_to_wrapped_position(width, row, col);
-                Ok(true)
-            } else if let Some(row) = diff_file_row_from_mouse(mouse) {
-                Ok(chat.app.select_diff_file(row))
+            if hit_id.as_deref() == Some("composer") {
+                if let Some((row, col)) = composer_position_from_mouse(mouse) {
+                    let width = usize::from(terminal_area()?.width.saturating_sub(4));
+                    chat.app.move_composer_to_wrapped_position(width, row, col);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            } else if hit_id.as_deref() == Some("diff-files") {
+                if let Some(row) = diff_file_row_from_mouse(mouse) {
+                    Ok(chat.app.select_diff_file(row))
+                } else {
+                    Ok(false)
+                }
             } else {
                 Ok(false)
             }

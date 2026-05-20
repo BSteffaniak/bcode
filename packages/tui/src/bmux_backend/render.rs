@@ -4,6 +4,7 @@ use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::diff::{DiffFileList, DiffFileListState, DiffView, DiffViewMode, DiffViewState};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
@@ -68,6 +69,11 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     }
     let transcript_area = transcript_area_for_body(app, area);
     render_transcript(app, transcript_area, frame);
+    frame.push_hit(
+        HitRegion::new("transcript", transcript_area)
+            .role(HitRole::Scroll)
+            .layer(0),
+    );
     let diff_height = area.height.saturating_sub(transcript_area.height);
     if diff_height > 0 {
         let diff_area = Rect::new(area.x, transcript_area.bottom(), area.width, diff_height);
@@ -143,6 +149,11 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         inner.width.min(32)
     };
     let list_area = Rect::new(inner.x, inner.y, split, inner.height);
+    frame.push_hit(
+        HitRegion::new("diff-files", list_area)
+            .role(HitRole::ListItem)
+            .layer(1),
+    );
     let mut state = DiffFileListState::new();
     if !app.changed_files().is_empty() {
         state.select(Some(0));
@@ -156,6 +167,11 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         inner.y,
         inner.width.saturating_sub(split).saturating_sub(1),
         inner.height,
+    );
+    frame.push_hit(
+        HitRegion::new("diff-detail", detail_area)
+            .role(HitRole::Scroll)
+            .layer(1),
     );
     let mut diff_state = DiffViewState {
         offset: app.diff_scroll_offset(),
@@ -349,10 +365,16 @@ fn render_composer(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         .title(" Composer ")
         .padding(Insets::new(0, 1, 0, 1));
     panel.render(area, frame);
+    let inner = panel.inner_area(area);
+    frame.push_hit(
+        HitRegion::new("composer", inner)
+            .role(HitRole::TextInput)
+            .layer(1),
+    );
     TextInput::new(app.composer())
         .placeholder("Type here; Enter sends")
         .cursor_visible(app.cursor_visible())
-        .render(panel.inner_area(area), frame);
+        .render(inner, frame);
 }
 
 fn role_style(role: &str) -> Style {
