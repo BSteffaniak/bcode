@@ -19,6 +19,7 @@ bcode_ipc = { workspace = true }
 bcode_model = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_skill_models = { workspace = true }
+bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, optional = true, features = [
     "crossterm",
@@ -42,5 +43,5 @@ unicode-segmentation = { workspace = true }
 [features]
 default          = ["tui-ratatui"]
 fail-on-warnings = []
-tui-bmux         = ["dep:bmux_tui"]
+tui-bmux         = ["dep:bmux_tui", "dep:crossterm"]
 tui-ratatui      = ["dep:arboard", "dep:crossterm", "dep:ratatui"]

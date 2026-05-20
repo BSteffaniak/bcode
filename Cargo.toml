@@ -63,6 +63,7 @@ bcode_tui                    = { version = "0.0.1-alpha.0", default-features = f
 # BMUX reuse
 bmux_codec     = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_ipc       = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_keyboard  = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui       = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
