@@ -699,6 +699,103 @@ mod tests {
     use super::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEventKind};
 
+    #[test]
+    fn ipc_v1_golden_fixtures_decode_to_expected_payloads() {
+        let message_sent = fixture_bytes("fixtures/ipc/v1/response_message_sent.hex");
+        let decoded: Response = decode(&message_sent).expect("message_sent fixture should decode");
+        assert_eq!(decoded, Response::Ok(ResponsePayload::MessageSent));
+
+        let cancelled = fixture_bytes("fixtures/ipc/v1/response_turn_cancellation_requested.hex");
+        let decoded: Response = decode(&cancelled).expect("cancel fixture should decode");
+        assert_eq!(
+            decoded,
+            Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true })
+        );
+
+        let accepted = fixture_bytes("fixtures/ipc/v1/response_message_accepted.hex");
+        let decoded: Response = decode(&accepted).expect("message_accepted fixture should decode");
+        assert_eq!(
+            decoded,
+            Response::Ok(ResponsePayload::MessageAccepted {
+                queued: true,
+                queue_position: Some(2),
+            })
+        );
+
+        let request = fixture_bytes("fixtures/ipc/v1/request_send_user_message.hex");
+        let decoded: Request = decode(&request).expect("send request fixture should decode");
+        assert_eq!(
+            decoded,
+            Request::SendUserMessage {
+                session_id: "00000000-0000-0000-0000-000000000001"
+                    .parse()
+                    .expect("fixture session id should parse"),
+                text: "hello".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn ipc_v1_golden_fixtures_remain_byte_stable() {
+        let cases = [
+            (
+                "fixtures/ipc/v1/response_message_sent.hex",
+                encode(&Response::Ok(ResponsePayload::MessageSent))
+                    .expect("response should encode"),
+            ),
+            (
+                "fixtures/ipc/v1/response_turn_cancellation_requested.hex",
+                encode(&Response::Ok(ResponsePayload::TurnCancellationRequested {
+                    cancelled: true,
+                }))
+                .expect("response should encode"),
+            ),
+            (
+                "fixtures/ipc/v1/response_message_accepted.hex",
+                encode(&Response::Ok(ResponsePayload::MessageAccepted {
+                    queued: true,
+                    queue_position: Some(2),
+                }))
+                .expect("response should encode"),
+            ),
+            (
+                "fixtures/ipc/v1/request_send_user_message.hex",
+                encode(&Request::SendUserMessage {
+                    session_id: "00000000-0000-0000-0000-000000000001"
+                        .parse()
+                        .expect("fixture session id should parse"),
+                    text: "hello".to_string(),
+                })
+                .expect("request should encode"),
+            ),
+        ];
+        for (path, encoded) in cases {
+            assert_eq!(encoded, fixture_bytes(path), "fixture changed: {path}");
+        }
+    }
+
+    fn fixture_bytes(path: &str) -> Vec<u8> {
+        let hex = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(path),
+        )
+        .expect("fixture should be readable");
+        decode_hex(hex.trim()).expect("fixture should contain hex")
+    }
+
+    fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+        if !hex.len().is_multiple_of(2) {
+            return Err("hex fixture has odd length".to_string());
+        }
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| {
+                u8::from_str_radix(&hex[index..index + 2], 16).map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn oversized_response_envelope_round_trips_across_chunked_frames() {
         let payload = vec![b'x'; MAX_FRAME_PAYLOAD_SIZE + 100_000];

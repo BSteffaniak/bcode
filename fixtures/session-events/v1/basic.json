@@ -1,0 +1,57 @@
+[
+  {
+    "schema_version": 1,
+    "sequence": 1,
+    "session_id": "00000000-0000-0000-0000-000000000101",
+    "kind": {
+      "session_created": {
+        "name": "compat fixture"
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "sequence": 2,
+    "session_id": "00000000-0000-0000-0000-000000000101",
+    "kind": {
+      "user_message": {
+        "client_id": "00000000-0000-0000-0000-000000000201",
+        "text": "hello from v1"
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "sequence": 3,
+    "session_id": "00000000-0000-0000-0000-000000000101",
+    "kind": {
+      "assistant_message": {
+        "text": "hello from current"
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "sequence": 4,
+    "session_id": "00000000-0000-0000-0000-000000000101",
+    "kind": {
+      "tool_call_requested": {
+        "tool_call_id": "call-1",
+        "tool_name": "filesystem.read",
+        "arguments_json": "{\"path\":\"README.md\"}"
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "sequence": 5,
+    "session_id": "00000000-0000-0000-0000-000000000101",
+    "kind": {
+      "tool_call_finished": {
+        "tool_call_id": "call-1",
+        "result": "ok",
+        "is_error": false
+      }
+    }
+  }
+]

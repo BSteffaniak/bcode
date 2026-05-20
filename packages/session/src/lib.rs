@@ -2188,6 +2188,53 @@ mod tests {
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn session_event_log_golden_fixture_migrates_to_current_schema() {
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("fixtures/session-events/v1/basic.json"),
+        )
+        .expect("fixture should be readable");
+        let original: Vec<SessionEvent> =
+            serde_json::from_str(&fixture).expect("fixture should decode");
+        let session_id = original
+            .first()
+            .expect("fixture should contain events")
+            .session_id;
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp session dir should be created");
+        let store = super::SessionEventStore::new(&root);
+        let path = store.event_path(session_id);
+        {
+            let mut file =
+                std::fs::File::create(&path).expect("fixture event log should be writable");
+            for event in &original {
+                super::write_event_frame(&mut file, event).expect("fixture frame should write");
+            }
+        }
+
+        let report = store
+            .migrate_event_log_to_current(session_id)
+            .expect("fixture should migrate");
+        assert_eq!(report.items.len(), 1);
+
+        let migrated = store
+            .read_session_events(session_id)
+            .expect("migrated fixture should read");
+        assert_eq!(migrated.len(), original.len());
+        for (before, after) in original.iter().zip(&migrated) {
+            assert_eq!(after.schema_version, CURRENT_SESSION_EVENT_SCHEMA_VERSION);
+            assert_eq!(after.sequence, before.sequence);
+            assert_eq!(after.session_id, before.session_id);
+            assert_eq!(after.kind, before.kind);
+        }
+        store
+            .ensure_fresh_index(session_id)
+            .expect("migrated fixture should reindex");
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[test]
     fn trace_event_round_trips_through_bmux_codec() {
         let mut metadata = BTreeMap::new();
         metadata.insert("conversation_hash".to_string(), "abc123".to_string());
