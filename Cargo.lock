@@ -998,6 +998,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_skill_models",
  "bmux_text_edit",
+ "bmux_tui",
  "crossterm",
  "ratatui",
  "serde_json",
@@ -1069,7 +1070,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6f270bd39f75c2f883b268db8494458e19b9c743"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#b221cf2fa7e487ed7873205c2feb6f9fa5d76ca1"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -1079,7 +1080,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6f270bd39f75c2f883b268db8494458e19b9c743"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#b221cf2fa7e487ed7873205c2feb6f9fa5d76ca1"
 dependencies = [
  "serde",
 ]
@@ -1087,7 +1088,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6f270bd39f75c2f883b268db8494458e19b9c743"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#b221cf2fa7e487ed7873205c2feb6f9fa5d76ca1"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -1099,10 +1100,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_keyboard"
+version = "0.0.1-alpha.0"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#b221cf2fa7e487ed7873205c2feb6f9fa5d76ca1"
+
+[[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.0"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6f270bd39f75c2f883b268db8494458e19b9c743"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#b221cf2fa7e487ed7873205c2feb6f9fa5d76ca1"
 dependencies = [
+ "bmux_keyboard",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "bmux_tui"
+version = "0.0.1-alpha.0"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#b221cf2fa7e487ed7873205c2feb6f9fa5d76ca1"
+dependencies = [
+ "bmux_keyboard",
+ "bmux_text_edit",
+ "crossterm",
  "unicode-segmentation",
  "unicode-width",
 ]

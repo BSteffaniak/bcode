@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-arboard = { workspace = true }
+arboard = { workspace = true, optional = true }
 bcode_client = { workspace = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
@@ -20,8 +20,15 @@ bcode_model = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_skill_models = { workspace = true }
 bmux_text_edit = { workspace = true }
-crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
-ratatui = { workspace = true, features = [
+bmux_tui = { workspace = true, optional = true, features = [
+    "crossterm",
+    "diff",
+] }
+crossterm = { workspace = true, optional = true, features = [
+    "bracketed-paste",
+    "events",
+] }
+ratatui = { workspace = true, optional = true, features = [
     "crossterm",
     "crossterm_0_29",
     "std",
@@ -33,5 +40,7 @@ tokio = { workspace = true, features = ["sync"] }
 unicode-segmentation = { workspace = true }
 
 [features]
-default          = []
+default          = ["tui-ratatui"]
 fail-on-warnings = []
+tui-bmux         = ["dep:bmux_tui"]
+tui-ratatui      = ["dep:arboard", "dep:crossterm", "dep:ratatui"]
