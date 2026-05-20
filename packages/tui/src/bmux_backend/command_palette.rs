@@ -17,6 +17,8 @@ pub(super) enum PaletteCommand {
     ShowServerModelStatus,
     /// Select active session model.
     SelectModel,
+    /// Toggle diff panel.
+    ToggleDiff,
     /// Show available skills.
     ListSkills,
     /// Show active skills for the current session.
@@ -41,6 +43,7 @@ impl PaletteCommand {
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
             Self::SelectModel => "model.select",
+            Self::ToggleDiff => "diff.toggle",
             Self::ListSkills => "skills.list",
             Self::ActiveSkills => "skills.active",
             Self::Help => "help",
@@ -58,6 +61,7 @@ impl PaletteCommand {
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
             "model.select" => Some(Self::SelectModel),
+            "diff.toggle" => Some(Self::ToggleDiff),
             "skills.list" => Some(Self::ListSkills),
             "skills.active" => Some(Self::ActiveSkills),
             "help" => Some(Self::Help),
@@ -138,6 +142,12 @@ fn palette_items() -> Vec<PaletteItem> {
             "Select Model",
             "Choose a model for this session",
             "model select choose session provider",
+        ),
+        item(
+            PaletteCommand::ToggleDiff,
+            "Toggle Diff Panel",
+            "Show or hide changed files and diff preview",
+            "diff changed files toggle preview",
         ),
         item(
             PaletteCommand::ListSkills,

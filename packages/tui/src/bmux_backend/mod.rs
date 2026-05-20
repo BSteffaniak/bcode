@@ -650,7 +650,6 @@ async fn handle_chat_key<W: Write>(
         .await;
     }
     let changed = match stroke.key {
-        KeyCode::Char('d') if stroke.modifiers.ctrl => chat.app.toggle_diff_visible(),
         KeyCode::Char(']') if stroke.modifiers.is_empty() => chat.app.select_next_diff_file(),
         KeyCode::Char('[') if stroke.modifiers.is_empty() => chat.app.select_previous_diff_file(),
         _ => false,
@@ -1100,6 +1099,14 @@ async fn execute_palette_command<W: Write>(
         }
         PaletteCommand::SelectModel => {
             pick_model_for_session(terminal, client, chat, keymap).await?;
+        }
+        PaletteCommand::ToggleDiff => {
+            let _changed = chat.app.toggle_diff_visible();
+            chat.app.set_status(if chat.app.diff_visible() {
+                "diff panel shown".to_owned()
+            } else {
+                "diff panel hidden".to_owned()
+            });
         }
         PaletteCommand::ListSkills => {
             pick_skill_for_session(terminal, client, chat, keymap).await?;
@@ -1762,6 +1769,14 @@ async fn submit_composer<W: Write>(
             }
             slash_commands::SlashCommandOutcome::PickSkill => {
                 pick_skill_for_session(terminal, client, chat, keymap).await?;
+            }
+            slash_commands::SlashCommandOutcome::ToggleDiff => {
+                let _changed = chat.app.toggle_diff_visible();
+                chat.app.set_status(if chat.app.diff_visible() {
+                    "diff panel shown".to_owned()
+                } else {
+                    "diff panel hidden".to_owned()
+                });
             }
             slash_commands::SlashCommandOutcome::Unknown(command) => {
                 chat.app

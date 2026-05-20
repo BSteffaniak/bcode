@@ -234,6 +234,7 @@ fn static_items() -> Vec<SlashItem> {
         ("/set-model ", "Set model by id"),
         ("/provider", "Show current provider"),
         ("/set-provider ", "Set provider by id"),
+        ("/diff", "Toggle diff panel"),
         ("/skills", "Open skill picker"),
         ("/agent ", "Set session agent by id"),
         ("/skill ", "Invoke skill by id"),

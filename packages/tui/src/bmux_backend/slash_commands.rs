@@ -15,10 +15,32 @@ pub(super) enum SlashCommandOutcome {
     PickModel,
     /// Open skill picker.
     PickSkill,
+    /// Toggle diff panel.
+    ToggleDiff,
     /// Show a system note.
     SystemNote(String),
     /// Unknown slash command.
     Unknown(String),
+}
+
+async fn describe_skill(
+    client: &BcodeClient,
+    skill_id: &str,
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    let skill_id = bcode_skill_models::SkillId::new(skill_id);
+    let manifest = client.describe_skill(skill_id).await?;
+    Ok(SlashCommandOutcome::SystemNote(format!(
+        "Skill: {}\nName: {}\nDescription: {}\nSource: {}\nInstructions:\n{}",
+        manifest.summary.id,
+        manifest.summary.name,
+        manifest
+            .summary
+            .description
+            .as_deref()
+            .unwrap_or("no description"),
+        manifest.summary.source.label,
+        manifest.instructions
+    )))
 }
 
 /// Execute a slash command.
@@ -93,22 +115,10 @@ pub(super) async fn execute(
                 status.provider_plugin_id.as_deref().unwrap_or("auto")
             )))
         }
+        "diff" => Ok(SlashCommandOutcome::ToggleDiff),
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" if parts.get(1) == Some(&"describe") && parts.len() > 2 => {
-            let skill_id = bcode_skill_models::SkillId::new(parts[2]);
-            let manifest = client.describe_skill(skill_id.clone()).await?;
-            Ok(SlashCommandOutcome::SystemNote(format!(
-                "Skill: {}\nName: {}\nDescription: {}\nSource: {}\nInstructions:\n{}",
-                manifest.summary.id,
-                manifest.summary.name,
-                manifest
-                    .summary
-                    .description
-                    .as_deref()
-                    .unwrap_or("no description"),
-                manifest.summary.source.label,
-                manifest.instructions
-            )))
+            describe_skill(client, parts[2]).await
         }
         "skill" if parts.len() > 1 => {
             let skill_id = bcode_skill_models::SkillId::new(parts[1]);
