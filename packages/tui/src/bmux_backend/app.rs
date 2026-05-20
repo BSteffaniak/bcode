@@ -275,6 +275,13 @@ impl BmuxApp {
         self.pending_submission.take().unwrap_or_default()
     }
 
+    /// Remove the pending submission after an intercepted slash command.
+    pub(super) fn clear_pending_submission(&mut self) {
+        if let Some(text) = self.pending_submission.take() {
+            self.remove_pending_submission(&text);
+        }
+    }
+
     /// Mark the oldest pending submission as queued by the server.
     pub(super) fn mark_pending_submission_queued(&mut self, queue_position: Option<u32>) {
         if let Some(pending) = self.pending_submissions.first_mut() {

@@ -16,6 +16,7 @@ mod session_picker;
 mod session_picker_render;
 mod skill_picker;
 mod skill_picker_render;
+mod slash_commands;
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -1571,6 +1572,30 @@ async fn submit_composer(client: &BcodeClient, app: &mut BmuxApp) -> Result<(), 
     };
     let message = app.take_pending_submission();
     if message.trim().is_empty() {
+        return Ok(());
+    }
+    if message.starts_with('/') {
+        app.clear_pending_submission();
+        match slash_commands::execute(client, session_id, &message).await? {
+            slash_commands::SlashCommandOutcome::Handled(status) => app.set_status(status),
+            slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
+                app.set_status(format!(
+                    "created session {next_session_id}; use /sessions to switch"
+                ));
+            }
+            slash_commands::SlashCommandOutcome::PickSession => {
+                app.set_status("open the command palette to switch sessions".to_owned());
+            }
+            slash_commands::SlashCommandOutcome::PickModel => {
+                app.set_status("open the command palette to select a model".to_owned());
+            }
+            slash_commands::SlashCommandOutcome::PickSkill => {
+                app.set_status("open the command palette to select a skill".to_owned());
+            }
+            slash_commands::SlashCommandOutcome::Unknown(command) => {
+                app.set_status(format!("unknown slash command: {command}"));
+            }
+        }
         return Ok(());
     }
     match client.send_user_message(session_id, message).await {
