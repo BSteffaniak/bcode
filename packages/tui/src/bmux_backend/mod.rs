@@ -424,11 +424,12 @@ fn handle_picker_filter_key(
             PickerKeyOutcome::Continue
         }
         _ => {
-            let outcome = TextInputKeyHandler::new(
-                TextKeymap::default(),
+            let outcome = handle_text_buffer_key(
+                picker.filter_mut(),
+                keymap,
+                stroke,
                 TextInputEnterBehavior::InsertNewline,
-            )
-            .handle_key(picker.filter_mut(), stroke);
+            );
             if outcome == TextInputKeyOutcome::Edited {
                 picker.refresh_filter();
             }
@@ -767,7 +768,7 @@ async fn execute_palette_command<W: Write>(
             show_server_model_status(client, chat).await?;
         }
         PaletteCommand::SelectModel => {
-            pick_model_for_session(terminal, client, chat).await?;
+            pick_model_for_session(terminal, client, chat, keymap).await?;
         }
         PaletteCommand::ListSkills => {
             pick_skill_for_session(terminal, client, chat, keymap).await?;
@@ -857,9 +858,23 @@ async fn show_server_model_status(
     Ok(())
 }
 
+fn handle_text_buffer_key(
+    buffer: &mut bmux_text_edit::TextEditBuffer,
+    keymap: &BmuxKeyMap,
+    stroke: KeyStroke,
+    enter_behavior: TextInputEnterBehavior,
+) -> TextInputKeyOutcome {
+    if let Some(command) = keymap.editor_command_for_key(stroke) {
+        buffer.apply_command(command);
+        return TextInputKeyOutcome::Edited;
+    }
+    TextInputKeyHandler::new(TextKeymap::default(), enter_behavior).handle_key(buffer, stroke)
+}
+
 async fn pick_model_provider<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
+    keymap: &BmuxKeyMap,
 ) -> Result<Option<String>, TuiError> {
     let providers = client
         .plugin_services()
@@ -890,11 +905,12 @@ async fn pick_model_provider<W: Write>(
                 KeyCode::Up => picker.select_previous(),
                 KeyCode::Down => picker.select_next(),
                 _ => {
-                    let outcome = TextInputKeyHandler::new(
-                        TextKeymap::default(),
+                    let outcome = handle_text_buffer_key(
+                        picker.filter_mut(),
+                        keymap,
+                        stroke,
                         TextInputEnterBehavior::InsertNewline,
-                    )
-                    .handle_key(picker.filter_mut(), stroke);
+                    );
                     if outcome == TextInputKeyOutcome::Edited {
                         picker.refresh_filter();
                     }
@@ -912,12 +928,13 @@ async fn pick_model_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     chat: &mut ActiveChat,
+    keymap: &BmuxKeyMap,
 ) -> Result<(), TuiError> {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let provider_plugin_id = pick_model_provider(terminal, client).await?;
+    let provider_plugin_id = pick_model_provider(terminal, client, keymap).await?;
     let models = client
         .session_model_list(provider_plugin_id.clone())
         .await?
@@ -943,28 +960,37 @@ async fn pick_model_for_session<W: Write>(
                 KeyCode::Escape => return Ok(()),
                 KeyCode::Enter => {
                     if let Some(model_id) = picker.selected_model_id() {
-                        client
+                        if let Err(error) = client
                             .set_session_model(
                                 session_id,
                                 provider_plugin_id.clone(),
                                 model_id.clone(),
                             )
-                            .await?;
-                        chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
-                            || format!("model set to {model_id}"),
-                            |provider| format!("model set to {provider}/{model_id}"),
-                        ));
+                            .await
+                        {
+                            report_client_error(
+                                &mut chat.app,
+                                "model selection failed",
+                                &error.into(),
+                            );
+                        } else {
+                            chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
+                                || format!("model set to {model_id}"),
+                                |provider| format!("model set to {provider}/{model_id}"),
+                            ));
+                        }
                         return Ok(());
                     }
                 }
                 KeyCode::Up => picker.select_previous(),
                 KeyCode::Down => picker.select_next(),
                 _ => {
-                    let outcome = TextInputKeyHandler::new(
-                        TextKeymap::default(),
+                    let outcome = handle_text_buffer_key(
+                        picker.filter_mut(),
+                        keymap,
+                        stroke,
                         TextInputEnterBehavior::InsertNewline,
-                    )
-                    .handle_key(picker.filter_mut(), stroke);
+                    );
                     if outcome == TextInputKeyOutcome::Edited {
                         picker.refresh_filter();
                     }
@@ -1011,22 +1037,30 @@ async fn pick_skill_for_session<W: Write>(
                 skill_picker::SkillPickerAction::Continue => {}
                 skill_picker::SkillPickerAction::Cancel => return Ok(()),
                 skill_picker::SkillPickerAction::Help(skill_id) => {
-                    describe_skill(client, chat, skill_id).await?;
+                    if let Err(error) = describe_skill(client, chat, skill_id).await {
+                        report_client_error(&mut chat.app, "skill help failed", &error);
+                    }
                     return Ok(());
                 }
                 skill_picker::SkillPickerAction::Activate(skill_id) => {
-                    activate_skill(client, chat, skill_id).await?;
+                    if let Err(error) = activate_skill(client, chat, skill_id).await {
+                        report_client_error(&mut chat.app, "skill activation failed", &error);
+                    }
                     return Ok(());
                 }
                 skill_picker::SkillPickerAction::Deactivate(skill_id) => {
-                    deactivate_skill(client, chat, skill_id).await?;
+                    if let Err(error) = deactivate_skill(client, chat, skill_id).await {
+                        report_client_error(&mut chat.app, "skill deactivation failed", &error);
+                    }
                     return Ok(());
                 }
                 skill_picker::SkillPickerAction::Invoke {
                     skill_id,
                     arguments,
                 } => {
-                    invoke_skill(client, chat, skill_id, arguments).await?;
+                    if let Err(error) = invoke_skill(client, chat, skill_id, arguments).await {
+                        report_client_error(&mut chat.app, "skill invocation failed", &error);
+                    }
                     return Ok(());
                 }
             },
@@ -1045,7 +1079,9 @@ fn handle_skill_picker_key(
 ) -> skill_picker::SkillPickerAction {
     match picker.mode() {
         skill_picker::SkillPickerMode::Filter => handle_skill_filter_key(picker, keymap, stroke),
-        skill_picker::SkillPickerMode::Argument => handle_skill_argument_key(picker, stroke),
+        skill_picker::SkillPickerMode::Argument => {
+            handle_skill_argument_key(picker, keymap, stroke)
+        }
     }
 }
 
@@ -1086,11 +1122,12 @@ fn handle_skill_filter_key(
             skill_picker::SkillPickerAction::Help,
         ),
         _ => {
-            let outcome = TextInputKeyHandler::new(
-                TextKeymap::default(),
+            let outcome = handle_text_buffer_key(
+                picker.filter_mut(),
+                keymap,
+                stroke,
                 TextInputEnterBehavior::InsertNewline,
-            )
-            .handle_key(picker.filter_mut(), stroke);
+            );
             if outcome == TextInputKeyOutcome::Edited {
                 picker.refresh_filter();
             }
@@ -1166,6 +1203,7 @@ fn handle_skill_picker_action(
 
 fn handle_skill_argument_key(
     picker: &mut skill_picker::SkillPickerApp,
+    keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> skill_picker::SkillPickerAction {
     match stroke.key {
@@ -1178,11 +1216,12 @@ fn handle_skill_argument_key(
             },
         ),
         _ => {
-            let _outcome = TextInputKeyHandler::new(
-                TextKeymap::default(),
+            let _outcome = handle_text_buffer_key(
+                picker.argument_mut(),
+                keymap,
+                stroke,
                 TextInputEnterBehavior::InsertNewline,
-            )
-            .handle_key(picker.argument_mut(), stroke);
+            );
             skill_picker::SkillPickerAction::Continue
         }
     }
