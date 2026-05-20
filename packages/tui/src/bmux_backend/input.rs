@@ -25,6 +25,19 @@ pub(super) fn handle_key(app: &mut BmuxApp, stroke: KeyStroke) -> KeyOutcome {
         };
     }
 
+    if stroke.key == KeyCode::Up && stroke.modifiers.is_empty() {
+        return KeyOutcome {
+            redraw: app.previous_input_history(),
+            submitted: false,
+        };
+    }
+    if stroke.key == KeyCode::Down && stroke.modifiers.is_empty() {
+        return KeyOutcome {
+            redraw: app.next_input_history(),
+            submitted: false,
+        };
+    }
+
     let outcome = TextInputKeyHandler::new(TextKeymap::default(), TextInputEnterBehavior::Submit)
         .handle_key(app.composer_mut(), stroke);
     match outcome {

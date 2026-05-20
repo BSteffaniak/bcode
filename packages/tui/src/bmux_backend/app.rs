@@ -2,7 +2,9 @@
 
 use std::time::Instant;
 
-use bcode_session_models::SessionId;
+use bcode_session_models::{
+    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+};
 use bmux_text_edit::TextEditBuffer;
 
 use super::IDLE_REDRAW_INTERVAL;
@@ -12,6 +14,10 @@ use super::IDLE_REDRAW_INTERVAL;
 pub(super) struct BmuxApp {
     session_id: Option<SessionId>,
     composer: TextEditBuffer,
+    input_history: Vec<String>,
+    input_history_index: Option<usize>,
+    input_history_draft: Option<String>,
+    transcript: Vec<TranscriptItem>,
     pending_submission: Option<String>,
     status: String,
     should_exit: bool,
@@ -20,18 +26,31 @@ pub(super) struct BmuxApp {
 }
 
 impl BmuxApp {
-    /// Create BMUX backend state.
+    /// Create BMUX backend state with replayed session data.
     #[must_use]
-    pub(super) fn new(session_id: Option<SessionId>) -> Self {
-        Self {
+    pub(super) fn new_with_history(
+        session_id: Option<SessionId>,
+        history: &[SessionEvent],
+        input_history: &[SessionInputHistoryEntry],
+    ) -> Self {
+        let mut app = Self {
             session_id,
             composer: TextEditBuffer::new(),
+            input_history: input_history
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect(),
+            input_history_index: None,
+            input_history_draft: None,
+            transcript: Vec::new(),
             pending_submission: None,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
             should_exit: false,
             cursor_visible: true,
             last_cursor_toggle: Instant::now(),
-        }
+        };
+        app.absorb_history(history);
+        app
     }
 
     /// Return the active session id, if one was provided.
@@ -51,6 +70,12 @@ impl BmuxApp {
         &mut self.composer
     }
 
+    /// Return transcript items.
+    #[must_use]
+    pub(super) fn transcript(&self) -> &[TranscriptItem] {
+        &self.transcript
+    }
+
     /// Return the current status line.
     #[must_use]
     pub(super) fn status(&self) -> &str {
@@ -64,7 +89,11 @@ impl BmuxApp {
 
     /// Store the current composer text as a pending submission and clear input.
     pub(super) fn stage_submission(&mut self) {
-        self.pending_submission = Some(self.composer.text().to_owned());
+        let text = self.composer.text().to_owned();
+        self.pending_submission = Some(text.clone());
+        self.input_history.push(text);
+        self.input_history_index = None;
+        self.input_history_draft = None;
         self.composer.clear();
     }
 
@@ -79,6 +108,126 @@ impl BmuxApp {
             self.composer.insert_str(&text);
         }
         self.wake_cursor();
+    }
+
+    /// Show the previous input-history entry, if available.
+    pub(super) fn previous_input_history(&mut self) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+        let next_index = self.input_history_index.map_or_else(
+            || self.input_history.len().saturating_sub(1),
+            |index| index.saturating_sub(1),
+        );
+        if self.input_history_index.is_none() {
+            self.input_history_draft = Some(self.composer.text().to_owned());
+        }
+        self.input_history_index = Some(next_index);
+        let text = self.input_history[next_index].clone();
+        self.replace_composer_with(&text);
+        true
+    }
+
+    /// Show the next input-history entry, or restore the draft.
+    pub(super) fn next_input_history(&mut self) -> bool {
+        let Some(index) = self.input_history_index else {
+            return false;
+        };
+        if index + 1 < self.input_history.len() {
+            let next_index = index + 1;
+            self.input_history_index = Some(next_index);
+            let text = self.input_history[next_index].clone();
+            self.replace_composer_with(&text);
+        } else {
+            self.input_history_index = None;
+            let draft = self.input_history_draft.take().unwrap_or_default();
+            self.replace_composer_with(&draft);
+        }
+        true
+    }
+
+    /// Absorb replayed history events.
+    pub(super) fn absorb_history(&mut self, events: &[SessionEvent]) {
+        for event in events {
+            self.absorb_session_event(event);
+        }
+    }
+
+    /// Absorb one live session event.
+    pub(super) fn absorb_session_event(&mut self, event: &SessionEvent) {
+        match &event.kind {
+            SessionEventKind::UserMessage { text, .. } => self.push_user_message(text),
+            SessionEventKind::AssistantDelta { text } => {
+                self.push_streaming_item("Assistant", text);
+            }
+            SessionEventKind::AssistantMessage { text } => {
+                self.finish_streaming_item("Assistant", text);
+            }
+            SessionEventKind::SystemMessage { text } => self.push_system_message(text),
+            SessionEventKind::ToolCallRequested { tool_name, .. } => {
+                self.push_tool_request(tool_name);
+            }
+            SessionEventKind::ToolCallFinished {
+                result, is_error, ..
+            } => self.push_tool_result(result, *is_error),
+            SessionEventKind::PermissionRequested { tool_name, .. } => {
+                self.push_permission_request(tool_name);
+            }
+            SessionEventKind::PermissionResolved { approved, .. } => {
+                self.set_permission_status(*approved);
+            }
+            SessionEventKind::ModelChanged { provider, model } => {
+                self.status = format!("model: {provider}/{model}");
+            }
+            SessionEventKind::ModelTurnStarted { .. } => {
+                "thinking".clone_into(&mut self.status);
+            }
+            SessionEventKind::ModelTurnFinished {
+                outcome, message, ..
+            } => self.finish_model_turn(*outcome, message.as_deref()),
+            SessionEventKind::ModelUsage { usage, .. } => {
+                if let Some(tokens) = usage.metered_total_tokens() {
+                    self.status = format!("tokens: {tokens}");
+                }
+            }
+            SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
+            SessionEventKind::SessionRenamed { name } => {
+                self.set_session_name_status(name.as_deref());
+            }
+            SessionEventKind::SkillInvoked { skill_id, .. } => {
+                self.transcript
+                    .push(TranscriptItem::new("Skill", format!("invoked {skill_id}")));
+            }
+            SessionEventKind::SkillSuggested { skill_id, .. } => {
+                self.status = format!("suggested skill: {skill_id}");
+            }
+            SessionEventKind::SkillActivated { skill_id, .. } => {
+                self.status = format!("activated skill: {skill_id}");
+            }
+            SessionEventKind::SkillDeactivated { skill_id, .. } => {
+                self.status = format!("deactivated skill: {skill_id}");
+            }
+            SessionEventKind::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                ..
+            } => self.set_skill_context_status(skill_id, *bytes_loaded, *truncated),
+            SessionEventKind::SkillInvocationFailed {
+                skill_id, error, ..
+            } => self.push_skill_error(skill_id, error),
+            SessionEventKind::AssistantReasoningDelta { text } => {
+                self.push_streaming_item("Reasoning", text);
+            }
+            SessionEventKind::AssistantReasoningMessage { text } => {
+                self.finish_streaming_item("Reasoning", text);
+            }
+            SessionEventKind::TraceEvent { .. }
+            | SessionEventKind::SessionCreated { .. }
+            | SessionEventKind::ClientAttached { .. }
+            | SessionEventKind::ClientDetached { .. }
+            | SessionEventKind::AgentChanged { .. } => {}
+        }
     }
 
     /// Return whether the composer cursor should be visible.
@@ -112,5 +261,178 @@ impl BmuxApp {
     /// Request backend shutdown.
     pub(super) const fn request_exit(&mut self) {
         self.should_exit = true;
+    }
+
+    fn replace_composer_with(&mut self, text: &str) {
+        self.composer.clear();
+        self.composer.insert_str(text);
+        self.wake_cursor();
+    }
+
+    fn push_user_message(&mut self, text: &str) {
+        self.transcript
+            .push(TranscriptItem::new("You", text.to_owned()));
+    }
+
+    fn push_system_message(&mut self, text: &str) {
+        self.transcript
+            .push(TranscriptItem::new("System", text.to_owned()));
+    }
+
+    fn push_streaming_item(&mut self, role: &'static str, text: &str) {
+        if let Some(last) = self.transcript.last_mut()
+            && last.role == role
+            && last.streaming
+        {
+            last.text.push_str(text);
+            return;
+        }
+        self.transcript
+            .push(TranscriptItem::new_streaming(role, text.to_owned()));
+    }
+
+    fn finish_streaming_item(&mut self, role: &'static str, text: &str) {
+        if let Some(last) = self.transcript.last_mut()
+            && last.role == role
+            && last.streaming
+        {
+            last.text.clear();
+            last.text.push_str(text);
+            last.streaming = false;
+            return;
+        }
+        self.transcript
+            .push(TranscriptItem::new(role, text.to_owned()));
+    }
+
+    fn push_tool_request(&mut self, tool_name: &str) {
+        self.transcript
+            .push(TranscriptItem::new("Tool", format!("running {tool_name}")));
+        self.status = format!("running tool {tool_name}");
+    }
+
+    fn push_tool_result(&mut self, result: &str, is_error: bool) {
+        let label = if is_error { "Tool error" } else { "Tool" };
+        self.transcript
+            .push(TranscriptItem::new(label, result.to_owned()));
+        if is_error {
+            "tool failed".clone_into(&mut self.status);
+        } else {
+            "tool finished".clone_into(&mut self.status);
+        }
+    }
+
+    fn push_permission_request(&mut self, tool_name: &str) {
+        self.transcript.push(TranscriptItem::new(
+            "Permission",
+            format!("waiting for approval: {tool_name}"),
+        ));
+        self.status = format!("waiting for permission: {tool_name}");
+    }
+
+    fn set_permission_status(&mut self, approved: bool) {
+        if approved {
+            "permission approved".clone_into(&mut self.status);
+        } else {
+            "permission denied".clone_into(&mut self.status);
+        }
+    }
+
+    fn finish_model_turn(&mut self, outcome: ModelTurnOutcome, message: Option<&str>) {
+        self.status = message.map_or_else(
+            || model_turn_outcome_label(outcome).to_owned(),
+            ToOwned::to_owned,
+        );
+        if let Some(last) = self.transcript.last_mut()
+            && last.role == "Assistant"
+        {
+            last.streaming = false;
+        }
+    }
+
+    fn push_compaction(&mut self, summary: &str) {
+        self.transcript.push(TranscriptItem::new(
+            "Compaction",
+            format!("context compacted: {summary}"),
+        ));
+    }
+
+    fn set_session_name_status(&mut self, name: Option<&str>) {
+        self.status = name.map_or_else(
+            || "session renamed".to_owned(),
+            |name| format!("session: {name}"),
+        );
+    }
+
+    fn set_skill_context_status(
+        &mut self,
+        skill_id: &impl std::fmt::Display,
+        bytes_loaded: usize,
+        truncated: bool,
+    ) {
+        let suffix = if truncated { " truncated" } else { "" };
+        self.status = format!("loaded skill context: {skill_id} ({bytes_loaded} bytes{suffix})");
+    }
+
+    fn push_skill_error(&mut self, skill_id: &impl std::fmt::Display, error: &str) {
+        self.transcript.push(TranscriptItem::new(
+            "Skill error",
+            format!("{skill_id}: {error}"),
+        ));
+    }
+}
+
+/// Renderable transcript item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TranscriptItem {
+    role: &'static str,
+    text: String,
+    streaming: bool,
+}
+
+impl TranscriptItem {
+    const fn new(role: &'static str, text: String) -> Self {
+        Self {
+            role,
+            text,
+            streaming: false,
+        }
+    }
+
+    const fn new_streaming(role: &'static str, text: String) -> Self {
+        Self {
+            role,
+            text,
+            streaming: true,
+        }
+    }
+
+    /// Return display role.
+    #[must_use]
+    pub(super) const fn role(&self) -> &'static str {
+        self.role
+    }
+
+    /// Return display text.
+    #[must_use]
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Return whether this item is currently streaming.
+    #[must_use]
+    pub(super) const fn streaming(&self) -> bool {
+        self.streaming
+    }
+}
+
+const fn model_turn_outcome_label(outcome: ModelTurnOutcome) -> &'static str {
+    match outcome {
+        ModelTurnOutcome::Completed => "done",
+        ModelTurnOutcome::Cancelled => "cancelled",
+        ModelTurnOutcome::Error => "error",
+        ModelTurnOutcome::IdleTimeout => "idle timeout",
+        ModelTurnOutcome::ToolRoundLimitReached => "tool round limit reached",
+        ModelTurnOutcome::ProviderUnavailable => "provider unavailable",
     }
 }

@@ -8,18 +8,22 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use bcode_client::BcodeClient;
+use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::SessionId;
 use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 use crossterm::terminal::size;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use self::app::BmuxApp;
 use super::TuiError;
 
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 
 /// Run the BMUX-native TUI backend.
 ///
@@ -56,18 +60,44 @@ async fn run_event_loop<W: Write>(
         Some(session_id) => session_id,
         None => client.create_session(None).await?.id,
     };
-    run_with_client(terminal, &client, session_id).await
+    let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+    let (attached, event_task) =
+        attach_session_event_stream(&client, session_id, event_sender).await?;
+    let result = run_with_client(
+        terminal,
+        &client,
+        session_id,
+        &attached.history,
+        &attached.input_history,
+        &mut event_receiver,
+    )
+    .await;
+    event_task.abort();
+    result
 }
 
 async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     session_id: SessionId,
+    history: &[bcode_session_models::SessionEvent],
+    input_history: &[bcode_session_models::SessionInputHistoryEntry],
+    event_receiver: &mut mpsc::UnboundedReceiver<BcodeEvent>,
 ) -> Result<(), TuiError> {
-    let mut app = BmuxApp::new(Some(session_id));
+    let mut app = BmuxApp::new_with_history(Some(session_id), history, input_history);
     let mut needs_redraw = true;
 
     while !app.should_exit() {
+        while let Ok(event) = event_receiver.try_recv() {
+            match event {
+                BcodeEvent::Session(event) if event.session_id == session_id => {
+                    app.absorb_session_event(&event);
+                    needs_redraw = true;
+                }
+                BcodeEvent::Session(_) => {}
+            }
+        }
+
         if resize_from_terminal(terminal)? {
             needs_redraw = true;
         }
@@ -78,7 +108,7 @@ async fn run_with_client<W: Write>(
         }
 
         if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
-            if handle_event(&client, &mut app, terminal, event).await? {
+            if handle_event(client, &mut app, terminal, event).await? {
                 needs_redraw = true;
             }
         } else if app.tick() {
@@ -87,6 +117,33 @@ async fn run_with_client<W: Write>(
     }
 
     Ok(())
+}
+
+async fn attach_session_event_stream(
+    client: &BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
+    let mut connection = client.connect("bcode-tui-bmux").await?;
+    let attached = connection
+        .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
+        .await?;
+    let event_task = tokio::spawn(async move {
+        loop {
+            match connection.recv_event().await {
+                Ok(event) => {
+                    if event_sender.send(event).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("BMUX TUI event stream ended: {error}");
+                    break;
+                }
+            }
+        }
+    });
+    Ok((attached, event_task))
 }
 
 async fn handle_event<W: Write>(
@@ -170,14 +227,13 @@ mod tests {
 
     #[test]
     fn render_includes_status_and_composer() {
-        let app = BmuxApp::new(None);
+        let app = BmuxApp::new_with_history(None, &[], &[]);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
-        let mut frame = Frame::new(&mut buffer);
-
-        render::render(&app, &mut frame);
-
-        let cursor = frame.cursor();
-        drop(frame);
+        let cursor = {
+            let mut frame = Frame::new(&mut buffer);
+            render::render(&app, &mut frame);
+            frame.cursor()
+        };
 
         assert!(buffer.row_symbols(0).unwrap().contains("Bcode BMUX TUI"));
         assert!(buffer.row_symbols(3).unwrap().contains("BMUX backend"));
