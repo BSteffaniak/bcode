@@ -45,6 +45,7 @@ const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const OLDER_HISTORY_EVENT_LIMIT: usize = 500;
+const MOUSE_WHEEL_ROWS: usize = 1;
 
 /// Run the BMUX-native TUI backend.
 ///
@@ -86,8 +87,12 @@ async fn run_event_loop<W: Write>(
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (attached, event_task) =
         attach_session_event_stream(&client, session_id, event_sender.clone()).await?;
-    let app =
-        BmuxApp::new_with_history(Some(session_id), &attached.history, &attached.input_history);
+    let app = BmuxApp::new_with_history(
+        Some(session_id),
+        &attached.history,
+        &attached.input_history,
+        attached.history.len() >= INITIAL_HISTORY_EVENT_LIMIT,
+    );
     let mut chat = ActiveChat {
         app,
         session_id,
@@ -170,7 +175,7 @@ async fn run_with_client<W: Write>(
 
         if needs_redraw {
             terminal.draw(|frame| {
-                render::render(&chat.app, frame);
+                render::render(&mut chat.app, frame);
                 if let Some(palette) = &mut palette {
                     command_palette_render::render_palette(palette, frame);
                 }
@@ -690,6 +695,22 @@ fn permission_click_approval(mouse: MouseEvent) -> Option<bool> {
     }
 }
 
+enum MouseRegion {
+    Composer,
+    Diff,
+    Transcript,
+}
+
+fn mouse_region(mouse: MouseEvent) -> MouseRegion {
+    if composer_position_from_mouse(mouse).is_some() {
+        return MouseRegion::Composer;
+    }
+    if diff_file_row_from_mouse(mouse).is_some() {
+        return MouseRegion::Diff;
+    }
+    MouseRegion::Transcript
+}
+
 async fn handle_mouse(
     client: &BcodeClient,
     chat: &mut ActiveChat,
@@ -697,24 +718,16 @@ async fn handle_mouse(
     mouse: MouseEvent,
 ) -> Result<bool, TuiError> {
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            if mouse.position.y >= terminal_area()?.height.saturating_sub(12)
-                && chat.app.scroll_diff_up(3)
-            {
-                Ok(true)
-            } else {
-                Ok(chat.app.scroll_transcript_up(3))
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            if mouse.position.y >= terminal_area()?.height.saturating_sub(12)
-                && chat.app.scroll_diff_down(3)
-            {
-                Ok(true)
-            } else {
-                Ok(chat.app.scroll_transcript_down(3))
-            }
-        }
+        MouseEventKind::ScrollUp => match mouse_region(mouse) {
+            MouseRegion::Composer => Ok(chat.app.previous_input_history()),
+            MouseRegion::Diff => Ok(chat.app.scroll_diff_up(MOUSE_WHEEL_ROWS)),
+            MouseRegion::Transcript => Ok(chat.app.scroll_transcript_up(MOUSE_WHEEL_ROWS)),
+        },
+        MouseEventKind::ScrollDown => match mouse_region(mouse) {
+            MouseRegion::Composer => Ok(chat.app.next_input_history()),
+            MouseRegion::Diff => Ok(chat.app.scroll_diff_down(MOUSE_WHEEL_ROWS)),
+            MouseRegion::Transcript => Ok(chat.app.scroll_transcript_down(MOUSE_WHEEL_ROWS)),
+        },
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
             if let Some(approve) = permission_click_approval(mouse) {
                 resolve_permission_dialog(client, chat, permission_dialog, approve).await
@@ -1542,6 +1555,7 @@ async fn switch_session(
         Some(next_session_id),
         &attached.history,
         &attached.input_history,
+        attached.history.len() >= INITIAL_HISTORY_EVENT_LIMIT,
     );
     hydrate_status(client, &mut chat.app).await;
     Ok(())
@@ -1604,6 +1618,7 @@ fn terminal_area() -> io::Result<Rect> {
 
 #[cfg(test)]
 mod tests {
+    use bcode_session_models::{ClientId, SessionEvent, SessionEventKind, SessionId};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
@@ -1612,11 +1627,11 @@ mod tests {
 
     #[test]
     fn render_includes_status_and_composer() {
-        let app = BmuxApp::new_with_history(None, &[], &[]);
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
         let cursor = {
             let mut frame = Frame::new(&mut buffer);
-            render::render(&app, &mut frame);
+            render::render(&mut app, &mut frame);
             frame.cursor()
         };
 
@@ -1624,5 +1639,95 @@ mod tests {
         assert!(buffer.row_symbols(3).unwrap().contains("BMUX backend"));
         assert!(buffer.row_symbols(4).unwrap().contains("Composer"));
         assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn prepended_history_coalesces_assistant_deltas() {
+        let session_id = SessionId::new();
+        let newer = [event(
+            session_id,
+            10,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "newer prompt".to_owned(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &newer, &[], true);
+        let older = [
+            event(
+                session_id,
+                1,
+                SessionEventKind::AssistantDelta {
+                    text: "hello ".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::AssistantDelta {
+                    text: "world".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::AssistantMessage {
+                    text: "hello world".to_owned(),
+                },
+            ),
+        ];
+
+        app.prepend_older_history(&older, false);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 14));
+        let mut frame = Frame::new(&mut buffer);
+        render::render(&mut app, &mut frame);
+        let output = rendered_text(&buffer);
+
+        assert!(output.contains("Assistant: hello world"));
+        assert!(!output.contains("Assistant …: hello"));
+        assert_eq!(output.matches("Assistant").count(), 1);
+    }
+
+    #[test]
+    fn scroll_up_requests_older_history_only_after_top() {
+        let session_id = SessionId::new();
+        let history = (10..60)
+            .map(|sequence| {
+                event(
+                    session_id,
+                    sequence,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("prompt {sequence}"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], true);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+        let mut frame = Frame::new(&mut buffer);
+        render::render(&mut app, &mut frame);
+
+        assert!(app.scroll_transcript_up(1));
+        assert!(!app.should_load_older_history());
+
+        assert!(app.scroll_transcript_up(usize::MAX / 2));
+        assert!(app.should_load_older_history());
+    }
+
+    fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
+            schema_version: 1,
+            sequence,
+            session_id,
+            kind,
+        }
+    }
+
+    fn rendered_text(buffer: &Buffer) -> String {
+        (0..buffer.area().height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

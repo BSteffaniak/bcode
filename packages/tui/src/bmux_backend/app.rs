@@ -29,7 +29,10 @@ pub(super) struct BmuxApp {
     pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
     scroll_offset: usize,
+    transcript_max_scroll_offset: usize,
+    scroll_preserve_max_offset: Option<usize>,
     older_history_cursor: Option<SessionHistoryCursor>,
+    older_history_reveal_request: Option<usize>,
     loading_older_history: bool,
     activity: ActivityState,
     status: String,
@@ -45,6 +48,7 @@ impl BmuxApp {
         session_id: Option<SessionId>,
         history: &[SessionEvent],
         input_history: &[SessionInputHistoryEntry],
+        has_older_history: bool,
     ) -> Self {
         let mut app = Self {
             session_id,
@@ -64,9 +68,10 @@ impl BmuxApp {
             pending_submissions: Vec::new(),
             pending_submission: None,
             scroll_offset: 0,
-            older_history_cursor: history.first().map(|event| SessionHistoryCursor {
-                sequence: event.sequence,
-            }),
+            transcript_max_scroll_offset: 0,
+            scroll_preserve_max_offset: None,
+            older_history_cursor: oldest_history_cursor(history, has_older_history),
+            older_history_reveal_request: None,
             loading_older_history: false,
             activity: ActivityState::Idle,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
@@ -122,12 +127,16 @@ impl BmuxApp {
     }
 
     /// Scroll diff preview up.
-    pub(super) const fn scroll_diff_up(&mut self, rows: usize) -> bool {
+    pub(super) fn scroll_diff_up(&mut self, rows: usize) -> bool {
         if rows == 0 || self.diff_lines.is_empty() {
             return false;
         }
-        self.diff_scroll_offset = self.diff_scroll_offset.saturating_add(rows);
-        true
+        let previous = self.diff_scroll_offset;
+        self.diff_scroll_offset = self
+            .diff_scroll_offset
+            .saturating_add(rows)
+            .min(self.diff_lines.len());
+        self.diff_scroll_offset != previous
     }
 
     /// Scroll diff preview down.
@@ -208,6 +217,9 @@ impl BmuxApp {
     /// Mark older history as loading or idle.
     pub(super) const fn set_loading_older_history(&mut self, loading: bool) {
         self.loading_older_history = loading;
+        if !loading {
+            self.older_history_reveal_request = None;
+        }
     }
 
     /// Return the cursor for loading older history.
@@ -216,10 +228,12 @@ impl BmuxApp {
         self.older_history_cursor
     }
 
-    /// Return whether the viewport is near the oldest loaded event.
+    /// Return whether an older-history request should be started.
     #[must_use]
     pub(super) const fn should_load_older_history(&self) -> bool {
-        self.older_history_cursor.is_some() && !self.loading_older_history && self.scroll_offset > 0
+        self.older_history_cursor.is_some()
+            && !self.loading_older_history
+            && self.older_history_reveal_request.is_some()
     }
 
     /// Return the current activity state.
@@ -321,12 +335,20 @@ impl BmuxApp {
     }
 
     /// Scroll transcript up by rendered rows.
-    pub(super) const fn scroll_transcript_up(&mut self, rows: usize) -> bool {
+    pub(super) fn scroll_transcript_up(&mut self, rows: usize) -> bool {
         if rows == 0 {
             return false;
         }
-        self.scroll_offset = self.scroll_offset.saturating_add(rows);
-        true
+        let previous = self.scroll_offset;
+        let previous_request = self.older_history_reveal_request;
+        let desired = self.scroll_offset.saturating_add(rows);
+        self.scroll_offset = desired.min(self.transcript_max_scroll_offset);
+        if desired > self.transcript_max_scroll_offset {
+            self.request_older_history_load(
+                desired.saturating_sub(self.transcript_max_scroll_offset),
+            );
+        }
+        self.scroll_offset != previous || self.older_history_reveal_request != previous_request
     }
 
     /// Scroll transcript down by rendered rows.
@@ -340,7 +362,37 @@ impl BmuxApp {
     pub(super) const fn scroll_transcript_to_bottom(&mut self) -> bool {
         let changed = self.scroll_offset != 0;
         self.scroll_offset = 0;
+        self.older_history_reveal_request = None;
         changed
+    }
+
+    /// Sync cached rendered transcript scroll bounds from the latest frame.
+    pub(super) fn sync_transcript_scroll_max(&mut self, max_scroll_offset: usize) {
+        let previous_max = self.transcript_max_scroll_offset;
+        self.transcript_max_scroll_offset = max_scroll_offset;
+        if let Some(requested_rows) = self.older_history_reveal_request.take() {
+            let inserted_rows = max_scroll_offset.saturating_sub(previous_max);
+            let reveal_rows = requested_rows.min(inserted_rows);
+            self.scroll_offset = self.scroll_offset.saturating_add(reveal_rows);
+        }
+        if let Some(preserve_max) = self.scroll_preserve_max_offset.take()
+            && self.scroll_offset > 0
+        {
+            let appended_rows = max_scroll_offset.saturating_sub(preserve_max);
+            self.scroll_offset = self.scroll_offset.saturating_add(appended_rows);
+        }
+        self.scroll_offset = self.scroll_offset.min(self.transcript_max_scroll_offset);
+    }
+
+    fn request_older_history_load(&mut self, reveal_rows: usize) {
+        if self.older_history_cursor.is_none() || self.loading_older_history {
+            return;
+        }
+        let reveal_rows = reveal_rows.max(1);
+        self.older_history_reveal_request = Some(
+            self.older_history_reveal_request
+                .map_or(reveal_rows, |requested| requested.max(reveal_rows)),
+        );
     }
 
     /// Absorb replayed history events.
@@ -350,30 +402,34 @@ impl BmuxApp {
         }
     }
 
-    /// Prepend older history and preserve approximate viewport position.
+    /// Prepend older history and preserve the current viewport.
     pub(super) fn prepend_older_history(&mut self, events: &[SessionEvent], has_more: bool) {
-        let added = events.len();
-        let mut older = Vec::with_capacity(self.transcript.len().saturating_add(added));
-        for event in events {
-            if let Some(item) = transcript_item_from_event(event) {
-                older.push(item);
-            }
+        if events.is_empty() {
+            self.older_history_cursor = None;
+            self.older_history_reveal_request = None;
+            self.loading_older_history = false;
+            "start of session history".clone_into(&mut self.status);
+            return;
         }
+
+        let mut older = transcript_items_from_events(events);
+        merge_transcript_boundary(&mut older, &mut self.transcript);
         older.append(&mut self.transcript);
         self.transcript = older;
-        self.scroll_offset = self.scroll_offset.saturating_add(added);
-        self.older_history_cursor = if has_more {
-            events.first().map(|event| SessionHistoryCursor {
-                sequence: event.sequence,
-            })
-        } else {
-            None
-        };
+        self.older_history_cursor = oldest_history_cursor(events, has_more);
         self.loading_older_history = false;
+        if self.older_history_cursor.is_some() {
+            "loaded older history".clone_into(&mut self.status);
+        } else {
+            "start of session history".clone_into(&mut self.status);
+        }
     }
 
     /// Absorb one live session event.
     pub(super) fn absorb_session_event(&mut self, event: &SessionEvent) {
+        if self.scroll_offset > 0 && event_affects_transcript_rows(event) {
+            self.scroll_preserve_max_offset = Some(self.transcript_max_scroll_offset);
+        }
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => self.push_live_user_message(text),
             SessionEventKind::AssistantDelta { text } => self.push_live_assistant_delta(text),
@@ -741,16 +797,115 @@ impl BmuxApp {
     }
 }
 
-fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
+const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
+    match &event.kind {
+        SessionEventKind::UserMessage { .. }
+        | SessionEventKind::AssistantDelta { .. }
+        | SessionEventKind::AssistantMessage { .. }
+        | SessionEventKind::SystemMessage { .. }
+        | SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::ToolCallFinished { .. }
+        | SessionEventKind::PermissionRequested { .. }
+        | SessionEventKind::PermissionResolved { .. }
+        | SessionEventKind::ModelUsage { .. }
+        | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::SkillInvoked { .. }
+        | SessionEventKind::SkillInvocationFailed { .. }
+        | SessionEventKind::AssistantReasoningDelta { .. }
+        | SessionEventKind::AssistantReasoningMessage { .. } => true,
+        SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
+        SessionEventKind::SessionCreated { .. }
+        | SessionEventKind::ClientAttached { .. }
+        | SessionEventKind::ClientDetached { .. }
+        | SessionEventKind::ModelChanged { .. }
+        | SessionEventKind::AgentChanged { .. }
+        | SessionEventKind::ModelTurnStarted { .. }
+        | SessionEventKind::ModelTurnFinished { .. }
+        | SessionEventKind::SessionRenamed { .. }
+        | SessionEventKind::SkillActivated { .. }
+        | SessionEventKind::SkillDeactivated { .. }
+        | SessionEventKind::SkillContextLoaded { .. }
+        | SessionEventKind::TraceEvent { .. } => false,
+    }
+}
+
+fn transcript_items_from_events(events: &[SessionEvent]) -> Vec<TranscriptItem> {
+    let mut items = Vec::new();
+    for event in events {
+        push_transcript_item_from_event(&mut items, event);
+    }
+    items
+}
+
+fn push_transcript_item_from_event(items: &mut Vec<TranscriptItem>, event: &SessionEvent) {
+    match &event.kind {
+        SessionEventKind::AssistantDelta { text } => {
+            push_streaming_transcript_item(items, "Assistant", text);
+        }
+        SessionEventKind::AssistantMessage { text } => {
+            finish_streaming_transcript_item(items, "Assistant", text);
+        }
+        SessionEventKind::AssistantReasoningDelta { text } => {
+            push_streaming_transcript_item(items, "Reasoning", text);
+        }
+        SessionEventKind::AssistantReasoningMessage { text } => {
+            finish_streaming_transcript_item(items, "Reasoning", text);
+        }
+        _ => {
+            if let Some(item) = non_streaming_transcript_item_from_event(event) {
+                items.push(item);
+            }
+        }
+    }
+}
+
+fn push_streaming_transcript_item(items: &mut Vec<TranscriptItem>, role: &'static str, text: &str) {
+    if let Some(last) = items.last_mut()
+        && last.role == role
+        && last.streaming
+    {
+        last.text.push_str(text);
+        return;
+    }
+    items.push(TranscriptItem::new_streaming(role, text.to_owned()));
+}
+
+fn finish_streaming_transcript_item(
+    items: &mut Vec<TranscriptItem>,
+    role: &'static str,
+    text: &str,
+) {
+    if let Some(last) = items.last_mut()
+        && last.role == role
+        && last.streaming
+    {
+        last.text.clear();
+        last.text.push_str(text);
+        last.streaming = false;
+        return;
+    }
+    items.push(TranscriptItem::new(role, text.to_owned()));
+}
+
+fn merge_transcript_boundary(older: &mut Vec<TranscriptItem>, current: &mut Vec<TranscriptItem>) {
+    let (Some(last_older), Some(first_current)) = (older.last_mut(), current.first()) else {
+        return;
+    };
+    if last_older.role != first_current.role || !last_older.streaming {
+        return;
+    }
+    if first_current.streaming {
+        last_older.text.push_str(&first_current.text);
+        current.remove(0);
+    } else {
+        older.pop();
+    }
+}
+
+fn non_streaming_transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
     match &event.kind {
         SessionEventKind::UserMessage { text, .. } => {
             Some(TranscriptItem::new("You", text.clone()))
-        }
-        SessionEventKind::AssistantDelta { text } => {
-            Some(TranscriptItem::new_streaming("Assistant", text.clone()))
-        }
-        SessionEventKind::AssistantMessage { text } => {
-            Some(TranscriptItem::new("Assistant", text.clone()))
         }
         SessionEventKind::SystemMessage { text } => {
             Some(TranscriptItem::new("System", text.clone()))
@@ -807,13 +962,11 @@ fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
             "Skill error",
             format!("{skill_id}: {error}"),
         )),
-        SessionEventKind::AssistantReasoningDelta { text } => {
-            Some(TranscriptItem::new_streaming("Reasoning", text.clone()))
-        }
-        SessionEventKind::AssistantReasoningMessage { text } => {
-            Some(TranscriptItem::new("Reasoning", text.clone()))
-        }
-        SessionEventKind::PermissionResolved { .. }
+        SessionEventKind::AssistantDelta { .. }
+        | SessionEventKind::AssistantMessage { .. }
+        | SessionEventKind::AssistantReasoningDelta { .. }
+        | SessionEventKind::AssistantReasoningMessage { .. }
+        | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::ModelChanged { .. }
         | SessionEventKind::ModelTurnStarted { .. }
         | SessionEventKind::ModelTurnFinished { .. }
@@ -828,6 +981,23 @@ fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
         | SessionEventKind::AgentChanged { .. } => None,
+    }
+}
+
+fn oldest_history_cursor(
+    events: &[SessionEvent],
+    has_older_history: bool,
+) -> Option<SessionHistoryCursor> {
+    if !has_older_history {
+        return None;
+    }
+    let oldest_sequence = events.first()?.sequence;
+    if oldest_sequence == 0 {
+        None
+    } else {
+        Some(SessionHistoryCursor {
+            sequence: oldest_sequence.saturating_sub(1),
+        })
     }
 }
 

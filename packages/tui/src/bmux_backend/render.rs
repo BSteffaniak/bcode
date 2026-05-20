@@ -16,7 +16,7 @@ use super::app::{
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Render one BMUX backend frame.
-pub(super) fn render(app: &BmuxApp, frame: &mut Frame<'_>) {
+pub(super) fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let area = frame.area();
     if area.is_empty() {
         return;
@@ -36,6 +36,8 @@ pub(super) fn render(app: &BmuxApp, frame: &mut Frame<'_>) {
 
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
+    let transcript_area = transcript_area_for_body(app, body);
+    app.sync_transcript_scroll_max(max_transcript_scroll_offset(app, transcript_area));
     render_body(app, body, frame);
 
     let status = Rect::new(
@@ -64,22 +66,36 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
+    let transcript_area = transcript_area_for_body(app, area);
+    render_transcript(app, transcript_area, frame);
+    let diff_height = area.height.saturating_sub(transcript_area.height);
+    if diff_height > 0 {
+        let diff_area = Rect::new(area.x, transcript_area.bottom(), area.width, diff_height);
+        render_changed_files(app, diff_area, frame);
+    }
+}
+
+fn transcript_area_for_body(app: &BmuxApp, area: Rect) -> Rect {
     let diff_height = if app.changed_files().is_empty() {
         0
     } else {
         area.height.min(9)
     };
-    let transcript_area = Rect::new(
+    Rect::new(
         area.x,
         area.y,
         area.width,
         area.height.saturating_sub(diff_height),
-    );
-    render_transcript(app, transcript_area, frame);
-    if diff_height > 0 {
-        let diff_area = Rect::new(area.x, transcript_area.bottom(), area.width, diff_height);
-        render_changed_files(app, diff_area, frame);
+    )
+}
+
+fn max_transcript_scroll_offset(app: &BmuxApp, area: Rect) -> usize {
+    if area.is_empty() || app.transcript().is_empty() && app.pending_submissions().is_empty() {
+        return 0;
     }
+    transcript_render_rows(app, area.width)
+        .len()
+        .saturating_sub(usize::from(area.height))
 }
 
 fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
