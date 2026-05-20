@@ -12,6 +12,12 @@ use bmux_tui::diff::{DiffFileSummary, DiffLine, DiffLineKind};
 
 use super::IDLE_REDRAW_INTERVAL;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffPanelState {
+    Hidden,
+    Visible,
+}
+
 /// State owned by the BMUX-native backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BmuxApp {
@@ -24,6 +30,7 @@ pub(super) struct BmuxApp {
     changed_files: Vec<DiffFileSummary>,
     diff_details: Vec<Vec<DiffLine>>,
     selected_diff_file: Option<usize>,
+    diff_panel: DiffPanelState,
     diff_scroll_offset: usize,
     diff_lines: Vec<DiffLine>,
     pending_submissions: Vec<PendingSubmission>,
@@ -63,6 +70,7 @@ impl BmuxApp {
             changed_files: Vec::new(),
             diff_details: Vec::new(),
             selected_diff_file: None,
+            diff_panel: DiffPanelState::Hidden,
             diff_scroll_offset: 0,
             diff_lines: Vec::new(),
             pending_submissions: Vec::new(),
@@ -110,6 +118,21 @@ impl BmuxApp {
     #[must_use]
     pub(super) fn changed_files(&self) -> &[DiffFileSummary] {
         &self.changed_files
+    }
+
+    /// Return whether the diff panel is visible.
+    #[must_use]
+    pub(super) fn diff_visible(&self) -> bool {
+        self.diff_panel == DiffPanelState::Visible
+    }
+
+    /// Toggle diff panel visibility.
+    pub(super) const fn toggle_diff_visible(&mut self) -> bool {
+        self.diff_panel = match self.diff_panel {
+            DiffPanelState::Hidden => DiffPanelState::Visible,
+            DiffPanelState::Visible => DiffPanelState::Hidden,
+        };
+        true
     }
 
     /// Return detailed diff lines inferred from edit tool calls.

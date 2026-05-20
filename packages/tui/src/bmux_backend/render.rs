@@ -82,7 +82,7 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn transcript_area_for_body(app: &BmuxApp, area: Rect) -> Rect {
-    let diff_height = if app.changed_files().is_empty() {
+    let diff_height = if app.changed_files().is_empty() || !app.diff_visible() {
         0
     } else {
         area.height.min(9)

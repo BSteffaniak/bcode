@@ -650,6 +650,7 @@ async fn handle_chat_key<W: Write>(
         .await;
     }
     let changed = match stroke.key {
+        KeyCode::Char('d') if stroke.modifiers.ctrl => chat.app.toggle_diff_visible(),
         KeyCode::Char(']') if stroke.modifiers.is_empty() => chat.app.select_next_diff_file(),
         KeyCode::Char('[') if stroke.modifiers.is_empty() => chat.app.select_previous_diff_file(),
         _ => false,
@@ -774,12 +775,16 @@ async fn handle_mouse(
     match mouse.kind {
         MouseEventKind::ScrollUp => match hit_id.as_deref() {
             Some("composer") => Ok(chat.app.previous_input_history()),
-            Some("diff-files" | "diff-detail") => Ok(chat.app.scroll_diff_up(MOUSE_WHEEL_ROWS)),
+            Some("diff-files" | "diff-detail") if chat.app.diff_visible() => {
+                Ok(chat.app.scroll_diff_up(MOUSE_WHEEL_ROWS))
+            }
             _ => Ok(chat.app.scroll_transcript_up(MOUSE_WHEEL_ROWS)),
         },
         MouseEventKind::ScrollDown => match hit_id.as_deref() {
             Some("composer") => Ok(chat.app.next_input_history()),
-            Some("diff-files" | "diff-detail") => Ok(chat.app.scroll_diff_down(MOUSE_WHEEL_ROWS)),
+            Some("diff-files" | "diff-detail") if chat.app.diff_visible() => {
+                Ok(chat.app.scroll_diff_down(MOUSE_WHEEL_ROWS))
+            }
             _ => Ok(chat.app.scroll_transcript_down(MOUSE_WHEEL_ROWS)),
         },
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
@@ -798,7 +803,7 @@ async fn handle_mouse(
                 } else {
                     Ok(false)
                 }
-            } else if hit_id.as_deref() == Some("diff-files") {
+            } else if hit_id.as_deref() == Some("diff-files") && chat.app.diff_visible() {
                 if let Some(row) = diff_file_row_from_mouse(mouse) {
                     Ok(chat.app.select_diff_file(row))
                 } else {
