@@ -142,6 +142,11 @@ impl BmuxApp {
         &self.status
     }
 
+    /// Append a system-style transcript note.
+    pub(super) fn push_system_note(&mut self, text: String) {
+        self.transcript.push(TranscriptItem::new("System", text));
+    }
+
     /// Replace the current status line.
     pub(super) fn set_status(&mut self, status: String) {
         self.status = status;

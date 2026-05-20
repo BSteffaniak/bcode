@@ -11,6 +11,10 @@ pub(super) enum PaletteCommand {
     NewSession,
     /// Open the session picker.
     SwitchSession,
+    /// Show active model status.
+    ShowModelStatus,
+    /// Show server default model/provider.
+    ShowServerModelStatus,
     /// Open the session picker in rename mode.
     RenameSession,
     /// Open the session picker in delete mode.
@@ -26,6 +30,8 @@ impl PaletteCommand {
         match self {
             Self::NewSession => "session.new",
             Self::SwitchSession => "session.switch",
+            Self::ShowModelStatus => "model.status",
+            Self::ShowServerModelStatus => "model.serverStatus",
             Self::RenameSession => "session.rename",
             Self::DeleteSession => "session.delete",
             Self::CancelTurn => "turn.cancel",
@@ -37,6 +43,8 @@ impl PaletteCommand {
         match id {
             "session.new" => Some(Self::NewSession),
             "session.switch" => Some(Self::SwitchSession),
+            "model.status" => Some(Self::ShowModelStatus),
+            "model.serverStatus" => Some(Self::ShowServerModelStatus),
             "session.rename" => Some(Self::RenameSession),
             "session.delete" => Some(Self::DeleteSession),
             "turn.cancel" => Some(Self::CancelTurn),
@@ -96,6 +104,18 @@ fn palette_items() -> Vec<PaletteItem> {
             "Switch Session",
             "Open the session picker",
             "switch session picker open",
+        ),
+        item(
+            PaletteCommand::ShowModelStatus,
+            "Show Model Status",
+            "Show active session model metadata",
+            "model provider status active current",
+        ),
+        item(
+            PaletteCommand::ShowServerModelStatus,
+            "Show Server Model Defaults",
+            "Show selected default provider/model",
+            "server model provider default status",
         ),
         item(
             PaletteCommand::RenameSession,

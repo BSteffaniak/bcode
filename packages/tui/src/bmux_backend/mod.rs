@@ -668,6 +668,12 @@ async fn execute_palette_command<W: Write>(
             .await?;
             switch_session(client, chat, selected_session_id).await?;
         }
+        PaletteCommand::ShowModelStatus => {
+            show_model_status(client, chat).await?;
+        }
+        PaletteCommand::ShowServerModelStatus => {
+            show_server_model_status(client, chat).await?;
+        }
         PaletteCommand::RenameSession => {
             pick_session_for_mutation(terminal, client, SessionPickerStartMode::Rename).await?;
         }
@@ -695,6 +701,55 @@ async fn execute_palette_command<W: Write>(
             chat.app.set_status(message);
         }
     }
+    Ok(())
+}
+
+async fn show_model_status(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    let status = client.session_model_status(session_id).await?;
+    let provider = status
+        .provider_plugin_id
+        .as_deref()
+        .unwrap_or("default provider");
+    let model = status.model_id.as_deref().unwrap_or("default model");
+    let mut lines = vec![format!("Active model: {provider}/{model}")];
+    if let Some(info) = status.model {
+        lines.push(format!("Display name: {}", info.display_name));
+        if let Some(context_window) = info.context_window {
+            lines.push(format!("Context window: {context_window}"));
+        }
+        if let Some(max_output_tokens) = info.max_output_tokens {
+            lines.push(format!("Max output tokens: {max_output_tokens}"));
+        }
+        if !info.capabilities.is_empty() {
+            lines.push(format!("Capabilities: {:?}", info.capabilities));
+        }
+    }
+    let text = lines.join("\n");
+    chat.app.set_status(format!("model: {provider}/{model}"));
+    chat.app.push_system_note(text);
+    Ok(())
+}
+
+async fn show_server_model_status(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let status = client.server_status().await?;
+    let provider = status
+        .selected_provider_plugin_id
+        .as_deref()
+        .unwrap_or("default provider");
+    let model = status
+        .selected_model_id
+        .as_deref()
+        .unwrap_or("default model");
+    let text = format!("Server default model: {provider}/{model}");
+    chat.app.set_status(text.clone());
+    chat.app.push_system_note(text);
     Ok(())
 }
 
