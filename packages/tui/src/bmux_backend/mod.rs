@@ -256,6 +256,63 @@ enum PickerKeyOutcome {
     Canceled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPickerStartMode {
+    Rename,
+    Delete,
+}
+
+async fn pick_session_for_mutation<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    start_mode: SessionPickerStartMode,
+) -> Result<(), TuiError> {
+    let keymap = BmuxKeyMap::from_config(&bcode_config::load_config()?.tui);
+    let sessions = client.list_sessions().await?;
+    let mut picker = session_picker::SessionPickerApp::new(sessions);
+    match start_mode {
+        SessionPickerStartMode::Rename => {
+            picker.start_rename();
+        }
+        SessionPickerStartMode::Delete => {
+            picker.start_delete_confirmation();
+        }
+    }
+    loop {
+        terminal.resize(terminal_area()?);
+        terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
+        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => match picker.mode() {
+                session_picker::SessionPickerMode::Rename => picker.rename_mut().insert_str(&text),
+                session_picker::SessionPickerMode::Filter
+                | session_picker::SessionPickerMode::DeleteConfirm => {
+                    picker.filter_mut().insert_str(&text);
+                    picker.refresh_filter();
+                }
+            },
+            Event::Key(stroke) => match handle_picker_key(&mut picker, &keymap, stroke) {
+                PickerKeyOutcome::Continue
+                | PickerKeyOutcome::Create
+                | PickerKeyOutcome::Selected => {}
+                PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
+                PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
+                PickerKeyOutcome::Canceled => return Ok(()),
+            },
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Mouse(_)
+            | Event::Tick
+            | Event::User(_) => {}
+        }
+        if matches!(picker.mode(), session_picker::SessionPickerMode::Filter) {
+            return Ok(());
+        }
+    }
+}
+
 fn handle_picker_key(
     picker: &mut session_picker::SessionPickerApp,
     keymap: &BmuxKeyMap,
@@ -610,6 +667,12 @@ async fn execute_palette_command<W: Write>(
             )
             .await?;
             switch_session(client, chat, selected_session_id).await?;
+        }
+        PaletteCommand::RenameSession => {
+            pick_session_for_mutation(terminal, client, SessionPickerStartMode::Rename).await?;
+        }
+        PaletteCommand::DeleteSession => {
+            pick_session_for_mutation(terminal, client, SessionPickerStartMode::Delete).await?;
         }
         PaletteCommand::CancelTurn => {
             let Some(session_id) = chat.app.session_id() else {

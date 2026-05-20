@@ -11,6 +11,10 @@ pub(super) enum PaletteCommand {
     NewSession,
     /// Open the session picker.
     SwitchSession,
+    /// Open the session picker in rename mode.
+    RenameSession,
+    /// Open the session picker in delete mode.
+    DeleteSession,
     /// Request active turn cancellation.
     CancelTurn,
     /// Request context compaction.
@@ -22,6 +26,8 @@ impl PaletteCommand {
         match self {
             Self::NewSession => "session.new",
             Self::SwitchSession => "session.switch",
+            Self::RenameSession => "session.rename",
+            Self::DeleteSession => "session.delete",
             Self::CancelTurn => "turn.cancel",
             Self::CompactContext => "context.compact",
         }
@@ -31,6 +37,8 @@ impl PaletteCommand {
         match id {
             "session.new" => Some(Self::NewSession),
             "session.switch" => Some(Self::SwitchSession),
+            "session.rename" => Some(Self::RenameSession),
+            "session.delete" => Some(Self::DeleteSession),
             "turn.cancel" => Some(Self::CancelTurn),
             "context.compact" => Some(Self::CompactContext),
             _ => None,
@@ -88,6 +96,18 @@ fn palette_items() -> Vec<PaletteItem> {
             "Switch Session",
             "Open the session picker",
             "switch session picker open",
+        ),
+        item(
+            PaletteCommand::RenameSession,
+            "Rename Session",
+            "Rename a session from the picker",
+            "rename session current selected",
+        ),
+        item(
+            PaletteCommand::DeleteSession,
+            "Delete Session",
+            "Delete a session with confirmation",
+            "delete remove session current selected",
         ),
         item(
             PaletteCommand::CancelTurn,
