@@ -26,7 +26,7 @@ use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery, Session
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::keyboard::TextKeymap;
 use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event};
-use bmux_tui::event::{Event, FocusEvent};
+use bmux_tui::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
@@ -540,8 +540,10 @@ async fn handle_event<W: Write>(
                 return Ok(true);
             }
             let outcome = input::handle_key(&mut chat.app, keymap, stroke);
-            if outcome.submitted {
-                submit_composer(client, &mut chat.app).await?;
+            if outcome.submitted
+                && let Err(error) = submit_composer(client, &mut chat.app).await
+            {
+                report_client_error(&mut chat.app, "send failed", &error);
             }
             Ok(outcome.redraw)
         }
@@ -555,7 +557,33 @@ async fn handle_event<W: Write>(
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
-        Event::Mouse(_) | Event::User(_) => Ok(false),
+        Event::Mouse(mouse) => handle_mouse(client, chat, permission_dialog, mouse).await,
+        Event::User(_) => Ok(false),
+    }
+}
+
+async fn handle_mouse(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    permission_dialog: &mut Option<PermissionDialogState>,
+    mouse: MouseEvent,
+) -> Result<bool, TuiError> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Ok(chat.app.scroll_transcript_up(3)),
+        MouseEventKind::ScrollDown => Ok(chat.app.scroll_transcript_down(3)),
+        MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
+            let terminal_width = terminal_area()?.width;
+            let approve = mouse.position.x < terminal_width / 2;
+            resolve_permission_dialog(client, chat, permission_dialog, approve).await
+        }
+        MouseEventKind::Down(
+            MouseButton::Left | MouseButton::Right | MouseButton::Middle | MouseButton::Other(_),
+        )
+        | MouseEventKind::Up(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Move
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => Ok(false),
     }
 }
 
@@ -664,8 +692,10 @@ async fn handle_palette_key<W: Write>(
         CommandPaletteKeyOutcome::Activated(index) => {
             let command = active_palette.command_at(index);
             *palette = None;
-            if let Some(command) = command {
-                execute_palette_command(client, chat, terminal, command).await?;
+            if let Some(command) = command
+                && let Err(error) = execute_palette_command(client, chat, terminal, command).await
+            {
+                report_client_error(&mut chat.app, "command failed", &error);
             }
             Ok(true)
         }
@@ -1234,6 +1264,12 @@ async fn submit_composer(client: &BcodeClient, app: &mut BmuxApp) -> Result<(), 
             Ok(())
         }
     }
+}
+
+fn report_client_error(app: &mut BmuxApp, label: &str, error: &TuiError) {
+    let message = format!("{label}: {error}");
+    app.set_status(message.clone());
+    app.push_system_note(message);
 }
 
 fn resize_from_terminal<W: Write>(terminal: &mut Terminal<&mut W>) -> io::Result<bool> {
