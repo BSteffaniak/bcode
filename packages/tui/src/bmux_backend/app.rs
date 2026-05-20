@@ -6,6 +6,7 @@ use bcode_session_models::{
     ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId,
     SessionInputHistoryEntry,
 };
+use bcode_skill_models::SkillSource;
 use bmux_text_edit::TextEditBuffer;
 
 use super::IDLE_REDRAW_INTERVAL;
@@ -283,33 +284,46 @@ impl BmuxApp {
     /// Absorb one live session event.
     pub(super) fn absorb_session_event(&mut self, event: &SessionEvent) {
         match &event.kind {
-            SessionEventKind::UserMessage { text, .. } => {
-                self.activity = ActivityState::Thinking;
-                self.push_user_message(text);
-            }
-            SessionEventKind::AssistantDelta { text } => {
-                self.activity = ActivityState::Streaming;
-                self.push_streaming_item("Assistant", text);
-            }
+            SessionEventKind::UserMessage { text, .. } => self.push_live_user_message(text),
+            SessionEventKind::AssistantDelta { text } => self.push_live_assistant_delta(text),
             SessionEventKind::AssistantMessage { text } => {
                 self.finish_streaming_item("Assistant", text);
             }
             SessionEventKind::SystemMessage { text } => self.push_system_message(text),
-            SessionEventKind::ToolCallRequested { tool_name, .. } => {
-                self.push_tool_request(tool_name);
+            SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => {
+                self.push_tool_request(tool_call_id, tool_name, arguments_json);
             }
             SessionEventKind::ToolCallFinished {
-                result, is_error, ..
+                tool_call_id,
+                result,
+                is_error,
             } => {
                 self.activity = ActivityState::Thinking;
-                self.push_tool_result(result, *is_error);
+                self.push_tool_result(tool_call_id, result, *is_error);
             }
-            SessionEventKind::PermissionRequested { tool_name, .. } => {
-                self.push_permission_request(tool_name);
+            SessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => {
+                self.push_permission_request(
+                    permission_id,
+                    tool_call_id,
+                    tool_name,
+                    arguments_json,
+                );
             }
-            SessionEventKind::PermissionResolved { approved, .. } => {
+            SessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+            } => {
                 self.activity = ActivityState::Thinking;
-                self.set_permission_status(*approved);
+                self.set_permission_status(permission_id, *approved);
             }
             SessionEventKind::ModelChanged { provider, model } => {
                 self.status = format!("model: {provider}/{model}");
@@ -321,22 +335,22 @@ impl BmuxApp {
             SessionEventKind::ModelTurnFinished {
                 outcome, message, ..
             } => self.finish_model_turn(*outcome, message.as_deref()),
-            SessionEventKind::ModelUsage { usage, .. } => {
-                if let Some(tokens) = usage.metered_total_tokens() {
-                    self.status = format!("tokens: {tokens}");
-                }
+            SessionEventKind::ModelUsage { turn_id, usage } => {
+                self.push_model_usage(turn_id, usage);
             }
             SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
             SessionEventKind::SessionRenamed { name } => {
                 self.set_session_name_status(name.as_deref());
             }
-            SessionEventKind::SkillInvoked { skill_id, .. } => {
-                self.transcript
-                    .push(TranscriptItem::new("Skill", format!("invoked {skill_id}")));
-            }
-            SessionEventKind::SkillSuggested { skill_id, .. } => {
-                self.status = format!("suggested skill: {skill_id}");
-            }
+            SessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                ..
+            } => self.push_skill_invoked(skill_id, arguments, source.as_ref()),
+            SessionEventKind::SkillSuggested {
+                skill_id, reason, ..
+            } => self.push_skill_suggested(skill_id, reason.as_deref()),
             SessionEventKind::SkillActivated { skill_id, .. } => {
                 self.status = format!("activated skill: {skill_id}");
             }
@@ -416,6 +430,16 @@ impl BmuxApp {
         }
     }
 
+    fn push_live_user_message(&mut self, text: &str) {
+        self.activity = ActivityState::Thinking;
+        self.push_user_message(text);
+    }
+
+    fn push_live_assistant_delta(&mut self, text: &str) {
+        self.activity = ActivityState::Streaming;
+        self.push_streaming_item("Assistant", text);
+    }
+
     fn push_user_message(&mut self, text: &str) {
         self.remove_pending_submission(text);
         self.transcript
@@ -453,19 +477,29 @@ impl BmuxApp {
             .push(TranscriptItem::new(role, text.to_owned()));
     }
 
-    fn push_tool_request(&mut self, tool_name: &str) {
-        self.transcript
-            .push(TranscriptItem::new("Tool", format!("running {tool_name}")));
+    fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
+        self.transcript.push(TranscriptItem::new(
+            "Tool",
+            format!(
+                "request {tool_name}\nCall: {tool_call_id}\nArguments:\n{}",
+                pretty_jsonish(arguments_json)
+            ),
+        ));
         self.activity = ActivityState::RunningTool {
             name: tool_name.to_owned(),
         };
         self.status = format!("running tool {tool_name}");
     }
 
-    fn push_tool_result(&mut self, result: &str, is_error: bool) {
+    fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
         let label = if is_error { "Tool error" } else { "Tool" };
-        self.transcript
-            .push(TranscriptItem::new(label, result.to_owned()));
+        self.transcript.push(TranscriptItem::new(
+            label,
+            format!(
+                "result for {tool_call_id}\n{}",
+                truncate_block(result, 4_000)
+            ),
+        ));
         if is_error {
             "tool failed".clone_into(&mut self.status);
         } else {
@@ -473,10 +507,19 @@ impl BmuxApp {
         }
     }
 
-    fn push_permission_request(&mut self, tool_name: &str) {
+    fn push_permission_request(
+        &mut self,
+        permission_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) {
         self.transcript.push(TranscriptItem::new(
             "Permission",
-            format!("waiting for approval: {tool_name}"),
+            format!(
+                "waiting for approval: {tool_name}\nPermission: {permission_id}\nCall: {tool_call_id}\nArguments:\n{}",
+                pretty_jsonish(arguments_json)
+            ),
         ));
         self.activity = ActivityState::WaitingPermission {
             name: tool_name.to_owned(),
@@ -484,12 +527,33 @@ impl BmuxApp {
         self.status = format!("waiting for permission: {tool_name}");
     }
 
-    fn set_permission_status(&mut self, approved: bool) {
-        if approved {
-            "permission approved".clone_into(&mut self.status);
+    fn set_permission_status(&mut self, permission_id: &str, approved: bool) {
+        let status = if approved {
+            "permission approved"
         } else {
-            "permission denied".clone_into(&mut self.status);
+            "permission denied"
+        };
+        status.clone_into(&mut self.status);
+        self.transcript.push(TranscriptItem::new(
+            "Permission",
+            format!("{status}: {permission_id}"),
+        ));
+    }
+
+    fn push_model_usage(&mut self, turn_id: &str, usage: &bcode_session_models::SessionTokenUsage) {
+        if let Some(tokens) = usage.metered_total_tokens() {
+            self.status = format!("tokens: {tokens}");
         }
+        self.transcript.push(TranscriptItem::new(
+            "Usage",
+            format!(
+                "turn {turn_id}\ninput: {}\noutput: {}\ntotal: {}\nreasoning: {}",
+                optional_u32(usage.input_tokens),
+                optional_u32(usage.output_tokens),
+                optional_u32(usage.metered_total_tokens()),
+                optional_u32(usage.reasoning_tokens),
+            ),
+        ));
     }
 
     fn finish_model_turn(&mut self, outcome: ModelTurnOutcome, message: Option<&str>) {
@@ -529,6 +593,30 @@ impl BmuxApp {
         self.status = format!("loaded skill context: {skill_id} ({bytes_loaded} bytes{suffix})");
     }
 
+    fn push_skill_invoked(
+        &mut self,
+        skill_id: &impl std::fmt::Display,
+        arguments: &str,
+        source: Option<&SkillSource>,
+    ) {
+        let source =
+            source.map_or_else(String::new, |source| format!("\nSource: {}", source.label));
+        self.transcript.push(TranscriptItem::new(
+            "Skill",
+            format!("invoked {skill_id}{source}\nArguments: {arguments}"),
+        ));
+    }
+
+    fn push_skill_suggested(&mut self, skill_id: &impl std::fmt::Display, reason: Option<&str>) {
+        self.status = format!("suggested skill: {skill_id}");
+        if let Some(reason) = reason {
+            self.transcript.push(TranscriptItem::new(
+                "Skill",
+                format!("suggested {skill_id}\nReason: {reason}"),
+            ));
+        }
+    }
+
     fn push_skill_error(&mut self, skill_id: &impl std::fmt::Display, error: &str) {
         self.transcript.push(TranscriptItem::new(
             "Skill error",
@@ -551,26 +639,58 @@ fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
         SessionEventKind::SystemMessage { text } => {
             Some(TranscriptItem::new("System", text.clone()))
         }
-        SessionEventKind::ToolCallRequested { tool_name, .. } => {
-            Some(TranscriptItem::new("Tool", format!("running {tool_name}")))
-        }
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        } => Some(TranscriptItem::new(
+            "Tool",
+            format!(
+                "request {tool_name}\nCall: {tool_call_id}\nArguments:\n{}",
+                pretty_jsonish(arguments_json)
+            ),
+        )),
         SessionEventKind::ToolCallFinished {
-            result, is_error, ..
+            tool_call_id,
+            result,
+            is_error,
         } => Some(TranscriptItem::new(
             if *is_error { "Tool error" } else { "Tool" },
-            result.clone(),
+            format!(
+                "result for {tool_call_id}\n{}",
+                truncate_block(result, 4_000)
+            ),
         )),
-        SessionEventKind::PermissionRequested { tool_name, .. } => Some(TranscriptItem::new(
+        SessionEventKind::PermissionRequested {
+            permission_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        } => Some(TranscriptItem::new(
             "Permission",
-            format!("waiting for approval: {tool_name}"),
+            format!(
+                "waiting for approval: {tool_name}\nPermission: {permission_id}\nCall: {tool_call_id}\nArguments:\n{}",
+                pretty_jsonish(arguments_json)
+            ),
         )),
         SessionEventKind::ContextCompacted { summary, .. } => Some(TranscriptItem::new(
             "Compaction",
             format!("context compacted: {summary}"),
         )),
-        SessionEventKind::SkillInvoked { skill_id, .. } => {
-            Some(TranscriptItem::new("Skill", format!("invoked {skill_id}")))
-        }
+        SessionEventKind::SkillInvoked {
+            skill_id,
+            arguments,
+            source,
+            ..
+        } => Some(TranscriptItem::new(
+            "Skill",
+            format!(
+                "invoked {skill_id}{}\nArguments: {arguments}",
+                source
+                    .as_ref()
+                    .map_or_else(String::new, |source| format!("\nSource: {}", source.label))
+            ),
+        )),
         SessionEventKind::SkillInvocationFailed {
             skill_id, error, ..
         } => Some(TranscriptItem::new(
@@ -599,6 +719,26 @@ fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
         | SessionEventKind::ClientDetached { .. }
         | SessionEventKind::AgentChanged { .. } => None,
     }
+}
+
+fn optional_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn pretty_jsonish(value: &str) -> String {
+    truncate_block(value, 2_000)
+}
+
+fn truncate_block(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("\n… truncated");
+            return output;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 /// Current high-level backend activity.
