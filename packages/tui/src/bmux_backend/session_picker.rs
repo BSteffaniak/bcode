@@ -131,6 +131,15 @@ impl SessionPickerApp {
         self.sessions[index].name.as_deref()
     }
 
+    /// Select a visible row by zero-based index.
+    pub(super) const fn select_visible(&mut self, row: usize) -> bool {
+        if row >= self.filtered_indices.len() {
+            return false;
+        }
+        self.list_state.select(Some(row));
+        true
+    }
+
     /// Enter rename mode for the selected session.
     pub(super) fn start_rename(&mut self) -> bool {
         let Some(name) = self.selected_session_name() else {

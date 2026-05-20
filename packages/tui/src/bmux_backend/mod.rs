@@ -263,10 +263,15 @@ async fn pick_session<W: Write>(
                 }
                 PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
             },
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
-            | Event::Mouse(_)
-            | Event::Tick
-            | Event::User(_) => {}
+            Event::Mouse(mouse) => {
+                if let Some(row) = picker_row_from_mouse(mouse)
+                    && picker.select_visible(row)
+                    && let Some(session_id) = picker.selected_session_id()
+                {
+                    return Ok(session_id);
+                }
+            }
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
         }
     }
 }
@@ -327,10 +332,12 @@ async fn pick_session_for_mutation<W: Write>(
                 PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Canceled => return Ok(()),
             },
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
-            | Event::Mouse(_)
-            | Event::Tick
-            | Event::User(_) => {}
+            Event::Mouse(mouse) => {
+                if let Some(row) = picker_row_from_mouse(mouse) {
+                    let _selected = picker.select_visible(row);
+                }
+            }
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
         }
         if matches!(picker.mode(), session_picker::SessionPickerMode::Filter) {
             return Ok(());
@@ -586,6 +593,45 @@ async fn handle_event<W: Write>(
     }
 }
 
+fn picker_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {}
+        _ => return None,
+    }
+    let y = usize::from(mouse.position.y);
+    y.checked_sub(5)
+}
+
+fn permission_click_approval(mouse: MouseEvent) -> Option<bool> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return None;
+    };
+    let area = terminal_area().ok()?;
+    let dialog_width = area.width.saturating_sub(4).min(76);
+    let dialog_height = area.height.saturating_sub(4).min(14);
+    let dialog_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(dialog_width) / 2);
+    let dialog_y = area
+        .y
+        .saturating_add(area.height.saturating_sub(dialog_height) / 3);
+    let button_y = dialog_y.saturating_add(dialog_height).saturating_sub(3);
+    if mouse.position.y != button_y {
+        return None;
+    }
+    let approve_start = dialog_x.saturating_add(2);
+    let approve_end = approve_start.saturating_add(12);
+    let deny_start = approve_end.saturating_add(2);
+    let deny_end = deny_start.saturating_add(9);
+    if (approve_start..approve_end).contains(&mouse.position.x) {
+        Some(true)
+    } else if (deny_start..deny_end).contains(&mouse.position.x) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 async fn handle_mouse(
     client: &BcodeClient,
     chat: &mut ActiveChat,
@@ -596,9 +642,11 @@ async fn handle_mouse(
         MouseEventKind::ScrollUp => Ok(chat.app.scroll_transcript_up(3)),
         MouseEventKind::ScrollDown => Ok(chat.app.scroll_transcript_down(3)),
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
-            let terminal_width = terminal_area()?.width;
-            let approve = mouse.position.x < terminal_width / 2;
-            resolve_permission_dialog(client, chat, permission_dialog, approve).await
+            if let Some(approve) = permission_click_approval(mouse) {
+                resolve_permission_dialog(client, chat, permission_dialog, approve).await
+            } else {
+                Ok(false)
+            }
         }
         MouseEventKind::Down(
             MouseButton::Left | MouseButton::Right | MouseButton::Middle | MouseButton::Other(_),
@@ -916,10 +964,14 @@ async fn pick_model_provider<W: Write>(
                     }
                 }
             },
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
-            | Event::Mouse(_)
-            | Event::Tick
-            | Event::User(_) => {}
+            Event::Mouse(mouse) => {
+                if let Some(row) = picker_row_from_mouse(mouse)
+                    && picker.select_visible(row)
+                {
+                    return Ok(picker.selected_provider_id());
+                }
+            }
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
         }
     }
 }
@@ -996,10 +1048,26 @@ async fn pick_model_for_session<W: Write>(
                     }
                 }
             },
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
-            | Event::Mouse(_)
-            | Event::Tick
-            | Event::User(_) => {}
+            Event::Mouse(mouse) => {
+                if let Some(row) = picker_row_from_mouse(mouse)
+                    && picker.select_visible(row)
+                    && let Some(model_id) = picker.selected_model_id()
+                {
+                    if let Err(error) = client
+                        .set_session_model(session_id, provider_plugin_id.clone(), model_id.clone())
+                        .await
+                    {
+                        report_client_error(&mut chat.app, "model selection failed", &error.into());
+                    } else {
+                        chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
+                            || format!("model set to {model_id}"),
+                            |provider| format!("model set to {provider}/{model_id}"),
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
         }
     }
 }
@@ -1064,10 +1132,14 @@ async fn pick_skill_for_session<W: Write>(
                     return Ok(());
                 }
             },
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
-            | Event::Mouse(_)
-            | Event::Tick
-            | Event::User(_) => {}
+            Event::Mouse(mouse) => {
+                if let Some(row) = picker_row_from_mouse(mouse)
+                    && picker.select_visible(row)
+                {
+                    picker.start_argument();
+                }
+            }
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
         }
     }
 }

@@ -94,6 +94,15 @@ impl ProviderPickerApp {
     pub(super) fn select_previous(&mut self) {
         self.list_state.select_previous(self.filtered_indices.len());
     }
+
+    /// Select a visible row by zero-based index.
+    pub(super) const fn select_visible(&mut self, row: usize) -> bool {
+        if row >= self.filtered_indices.len() {
+            return false;
+        }
+        self.list_state.select(Some(row));
+        true
+    }
 }
 
 fn provider_item(provider: &PluginServiceSummary) -> ListItem {
