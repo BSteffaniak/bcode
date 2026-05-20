@@ -8,7 +8,11 @@ use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_block::{TextBlock, TextWrap};
 
-use super::app::{BmuxApp, PendingSubmission, PendingSubmissionState, TranscriptItem};
+use super::app::{
+    ActivityState, BmuxApp, PendingSubmission, PendingSubmissionState, TranscriptItem,
+};
+
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Render one BMUX backend frame.
 pub(super) fn render(app: &BmuxApp, frame: &mut Frame<'_>) {
@@ -59,7 +63,7 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    if app.transcript().is_empty() {
+    if app.transcript().is_empty() && app.pending_submissions().is_empty() {
         TextBlock::new(
             "BMUX backend is attached. Composer submissions are sent to the active Bcode session; live transcript events will appear here.",
         )
@@ -68,7 +72,7 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     }
 
-    let transcript_rows = transcript_render_rows(app);
+    let transcript_rows = transcript_render_rows(app, area.width);
     let end = transcript_rows
         .len()
         .saturating_sub(app.scroll_offset())
@@ -84,54 +88,124 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
-fn transcript_render_rows(app: &BmuxApp) -> Vec<Line> {
+fn transcript_render_rows(app: &BmuxApp, width: u16) -> Vec<Line> {
     let mut rows = Vec::new();
     for item in app.transcript() {
-        push_transcript_item_rows(&mut rows, item);
+        push_transcript_item_rows(&mut rows, item, width);
     }
     for pending in app.pending_submissions() {
-        push_pending_submission_rows(&mut rows, pending);
+        push_pending_submission_rows(&mut rows, pending, width);
     }
     rows
 }
 
-fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem) {
+fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
     let role_style = role_style(item.role());
     let marker = if item.streaming() { " …" } else { "" };
-    rows.push(Line::from_spans(vec![
-        Span::styled(format!("{}{}", item.role(), marker), role_style),
-        Span::raw(": "),
-        Span::raw(first_line(item.text())),
-    ]));
+    push_wrapped_prefixed_text(
+        rows,
+        vec![
+            Span::styled(format!("{}{}", item.role(), marker), role_style),
+            Span::raw(": "),
+        ],
+        item.text(),
+        width,
+    );
+}
 
-    for continuation in item.text().lines().skip(1) {
-        rows.push(Line::from_spans(vec![
-            Span::raw("  "),
-            Span::raw(continuation.to_owned()),
-        ]));
+fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmission, width: u16) {
+    push_wrapped_prefixed_text(
+        rows,
+        vec![
+            Span::styled(
+                "You",
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ["),
+            Span::styled(
+                pending_label(pending.state()),
+                Style::new().fg(Color::BrightBlack),
+            ),
+            Span::raw("]: "),
+        ],
+        pending.text(),
+        width,
+    );
+}
+
+fn push_wrapped_prefixed_text(rows: &mut Vec<Line>, prefix: Vec<Span>, text: &str, width: u16) {
+    let max_width = usize::from(width.max(1));
+    let prefix_width = spans_width(&prefix);
+    let available_first = max_width.saturating_sub(prefix_width).max(1);
+    let continuation_prefix = Span::raw("  ");
+    let available_next = max_width.saturating_sub(2).max(1);
+
+    for (line_index, raw_line) in text.lines().enumerate() {
+        let chunks = wrap_text(
+            raw_line,
+            if line_index == 0 {
+                available_first
+            } else {
+                available_next
+            },
+        );
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            if line_index == 0 && chunk_index == 0 {
+                let mut spans = prefix.clone();
+                spans.push(Span::raw(chunk.clone()));
+                rows.push(Line::from_spans(spans));
+            } else {
+                rows.push(Line::from_spans(vec![
+                    continuation_prefix.clone(),
+                    Span::raw(chunk.clone()),
+                ]));
+            }
+        }
+    }
+
+    if text.is_empty() {
+        rows.push(Line::from_spans(prefix));
     }
 }
 
-fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmission) {
-    rows.push(Line::from_spans(vec![
-        Span::styled(
-            "You",
-            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" ["),
-        Span::styled(
-            pending_label(pending.state()),
-            Style::new().fg(Color::BrightBlack),
-        ),
-        Span::raw("]: "),
-        Span::raw(first_line(pending.text())),
-    ]));
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in text.chars() {
+        let width = char_display_width(ch);
+        if current_width > 0 && current_width.saturating_add(width) > max_width {
+            rows.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width = current_width.saturating_add(width);
+    }
+    rows.push(current);
+    rows
+}
 
-    for continuation in pending.text().lines().skip(1) {
-        rows.push(Line::from_spans(vec![
-            Span::raw("  "),
-            Span::raw(continuation.to_owned()),
-        ]));
+fn spans_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|span| text_display_width(&span.content))
+        .sum()
+}
+
+fn text_display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    if ch == '\t' {
+        4
+    } else if ch.is_control() {
+        0
+    } else if ch.len_utf8() > 1 {
+        2
+    } else {
+        1
     }
 }
 
@@ -150,11 +224,30 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let line = Line::from_spans(vec![Span::styled(
-        app.status().to_owned(),
-        Style::new().fg(Color::BrightBlack),
-    )]);
+    let line = Line::from_spans(vec![
+        Span::styled(activity_label(app.activity()), Style::new().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled(app.status().to_owned(), Style::new().fg(Color::BrightBlack)),
+    ]);
     frame.write_line(area, &line);
+}
+
+fn activity_label(activity: &ActivityState) -> String {
+    match activity {
+        ActivityState::Idle => "idle".to_owned(),
+        ActivityState::Thinking => format!("{} thinking", spinner_frame()),
+        ActivityState::Streaming => format!("{} streaming", spinner_frame()),
+        ActivityState::RunningTool { name } => format!("{} tool {name}", spinner_frame()),
+        ActivityState::WaitingPermission { name } => format!("permission {name}"),
+    }
+}
+
+fn spinner_frame() -> &'static str {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let index = usize::try_from((elapsed / 100) % SPINNER_FRAMES.len() as u128).unwrap_or(0);
+    SPINNER_FRAMES[index]
 }
 
 fn render_composer(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -170,12 +263,6 @@ fn render_composer(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         .placeholder("Type here; Enter sends")
         .cursor_visible(app.cursor_visible())
         .render(panel.inner_area(area), frame);
-}
-
-fn first_line(text: &str) -> String {
-    text.lines()
-        .next()
-        .map_or_else(String::new, ToOwned::to_owned)
 }
 
 fn role_style(role: &str) -> Style {

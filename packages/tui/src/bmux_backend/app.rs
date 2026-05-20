@@ -21,6 +21,7 @@ pub(super) struct BmuxApp {
     pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
     scroll_offset: usize,
+    activity: ActivityState,
     status: String,
     should_exit: bool,
     cursor_visible: bool,
@@ -48,6 +49,7 @@ impl BmuxApp {
             pending_submissions: Vec::new(),
             pending_submission: None,
             scroll_offset: 0,
+            activity: ActivityState::Idle,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
             should_exit: false,
             cursor_visible: true,
@@ -90,6 +92,12 @@ impl BmuxApp {
     #[must_use]
     pub(super) const fn scroll_offset(&self) -> usize {
         self.scroll_offset
+    }
+
+    /// Return the current activity state.
+    #[must_use]
+    pub(super) const fn activity(&self) -> &ActivityState {
+        &self.activity
     }
 
     /// Return the current status line.
@@ -212,8 +220,12 @@ impl BmuxApp {
     /// Absorb one live session event.
     pub(super) fn absorb_session_event(&mut self, event: &SessionEvent) {
         match &event.kind {
-            SessionEventKind::UserMessage { text, .. } => self.push_user_message(text),
+            SessionEventKind::UserMessage { text, .. } => {
+                self.activity = ActivityState::Thinking;
+                self.push_user_message(text);
+            }
             SessionEventKind::AssistantDelta { text } => {
+                self.activity = ActivityState::Streaming;
                 self.push_streaming_item("Assistant", text);
             }
             SessionEventKind::AssistantMessage { text } => {
@@ -225,17 +237,22 @@ impl BmuxApp {
             }
             SessionEventKind::ToolCallFinished {
                 result, is_error, ..
-            } => self.push_tool_result(result, *is_error),
+            } => {
+                self.activity = ActivityState::Thinking;
+                self.push_tool_result(result, *is_error);
+            }
             SessionEventKind::PermissionRequested { tool_name, .. } => {
                 self.push_permission_request(tool_name);
             }
             SessionEventKind::PermissionResolved { approved, .. } => {
+                self.activity = ActivityState::Thinking;
                 self.set_permission_status(*approved);
             }
             SessionEventKind::ModelChanged { provider, model } => {
                 self.status = format!("model: {provider}/{model}");
             }
             SessionEventKind::ModelTurnStarted { .. } => {
+                self.activity = ActivityState::Thinking;
                 "thinking".clone_into(&mut self.status);
             }
             SessionEventKind::ModelTurnFinished {
@@ -273,6 +290,7 @@ impl BmuxApp {
                 skill_id, error, ..
             } => self.push_skill_error(skill_id, error),
             SessionEventKind::AssistantReasoningDelta { text } => {
+                self.activity = ActivityState::Streaming;
                 self.push_streaming_item("Reasoning", text);
             }
             SessionEventKind::AssistantReasoningMessage { text } => {
@@ -375,6 +393,9 @@ impl BmuxApp {
     fn push_tool_request(&mut self, tool_name: &str) {
         self.transcript
             .push(TranscriptItem::new("Tool", format!("running {tool_name}")));
+        self.activity = ActivityState::RunningTool {
+            name: tool_name.to_owned(),
+        };
         self.status = format!("running tool {tool_name}");
     }
 
@@ -394,6 +415,9 @@ impl BmuxApp {
             "Permission",
             format!("waiting for approval: {tool_name}"),
         ));
+        self.activity = ActivityState::WaitingPermission {
+            name: tool_name.to_owned(),
+        };
         self.status = format!("waiting for permission: {tool_name}");
     }
 
@@ -415,6 +439,7 @@ impl BmuxApp {
         {
             last.streaming = false;
         }
+        self.activity = ActivityState::Idle;
     }
 
     fn push_compaction(&mut self, summary: &str) {
@@ -447,6 +472,27 @@ impl BmuxApp {
             format!("{skill_id}: {error}"),
         ));
     }
+}
+
+/// Current high-level backend activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ActivityState {
+    /// No active model/tool work.
+    Idle,
+    /// Waiting for a model response.
+    Thinking,
+    /// Receiving streamed model output.
+    Streaming,
+    /// Running a tool.
+    RunningTool {
+        /// Tool name.
+        name: String,
+    },
+    /// Waiting for a permission decision.
+    WaitingPermission {
+        /// Tool name.
+        name: String,
+    },
 }
 
 /// Pending user message not yet confirmed by the session stream.
