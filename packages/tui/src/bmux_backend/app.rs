@@ -169,6 +169,18 @@ impl BmuxApp {
         self.select_diff_file(previous)
     }
 
+    /// Move composer cursor to soft-wrapped row and column.
+    pub(super) fn move_composer_to_wrapped_position(
+        &mut self,
+        width: usize,
+        row: usize,
+        col: usize,
+    ) {
+        self.composer
+            .move_cursor_to_wrapped_position(width, row, col);
+        self.wake_cursor();
+    }
+
     /// Return pending submissions that have not been committed by the session stream.
     #[must_use]
     pub(super) fn pending_submissions(&self) -> &[PendingSubmission] {

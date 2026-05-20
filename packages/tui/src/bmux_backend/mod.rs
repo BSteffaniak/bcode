@@ -600,9 +600,43 @@ async fn handle_event<W: Write>(
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
-        Event::Mouse(mouse) => handle_mouse(client, chat, permission_dialog, mouse).await,
+        Event::Mouse(mouse) => {
+            if palette.is_some() {
+                return handle_palette_mouse(client, keymap, chat, palette, terminal, mouse).await;
+            }
+            handle_mouse(client, chat, permission_dialog, mouse).await
+        }
         Event::User(_) => Ok(false),
     }
+}
+
+fn command_palette_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return None;
+    };
+    usize::from(mouse.position.y).checked_sub(3)
+}
+
+fn composer_position_from_mouse(mouse: MouseEvent) -> Option<(usize, usize)> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return None;
+    };
+    let area = terminal_area().ok()?;
+    let composer_height = area.height.clamp(3, 6);
+    let composer_y = area.bottom().saturating_sub(composer_height);
+    let inner_x = area.x.saturating_add(2);
+    let inner_y = composer_y.saturating_add(1);
+    let inner_width = area.width.saturating_sub(4);
+    if mouse.position.y < inner_y || mouse.position.y >= area.bottom().saturating_sub(1) {
+        return None;
+    }
+    if mouse.position.x < inner_x || mouse.position.x >= inner_x.saturating_add(inner_width) {
+        return None;
+    }
+    Some((
+        usize::from(mouse.position.y.saturating_sub(inner_y)),
+        usize::from(mouse.position.x.saturating_sub(inner_x)),
+    ))
 }
 
 fn picker_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
@@ -689,7 +723,11 @@ async fn handle_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(row) = diff_file_row_from_mouse(mouse) {
+            if let Some((row, col)) = composer_position_from_mouse(mouse) {
+                let width = usize::from(terminal_area()?.width.saturating_sub(4));
+                chat.app.move_composer_to_wrapped_position(width, row, col);
+                Ok(true)
+            } else if let Some(row) = diff_file_row_from_mouse(mouse) {
                 Ok(chat.app.select_diff_file(row))
             } else {
                 Ok(false)
@@ -831,6 +869,30 @@ async fn handle_palette_key<W: Write>(
             Ok(true)
         }
     }
+}
+
+async fn handle_palette_mouse<W: Write>(
+    client: &BcodeClient,
+    keymap: &BmuxKeyMap,
+    chat: &mut ActiveChat,
+    palette: &mut Option<BmuxCommandPalette>,
+    terminal: &mut Terminal<&mut W>,
+    mouse: MouseEvent,
+) -> Result<bool, TuiError> {
+    let Some(index) = command_palette_row_from_mouse(mouse) else {
+        return Ok(false);
+    };
+    let Some(active_palette) = palette else {
+        return Ok(false);
+    };
+    let command = active_palette.command_at(index);
+    *palette = None;
+    if let Some(command) = command
+        && let Err(error) = execute_palette_command(client, chat, terminal, keymap, command).await
+    {
+        report_client_error(&mut chat.app, "command failed", &error);
+    }
+    Ok(true)
 }
 
 async fn execute_palette_command<W: Write>(
