@@ -69,39 +69,44 @@ async fn run_event_loop<W: Write>(
         Some(session_id) => session_id,
         None => pick_session(terminal, &client).await?,
     };
-    let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+    let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (attached, event_task) =
-        attach_session_event_stream(&client, session_id, event_sender).await?;
-    let result = run_with_client(
-        terminal,
-        &client,
+        attach_session_event_stream(&client, session_id, event_sender.clone()).await?;
+    let app =
+        BmuxApp::new_with_history(Some(session_id), &attached.history, &attached.input_history);
+    let mut chat = ActiveChat {
+        app,
         session_id,
-        &attached.history,
-        &attached.input_history,
-        &mut event_receiver,
-    )
-    .await;
-    event_task.abort();
+        event_sender,
+        event_receiver,
+        event_task,
+    };
+    let result = run_with_client(terminal, &client, &mut chat).await;
+    chat.event_task.abort();
     result
+}
+
+struct ActiveChat {
+    app: BmuxApp,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
+    event_task: JoinHandle<()>,
 }
 
 async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
-    session_id: SessionId,
-    history: &[bcode_session_models::SessionEvent],
-    input_history: &[bcode_session_models::SessionInputHistoryEntry],
-    event_receiver: &mut mpsc::UnboundedReceiver<BcodeEvent>,
+    chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let mut app = BmuxApp::new_with_history(Some(session_id), history, input_history);
     let mut palette: Option<BmuxCommandPalette> = None;
     let mut needs_redraw = true;
 
-    while !app.should_exit() {
-        while let Ok(event) = event_receiver.try_recv() {
+    while !chat.app.should_exit() {
+        while let Ok(event) = chat.event_receiver.try_recv() {
             match event {
-                BcodeEvent::Session(event) if event.session_id == session_id => {
-                    app.absorb_session_event(&event);
+                BcodeEvent::Session(event) if event.session_id == chat.session_id => {
+                    chat.app.absorb_session_event(&event);
                     needs_redraw = true;
                 }
                 BcodeEvent::Session(_) => {}
@@ -114,7 +119,7 @@ async fn run_with_client<W: Write>(
 
         if needs_redraw {
             terminal.draw(|frame| {
-                render::render(&app, frame);
+                render::render(&chat.app, frame);
                 if let Some(palette) = &mut palette {
                     command_palette_render::render_palette(palette, frame);
                 }
@@ -123,10 +128,10 @@ async fn run_with_client<W: Write>(
         }
 
         if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
-            if handle_event(client, &mut app, &mut palette, terminal, event).await? {
+            if handle_event(client, chat, &mut palette, terminal, event).await? {
                 needs_redraw = true;
             }
-        } else if app.tick() {
+        } else if chat.app.tick() {
             needs_redraw = true;
         }
     }
@@ -339,7 +344,7 @@ async fn attach_session_event_stream(
 
 async fn handle_event<W: Write>(
     client: &BcodeClient,
-    app: &mut BmuxApp,
+    chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
     event: Event,
@@ -351,15 +356,15 @@ async fn handle_event<W: Write>(
         }
         Event::Key(stroke) => {
             if palette.is_some() {
-                return handle_palette_key(client, app, palette, terminal, stroke).await;
+                return handle_palette_key(client, chat, palette, terminal, stroke).await;
             }
             if is_palette_open_key(stroke) {
                 *palette = Some(BmuxCommandPalette::new());
                 return Ok(true);
             }
-            let outcome = input::handle_key(app, stroke);
+            let outcome = input::handle_key(&mut chat.app, stroke);
             if outcome.submitted {
-                submit_composer(client, app).await?;
+                submit_composer(client, &mut chat.app).await?;
             }
             Ok(outcome.redraw)
         }
@@ -368,8 +373,8 @@ async fn handle_event<W: Write>(
                 palette.state_mut().query.insert_str(&text);
                 return Ok(true);
             }
-            app.composer_mut().insert_str(&text);
-            app.wake_cursor();
+            chat.app.composer_mut().insert_str(&text);
+            chat.app.wake_cursor();
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
@@ -379,7 +384,7 @@ async fn handle_event<W: Write>(
 
 async fn handle_palette_key<W: Write>(
     client: &BcodeClient,
-    app: &mut BmuxApp,
+    chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
     stroke: KeyStroke,
@@ -395,7 +400,7 @@ async fn handle_palette_key<W: Write>(
             let command = active_palette.command_at(index);
             *palette = None;
             if let Some(command) = command {
-                execute_palette_command(client, app, terminal, command).await?;
+                execute_palette_command(client, chat, terminal, command).await?;
             }
             Ok(true)
         }
@@ -412,42 +417,61 @@ async fn handle_palette_key<W: Write>(
 
 async fn execute_palette_command<W: Write>(
     client: &BcodeClient,
-    app: &mut BmuxApp,
+    chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
         PaletteCommand::NewSession => {
             let session = client.create_session(None).await?;
-            app.set_status(format!("created session {}", session.id));
+            switch_session(client, chat, session.id).await?;
         }
         PaletteCommand::SwitchSession => {
-            let session_id = pick_session(terminal, client).await?;
-            app.set_status(format!(
-                "selected session {session_id}; restart BMUX backend to attach"
-            ));
+            let selected_session_id = pick_session(terminal, client).await?;
+            switch_session(client, chat, selected_session_id).await?;
         }
         PaletteCommand::CancelTurn => {
-            let Some(session_id) = app.session_id() else {
-                app.set_status("No active session".to_owned());
+            let Some(session_id) = chat.app.session_id() else {
+                chat.app.set_status("No active session".to_owned());
                 return Ok(());
             };
             let cancelled = client.cancel_session_turn(session_id).await?;
-            app.set_status(if cancelled {
+            chat.app.set_status(if cancelled {
                 "cancel requested".to_owned()
             } else {
                 "no active turn to cancel".to_owned()
             });
         }
         PaletteCommand::CompactContext => {
-            let Some(session_id) = app.session_id() else {
-                app.set_status("No active session".to_owned());
+            let Some(session_id) = chat.app.session_id() else {
+                chat.app.set_status("No active session".to_owned());
                 return Ok(());
             };
             let message = client.compact_session(session_id).await?;
-            app.set_status(message);
+            chat.app.set_status(message);
         }
     }
+    Ok(())
+}
+
+async fn switch_session(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    next_session_id: SessionId,
+) -> Result<(), TuiError> {
+    chat.event_task.abort();
+    while chat.event_receiver.try_recv().is_ok() {}
+    let (attached, next_task) =
+        attach_session_event_stream(client, next_session_id, chat.event_sender.clone()).await?;
+    chat.event_task = next_task;
+    chat.session_id = next_session_id;
+    chat.app = BmuxApp::new_with_history(
+        Some(next_session_id),
+        &attached.history,
+        &attached.input_history,
+    );
+    chat.app
+        .set_status(format!("attached session {next_session_id}"));
     Ok(())
 }
 
