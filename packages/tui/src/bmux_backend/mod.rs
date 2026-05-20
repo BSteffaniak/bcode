@@ -4,6 +4,7 @@ mod app;
 mod command_palette;
 mod command_palette_render;
 mod input;
+mod keymap;
 mod permission_dialog;
 mod permission_dialog_render;
 mod render;
@@ -30,6 +31,7 @@ use tokio::task::JoinHandle;
 
 use self::app::BmuxApp;
 use self::command_palette::{BmuxCommandPalette, PaletteCommand};
+use self::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use self::permission_dialog::PermissionDialogState;
 use super::TuiError;
 
@@ -69,9 +71,11 @@ async fn run_event_loop<W: Write>(
     session_id: Option<SessionId>,
 ) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
+    let config = bcode_config::load_config()?;
+    let keymap = BmuxKeyMap::from_config(&config.tui);
     let session_id = match session_id {
         Some(session_id) => session_id,
-        None => pick_session(terminal, &client).await?,
+        None => pick_session(terminal, &client, &keymap).await?,
     };
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (attached, event_task) =
@@ -85,7 +89,7 @@ async fn run_event_loop<W: Write>(
         event_receiver,
         event_task,
     };
-    let result = run_with_client(terminal, &client, &mut chat).await;
+    let result = run_with_client(terminal, &client, &keymap, &mut chat).await;
     chat.event_task.abort();
     result
 }
@@ -101,6 +105,7 @@ struct ActiveChat {
 async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
+    keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
     let mut palette: Option<BmuxCommandPalette> = None;
@@ -154,6 +159,7 @@ async fn run_with_client<W: Write>(
         if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
             if handle_event(
                 client,
+                keymap,
                 chat,
                 &mut permission_dialog,
                 &mut palette,
@@ -203,6 +209,7 @@ async fn load_older_history(client: &BcodeClient, chat: &mut ActiveChat) -> Resu
 async fn pick_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
+    keymap: &BmuxKeyMap,
 ) -> Result<SessionId, TuiError> {
     let sessions = client.list_sessions().await?;
     let mut picker = session_picker::SessionPickerApp::new(sessions);
@@ -218,7 +225,7 @@ async fn pick_session<W: Write>(
                 picker.filter_mut().insert_str(&text);
                 picker.refresh_filter();
             }
-            Event::Key(stroke) => match handle_picker_key(&mut picker, stroke) {
+            Event::Key(stroke) => match handle_picker_key(&mut picker, keymap, stroke) {
                 PickerKeyOutcome::Continue => {}
                 PickerKeyOutcome::Create => return Ok(client.create_session(None).await?.id),
                 PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
@@ -251,10 +258,13 @@ enum PickerKeyOutcome {
 
 fn handle_picker_key(
     picker: &mut session_picker::SessionPickerApp,
+    keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> PickerKeyOutcome {
     match picker.mode() {
-        session_picker::SessionPickerMode::Filter => handle_picker_filter_key(picker, stroke),
+        session_picker::SessionPickerMode::Filter => {
+            handle_picker_filter_key(picker, keymap, stroke)
+        }
         session_picker::SessionPickerMode::Rename => handle_picker_rename_key(picker, stroke),
         session_picker::SessionPickerMode::DeleteConfirm => {
             handle_picker_delete_key(picker, stroke)
@@ -264,21 +274,45 @@ fn handle_picker_key(
 
 fn handle_picker_filter_key(
     picker: &mut session_picker::SessionPickerApp,
+    keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> PickerKeyOutcome {
-    if stroke.key == KeyCode::Escape {
-        return PickerKeyOutcome::Canceled;
-    }
-    if matches!(stroke.key, KeyCode::Char('n' | 'N')) && stroke.modifiers.ctrl {
-        return PickerKeyOutcome::Create;
-    }
-    if matches!(stroke.key, KeyCode::Char('r' | 'R')) && stroke.modifiers.ctrl {
-        picker.start_rename();
-        return PickerKeyOutcome::Continue;
-    }
-    if matches!(stroke.key, KeyCode::Char('d' | 'D')) && stroke.modifiers.ctrl {
-        picker.start_delete_confirmation();
-        return PickerKeyOutcome::Continue;
+    if let Some(action) = keymap.action_for_key(BmuxScope::SessionPicker, stroke) {
+        return match action {
+            BmuxAction::SelectCancel => PickerKeyOutcome::Canceled,
+            BmuxAction::SessionNew => PickerKeyOutcome::Create,
+            BmuxAction::SessionRename => {
+                picker.start_rename();
+                PickerKeyOutcome::Continue
+            }
+            BmuxAction::SessionDelete => {
+                picker.start_delete_confirmation();
+                PickerKeyOutcome::Continue
+            }
+            BmuxAction::SelectConfirm => PickerKeyOutcome::Selected,
+            BmuxAction::SelectUp => {
+                picker.select_previous();
+                PickerKeyOutcome::Continue
+            }
+            BmuxAction::SelectDown => {
+                picker.select_next();
+                PickerKeyOutcome::Continue
+            }
+            BmuxAction::InputSubmit
+            | BmuxAction::InputHistoryPrevious
+            | BmuxAction::InputHistoryNext
+            | BmuxAction::AppExit
+            | BmuxAction::AppInterrupt
+            | BmuxAction::CommandPaletteOpen
+            | BmuxAction::TranscriptPageUp
+            | BmuxAction::TranscriptPageDown
+            | BmuxAction::TranscriptTop
+            | BmuxAction::TranscriptBottom
+            | BmuxAction::TranscriptLineUp
+            | BmuxAction::TranscriptLineDown
+            | BmuxAction::PermissionApprove
+            | BmuxAction::PermissionDeny => PickerKeyOutcome::Continue,
+        };
     }
     match stroke.key {
         KeyCode::Enter => PickerKeyOutcome::Selected,
@@ -405,6 +439,7 @@ async fn attach_session_event_stream(
 
 async fn handle_event<W: Write>(
     client: &BcodeClient,
+    keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     permission_dialog: &mut Option<PermissionDialogState>,
     palette: &mut Option<BmuxCommandPalette>,
@@ -418,12 +453,13 @@ async fn handle_event<W: Write>(
         }
         Event::Key(stroke) => {
             if permission_dialog.is_some() {
-                return handle_permission_key(client, chat, permission_dialog, stroke).await;
+                return handle_permission_key(client, keymap, chat, permission_dialog, stroke)
+                    .await;
             }
             if palette.is_some() {
                 return handle_palette_key(client, chat, palette, terminal, stroke).await;
             }
-            if is_palette_open_key(stroke) {
+            if is_palette_open_key(keymap, stroke) {
                 *palette = Some(BmuxCommandPalette::new());
                 return Ok(true);
             }
@@ -449,6 +485,7 @@ async fn handle_event<W: Write>(
 
 async fn handle_permission_key(
     client: &BcodeClient,
+    keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     permission_dialog: &mut Option<PermissionDialogState>,
     stroke: KeyStroke,
@@ -456,26 +493,43 @@ async fn handle_permission_key(
     let Some(dialog) = permission_dialog else {
         return Ok(false);
     };
-    match stroke.key {
-        KeyCode::Left | KeyCode::Up => {
+    let Some(action) = keymap.action_for_key(BmuxScope::Permission, stroke) else {
+        return Ok(false);
+    };
+    match action {
+        BmuxAction::SelectUp => {
             dialog.focus_previous();
             Ok(true)
         }
-        KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+        BmuxAction::SelectDown => {
             dialog.focus_next();
             Ok(true)
         }
-        KeyCode::Char('a' | 'A') => {
+        BmuxAction::PermissionApprove => {
             resolve_permission_dialog(client, chat, permission_dialog, true).await
         }
-        KeyCode::Char('d' | 'D') | KeyCode::Escape => {
+        BmuxAction::PermissionDeny | BmuxAction::SelectCancel => {
             resolve_permission_dialog(client, chat, permission_dialog, false).await
         }
-        KeyCode::Enter => {
+        BmuxAction::SelectConfirm => {
             let approved = dialog.focused_approval();
             resolve_permission_dialog(client, chat, permission_dialog, approved).await
         }
-        _ => Ok(false),
+        BmuxAction::InputSubmit
+        | BmuxAction::InputHistoryPrevious
+        | BmuxAction::InputHistoryNext
+        | BmuxAction::AppExit
+        | BmuxAction::AppInterrupt
+        | BmuxAction::CommandPaletteOpen
+        | BmuxAction::TranscriptPageUp
+        | BmuxAction::TranscriptPageDown
+        | BmuxAction::TranscriptTop
+        | BmuxAction::TranscriptBottom
+        | BmuxAction::TranscriptLineUp
+        | BmuxAction::TranscriptLineDown
+        | BmuxAction::SessionNew
+        | BmuxAction::SessionRename
+        | BmuxAction::SessionDelete => Ok(false),
     }
 }
 
@@ -549,7 +603,12 @@ async fn execute_palette_command<W: Write>(
             switch_session(client, chat, session.id).await?;
         }
         PaletteCommand::SwitchSession => {
-            let selected_session_id = pick_session(terminal, client).await?;
+            let selected_session_id = pick_session(
+                terminal,
+                client,
+                &BmuxKeyMap::from_config(&bcode_config::load_config()?.tui),
+            )
+            .await?;
             switch_session(client, chat, selected_session_id).await?;
         }
         PaletteCommand::CancelTurn => {
@@ -597,8 +656,8 @@ async fn switch_session(
     Ok(())
 }
 
-const fn is_palette_open_key(stroke: KeyStroke) -> bool {
-    matches!(stroke.key, KeyCode::Char('p' | 'P')) && stroke.modifiers.ctrl
+fn is_palette_open_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {
+    keymap.action_for_key(BmuxScope::Chat, stroke) == Some(BmuxAction::CommandPaletteOpen)
 }
 
 async fn submit_composer(client: &BcodeClient, app: &mut BmuxApp) -> Result<(), TuiError> {
