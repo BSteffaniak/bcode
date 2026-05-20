@@ -91,7 +91,6 @@ struct ServerState {
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     provider_state: Mutex<ProviderStateStore>,
-    show_thinking: bool,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
@@ -362,7 +361,6 @@ struct ServerStateInit {
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     provider_state: ProviderStateStore,
-    show_thinking: bool,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
@@ -389,7 +387,6 @@ impl ServerState {
             prompt_cache_mode: init.prompt_cache_mode,
             conversation_reuse_mode: init.conversation_reuse_mode,
             provider_state: Mutex::new(init.provider_state),
-            show_thinking: init.show_thinking,
             observability: init.observability,
             trace_store: init.trace_store,
             max_tool_rounds: init.max_tool_rounds,
@@ -505,7 +502,6 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
             tool_output_context_chars: config.model.tool_output.context_chars,
-            show_thinking: config.tui.thinking.show,
             model_streaming: config.model.streaming,
             auto_compaction: config.model.compaction,
             skill_context_bytes: config.skills.max_context_bytes,
@@ -3375,15 +3371,13 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::ReasoningDelta { text } => {
-            if state.show_thinking {
-                let _ = state
-                    .sessions
-                    .append_event(
-                        session_id,
-                        SessionEventKind::AssistantReasoningDelta { text },
-                    )
-                    .await;
-            }
+            let _ = state
+                .sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::AssistantReasoningDelta { text },
+                )
+                .await;
             append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
         }
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {

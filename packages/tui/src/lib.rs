@@ -3671,7 +3671,10 @@ impl ChatApp {
                 SessionEventKind::AssistantDelta { .. }
                     | SessionEventKind::AssistantReasoningDelta { .. }
             ) {
-                blocks.extend(transcript_blocks_from_event(event));
+                blocks.extend(transcript_blocks_from_event_with_thinking(
+                    event,
+                    self.thinking_visible,
+                ));
             }
         }
         self.input_history_sequences
@@ -3771,7 +3774,7 @@ impl ChatApp {
     }
 
     fn push_session_event(&mut self, event: &SessionEvent) {
-        let blocks = transcript_blocks_from_event(event);
+        let blocks = transcript_blocks_from_event_with_thinking(event, self.thinking_visible);
         if blocks.is_empty() {
             return;
         }
@@ -6188,7 +6191,10 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
+fn transcript_blocks_from_event_with_thinking(
+    event: &SessionEvent,
+    thinking_visible: bool,
+) -> Vec<TranscriptBlock> {
     match &event.kind {
         SessionEventKind::SessionCreated { name } => vec![TranscriptBlock::Meta {
             text: format!("session started: {}", name.as_deref().unwrap_or("untitled")),
@@ -6206,16 +6212,24 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
             vec![TranscriptBlock::User { text: text.clone() }]
         }
         SessionEventKind::AssistantReasoningDelta { text } => {
-            vec![TranscriptBlock::AssistantReasoning {
-                text: text.clone(),
-                streaming: true,
-            }]
+            if thinking_visible {
+                vec![TranscriptBlock::AssistantReasoning {
+                    text: text.clone(),
+                    streaming: true,
+                }]
+            } else {
+                Vec::new()
+            }
         }
         SessionEventKind::AssistantReasoningMessage { text } => {
-            vec![TranscriptBlock::AssistantReasoning {
-                text: text.clone(),
-                streaming: false,
-            }]
+            if thinking_visible {
+                vec![TranscriptBlock::AssistantReasoning {
+                    text: text.clone(),
+                    streaming: false,
+                }]
+            } else {
+                Vec::new()
+            }
         }
         SessionEventKind::AssistantDelta { text } => vec![TranscriptBlock::Assistant {
             text: text.clone(),
