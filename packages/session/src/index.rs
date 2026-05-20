@@ -7,7 +7,7 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-pub const SESSION_INDEX_VERSION: u16 = 4;
+pub const SESSION_INDEX_VERSION: u16 = 5;
 pub const SESSION_ENTRY_INDEX_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,8 +451,6 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
         SessionEventKind::UserMessage { .. } => "user_message",
-        SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
-        SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
@@ -474,6 +472,8 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SkillDeactivated { .. } => "skill_deactivated",
         SessionEventKind::SkillContextLoaded { .. } => "skill_context_loaded",
         SessionEventKind::SkillInvocationFailed { .. } => "skill_invocation_failed",
+        SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
+        SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
     }
 }
 

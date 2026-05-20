@@ -399,14 +399,6 @@ pub enum SessionEventKind {
         client_id: ClientId,
         text: String,
     },
-    /// Provider-exposed reasoning text delta.
-    AssistantReasoningDelta {
-        text: String,
-    },
-    /// Completed provider-exposed reasoning text.
-    AssistantReasoningMessage {
-        text: String,
-    },
     AssistantDelta {
         text: String,
     },
@@ -501,5 +493,13 @@ pub enum SessionEventKind {
         skill_id: SkillId,
         error: String,
         failed_at_ms: u64,
+    },
+    /// Provider-exposed reasoning text delta.
+    AssistantReasoningDelta {
+        text: String,
+    },
+    /// Completed provider-exposed reasoning text.
+    AssistantReasoningMessage {
+        text: String,
     },
 }

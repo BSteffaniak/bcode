@@ -1,6 +1,11 @@
 use crate::SessionStoreError;
 use crate::index::SessionIndexEntry;
-use bcode_session_models::SessionEvent;
+use bcode_session_models::{
+    ClientId, ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionTokenUsage,
+    SessionTraceEvent,
+};
+use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -52,7 +57,7 @@ pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> 
         else {
             break;
         };
-        match bmux_codec::from_bytes::<SessionEvent>(&payload) {
+        match decode_session_event(&payload) {
             Ok(event) => {
                 let frame_len = offset.saturating_sub(frame_offset);
                 entries.push(SessionIndexEntry::from_event(
@@ -88,7 +93,316 @@ pub fn read_event_at(path: &Path, offset: u64) -> Result<SessionEvent, SessionSt
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let payload = read_frame_payload_at_current_offset(&mut file)?;
-    bmux_codec::from_bytes(&payload).map_err(SessionStoreError::Decode)
+    decode_session_event(&payload).map_err(SessionStoreError::Decode)
+}
+
+fn decode_session_event(payload: &[u8]) -> Result<SessionEvent, bmux_codec::Error> {
+    match bmux_codec::from_bytes(payload) {
+        Ok(event) => Ok(event),
+        Err(primary) => bmux_codec::from_bytes::<BadReasoningOrderSessionEvent>(payload)
+            .map(Into::into)
+            .map_err(|_| primary),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BadReasoningOrderSessionEvent {
+    schema_version: u16,
+    sequence: u64,
+    session_id: SessionId,
+    kind: BadReasoningOrderSessionEventKind,
+}
+
+impl From<BadReasoningOrderSessionEvent> for SessionEvent {
+    fn from(value: BadReasoningOrderSessionEvent) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            sequence: value.sequence,
+            session_id: value.session_id,
+            kind: value.kind.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BadReasoningOrderSessionEventKind {
+    SessionCreated {
+        name: Option<String>,
+    },
+    ClientAttached {
+        client_id: ClientId,
+    },
+    ClientDetached {
+        client_id: ClientId,
+    },
+    UserMessage {
+        client_id: ClientId,
+        text: String,
+    },
+    AssistantReasoningDelta {
+        text: String,
+    },
+    AssistantReasoningMessage {
+        text: String,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    ToolCallRequested {
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
+    ToolCallFinished {
+        tool_call_id: String,
+        result: String,
+        #[serde(default)]
+        is_error: bool,
+    },
+    PermissionRequested {
+        permission_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
+    PermissionResolved {
+        permission_id: String,
+        approved: bool,
+    },
+    ModelChanged {
+        provider: String,
+        model: String,
+    },
+    SystemMessage {
+        text: String,
+    },
+    AgentChanged {
+        agent_id: String,
+    },
+    ModelTurnStarted {
+        turn_id: String,
+    },
+    ModelTurnFinished {
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    ModelUsage {
+        turn_id: String,
+        usage: SessionTokenUsage,
+    },
+    ContextCompacted {
+        summary: String,
+        compacted_through_sequence: u64,
+    },
+    SessionRenamed {
+        name: Option<String>,
+    },
+    TraceEvent {
+        trace: Box<SessionTraceEvent>,
+    },
+    SkillInvoked {
+        skill_id: SkillId,
+        arguments: String,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        invoked_at_ms: u64,
+    },
+    SkillSuggested {
+        skill_id: SkillId,
+        #[serde(default)]
+        reason: Option<String>,
+        suggested_at_ms: u64,
+    },
+    SkillActivated {
+        skill_id: SkillId,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        mode: SkillActivationMode,
+        activated_at_ms: u64,
+    },
+    SkillDeactivated {
+        skill_id: SkillId,
+        deactivated_at_ms: u64,
+    },
+    SkillContextLoaded {
+        skill_id: SkillId,
+        bytes_loaded: usize,
+        truncated: bool,
+        loaded_at_ms: u64,
+    },
+    SkillInvocationFailed {
+        skill_id: SkillId,
+        error: String,
+        failed_at_ms: u64,
+    },
+}
+
+impl From<BadReasoningOrderSessionEventKind> for SessionEventKind {
+    // This compatibility shim must enumerate every persisted variant in the bad order.
+    #[allow(clippy::too_many_lines)]
+    fn from(value: BadReasoningOrderSessionEventKind) -> Self {
+        match value {
+            BadReasoningOrderSessionEventKind::SessionCreated { name } => {
+                Self::SessionCreated { name }
+            }
+            BadReasoningOrderSessionEventKind::ClientAttached { client_id } => {
+                Self::ClientAttached { client_id }
+            }
+            BadReasoningOrderSessionEventKind::ClientDetached { client_id } => {
+                Self::ClientDetached { client_id }
+            }
+            BadReasoningOrderSessionEventKind::UserMessage { client_id, text } => {
+                Self::UserMessage { client_id, text }
+            }
+            BadReasoningOrderSessionEventKind::AssistantReasoningDelta { text } => {
+                Self::AssistantReasoningDelta { text }
+            }
+            BadReasoningOrderSessionEventKind::AssistantReasoningMessage { text } => {
+                Self::AssistantReasoningMessage { text }
+            }
+            BadReasoningOrderSessionEventKind::AssistantDelta { text } => {
+                Self::AssistantDelta { text }
+            }
+            BadReasoningOrderSessionEventKind::AssistantMessage { text } => {
+                Self::AssistantMessage { text }
+            }
+            BadReasoningOrderSessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Self::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            },
+            BadReasoningOrderSessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                is_error,
+            } => Self::ToolCallFinished {
+                tool_call_id,
+                result,
+                is_error,
+            },
+            BadReasoningOrderSessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Self::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            },
+            BadReasoningOrderSessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+            } => Self::PermissionResolved {
+                permission_id,
+                approved,
+            },
+            BadReasoningOrderSessionEventKind::ModelChanged { provider, model } => {
+                Self::ModelChanged { provider, model }
+            }
+            BadReasoningOrderSessionEventKind::SystemMessage { text } => {
+                Self::SystemMessage { text }
+            }
+            BadReasoningOrderSessionEventKind::AgentChanged { agent_id } => {
+                Self::AgentChanged { agent_id }
+            }
+            BadReasoningOrderSessionEventKind::ModelTurnStarted { turn_id } => {
+                Self::ModelTurnStarted { turn_id }
+            }
+            BadReasoningOrderSessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => Self::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            },
+            BadReasoningOrderSessionEventKind::ModelUsage { turn_id, usage } => {
+                Self::ModelUsage { turn_id, usage }
+            }
+            BadReasoningOrderSessionEventKind::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            } => Self::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            },
+            BadReasoningOrderSessionEventKind::SessionRenamed { name } => {
+                Self::SessionRenamed { name }
+            }
+            BadReasoningOrderSessionEventKind::TraceEvent { trace } => Self::TraceEvent { trace },
+            BadReasoningOrderSessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            } => Self::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            },
+            BadReasoningOrderSessionEventKind::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            } => Self::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            },
+            BadReasoningOrderSessionEventKind::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            } => Self::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            },
+            BadReasoningOrderSessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            } => Self::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            },
+            BadReasoningOrderSessionEventKind::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            } => Self::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            },
+            BadReasoningOrderSessionEventKind::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            } => Self::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            },
+        }
+    }
 }
 
 fn read_next_frame_payload(
@@ -248,4 +562,78 @@ fn read_frame_payload(
         *offset = offset.saturating_add(read.try_into().unwrap_or(u64::MAX));
     }
     Ok(Some(payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+    use std::io::Write as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Serialize)]
+    struct BadOrderTestSessionEvent {
+        schema_version: u16,
+        sequence: u64,
+        session_id: SessionId,
+        kind: BadOrderTestSessionEventKind,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum BadOrderTestSessionEventKind {
+        SessionCreated { name: Option<String> },
+        ClientAttached { client_id: ClientId },
+        ClientDetached { client_id: ClientId },
+        UserMessage { client_id: ClientId, text: String },
+        AssistantReasoningDelta { text: String },
+        AssistantReasoningMessage { text: String },
+        AssistantDelta { text: String },
+    }
+
+    #[test]
+    fn reads_events_written_with_bad_reasoning_variant_order() {
+        let session_id = SessionId::new();
+        let path = temp_event_path();
+        let bad_order_event = BadOrderTestSessionEvent {
+            schema_version: 9,
+            sequence: 0,
+            session_id,
+            kind: BadOrderTestSessionEventKind::AssistantDelta {
+                text: "hello".to_string(),
+            },
+        };
+        let payload = bmux_codec::to_vec(&bad_order_event).expect("event should encode");
+        {
+            let mut file = std::fs::File::create(&path).expect("event log should create");
+            file.write_all(
+                &u32::try_from(payload.len())
+                    .expect("payload should fit")
+                    .to_le_bytes(),
+            )
+            .expect("length should write");
+            file.write_all(&payload).expect("payload should write");
+        }
+
+        let report = read_events(&path).expect("bad order event should read");
+        assert!(report.issues.is_empty());
+        assert_eq!(report.events.len(), 1);
+        assert!(matches!(
+            &report.events[0].kind,
+            SessionEventKind::AssistantDelta { text } if text == "hello"
+        ));
+
+        std::fs::remove_file(path).expect("event log should remove");
+    }
+
+    fn temp_event_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bcode-session-reader-test-{}-{nanos}.events",
+            std::process::id()
+        ))
+    }
 }

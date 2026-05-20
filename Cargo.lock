@@ -931,6 +931,7 @@ name = "bcode_session"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_session_models",
+ "bcode_skill_models",
  "bmux_codec",
  "serde",
  "serde_json",
