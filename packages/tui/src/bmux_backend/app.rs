@@ -22,6 +22,9 @@ pub(super) struct BmuxApp {
     input_history_draft: Option<String>,
     transcript: Vec<TranscriptItem>,
     changed_files: Vec<DiffFileSummary>,
+    diff_details: Vec<Vec<DiffLine>>,
+    selected_diff_file: Option<usize>,
+    diff_scroll_offset: usize,
     diff_lines: Vec<DiffLine>,
     pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
@@ -54,6 +57,9 @@ impl BmuxApp {
             input_history_draft: None,
             transcript: Vec::new(),
             changed_files: Vec::new(),
+            diff_details: Vec::new(),
+            selected_diff_file: None,
+            diff_scroll_offset: 0,
             diff_lines: Vec::new(),
             pending_submissions: Vec::new(),
             pending_submission: None,
@@ -104,7 +110,63 @@ impl BmuxApp {
     /// Return detailed diff lines inferred from edit tool calls.
     #[must_use]
     pub(super) fn diff_lines(&self) -> &[DiffLine] {
-        &self.diff_lines
+        self.selected_diff_file
+            .and_then(|index| self.diff_details.get(index).map(Vec::as_slice))
+            .unwrap_or(&self.diff_lines)
+    }
+
+    /// Return diff scroll offset.
+    #[must_use]
+    pub(super) const fn diff_scroll_offset(&self) -> usize {
+        self.diff_scroll_offset
+    }
+
+    /// Scroll diff preview up.
+    pub(super) const fn scroll_diff_up(&mut self, rows: usize) -> bool {
+        if rows == 0 || self.diff_lines.is_empty() {
+            return false;
+        }
+        self.diff_scroll_offset = self.diff_scroll_offset.saturating_add(rows);
+        true
+    }
+
+    /// Scroll diff preview down.
+    pub(super) const fn scroll_diff_down(&mut self, rows: usize) -> bool {
+        let previous = self.diff_scroll_offset;
+        self.diff_scroll_offset = self.diff_scroll_offset.saturating_sub(rows);
+        self.diff_scroll_offset != previous
+    }
+
+    /// Select a changed-file diff detail.
+    pub(super) const fn select_diff_file(&mut self, index: usize) -> bool {
+        if index >= self.changed_files.len() {
+            return false;
+        }
+        self.selected_diff_file = Some(index);
+        self.diff_scroll_offset = 0;
+        true
+    }
+
+    /// Select next changed file.
+    pub(super) fn select_next_diff_file(&mut self) -> bool {
+        if self.changed_files.is_empty() {
+            return false;
+        }
+        let next = self.selected_diff_file.map_or(0, |index| {
+            index.saturating_add(1).min(self.changed_files.len() - 1)
+        });
+        self.select_diff_file(next)
+    }
+
+    /// Select previous changed file.
+    pub(super) fn select_previous_diff_file(&mut self) -> bool {
+        if self.changed_files.is_empty() {
+            return false;
+        }
+        let previous = self
+            .selected_diff_file
+            .map_or(0, |index| index.saturating_sub(1));
+        self.select_diff_file(previous)
     }
 
     /// Return pending submissions that have not been committed by the session stream.
@@ -510,16 +572,27 @@ impl BmuxApp {
             return;
         };
         let path = summary.display_path();
-        if let Some(existing) = self
+        if let Some(existing_index) = self
             .changed_files
-            .iter_mut()
-            .find(|existing| existing.display_path() == path)
+            .iter()
+            .position(|existing| existing.display_path() == path)
         {
-            *existing = summary;
+            self.changed_files[existing_index] = summary;
+            if let Some(existing_lines) = self.diff_details.get_mut(existing_index) {
+                *existing_lines = lines;
+            }
+            self.selected_diff_file = Some(existing_index);
         } else {
             self.changed_files.push(summary);
+            self.diff_details.push(lines);
+            self.selected_diff_file = Some(self.changed_files.len().saturating_sub(1));
         }
-        self.diff_lines.extend(lines);
+        self.diff_scroll_offset = 0;
+        self.diff_lines = self
+            .diff_details
+            .iter()
+            .flat_map(|detail| detail.iter().cloned())
+            .collect();
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {

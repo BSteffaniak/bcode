@@ -141,7 +141,9 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         inner.width.saturating_sub(split).saturating_sub(1),
         inner.height,
     );
-    let mut diff_state = DiffViewState::default();
+    let mut diff_state = DiffViewState {
+        offset: app.diff_scroll_offset(),
+    };
     DiffView::new(app.diff_lines())
         .mode(DiffViewMode::Responsive)
         .fold_context(20, 3)

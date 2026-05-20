@@ -559,6 +559,18 @@ async fn handle_event<W: Write>(
             Ok(true)
         }
         Event::Key(stroke) => {
+            let changed = match stroke.key {
+                KeyCode::Char(']') if stroke.modifiers.is_empty() => {
+                    chat.app.select_next_diff_file()
+                }
+                KeyCode::Char('[') if stroke.modifiers.is_empty() => {
+                    chat.app.select_previous_diff_file()
+                }
+                _ => false,
+            };
+            if changed {
+                return Ok(true);
+            }
             if permission_dialog.is_some() {
                 return handle_permission_key(client, keymap, chat, permission_dialog, stroke)
                     .await;
@@ -602,6 +614,18 @@ fn picker_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
     y.checked_sub(5)
 }
 
+fn diff_file_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return None;
+    };
+    let area = terminal_area().ok()?;
+    let diff_top = area.height.saturating_sub(12);
+    if mouse.position.y < diff_top {
+        return None;
+    }
+    usize::from(mouse.position.y.saturating_sub(diff_top).saturating_sub(1)).into()
+}
+
 fn permission_click_approval(mouse: MouseEvent) -> Option<bool> {
     let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
         return None;
@@ -639,8 +663,24 @@ async fn handle_mouse(
     mouse: MouseEvent,
 ) -> Result<bool, TuiError> {
     match mouse.kind {
-        MouseEventKind::ScrollUp => Ok(chat.app.scroll_transcript_up(3)),
-        MouseEventKind::ScrollDown => Ok(chat.app.scroll_transcript_down(3)),
+        MouseEventKind::ScrollUp => {
+            if mouse.position.y >= terminal_area()?.height.saturating_sub(12)
+                && chat.app.scroll_diff_up(3)
+            {
+                Ok(true)
+            } else {
+                Ok(chat.app.scroll_transcript_up(3))
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if mouse.position.y >= terminal_area()?.height.saturating_sub(12)
+                && chat.app.scroll_diff_down(3)
+            {
+                Ok(true)
+            } else {
+                Ok(chat.app.scroll_transcript_down(3))
+            }
+        }
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
             if let Some(approve) = permission_click_approval(mouse) {
                 resolve_permission_dialog(client, chat, permission_dialog, approve).await
@@ -648,9 +688,14 @@ async fn handle_mouse(
                 Ok(false)
             }
         }
-        MouseEventKind::Down(
-            MouseButton::Left | MouseButton::Right | MouseButton::Middle | MouseButton::Other(_),
-        )
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(row) = diff_file_row_from_mouse(mouse) {
+                Ok(chat.app.select_diff_file(row))
+            } else {
+                Ok(false)
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right | MouseButton::Middle | MouseButton::Other(_))
         | MouseEventKind::Up(_)
         | MouseEventKind::Drag(_)
         | MouseEventKind::Move
