@@ -186,6 +186,7 @@ async fn submit_composer(client: &BcodeClient, app: &mut BmuxApp) -> Result<(), 
     match client.send_user_message(session_id, message).await {
         Ok(acceptance) => {
             if acceptance.queued {
+                app.mark_pending_submission_queued(acceptance.queue_position);
                 app.set_status(format!(
                     "Message queued{}",
                     acceptance
@@ -193,6 +194,7 @@ async fn submit_composer(client: &BcodeClient, app: &mut BmuxApp) -> Result<(), 
                         .map_or_else(String::new, |position| format!(" at #{position}"))
                 ));
             } else {
+                app.mark_pending_submission_sent();
                 app.set_status("Message sent".to_owned());
             }
             Ok(())

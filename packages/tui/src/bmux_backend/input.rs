@@ -6,6 +6,9 @@ use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyO
 
 use super::app::BmuxApp;
 
+const TRANSCRIPT_SCROLL_ROWS: usize = 3;
+const TRANSCRIPT_PAGE_ROWS: usize = 10;
+
 /// Result of handling one key stroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct KeyOutcome {
@@ -21,6 +24,13 @@ pub(super) fn handle_key(app: &mut BmuxApp, stroke: KeyStroke) -> KeyOutcome {
         app.request_exit();
         return KeyOutcome {
             redraw: true,
+            submitted: false,
+        };
+    }
+
+    if let Some(redraw) = handle_transcript_navigation(app, stroke) {
+        return KeyOutcome {
+            redraw,
             submitted: false,
         };
     }
@@ -57,6 +67,26 @@ pub(super) fn handle_key(app: &mut BmuxApp, stroke: KeyStroke) -> KeyOutcome {
             }
         }
         TextInputKeyOutcome::Ignored => KeyOutcome::default(),
+    }
+}
+
+const fn handle_transcript_navigation(app: &mut BmuxApp, stroke: KeyStroke) -> Option<bool> {
+    match stroke.key {
+        KeyCode::PageUp if stroke.modifiers.is_empty() => {
+            Some(app.scroll_transcript_up(TRANSCRIPT_PAGE_ROWS))
+        }
+        KeyCode::PageDown if stroke.modifiers.is_empty() => {
+            Some(app.scroll_transcript_down(TRANSCRIPT_PAGE_ROWS))
+        }
+        KeyCode::Home if stroke.modifiers.ctrl => Some(app.scroll_transcript_up(usize::MAX / 2)),
+        KeyCode::End if stroke.modifiers.ctrl => Some(app.scroll_transcript_to_bottom()),
+        KeyCode::Up if stroke.modifiers.ctrl => {
+            Some(app.scroll_transcript_up(TRANSCRIPT_SCROLL_ROWS))
+        }
+        KeyCode::Down if stroke.modifiers.ctrl => {
+            Some(app.scroll_transcript_down(TRANSCRIPT_SCROLL_ROWS))
+        }
+        _ => None,
     }
 }
 

@@ -18,7 +18,9 @@ pub(super) struct BmuxApp {
     input_history_index: Option<usize>,
     input_history_draft: Option<String>,
     transcript: Vec<TranscriptItem>,
+    pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
+    scroll_offset: usize,
     status: String,
     should_exit: bool,
     cursor_visible: bool,
@@ -43,7 +45,9 @@ impl BmuxApp {
             input_history_index: None,
             input_history_draft: None,
             transcript: Vec::new(),
+            pending_submissions: Vec::new(),
             pending_submission: None,
+            scroll_offset: 0,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
             should_exit: false,
             cursor_visible: true,
@@ -76,6 +80,18 @@ impl BmuxApp {
         &self.transcript
     }
 
+    /// Return pending submissions that have not been committed by the session stream.
+    #[must_use]
+    pub(super) fn pending_submissions(&self) -> &[PendingSubmission] {
+        &self.pending_submissions
+    }
+
+    /// Return the number of transcript rows hidden below the viewport.
+    #[must_use]
+    pub(super) const fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
     /// Return the current status line.
     #[must_use]
     pub(super) fn status(&self) -> &str {
@@ -91,6 +107,8 @@ impl BmuxApp {
     pub(super) fn stage_submission(&mut self) {
         let text = self.composer.text().to_owned();
         self.pending_submission = Some(text.clone());
+        self.pending_submissions
+            .push(PendingSubmission::new(text.clone()));
         self.input_history.push(text);
         self.input_history_index = None;
         self.input_history_draft = None;
@@ -102,9 +120,24 @@ impl BmuxApp {
         self.pending_submission.take().unwrap_or_default()
     }
 
-    /// Restore pending submission text into the composer after send failure.
+    /// Mark the oldest pending submission as queued by the server.
+    pub(super) fn mark_pending_submission_queued(&mut self, queue_position: Option<u32>) {
+        if let Some(pending) = self.pending_submissions.first_mut() {
+            pending.state = PendingSubmissionState::Queued { queue_position };
+        }
+    }
+
+    /// Mark the oldest pending submission as sent to the server.
+    pub(super) fn mark_pending_submission_sent(&mut self) {
+        if let Some(pending) = self.pending_submissions.first_mut() {
+            pending.state = PendingSubmissionState::Sent;
+        }
+    }
+
+    /// Remove the oldest pending submission and restore it into the composer.
     pub(super) fn restore_pending_submission(&mut self) {
         if let Some(text) = self.pending_submission.take() {
+            self.remove_pending_submission(&text);
             self.composer.insert_str(&text);
         }
         self.wake_cursor();
@@ -144,6 +177,29 @@ impl BmuxApp {
             self.replace_composer_with(&draft);
         }
         true
+    }
+
+    /// Scroll transcript up by rendered rows.
+    pub(super) const fn scroll_transcript_up(&mut self, rows: usize) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        self.scroll_offset = self.scroll_offset.saturating_add(rows);
+        true
+    }
+
+    /// Scroll transcript down by rendered rows.
+    pub(super) const fn scroll_transcript_down(&mut self, rows: usize) -> bool {
+        let previous = self.scroll_offset;
+        self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        self.scroll_offset != previous
+    }
+
+    /// Pin transcript to the newest rows.
+    pub(super) const fn scroll_transcript_to_bottom(&mut self) -> bool {
+        let changed = self.scroll_offset != 0;
+        self.scroll_offset = 0;
+        changed
     }
 
     /// Absorb replayed history events.
@@ -269,7 +325,18 @@ impl BmuxApp {
         self.wake_cursor();
     }
 
+    fn remove_pending_submission(&mut self, text: &str) {
+        if let Some(index) = self
+            .pending_submissions
+            .iter()
+            .position(|pending| pending.text == text)
+        {
+            self.pending_submissions.remove(index);
+        }
+    }
+
     fn push_user_message(&mut self, text: &str) {
+        self.remove_pending_submission(text);
         self.transcript
             .push(TranscriptItem::new("You", text.to_owned()));
     }
@@ -380,6 +447,48 @@ impl BmuxApp {
             format!("{skill_id}: {error}"),
         ));
     }
+}
+
+/// Pending user message not yet confirmed by the session stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingSubmission {
+    text: String,
+    state: PendingSubmissionState,
+}
+
+impl PendingSubmission {
+    const fn new(text: String) -> Self {
+        Self {
+            text,
+            state: PendingSubmissionState::Sending,
+        }
+    }
+
+    /// Return pending text.
+    #[must_use]
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Return pending state.
+    #[must_use]
+    pub(super) const fn state(&self) -> PendingSubmissionState {
+        self.state
+    }
+}
+
+/// Pending user message state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingSubmissionState {
+    /// Client request is in flight.
+    Sending,
+    /// Server accepted the request immediately.
+    Sent,
+    /// Server queued the request.
+    Queued {
+        /// Server-reported queue position.
+        queue_position: Option<u32>,
+    },
 }
 
 /// Renderable transcript item.

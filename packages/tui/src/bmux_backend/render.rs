@@ -8,7 +8,7 @@ use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_block::{TextBlock, TextWrap};
 
-use super::app::{BmuxApp, TranscriptItem};
+use super::app::{BmuxApp, PendingSubmission, PendingSubmissionState, TranscriptItem};
 
 /// Render one BMUX backend frame.
 pub(super) fn render(app: &BmuxApp, frame: &mut Frame<'_>) {
@@ -68,47 +68,82 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     }
 
-    let transcript = app.transcript();
-    let visible_items = usize::from(area.height).max(1);
-    let start = transcript.len().saturating_sub(visible_items);
+    let transcript_rows = transcript_render_rows(app);
+    let end = transcript_rows
+        .len()
+        .saturating_sub(app.scroll_offset())
+        .min(transcript_rows.len());
+    let start = end.saturating_sub(usize::from(area.height));
     let mut y = area.y;
-    for item in &transcript[start..] {
+    for row in &transcript_rows[start..end] {
         if y >= area.bottom() {
             break;
         }
-        y = render_transcript_item(
-            item,
-            Rect::new(area.x, y, area.width, area.bottom() - y),
-            frame,
-        );
+        frame.write_line(Rect::new(area.x, y, area.width, 1), row);
+        y = y.saturating_add(1);
     }
 }
 
-fn render_transcript_item(item: &TranscriptItem, area: Rect, frame: &mut Frame<'_>) -> u16 {
-    if area.is_empty() {
-        return area.y;
+fn transcript_render_rows(app: &BmuxApp) -> Vec<Line> {
+    let mut rows = Vec::new();
+    for item in app.transcript() {
+        push_transcript_item_rows(&mut rows, item);
     }
+    for pending in app.pending_submissions() {
+        push_pending_submission_rows(&mut rows, pending);
+    }
+    rows
+}
+
+fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem) {
     let role_style = role_style(item.role());
     let marker = if item.streaming() { " …" } else { "" };
-    let line = Line::from_spans(vec![
+    rows.push(Line::from_spans(vec![
         Span::styled(format!("{}{}", item.role(), marker), role_style),
         Span::raw(": "),
         Span::raw(first_line(item.text())),
-    ]);
-    frame.write_line(Rect::new(area.x, area.y, area.width, 1), &line);
+    ]));
 
-    let mut y = area.y.saturating_add(1);
     for continuation in item.text().lines().skip(1) {
-        if y >= area.bottom() {
-            break;
-        }
-        frame.write_line(
-            Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(2), 1),
-            &Line::from_spans(vec![Span::raw(continuation.to_owned())]),
-        );
-        y = y.saturating_add(1);
+        rows.push(Line::from_spans(vec![
+            Span::raw("  "),
+            Span::raw(continuation.to_owned()),
+        ]));
     }
-    y
+}
+
+fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmission) {
+    rows.push(Line::from_spans(vec![
+        Span::styled(
+            "You",
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ["),
+        Span::styled(
+            pending_label(pending.state()),
+            Style::new().fg(Color::BrightBlack),
+        ),
+        Span::raw("]: "),
+        Span::raw(first_line(pending.text())),
+    ]));
+
+    for continuation in pending.text().lines().skip(1) {
+        rows.push(Line::from_spans(vec![
+            Span::raw("  "),
+            Span::raw(continuation.to_owned()),
+        ]));
+    }
+}
+
+fn pending_label(state: PendingSubmissionState) -> String {
+    match state {
+        PendingSubmissionState::Sending => "sending".to_owned(),
+        PendingSubmissionState::Sent => "sent".to_owned(),
+        PendingSubmissionState::Queued { queue_position } => queue_position.map_or_else(
+            || "queued".to_owned(),
+            |position| format!("queued #{position}"),
+        ),
+    }
 }
 
 fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
