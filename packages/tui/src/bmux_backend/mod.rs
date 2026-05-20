@@ -3,6 +3,8 @@
 mod app;
 mod input;
 mod render;
+mod session_picker;
+mod session_picker_render;
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -10,9 +12,12 @@ use std::time::Duration;
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::SessionId;
+use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_text_edit::keyboard::TextKeymap;
 use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
+use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
 use crossterm::terminal::size;
 use tokio::sync::mpsc;
@@ -58,7 +63,7 @@ async fn run_event_loop<W: Write>(
     let client = BcodeClient::default_endpoint();
     let session_id = match session_id {
         Some(session_id) => session_id,
-        None => client.create_session(None).await?.id,
+        None => pick_session(terminal, &client).await?,
     };
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
     let (attached, event_task) =
@@ -117,6 +122,85 @@ async fn run_with_client<W: Write>(
     }
 
     Ok(())
+}
+
+async fn pick_session<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+) -> Result<SessionId, TuiError> {
+    let sessions = client.list_sessions().await?;
+    let mut picker = session_picker::SessionPickerApp::new(sessions);
+    loop {
+        terminal.resize(terminal_area()?);
+        terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
+        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => {
+                picker.filter_mut().insert_str(&text);
+                picker.refresh_filter();
+            }
+            Event::Key(stroke) => match handle_picker_key(&mut picker, stroke) {
+                PickerKeyOutcome::Continue => {}
+                PickerKeyOutcome::Create => return Ok(client.create_session(None).await?.id),
+                PickerKeyOutcome::Selected => {
+                    if let Some(session_id) = picker.selected_session_id() {
+                        return Ok(session_id);
+                    }
+                    picker.set_status("No session selected; press Ctrl-N to create one".to_owned());
+                }
+                PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
+            },
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Mouse(_)
+            | Event::Tick
+            | Event::User(_) => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerKeyOutcome {
+    Continue,
+    Create,
+    Selected,
+    Canceled,
+}
+
+fn handle_picker_key(
+    picker: &mut session_picker::SessionPickerApp,
+    stroke: KeyStroke,
+) -> PickerKeyOutcome {
+    if stroke.key == KeyCode::Escape {
+        return PickerKeyOutcome::Canceled;
+    }
+    if matches!(stroke.key, KeyCode::Char('n' | 'N')) && stroke.modifiers.ctrl {
+        return PickerKeyOutcome::Create;
+    }
+    match stroke.key {
+        KeyCode::Enter => PickerKeyOutcome::Selected,
+        KeyCode::Up if stroke.modifiers.is_empty() => {
+            picker.select_previous();
+            PickerKeyOutcome::Continue
+        }
+        KeyCode::Down if stroke.modifiers.is_empty() => {
+            picker.select_next();
+            PickerKeyOutcome::Continue
+        }
+        _ => {
+            let outcome = TextInputKeyHandler::new(
+                TextKeymap::default(),
+                TextInputEnterBehavior::InsertNewline,
+            )
+            .handle_key(picker.filter_mut(), stroke);
+            if outcome == TextInputKeyOutcome::Edited {
+                picker.refresh_filter();
+            }
+            PickerKeyOutcome::Continue
+        }
+    }
 }
 
 async fn attach_session_event_stream(
