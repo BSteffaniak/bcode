@@ -606,6 +606,25 @@ async fn handle_event<W: Write>(
     }
 }
 
+async fn update_slash_palette(
+    client: &BcodeClient,
+    chat: &ActiveChat,
+    slash_palette: &mut Option<slash_palette::SlashPalette>,
+) {
+    if chat.app.composer().text().starts_with('/') {
+        *slash_palette = Some(
+            slash_palette::SlashPalette::new(
+                client,
+                chat.app.session_id(),
+                chat.app.composer().text(),
+            )
+            .await,
+        );
+    } else {
+        *slash_palette = None;
+    }
+}
+
 async fn handle_chat_key<W: Write>(
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
@@ -646,11 +665,7 @@ async fn handle_chat_key<W: Write>(
         return Ok(true);
     }
     let outcome = input::handle_key(&mut chat.app, keymap, stroke);
-    if chat.app.composer().text().starts_with('/') {
-        modals.slash_palette = Some(slash_palette::SlashPalette::new(chat.app.composer().text()));
-    } else {
-        modals.slash_palette = None;
-    }
+    update_slash_palette(client, chat, &mut modals.slash_palette).await;
     if outcome.submitted
         && let Err(error) = submit_composer(client, keymap, chat, terminal).await
     {
@@ -954,11 +969,7 @@ async fn handle_slash_palette_key<W: Write>(
         }
         CommandPaletteKeyOutcome::Ignored => {
             let outcome = input::handle_key(&mut chat.app, keymap, stroke);
-            if chat.app.composer().text().starts_with('/') {
-                *slash_palette = Some(slash_palette::SlashPalette::new(chat.app.composer().text()));
-            } else {
-                *slash_palette = None;
-            }
+            update_slash_palette(client, chat, slash_palette).await;
             if outcome.submitted
                 && let Err(error) = submit_composer(client, keymap, chat, terminal).await
             {
@@ -1671,6 +1682,10 @@ async fn submit_composer<W: Write>(
         chat.app.clear_pending_submission();
         match slash_commands::execute(client, session_id, &message).await? {
             slash_commands::SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
+            slash_commands::SlashCommandOutcome::SystemNote(note) => {
+                chat.app.push_system_note(note);
+                chat.app.set_status("slash command handled".to_owned());
+            }
             slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
                 switch_session(client, chat, next_session_id).await?;
             }

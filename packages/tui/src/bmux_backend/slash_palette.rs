@@ -1,5 +1,7 @@
 //! Slash completion state for the BMUX backend.
 
+use bcode_client::BcodeClient;
+use bcode_session_models::SessionId;
 use bmux_tui::palette::{CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
@@ -19,14 +21,15 @@ struct SlashItem {
 
 impl SlashPalette {
     /// Create slash completion state.
-    #[must_use]
-    pub(super) fn new(query: &str) -> Self {
+    pub(super) async fn new(
+        client: &BcodeClient,
+        _session_id: Option<SessionId>,
+        query: &str,
+    ) -> Self {
         let mut state = CommandPaletteState::default();
         state.query.insert_str(query.trim_start_matches('/'));
-        Self {
-            items: slash_items(),
-            state,
-        }
+        let items = slash_items(client, query).await;
+        Self { items, state }
     }
 
     /// Return state mutably.
@@ -66,7 +69,61 @@ impl SlashPalette {
     }
 }
 
-fn slash_items() -> Vec<SlashItem> {
+async fn slash_items(client: &BcodeClient, query: &str) -> Vec<SlashItem> {
+    let trimmed = query.trim_start_matches('/');
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    if parts.first() == Some(&"agent")
+        && let Ok(agents) = client.list_agents().await
+    {
+        return agents
+            .into_iter()
+            .map(|agent| item(format!("/agent {}", agent.id), agent.name))
+            .collect();
+    }
+    if matches!(parts.first(), Some(&"skill"))
+        && let Ok(skills) = client.list_skills().await
+    {
+        return skills
+            .skills
+            .into_iter()
+            .flat_map(|skill| {
+                let description = skill
+                    .description
+                    .unwrap_or_else(|| "invoke skill".to_owned());
+                [
+                    item(format!("/skill {}", skill.id), description),
+                    item(format!("/skill describe {}", skill.id), "describe skill"),
+                ]
+            })
+            .collect();
+    }
+    if matches!(parts.first(), Some(&"model" | &"set-model"))
+        && let Ok(models) = client.session_model_list(None).await
+    {
+        return models
+            .models
+            .into_iter()
+            .map(|model| item(format!("/model {}", model.model_id), model.display_name))
+            .collect();
+    }
+    if matches!(parts.first(), Some(&"provider" | &"set-provider"))
+        && let Ok(services) = client.plugin_services().await
+    {
+        return services
+            .into_iter()
+            .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
+            .map(|service| {
+                item(
+                    format!("/provider {}", service.plugin_id),
+                    service.name.unwrap_or_else(|| "model provider".to_owned()),
+                )
+            })
+            .collect();
+    }
+    static_items()
+}
+
+fn static_items() -> Vec<SlashItem> {
     [
         ("/plan", "Switch to plan agent"),
         ("/build", "Switch to build agent"),
@@ -75,14 +132,22 @@ fn slash_items() -> Vec<SlashItem> {
         ("/compact", "Compact current session context"),
         ("/model", "Open model picker"),
         ("/models", "Open model picker"),
+        ("/set-model ", "Set model by id"),
+        ("/provider", "Show current provider"),
+        ("/set-provider ", "Set provider by id"),
         ("/skills", "Open skill picker"),
         ("/agent ", "Set session agent by id"),
         ("/skill ", "Invoke skill by id"),
+        ("/skill describe ", "Describe skill by id"),
     ]
     .into_iter()
-    .map(|(command, description)| SlashItem {
-        command: command.to_owned(),
-        description: description.to_owned(),
-    })
+    .map(|(command, description)| item(command, description))
     .collect()
+}
+
+fn item(command: impl Into<String>, description: impl Into<String>) -> SlashItem {
+    SlashItem {
+        command: command.into(),
+        description: description.into(),
+    }
 }
