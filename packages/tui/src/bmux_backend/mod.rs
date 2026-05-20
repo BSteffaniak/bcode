@@ -9,6 +9,8 @@ mod model_picker;
 mod model_picker_render;
 mod permission_dialog;
 mod permission_dialog_render;
+mod provider_picker;
+mod provider_picker_render;
 mod render;
 mod session_picker;
 mod session_picker_render;
@@ -795,6 +797,57 @@ async fn show_server_model_status(
     Ok(())
 }
 
+async fn pick_model_provider<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+) -> Result<Option<String>, TuiError> {
+    let providers = client
+        .plugin_services()
+        .await?
+        .into_iter()
+        .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
+        .collect::<Vec<_>>();
+    if providers.len() <= 1 {
+        return Ok(providers.first().map(|provider| provider.plugin_id.clone()));
+    }
+    let mut picker = provider_picker::ProviderPickerApp::new(providers);
+    loop {
+        terminal.resize(terminal_area()?);
+        terminal
+            .draw(|frame| provider_picker_render::render_provider_picker(&mut picker, frame))?;
+        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => {
+                picker.filter_mut().insert_str(&text);
+                picker.refresh_filter();
+            }
+            Event::Key(stroke) => match stroke.key {
+                KeyCode::Escape => return Ok(None),
+                KeyCode::Enter => return Ok(picker.selected_provider_id()),
+                KeyCode::Up => picker.select_previous(),
+                KeyCode::Down => picker.select_next(),
+                _ => {
+                    let outcome = TextInputKeyHandler::new(
+                        TextKeymap::default(),
+                        TextInputEnterBehavior::InsertNewline,
+                    )
+                    .handle_key(picker.filter_mut(), stroke);
+                    if outcome == TextInputKeyOutcome::Edited {
+                        picker.refresh_filter();
+                    }
+                }
+            },
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Mouse(_)
+            | Event::Tick
+            | Event::User(_) => {}
+        }
+    }
+}
+
 async fn pick_model_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
@@ -804,8 +857,16 @@ async fn pick_model_for_session<W: Write>(
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let models = client.session_model_list(None).await?.models;
-    let mut picker = model_picker::ModelPickerApp::new(models);
+    let provider_plugin_id = pick_model_provider(terminal, client).await?;
+    let models = client
+        .session_model_list(provider_plugin_id.clone())
+        .await?
+        .models;
+    let status = provider_plugin_id.as_ref().map_or_else(
+        || "Select a model".to_owned(),
+        |provider| format!("Select a model from {provider}"),
+    );
+    let mut picker = model_picker::ModelPickerApp::new_with_status(models, status);
     loop {
         terminal.resize(terminal_area()?);
         terminal.draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
@@ -823,9 +884,16 @@ async fn pick_model_for_session<W: Write>(
                 KeyCode::Enter => {
                     if let Some(model_id) = picker.selected_model_id() {
                         client
-                            .set_session_model(session_id, None, model_id.clone())
+                            .set_session_model(
+                                session_id,
+                                provider_plugin_id.clone(),
+                                model_id.clone(),
+                            )
                             .await?;
-                        chat.app.set_status(format!("model set to {model_id}"));
+                        chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
+                            || format!("model set to {model_id}"),
+                            |provider| format!("model set to {provider}/{model_id}"),
+                        ));
                         return Ok(());
                     }
                 }

@@ -1,92 +1,78 @@
-//! BMUX backend model picker state.
+//! BMUX backend provider picker state.
 
-use bcode_model::ModelInfo;
+use bcode_ipc::PluginServiceSummary;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 
-/// Model picker state.
+/// Model provider picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ModelPickerApp {
-    models: Vec<ModelInfo>,
+pub(super) struct ProviderPickerApp {
+    providers: Vec<PluginServiceSummary>,
     filter: TextEditBuffer,
     list_state: ListState,
     filtered_indices: Vec<usize>,
-    status: String,
 }
 
-impl ModelPickerApp {
-    /// Create a model picker with status text.
+impl ProviderPickerApp {
+    /// Create a provider picker.
     #[must_use]
-    pub(super) fn new_with_status(models: Vec<ModelInfo>, status: impl Into<String>) -> Self {
-        let filtered_indices = (0..models.len()).collect::<Vec<_>>();
+    pub(super) fn new(providers: Vec<PluginServiceSummary>) -> Self {
+        let filtered_indices = (0..providers.len()).collect::<Vec<_>>();
         let mut list_state = ListState::new();
         if !filtered_indices.is_empty() {
             list_state.select(Some(0));
         }
         Self {
-            models,
+            providers,
             filter: TextEditBuffer::new(),
             list_state,
             filtered_indices,
-            status: status.into(),
         }
     }
 
-    /// Return filter input.
     #[must_use]
     pub(super) const fn filter(&self) -> &TextEditBuffer {
         &self.filter
     }
 
-    /// Return filter input mutably.
     pub(super) const fn filter_mut(&mut self) -> &mut TextEditBuffer {
         &mut self.filter
     }
 
-    /// Return list state mutably.
     pub(super) const fn list_state_mut(&mut self) -> &mut ListState {
         &mut self.list_state
     }
 
-    /// Return status.
-    #[must_use]
-    pub(super) fn status(&self) -> &str {
-        &self.status
-    }
-
-    /// Return visible list items.
     #[must_use]
     pub(super) fn list_items(&self) -> Vec<ListItem> {
         if self.filtered_indices.is_empty() {
             return vec![ListItem::new(Line::from_spans(vec![Span::styled(
-                "No matching models.",
+                "No matching providers.",
                 Style::new().fg(Color::BrightBlack),
             )]))];
         }
         self.filtered_indices
             .iter()
-            .map(|index| model_item(&self.models[*index]))
+            .map(|index| provider_item(&self.providers[*index]))
             .collect()
     }
 
-    /// Return selected model id.
     #[must_use]
-    pub(super) fn selected_model_id(&self) -> Option<String> {
+    pub(super) fn selected_provider_id(&self) -> Option<String> {
         let selected = self.list_state.selected?;
         let index = *self.filtered_indices.get(selected)?;
-        Some(self.models[index].model_id.clone())
+        Some(self.providers[index].plugin_id.clone())
     }
 
-    /// Refresh filter.
     pub(super) fn refresh_filter(&mut self) {
         let query = self.filter.text().trim().to_ascii_lowercase();
         self.filtered_indices = self
-            .models
+            .providers
             .iter()
             .enumerate()
-            .filter_map(|(index, model)| model_matches(model, &query).then_some(index))
+            .filter_map(|(index, provider)| provider_matches(provider, &query).then_some(index))
             .collect();
         if self.filtered_indices.is_empty() {
             self.list_state.select(None);
@@ -101,35 +87,39 @@ impl ModelPickerApp {
         }
     }
 
-    /// Move selection down.
     pub(super) fn select_next(&mut self) {
         self.list_state.select_next(self.filtered_indices.len());
     }
 
-    /// Move selection up.
     pub(super) fn select_previous(&mut self) {
         self.list_state.select_previous(self.filtered_indices.len());
     }
 }
 
-fn model_item(model: &ModelInfo) -> ListItem {
-    let marker = if model.is_default { "* " } else { "  " };
+fn provider_item(provider: &PluginServiceSummary) -> ListItem {
+    let label = provider.name.as_deref().unwrap_or(&provider.plugin_id);
+    let description = provider.description.as_deref().unwrap_or("model provider");
     ListItem::new(Line::from_spans(vec![
-        Span::styled(marker, Style::new().fg(Color::BrightBlack)),
-        Span::styled(
-            model.model_id.clone(),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(label.to_owned(), Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(
-            model.display_name.clone(),
+            provider.plugin_id.clone(),
             Style::new().fg(Color::BrightBlack),
         ),
+        Span::raw("  "),
+        Span::styled(description.to_owned(), Style::new().fg(Color::BrightBlack)),
     ]))
 }
 
-fn model_matches(model: &ModelInfo, query: &str) -> bool {
+fn provider_matches(provider: &PluginServiceSummary, query: &str) -> bool {
     query.is_empty()
-        || model.model_id.to_ascii_lowercase().contains(query)
-        || model.display_name.to_ascii_lowercase().contains(query)
+        || provider.plugin_id.to_ascii_lowercase().contains(query)
+        || provider
+            .name
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_lowercase().contains(query))
+        || provider
+            .description
+            .as_deref()
+            .is_some_and(|description| description.to_ascii_lowercase().contains(query))
 }
