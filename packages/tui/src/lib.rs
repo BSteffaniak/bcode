@@ -4727,7 +4727,7 @@ impl ratatui::widgets::Widget for &ChatApp {
             && self.command_palette.is_none()
             && !self.search_mode
         {
-            render_slash_completion(area, chunks[4], buf, completion);
+            render_slash_completion(area, chunks[3], buf, completion);
         }
         if let Some(palette) = &self.command_palette {
             render_command_palette(area, buf, palette);
