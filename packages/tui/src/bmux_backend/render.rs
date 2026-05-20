@@ -29,9 +29,17 @@ pub(super) fn render(app: &BmuxApp, frame: &mut Frame<'_>) {
     );
     render_composer(app, composer, frame);
 
-    let body_height = composer.y.saturating_sub(area.y.saturating_add(1));
+    let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
     render_body(body, frame);
+
+    let status = Rect::new(
+        area.x,
+        composer.y.saturating_sub(1),
+        area.width,
+        u16::from(composer.y > area.y.saturating_add(1)),
+    );
+    render_status(app, status, frame);
 }
 
 fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -51,9 +59,22 @@ fn render_body(area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    TextBlock::new("BMUX backend skeleton is running. Composer input is local-only until parity migration continues.")
+    TextBlock::new(
+        "BMUX backend is running on bmux_tui. Composer submissions are sent to the active Bcode session; transcript parity migration is next.",
+    )
         .wrap(TextWrap::Character)
         .render(area.inset(Insets::all(1)), frame);
+}
+
+fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.is_empty() {
+        return;
+    }
+    let line = Line::from_spans(vec![Span::styled(
+        app.status().to_owned(),
+        Style::new().fg(Color::BrightBlack),
+    )]);
+    frame.write_line(area, &line);
 }
 
 fn render_composer(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -66,6 +87,7 @@ fn render_composer(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         .padding(Insets::new(0, 1, 0, 1));
     panel.render(area, frame);
     TextInput::new(app.composer())
-        .placeholder("Type here; Enter clears local draft")
+        .placeholder("Type here; Enter sends")
+        .cursor_visible(app.cursor_visible())
         .render(panel.inner_area(area), frame);
 }

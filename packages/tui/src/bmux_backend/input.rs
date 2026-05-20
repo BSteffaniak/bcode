@@ -6,17 +6,44 @@ use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyO
 
 use super::app::BmuxApp;
 
+/// Result of handling one key stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct KeyOutcome {
+    /// Whether the caller should redraw the UI.
+    pub(super) redraw: bool,
+    /// Whether the composer was submitted.
+    pub(super) submitted: bool,
+}
+
 /// Handle a key stroke.
-pub(super) fn handle_key(app: &mut BmuxApp, stroke: KeyStroke) {
+pub(super) fn handle_key(app: &mut BmuxApp, stroke: KeyStroke) -> KeyOutcome {
     if should_exit(stroke) {
         app.request_exit();
-        return;
+        return KeyOutcome {
+            redraw: true,
+            submitted: false,
+        };
     }
 
     let outcome = TextInputKeyHandler::new(TextKeymap::default(), TextInputEnterBehavior::Submit)
         .handle_key(app.composer_mut(), stroke);
-    if outcome == TextInputKeyOutcome::Submitted {
-        app.composer_mut().clear();
+    match outcome {
+        TextInputKeyOutcome::Submitted => {
+            app.stage_submission();
+            app.wake_cursor();
+            KeyOutcome {
+                redraw: true,
+                submitted: true,
+            }
+        }
+        TextInputKeyOutcome::Edited => {
+            app.wake_cursor();
+            KeyOutcome {
+                redraw: true,
+                submitted: false,
+            }
+        }
+        TextInputKeyOutcome::Ignored => KeyOutcome::default(),
     }
 }
 

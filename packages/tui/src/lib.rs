@@ -140,7 +140,7 @@ async fn run_bmux(session_id: Option<bcode_session_models::SessionId>) -> Result
     #[cfg(feature = "tui-bmux")]
     {
         tokio::task::yield_now().await;
-        bmux_backend::run(session_id)
+        bmux_backend::run(session_id).await
     }
     #[cfg(not(feature = "tui-bmux"))]
     {
