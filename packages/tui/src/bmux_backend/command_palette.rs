@@ -15,6 +15,12 @@ pub(super) enum PaletteCommand {
     ShowModelStatus,
     /// Show server default model/provider.
     ShowServerModelStatus,
+    /// Show available skills.
+    ListSkills,
+    /// Show active skills for the current session.
+    ActiveSkills,
+    /// Show BMUX backend help.
+    Help,
     /// Open the session picker in rename mode.
     RenameSession,
     /// Open the session picker in delete mode.
@@ -32,6 +38,9 @@ impl PaletteCommand {
             Self::SwitchSession => "session.switch",
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
+            Self::ListSkills => "skills.list",
+            Self::ActiveSkills => "skills.active",
+            Self::Help => "help",
             Self::RenameSession => "session.rename",
             Self::DeleteSession => "session.delete",
             Self::CancelTurn => "turn.cancel",
@@ -45,6 +54,9 @@ impl PaletteCommand {
             "session.switch" => Some(Self::SwitchSession),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
+            "skills.list" => Some(Self::ListSkills),
+            "skills.active" => Some(Self::ActiveSkills),
+            "help" => Some(Self::Help),
             "session.rename" => Some(Self::RenameSession),
             "session.delete" => Some(Self::DeleteSession),
             "turn.cancel" => Some(Self::CancelTurn),
@@ -116,6 +128,24 @@ fn palette_items() -> Vec<PaletteItem> {
             "Show Server Model Defaults",
             "Show selected default provider/model",
             "server model provider default status",
+        ),
+        item(
+            PaletteCommand::ListSkills,
+            "List Skills",
+            "Show available skills",
+            "skills list available",
+        ),
+        item(
+            PaletteCommand::ActiveSkills,
+            "Active Skills",
+            "Show active session skills",
+            "skills active context enabled",
+        ),
+        item(
+            PaletteCommand::Help,
+            "Help",
+            "Show BMUX backend shortcuts",
+            "help shortcuts keybindings",
         ),
         item(
             PaletteCommand::RenameSession,

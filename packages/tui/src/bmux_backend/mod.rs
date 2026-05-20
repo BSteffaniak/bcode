@@ -674,6 +674,15 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::ShowServerModelStatus => {
             show_server_model_status(client, chat).await?;
         }
+        PaletteCommand::ListSkills => {
+            list_skills(client, chat).await?;
+        }
+        PaletteCommand::ActiveSkills => {
+            show_active_skills(client, chat).await?;
+        }
+        PaletteCommand::Help => {
+            show_bmux_help(chat);
+        }
         PaletteCommand::RenameSession => {
             pick_session_for_mutation(terminal, client, SessionPickerStartMode::Rename).await?;
         }
@@ -751,6 +760,58 @@ async fn show_server_model_status(
     chat.app.set_status(text.clone());
     chat.app.push_system_note(text);
     Ok(())
+}
+
+async fn list_skills(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let skills = client.list_skills().await?;
+    let mut lines = vec![format!("Available skills: {}", skills.skills.len())];
+    lines.extend(skills.skills.iter().take(40).map(|skill| {
+        let description = skill.description.as_deref().unwrap_or("no description");
+        format!("* {} — {description}", skill.id)
+    }));
+    if skills.skills.len() > 40 {
+        lines.push(format!("… {} more", skills.skills.len() - 40));
+    }
+    if !skills.diagnostics.is_empty() {
+        lines.push(format!("Diagnostics: {}", skills.diagnostics.len()));
+    }
+    chat.app
+        .set_status(format!("listed {} skills", skills.skills.len()));
+    chat.app.push_system_note(lines.join("\n"));
+    Ok(())
+}
+
+async fn show_active_skills(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    let skills = client.active_skills(session_id).await?;
+    let mut lines = vec![format!("Active skills: {}", skills.len())];
+    lines.extend(skills.iter().map(|skill| {
+        let suffix = if skill.truncated { " truncated" } else { "" };
+        format!(
+            "* {} — {} bytes{} from {}",
+            skill.skill_id, skill.bytes_loaded, suffix, skill.source.label
+        )
+    }));
+    chat.app
+        .set_status(format!("active skills: {}", skills.len()));
+    chat.app.push_system_note(lines.join("\n"));
+    Ok(())
+}
+
+fn show_bmux_help(chat: &mut ActiveChat) {
+    chat.app.push_system_note(
+        [
+            "BMUX backend help",
+            "* Use the command palette for sessions, model status, skills, cancel, and compact.",
+            "* Transcript scrolling, composer history, session picker, and permissions honor configured keybindings where wired.",
+            "* Permission dialogs: approve/deny or move focus and confirm.",
+        ]
+        .join("\n"),
+    );
+    chat.app.set_status("shown help".to_owned());
 }
 
 async fn switch_session(
