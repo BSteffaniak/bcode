@@ -429,17 +429,52 @@ pub struct TuiConfig {
     /// Mouse interaction configuration.
     #[serde(default)]
     pub mouse: TuiMouseConfig,
+    /// Provider-exposed reasoning / thinking display configuration.
+    #[serde(default)]
+    pub thinking: TuiThinkingConfig,
 }
 
 impl TuiConfig {
     fn merge(&mut self, next: Self) {
         self.keybindings.merge(next.keybindings);
         self.mouse = next.mouse;
+        self.thinking = next.thinking;
     }
 }
 
 /// Terminal UI mouse interaction configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Terminal UI configuration for provider-exposed reasoning / thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiThinkingConfig {
+    /// Whether provider-exposed reasoning should be shown in the TUI.
+    #[serde(default)]
+    pub show: bool,
+    /// How provider-exposed reasoning should be rendered.
+    #[serde(default)]
+    pub mode: TuiThinkingMode,
+}
+
+impl Default for TuiThinkingConfig {
+    fn default() -> Self {
+        Self {
+            show: false,
+            mode: TuiThinkingMode::Summary,
+        }
+    }
+}
+
+/// Rendering mode for provider-exposed reasoning / thinking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiThinkingMode {
+    /// Show provider reasoning summaries when available.
+    #[default]
+    Summary,
+    /// Show raw provider reasoning when available.
+    Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiMouseConfig {
     /// Maximum milliseconds between clicks in the same sequence.
     #[serde(default = "default_mouse_multi_click_ms")]
@@ -1490,12 +1525,26 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
 }
 
 fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
-    if tui.keybindings.is_empty() {
-        return;
+    if !tui.keybindings.is_empty() {
+        write_tui_keybinding_section(output, "chat", &tui.keybindings.chat);
+        write_tui_keybinding_section(output, "permission", &tui.keybindings.permission);
+        write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
     }
-    write_tui_keybinding_section(output, "chat", &tui.keybindings.chat);
-    write_tui_keybinding_section(output, "permission", &tui.keybindings.permission);
-    write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
+    writeln!(output, "[tui.thinking]").expect("writing to string should not fail");
+    writeln!(output, "show = {}", tui.thinking.show).expect("writing to string should not fail");
+    writeln!(
+        output,
+        "mode = \"{}\"",
+        tui_thinking_mode_name(tui.thinking.mode)
+    )
+    .expect("writing to string should not fail");
+}
+
+const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
+    match mode {
+        TuiThinkingMode::Summary => "summary",
+        TuiThinkingMode::Raw => "raw",
+    }
 }
 
 fn write_tui_keybinding_section(

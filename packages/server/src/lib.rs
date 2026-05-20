@@ -91,6 +91,7 @@ struct ServerState {
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     provider_state: Mutex<ProviderStateStore>,
+    show_thinking: bool,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
@@ -361,6 +362,7 @@ struct ServerStateInit {
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
     provider_state: ProviderStateStore,
+    show_thinking: bool,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
@@ -387,6 +389,7 @@ impl ServerState {
             prompt_cache_mode: init.prompt_cache_mode,
             conversation_reuse_mode: init.conversation_reuse_mode,
             provider_state: Mutex::new(init.provider_state),
+            show_thinking: init.show_thinking,
             observability: init.observability,
             trace_store: init.trace_store,
             max_tool_rounds: init.max_tool_rounds,
@@ -502,6 +505,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
             tool_output_context_chars: config.model.tool_output.context_chars,
+            show_thinking: config.tui.thinking.show,
             model_streaming: config.model.streaming,
             auto_compaction: config.model.compaction,
             skill_context_bytes: config.skills.max_context_bytes,
@@ -2660,6 +2664,8 @@ const fn session_event_is_safe_compaction_cut(event: &bcode_session_models::Sess
     matches!(
         &event.kind,
         SessionEventKind::UserMessage { .. }
+            | SessionEventKind::AssistantReasoningDelta { .. }
+            | SessionEventKind::AssistantReasoningMessage { .. }
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ToolCallFinished { .. }
             | SessionEventKind::SystemMessage { .. }
@@ -3289,6 +3295,7 @@ async fn poll_model_turn(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_provider_turn_event(
     state: &ServerState,
     session_id: SessionId,
@@ -3367,7 +3374,16 @@ async fn handle_provider_turn_event(
             )
             .await;
         }
-        ProviderTurnEvent::ReasoningDelta { .. } => {
+        ProviderTurnEvent::ReasoningDelta { text } => {
+            if state.show_thinking {
+                let _ = state
+                    .sessions
+                    .append_event(
+                        session_id,
+                        SessionEventKind::AssistantReasoningDelta { text },
+                    )
+                    .await;
+            }
             append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
         }
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
@@ -5228,6 +5244,9 @@ fn compact_attach_history(
 
     for event in history {
         match event.kind {
+            SessionEventKind::AssistantReasoningDelta { .. } => {
+                pending_assistant_deltas.push(event);
+            }
             SessionEventKind::AssistantDelta { .. } => pending_assistant_deltas.push(event),
             SessionEventKind::AssistantMessage { .. } => {
                 pending_assistant_deltas.clear();

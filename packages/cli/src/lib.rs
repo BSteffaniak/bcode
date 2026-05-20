@@ -2632,6 +2632,10 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::UserMessage { client_id, text } => {
             println!("#{} {client_id}: {text}", event.sequence);
         }
+        SessionEventKind::AssistantReasoningDelta { text }
+        | SessionEventKind::AssistantReasoningMessage { text } => {
+            println!("thinking: {text}");
+        }
         SessionEventKind::AssistantDelta { text } => {
             println!("#{} assistant delta: {text}", event.sequence);
         }

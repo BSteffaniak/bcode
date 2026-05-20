@@ -674,9 +674,18 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
     let config = bcode_config::load_config()?;
     let keymap = KeyMap::from_config(&config.tui);
+    let thinking_visible = config.tui.thinking.show;
     let mut terminal = TerminalGuard::enter()?;
     let session_id = resolve_session(&client, session_id, &keymap, &mut terminal).await?;
-    run_chat(client, session_id, keymap, config.tui.mouse, terminal).await
+    run_chat(
+        client,
+        session_id,
+        keymap,
+        config.tui.mouse,
+        thinking_visible,
+        terminal,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -685,6 +694,7 @@ async fn run_chat(
     session_id: SessionId,
     keymap: KeyMap,
     mouse_config: TuiMouseConfig,
+    thinking_visible: bool,
     mut terminal: TerminalGuard,
 ) -> Result<(), TuiError> {
     let mut session_id = session_id;
@@ -699,7 +709,8 @@ async fn run_chat(
         &attached.history,
         &attached.input_history,
         &keymap,
-        mouse_config.clone(),
+        mouse_config,
+        thinking_visible,
     );
     if let Some(status) = status {
         app.selected_provider_plugin_id = status.selected_provider_plugin_id;
@@ -758,7 +769,7 @@ async fn run_chat(
                                     &event_sender,
                                     &mut app,
                                     &keymap,
-                                    mouse_config.clone(),
+                                    mouse_config,
                                     next_session_id,
                                 )
                                 .await?;
@@ -774,7 +785,7 @@ async fn run_chat(
                                         &event_sender,
                                         &mut app,
                                         &keymap,
-                                        mouse_config.clone(),
+                                        mouse_config,
                                         next_session_id,
                                     )
                                     .await?;
@@ -862,6 +873,7 @@ async fn switch_chat_session(
         &attached.input_history,
         keymap,
         mouse_config,
+        app.thinking_visible,
     );
     if let Some(status) = status {
         app.selected_provider_plugin_id = status.selected_provider_plugin_id;
@@ -2670,6 +2682,10 @@ enum TranscriptBlock {
         text: String,
         streaming: bool,
     },
+    AssistantReasoning {
+        text: String,
+        streaming: bool,
+    },
     ToolCall {
         name: String,
         arguments_json: String,
@@ -2742,6 +2758,7 @@ struct ChatApp {
     token_usage: TokenUsageMeter,
     model_status_refresh_needed: bool,
     current_agent_id: String,
+    thinking_visible: bool,
     current_thinking_level: Option<ReasoningEffort>,
     activity: ActivityState,
     activity_started_at: Option<Instant>,
@@ -3087,6 +3104,7 @@ impl ChatApp {
             &input_history,
             keymap,
             TuiMouseConfig::default(),
+            false,
         )
     }
 
@@ -3096,6 +3114,7 @@ impl ChatApp {
         input_history: &[SessionInputHistoryEntry],
         keymap: &KeyMap,
         mouse_config: TuiMouseConfig,
+        thinking_visible: bool,
     ) -> Self {
         let mut app = Self {
             session_id,
@@ -3123,6 +3142,7 @@ impl ChatApp {
             model_status_refresh_needed: false,
             current_agent_id: "build".to_string(),
             current_thinking_level: None,
+            thinking_visible,
             activity: ActivityState::Idle,
             activity_started_at: None,
             render_tick: Cell::new(0),
@@ -3321,6 +3341,8 @@ impl ChatApp {
             }
             SessionEventKind::ClientAttached { .. }
             | SessionEventKind::ClientDetached { .. }
+            | SessionEventKind::AssistantReasoningDelta { .. }
+            | SessionEventKind::AssistantReasoningMessage { .. }
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ModelChanged { .. }
             | SessionEventKind::AgentChanged { .. }
@@ -3644,7 +3666,11 @@ impl ChatApp {
             if let SessionEventKind::ModelUsage { usage, .. } = &event.kind {
                 self.token_usage.absorb(usage);
             }
-            if !matches!(event.kind, SessionEventKind::AssistantDelta { .. }) {
+            if !matches!(
+                event.kind,
+                SessionEventKind::AssistantDelta { .. }
+                    | SessionEventKind::AssistantReasoningDelta { .. }
+            ) {
                 blocks.extend(transcript_blocks_from_event(event));
             }
         }
@@ -3680,6 +3706,12 @@ impl ChatApp {
 
     fn absorb_session_event_with_scroll_clamp(&mut self, event: &SessionEvent, clamp_scroll: bool) {
         match &event.kind {
+            SessionEventKind::AssistantReasoningDelta { text } => {
+                self.push_reasoning_delta_with_scroll_clamp(text, clamp_scroll);
+            }
+            SessionEventKind::AssistantReasoningMessage { text } => {
+                self.push_reasoning_message_with_scroll_clamp(text, clamp_scroll);
+            }
             SessionEventKind::AssistantDelta { text } => {
                 self.push_assistant_delta_with_scroll_clamp(text, clamp_scroll);
                 return;
@@ -3787,8 +3819,53 @@ impl ChatApp {
         }
     }
 
+    fn push_reasoning_delta_with_scroll_clamp(&mut self, text: &str, clamp_scroll: bool) {
+        if !self.thinking_visible {
+            return;
+        }
+        match self.blocks.last_mut() {
+            Some(TranscriptBlock::AssistantReasoning {
+                text: existing,
+                streaming: true,
+            }) => existing.push_str(text),
+            _ => self.blocks.push(TranscriptBlock::AssistantReasoning {
+                text: text.to_string(),
+                streaming: true,
+            }),
+        }
+        if clamp_scroll {
+            self.clamp_scroll();
+        }
+    }
+
+    fn push_reasoning_message_with_scroll_clamp(&mut self, text: &str, clamp_scroll: bool) {
+        if !self.thinking_visible {
+            return;
+        }
+        match self.blocks.last_mut() {
+            Some(TranscriptBlock::AssistantReasoning {
+                text: existing,
+                streaming,
+            }) if *streaming => {
+                existing.push_str(text);
+                *streaming = false;
+            }
+            _ => self.blocks.push(TranscriptBlock::AssistantReasoning {
+                text: text.to_string(),
+                streaming: false,
+            }),
+        }
+        if clamp_scroll {
+            self.clamp_scroll();
+        }
+    }
+
     fn finish_streaming_block_if_needed(&mut self) {
-        if let Some(TranscriptBlock::Assistant { streaming, .. }) = self.blocks.last_mut() {
+        if let Some(
+            TranscriptBlock::Assistant { streaming, .. }
+            | TranscriptBlock::AssistantReasoning { streaming, .. },
+        ) = self.blocks.last_mut()
+        {
             *streaming = false;
         }
     }
@@ -4209,7 +4286,7 @@ impl ChatApp {
             "switch-provider" | "set-provider" => {
                 self.status = "use slash /provider <plugin-id>".to_string();
             }
-            "set-thinking" | "thinking" => {
+            "set-thinking" => {
                 // cycle levels on repeated selection
                 let next = match self.current_thinking_level {
                     Some(ReasoningEffort::Low) => ReasoningEffort::Medium,
@@ -4221,7 +4298,7 @@ impl ChatApp {
             }
             "help" => {
                 self.status =
-                    "Slash: /sessions, /new, /models, /model <id>, /provider <id>, /thinking low|medium|high, /compact, /clear, /help"
+                    "Slash: /sessions, /new, /models, /model <id>, /provider <id>, /thinking show|hide|toggle|status|effort low|medium|high, /compact, /clear, /help"
                         .to_string();
             }
             "compact" => {
@@ -4269,7 +4346,66 @@ impl ChatApp {
                 self.status = format!("switching provider to {}", parts[1]);
                 true
             }
-            "thinking" | "set-thinking" if parts.len() > 1 => {
+            "thinking" => {
+                match parts.get(1).copied() {
+                    Some("show" | "on") => {
+                        self.thinking_visible = true;
+                        self.status = "thinking display enabled for this TUI".to_string();
+                    }
+                    Some("hide" | "off") => {
+                        self.thinking_visible = false;
+                        self.status = "thinking display disabled for this TUI".to_string();
+                    }
+                    Some("toggle") => {
+                        self.thinking_visible = !self.thinking_visible;
+                        self.status = if self.thinking_visible {
+                            "thinking display enabled for this TUI"
+                        } else {
+                            "thinking display disabled for this TUI"
+                        }
+                        .to_string();
+                    }
+                    Some("status") | None => {
+                        let state = if self.thinking_visible {
+                            "shown"
+                        } else {
+                            "hidden"
+                        };
+                        self.status = format!("thinking display is {state}");
+                    }
+                    Some("effort") if parts.len() > 2 => {
+                        let lvl = match parts[2] {
+                            "low" => Some(ReasoningEffort::Low),
+                            "medium" => Some(ReasoningEffort::Medium),
+                            "high" => Some(ReasoningEffort::High),
+                            _ => None,
+                        };
+                        if let Some(l) = lvl {
+                            self.current_thinking_level = Some(l);
+                            self.status = format!("thinking effort set to {:?}", l);
+                        } else {
+                            self.status = "invalid thinking effort (low|medium|high)".to_string();
+                        }
+                    }
+                    Some("low" | "medium" | "high") => {
+                        let lvl = match parts[1] {
+                            "low" => ReasoningEffort::Low,
+                            "medium" => ReasoningEffort::Medium,
+                            "high" => ReasoningEffort::High,
+                            _ => unreachable!(),
+                        };
+                        self.current_thinking_level = Some(lvl);
+                        self.status = format!("thinking effort set to {:?}", lvl);
+                    }
+                    Some(_) => {
+                        self.status =
+                            "usage: /thinking show|hide|toggle|status|effort low|medium|high"
+                                .to_string();
+                    }
+                }
+                true
+            }
+            "set-thinking" if parts.len() > 1 => {
                 let level_str = parts[1].to_lowercase();
                 let level = match level_str.as_str() {
                     "low" => Some(ReasoningEffort::Low),
@@ -4359,7 +4495,7 @@ fn builtin_commands() -> Vec<CommandInfo> {
         CommandInfo {
             id: "thinking".into(),
             name: "/thinking".into(),
-            description: Some("low | medium | high (for reasoning models)".into()),
+            description: Some("show | hide | toggle | status | effort low|medium|high".into()),
             requires_args: true,
             category: Some("model".into()),
         },
@@ -4426,7 +4562,7 @@ fn slash_command_usage(command_id: &str) -> Option<&'static str> {
     match command_id {
         "model" => Some("<model-id> [--provider <plugin-id>]"),
         "provider" => Some("<plugin-id>"),
-        "thinking" => Some("low|medium|high"),
+        "thinking" => Some("show|hide|toggle|status|effort low|medium|high"),
         "agent" => Some("[agent-id]"),
         "skill" => Some("active | describe <id> | off <id> | <id>"),
         _ => None,
@@ -4549,7 +4685,8 @@ fn slash_argument_completion_items(
             provider_ids
         }
         "provider" | "set-provider" => provider_ids,
-        "thinking" | "set-thinking" => {
+        "thinking" => &[],
+        "set-thinking" => {
             return static_argument_items(query, &["low", "medium", "high"]);
         }
         "agent" => agent_ids,
@@ -5842,6 +5979,16 @@ impl TranscriptBlock {
                 },
                 search_query,
             ),
+            Self::AssistantReasoning { text, streaming } => render_message_block(
+                if *streaming {
+                    "thinking …"
+                } else {
+                    "thinking"
+                },
+                text,
+                COLOR_MUTED,
+                search_query,
+            ),
             Self::ToolCall {
                 name,
                 arguments_json,
@@ -6057,6 +6204,18 @@ fn transcript_blocks_from_event(event: &SessionEvent) -> Vec<TranscriptBlock> {
         | SessionEventKind::TraceEvent { .. } => Vec::new(),
         SessionEventKind::UserMessage { text, .. } => {
             vec![TranscriptBlock::User { text: text.clone() }]
+        }
+        SessionEventKind::AssistantReasoningDelta { text } => {
+            vec![TranscriptBlock::AssistantReasoning {
+                text: text.clone(),
+                streaming: true,
+            }]
+        }
+        SessionEventKind::AssistantReasoningMessage { text } => {
+            vec![TranscriptBlock::AssistantReasoning {
+                text: text.clone(),
+                streaming: false,
+            }]
         }
         SessionEventKind::AssistantDelta { text } => vec![TranscriptBlock::Assistant {
             text: text.clone(),
@@ -6483,6 +6642,7 @@ mod tests {
             &input_history,
             &keymap,
             TuiMouseConfig::default(),
+            false,
         );
 
         app.previous_input_history();
@@ -8292,7 +8452,7 @@ mod tests {
     fn slash_completion_exact_selected_argument_match_is_submit_ready() {
         let keymap = KeyMap::from_config(&bcode_config::TuiConfig::default());
         let mut app = ChatApp::new(SessionId::new(), &[], &keymap);
-        app.set_input_text("/thinking high");
+        app.set_input_text("/set-thinking high");
         app.update_slash_completion();
 
         assert!(app.slash_completion_has_exact_selected_match());

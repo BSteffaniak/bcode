@@ -451,6 +451,8 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
         SessionEventKind::UserMessage { .. } => "user_message",
+        SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
+        SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
