@@ -2,21 +2,30 @@
 
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
-use bmux_tui::palette::{CommandPaletteState, PaletteItem};
-use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+
+const MAX_SLASH_COMPLETIONS: usize = 8;
 
 /// Slash completion picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SlashPalette {
     items: Vec<SlashItem>,
-    state: CommandPaletteState,
+    selected: usize,
 }
 
+/// One slash completion item.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SlashItem {
+pub(super) struct SlashItem {
     command: String,
     description: String,
+}
+
+/// Visible slash completion item with its source index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VisibleSlashItem<'a> {
+    /// Source item index.
+    pub(super) source_index: usize,
+    /// Completion item.
+    pub(super) item: &'a SlashItem,
 }
 
 impl SlashPalette {
@@ -26,64 +35,128 @@ impl SlashPalette {
         _session_id: Option<SessionId>,
         query: &str,
     ) -> Self {
-        let mut state = CommandPaletteState::default();
-        state.query.insert_str(query.trim_start_matches('/'));
         let items = slash_items(client, query).await;
-        Self { items, state }
+        Self { items, selected: 0 }
     }
 
-    /// Return state mutably.
-    pub(super) const fn state_mut(&mut self) -> &mut CommandPaletteState {
-        &mut self.state
-    }
-
-    /// Return palette widget items.
+    /// Return true if there are no completions.
     #[must_use]
-    pub(super) fn palette_items(&self) -> Vec<PaletteItem> {
+    pub(super) const fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Return the selected source item index.
+    #[must_use]
+    pub(super) fn selected_index(&self) -> usize {
+        self.selected.min(self.items.len().saturating_sub(1))
+    }
+
+    /// Return the number of completion items.
+    #[must_use]
+    pub(super) const fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Return visible items for the popup height.
+    pub(super) fn visible_items(
+        &self,
+        height: usize,
+    ) -> impl Iterator<Item = VisibleSlashItem<'_>> {
+        let selected = self.selected_index();
+        let start = selected.saturating_sub(height.saturating_sub(1));
         self.items
             .iter()
-            .map(|item| {
-                PaletteItem::new(
-                    item.command.clone(),
-                    Line::from_spans(vec![
-                        Span::styled(
-                            item.command.clone(),
-                            Style::new().add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("  "),
-                        Span::styled(
-                            item.description.clone(),
-                            Style::new().fg(Color::BrightBlack),
-                        ),
-                    ]),
-                )
-                .search_text(format!("{} {}", item.command, item.description))
-            })
-            .collect()
+            .enumerate()
+            .skip(start)
+            .take(height)
+            .map(|(source_index, item)| VisibleSlashItem { source_index, item })
     }
 
-    /// Return command at source index.
+    /// Return the currently selected command.
     #[must_use]
-    pub(super) fn command_at(&self, index: usize) -> Option<&str> {
-        self.items.get(index).map(|item| item.command.as_str())
+    pub(super) fn selected_command(&self) -> Option<&str> {
+        self.items
+            .get(self.selected_index())
+            .map(|item| item.command.as_str())
+    }
+
+    /// Select a command if it exists in the current completion list.
+    pub(super) fn select_command(&mut self, command: &str) {
+        if let Some(index) = self.items.iter().position(|item| item.command == command) {
+            self.selected = index;
+        }
+    }
+
+    /// Select an item by visible row, returning the selected command.
+    pub(super) fn select_visible_row(&mut self, row: usize, height: usize) -> Option<&str> {
+        let selected = self.selected_index();
+        let start = selected.saturating_sub(height.saturating_sub(1));
+        self.selected = start
+            .saturating_add(row)
+            .min(self.items.len().saturating_sub(1));
+        self.selected_command()
+    }
+
+    /// Move selection to previous item.
+    pub(super) const fn move_previous(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Move selection to next item.
+    pub(super) fn move_next(&mut self) {
+        self.selected = self
+            .selected
+            .saturating_add(1)
+            .min(self.items.len().saturating_sub(1));
+    }
+
+    /// Return whether the selected command exactly matches current composer text.
+    #[must_use]
+    pub(super) fn selected_matches(&self, text: &str) -> bool {
+        self.selected_command()
+            .is_some_and(|command| text == command.trim_end())
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_items(items: Vec<(&str, &str)>) -> Self {
+        Self {
+            items: items
+                .into_iter()
+                .map(|(command, description)| item(command, description))
+                .collect(),
+            selected: 0,
+        }
+    }
+}
+
+impl SlashItem {
+    /// Return replacement command text.
+    #[must_use]
+    pub(super) fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// Return item description.
+    #[must_use]
+    pub(super) fn description(&self) -> &str {
+        &self.description
     }
 }
 
 async fn slash_items(client: &BcodeClient, query: &str) -> Vec<SlashItem> {
     let trimmed = query.trim_start_matches('/');
     let parts = trimmed.split_whitespace().collect::<Vec<_>>();
-    if parts.first() == Some(&"agent")
+    let candidates = if parts.first() == Some(&"agent")
         && let Ok(agents) = client.list_agents().await
     {
-        return agents
+        agents
             .into_iter()
             .map(|agent| item(format!("/agent {}", agent.id), agent.name))
-            .collect();
-    }
-    if matches!(parts.first(), Some(&"skill"))
+            .collect()
+    } else if matches!(parts.first(), Some(&"skill"))
         && let Ok(skills) = client.list_skills().await
     {
-        return skills
+        skills
             .skills
             .into_iter()
             .flat_map(|skill| {
@@ -95,21 +168,19 @@ async fn slash_items(client: &BcodeClient, query: &str) -> Vec<SlashItem> {
                     item(format!("/skill describe {}", skill.id), "describe skill"),
                 ]
             })
-            .collect();
-    }
-    if matches!(parts.first(), Some(&"model" | &"set-model"))
+            .collect()
+    } else if matches!(parts.first(), Some(&"model" | &"set-model"))
         && let Ok(models) = client.session_model_list(None).await
     {
-        return models
+        models
             .models
             .into_iter()
             .map(|model| item(format!("/model {}", model.model_id), model.display_name))
-            .collect();
-    }
-    if matches!(parts.first(), Some(&"provider" | &"set-provider"))
+            .collect()
+    } else if matches!(parts.first(), Some(&"provider" | &"set-provider"))
         && let Ok(services) = client.plugin_services().await
     {
-        return services
+        services
             .into_iter()
             .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
             .map(|service| {
@@ -118,9 +189,37 @@ async fn slash_items(client: &BcodeClient, query: &str) -> Vec<SlashItem> {
                     service.name.unwrap_or_else(|| "model provider".to_owned()),
                 )
             })
-            .collect();
+            .collect()
+    } else {
+        static_items()
+    };
+    filter_items(candidates, trimmed)
+        .into_iter()
+        .take(MAX_SLASH_COMPLETIONS)
+        .collect()
+}
+
+fn filter_items(items: Vec<SlashItem>, query: &str) -> Vec<SlashItem> {
+    let normalized_query = normalize(query);
+    if normalized_query.is_empty() {
+        return items;
     }
-    static_items()
+    items
+        .into_iter()
+        .filter(|item| {
+            normalize(&item.command).contains(&normalized_query)
+                || normalize(&item.description).contains(&normalized_query)
+        })
+        .collect()
+}
+
+fn normalize(value: &str) -> String {
+    value
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn static_items() -> Vec<SlashItem> {
@@ -149,5 +248,22 @@ fn item(command: impl Into<String>, description: impl Into<String>) -> SlashItem
     SlashItem {
         command: command.into(),
         description: description.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_items, static_items};
+
+    #[test]
+    fn filters_static_slash_items_by_typed_prefix() {
+        let items = filter_items(static_items(), "pl");
+
+        assert_eq!(items[0].command(), "/plan");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.command().contains("pl") || item.description().contains("pl"))
+        );
     }
 }

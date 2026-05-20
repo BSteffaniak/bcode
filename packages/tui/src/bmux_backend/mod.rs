@@ -18,6 +18,7 @@ mod skill_picker;
 mod skill_picker_render;
 mod slash_commands;
 mod slash_palette;
+mod slash_palette_render;
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -33,7 +34,6 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
 use bmux_tui::terminal::Terminal;
-use bmux_tui::widget::StatefulWidget;
 use crossterm::terminal::size;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -186,12 +186,10 @@ async fn run_with_client<W: Write>(
         }
 
         if needs_redraw {
-            let area = terminal.area();
             terminal.draw(|frame| {
                 render::render(&mut chat.app, frame);
-                if let Some(slash_palette) = &mut modals.slash_palette {
-                    let items = slash_palette.palette_items();
-                    CommandPalette::new(&items).render(area, frame, slash_palette.state_mut());
+                if let Some(slash_palette) = &modals.slash_palette {
+                    slash_palette_render::render_palette(slash_palette, frame);
                 }
                 if let Some(palette) = &mut modals.palette {
                     command_palette_render::render_palette(palette, frame);
@@ -571,19 +569,13 @@ async fn handle_event<W: Write>(
         }
         Event::Key(stroke) => handle_chat_key(client, keymap, chat, modals, terminal, stroke).await,
         Event::Paste(text) => {
-            if let Some(slash_palette) = &mut modals.slash_palette {
-                slash_palette
-                    .state_mut()
-                    .query
-                    .insert_str(text.trim_start_matches('/'));
-                return Ok(true);
-            }
             if let Some(palette) = &mut modals.palette {
                 palette.state_mut().query.insert_str(&text);
                 return Ok(true);
             }
             chat.app.composer_mut().insert_str(&text);
             chat.app.wake_cursor();
+            update_slash_palette(client, chat, &mut modals.slash_palette).await;
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
@@ -599,6 +591,14 @@ async fn handle_event<W: Write>(
                 )
                 .await;
             }
+            if modals.slash_palette.is_some() {
+                return Ok(handle_slash_palette_mouse(
+                    chat,
+                    &mut modals.slash_palette,
+                    terminal,
+                    mouse,
+                ));
+            }
             let hit_id = mouse_hit_id(terminal.hits(), mouse);
             handle_mouse(hit_id, client, chat, &mut modals.permission_dialog, mouse).await
         }
@@ -612,14 +612,19 @@ async fn update_slash_palette(
     slash_palette: &mut Option<slash_palette::SlashPalette>,
 ) {
     if chat.app.composer().text().starts_with('/') {
-        *slash_palette = Some(
-            slash_palette::SlashPalette::new(
-                client,
-                chat.app.session_id(),
-                chat.app.composer().text(),
-            )
-            .await,
-        );
+        let previous = slash_palette
+            .as_ref()
+            .and_then(|palette| palette.selected_command().map(str::to_owned));
+        let mut next = slash_palette::SlashPalette::new(
+            client,
+            chat.app.session_id(),
+            chat.app.composer().text(),
+        )
+        .await;
+        if let Some(previous) = previous {
+            next.select_command(&previous);
+        }
+        *slash_palette = (!next.is_empty()).then_some(next);
     } else {
         *slash_palette = None;
     }
@@ -952,22 +957,35 @@ async fn handle_slash_palette_key<W: Write>(
     let Some(active_palette) = slash_palette else {
         return Ok(false);
     };
-    let items = active_palette.palette_items();
-    let widget = CommandPalette::new(&items);
-    let outcome = widget.handle_key(active_palette.state_mut(), terminal.area().height, stroke);
-    match outcome {
-        CommandPaletteKeyOutcome::Activated(index) => {
-            if let Some(command) = active_palette.command_at(index).map(str::to_owned) {
-                chat.app.replace_composer_with(&command);
+    match stroke.key {
+        KeyCode::Up if stroke.modifiers.is_empty() => {
+            active_palette.move_previous();
+            Ok(true)
+        }
+        KeyCode::Down if stroke.modifiers.is_empty() => {
+            active_palette.move_next();
+            Ok(true)
+        }
+        KeyCode::Tab if stroke.modifiers.is_empty() => {
+            accept_slash_completion(chat, slash_palette);
+            Ok(true)
+        }
+        KeyCode::Enter if stroke.modifiers.is_empty() => {
+            if active_palette.selected_matches(chat.app.composer().text()) {
+                *slash_palette = None;
+                if let Err(error) = submit_composer(client, keymap, chat, terminal).await {
+                    report_client_error(&mut chat.app, "send failed", &error);
+                }
+            } else {
+                accept_slash_completion(chat, slash_palette);
             }
+            Ok(true)
+        }
+        KeyCode::Escape if stroke.modifiers.is_empty() => {
             *slash_palette = None;
             Ok(true)
         }
-        CommandPaletteKeyOutcome::Canceled => {
-            *slash_palette = None;
-            Ok(true)
-        }
-        CommandPaletteKeyOutcome::Ignored => {
+        _ => {
             let outcome = input::handle_key(&mut chat.app, keymap, stroke);
             update_slash_palette(client, chat, slash_palette).await;
             if outcome.submitted
@@ -975,12 +993,53 @@ async fn handle_slash_palette_key<W: Write>(
             {
                 report_client_error(&mut chat.app, "send failed", &error);
             }
-            Ok(outcome.redraw)
-        }
-        CommandPaletteKeyOutcome::QueryEdited | CommandPaletteKeyOutcome::SelectionMoved => {
-            Ok(true)
+            Ok(outcome.redraw || slash_palette.is_some())
         }
     }
+}
+
+fn accept_slash_completion(
+    chat: &mut ActiveChat,
+    slash_palette: &mut Option<slash_palette::SlashPalette>,
+) {
+    let Some(active_palette) = slash_palette else {
+        return;
+    };
+    if let Some(command) = active_palette.selected_command().map(str::to_owned) {
+        chat.app.replace_composer_with(&command);
+    }
+    *slash_palette = None;
+}
+
+fn handle_slash_palette_mouse<W: Write>(
+    chat: &mut ActiveChat,
+    slash_palette: &mut Option<slash_palette::SlashPalette>,
+    terminal: &Terminal<&mut W>,
+    mouse: MouseEvent,
+) -> bool {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return false;
+    };
+    let Some(active_palette) = slash_palette else {
+        return false;
+    };
+    let Some(row) = slash_palette_render::slash_palette_row_from_mouse(
+        terminal.area(),
+        mouse.position.x,
+        mouse.position.y,
+        active_palette.item_count(),
+    ) else {
+        *slash_palette = None;
+        return true;
+    };
+    if let Some(command) = active_palette
+        .select_visible_row(row, usize::from(terminal.area().height))
+        .map(str::to_owned)
+    {
+        chat.app.replace_composer_with(&command);
+        *slash_palette = None;
+    }
+    true
 }
 
 async fn handle_palette_mouse<W: Write>(
@@ -1756,7 +1815,7 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
 
-    use super::{app::BmuxApp, render};
+    use super::{app::BmuxApp, render, slash_palette, slash_palette_render};
 
     #[test]
     fn render_includes_status_and_composer() {
@@ -1772,6 +1831,24 @@ mod tests {
         assert!(buffer.row_symbols(3).unwrap().contains("BMUX backend"));
         assert!(buffer.row_symbols(4).unwrap().contains("Composer"));
         assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn slash_palette_renders_above_composer() {
+        let palette = slash_palette::SlashPalette::from_items(vec![
+            ("/plan", "Switch to plan agent"),
+            ("/build", "Switch to build agent"),
+        ]);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+        let mut frame = Frame::new(&mut buffer);
+
+        slash_palette_render::render_palette(&palette, &mut frame);
+        let output = rendered_text(&buffer);
+
+        assert!(output.contains("Slash Commands"));
+        assert!(output.contains("/plan"));
+        assert!(buffer.row_symbols(0).unwrap().trim().is_empty());
+        assert!(buffer.row_symbols(10).unwrap().contains("Slash Commands"));
     }
 
     #[test]
