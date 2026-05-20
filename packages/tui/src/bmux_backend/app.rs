@@ -3,7 +3,8 @@
 use std::time::Instant;
 
 use bcode_session_models::{
-    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId,
+    SessionInputHistoryEntry,
 };
 use bmux_text_edit::TextEditBuffer;
 
@@ -21,6 +22,8 @@ pub(super) struct BmuxApp {
     pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
     scroll_offset: usize,
+    older_history_cursor: Option<SessionHistoryCursor>,
+    loading_older_history: bool,
     activity: ActivityState,
     status: String,
     should_exit: bool,
@@ -49,6 +52,10 @@ impl BmuxApp {
             pending_submissions: Vec::new(),
             pending_submission: None,
             scroll_offset: 0,
+            older_history_cursor: history.first().map(|event| SessionHistoryCursor {
+                sequence: event.sequence,
+            }),
+            loading_older_history: false,
             activity: ActivityState::Idle,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
             should_exit: false,
@@ -92,6 +99,35 @@ impl BmuxApp {
     #[must_use]
     pub(super) const fn scroll_offset(&self) -> usize {
         self.scroll_offset
+    }
+
+    /// Return whether older history may be available.
+    #[must_use]
+    pub(super) const fn has_older_history(&self) -> bool {
+        self.older_history_cursor.is_some()
+    }
+
+    /// Return whether an older-history request is in flight.
+    #[must_use]
+    pub(super) const fn loading_older_history(&self) -> bool {
+        self.loading_older_history
+    }
+
+    /// Mark older history as loading or idle.
+    pub(super) const fn set_loading_older_history(&mut self, loading: bool) {
+        self.loading_older_history = loading;
+    }
+
+    /// Return the cursor for loading older history.
+    #[must_use]
+    pub(super) const fn older_history_cursor(&self) -> Option<SessionHistoryCursor> {
+        self.older_history_cursor
+    }
+
+    /// Return whether the viewport is near the oldest loaded event.
+    #[must_use]
+    pub(super) const fn should_load_older_history(&self) -> bool {
+        self.older_history_cursor.is_some() && !self.loading_older_history && self.scroll_offset > 0
     }
 
     /// Return the current activity state.
@@ -215,6 +251,28 @@ impl BmuxApp {
         for event in events {
             self.absorb_session_event(event);
         }
+    }
+
+    /// Prepend older history and preserve approximate viewport position.
+    pub(super) fn prepend_older_history(&mut self, events: &[SessionEvent], has_more: bool) {
+        let added = events.len();
+        let mut older = Vec::with_capacity(self.transcript.len().saturating_add(added));
+        for event in events {
+            if let Some(item) = transcript_item_from_event(event) {
+                older.push(item);
+            }
+        }
+        older.append(&mut self.transcript);
+        self.transcript = older;
+        self.scroll_offset = self.scroll_offset.saturating_add(added);
+        self.older_history_cursor = if has_more {
+            events.first().map(|event| SessionHistoryCursor {
+                sequence: event.sequence,
+            })
+        } else {
+            None
+        };
+        self.loading_older_history = false;
     }
 
     /// Absorb one live session event.
@@ -471,6 +529,70 @@ impl BmuxApp {
             "Skill error",
             format!("{skill_id}: {error}"),
         ));
+    }
+}
+
+fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
+    match &event.kind {
+        SessionEventKind::UserMessage { text, .. } => {
+            Some(TranscriptItem::new("You", text.clone()))
+        }
+        SessionEventKind::AssistantDelta { text } => {
+            Some(TranscriptItem::new_streaming("Assistant", text.clone()))
+        }
+        SessionEventKind::AssistantMessage { text } => {
+            Some(TranscriptItem::new("Assistant", text.clone()))
+        }
+        SessionEventKind::SystemMessage { text } => {
+            Some(TranscriptItem::new("System", text.clone()))
+        }
+        SessionEventKind::ToolCallRequested { tool_name, .. } => {
+            Some(TranscriptItem::new("Tool", format!("running {tool_name}")))
+        }
+        SessionEventKind::ToolCallFinished {
+            result, is_error, ..
+        } => Some(TranscriptItem::new(
+            if *is_error { "Tool error" } else { "Tool" },
+            result.clone(),
+        )),
+        SessionEventKind::PermissionRequested { tool_name, .. } => Some(TranscriptItem::new(
+            "Permission",
+            format!("waiting for approval: {tool_name}"),
+        )),
+        SessionEventKind::ContextCompacted { summary, .. } => Some(TranscriptItem::new(
+            "Compaction",
+            format!("context compacted: {summary}"),
+        )),
+        SessionEventKind::SkillInvoked { skill_id, .. } => {
+            Some(TranscriptItem::new("Skill", format!("invoked {skill_id}")))
+        }
+        SessionEventKind::SkillInvocationFailed {
+            skill_id, error, ..
+        } => Some(TranscriptItem::new(
+            "Skill error",
+            format!("{skill_id}: {error}"),
+        )),
+        SessionEventKind::AssistantReasoningDelta { text } => {
+            Some(TranscriptItem::new_streaming("Reasoning", text.clone()))
+        }
+        SessionEventKind::AssistantReasoningMessage { text } => {
+            Some(TranscriptItem::new("Reasoning", text.clone()))
+        }
+        SessionEventKind::PermissionResolved { .. }
+        | SessionEventKind::ModelChanged { .. }
+        | SessionEventKind::ModelTurnStarted { .. }
+        | SessionEventKind::ModelTurnFinished { .. }
+        | SessionEventKind::ModelUsage { .. }
+        | SessionEventKind::SessionRenamed { .. }
+        | SessionEventKind::SkillSuggested { .. }
+        | SessionEventKind::SkillActivated { .. }
+        | SessionEventKind::SkillDeactivated { .. }
+        | SessionEventKind::SkillContextLoaded { .. }
+        | SessionEventKind::TraceEvent { .. }
+        | SessionEventKind::SessionCreated { .. }
+        | SessionEventKind::ClientAttached { .. }
+        | SessionEventKind::ClientDetached { .. }
+        | SessionEventKind::AgentChanged { .. } => None,
     }
 }
 

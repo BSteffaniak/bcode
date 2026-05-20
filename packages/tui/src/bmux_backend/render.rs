@@ -96,9 +96,21 @@ fn transcript_render_rows(app: &BmuxApp, width: u16) -> Vec<Line> {
     for pending in app.pending_submissions() {
         push_pending_submission_rows(&mut rows, pending, width);
     }
+    if app.has_older_history() || app.loading_older_history() {
+        rows.insert(
+            0,
+            Line::from_spans(vec![Span::styled(
+                if app.loading_older_history() {
+                    "Loading older history…"
+                } else {
+                    "Scroll up to load older history"
+                },
+                Style::new().fg(Color::BrightBlack),
+            )]),
+        );
+    }
     rows
 }
-
 fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
     let role_style = role_style(item.role());
     let marker = if item.streaming() { " …" } else { "" };

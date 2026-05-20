@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
-use bcode_session_models::SessionId;
+use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery, SessionId};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::keyboard::TextKeymap;
 use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event};
@@ -36,6 +36,7 @@ use super::TuiError;
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
+const OLDER_HISTORY_EVENT_LIMIT: usize = 500;
 
 /// Run the BMUX-native TUI backend.
 ///
@@ -117,6 +118,11 @@ async fn run_with_client<W: Write>(
             }
         }
 
+        if chat.app.should_load_older_history() {
+            load_older_history(client, chat).await?;
+            needs_redraw = true;
+        }
+
         if permission_dialog.is_none()
             && let Some(permission) = client
                 .list_permissions()
@@ -163,6 +169,34 @@ async fn run_with_client<W: Write>(
         }
     }
 
+    Ok(())
+}
+
+async fn load_older_history(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let Some(cursor) = chat.app.older_history_cursor() else {
+        return Ok(());
+    };
+    chat.app.set_loading_older_history(true);
+    match client
+        .session_history_page(
+            chat.session_id,
+            SessionHistoryQuery {
+                cursor: Some(cursor),
+                limit: OLDER_HISTORY_EVENT_LIMIT,
+                direction: SessionHistoryDirection::Backward,
+            },
+        )
+        .await
+    {
+        Ok(page) => {
+            chat.app.prepend_older_history(&page.events, page.has_more);
+        }
+        Err(error) => {
+            chat.app.set_loading_older_history(false);
+            chat.app
+                .set_status(format!("older history load failed: {error}"));
+        }
+    }
     Ok(())
 }
 
