@@ -370,7 +370,20 @@ fn handle_picker_filter_key(
             | BmuxAction::TranscriptLineUp
             | BmuxAction::TranscriptLineDown
             | BmuxAction::PermissionApprove
-            | BmuxAction::PermissionDeny => PickerKeyOutcome::Continue,
+            | BmuxAction::PermissionDeny
+            | BmuxAction::InputNewLine
+            | BmuxAction::EditorMoveLeft
+            | BmuxAction::EditorMoveRight
+            | BmuxAction::EditorMoveWordLeft
+            | BmuxAction::EditorMoveWordRight
+            | BmuxAction::EditorMoveStart
+            | BmuxAction::EditorMoveEnd
+            | BmuxAction::EditorDeleteBackward
+            | BmuxAction::EditorDeleteForward
+            | BmuxAction::EditorDeleteWordBackward
+            | BmuxAction::EditorDeleteWordForward
+            | BmuxAction::EditorDeleteToStart
+            | BmuxAction::EditorDeleteToEnd => PickerKeyOutcome::Continue,
         };
     }
     match stroke.key {
@@ -588,7 +601,20 @@ async fn handle_permission_key(
         | BmuxAction::TranscriptLineDown
         | BmuxAction::SessionNew
         | BmuxAction::SessionRename
-        | BmuxAction::SessionDelete => Ok(false),
+        | BmuxAction::SessionDelete
+        | BmuxAction::InputNewLine
+        | BmuxAction::EditorMoveLeft
+        | BmuxAction::EditorMoveRight
+        | BmuxAction::EditorMoveWordLeft
+        | BmuxAction::EditorMoveWordRight
+        | BmuxAction::EditorMoveStart
+        | BmuxAction::EditorMoveEnd
+        | BmuxAction::EditorDeleteBackward
+        | BmuxAction::EditorDeleteForward
+        | BmuxAction::EditorDeleteWordBackward
+        | BmuxAction::EditorDeleteWordForward
+        | BmuxAction::EditorDeleteToStart
+        | BmuxAction::EditorDeleteToEnd => Ok(false),
     }
 }
 

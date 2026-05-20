@@ -6,7 +6,6 @@ use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyO
 
 use super::app::BmuxApp;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
-
 const TRANSCRIPT_SCROLL_ROWS: usize = 3;
 const TRANSCRIPT_PAGE_ROWS: usize = 10;
 
@@ -23,6 +22,14 @@ pub(super) struct KeyOutcome {
 pub(super) fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> KeyOutcome {
     if let Some(outcome) = handle_chat_action(app, keymap.action_for_key(BmuxScope::Chat, stroke)) {
         return outcome;
+    }
+    if let Some(command) = keymap.editor_command_for_key(stroke) {
+        app.composer_mut().apply_command(command);
+        app.wake_cursor();
+        return KeyOutcome {
+            redraw: true,
+            submitted: false,
+        };
     }
 
     let outcome = TextInputKeyHandler::new(TextKeymap::default(), TextInputEnterBehavior::Submit)
@@ -91,7 +98,20 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
         | BmuxAction::SelectCancel
         | BmuxAction::SessionNew
         | BmuxAction::SessionRename
-        | BmuxAction::SessionDelete => return None,
+        | BmuxAction::SessionDelete
+        | BmuxAction::InputNewLine
+        | BmuxAction::EditorMoveLeft
+        | BmuxAction::EditorMoveRight
+        | BmuxAction::EditorMoveWordLeft
+        | BmuxAction::EditorMoveWordRight
+        | BmuxAction::EditorMoveStart
+        | BmuxAction::EditorMoveEnd
+        | BmuxAction::EditorDeleteBackward
+        | BmuxAction::EditorDeleteForward
+        | BmuxAction::EditorDeleteWordBackward
+        | BmuxAction::EditorDeleteWordForward
+        | BmuxAction::EditorDeleteToStart
+        | BmuxAction::EditorDeleteToEnd => return None,
     };
     Some(outcome)
 }

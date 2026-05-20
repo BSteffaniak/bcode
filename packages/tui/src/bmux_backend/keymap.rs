@@ -40,6 +40,19 @@ pub(super) enum BmuxAction {
     SessionNew,
     SessionRename,
     SessionDelete,
+    InputNewLine,
+    EditorMoveLeft,
+    EditorMoveRight,
+    EditorMoveWordLeft,
+    EditorMoveWordRight,
+    EditorMoveStart,
+    EditorMoveEnd,
+    EditorDeleteBackward,
+    EditorDeleteForward,
+    EditorDeleteWordBackward,
+    EditorDeleteWordForward,
+    EditorDeleteToStart,
+    EditorDeleteToEnd,
 }
 
 impl BmuxAction {
@@ -66,6 +79,19 @@ impl BmuxAction {
             "tui.session.new" => Self::SessionNew,
             "tui.session.rename" => Self::SessionRename,
             "tui.session.delete" => Self::SessionDelete,
+            "tui.input.newLine" | "tui.input.newline" => Self::InputNewLine,
+            "tui.editor.moveCursorLeft" => Self::EditorMoveLeft,
+            "tui.editor.moveCursorRight" => Self::EditorMoveRight,
+            "tui.editor.moveCursorWordLeft" => Self::EditorMoveWordLeft,
+            "tui.editor.moveCursorWordRight" => Self::EditorMoveWordRight,
+            "tui.editor.moveCursorStart" => Self::EditorMoveStart,
+            "tui.editor.moveCursorEnd" => Self::EditorMoveEnd,
+            "tui.editor.deleteCharBackward" => Self::EditorDeleteBackward,
+            "tui.editor.deleteCharForward" => Self::EditorDeleteForward,
+            "tui.editor.deleteWordBackward" => Self::EditorDeleteWordBackward,
+            "tui.editor.deleteWordForward" => Self::EditorDeleteWordForward,
+            "tui.editor.deleteToStart" => Self::EditorDeleteToStart,
+            "tui.editor.deleteToEnd" => Self::EditorDeleteToEnd,
             _ => return None,
         })
     }
@@ -105,6 +131,54 @@ impl BmuxKeyMap {
                 .find_map(|(binding, action)| (*binding == stroke).then_some(*action))
         })
     }
+
+    /// Return the configured editor command for `stroke`.
+    #[must_use]
+    pub(super) fn editor_command_for_key(
+        &self,
+        stroke: KeyStroke,
+    ) -> Option<bmux_text_edit::TextEditCommand> {
+        use bmux_text_edit::{TextDelete, TextEditCommand, TextMotion};
+
+        Some(match self.action_for_key(BmuxScope::Chat, stroke)? {
+            BmuxAction::InputNewLine => TextEditCommand::Insert('\n'),
+            BmuxAction::EditorMoveLeft => TextEditCommand::Move(TextMotion::Left),
+            BmuxAction::EditorMoveRight => TextEditCommand::Move(TextMotion::Right),
+            BmuxAction::EditorMoveWordLeft => TextEditCommand::Move(TextMotion::WordLeft),
+            BmuxAction::EditorMoveWordRight => TextEditCommand::Move(TextMotion::WordRight),
+            BmuxAction::EditorMoveStart => TextEditCommand::Move(TextMotion::Start),
+            BmuxAction::EditorMoveEnd => TextEditCommand::Move(TextMotion::End),
+            BmuxAction::EditorDeleteBackward => TextEditCommand::Delete(TextDelete::Backward),
+            BmuxAction::EditorDeleteForward => TextEditCommand::Delete(TextDelete::Forward),
+            BmuxAction::EditorDeleteWordBackward => {
+                TextEditCommand::Delete(TextDelete::WordBackward)
+            }
+            BmuxAction::EditorDeleteWordForward => TextEditCommand::Delete(TextDelete::WordForward),
+            BmuxAction::EditorDeleteToStart => TextEditCommand::Delete(TextDelete::ToStart),
+            BmuxAction::EditorDeleteToEnd => TextEditCommand::Delete(TextDelete::ToEnd),
+            BmuxAction::InputSubmit
+            | BmuxAction::InputHistoryPrevious
+            | BmuxAction::InputHistoryNext
+            | BmuxAction::AppExit
+            | BmuxAction::AppInterrupt
+            | BmuxAction::CommandPaletteOpen
+            | BmuxAction::TranscriptPageUp
+            | BmuxAction::TranscriptPageDown
+            | BmuxAction::TranscriptTop
+            | BmuxAction::TranscriptBottom
+            | BmuxAction::TranscriptLineUp
+            | BmuxAction::TranscriptLineDown
+            | BmuxAction::PermissionApprove
+            | BmuxAction::PermissionDeny
+            | BmuxAction::SelectUp
+            | BmuxAction::SelectDown
+            | BmuxAction::SelectConfirm
+            | BmuxAction::SelectCancel
+            | BmuxAction::SessionNew
+            | BmuxAction::SessionRename
+            | BmuxAction::SessionDelete => return None,
+        })
+    }
 }
 
 fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
@@ -113,6 +187,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
             BmuxScope::Chat,
             vec![
                 bind("enter", BmuxAction::InputSubmit),
+                bind("shift+enter", BmuxAction::InputNewLine),
                 bind("up", BmuxAction::InputHistoryPrevious),
                 bind("down", BmuxAction::InputHistoryNext),
                 bind("ctrl+d", BmuxAction::AppExit),

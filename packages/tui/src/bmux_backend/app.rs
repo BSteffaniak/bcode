@@ -8,6 +8,7 @@ use bcode_session_models::{
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::diff::DiffFileSummary;
 
 use super::IDLE_REDRAW_INTERVAL;
 
@@ -20,6 +21,7 @@ pub(super) struct BmuxApp {
     input_history_index: Option<usize>,
     input_history_draft: Option<String>,
     transcript: Vec<TranscriptItem>,
+    changed_files: Vec<DiffFileSummary>,
     pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
     scroll_offset: usize,
@@ -50,6 +52,7 @@ impl BmuxApp {
             input_history_index: None,
             input_history_draft: None,
             transcript: Vec::new(),
+            changed_files: Vec::new(),
             pending_submissions: Vec::new(),
             pending_submission: None,
             scroll_offset: 0,
@@ -88,6 +91,12 @@ impl BmuxApp {
     #[must_use]
     pub(super) fn transcript(&self) -> &[TranscriptItem] {
         &self.transcript
+    }
+
+    /// Return changed-file summaries inferred from edit tool calls.
+    #[must_use]
+    pub(super) fn changed_files(&self) -> &[DiffFileSummary] {
+        &self.changed_files
     }
 
     /// Return pending submissions that have not been committed by the session stream.
@@ -295,6 +304,7 @@ impl BmuxApp {
                 tool_name,
                 arguments_json,
             } => {
+                self.record_diff_summary(tool_name, arguments_json);
                 self.push_tool_request(tool_call_id, tool_name, arguments_json);
             }
             SessionEventKind::ToolCallFinished {
@@ -478,17 +488,29 @@ impl BmuxApp {
     }
 
     fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
-        self.transcript.push(TranscriptItem::new(
-            "Tool",
-            format!(
-                "request {tool_name}\nCall: {tool_call_id}\nArguments:\n{}",
-                pretty_jsonish(arguments_json)
-            ),
-        ));
+        self.record_diff_summary(tool_name, arguments_json);
+        self.transcript
+            .push(tool_request_item(tool_call_id, tool_name, arguments_json));
         self.activity = ActivityState::RunningTool {
             name: tool_name.to_owned(),
         };
         self.status = format!("running tool {tool_name}");
+    }
+
+    fn record_diff_summary(&mut self, tool_name: &str, arguments_json: &str) {
+        let Some(summary) = diff_summary_from_tool_request(tool_name, arguments_json) else {
+            return;
+        };
+        let path = summary.display_path();
+        if let Some(existing) = self
+            .changed_files
+            .iter_mut()
+            .find(|existing| existing.display_path() == path)
+        {
+            *existing = summary;
+        } else {
+            self.changed_files.push(summary);
+        }
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
@@ -643,13 +665,7 @@ fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
             tool_call_id,
             tool_name,
             arguments_json,
-        } => Some(TranscriptItem::new(
-            "Tool",
-            format!(
-                "request {tool_name}\nCall: {tool_call_id}\nArguments:\n{}",
-                pretty_jsonish(arguments_json)
-            ),
-        )),
+        } => Some(tool_request_item(tool_call_id, tool_name, arguments_json)),
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
@@ -723,6 +739,66 @@ fn transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
 
 fn optional_u32(value: Option<u32>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn tool_request_item(tool_call_id: &str, tool_name: &str, arguments_json: &str) -> TranscriptItem {
+    let diff_note = diff_summary_from_tool_request(tool_name, arguments_json).map_or_else(
+        String::new,
+        |summary| {
+            format!(
+                "\nDiff: {} (+{} -{})",
+                summary.display_path(),
+                summary.added,
+                summary.removed
+            )
+        },
+    );
+    TranscriptItem::new(
+        "Tool",
+        format!(
+            "request {tool_name}\nCall: {tool_call_id}{diff_note}\nArguments:\n{}",
+            pretty_jsonish(arguments_json)
+        ),
+    )
+}
+
+fn diff_summary_from_tool_request(
+    tool_name: &str,
+    arguments_json: &str,
+) -> Option<DiffFileSummary> {
+    let normalized_tool = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
+    if !matches!(
+        normalized_tool.as_str(),
+        "filesystem_edit" | "filesystem_write"
+    ) {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
+    let path = value
+        .get("path")
+        .or_else(|| value.get("file_path"))
+        .or_else(|| value.get("file"))?
+        .as_str()?;
+    let (added, removed) = count_edit_lines(&value);
+    Some(DiffFileSummary::new(path, added, removed))
+}
+
+fn count_edit_lines(value: &serde_json::Value) -> (u32, u32) {
+    let new_text = value
+        .get("new_text")
+        .or_else(|| value.get("contents"))
+        .and_then(serde_json::Value::as_str);
+    let old_text = value.get("old_text").and_then(serde_json::Value::as_str);
+    match (new_text, old_text) {
+        (Some(new_text), Some(old_text)) => (line_count(new_text), line_count(old_text)),
+        (Some(new_text), None) => (line_count(new_text), 0),
+        (None, Some(old_text)) => (0, line_count(old_text)),
+        (None, None) => (0, 0),
+    }
+}
+
+fn line_count(value: &str) -> u32 {
+    u32::try_from(value.lines().count().max(1)).unwrap_or(u32::MAX)
 }
 
 fn pretty_jsonish(value: &str) -> String {

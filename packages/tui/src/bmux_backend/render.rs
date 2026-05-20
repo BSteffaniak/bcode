@@ -1,10 +1,11 @@
 //! BMUX backend rendering.
 
 use bmux_tui::chrome::{Border, Panel};
+use bmux_tui::diff::{DiffFileList, DiffFileListState};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Span, Style, Widget};
+use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_block::{TextBlock, TextWrap};
 
@@ -63,6 +64,28 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
+    let diff_height = if app.changed_files().is_empty() {
+        0
+    } else {
+        area.height.min(5)
+    };
+    let transcript_area = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.saturating_sub(diff_height),
+    );
+    render_transcript(app, transcript_area, frame);
+    if diff_height > 0 {
+        let diff_area = Rect::new(area.x, transcript_area.bottom(), area.width, diff_height);
+        render_changed_files(app, diff_area, frame);
+    }
+}
+
+fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.is_empty() {
+        return;
+    }
     if app.transcript().is_empty() && app.pending_submissions().is_empty() {
         TextBlock::new(
             "BMUX backend is attached. Composer submissions are sent to the active Bcode session; live transcript events will appear here.",
@@ -86,6 +109,20 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         frame.write_line(Rect::new(area.x, y, area.width, 1), row);
         y = y.saturating_add(1);
     }
+}
+
+fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+    let panel = Panel::new()
+        .border(Border::single().style(Style::new().fg(Color::BrightBlack)))
+        .title(" Changed files ")
+        .padding(Insets::new(0, 1, 0, 1));
+    panel.render(area, frame);
+    let inner = panel.inner_area(area);
+    let mut state = DiffFileListState::new();
+    if !app.changed_files().is_empty() {
+        state.select(Some(0));
+    }
+    DiffFileList::new(app.changed_files()).render(inner, frame, &mut state);
 }
 
 fn transcript_render_rows(app: &BmuxApp, width: u16) -> Vec<Line> {
