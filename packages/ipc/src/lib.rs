@@ -139,6 +139,9 @@ pub enum Request {
     SessionModelStatus {
         session_id: SessionId,
     },
+    SessionModelList {
+        provider_plugin_id: Option<String>,
+    },
     ListAgents,
     ListSkills,
     DescribeSkill {
@@ -294,6 +297,10 @@ pub enum ResponsePayload {
     SessionModelSet,
     SessionModelStatus {
         status: SessionModelStatus,
+    },
+    SessionModelList {
+        provider_plugin_id: Option<String>,
+        models: bcode_model::ModelList,
     },
     AgentList {
         agents: Vec<AgentInfo>,

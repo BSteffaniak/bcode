@@ -15,6 +15,8 @@ pub(super) enum PaletteCommand {
     ShowModelStatus,
     /// Show server default model/provider.
     ShowServerModelStatus,
+    /// Select active session model.
+    SelectModel,
     /// Show available skills.
     ListSkills,
     /// Show active skills for the current session.
@@ -38,6 +40,7 @@ impl PaletteCommand {
             Self::SwitchSession => "session.switch",
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
+            Self::SelectModel => "model.select",
             Self::ListSkills => "skills.list",
             Self::ActiveSkills => "skills.active",
             Self::Help => "help",
@@ -54,6 +57,7 @@ impl PaletteCommand {
             "session.switch" => Some(Self::SwitchSession),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
+            "model.select" => Some(Self::SelectModel),
             "skills.list" => Some(Self::ListSkills),
             "skills.active" => Some(Self::ActiveSkills),
             "help" => Some(Self::Help),
@@ -128,6 +132,12 @@ fn palette_items() -> Vec<PaletteItem> {
             "Show Server Model Defaults",
             "Show selected default provider/model",
             "server model provider default status",
+        ),
+        item(
+            PaletteCommand::SelectModel,
+            "Select Model",
+            "Choose a model for this session",
+            "model select choose session provider",
         ),
         item(
             PaletteCommand::ListSkills,

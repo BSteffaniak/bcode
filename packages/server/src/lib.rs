@@ -682,6 +682,9 @@ async fn handle_request(
         Request::SessionModelStatus { session_id } => {
             handle_session_model_status(request_id, state, writer, session_id).await
         }
+        Request::SessionModelList { provider_plugin_id } => {
+            handle_session_model_list(request_id, state, writer, provider_plugin_id).await
+        }
         request => handle_agent_permission_plugin_request(request, request_id, state, writer).await,
     }
 }
@@ -1452,6 +1455,42 @@ async fn handle_session_model_status(
         }),
     )
     .await
+}
+
+async fn handle_session_model_list(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    provider_plugin_id: Option<String>,
+) -> Result<(), ServerError> {
+    match invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        provider_plugin_id.clone(),
+        OP_MODELS,
+        serde_json::Value::Null,
+    )
+    .await
+    {
+        Ok(models) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionModelList {
+                    provider_plugin_id,
+                    models,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("model_list_failed", error.clone())),
+            )
+            .await
+        }
+    }
 }
 
 fn select_model_info(

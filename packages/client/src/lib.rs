@@ -281,6 +281,25 @@ impl BcodeClient {
         }
     }
 
+    /// Return available models for a provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_model_list(
+        &self,
+        provider_plugin_id: Option<String>,
+    ) -> Result<bcode_model::ModelList, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::SessionModelList { provider_plugin_id })
+            .await?
+        {
+            ResponsePayload::SessionModelList { models, .. } => Ok(models),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Request cancellation of the active model turn for a session.
     ///
     /// # Errors

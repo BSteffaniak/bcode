@@ -5,6 +5,8 @@ mod command_palette;
 mod command_palette_render;
 mod input;
 mod keymap;
+mod model_picker;
+mod model_picker_render;
 mod permission_dialog;
 mod permission_dialog_render;
 mod render;
@@ -674,6 +676,9 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::ShowServerModelStatus => {
             show_server_model_status(client, chat).await?;
         }
+        PaletteCommand::SelectModel => {
+            pick_model_for_session(terminal, client, chat).await?;
+        }
         PaletteCommand::ListSkills => {
             list_skills(client, chat).await?;
         }
@@ -760,6 +765,61 @@ async fn show_server_model_status(
     chat.app.set_status(text.clone());
     chat.app.push_system_note(text);
     Ok(())
+}
+
+async fn pick_model_for_session<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    let models = client.session_model_list(None).await?.models;
+    let mut picker = model_picker::ModelPickerApp::new(models);
+    loop {
+        terminal.resize(terminal_area()?);
+        terminal.draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
+        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => {
+                picker.filter_mut().insert_str(&text);
+                picker.refresh_filter();
+            }
+            Event::Key(stroke) => match stroke.key {
+                KeyCode::Escape => return Ok(()),
+                KeyCode::Enter => {
+                    if let Some(model_id) = picker.selected_model_id() {
+                        client
+                            .set_session_model(session_id, None, model_id.clone())
+                            .await?;
+                        chat.app.set_status(format!("model set to {model_id}"));
+                        return Ok(());
+                    }
+                }
+                KeyCode::Up => picker.select_previous(),
+                KeyCode::Down => picker.select_next(),
+                _ => {
+                    let outcome = TextInputKeyHandler::new(
+                        TextKeymap::default(),
+                        TextInputEnterBehavior::InsertNewline,
+                    )
+                    .handle_key(picker.filter_mut(), stroke);
+                    if outcome == TextInputKeyOutcome::Edited {
+                        picker.refresh_filter();
+                    }
+                }
+            },
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Mouse(_)
+            | Event::Tick
+            | Event::User(_) => {}
+        }
+    }
 }
 
 async fn list_skills(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
