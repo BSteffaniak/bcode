@@ -569,7 +569,8 @@ impl BmuxApp {
         self.should_exit = true;
     }
 
-    fn replace_composer_with(&mut self, text: &str) {
+    /// Replace composer contents.
+    pub(super) fn replace_composer_with(&mut self, text: &str) {
         self.composer.clear();
         self.composer.insert_str(text);
         self.wake_cursor();

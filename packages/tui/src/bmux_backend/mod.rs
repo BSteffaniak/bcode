@@ -17,6 +17,7 @@ mod session_picker_render;
 mod skill_picker;
 mod skill_picker_render;
 mod slash_commands;
+mod slash_palette;
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -32,6 +33,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
 use bmux_tui::terminal::Terminal;
+use bmux_tui::widget::StatefulWidget;
 use crossterm::terminal::size;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -133,14 +135,23 @@ async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
     app.set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
 
+struct ModalState {
+    palette: Option<BmuxCommandPalette>,
+    slash_palette: Option<slash_palette::SlashPalette>,
+    permission_dialog: Option<PermissionDialogState>,
+}
+
 async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let mut palette: Option<BmuxCommandPalette> = None;
-    let mut permission_dialog: Option<PermissionDialogState> = None;
+    let mut modals = ModalState {
+        palette: None,
+        slash_palette: None,
+        permission_dialog: None,
+    };
     let mut needs_redraw = true;
 
     while !chat.app.should_exit() {
@@ -159,14 +170,14 @@ async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if permission_dialog.is_none()
+        if modals.permission_dialog.is_none()
             && let Some(permission) = client
                 .list_permissions()
                 .await?
                 .into_iter()
                 .find(|permission| permission.session_id == chat.session_id)
         {
-            permission_dialog = Some(PermissionDialogState::new(permission));
+            modals.permission_dialog = Some(PermissionDialogState::new(permission));
             needs_redraw = true;
         }
 
@@ -175,12 +186,17 @@ async fn run_with_client<W: Write>(
         }
 
         if needs_redraw {
+            let area = terminal.area();
             terminal.draw(|frame| {
                 render::render(&mut chat.app, frame);
-                if let Some(palette) = &mut palette {
+                if let Some(slash_palette) = &mut modals.slash_palette {
+                    let items = slash_palette.palette_items();
+                    CommandPalette::new(&items).render(area, frame, slash_palette.state_mut());
+                }
+                if let Some(palette) = &mut modals.palette {
                     command_palette_render::render_palette(palette, frame);
                 }
-                if let Some(dialog) = &mut permission_dialog {
+                if let Some(dialog) = &mut modals.permission_dialog {
                     permission_dialog_render::render_permission_dialog(dialog, frame);
                 }
             })?;
@@ -188,17 +204,7 @@ async fn run_with_client<W: Write>(
         }
 
         if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
-            if handle_event(
-                client,
-                keymap,
-                chat,
-                &mut permission_dialog,
-                &mut palette,
-                terminal,
-                event,
-            )
-            .await?
-            {
+            if handle_event(client, keymap, chat, &mut modals, terminal, event).await? {
                 needs_redraw = true;
             }
         } else if chat.app.tick() {
@@ -554,8 +560,7 @@ async fn handle_event<W: Write>(
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
-    permission_dialog: &mut Option<PermissionDialogState>,
-    palette: &mut Option<BmuxCommandPalette>,
+    modals: &mut ModalState,
     terminal: &mut Terminal<&mut W>,
     event: Event,
 ) -> Result<bool, TuiError> {
@@ -564,40 +569,16 @@ async fn handle_event<W: Write>(
             terminal.resize(Rect::new(0, 0, size.width, size.height));
             Ok(true)
         }
-        Event::Key(stroke) => {
-            let changed = match stroke.key {
-                KeyCode::Char(']') if stroke.modifiers.is_empty() => {
-                    chat.app.select_next_diff_file()
-                }
-                KeyCode::Char('[') if stroke.modifiers.is_empty() => {
-                    chat.app.select_previous_diff_file()
-                }
-                _ => false,
-            };
-            if changed {
-                return Ok(true);
-            }
-            if permission_dialog.is_some() {
-                return handle_permission_key(client, keymap, chat, permission_dialog, stroke)
-                    .await;
-            }
-            if palette.is_some() {
-                return handle_palette_key(client, keymap, chat, palette, terminal, stroke).await;
-            }
-            if is_palette_open_key(keymap, stroke) {
-                *palette = Some(BmuxCommandPalette::new());
-                return Ok(true);
-            }
-            let outcome = input::handle_key(&mut chat.app, keymap, stroke);
-            if outcome.submitted
-                && let Err(error) = submit_composer(client, &mut chat.app).await
-            {
-                report_client_error(&mut chat.app, "send failed", &error);
-            }
-            Ok(outcome.redraw)
-        }
+        Event::Key(stroke) => handle_chat_key(client, keymap, chat, modals, terminal, stroke).await,
         Event::Paste(text) => {
-            if let Some(palette) = palette {
+            if let Some(slash_palette) = &mut modals.slash_palette {
+                slash_palette
+                    .state_mut()
+                    .query
+                    .insert_str(text.trim_start_matches('/'));
+                return Ok(true);
+            }
+            if let Some(palette) = &mut modals.palette {
                 palette.state_mut().query.insert_str(&text);
                 return Ok(true);
             }
@@ -607,14 +588,75 @@ async fn handle_event<W: Write>(
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
         Event::Mouse(mouse) => {
-            if palette.is_some() {
-                return handle_palette_mouse(client, keymap, chat, palette, terminal, mouse).await;
+            if modals.palette.is_some() {
+                return handle_palette_mouse(
+                    client,
+                    keymap,
+                    chat,
+                    &mut modals.palette,
+                    terminal,
+                    mouse,
+                )
+                .await;
             }
             let hit_id = mouse_hit_id(terminal.hits(), mouse);
-            handle_mouse(hit_id, client, chat, permission_dialog, mouse).await
+            handle_mouse(hit_id, client, chat, &mut modals.permission_dialog, mouse).await
         }
         Event::User(_) => Ok(false),
     }
+}
+
+async fn handle_chat_key<W: Write>(
+    client: &BcodeClient,
+    keymap: &BmuxKeyMap,
+    chat: &mut ActiveChat,
+    modals: &mut ModalState,
+    terminal: &mut Terminal<&mut W>,
+    stroke: KeyStroke,
+) -> Result<bool, TuiError> {
+    if modals.slash_palette.is_some() {
+        return handle_slash_palette_key(
+            client,
+            keymap,
+            chat,
+            &mut modals.slash_palette,
+            terminal,
+            stroke,
+        )
+        .await;
+    }
+    let changed = match stroke.key {
+        KeyCode::Char(']') if stroke.modifiers.is_empty() => chat.app.select_next_diff_file(),
+        KeyCode::Char('[') if stroke.modifiers.is_empty() => chat.app.select_previous_diff_file(),
+        _ => false,
+    };
+    if changed {
+        return Ok(true);
+    }
+    if modals.permission_dialog.is_some() {
+        return handle_permission_key(client, keymap, chat, &mut modals.permission_dialog, stroke)
+            .await;
+    }
+    if modals.palette.is_some() {
+        return handle_palette_key(client, keymap, chat, &mut modals.palette, terminal, stroke)
+            .await;
+    }
+    if is_palette_open_key(keymap, stroke) {
+        modals.palette = Some(BmuxCommandPalette::new());
+        return Ok(true);
+    }
+    let outcome = input::handle_key(&mut chat.app, keymap, stroke);
+    if chat.app.composer().text().starts_with('/') {
+        modals.slash_palette = Some(slash_palette::SlashPalette::new(chat.app.composer().text()));
+    } else {
+        modals.slash_palette = None;
+    }
+    if outcome.submitted
+        && let Err(error) = submit_composer(client, keymap, chat, terminal).await
+    {
+        report_client_error(&mut chat.app, "send failed", &error);
+    }
+    Ok(outcome.redraw)
 }
 
 fn command_palette_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
@@ -878,6 +920,52 @@ async fn handle_palette_key<W: Write>(
             Ok(true)
         }
         CommandPaletteKeyOutcome::Ignored => Ok(false),
+        CommandPaletteKeyOutcome::QueryEdited | CommandPaletteKeyOutcome::SelectionMoved => {
+            Ok(true)
+        }
+    }
+}
+
+async fn handle_slash_palette_key<W: Write>(
+    client: &BcodeClient,
+    keymap: &BmuxKeyMap,
+    chat: &mut ActiveChat,
+    slash_palette: &mut Option<slash_palette::SlashPalette>,
+    terminal: &mut Terminal<&mut W>,
+    stroke: KeyStroke,
+) -> Result<bool, TuiError> {
+    let Some(active_palette) = slash_palette else {
+        return Ok(false);
+    };
+    let items = active_palette.palette_items();
+    let widget = CommandPalette::new(&items);
+    let outcome = widget.handle_key(active_palette.state_mut(), terminal.area().height, stroke);
+    match outcome {
+        CommandPaletteKeyOutcome::Activated(index) => {
+            if let Some(command) = active_palette.command_at(index).map(str::to_owned) {
+                chat.app.replace_composer_with(&command);
+            }
+            *slash_palette = None;
+            Ok(true)
+        }
+        CommandPaletteKeyOutcome::Canceled => {
+            *slash_palette = None;
+            Ok(true)
+        }
+        CommandPaletteKeyOutcome::Ignored => {
+            let outcome = input::handle_key(&mut chat.app, keymap, stroke);
+            if chat.app.composer().text().starts_with('/') {
+                *slash_palette = Some(slash_palette::SlashPalette::new(chat.app.composer().text()));
+            } else {
+                *slash_palette = None;
+            }
+            if outcome.submitted
+                && let Err(error) = submit_composer(client, keymap, chat, terminal).await
+            {
+                report_client_error(&mut chat.app, "send failed", &error);
+            }
+            Ok(outcome.redraw)
+        }
         CommandPaletteKeyOutcome::QueryEdited | CommandPaletteKeyOutcome::SelectionMoved => {
             Ok(true)
         }
@@ -1565,35 +1653,40 @@ fn is_palette_open_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {
     keymap.action_for_key(BmuxScope::Chat, stroke) == Some(BmuxAction::CommandPaletteOpen)
 }
 
-async fn submit_composer(client: &BcodeClient, app: &mut BmuxApp) -> Result<(), TuiError> {
-    let Some(session_id) = app.session_id() else {
-        app.set_status("No active session".to_owned());
+async fn submit_composer<W: Write>(
+    client: &BcodeClient,
+    keymap: &BmuxKeyMap,
+    chat: &mut ActiveChat,
+    terminal: &mut Terminal<&mut W>,
+) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let message = app.take_pending_submission();
+    let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
         return Ok(());
     }
     if message.starts_with('/') {
-        app.clear_pending_submission();
+        chat.app.clear_pending_submission();
         match slash_commands::execute(client, session_id, &message).await? {
-            slash_commands::SlashCommandOutcome::Handled(status) => app.set_status(status),
+            slash_commands::SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
             slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
-                app.set_status(format!(
-                    "created session {next_session_id}; use /sessions to switch"
-                ));
+                switch_session(client, chat, next_session_id).await?;
             }
             slash_commands::SlashCommandOutcome::PickSession => {
-                app.set_status("open the command palette to switch sessions".to_owned());
+                let next_session_id = pick_session(terminal, client, keymap).await?;
+                switch_session(client, chat, next_session_id).await?;
             }
             slash_commands::SlashCommandOutcome::PickModel => {
-                app.set_status("open the command palette to select a model".to_owned());
+                pick_model_for_session(terminal, client, chat, keymap).await?;
             }
             slash_commands::SlashCommandOutcome::PickSkill => {
-                app.set_status("open the command palette to select a skill".to_owned());
+                pick_skill_for_session(terminal, client, chat, keymap).await?;
             }
             slash_commands::SlashCommandOutcome::Unknown(command) => {
-                app.set_status(format!("unknown slash command: {command}"));
+                chat.app
+                    .set_status(format!("unknown slash command: {command}"));
             }
         }
         return Ok(());
@@ -1601,22 +1694,23 @@ async fn submit_composer(client: &BcodeClient, app: &mut BmuxApp) -> Result<(), 
     match client.send_user_message(session_id, message).await {
         Ok(acceptance) => {
             if acceptance.queued {
-                app.mark_pending_submission_queued(acceptance.queue_position);
-                app.set_status(format!(
+                chat.app
+                    .mark_pending_submission_queued(acceptance.queue_position);
+                chat.app.set_status(format!(
                     "Message queued{}",
                     acceptance
                         .queue_position
                         .map_or_else(String::new, |position| format!(" at #{position}"))
                 ));
             } else {
-                app.mark_pending_submission_sent();
-                app.set_status("Message sent".to_owned());
+                chat.app.mark_pending_submission_sent();
+                chat.app.set_status("Message sent".to_owned());
             }
             Ok(())
         }
         Err(error) => {
-            app.restore_pending_submission();
-            app.set_status(format!("send failed: {error}"));
+            chat.app.restore_pending_submission();
+            chat.app.set_status(format!("send failed: {error}"));
             Ok(())
         }
     }
