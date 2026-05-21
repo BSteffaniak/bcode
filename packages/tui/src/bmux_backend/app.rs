@@ -12,6 +12,7 @@ use bmux_tui::diff::{DiffFileSummary, DiffLine};
 
 use super::IDLE_REDRAW_INTERVAL;
 use super::diff_extract::diff_from_tool_request;
+use super::pending_submission::PendingSubmission;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffPanelState {
@@ -310,14 +311,14 @@ impl BmuxApp {
     /// Mark the oldest pending submission as queued by the server.
     pub(super) fn mark_pending_submission_queued(&mut self, queue_position: Option<u32>) {
         if let Some(pending) = self.pending_submissions.first_mut() {
-            pending.state = PendingSubmissionState::Queued { queue_position };
+            pending.mark_queued(queue_position);
         }
     }
 
     /// Mark the oldest pending submission as sent to the server.
     pub(super) fn mark_pending_submission_sent(&mut self) {
         if let Some(pending) = self.pending_submissions.first_mut() {
-            pending.state = PendingSubmissionState::Sent;
+            pending.mark_sent();
         }
     }
 
@@ -606,7 +607,7 @@ impl BmuxApp {
         if let Some(index) = self
             .pending_submissions
             .iter()
-            .position(|pending| pending.text == text)
+            .position(|pending| pending.text() == text)
         {
             self.pending_submissions.remove(index);
         }
@@ -1094,48 +1095,6 @@ pub(super) enum ActivityState {
     WaitingPermission {
         /// Tool name.
         name: String,
-    },
-}
-
-/// Pending user message not yet confirmed by the session stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PendingSubmission {
-    text: String,
-    state: PendingSubmissionState,
-}
-
-impl PendingSubmission {
-    const fn new(text: String) -> Self {
-        Self {
-            text,
-            state: PendingSubmissionState::Sending,
-        }
-    }
-
-    /// Return pending text.
-    #[must_use]
-    pub(super) fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// Return pending state.
-    #[must_use]
-    pub(super) const fn state(&self) -> PendingSubmissionState {
-        self.state
-    }
-}
-
-/// Pending user message state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PendingSubmissionState {
-    /// Client request is in flight.
-    Sending,
-    /// Server accepted the request immediately.
-    Sent,
-    /// Server queued the request.
-    Queued {
-        /// Server-reported queue position.
-        queue_position: Option<u32>,
     },
 }
 

@@ -16,6 +16,7 @@ mod model_picker;
 mod model_picker_render;
 mod mouse_flow;
 mod palette_flow;
+mod pending_submission;
 mod permission_dialog;
 mod permission_dialog_render;
 mod permission_flow;
