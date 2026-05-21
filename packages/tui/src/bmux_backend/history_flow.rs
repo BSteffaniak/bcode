@@ -6,7 +6,9 @@ use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery, Session
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::{ActiveChat, INITIAL_HISTORY_EVENT_LIMIT, OLDER_HISTORY_EVENT_LIMIT, TuiError};
+use super::{
+    INITIAL_HISTORY_EVENT_LIMIT, OLDER_HISTORY_EVENT_LIMIT, TuiError, session_flow::ActiveChat,
+};
 
 /// Load the next older page of transcript history when available.
 pub(super) async fn load_older_history(

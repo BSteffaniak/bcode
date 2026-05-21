@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use bcode_client::BcodeClient;
+use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::crossterm::poll_event;
@@ -13,10 +14,67 @@ use bmux_tui::terminal::Terminal;
 
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
-use super::{EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, terminal_area};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use super::app::BmuxApp;
+use super::{EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, history_flow, terminal_area};
 use super::{session_picker, session_picker_render};
 
-/// Initial mutation mode for opening the session picker.
+/// Active chat session state shared by BMUX backend flows.
+pub(super) struct ActiveChat {
+    pub(super) app: BmuxApp,
+    pub(super) session_id: SessionId,
+    pub(super) event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    pub(super) event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
+    pub(super) event_task: JoinHandle<()>,
+}
+
+/// Hydrate model and skill status for the active session.
+pub(super) async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
+    let Some(session_id) = app.session_id() else {
+        return;
+    };
+    let model = client.session_model_status(session_id).await.ok();
+    let active_skills = client.active_skills(session_id).await.ok();
+    let model_text = model.as_ref().map_or_else(
+        || "model unknown".to_owned(),
+        |status| {
+            let provider = status.provider_plugin_id.as_deref().unwrap_or("auto");
+            let model = status.model_id.as_deref().unwrap_or("default");
+            format!("{provider}/{model}")
+        },
+    );
+    let skill_count = active_skills.as_ref().map_or(0, Vec::len);
+    app.set_status(format!("model: {model_text}; active skills: {skill_count}"));
+}
+
+/// Switch the active chat to another session.
+pub(super) async fn switch_session(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    next_session_id: SessionId,
+) -> Result<(), TuiError> {
+    chat.event_task.abort();
+    while chat.event_receiver.try_recv().is_ok() {}
+    let (attached, next_task) = history_flow::attach_session_event_stream(
+        client,
+        next_session_id,
+        chat.event_sender.clone(),
+    )
+    .await?;
+    chat.event_task = next_task;
+    chat.session_id = next_session_id;
+    chat.app = BmuxApp::new_with_history(
+        Some(next_session_id),
+        &attached.history,
+        &attached.input_history,
+        attached.history.len() >= super::INITIAL_HISTORY_EVENT_LIMIT,
+    );
+    hydrate_status(client, &mut chat.app).await;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionPickerStartMode {
     /// Start in rename mode.

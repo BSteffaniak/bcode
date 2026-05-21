@@ -13,8 +13,8 @@ use bmux_tui::terminal::Terminal;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::picker_row_from_mouse;
 use super::{
-    ActiveChat, EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, model_picker,
-    model_picker_render, provider_picker, provider_picker_render, report_client_error,
+    EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, model_picker, model_picker_render,
+    provider_picker, provider_picker_render, report_client_error, session_flow::ActiveChat,
     terminal_area,
 };
 

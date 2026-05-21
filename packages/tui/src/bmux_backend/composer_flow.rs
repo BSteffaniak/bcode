@@ -6,9 +6,8 @@ use bcode_client::BcodeClient;
 use bmux_tui::terminal::Terminal;
 
 use super::keymap::BmuxKeyMap;
-use super::{
-    ActiveChat, TuiError, model_flow, session_flow, skill_flow, slash_commands, switch_session,
-};
+use super::session_flow::ActiveChat;
+use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands};
 
 /// Submit the staged composer text.
 pub(super) async fn submit_composer<W: Write>(
@@ -35,11 +34,11 @@ pub(super) async fn submit_composer<W: Write>(
                 chat.app.set_status("slash command handled".to_owned());
             }
             slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
-                switch_session(client, chat, next_session_id).await?;
+                session_flow::switch_session(client, chat, next_session_id).await?;
             }
             slash_commands::SlashCommandOutcome::PickSession => {
                 let next_session_id = session_flow::pick_session(terminal, client, keymap).await?;
-                switch_session(client, chat, next_session_id).await?;
+                session_flow::switch_session(client, chat, next_session_id).await?;
             }
             slash_commands::SlashCommandOutcome::PickModel => {
                 model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;

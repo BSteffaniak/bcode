@@ -14,8 +14,8 @@ use bmux_tui::terminal::Terminal;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::{
-    ActiveChat, EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, report_client_error,
-    skill_picker, skill_picker_render, terminal_area,
+    EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, report_client_error,
+    session_flow::ActiveChat, skill_picker, skill_picker_render, terminal_area,
 };
 
 /// Pick and perform a skill action for the active session.

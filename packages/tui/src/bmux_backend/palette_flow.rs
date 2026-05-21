@@ -10,9 +10,8 @@ use bmux_tui::terminal::Terminal;
 use super::command_palette::{BmuxCommandPalette, PaletteCommand};
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::command_palette_row_from_mouse;
-use super::{
-    ActiveChat, TuiError, model_flow, report_client_error, session_flow, skill_flow, switch_session,
-};
+use super::session_flow::{self, ActiveChat};
+use super::{TuiError, model_flow, report_client_error, skill_flow};
 
 /// Handle one key while the command palette is open.
 pub(super) async fn handle_palette_key<W: Write>(
@@ -87,7 +86,7 @@ async fn execute_palette_command<W: Write>(
     match command {
         PaletteCommand::NewSession => {
             let session = client.create_session(None).await?;
-            switch_session(client, chat, session.id).await?;
+            session_flow::switch_session(client, chat, session.id).await?;
         }
         PaletteCommand::SwitchSession => {
             let selected_session_id = session_flow::pick_session(
@@ -96,7 +95,7 @@ async fn execute_palette_command<W: Write>(
                 &BmuxKeyMap::from_config(&bcode_config::load_config()?.tui),
             )
             .await?;
-            switch_session(client, chat, selected_session_id).await?;
+            session_flow::switch_session(client, chat, selected_session_id).await?;
         }
         PaletteCommand::ShowModelStatus => {
             model_flow::show_model_status(client, chat).await?;

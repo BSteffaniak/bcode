@@ -37,7 +37,6 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use bcode_client::BcodeClient;
-use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::SessionId;
 use bmux_keyboard::KeyStroke;
 use bmux_text_edit::keyboard::TextKeymap;
@@ -47,7 +46,6 @@ use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyO
 use bmux_tui::terminal::Terminal;
 use crossterm::terminal::size;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use self::app::BmuxApp;
 use self::keymap::BmuxKeyMap;
@@ -106,43 +104,17 @@ async fn run_event_loop<W: Write>(
         &attached.input_history,
         attached.history.len() >= INITIAL_HISTORY_EVENT_LIMIT,
     );
-    let mut chat = ActiveChat {
+    let mut chat = session_flow::ActiveChat {
         app,
         session_id,
         event_sender,
         event_receiver,
         event_task,
     };
-    hydrate_status(&client, &mut chat.app).await;
+    session_flow::hydrate_status(&client, &mut chat.app).await;
     let result = chat_loop::run_with_client(terminal, &client, &keymap, &mut chat).await;
     chat.event_task.abort();
     result
-}
-
-struct ActiveChat {
-    app: BmuxApp,
-    session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
-    event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
-    event_task: JoinHandle<()>,
-}
-
-async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
-    let Some(session_id) = app.session_id() else {
-        return;
-    };
-    let model = client.session_model_status(session_id).await.ok();
-    let active_skills = client.active_skills(session_id).await.ok();
-    let model_text = model.as_ref().map_or_else(
-        || "model unknown".to_owned(),
-        |status| {
-            let provider = status.provider_plugin_id.as_deref().unwrap_or("auto");
-            let model = status.model_id.as_deref().unwrap_or("default");
-            format!("{provider}/{model}")
-        },
-    );
-    let skill_count = active_skills.as_ref().map_or(0, Vec::len);
-    app.set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
 
 fn handle_text_buffer_key(
@@ -156,31 +128,6 @@ fn handle_text_buffer_key(
         return TextInputKeyOutcome::Edited;
     }
     TextInputKeyHandler::new(TextKeymap::default(), enter_behavior).handle_key(buffer, stroke)
-}
-
-async fn switch_session(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    next_session_id: SessionId,
-) -> Result<(), TuiError> {
-    chat.event_task.abort();
-    while chat.event_receiver.try_recv().is_ok() {}
-    let (attached, next_task) = history_flow::attach_session_event_stream(
-        client,
-        next_session_id,
-        chat.event_sender.clone(),
-    )
-    .await?;
-    chat.event_task = next_task;
-    chat.session_id = next_session_id;
-    chat.app = BmuxApp::new_with_history(
-        Some(next_session_id),
-        &attached.history,
-        &attached.input_history,
-        attached.history.len() >= INITIAL_HISTORY_EVENT_LIMIT,
-    );
-    hydrate_status(client, &mut chat.app).await;
-    Ok(())
 }
 
 fn report_client_error(app: &mut BmuxApp, label: &str, error: &TuiError) {

@@ -4,7 +4,7 @@ use bcode_client::BcodeClient;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use super::permission_dialog::PermissionDialogState;
-use super::{ActiveChat, MOUSE_WHEEL_ROWS, TuiError, permission_flow, terminal_area};
+use super::{MOUSE_WHEEL_ROWS, TuiError, permission_flow, session_flow::ActiveChat, terminal_area};
 
 /// Return the hit-region id under a mouse event.
 #[must_use]

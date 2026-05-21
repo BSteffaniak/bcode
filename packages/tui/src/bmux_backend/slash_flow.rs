@@ -9,7 +9,7 @@ use bmux_tui::terminal::Terminal;
 
 use super::keymap::BmuxKeyMap;
 use super::{
-    ActiveChat, TuiError, composer_flow, input, report_client_error, slash_palette,
+    TuiError, composer_flow, input, report_client_error, session_flow::ActiveChat, slash_palette,
     slash_palette_render,
 };
 

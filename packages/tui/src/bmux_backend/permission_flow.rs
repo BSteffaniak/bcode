@@ -6,7 +6,7 @@ use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
-use super::{ActiveChat, TuiError, terminal_area};
+use super::{TuiError, session_flow::ActiveChat, terminal_area};
 
 /// Handle one permission-dialog key.
 pub(super) async fn handle_permission_key(
