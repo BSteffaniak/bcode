@@ -586,7 +586,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
         ),
     ];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 18));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 32));
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
@@ -595,10 +595,101 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
     assert!(output.contains("Tool · shell.run"));
     assert!(output.contains("call call_ABCD"));
     assert!(!output.contains(full_call_id));
-    assert!(output.contains("arguments:"));
+    assert!(output.contains("arguments"));
     assert!(output.contains(r#""command": "cargo check""#));
-    assert!(output.contains("Tool result · ok"));
-    assert!(output.contains("  ok"));
+    assert!(output.contains("Tool result · shell.run · ok"));
+    assert!(output.contains("    ok"));
+}
+
+#[test]
+fn transcript_renders_filesystem_edit_inline_diff_preview() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_edit".to_owned(),
+            tool_name: "filesystem.edit".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "src/lib.rs",
+                "old_text": "fn answer() -> i32 {\n    41\n}\n",
+                "new_text": "fn answer() -> i32 {\n    42\n}\n",
+            })
+            .to_string(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 18));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("Tool · filesystem.edit"));
+    assert!(output.contains("src/lib.rs  +3 -3"));
+    assert!(output.contains("diff preview"));
+    assert!(output.contains("-    41"));
+    assert!(output.contains("+    42"));
+    assert!(!output.contains("\"old_text\""));
+}
+
+#[test]
+fn transcript_renders_shell_output_with_ansi_and_limits() {
+    let session_id = SessionId::new();
+    let stdout = (0..40)
+        .map(|index| format!("\u{1b}[32mline {index}\u{1b}[0m"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call_shell".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: serde_json::json!({
+                    "command": "cargo test",
+                    "cwd": "/tmp/project",
+                })
+                .to_string(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call_shell".to_owned(),
+                result: serde_json::json!({
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "stdout": stdout,
+                    "stderr": "\u{1b}[31mwarning\u{1b}[0m",
+                })
+                .to_string(),
+                is_error: false,
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("Tool result · shell.run · ok"));
+    assert!(output.contains("command: cargo test"));
+    assert!(output.contains("exit 0"));
+    assert!(output.contains("line 0"));
+    assert!(output.contains("line 39"));
+    assert!(output.contains("stdout rows hidden"));
+    assert!(!output.contains('\u{1b}'));
+    assert_eq!(
+        buffer
+            .get(Point::new(4, output_line_y(&buffer, "line 0").unwrap()))
+            .map(|cell| cell.style.fg),
+        Some(Some(bmux_tui::style::Color::Green))
+    );
 }
 
 #[test]
@@ -666,6 +757,14 @@ fn ctrl_key(ch: char) -> KeyStroke {
 
 fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
     MouseEvent::new(kind, Point::new(x, y))
+}
+
+fn output_line_y(buffer: &Buffer, needle: &str) -> Option<u16> {
+    (0..buffer.area().height).find(|row| {
+        buffer
+            .row_symbols(*row)
+            .is_some_and(|line| line.contains(needle))
+    })
 }
 
 fn rendered_text(buffer: &Buffer) -> String {

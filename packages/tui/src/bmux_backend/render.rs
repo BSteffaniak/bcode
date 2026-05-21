@@ -1,7 +1,6 @@
 //! BMUX backend rendering.
 
-use std::fmt::Write as _;
-
+use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::diff::{DiffFileList, DiffFileListState, DiffView, DiffViewMode, DiffViewState};
 use bmux_tui::frame::Frame;
@@ -14,11 +13,16 @@ use bmux_tui::text_block::{TextBlock, TextWrap};
 
 use super::activity::ActivityState;
 use super::app::BmuxApp;
+use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
-use super::transcript::{TranscriptItem, TranscriptItemKind};
+use super::transcript::{ShellOutputTranscript, TranscriptItem, TranscriptItemKind};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
+const MAX_INLINE_DIFF_ROWS: usize = 28;
+const MAX_INLINE_STDOUT_ROWS: usize = 24;
+const MAX_INLINE_STDERR_ROWS: usize = 24;
+const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 /// Render one BMUX backend frame.
 pub(super) fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let area = frame.area();
@@ -270,22 +274,32 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
         TranscriptItemKind::ToolRequest {
             tool_call_id,
             tool_name,
-            diff_summary,
+            file_edit,
         } => {
             push_tool_request_rows(
                 rows,
                 item,
                 tool_call_id,
                 tool_name,
-                diff_summary.as_deref(),
+                file_edit.as_ref(),
                 width,
             );
         }
         TranscriptItemKind::ToolResult {
             tool_call_id,
+            tool_name,
+            shell_output,
             is_error,
         } => {
-            push_tool_result_rows(rows, item, tool_call_id, *is_error, width);
+            push_tool_result_rows(
+                rows,
+                item,
+                tool_call_id,
+                tool_name.as_deref(),
+                shell_output.as_ref(),
+                *is_error,
+                width,
+            );
         }
         TranscriptItemKind::Usage { turn_id } => {
             push_usage_rows(rows, item, turn_id, width);
@@ -352,50 +366,282 @@ fn push_tool_request_rows(
     item: &TranscriptItem,
     tool_call_id: &str,
     tool_name: &str,
-    diff_summary: Option<&str>,
+    file_edit: Option<&FileEditTranscript>,
     width: u16,
 ) {
-    let mut body = format!("call {}", truncate_middle(tool_call_id, 20));
-    if let Some(summary) = diff_summary {
-        body.push_str("\ndiff ");
-        body.push_str(summary);
-    }
-    if !item.text().is_empty() {
-        body.push_str("\narguments:\n");
-        body.push_str(item.text());
-    }
-    push_detail_block(
+    push_wrapped_styled_text(
         rows,
+        Vec::new(),
         &format!("Tool · {tool_name}"),
-        &body,
-        Color::Yellow,
         width,
+        Style::new().fg(Color::Yellow),
+        Style::new().fg(Color::Yellow),
     );
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!("call {}", truncate_middle(tool_call_id, 20)),
+        width,
+        muted_style(),
+        muted_style(),
+    );
+    if let Some(edit) = file_edit {
+        push_file_edit_preview_rows(rows, edit, width);
+    } else if !item.text().is_empty() {
+        push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
+    }
+    rows.push(Line::default());
 }
 
 fn push_tool_result_rows(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
     tool_call_id: &str,
+    tool_name: Option<&str>,
+    shell_output: Option<&ShellOutputTranscript>,
     is_error: bool,
     width: u16,
 ) {
-    let mut body = tool_result_preview(item.text());
-    if is_error {
-        body.push_str("\ntool call ");
-        body.push_str(&truncate_middle(tool_call_id, 20));
-    }
-    push_detail_block(
-        rows,
-        if is_error {
-            "Tool result · failed"
-        } else {
-            "Tool result · ok"
-        },
-        &body,
-        if is_error { Color::Red } else { Color::Yellow },
-        width,
+    let status = if is_error { "failed" } else { "ok" };
+    let title = tool_name.map_or_else(
+        || format!("Tool result · {status}"),
+        |name| format!("Tool result · {name} · {status}"),
     );
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &title,
+        width,
+        if is_error {
+            Style::new().fg(Color::Red)
+        } else {
+            Style::new().fg(Color::Yellow)
+        },
+        muted_style(),
+    );
+    if let Some(output) = shell_output {
+        push_shell_output_rows(rows, output, width);
+    } else {
+        push_labeled_text_preview(
+            rows,
+            "output",
+            item.text(),
+            width,
+            MAX_INLINE_TOOL_TEXT_ROWS,
+        );
+    }
+    if is_error {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("tool call {}", truncate_middle(tool_call_id, 20)),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    rows.push(Line::default());
+}
+
+fn push_file_edit_preview_rows(rows: &mut Vec<Line>, edit: &FileEditTranscript, width: u16) {
+    let summary = edit.summary();
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!(
+            "{}  +{} -{}",
+            summary.display_path(),
+            summary.added,
+            summary.removed
+        ),
+        width,
+        muted_style(),
+        muted_style(),
+    );
+    let diff_lines = edit.diff_lines();
+    let diff_view = DiffView::new(&diff_lines)
+        .mode(DiffViewMode::Responsive)
+        .fold_context(20, 3);
+    let total_rows = diff_view.rendered_row_count();
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!(
+            "diff preview · {} of {total_rows} rows shown · use /diff for full view",
+            total_rows.min(MAX_INLINE_DIFF_ROWS)
+        ),
+        width,
+        muted_style(),
+        muted_style(),
+    );
+    for line in diff_view.render_lines(width.saturating_sub(2), MAX_INLINE_DIFF_ROWS) {
+        rows.push(prefix_line(line, "  ", muted_style()));
+    }
+    if total_rows > MAX_INLINE_DIFF_ROWS {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("… {} diff rows hidden …", total_rows - MAX_INLINE_DIFF_ROWS),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+}
+
+fn push_shell_output_rows(rows: &mut Vec<Line>, output: &ShellOutputTranscript, width: u16) {
+    if let Some(command) = &output.command {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("command: {command}"),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    if let Some(cwd) = &output.cwd {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("cwd: {cwd}"),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    let status = shell_status(output);
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &status,
+        width,
+        shell_status_style(output),
+        muted_style(),
+    );
+    push_ansi_output_preview(
+        rows,
+        "stdout",
+        &output.stdout,
+        width,
+        MAX_INLINE_STDOUT_ROWS,
+    );
+    push_ansi_output_preview(
+        rows,
+        "stderr",
+        &output.stderr,
+        width,
+        MAX_INLINE_STDERR_ROWS,
+    );
+}
+
+fn push_ansi_output_preview(
+    rows: &mut Vec<Line>,
+    label: &str,
+    text: &str,
+    width: u16,
+    max_rows: usize,
+) {
+    if text.is_empty() {
+        return;
+    }
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        label,
+        width,
+        muted_style().add_modifier(Modifier::BOLD),
+        muted_style(),
+    );
+    let parsed = ansi_to_lines(text);
+    let total = parsed.len();
+    for line in preview_lines(&parsed, max_rows) {
+        rows.push(prefix_line(line.clone(), "    ", muted_style()));
+    }
+    if total > max_rows {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("    ", muted_style())],
+            &format!("… {} {label} rows hidden …", total - max_rows),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+}
+
+fn push_labeled_text_preview(
+    rows: &mut Vec<Line>,
+    label: &str,
+    text: &str,
+    width: u16,
+    max_rows: usize,
+) {
+    if text.is_empty() {
+        return;
+    }
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        label,
+        width,
+        muted_style().add_modifier(Modifier::BOLD),
+        muted_style(),
+    );
+    let lines = text.lines().map(Line::raw).collect::<Vec<_>>();
+    let total = lines.len();
+    for line in preview_lines(&lines, max_rows) {
+        rows.push(prefix_line(line.clone(), "    ", muted_style()));
+    }
+    if total > max_rows {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("    ", muted_style())],
+            &format!("… {} {label} rows hidden …", total - max_rows),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+}
+
+fn preview_lines(lines: &[Line], max_rows: usize) -> Vec<&Line> {
+    if lines.len() <= max_rows || max_rows < 4 {
+        return lines.iter().take(max_rows).collect();
+    }
+    let head = max_rows / 2;
+    let tail = max_rows.saturating_sub(head);
+    lines
+        .iter()
+        .take(head)
+        .chain(lines.iter().skip(lines.len().saturating_sub(tail)))
+        .collect()
+}
+
+fn prefix_line(mut line: Line, prefix: &str, prefix_style: Style) -> Line {
+    let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
+    spans.append(&mut line.spans);
+    Line::from_spans(spans)
+}
+
+fn shell_status(output: &ShellOutputTranscript) -> String {
+    let exit = output.exit_code.map_or_else(
+        || "exit unknown".to_owned(),
+        |exit_code| format!("exit {exit_code}"),
+    );
+    if output.timed_out {
+        format!("{exit} · timed out")
+    } else {
+        exit
+    }
+}
+
+fn shell_status_style(output: &ShellOutputTranscript) -> Style {
+    if output.timed_out || output.exit_code.is_some_and(|exit_code| exit_code != 0) {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new().fg(Color::Green)
+    }
 }
 
 fn push_usage_rows(rows: &mut Vec<Line>, item: &TranscriptItem, turn_id: &str, width: u16) {
@@ -704,29 +950,4 @@ fn usize_to_u16_saturating(value: usize) -> u16 {
 
 const fn muted_style() -> Style {
     Style::new().fg(Color::BrightBlack)
-}
-
-fn tool_result_preview(result: &str) -> String {
-    let lines = result.lines().collect::<Vec<_>>();
-    if lines.len() <= 24 {
-        return result.to_owned();
-    }
-
-    let omitted = lines.len().saturating_sub(20);
-    let mut preview = lines
-        .iter()
-        .take(12)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let _ = write!(preview, "\n… {omitted} lines omitted …\n");
-    preview.push_str(
-        &lines
-            .iter()
-            .skip(lines.len().saturating_sub(8))
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    preview
 }

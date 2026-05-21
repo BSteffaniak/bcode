@@ -1,8 +1,10 @@
 //! Transcript item projection for the BMUX backend.
 
+use std::collections::BTreeMap;
+
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionTokenUsage};
 
-use super::diff_extract::diff_from_tool_request;
+use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
 
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,13 +21,17 @@ pub(super) enum TranscriptItemKind {
         tool_call_id: String,
         /// Tool name.
         tool_name: String,
-        /// Optional diff summary for filesystem edit/write tools.
-        diff_summary: Option<String>,
+        /// Optional semantic file edit extracted from filesystem tools.
+        file_edit: Option<FileEditTranscript>,
     },
     /// Tool-call result with structured metadata.
     ToolResult {
         /// Provider tool call identifier.
         tool_call_id: String,
+        /// Tool name, when the matching request is known.
+        tool_name: Option<String>,
+        /// Parsed shell output, when the result came from a shell tool.
+        shell_output: Option<ShellOutputTranscript>,
         /// Whether the tool failed.
         is_error: bool,
     },
@@ -58,6 +64,29 @@ pub(super) enum TranscriptItemKind {
     SkillError,
     /// Generic fallback item.
     Generic,
+}
+
+/// Parsed shell tool output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ShellOutputTranscript {
+    /// Command that ran, when known from the tool request.
+    pub(super) command: Option<String>,
+    /// Working directory, when known from the tool request.
+    pub(super) cwd: Option<String>,
+    /// Process exit code, when reported by the tool.
+    pub(super) exit_code: Option<i32>,
+    /// Whether the command timed out.
+    pub(super) timed_out: bool,
+    /// Raw ANSI-preserving stdout.
+    pub(super) stdout: String,
+    /// Raw ANSI-preserving stderr.
+    pub(super) stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ToolCallContext {
+    tool_name: String,
+    arguments_json: String,
 }
 
 /// Renderable transcript item.
@@ -130,11 +159,27 @@ impl TranscriptItem {
 /// Project session events into transcript items.
 #[must_use]
 pub(super) fn transcript_items_from_events(events: &[SessionEvent]) -> Vec<TranscriptItem> {
-    let mut items = Vec::new();
+    let mut projector = TranscriptProjector::default();
     for event in events {
-        push_transcript_item_from_event(&mut items, event);
+        projector.push_event(event);
     }
-    items
+    projector.finish()
+}
+
+#[derive(Debug, Clone, Default)]
+struct TranscriptProjector {
+    items: Vec<TranscriptItem>,
+    tool_calls: BTreeMap<String, ToolCallContext>,
+}
+
+impl TranscriptProjector {
+    fn push_event(&mut self, event: &SessionEvent) {
+        push_transcript_item_from_event(&mut self.items, &mut self.tool_calls, event);
+    }
+
+    fn finish(self) -> Vec<TranscriptItem> {
+        self.items
+    }
 }
 
 /// Merge streaming transcript items across a prepended history boundary.
@@ -163,15 +208,7 @@ pub(super) fn tool_request_item(
     tool_name: &str,
     arguments_json: &str,
 ) -> TranscriptItem {
-    let diff_summary =
-        diff_from_tool_request(tool_name, arguments_json).map(|(summary, _lines)| {
-            format!(
-                "{} (+{} -{})",
-                summary.display_path(),
-                summary.added,
-                summary.removed
-            )
-        });
+    let file_edit = file_edit_from_tool_request(tool_name, arguments_json);
     TranscriptItem::with_kind(
         "Tool",
         pretty_jsonish(arguments_json),
@@ -179,20 +216,28 @@ pub(super) fn tool_request_item(
         TranscriptItemKind::ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
-            diff_summary,
+            file_edit,
         },
     )
 }
 
 /// Build a transcript item for a tool result.
 #[must_use]
-pub(super) fn tool_result_item(tool_call_id: &str, result: &str, is_error: bool) -> TranscriptItem {
+pub(super) fn tool_result_item(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    result: &str,
+    is_error: bool,
+) -> TranscriptItem {
     TranscriptItem::with_kind(
         if is_error { "Tool error" } else { "Tool" },
-        truncate_block(result, 4_000),
+        result.to_owned(),
         false,
         TranscriptItemKind::ToolResult {
             tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.map(ToOwned::to_owned),
+            shell_output: shell_output_from_result(tool_name, arguments_json, result),
             is_error,
         },
     )
@@ -275,6 +320,49 @@ pub(super) fn pretty_jsonish(value: &str) -> String {
     )
 }
 
+fn shell_output_from_result(
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    result: &str,
+) -> Option<ShellOutputTranscript> {
+    let tool_name = tool_name?;
+    if normalized_tool_name(tool_name) != "shell_run" {
+        return None;
+    }
+    let result_json = serde_json::from_str::<serde_json::Value>(result).ok()?;
+    let arguments_json = arguments_json
+        .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok());
+    Some(ShellOutputTranscript {
+        command: arguments_json
+            .as_ref()
+            .and_then(|arguments| string_field(arguments, "command")),
+        cwd: arguments_json
+            .as_ref()
+            .and_then(|arguments| string_field(arguments, "cwd")),
+        exit_code: result_json
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+        timed_out: result_json
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        stdout: string_field(&result_json, "stdout").unwrap_or_default(),
+        stderr: string_field(&result_json, "stderr").unwrap_or_default(),
+    })
+}
+
+fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn normalized_tool_name(tool_name: &str) -> String {
+    tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
+}
+
 /// Truncate long transcript blocks.
 #[must_use]
 pub(super) fn truncate_block(value: &str, max_chars: usize) -> String {
@@ -289,7 +377,11 @@ pub(super) fn truncate_block(value: &str, max_chars: usize) -> String {
     output
 }
 
-fn push_transcript_item_from_event(items: &mut Vec<TranscriptItem>, event: &SessionEvent) {
+fn push_transcript_item_from_event(
+    items: &mut Vec<TranscriptItem>,
+    tool_calls: &mut BTreeMap<String, ToolCallContext>,
+    event: &SessionEvent,
+) {
     match &event.kind {
         SessionEventKind::AssistantDelta { text } => {
             push_streaming_transcript_item(items, "Assistant", text);
@@ -304,7 +396,7 @@ fn push_transcript_item_from_event(items: &mut Vec<TranscriptItem>, event: &Sess
             finish_streaming_transcript_item(items, "Reasoning", text);
         }
         _ => {
-            if let Some(item) = non_streaming_transcript_item_from_event(event) {
+            if let Some(item) = non_streaming_transcript_item_from_event(event, tool_calls) {
                 items.push(item);
             }
         }
@@ -353,7 +445,10 @@ fn latest_streaming_item_mut<'items>(
         .find(|item| item.role == role && item.streaming)
 }
 
-fn non_streaming_transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
+fn non_streaming_transcript_item_from_event(
+    event: &SessionEvent,
+    tool_calls: &mut BTreeMap<String, ToolCallContext>,
+) -> Option<TranscriptItem> {
     match &event.kind {
         SessionEventKind::UserMessage { text, .. } => {
             Some(TranscriptItem::new("You", text.clone()))
@@ -365,12 +460,30 @@ fn non_streaming_transcript_item_from_event(event: &SessionEvent) -> Option<Tran
             tool_call_id,
             tool_name,
             arguments_json,
-        } => Some(tool_request_item(tool_call_id, tool_name, arguments_json)),
+        } => {
+            tool_calls.insert(
+                tool_call_id.clone(),
+                ToolCallContext {
+                    tool_name: tool_name.clone(),
+                    arguments_json: arguments_json.clone(),
+                },
+            );
+            Some(tool_request_item(tool_call_id, tool_name, arguments_json))
+        }
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             result,
             is_error,
-        } => Some(tool_result_item(tool_call_id, result, *is_error)),
+        } => {
+            let context = tool_calls.get(tool_call_id);
+            Some(tool_result_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                context.map(|context| context.arguments_json.as_str()),
+                result,
+                *is_error,
+            ))
+        }
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,

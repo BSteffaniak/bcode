@@ -1,5 +1,7 @@
 //! BMUX backend app state.
 
+use std::collections::BTreeMap;
+
 use bcode_session_models::{
     ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
     SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
@@ -42,6 +44,7 @@ pub(super) struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
+    tool_call_contexts: BTreeMap<String, ToolCallContext>,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
     viewport: TranscriptViewport,
@@ -51,6 +54,12 @@ pub(super) struct BmuxApp {
     key_hints: String,
     exit: ExitState,
     cursor: CursorBlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolCallContext {
+    tool_name: String,
+    arguments_json: String,
 }
 
 impl BmuxApp {
@@ -73,6 +82,7 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
+            tool_call_contexts: BTreeMap::new(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
             viewport: TranscriptViewport::default(),
@@ -765,6 +775,13 @@ impl BmuxApp {
 
     fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
         self.record_diff_summary(tool_name, arguments_json);
+        self.tool_call_contexts.insert(
+            tool_call_id.to_owned(),
+            ToolCallContext {
+                tool_name: tool_name.to_owned(),
+                arguments_json: arguments_json.to_owned(),
+            },
+        );
         self.transcript
             .push(tool_request_item(tool_call_id, tool_name, arguments_json));
         self.set_activity(ActivityState::RunningTool {
@@ -781,8 +798,14 @@ impl BmuxApp {
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
-        self.transcript
-            .push(tool_result_item(tool_call_id, result, is_error));
+        let context = self.tool_call_contexts.get(tool_call_id);
+        self.transcript.push(tool_result_item(
+            tool_call_id,
+            context.map(|context| context.tool_name.as_str()),
+            context.map(|context| context.arguments_json.as_str()),
+            result,
+            is_error,
+        ));
         if is_error {
             "tool failed".clone_into(&mut self.status);
         } else {
