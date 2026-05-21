@@ -626,11 +626,24 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Tool · filesystem.edit"));
-    assert!(output.contains("src/lib.rs  +3 -3"));
-    assert!(output.contains("diff preview"));
-    assert!(output.contains("-    41"));
-    assert!(output.contains("+    42"));
+    assert!(output.contains("src/lib.rs  +1 -1"));
+    assert!(output.contains("replaced 1 line with 1 line"));
+    assert!(output.contains("showing"));
+    assert!(output.contains("-   2 │     41"));
+    assert!(output.contains("+   2 │     42"));
     assert!(!output.contains("\"old_text\""));
+    assert_eq!(
+        buffer
+            .get(Point::new(2, output_line_y(&buffer, "41").unwrap()))
+            .map(|cell| cell.style.fg),
+        Some(Some(bmux_tui::style::Color::BrightRed))
+    );
+    assert_eq!(
+        buffer
+            .get(Point::new(2, output_line_y(&buffer, "42").unwrap()))
+            .map(|cell| cell.style.fg),
+        Some(Some(bmux_tui::style::Color::BrightGreen))
+    );
 }
 
 #[test]

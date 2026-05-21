@@ -2,7 +2,10 @@
 
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::chrome::{Border, Panel};
-use bmux_tui::diff::{DiffFileList, DiffFileListState, DiffView, DiffViewMode, DiffViewState};
+use bmux_tui::diff::{
+    DiffFileList, DiffFileListState, DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState,
+    DiffViewStyles,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::hit::{HitRegion, HitRole};
@@ -233,6 +236,7 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     };
     DiffView::new(app.diff_lines())
         .mode(DiffViewMode::Responsive)
+        .styles(diff_view_styles())
         .fold_context(20, 3)
         .render(detail_area, frame, &mut diff_state);
 }
@@ -455,37 +459,161 @@ fn push_file_edit_preview_rows(rows: &mut Vec<Line>, edit: &FileEditTranscript, 
             summary.removed
         ),
         width,
-        muted_style(),
+        Style::new()
+            .fg(Color::BrightWhite)
+            .add_modifier(Modifier::BOLD),
         muted_style(),
     );
-    let diff_lines = edit.diff_lines();
-    let diff_view = DiffView::new(&diff_lines)
-        .mode(DiffViewMode::Responsive)
-        .fold_context(20, 3);
-    let total_rows = diff_view.rendered_row_count();
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
-        &format!(
-            "diff preview · {} of {total_rows} rows shown · use /diff for full view",
-            total_rows.min(MAX_INLINE_DIFF_ROWS)
-        ),
+        &edit_change_summary(summary.added, summary.removed),
         width,
         muted_style(),
         muted_style(),
     );
-    for line in diff_view.render_lines(width.saturating_sub(2), MAX_INLINE_DIFF_ROWS) {
-        rows.push(prefix_line(line, "  ", muted_style()));
+
+    let diff_lines = edit
+        .diff_lines()
+        .into_iter()
+        .filter(|line| line.kind != DiffLineKind::FileHeader)
+        .collect::<Vec<_>>();
+    let total_rows = diff_lines.len();
+    let shown_rows = total_rows.min(MAX_INLINE_DIFF_ROWS);
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!("showing {shown_rows} of {total_rows} diff rows · /diff for full view"),
+        width,
+        muted_style(),
+        muted_style(),
+    );
+
+    let preview = inline_diff_preview(&diff_lines, MAX_INLINE_DIFF_ROWS);
+    for row in preview {
+        match row {
+            InlineDiffPreviewRow::Line(line) => {
+                rows.push(render_inline_diff_line(line, width.saturating_sub(2)));
+            }
+            InlineDiffPreviewRow::Hidden(count) => {
+                push_wrapped_styled_text(
+                    rows,
+                    vec![Span::styled("  ", muted_style())],
+                    &format!("… {count} diff rows hidden …"),
+                    width,
+                    muted_style(),
+                    muted_style(),
+                );
+            }
+        }
     }
-    if total_rows > MAX_INLINE_DIFF_ROWS {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            &format!("… {} diff rows hidden …", total_rows - MAX_INLINE_DIFF_ROWS),
-            width,
-            muted_style(),
-            muted_style(),
-        );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InlineDiffPreviewRow<'line> {
+    Line(&'line DiffLine),
+    Hidden(usize),
+}
+
+fn inline_diff_preview(lines: &[DiffLine], max_rows: usize) -> Vec<InlineDiffPreviewRow<'_>> {
+    if lines.len() <= max_rows || max_rows < 4 {
+        return lines.iter().map(InlineDiffPreviewRow::Line).collect();
+    }
+    let head = max_rows / 2;
+    let tail = max_rows.saturating_sub(head).saturating_sub(1);
+    let hidden = lines.len().saturating_sub(head).saturating_sub(tail);
+    lines
+        .iter()
+        .take(head)
+        .map(InlineDiffPreviewRow::Line)
+        .chain(std::iter::once(InlineDiffPreviewRow::Hidden(hidden)))
+        .chain(
+            lines
+                .iter()
+                .skip(lines.len().saturating_sub(tail))
+                .map(InlineDiffPreviewRow::Line),
+        )
+        .collect()
+}
+
+fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
+    let (sign, sign_style, body_style) = inline_diff_line_styles(line.kind);
+    let line_number = inline_diff_line_number(line);
+    let gutter_style = muted_style();
+    let body_width = usize::from(width)
+        .saturating_sub(2)
+        .saturating_sub(5)
+        .saturating_sub(3);
+    Line::from_spans(vec![
+        Span::styled("  ", gutter_style),
+        Span::styled(sign, sign_style.add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{line_number:>4}"), gutter_style),
+        Span::styled(" │ ", gutter_style),
+        Span::styled(
+            truncate_to_display_width(&line.content, body_width),
+            body_style,
+        ),
+    ])
+}
+
+const fn inline_diff_line_styles(kind: DiffLineKind) -> (&'static str, Style, Style) {
+    match kind {
+        DiffLineKind::Added => (
+            "+",
+            Style::new().fg(Color::BrightGreen),
+            Style::new().fg(Color::BrightGreen),
+        ),
+        DiffLineKind::Removed => (
+            "-",
+            Style::new().fg(Color::BrightRed),
+            Style::new().fg(Color::BrightRed),
+        ),
+        DiffLineKind::HunkHeader => (
+            "·",
+            Style::new().fg(Color::BrightCyan),
+            Style::new().fg(Color::BrightCyan),
+        ),
+        DiffLineKind::Context | DiffLineKind::FileHeader => (" ", muted_style(), Style::new()),
+    }
+}
+
+fn inline_diff_line_number(line: &DiffLine) -> String {
+    line.new_line
+        .or(line.old_line)
+        .map_or_else(|| "·".to_owned(), |line| line.to_string())
+}
+
+fn edit_change_summary(added: u32, removed: u32) -> String {
+    match (added, removed) {
+        (0, 0) => "no textual changes detected".to_owned(),
+        (added, 0) => format!("added {}", line_count_label(added)),
+        (0, removed) => format!("removed {}", line_count_label(removed)),
+        (added, removed) => {
+            format!(
+                "replaced {} with {}",
+                line_count_label(removed),
+                line_count_label(added)
+            )
+        }
+    }
+}
+
+fn line_count_label(count: u32) -> String {
+    if count == 1 {
+        "1 line".to_owned()
+    } else {
+        format!("{count} lines")
+    }
+}
+
+const fn diff_view_styles() -> DiffViewStyles {
+    DiffViewStyles {
+        file_header: Style::new().fg(Color::BrightBlack),
+        hunk_header: Style::new().fg(Color::BrightCyan),
+        context: Style::new(),
+        added: Style::new().fg(Color::BrightGreen),
+        removed: Style::new().fg(Color::BrightRed),
+        gutter: Style::new().fg(Color::BrightBlack),
     }
 }
 
@@ -804,6 +932,21 @@ fn spans_width(spans: &[Span]) -> usize {
 
 fn text_display_width(text: &str) -> usize {
     text.chars().map(char_display_width).sum()
+}
+
+fn truncate_to_display_width(text: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let char_width = char_display_width(ch);
+        if used.saturating_add(char_width) > width {
+            output.push('…');
+            return output;
+        }
+        output.push(ch);
+        used = used.saturating_add(char_width);
+    }
+    output
 }
 
 fn char_display_width(ch: char) -> usize {

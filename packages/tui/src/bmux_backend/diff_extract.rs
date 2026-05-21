@@ -17,11 +17,8 @@ impl FileEditTranscript {
     /// Return a summary for this file edit.
     #[must_use]
     pub(super) fn summary(&self) -> DiffFileSummary {
-        DiffFileSummary::new(
-            self.path.clone(),
-            line_count(&self.new_text),
-            line_count(&self.old_text),
-        )
+        let (added, removed) = count_changed_diff_lines(&self.diff_lines());
+        DiffFileSummary::new(self.path.clone(), added, removed)
     }
 
     /// Return diff lines for this file edit.
@@ -351,8 +348,16 @@ fn common_suffix_len(old_lines: &[&str], new_lines: &[&str], prefix: usize) -> u
         .count()
 }
 
-fn line_count(value: &str) -> u32 {
-    u32::try_from(value.lines().count().max(1)).unwrap_or(u32::MAX)
+fn count_changed_diff_lines(lines: &[DiffLine]) -> (u32, u32) {
+    let added = lines
+        .iter()
+        .filter(|line| line.kind == DiffLineKind::Added)
+        .count();
+    let removed = lines
+        .iter()
+        .filter(|line| line.kind == DiffLineKind::Removed)
+        .count();
+    (usize_to_u32(added), usize_to_u32(removed))
 }
 
 fn usize_to_u32(value: usize) -> u32 {
