@@ -1,5 +1,6 @@
 //! BMUX-native TUI backend.
 
+mod activity;
 mod app;
 mod chat_loop;
 mod command_palette;
@@ -17,6 +18,7 @@ mod model_flow;
 mod model_picker;
 mod model_picker_render;
 mod mouse_flow;
+mod older_history;
 mod palette_flow;
 mod pending_submission;
 mod permission_dialog;

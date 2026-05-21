@@ -1,0 +1,37 @@
+//! Current backend activity state.
+
+use bcode_session_models::ModelTurnOutcome;
+
+/// Current high-level backend activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ActivityState {
+    /// No active model/tool work.
+    Idle,
+    /// Waiting for a model response.
+    Thinking,
+    /// Receiving streamed model output.
+    Streaming,
+    /// Running a tool.
+    RunningTool {
+        /// Tool name.
+        name: String,
+    },
+    /// Waiting for a permission decision.
+    WaitingPermission {
+        /// Tool name.
+        name: String,
+    },
+}
+
+/// Return a status label for a model turn outcome.
+#[must_use]
+pub(super) const fn model_turn_outcome_label(outcome: ModelTurnOutcome) -> &'static str {
+    match outcome {
+        ModelTurnOutcome::Completed => "done",
+        ModelTurnOutcome::Cancelled => "cancelled",
+        ModelTurnOutcome::Error => "error",
+        ModelTurnOutcome::IdleTimeout => "idle timeout",
+        ModelTurnOutcome::ToolRoundLimitReached => "tool round limit reached",
+        ModelTurnOutcome::ProviderUnavailable => "provider unavailable",
+    }
+}

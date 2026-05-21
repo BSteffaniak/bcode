@@ -11,9 +11,11 @@ use bmux_text_edit::TextEditBuffer;
 use bmux_tui::diff::{DiffFileSummary, DiffLine};
 
 use super::IDLE_REDRAW_INTERVAL;
+use super::activity::{ActivityState, model_turn_outcome_label};
 use super::diff_extract::diff_from_tool_request;
 use super::diff_panel::DiffPanel;
 use super::input_history::InputHistory;
+use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::transcript::{
     TranscriptItem, merge_transcript_boundary, optional_u32, pretty_jsonish, tool_request_item,
@@ -33,9 +35,7 @@ pub(super) struct BmuxApp {
     scroll_offset: usize,
     transcript_max_scroll_offset: usize,
     scroll_preserve_max_offset: Option<usize>,
-    older_history_cursor: Option<SessionHistoryCursor>,
-    older_history_reveal_request: Option<usize>,
-    loading_older_history: bool,
+    older_history: OlderHistoryState,
     activity: ActivityState,
     status: String,
     should_exit: bool,
@@ -63,9 +63,7 @@ impl BmuxApp {
             scroll_offset: 0,
             transcript_max_scroll_offset: 0,
             scroll_preserve_max_offset: None,
-            older_history_cursor: oldest_history_cursor(history, has_older_history),
-            older_history_reveal_request: None,
-            loading_older_history: false,
+            older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
             should_exit: false,
@@ -180,35 +178,30 @@ impl BmuxApp {
     /// Return whether older history may be available.
     #[must_use]
     pub(super) const fn has_older_history(&self) -> bool {
-        self.older_history_cursor.is_some()
+        self.older_history.has_older_history()
     }
 
     /// Return whether an older-history request is in flight.
     #[must_use]
     pub(super) const fn loading_older_history(&self) -> bool {
-        self.loading_older_history
+        self.older_history.loading()
     }
 
     /// Mark older history as loading or idle.
     pub(super) const fn set_loading_older_history(&mut self, loading: bool) {
-        self.loading_older_history = loading;
-        if !loading {
-            self.older_history_reveal_request = None;
-        }
+        self.older_history.set_loading(loading);
     }
 
     /// Return the cursor for loading older history.
     #[must_use]
     pub(super) const fn older_history_cursor(&self) -> Option<SessionHistoryCursor> {
-        self.older_history_cursor
+        self.older_history.cursor()
     }
 
     /// Return whether an older-history request should be started.
     #[must_use]
     pub(super) const fn should_load_older_history(&self) -> bool {
-        self.older_history_cursor.is_some()
-            && !self.loading_older_history
-            && self.older_history_reveal_request.is_some()
+        self.older_history.should_load()
     }
 
     /// Return the current activity state.
@@ -304,7 +297,7 @@ impl BmuxApp {
             return false;
         }
         let previous = self.scroll_offset;
-        let previous_request = self.older_history_reveal_request;
+        let previous_request = self.older_history.reveal_request();
         let desired = self.scroll_offset.saturating_add(rows);
         self.scroll_offset = desired.min(self.transcript_max_scroll_offset);
         if desired > self.transcript_max_scroll_offset {
@@ -312,7 +305,7 @@ impl BmuxApp {
                 desired.saturating_sub(self.transcript_max_scroll_offset),
             );
         }
-        self.scroll_offset != previous || self.older_history_reveal_request != previous_request
+        self.scroll_offset != previous || self.older_history.reveal_request() != previous_request
     }
 
     /// Scroll transcript down by rendered rows.
@@ -326,7 +319,7 @@ impl BmuxApp {
     pub(super) const fn scroll_transcript_to_bottom(&mut self) -> bool {
         let changed = self.scroll_offset != 0;
         self.scroll_offset = 0;
-        self.older_history_reveal_request = None;
+        self.older_history.clear_reveal_request();
         changed
     }
 
@@ -334,7 +327,7 @@ impl BmuxApp {
     pub(super) fn sync_transcript_scroll_max(&mut self, max_scroll_offset: usize) {
         let previous_max = self.transcript_max_scroll_offset;
         self.transcript_max_scroll_offset = max_scroll_offset;
-        if let Some(requested_rows) = self.older_history_reveal_request.take() {
+        if let Some(requested_rows) = self.older_history.take_reveal_request() {
             let inserted_rows = max_scroll_offset.saturating_sub(previous_max);
             let reveal_rows = requested_rows.min(inserted_rows);
             self.scroll_offset = self.scroll_offset.saturating_add(reveal_rows);
@@ -349,14 +342,11 @@ impl BmuxApp {
     }
 
     fn request_older_history_load(&mut self, reveal_rows: usize) {
-        if self.older_history_cursor.is_none() || self.loading_older_history {
+        if self.older_history.cursor().is_none() || self.older_history.loading() {
             return;
         }
         let reveal_rows = reveal_rows.max(1);
-        self.older_history_reveal_request = Some(
-            self.older_history_reveal_request
-                .map_or(reveal_rows, |requested| requested.max(reveal_rows)),
-        );
+        self.older_history.request_load(reveal_rows);
     }
 
     /// Absorb replayed history events.
@@ -369,9 +359,8 @@ impl BmuxApp {
     /// Prepend older history and preserve the current viewport.
     pub(super) fn prepend_older_history(&mut self, events: &[SessionEvent], has_more: bool) {
         if events.is_empty() {
-            self.older_history_cursor = None;
-            self.older_history_reveal_request = None;
-            self.loading_older_history = false;
+            self.older_history.update_cursor(&[], false);
+            self.older_history.set_loading(false);
             "start of session history".clone_into(&mut self.status);
             return;
         }
@@ -380,9 +369,9 @@ impl BmuxApp {
         merge_transcript_boundary(&mut older, &mut self.transcript);
         older.append(&mut self.transcript);
         self.transcript = older;
-        self.older_history_cursor = oldest_history_cursor(events, has_more);
-        self.loading_older_history = false;
-        if self.older_history_cursor.is_some() {
+        self.older_history.update_cursor(events, has_more);
+        self.older_history.set_loading(false);
+        if self.older_history.has_older_history() {
             "loaded older history".clone_into(&mut self.status);
         } else {
             "start of session history".clone_into(&mut self.status);
@@ -770,54 +759,5 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }
         | SessionEventKind::TraceEvent { .. } => false,
-    }
-}
-
-fn oldest_history_cursor(
-    events: &[SessionEvent],
-    has_older_history: bool,
-) -> Option<SessionHistoryCursor> {
-    if !has_older_history {
-        return None;
-    }
-    let oldest_sequence = events.first()?.sequence;
-    if oldest_sequence == 0 {
-        None
-    } else {
-        Some(SessionHistoryCursor {
-            sequence: oldest_sequence.saturating_sub(1),
-        })
-    }
-}
-
-/// Current high-level backend activity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ActivityState {
-    /// No active model/tool work.
-    Idle,
-    /// Waiting for a model response.
-    Thinking,
-    /// Receiving streamed model output.
-    Streaming,
-    /// Running a tool.
-    RunningTool {
-        /// Tool name.
-        name: String,
-    },
-    /// Waiting for a permission decision.
-    WaitingPermission {
-        /// Tool name.
-        name: String,
-    },
-}
-
-const fn model_turn_outcome_label(outcome: ModelTurnOutcome) -> &'static str {
-    match outcome {
-        ModelTurnOutcome::Completed => "done",
-        ModelTurnOutcome::Cancelled => "cancelled",
-        ModelTurnOutcome::Error => "error",
-        ModelTurnOutcome::IdleTimeout => "idle timeout",
-        ModelTurnOutcome::ToolRoundLimitReached => "tool round limit reached",
-        ModelTurnOutcome::ProviderUnavailable => "provider unavailable",
     }
 }
