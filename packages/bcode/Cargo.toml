@@ -19,7 +19,7 @@ bcode_cli = { workspace = true }
 tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = ["static-bundled-plugins", "tui-ratatui", "tui-bmux"]
+default = ["static-bundled-plugins"]
 fail-on-warnings = []
 static-bundled-bedrock-provider-plugin = [
     "bcode_cli/static-bundled-bedrock-provider-plugin",
@@ -36,7 +36,12 @@ static-bundled-filesystem-plugin = [
 static-bundled-openai-compatible-provider-plugin = [
     "bcode_cli/static-bundled-openai-compatible-provider-plugin",
 ]
-static-bundled-plugins = ["bcode_cli/static-bundled-plugins"]
+static-bundled-plugins = [
+    "static-bundled-bedrock-provider-plugin",
+    "static-bundled-default-agents-plugin",
+    "static-bundled-fake-provider-plugin",
+    "static-bundled-filesystem-plugin",
+    "static-bundled-openai-compatible-provider-plugin",
+    "static-bundled-shell-plugin",
+]
 static-bundled-shell-plugin = ["bcode_cli/static-bundled-shell-plugin"]
-tui-bmux = ["bcode_cli/tui-bmux"]
-tui-ratatui = ["bcode_cli/tui-ratatui"]

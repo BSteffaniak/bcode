@@ -11,40 +11,23 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-arboard = { workspace = true, optional = true }
-bcode_client = { workspace = true }
-bcode_command = { workspace = true }
-bcode_config = { workspace = true }
-bcode_ipc = { workspace = true }
-bcode_model = { workspace = true }
+bcode_client         = { workspace = true }
+bcode_command        = { workspace = true }
+bcode_config         = { workspace = true }
+bcode_ipc            = { workspace = true }
+bcode_model          = { workspace = true }
 bcode_session_models = { workspace = true }
-bcode_skill_models = { workspace = true }
-bmux_keyboard = { workspace = true }
-bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true, optional = true, features = [
-    "crossterm",
-    "diff",
-] }
-bmux_tui_components = { workspace = true, optional = true, features = [
-    "text-input",
-] }
-crossterm = { workspace = true, optional = true, features = [
-    "bracketed-paste",
-    "events",
-] }
-ratatui = { workspace = true, optional = true, features = [
-    "crossterm",
-    "crossterm_0_29",
-    "std",
-    "unstable-rendered-line-info",
-] }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+bcode_skill_models   = { workspace = true }
+bmux_keyboard        = { workspace = true }
+bmux_text_edit       = { workspace = true }
+bmux_tui             = { workspace = true, features = ["crossterm", "diff"] }
+bmux_tui_components  = { workspace = true, features = ["text-input"] }
+crossterm            = { workspace = true, features = ["bracketed-paste", "events"] }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["sync"] }
 unicode-segmentation = { workspace = true }
 
 [features]
-default          = ["tui-ratatui", "tui-bmux"]
+default          = []
 fail-on-warnings = []
-tui-bmux         = ["dep:bmux_tui", "dep:bmux_tui_components", "dep:crossterm"]
-tui-ratatui      = ["dep:arboard", "dep:crossterm", "dep:ratatui"]
