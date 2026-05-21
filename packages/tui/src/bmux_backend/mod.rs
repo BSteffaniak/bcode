@@ -1747,10 +1747,11 @@ async fn submit_composer<W: Write>(
     };
     let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
+        chat.app.clear_pending_submission(&message);
         return Ok(());
     }
     if message.starts_with('/') {
-        chat.app.clear_pending_submission();
+        chat.app.clear_pending_submission(&message);
         match slash_commands::execute(client, session_id, &message).await? {
             slash_commands::SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
             slash_commands::SlashCommandOutcome::SystemNote(note) => {
@@ -1785,7 +1786,7 @@ async fn submit_composer<W: Write>(
         }
         return Ok(());
     }
-    match client.send_user_message(session_id, message).await {
+    match client.send_user_message(session_id, message.clone()).await {
         Ok(acceptance) => {
             if acceptance.queued {
                 chat.app
@@ -1803,7 +1804,7 @@ async fn submit_composer<W: Write>(
             Ok(())
         }
         Err(error) => {
-            chat.app.restore_pending_submission();
+            chat.app.restore_pending_submission(&message);
             chat.app.set_status(format!("send failed: {error}"));
             Ok(())
         }
@@ -1851,6 +1852,42 @@ mod tests {
         assert!(buffer.row_symbols(3).unwrap().contains("BMUX backend"));
         assert!(buffer.row_symbols(4).unwrap().contains("Composer"));
         assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn slash_pending_submission_clears_after_take() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.replace_composer_with("/plan");
+        app.stage_submission();
+        let message = app.take_pending_submission();
+
+        app.clear_pending_submission(&message);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let mut frame = Frame::new(&mut buffer);
+        render::render(&mut app, &mut frame);
+        let output = rendered_text(&buffer);
+
+        assert!(!output.contains("/plan"));
+        assert!(!output.contains("[sending]"));
+    }
+
+    #[test]
+    fn taken_pending_submission_can_be_restored_after_send_failure() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.replace_composer_with("hello");
+        app.stage_submission();
+        let message = app.take_pending_submission();
+
+        app.restore_pending_submission(&message);
+
+        assert_eq!(app.composer().text(), "hello");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let mut frame = Frame::new(&mut buffer);
+        render::render(&mut app, &mut frame);
+        let output = rendered_text(&buffer);
+
+        assert!(!output.contains("[sending]"));
     }
 
     #[test]

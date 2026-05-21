@@ -298,11 +298,12 @@ impl BmuxApp {
         self.pending_submission.take().unwrap_or_default()
     }
 
-    /// Remove the pending submission after an intercepted slash command.
-    pub(super) fn clear_pending_submission(&mut self) {
-        if let Some(text) = self.pending_submission.take() {
-            self.remove_pending_submission(&text);
+    /// Remove a pending submission that was handled outside the session transcript.
+    pub(super) fn clear_pending_submission(&mut self, text: &str) {
+        if self.pending_submission.as_deref() == Some(text) {
+            self.pending_submission = None;
         }
+        self.remove_pending_submission(text);
     }
 
     /// Mark the oldest pending submission as queued by the server.
@@ -319,12 +320,13 @@ impl BmuxApp {
         }
     }
 
-    /// Remove the oldest pending submission and restore it into the composer.
-    pub(super) fn restore_pending_submission(&mut self) {
-        if let Some(text) = self.pending_submission.take() {
-            self.remove_pending_submission(&text);
-            self.composer.insert_str(&text);
+    /// Remove a pending submission and restore it into the composer.
+    pub(super) fn restore_pending_submission(&mut self, text: &str) {
+        if self.pending_submission.as_deref() == Some(text) {
+            self.pending_submission = None;
         }
+        self.remove_pending_submission(text);
+        self.composer.insert_str(text);
         self.wake_cursor();
     }
 
