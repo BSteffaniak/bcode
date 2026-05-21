@@ -12,17 +12,12 @@ use bmux_tui::diff::{DiffFileSummary, DiffLine};
 
 use super::IDLE_REDRAW_INTERVAL;
 use super::diff_extract::diff_from_tool_request;
+use super::diff_panel::DiffPanel;
 use super::pending_submission::PendingSubmission;
 use super::transcript::{
     TranscriptItem, merge_transcript_boundary, optional_u32, pretty_jsonish, tool_request_item,
     transcript_items_from_events, truncate_block,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffPanelState {
-    Hidden,
-    Visible,
-}
 
 /// State owned by the BMUX-native backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,12 +28,7 @@ pub(super) struct BmuxApp {
     input_history_index: Option<usize>,
     input_history_draft: Option<String>,
     transcript: Vec<TranscriptItem>,
-    changed_files: Vec<DiffFileSummary>,
-    diff_details: Vec<Vec<DiffLine>>,
-    selected_diff_file: Option<usize>,
-    diff_panel: DiffPanelState,
-    diff_scroll_offset: usize,
-    diff_lines: Vec<DiffLine>,
+    diff_panel: DiffPanel,
     pending_submissions: Vec<PendingSubmission>,
     pending_submission: Option<String>,
     scroll_offset: usize,
@@ -73,12 +63,7 @@ impl BmuxApp {
             input_history_index: None,
             input_history_draft: None,
             transcript: Vec::new(),
-            changed_files: Vec::new(),
-            diff_details: Vec::new(),
-            selected_diff_file: None,
-            diff_panel: DiffPanelState::Hidden,
-            diff_scroll_offset: 0,
-            diff_lines: Vec::new(),
+            diff_panel: DiffPanel::new(),
             pending_submissions: Vec::new(),
             pending_submission: None,
             scroll_offset: 0,
@@ -123,88 +108,55 @@ impl BmuxApp {
     /// Return changed-file summaries inferred from edit tool calls.
     #[must_use]
     pub(super) fn changed_files(&self) -> &[DiffFileSummary] {
-        &self.changed_files
+        self.diff_panel.changed_files()
     }
 
     /// Return whether the diff panel is visible.
     #[must_use]
     pub(super) fn diff_visible(&self) -> bool {
-        self.diff_panel == DiffPanelState::Visible
+        self.diff_panel.visible()
     }
 
     /// Toggle diff panel visibility.
     pub(super) const fn toggle_diff_visible(&mut self) -> bool {
-        self.diff_panel = match self.diff_panel {
-            DiffPanelState::Hidden => DiffPanelState::Visible,
-            DiffPanelState::Visible => DiffPanelState::Hidden,
-        };
-        true
+        self.diff_panel.toggle_visible()
     }
 
     /// Return detailed diff lines inferred from edit tool calls.
     #[must_use]
     pub(super) fn diff_lines(&self) -> &[DiffLine] {
-        self.selected_diff_file
-            .and_then(|index| self.diff_details.get(index).map(Vec::as_slice))
-            .unwrap_or(&self.diff_lines)
+        self.diff_panel.lines()
     }
 
     /// Return diff scroll offset.
     #[must_use]
     pub(super) const fn diff_scroll_offset(&self) -> usize {
-        self.diff_scroll_offset
+        self.diff_panel.scroll_offset()
     }
 
     /// Scroll diff preview up.
     pub(super) fn scroll_diff_up(&mut self, rows: usize) -> bool {
-        if rows == 0 || self.diff_lines.is_empty() {
-            return false;
-        }
-        let previous = self.diff_scroll_offset;
-        self.diff_scroll_offset = self
-            .diff_scroll_offset
-            .saturating_add(rows)
-            .min(self.diff_lines.len());
-        self.diff_scroll_offset != previous
+        self.diff_panel.scroll_up(rows)
     }
 
     /// Scroll diff preview down.
     pub(super) const fn scroll_diff_down(&mut self, rows: usize) -> bool {
-        let previous = self.diff_scroll_offset;
-        self.diff_scroll_offset = self.diff_scroll_offset.saturating_sub(rows);
-        self.diff_scroll_offset != previous
+        self.diff_panel.scroll_down(rows)
     }
 
     /// Select a changed-file diff detail.
     pub(super) const fn select_diff_file(&mut self, index: usize) -> bool {
-        if index >= self.changed_files.len() {
-            return false;
-        }
-        self.selected_diff_file = Some(index);
-        self.diff_scroll_offset = 0;
-        true
+        self.diff_panel.select_file(index)
     }
 
     /// Select next changed file.
     pub(super) fn select_next_diff_file(&mut self) -> bool {
-        if self.changed_files.is_empty() {
-            return false;
-        }
-        let next = self.selected_diff_file.map_or(0, |index| {
-            index.saturating_add(1).min(self.changed_files.len() - 1)
-        });
-        self.select_diff_file(next)
+        self.diff_panel.select_next_file()
     }
 
     /// Select previous changed file.
     pub(super) fn select_previous_diff_file(&mut self) -> bool {
-        if self.changed_files.is_empty() {
-            return false;
-        }
-        let previous = self
-            .selected_diff_file
-            .map_or(0, |index| index.saturating_sub(1));
-        self.select_diff_file(previous)
+        self.diff_panel.select_previous_file()
     }
 
     /// Move composer cursor to soft-wrapped row and column.
@@ -678,28 +630,7 @@ impl BmuxApp {
         let Some((summary, lines)) = diff_from_tool_request(tool_name, arguments_json) else {
             return;
         };
-        let path = summary.display_path();
-        if let Some(existing_index) = self
-            .changed_files
-            .iter()
-            .position(|existing| existing.display_path() == path)
-        {
-            self.changed_files[existing_index] = summary;
-            if let Some(existing_lines) = self.diff_details.get_mut(existing_index) {
-                *existing_lines = lines;
-            }
-            self.selected_diff_file = Some(existing_index);
-        } else {
-            self.changed_files.push(summary);
-            self.diff_details.push(lines);
-            self.selected_diff_file = Some(self.changed_files.len().saturating_sub(1));
-        }
-        self.diff_scroll_offset = 0;
-        self.diff_lines = self
-            .diff_details
-            .iter()
-            .flat_map(|detail| detail.iter().cloned())
-            .collect();
+        self.diff_panel.record(summary, lines);
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
