@@ -7,6 +7,7 @@ use bcode_session_models::{
     SessionTokenUsage,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+use bmux_text_edit::TextMotion;
 use bmux_tui::buffer::Buffer;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
@@ -107,6 +108,24 @@ fn composer_mouse_drag_extends_selection() {
         bmux_tui_components::text_input::TextInputOutcome::Redraw
     ));
     assert_eq!(app.composer().selected_text(), Some("hello".to_owned()));
+}
+
+#[test]
+fn composer_drag_beyond_visible_edge_scrolls_selection() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.replace_composer_with("0\n1\n2\n3\n4");
+    app.composer_mut().move_cursor(TextMotion::Start);
+    app.set_composer_content_area(Rect::new(2, 8, 20, 2));
+
+    let _ = app.handle_composer_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 8));
+    let outcome = app.handle_composer_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 10));
+
+    assert!(matches!(
+        outcome,
+        bmux_tui_components::text_input::TextInputOutcome::Redraw
+    ));
+    assert_eq!(app.composer_scroll_offset(), 1);
+    assert_eq!(app.composer().selected_text(), Some("0\n1\n".to_owned()));
 }
 
 #[test]
