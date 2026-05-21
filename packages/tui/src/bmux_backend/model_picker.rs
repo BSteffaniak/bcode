@@ -6,13 +6,14 @@ use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 
+use super::filtered_list::FilteredListState;
+
 /// Model picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ModelPickerApp {
     models: Vec<ModelInfo>,
     filter: TextEditBuffer,
-    list_state: ListState,
-    filtered_indices: Vec<usize>,
+    list: FilteredListState,
     status: String,
 }
 
@@ -20,16 +21,11 @@ impl ModelPickerApp {
     /// Create a model picker with status text.
     #[must_use]
     pub(super) fn new_with_status(models: Vec<ModelInfo>, status: impl Into<String>) -> Self {
-        let filtered_indices = (0..models.len()).collect::<Vec<_>>();
-        let mut list_state = ListState::new();
-        if !filtered_indices.is_empty() {
-            list_state.select(Some(0));
-        }
+        let list = FilteredListState::new(models.len());
         Self {
             models,
             filter: TextEditBuffer::new(),
-            list_state,
-            filtered_indices,
+            list,
             status: status.into(),
         }
     }
@@ -47,7 +43,7 @@ impl ModelPickerApp {
 
     /// Return list state mutably.
     pub(super) const fn list_state_mut(&mut self) -> &mut ListState {
-        &mut self.list_state
+        self.list.list_state_mut()
     }
 
     /// Return status.
@@ -59,13 +55,11 @@ impl ModelPickerApp {
     /// Return visible list items.
     #[must_use]
     pub(super) fn list_items(&self) -> Vec<ListItem> {
-        if self.filtered_indices.is_empty() {
-            return vec![ListItem::new(Line::from_spans(vec![Span::styled(
-                "No matching models.",
-                Style::new().fg(Color::BrightBlack),
-            )]))];
+        if self.list.indices().is_empty() {
+            return vec![empty_item("No matching models.")];
         }
-        self.filtered_indices
+        self.list
+            .indices()
             .iter()
             .map(|index| model_item(&self.models[*index]))
             .collect()
@@ -74,50 +68,35 @@ impl ModelPickerApp {
     /// Return selected model id.
     #[must_use]
     pub(super) fn selected_model_id(&self) -> Option<String> {
-        let selected = self.list_state.selected?;
-        let index = *self.filtered_indices.get(selected)?;
+        let index = self.list.selected_source_index()?;
         Some(self.models[index].model_id.clone())
     }
 
     /// Refresh filter.
     pub(super) fn refresh_filter(&mut self) {
         let query = self.filter.text().trim().to_ascii_lowercase();
-        self.filtered_indices = self
+        let filtered_indices = self
             .models
             .iter()
             .enumerate()
             .filter_map(|(index, model)| model_matches(model, &query).then_some(index))
             .collect();
-        if self.filtered_indices.is_empty() {
-            self.list_state.select(None);
-            self.list_state.offset = 0;
-        } else {
-            self.list_state.select(Some(
-                self.list_state
-                    .selected
-                    .unwrap_or(0)
-                    .min(self.filtered_indices.len() - 1),
-            ));
-        }
+        self.list.replace_indices(filtered_indices);
     }
 
     /// Move selection down.
     pub(super) fn select_next(&mut self) {
-        self.list_state.select_next(self.filtered_indices.len());
+        self.list.select_next();
     }
 
     /// Move selection up.
     pub(super) fn select_previous(&mut self) {
-        self.list_state.select_previous(self.filtered_indices.len());
+        self.list.select_previous();
     }
 
     /// Select a visible row by zero-based index.
     pub(super) const fn select_visible(&mut self, row: usize) -> bool {
-        if row >= self.filtered_indices.len() {
-            return false;
-        }
-        self.list_state.select(Some(row));
-        true
+        self.list.select_visible(row)
     }
 }
 
@@ -141,4 +120,11 @@ fn model_matches(model: &ModelInfo, query: &str) -> bool {
     query.is_empty()
         || model.model_id.to_ascii_lowercase().contains(query)
         || model.display_name.to_ascii_lowercase().contains(query)
+}
+
+fn empty_item(message: &str) -> ListItem {
+    ListItem::new(Line::from_spans(vec![Span::styled(
+        message.to_owned(),
+        Style::new().fg(Color::BrightBlack),
+    )]))
 }

@@ -3,6 +3,7 @@
 mod app;
 mod command_palette;
 mod command_palette_render;
+mod filtered_list;
 mod input;
 mod keymap;
 mod model_picker;
