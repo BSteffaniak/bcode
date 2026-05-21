@@ -301,10 +301,6 @@ pub enum ResponsePayload {
     SessionModelStatus {
         status: SessionModelStatus,
     },
-    SessionModelList {
-        provider_plugin_id: Option<String>,
-        models: bcode_model::ModelList,
-    },
     AgentList {
         agents: Vec<AgentInfo>,
     },
@@ -342,6 +338,10 @@ pub enum ResponsePayload {
     MessageAccepted {
         queued: bool,
         queue_position: Option<u32>,
+    },
+    SessionModelList {
+        provider_plugin_id: Option<String>,
+        models: bcode_model::ModelList,
     },
 }
 
