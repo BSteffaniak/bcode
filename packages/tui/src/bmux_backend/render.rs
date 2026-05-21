@@ -10,8 +10,9 @@ use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_block::{TextBlock, TextWrap};
 
-use super::app::{ActivityState, BmuxApp, TranscriptItem};
+use super::app::{ActivityState, BmuxApp};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
+use super::transcript::TranscriptItem;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 

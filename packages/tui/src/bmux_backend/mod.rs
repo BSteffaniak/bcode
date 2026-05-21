@@ -38,6 +38,7 @@ mod slash_palette;
 mod slash_palette_render;
 #[cfg(test)]
 mod tests;
+mod transcript;
 
 use std::io;
 use std::time::Duration;
