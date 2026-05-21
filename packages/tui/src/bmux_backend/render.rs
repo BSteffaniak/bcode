@@ -16,6 +16,8 @@ use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::transcript::TranscriptItem;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const MAX_COMPOSER_ROWS: u16 = 6;
+const KEY_HINTS: &str = "enter send · escape interrupt · ctrl+d exit · ctrl+p palette";
 
 /// Render one BMUX backend frame.
 pub(super) fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
@@ -27,7 +29,7 @@ pub(super) fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(app, header, frame);
 
-    let composer_height = area.height.clamp(3, 6);
+    let composer_height = composer_height(app, area);
     let composer = Rect::new(
         area.x,
         area.bottom().saturating_sub(composer_height),
@@ -51,15 +53,63 @@ pub(super) fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     render_status(app, status, frame);
 }
 
+fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
+    if area.height == 0 {
+        return 0;
+    }
+    let content_width = area.width.saturating_sub(4).max(1);
+    let rows = app
+        .composer()
+        .wrapped_layout(usize::from(content_width))
+        .lines
+        .len()
+        .max(1);
+    let content_rows = usize_to_u16_saturating(rows).clamp(1, MAX_COMPOSER_ROWS);
+    content_rows
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2).max(3))
+        .min(area.height)
+}
+
 fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
-    let session = app
-        .session_id()
-        .map_or_else(|| String::from("new session"), |id| id.to_string());
+    let session_id = app.session_id().map_or_else(
+        || "new".to_owned(),
+        |id| truncate_middle(&id.to_string(), 12),
+    );
+    let session_title = app.session_title().map_or_else(
+        || "Untitled session".to_owned(),
+        |title| truncate_end(title, 28),
+    );
+    let provider = truncate_middle(app.selected_provider_plugin_id().unwrap_or("auto"), 22);
+    let model = truncate_middle(app.selected_model_id().unwrap_or("default"), 30);
+    let agent = truncate_middle(app.current_agent_id(), 18);
     let line = Line::from_spans(vec![
-        Span::styled("Bcode BMUX TUI", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "bcode",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled("session ", Style::new().fg(Color::BrightBlack)),
+        Span::raw(session_title),
+        Span::styled(
+            format!(" ({session_id})"),
+            Style::new().fg(Color::BrightBlack),
+        ),
         Span::raw("  "),
-        Span::styled(session, Style::new().fg(Color::BrightBlack)),
-        Span::raw("  Esc/Ctrl-C exits"),
+        Span::styled("provider: ", Style::new().fg(Color::BrightBlack)),
+        Span::styled(provider, Style::new().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("model: ", Style::new().fg(Color::BrightBlack)),
+        Span::raw(model),
+        Span::raw("  "),
+        Span::styled("agent: ", Style::new().fg(Color::BrightBlack)),
+        Span::styled(agent, Style::new().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("thinking: ", Style::new().fg(Color::BrightBlack)),
+        Span::styled(
+            app.thinking_label().to_owned(),
+            Style::new().fg(Color::BrightBlack),
+        ),
     ]);
     frame.write_line(area, &line);
 }
@@ -333,15 +383,19 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     }
     let line = Line::from_spans(vec![
         Span::styled(activity_label(app.activity()), Style::new().fg(Color::Cyan)),
-        Span::raw("  "),
+        Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
         Span::styled(app.status().to_owned(), Style::new().fg(Color::BrightBlack)),
+        Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
+        Span::styled(app.token_summary(), Style::new().fg(Color::BrightBlack)),
+        Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
+        Span::styled(KEY_HINTS, Style::new().fg(Color::BrightBlack)),
     ]);
     frame.write_line(area, &line);
 }
 
 fn activity_label(activity: &ActivityState) -> String {
     match activity {
-        ActivityState::Idle => "idle".to_owned(),
+        ActivityState::Idle => "ready".to_owned(),
         ActivityState::Thinking => format!("{} thinking", spinner_frame()),
         ActivityState::Streaming => format!("{} streaming", spinner_frame()),
         ActivityState::RunningTool { name } => format!("{} tool {name}", spinner_frame()),
@@ -357,25 +411,69 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[index]
 }
 
-fn render_composer(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
     let panel = Panel::new()
         .border(Border::single().style(Style::new().fg(Color::Cyan)))
-        .title(" Composer ")
+        .title(" Message ")
         .padding(Insets::new(0, 1, 0, 1));
     panel.render(area, frame);
     let inner = panel.inner_area(area);
+    app.set_composer_content_area(inner);
     frame.push_hit(
         HitRegion::new("composer", inner)
             .role(HitRole::TextInput)
             .layer(1),
     );
     TextInput::new(app.composer())
-        .placeholder("Type here; Enter sends")
+        .placeholder("Ask Bcode…")
+        .placeholder_style(Style::new().fg(Color::BrightBlack))
+        .vertical_scroll(app.composer_scroll_offset())
         .cursor_visible(app.cursor_visible())
         .render(inner, frame);
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 1 {
+        return "…".to_owned();
+    }
+    let left = max_chars / 2;
+    let right = max_chars.saturating_sub(left).saturating_sub(1);
+    let mut output = chars.iter().take(left).collect::<String>();
+    output.push('…');
+    output.extend(
+        chars
+            .iter()
+            .skip(chars.len().saturating_sub(right))
+            .copied(),
+    );
+    output
+}
+
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 1 {
+        return "…".to_owned();
+    }
+    let mut output = chars
+        .iter()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    output.push('…');
+    output
+}
+
+fn usize_to_u16_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 fn role_style(role: &str) -> Style {

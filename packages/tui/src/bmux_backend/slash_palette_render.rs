@@ -13,9 +13,13 @@ const POPUP_MAX_WIDTH: u16 = 88;
 const POPUP_SIDE_MARGIN: u16 = 2;
 
 /// Render slash completions above the composer.
-pub(super) fn render_palette(palette: &SlashPalette, frame: &mut Frame<'_>) {
+pub(super) fn render_palette(
+    palette: &SlashPalette,
+    composer_content_area: Rect,
+    frame: &mut Frame<'_>,
+) {
     let frame_area = frame.area();
-    let composer = composer_area(frame_area);
+    let composer = composer_panel_area(composer_content_area);
     let Some(area) = slash_palette_area(frame_area, composer, palette.item_count()) else {
         return;
     };
@@ -72,11 +76,12 @@ pub(super) fn slash_palette_area(
 
 pub(super) fn slash_palette_row_from_mouse(
     frame_area: Rect,
+    composer_content_area: Rect,
     mouse_x: u16,
     mouse_y: u16,
     item_count: usize,
 ) -> Option<usize> {
-    let composer = composer_area(frame_area);
+    let composer = composer_panel_area(composer_content_area);
     let area = slash_palette_area(frame_area, composer, item_count)?;
     let inner = area.inset(Insets::new(1, 1, 1, 1));
     if mouse_x < inner.x
@@ -89,13 +94,12 @@ pub(super) fn slash_palette_row_from_mouse(
     Some(usize::from(mouse_y.saturating_sub(inner.y)))
 }
 
-pub(super) fn composer_area(area: Rect) -> Rect {
-    let composer_height = area.height.clamp(3, 6);
+pub(super) const fn composer_panel_area(content_area: Rect) -> Rect {
     Rect::new(
-        area.x,
-        area.bottom().saturating_sub(composer_height),
-        area.width,
-        composer_height,
+        content_area.x.saturating_sub(2),
+        content_area.y.saturating_sub(1),
+        content_area.width.saturating_add(4),
+        content_area.height.saturating_add(2),
     )
 }
 

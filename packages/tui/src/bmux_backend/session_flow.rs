@@ -46,6 +46,9 @@ pub(super) async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
             format!("{provider}/{model}")
         },
     );
+    if let Some(model) = model {
+        app.apply_model_status(model);
+    }
     let skill_count = active_skills.as_ref().map_or(0, Vec::len);
     app.set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }

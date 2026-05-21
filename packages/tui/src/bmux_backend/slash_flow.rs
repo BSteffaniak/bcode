@@ -109,6 +109,7 @@ pub(super) fn handle_slash_palette_mouse<W: Write>(
     };
     let Some(row) = slash_palette_render::slash_palette_row_from_mouse(
         terminal.area(),
+        chat.app.composer_content_area(),
         mouse.position.x,
         mouse.position.y,
         active_palette.item_count(),

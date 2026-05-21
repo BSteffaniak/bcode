@@ -42,8 +42,11 @@ pub(super) async fn handle_mouse(
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if hit_id.as_deref() == Some("composer") {
-                if let Some((row, col)) = composer_position_from_mouse(mouse) {
-                    let width = usize::from(helpers::terminal_area()?.width.saturating_sub(4));
+                if let Some((row, col)) =
+                    composer_position_from_mouse(chat.app.composer_content_area(), mouse)
+                {
+                    let width = usize::from(chat.app.composer_content_area().width.max(1));
+                    let row = row.saturating_add(chat.app.composer_scroll_offset());
                     chat.app.move_composer_to_wrapped_position(width, row, col);
                     Ok(true)
                 } else {
@@ -68,25 +71,22 @@ pub(super) async fn handle_mouse(
     }
 }
 
-fn composer_position_from_mouse(mouse: MouseEvent) -> Option<(usize, usize)> {
+fn composer_position_from_mouse(
+    area: bmux_tui::geometry::Rect,
+    mouse: MouseEvent,
+) -> Option<(usize, usize)> {
     let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
         return None;
     };
-    let area = helpers::terminal_area().ok()?;
-    let composer_height = area.height.clamp(3, 6);
-    let composer_y = area.bottom().saturating_sub(composer_height);
-    let inner_x = area.x.saturating_add(2);
-    let inner_y = composer_y.saturating_add(1);
-    let inner_width = area.width.saturating_sub(4);
-    if mouse.position.y < inner_y || mouse.position.y >= area.bottom().saturating_sub(1) {
+    if mouse.position.y < area.y || mouse.position.y >= area.bottom() {
         return None;
     }
-    if mouse.position.x < inner_x || mouse.position.x >= inner_x.saturating_add(inner_width) {
+    if mouse.position.x < area.x || mouse.position.x >= area.right() {
         return None;
     }
     Some((
-        usize::from(mouse.position.y.saturating_sub(inner_y)),
-        usize::from(mouse.position.x.saturating_sub(inner_x)),
+        usize::from(mouse.position.y.saturating_sub(area.y)),
+        usize::from(mouse.position.x.saturating_sub(area.x)),
     ))
 }
 

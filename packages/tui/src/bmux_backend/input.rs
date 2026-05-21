@@ -58,11 +58,11 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
         }
         BmuxAction::InputSubmit => submit(app),
         BmuxAction::InputHistoryPrevious => KeyOutcome {
-            redraw: app.previous_input_history(),
+            redraw: app.move_composer_visual_up() || app.previous_input_history(),
             submitted: false,
         },
         BmuxAction::InputHistoryNext => KeyOutcome {
-            redraw: app.next_input_history(),
+            redraw: app.move_composer_visual_down() || app.next_input_history(),
             submitted: false,
         },
         BmuxAction::TranscriptPageUp => KeyOutcome {

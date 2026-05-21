@@ -76,7 +76,11 @@ pub(super) async fn run_with_client<W: Write>(
             terminal.draw(|frame| {
                 render::render(&mut chat.app, frame);
                 if let Some(slash_palette) = &modals.slash_palette {
-                    slash_palette_render::render_palette(slash_palette, frame);
+                    slash_palette_render::render_palette(
+                        slash_palette,
+                        chat.app.composer_content_area(),
+                        frame,
+                    );
                 }
                 if let Some(palette) = &mut modals.palette {
                     command_palette_render::render_palette(palette, frame);

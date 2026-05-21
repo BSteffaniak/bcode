@@ -7,6 +7,7 @@ use bcode_session_models::{
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::diff::{DiffFileSummary, DiffLine};
+use bmux_tui::geometry::Rect;
 
 use super::activity::{ActivityState, model_turn_outcome_label};
 use super::cursor_blink::CursorBlink;
@@ -27,6 +28,13 @@ use super::transcript_viewport::TranscriptViewport;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BmuxApp {
     session_id: Option<SessionId>,
+    session_title: Option<String>,
+    selected_provider_plugin_id: Option<String>,
+    selected_model_id: Option<String>,
+    current_agent_id: String,
+    thinking_label: String,
+    token_usage: TokenUsageMeter,
+    composer_content_area: Rect,
     composer: TextEditBuffer,
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
@@ -51,6 +59,13 @@ impl BmuxApp {
     ) -> Self {
         let mut app = Self {
             session_id,
+            session_title: None,
+            selected_provider_plugin_id: None,
+            selected_model_id: None,
+            current_agent_id: "build".to_owned(),
+            thinking_label: "default".to_owned(),
+            token_usage: TokenUsageMeter::default(),
+            composer_content_area: Rect::new(0, 0, 1, 1),
             composer: TextEditBuffer::new(),
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
@@ -71,6 +86,70 @@ impl BmuxApp {
     #[must_use]
     pub(super) const fn session_id(&self) -> Option<SessionId> {
         self.session_id
+    }
+
+    /// Return the current session title, if known.
+    #[must_use]
+    pub(super) fn session_title(&self) -> Option<&str> {
+        self.session_title.as_deref()
+    }
+
+    /// Return the currently selected provider plugin id, if explicit.
+    #[must_use]
+    pub(super) fn selected_provider_plugin_id(&self) -> Option<&str> {
+        self.selected_provider_plugin_id.as_deref()
+    }
+
+    /// Return the currently selected model id, if explicit.
+    #[must_use]
+    pub(super) fn selected_model_id(&self) -> Option<&str> {
+        self.selected_model_id.as_deref()
+    }
+
+    /// Return the current agent id.
+    #[must_use]
+    pub(super) fn current_agent_id(&self) -> &str {
+        &self.current_agent_id
+    }
+
+    /// Return the current thinking display label.
+    #[must_use]
+    pub(super) fn thinking_label(&self) -> &str {
+        &self.thinking_label
+    }
+
+    /// Return the token/context footer summary.
+    #[must_use]
+    pub(super) fn token_summary(&self) -> String {
+        self.token_usage.footer_summary()
+    }
+
+    /// Return the composer content area from the latest render.
+    #[must_use]
+    pub(super) const fn composer_content_area(&self) -> Rect {
+        self.composer_content_area
+    }
+
+    /// Store the composer content area from the latest render.
+    pub(super) const fn set_composer_content_area(&mut self, area: Rect) {
+        self.composer_content_area = area;
+    }
+
+    /// Return the current composer wrapped-row scroll offset.
+    #[must_use]
+    pub(super) fn composer_scroll_offset(&self) -> usize {
+        if self.composer_content_area.height == 0 {
+            return 0;
+        }
+        let visible_rows = usize::from(self.composer_content_area.height);
+        let layout = self
+            .composer
+            .wrapped_layout(usize::from(self.composer_content_area.width.max(1)));
+        layout
+            .cursor
+            .row
+            .saturating_add(1)
+            .saturating_sub(visible_rows)
     }
 
     /// Return the composer buffer.
@@ -154,6 +233,49 @@ impl BmuxApp {
         self.composer
             .move_cursor_to_wrapped_position(width, row, col);
         self.wake_cursor();
+    }
+
+    /// Move the composer cursor one rendered row up, if possible.
+    pub(super) fn move_composer_visual_up(&mut self) -> bool {
+        let width = usize::from(self.composer_content_area.width.max(1));
+        let layout = self.composer.wrapped_layout(width);
+        if layout.cursor.row == 0 {
+            return false;
+        }
+        self.composer.move_cursor_to_wrapped_position(
+            width,
+            layout.cursor.row.saturating_sub(1),
+            layout.cursor.col,
+        );
+        self.wake_cursor();
+        true
+    }
+
+    /// Move the composer cursor one rendered row down, if possible.
+    pub(super) fn move_composer_visual_down(&mut self) -> bool {
+        let width = usize::from(self.composer_content_area.width.max(1));
+        let layout = self.composer.wrapped_layout(width);
+        if layout.cursor.row.saturating_add(1) >= layout.lines.len() {
+            return false;
+        }
+        self.composer.move_cursor_to_wrapped_position(
+            width,
+            layout.cursor.row.saturating_add(1),
+            layout.cursor.col,
+        );
+        self.wake_cursor();
+        true
+    }
+
+    /// Apply hydrated model metadata to the app.
+    pub(super) fn apply_model_status(&mut self, status: bcode_ipc::SessionModelStatus) {
+        if status.provider_plugin_id.is_some() {
+            self.selected_provider_plugin_id = status.provider_plugin_id;
+        }
+        if status.model_id.is_some() {
+            self.selected_model_id = status.model_id;
+        }
+        self.token_usage.apply_model_info(status.model.as_ref());
     }
 
     /// Return pending submissions that have not been committed by the session stream.
@@ -377,7 +499,7 @@ impl BmuxApp {
                 self.set_permission_status(permission_id, *approved);
             }
             SessionEventKind::ModelChanged { provider, model } => {
-                self.status = format!("model: {provider}/{model}");
+                self.apply_model_changed(provider, model);
             }
             SessionEventKind::ModelTurnStarted { .. } => {
                 self.activity = ActivityState::Thinking;
@@ -390,9 +512,7 @@ impl BmuxApp {
                 self.push_model_usage(turn_id, usage);
             }
             SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
-            SessionEventKind::SessionRenamed { name } => {
-                self.set_session_name_status(name.as_deref());
-            }
+            SessionEventKind::SessionRenamed { name } => self.rename_session(name.as_deref()),
             SessionEventKind::SkillInvoked {
                 skill_id,
                 arguments,
@@ -424,11 +544,13 @@ impl BmuxApp {
             SessionEventKind::AssistantReasoningMessage { text } => {
                 self.finish_streaming_item("Reasoning", text);
             }
+            SessionEventKind::SessionCreated { name } => self.session_title.clone_from(name),
+            SessionEventKind::AgentChanged { agent_id } => {
+                self.current_agent_id.clone_from(agent_id);
+            }
             SessionEventKind::TraceEvent { .. }
-            | SessionEventKind::SessionCreated { .. }
             | SessionEventKind::ClientAttached { .. }
-            | SessionEventKind::ClientDetached { .. }
-            | SessionEventKind::AgentChanged { .. } => {}
+            | SessionEventKind::ClientDetached { .. } => {}
         }
     }
 
@@ -464,6 +586,18 @@ impl BmuxApp {
         self.composer.clear();
         self.composer.insert_str(text);
         self.wake_cursor();
+    }
+
+    fn apply_model_changed(&mut self, provider: &str, model: &str) {
+        self.selected_provider_plugin_id = provider_to_display_selection(provider);
+        self.selected_model_id = model_to_display_selection(model);
+        self.token_usage.clear_model_info();
+        self.status = format!("model: {provider}/{model}");
+    }
+
+    fn rename_session(&mut self, name: Option<&str>) {
+        self.session_title = name.map(ToOwned::to_owned);
+        self.set_session_name_status(name);
     }
 
     fn remove_pending_submission(&mut self, text: &str) {
@@ -584,16 +718,19 @@ impl BmuxApp {
     }
 
     fn push_model_usage(&mut self, turn_id: &str, usage: &bcode_session_models::SessionTokenUsage) {
+        self.token_usage.absorb(usage);
         if let Some(tokens) = usage.metered_total_tokens() {
             self.status = format!("tokens: {tokens}");
         }
         self.transcript.push(TranscriptItem::new(
             "Usage",
             format!(
-                "turn {turn_id}\ninput: {}\noutput: {}\ntotal: {}\nreasoning: {}",
+                "turn {turn_id}\ninput: {}\noutput: {}\ntotal: {}\ncached: {}\ncache write: {}\nreasoning: {}",
                 optional_u32(usage.input_tokens),
                 optional_u32(usage.output_tokens),
                 optional_u32(usage.metered_total_tokens()),
+                optional_u32(usage.cached_input_tokens),
+                optional_u32(usage.cache_write_input_tokens),
                 optional_u32(usage.reasoning_tokens),
             ),
         ));
@@ -666,6 +803,112 @@ impl BmuxApp {
             format!("{skill_id}: {error}"),
         ));
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TokenUsageMeter {
+    session_tokens: u64,
+    latest_context_input_tokens: Option<u32>,
+    latest_cached_input_tokens: Option<u32>,
+    latest_cache_write_input_tokens: Option<u32>,
+    context_window: Option<u32>,
+}
+
+impl TokenUsageMeter {
+    fn absorb(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
+        if let Some(tokens) = usage.metered_total_tokens() {
+            self.session_tokens = self.session_tokens.saturating_add(u64::from(tokens));
+        }
+        if let Some(input_tokens) = usage.context_input_tokens() {
+            self.latest_context_input_tokens = Some(input_tokens);
+        }
+        if usage.cached_input_tokens.is_some() {
+            self.latest_cached_input_tokens = usage.cached_input_tokens;
+        }
+        if usage.cache_write_input_tokens.is_some() {
+            self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
+        }
+    }
+
+    const fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
+        if let Some(model) = model {
+            self.context_window = model.context_window;
+        }
+    }
+
+    const fn clear_model_info(&mut self) {
+        self.context_window = None;
+    }
+
+    fn footer_summary(&self) -> String {
+        let mut parts = vec![self.context_summary()];
+        if let Some(cached) = self.latest_cached_input_tokens
+            && cached > 0
+        {
+            parts.push(format!("cached {} tok", compact_u64(u64::from(cached))));
+        }
+        if let Some(written) = self.latest_cache_write_input_tokens
+            && written > 0
+        {
+            parts.push(format!(
+                "cache write {} tok",
+                compact_u64(u64::from(written))
+            ));
+        }
+        parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
+        parts.join(" · ")
+    }
+
+    fn context_summary(&self) -> String {
+        if let Some(window) = self.context_window
+            && window > 0
+        {
+            let input = self.latest_context_input_tokens.unwrap_or_default();
+            return format!(
+                "ctx {}/{} {}%",
+                compact_u64(u64::from(input)),
+                compact_u64(u64::from(window)),
+                context_window_percentage(input, window)
+            );
+        }
+        "ctx unknown".to_owned()
+    }
+}
+
+fn provider_to_display_selection(provider: &str) -> Option<String> {
+    if provider == "<auto>" || provider.is_empty() {
+        None
+    } else {
+        Some(provider.to_owned())
+    }
+}
+
+fn model_to_display_selection(model: &str) -> Option<String> {
+    if model == "<default>" || model.is_empty() {
+        None
+    } else {
+        Some(model.to_owned())
+    }
+}
+
+fn compact_u64(value: u64) -> String {
+    if value >= 1_000_000 {
+        let whole = value / 1_000_000;
+        let decimal = (value % 1_000_000) / 100_000;
+        format!("{whole}.{decimal}m")
+    } else if value >= 1_000 {
+        let whole = value / 1_000;
+        let decimal = (value % 1_000) / 100;
+        format!("{whole}.{decimal}k")
+    } else {
+        value.to_string()
+    }
+}
+
+fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
+    let numerator = u64::from(input_tokens).saturating_mul(100);
+    let denominator = u64::from(context_window).max(1);
+    u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
