@@ -23,6 +23,7 @@ mod mouse_flow;
 mod older_history;
 mod palette_flow;
 mod pending_submission;
+mod pending_submissions;
 mod permission_dialog;
 mod permission_dialog_render;
 mod permission_flow;
@@ -45,6 +46,7 @@ mod slash_palette_render;
 #[cfg(test)]
 mod tests;
 mod transcript;
+mod transcript_viewport;
 
 use std::io;
 use std::time::Duration;

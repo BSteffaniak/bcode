@@ -16,10 +16,12 @@ use super::exit_state::ExitState;
 use super::input_history::InputHistory;
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
+use super::pending_submissions::PendingSubmissions;
 use super::transcript::{
     TranscriptItem, merge_transcript_boundary, optional_u32, pretty_jsonish, tool_request_item,
     transcript_items_from_events, truncate_block,
 };
+use super::transcript_viewport::TranscriptViewport;
 
 /// State owned by the BMUX-native backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,11 +31,8 @@ pub(super) struct BmuxApp {
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
     diff_panel: DiffPanel,
-    pending_submissions: Vec<PendingSubmission>,
-    pending_submission: Option<String>,
-    scroll_offset: usize,
-    transcript_max_scroll_offset: usize,
-    scroll_preserve_max_offset: Option<usize>,
+    pending_submissions: PendingSubmissions,
+    viewport: TranscriptViewport,
     older_history: OlderHistoryState,
     activity: ActivityState,
     status: String,
@@ -56,11 +55,8 @@ impl BmuxApp {
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
             diff_panel: DiffPanel::new(),
-            pending_submissions: Vec::new(),
-            pending_submission: None,
-            scroll_offset: 0,
-            transcript_max_scroll_offset: 0,
-            scroll_preserve_max_offset: None,
+            pending_submissions: PendingSubmissions::default(),
+            viewport: TranscriptViewport::default(),
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
@@ -163,13 +159,13 @@ impl BmuxApp {
     /// Return pending submissions that have not been committed by the session stream.
     #[must_use]
     pub(super) fn pending_submissions(&self) -> &[PendingSubmission] {
-        &self.pending_submissions
+        self.pending_submissions.items()
     }
 
     /// Return the number of transcript rows hidden below the viewport.
     #[must_use]
     pub(super) const fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+        self.viewport.offset()
     }
 
     /// Return whether older history may be available.
@@ -226,23 +222,19 @@ impl BmuxApp {
     /// Store the current composer text as a pending submission and clear input.
     pub(super) fn stage_submission(&mut self) {
         let text = self.composer.text().to_owned();
-        self.pending_submission = Some(text.clone());
-        self.pending_submissions
-            .push(PendingSubmission::new(text.clone()));
+        self.pending_submissions.stage(text.clone());
         self.input_history.push_submission(text);
         self.composer.clear();
     }
 
     /// Return the currently pending submission.
     pub(super) fn take_pending_submission(&mut self) -> String {
-        self.pending_submission.take().unwrap_or_default()
+        self.pending_submissions.take_staged()
     }
 
     /// Remove a pending submission that was handled outside the session transcript.
     pub(super) fn clear_pending_submission(&mut self, text: &str) {
-        if self.pending_submission.as_deref() == Some(text) {
-            self.pending_submission = None;
-        }
+        self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
     }
 
@@ -262,9 +254,7 @@ impl BmuxApp {
 
     /// Remove a pending submission and restore it into the composer.
     pub(super) fn restore_pending_submission(&mut self, text: &str) {
-        if self.pending_submission.as_deref() == Some(text) {
-            self.pending_submission = None;
-        }
+        self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
         self.composer.insert_str(text);
         self.wake_cursor();
@@ -290,60 +280,23 @@ impl BmuxApp {
 
     /// Scroll transcript up by rendered rows.
     pub(super) fn scroll_transcript_up(&mut self, rows: usize) -> bool {
-        if rows == 0 {
-            return false;
-        }
-        let previous = self.scroll_offset;
-        let previous_request = self.older_history.reveal_request();
-        let desired = self.scroll_offset.saturating_add(rows);
-        self.scroll_offset = desired.min(self.transcript_max_scroll_offset);
-        if desired > self.transcript_max_scroll_offset {
-            self.request_older_history_load(
-                desired.saturating_sub(self.transcript_max_scroll_offset),
-            );
-        }
-        self.scroll_offset != previous || self.older_history.reveal_request() != previous_request
+        self.viewport.scroll_up(rows, &mut self.older_history)
     }
 
     /// Scroll transcript down by rendered rows.
     pub(super) const fn scroll_transcript_down(&mut self, rows: usize) -> bool {
-        let previous = self.scroll_offset;
-        self.scroll_offset = self.scroll_offset.saturating_sub(rows);
-        self.scroll_offset != previous
+        self.viewport.scroll_down(rows)
     }
 
     /// Pin transcript to the newest rows.
     pub(super) const fn scroll_transcript_to_bottom(&mut self) -> bool {
-        let changed = self.scroll_offset != 0;
-        self.scroll_offset = 0;
-        self.older_history.clear_reveal_request();
-        changed
+        self.viewport.scroll_to_bottom(&mut self.older_history)
     }
 
     /// Sync cached rendered transcript scroll bounds from the latest frame.
     pub(super) fn sync_transcript_scroll_max(&mut self, max_scroll_offset: usize) {
-        let previous_max = self.transcript_max_scroll_offset;
-        self.transcript_max_scroll_offset = max_scroll_offset;
-        if let Some(requested_rows) = self.older_history.take_reveal_request() {
-            let inserted_rows = max_scroll_offset.saturating_sub(previous_max);
-            let reveal_rows = requested_rows.min(inserted_rows);
-            self.scroll_offset = self.scroll_offset.saturating_add(reveal_rows);
-        }
-        if let Some(preserve_max) = self.scroll_preserve_max_offset.take()
-            && self.scroll_offset > 0
-        {
-            let appended_rows = max_scroll_offset.saturating_sub(preserve_max);
-            self.scroll_offset = self.scroll_offset.saturating_add(appended_rows);
-        }
-        self.scroll_offset = self.scroll_offset.min(self.transcript_max_scroll_offset);
-    }
-
-    fn request_older_history_load(&mut self, reveal_rows: usize) {
-        if self.older_history.cursor().is_none() || self.older_history.loading() {
-            return;
-        }
-        let reveal_rows = reveal_rows.max(1);
-        self.older_history.request_load(reveal_rows);
+        self.viewport
+            .sync_max(max_scroll_offset, &mut self.older_history);
     }
 
     /// Absorb replayed history events.
@@ -377,8 +330,8 @@ impl BmuxApp {
 
     /// Absorb one live session event.
     pub(super) fn absorb_session_event(&mut self, event: &SessionEvent) {
-        if self.scroll_offset > 0 && event_affects_transcript_rows(event) {
-            self.scroll_preserve_max_offset = Some(self.transcript_max_scroll_offset);
+        if event_affects_transcript_rows(event) {
+            self.viewport.preserve_for_append();
         }
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => self.push_live_user_message(text),
@@ -514,13 +467,7 @@ impl BmuxApp {
     }
 
     fn remove_pending_submission(&mut self, text: &str) {
-        if let Some(index) = self
-            .pending_submissions
-            .iter()
-            .position(|pending| pending.text() == text)
-        {
-            self.pending_submissions.remove(index);
-        }
+        self.pending_submissions.remove(text);
     }
 
     fn push_live_user_message(&mut self, text: &str) {
