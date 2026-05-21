@@ -6,6 +6,7 @@ mod command_palette_render;
 mod filtered_list;
 mod input;
 mod keymap;
+mod model_flow;
 mod model_picker;
 mod model_picker_render;
 mod permission_dialog;
@@ -808,7 +809,7 @@ async fn execute_palette_command<W: Write>(
             show_server_model_status(client, chat).await?;
         }
         PaletteCommand::SelectModel => {
-            pick_model_for_session(terminal, client, chat, keymap).await?;
+            model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;
         }
         PaletteCommand::ToggleDiff => {
             let _changed = chat.app.toggle_diff_visible();
@@ -927,159 +928,6 @@ fn handle_text_buffer_key(
         return TextInputKeyOutcome::Edited;
     }
     TextInputKeyHandler::new(TextKeymap::default(), enter_behavior).handle_key(buffer, stroke)
-}
-
-async fn pick_model_provider<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
-) -> Result<Option<String>, TuiError> {
-    let providers = client
-        .plugin_services()
-        .await?
-        .into_iter()
-        .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
-        .collect::<Vec<_>>();
-    if providers.len() <= 1 {
-        return Ok(providers.first().map(|provider| provider.plugin_id.clone()));
-    }
-    let mut picker = provider_picker::ProviderPickerApp::new(providers);
-    loop {
-        terminal.resize(terminal_area()?);
-        terminal
-            .draw(|frame| provider_picker_render::render_provider_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
-            continue;
-        };
-        match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Paste(text) => {
-                picker.filter_mut().insert_str(&text);
-                picker.refresh_filter();
-            }
-            Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return Ok(None),
-                KeyCode::Enter => return Ok(picker.selected_provider_id()),
-                KeyCode::Up => picker.select_previous(),
-                KeyCode::Down => picker.select_next(),
-                _ => {
-                    let outcome = handle_text_buffer_key(
-                        picker.filter_mut(),
-                        keymap,
-                        stroke,
-                        TextInputEnterBehavior::InsertNewline,
-                    );
-                    if outcome == TextInputKeyOutcome::Edited {
-                        picker.refresh_filter();
-                    }
-                }
-            },
-            Event::Mouse(mouse) => {
-                if let Some(row) = picker_row_from_mouse(mouse)
-                    && picker.select_visible(row)
-                {
-                    return Ok(picker.selected_provider_id());
-                }
-            }
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
-        }
-    }
-}
-
-async fn pick_model_for_session<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    keymap: &BmuxKeyMap,
-) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
-    let provider_plugin_id = pick_model_provider(terminal, client, keymap).await?;
-    let models = client
-        .session_model_list(provider_plugin_id.clone())
-        .await?
-        .models;
-    let status = provider_plugin_id.as_ref().map_or_else(
-        || "Select a model".to_owned(),
-        |provider| format!("Select a model from {provider}"),
-    );
-    let mut picker = model_picker::ModelPickerApp::new_with_status(models, status);
-    loop {
-        terminal.resize(terminal_area()?);
-        terminal.draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
-            continue;
-        };
-        match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Paste(text) => {
-                picker.filter_mut().insert_str(&text);
-                picker.refresh_filter();
-            }
-            Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return Ok(()),
-                KeyCode::Enter => {
-                    if let Some(model_id) = picker.selected_model_id() {
-                        if let Err(error) = client
-                            .set_session_model(
-                                session_id,
-                                provider_plugin_id.clone(),
-                                model_id.clone(),
-                            )
-                            .await
-                        {
-                            report_client_error(
-                                &mut chat.app,
-                                "model selection failed",
-                                &error.into(),
-                            );
-                        } else {
-                            chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
-                                || format!("model set to {model_id}"),
-                                |provider| format!("model set to {provider}/{model_id}"),
-                            ));
-                        }
-                        return Ok(());
-                    }
-                }
-                KeyCode::Up => picker.select_previous(),
-                KeyCode::Down => picker.select_next(),
-                _ => {
-                    let outcome = handle_text_buffer_key(
-                        picker.filter_mut(),
-                        keymap,
-                        stroke,
-                        TextInputEnterBehavior::InsertNewline,
-                    );
-                    if outcome == TextInputKeyOutcome::Edited {
-                        picker.refresh_filter();
-                    }
-                }
-            },
-            Event::Mouse(mouse) => {
-                if let Some(row) = picker_row_from_mouse(mouse)
-                    && picker.select_visible(row)
-                    && let Some(model_id) = picker.selected_model_id()
-                {
-                    if let Err(error) = client
-                        .set_session_model(session_id, provider_plugin_id.clone(), model_id.clone())
-                        .await
-                    {
-                        report_client_error(&mut chat.app, "model selection failed", &error.into());
-                    } else {
-                        chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
-                            || format!("model set to {model_id}"),
-                            |provider| format!("model set to {provider}/{model_id}"),
-                        ));
-                    }
-                    return Ok(());
-                }
-            }
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
-        }
-    }
 }
 
 async fn pick_skill_for_session<W: Write>(
@@ -1486,7 +1334,7 @@ async fn submit_composer<W: Write>(
                 switch_session(client, chat, next_session_id).await?;
             }
             slash_commands::SlashCommandOutcome::PickModel => {
-                pick_model_for_session(terminal, client, chat, keymap).await?;
+                model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;
             }
             slash_commands::SlashCommandOutcome::PickSkill => {
                 pick_skill_for_session(terminal, client, chat, keymap).await?;
