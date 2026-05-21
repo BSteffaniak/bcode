@@ -4,6 +4,7 @@ mod app;
 mod command_palette;
 mod command_palette_render;
 mod filtered_list;
+mod history_flow;
 mod input;
 mod keymap;
 mod model_flow;
@@ -33,7 +34,7 @@ use std::time::Duration;
 
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
-use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery, SessionId};
+use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::keyboard::TextKeymap;
 use bmux_tui::crossterm::{CrosstermTerminalGuard, poll_event};
@@ -96,7 +97,8 @@ async fn run_event_loop<W: Write>(
     };
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (attached, event_task) =
-        attach_session_event_stream(&client, session_id, event_sender.clone()).await?;
+        history_flow::attach_session_event_stream(&client, session_id, event_sender.clone())
+            .await?;
     let app = BmuxApp::new_with_history(
         Some(session_id),
         &attached.history,
@@ -173,7 +175,7 @@ async fn run_with_client<W: Write>(
         }
 
         if chat.app.should_load_older_history() {
-            load_older_history(client, chat).await?;
+            history_flow::load_older_history(client, chat).await?;
             needs_redraw = true;
         }
 
@@ -218,61 +220,6 @@ async fn run_with_client<W: Write>(
     }
 
     Ok(())
-}
-
-async fn load_older_history(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let Some(cursor) = chat.app.older_history_cursor() else {
-        return Ok(());
-    };
-    chat.app.set_loading_older_history(true);
-    match client
-        .session_history_page(
-            chat.session_id,
-            SessionHistoryQuery {
-                cursor: Some(cursor),
-                limit: OLDER_HISTORY_EVENT_LIMIT,
-                direction: SessionHistoryDirection::Backward,
-            },
-        )
-        .await
-    {
-        Ok(page) => {
-            chat.app.prepend_older_history(&page.events, page.has_more);
-        }
-        Err(error) => {
-            chat.app.set_loading_older_history(false);
-            chat.app
-                .set_status(format!("older history load failed: {error}"));
-        }
-    }
-    Ok(())
-}
-
-async fn attach_session_event_stream(
-    client: &BcodeClient,
-    session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
-) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
-    let mut connection = client.connect("bcode-tui-bmux").await?;
-    let attached = connection
-        .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
-        .await?;
-    let event_task = tokio::spawn(async move {
-        loop {
-            match connection.recv_event().await {
-                Ok(event) => {
-                    if event_sender.send(event).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    eprintln!("BMUX TUI event stream ended: {error}");
-                    break;
-                }
-            }
-        }
-    });
-    Ok((attached, event_task))
 }
 
 async fn handle_event<W: Write>(
@@ -645,8 +592,12 @@ async fn switch_session(
 ) -> Result<(), TuiError> {
     chat.event_task.abort();
     while chat.event_receiver.try_recv().is_ok() {}
-    let (attached, next_task) =
-        attach_session_event_stream(client, next_session_id, chat.event_sender.clone()).await?;
+    let (attached, next_task) = history_flow::attach_session_event_stream(
+        client,
+        next_session_id,
+        chat.event_sender.clone(),
+    )
+    .await?;
     chat.event_task = next_task;
     chat.session_id = next_session_id;
     chat.app = BmuxApp::new_with_history(
