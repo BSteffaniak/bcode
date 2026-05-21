@@ -23,9 +23,9 @@ use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::transcript::{
-    TranscriptItem, finish_streaming_transcript_item, merge_transcript_boundary, optional_u32,
-    pretty_jsonish, push_streaming_transcript_item, tool_request_item,
-    transcript_items_from_events, truncate_block,
+    TranscriptItem, finish_streaming_transcript_item, merge_transcript_boundary, model_usage_item,
+    permission_request_item, permission_result_item, push_streaming_transcript_item,
+    tool_request_item, tool_result_item, transcript_items_from_events,
 };
 use super::transcript_viewport::TranscriptViewport;
 
@@ -781,14 +781,8 @@ impl BmuxApp {
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
-        let label = if is_error { "Tool error" } else { "Tool" };
-        self.transcript.push(TranscriptItem::new(
-            label,
-            format!(
-                "result for {tool_call_id}\n{}",
-                truncate_block(result, 4_000)
-            ),
-        ));
+        self.transcript
+            .push(tool_result_item(tool_call_id, result, is_error));
         if is_error {
             "tool failed".clone_into(&mut self.status);
         } else {
@@ -803,12 +797,11 @@ impl BmuxApp {
         tool_name: &str,
         arguments_json: &str,
     ) {
-        self.transcript.push(TranscriptItem::new(
-            "Permission",
-            format!(
-                "waiting for approval: {tool_name}\nPermission: {permission_id}\nCall: {tool_call_id}\nArguments:\n{}",
-                pretty_jsonish(arguments_json)
-            ),
+        self.transcript.push(permission_request_item(
+            permission_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
         ));
         self.set_activity(ActivityState::WaitingPermission {
             name: tool_name.to_owned(),
@@ -823,10 +816,8 @@ impl BmuxApp {
             "permission denied"
         };
         status.clone_into(&mut self.status);
-        self.transcript.push(TranscriptItem::new(
-            "Permission",
-            format!("{status}: {permission_id}"),
-        ));
+        self.transcript
+            .push(permission_result_item(permission_id, approved));
     }
 
     fn push_model_usage(&mut self, turn_id: &str, usage: &bcode_session_models::SessionTokenUsage) {
@@ -834,18 +825,7 @@ impl BmuxApp {
         if let Some(tokens) = usage.metered_total_tokens() {
             self.status = format!("tokens: {tokens}");
         }
-        self.transcript.push(TranscriptItem::new(
-            "Usage",
-            format!(
-                "turn {turn_id}\ninput: {}\noutput: {}\ntotal: {}\ncached: {}\ncache write: {}\nreasoning: {}",
-                optional_u32(usage.input_tokens),
-                optional_u32(usage.output_tokens),
-                optional_u32(usage.metered_total_tokens()),
-                optional_u32(usage.cached_input_tokens),
-                optional_u32(usage.cache_write_input_tokens),
-                optional_u32(usage.reasoning_tokens),
-            ),
-        ));
+        self.transcript.push(model_usage_item(turn_id, usage));
     }
 
     fn finish_model_turn(&mut self, outcome: ModelTurnOutcome, message: Option<&str>) {

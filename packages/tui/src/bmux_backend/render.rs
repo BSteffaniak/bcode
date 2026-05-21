@@ -1,5 +1,7 @@
 //! BMUX backend rendering.
 
+use std::fmt::Write as _;
+
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::diff::{DiffFileList, DiffFileListState, DiffView, DiffViewMode, DiffViewState};
 use bmux_tui::frame::Frame;
@@ -13,7 +15,7 @@ use bmux_tui::text_block::{TextBlock, TextWrap};
 use super::activity::ActivityState;
 use super::app::BmuxApp;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
-use super::transcript::TranscriptItem;
+use super::transcript::{TranscriptItem, TranscriptItemKind};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
@@ -255,84 +257,290 @@ fn transcript_render_rows(app: &BmuxApp, width: u16) -> Vec<Line> {
     rows
 }
 fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
-    let role_style = role_style(item.role());
-    let marker = if item.streaming() { " …" } else { "" };
-    push_wrapped_prefixed_text(
+    match item.kind() {
+        TranscriptItemKind::UserMessage => {
+            push_message_block(rows, "You", item.text(), Color::Blue, width);
+        }
+        TranscriptItemKind::AssistantMessage => {
+            push_assistant_rows(rows, item, width);
+        }
+        TranscriptItemKind::ReasoningMessage => {
+            push_reasoning_rows(rows, item, width);
+        }
+        TranscriptItemKind::ToolRequest {
+            tool_call_id,
+            tool_name,
+            diff_summary,
+        } => {
+            push_tool_request_rows(
+                rows,
+                item,
+                tool_call_id,
+                tool_name,
+                diff_summary.as_deref(),
+                width,
+            );
+        }
+        TranscriptItemKind::ToolResult {
+            tool_call_id,
+            is_error,
+        } => {
+            push_tool_result_rows(rows, item, tool_call_id, *is_error, width);
+        }
+        TranscriptItemKind::Usage { turn_id } => {
+            push_usage_rows(rows, item, turn_id, width);
+        }
+        TranscriptItemKind::PermissionRequest {
+            permission_id,
+            tool_call_id,
+            tool_name,
+        } => {
+            push_permission_request_rows(rows, item, permission_id, tool_call_id, tool_name, width);
+        }
+        TranscriptItemKind::PermissionResult { approved } => {
+            push_detail_block(
+                rows,
+                "Permission",
+                item.text(),
+                if *approved { Color::Green } else { Color::Red },
+                width,
+            );
+        }
+        TranscriptItemKind::System => {
+            push_detail_block(rows, "System", item.text(), Color::BrightBlack, width);
+        }
+        TranscriptItemKind::Meta => {
+            push_meta_block(rows, item.text(), width);
+        }
+        TranscriptItemKind::Skill => {
+            push_detail_block(rows, "Skill", item.text(), Color::Magenta, width);
+        }
+        TranscriptItemKind::SkillError => {
+            push_detail_block(rows, "Skill error", item.text(), Color::Red, width);
+        }
+        TranscriptItemKind::Generic => {
+            push_detail_block(rows, item.role(), item.text(), Color::BrightBlack, width);
+        }
+    }
+}
+
+fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
+    let title = if item.streaming() {
+        "Bcode …"
+    } else {
+        "Bcode"
+    };
+    let color = if item.streaming() {
+        Color::Cyan
+    } else {
+        Color::Green
+    };
+    push_message_block(rows, title, item.text(), color, width);
+}
+
+fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
+    let title = if item.streaming() {
+        "thinking …"
+    } else {
+        "thinking"
+    };
+    push_detail_block(rows, title, item.text(), Color::BrightBlack, width);
+}
+
+fn push_tool_request_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    tool_call_id: &str,
+    tool_name: &str,
+    diff_summary: Option<&str>,
+    width: u16,
+) {
+    let mut body = format!("call {}", truncate_middle(tool_call_id, 20));
+    if let Some(summary) = diff_summary {
+        body.push_str("\ndiff ");
+        body.push_str(summary);
+    }
+    if !item.text().is_empty() {
+        body.push_str("\narguments:\n");
+        body.push_str(item.text());
+    }
+    push_detail_block(
         rows,
-        vec![
-            Span::styled(format!("{}{}", item.role(), marker), role_style),
-            Span::raw(": "),
-        ],
-        item.text(),
+        &format!("Tool · {tool_name}"),
+        &body,
+        Color::Yellow,
+        width,
+    );
+}
+
+fn push_tool_result_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    tool_call_id: &str,
+    is_error: bool,
+    width: u16,
+) {
+    let mut body = tool_result_preview(item.text());
+    if is_error {
+        body.push_str("\ntool call ");
+        body.push_str(&truncate_middle(tool_call_id, 20));
+    }
+    push_detail_block(
+        rows,
+        if is_error {
+            "Tool result · failed"
+        } else {
+            "Tool result · ok"
+        },
+        &body,
+        if is_error { Color::Red } else { Color::Yellow },
+        width,
+    );
+}
+
+fn push_usage_rows(rows: &mut Vec<Line>, item: &TranscriptItem, turn_id: &str, width: u16) {
+    push_meta_block(
+        rows,
+        &format!("Usage · {} · {}", truncate_middle(turn_id, 18), item.text()),
+        width,
+    );
+}
+
+fn push_permission_request_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    permission_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    width: u16,
+) {
+    let body = format!(
+        "permission {}\ntool call {}\narguments:\n{}",
+        truncate_middle(permission_id, 20),
+        truncate_middle(tool_call_id, 20),
+        item.text()
+    );
+    push_detail_block(
+        rows,
+        &format!("Permission required · {tool_name}"),
+        &body,
+        Color::Red,
         width,
     );
 }
 
 fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmission, width: u16) {
-    push_wrapped_prefixed_text(
+    let title = format!("You · {}", pending_label(pending.state()));
+    push_message_block(rows, &title, pending.text(), Color::Blue, width);
+}
+
+fn push_message_block(rows: &mut Vec<Line>, title: &str, body: &str, color: Color, width: u16) {
+    push_block(rows, title, body, color, true, width);
+}
+
+fn push_detail_block(rows: &mut Vec<Line>, title: &str, body: &str, color: Color, width: u16) {
+    push_block(rows, title, body, color, false, width);
+}
+
+fn push_meta_block(rows: &mut Vec<Line>, text: &str, width: u16) {
+    push_wrapped_styled_text(
         rows,
-        vec![
-            Span::styled(
-                "You",
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ["),
-            Span::styled(
-                pending_label(pending.state()),
-                Style::new().fg(Color::BrightBlack),
-            ),
-            Span::raw("]: "),
-        ],
-        pending.text(),
+        vec![Span::styled("· ", muted_style())],
+        text,
         width,
+        muted_style(),
+        muted_style(),
     );
 }
 
-fn push_wrapped_prefixed_text(rows: &mut Vec<Line>, prefix: Vec<Span>, text: &str, width: u16) {
+fn push_block(
+    rows: &mut Vec<Line>,
+    title: &str,
+    body: &str,
+    color: Color,
+    prominent: bool,
+    width: u16,
+) {
+    let heading_style = if prominent {
+        Style::new().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(color)
+    };
+    push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
+    let body_style = if prominent {
+        Style::new()
+    } else {
+        muted_style()
+    };
+    if body.is_empty() {
+        rows.push(Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled("·", body_style),
+        ]));
+    } else {
+        for line in body.lines() {
+            push_wrapped_styled_text(
+                rows,
+                vec![Span::styled("  ", muted_style())],
+                line,
+                width,
+                body_style,
+                muted_style(),
+            );
+        }
+    }
+    rows.push(Line::default());
+}
+
+fn push_wrapped_styled_text(
+    rows: &mut Vec<Line>,
+    prefix: Vec<Span>,
+    text: &str,
+    width: u16,
+    body_style: Style,
+    continuation_style: Style,
+) {
     let max_width = usize::from(width.max(1));
     let prefix_width = spans_width(&prefix);
     let available_first = max_width.saturating_sub(prefix_width).max(1);
-    let continuation_prefix = Span::raw("  ");
     let available_next = max_width.saturating_sub(2).max(1);
+    let continuation_prefix = Span::styled("  ", continuation_style);
 
-    for (line_index, raw_line) in text.lines().enumerate() {
-        let chunks = wrap_text(
-            raw_line,
-            if line_index == 0 {
-                available_first
-            } else {
-                available_next
-            },
-        );
-        for (chunk_index, chunk) in chunks.iter().enumerate() {
-            if line_index == 0 && chunk_index == 0 {
-                let mut spans = prefix.clone();
-                spans.push(Span::raw(chunk.clone()));
-                rows.push(Line::from_spans(spans));
-            } else {
-                rows.push(Line::from_spans(vec![
-                    continuation_prefix.clone(),
-                    Span::raw(chunk.clone()),
-                ]));
-            }
+    let chunks = wrap_text_with_continuation(text, available_first, available_next);
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        if chunk_index == 0 {
+            let mut spans = prefix.clone();
+            spans.push(Span::styled(chunk.clone(), body_style));
+            rows.push(Line::from_spans(spans));
+        } else {
+            rows.push(Line::from_spans(vec![
+                continuation_prefix.clone(),
+                Span::styled(chunk.clone(), body_style),
+            ]));
         }
     }
 
-    if text.is_empty() {
+    if chunks.is_empty() {
         rows.push(Line::from_spans(prefix));
     }
 }
 
-fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+fn wrap_text_with_continuation(
+    text: &str,
+    first_width: usize,
+    continuation_width: usize,
+) -> Vec<String> {
     let mut rows = Vec::new();
     let mut current = String::new();
     let mut current_width = 0usize;
+    let mut max_width = first_width;
     for ch in text.chars() {
         let width = char_display_width(ch);
         if current_width > 0 && current_width.saturating_add(width) > max_width {
             rows.push(current);
             current = String::new();
             current_width = 0;
+            max_width = continuation_width;
         }
         current.push(ch);
         current_width = current_width.saturating_add(width);
@@ -494,16 +702,31 @@ fn usize_to_u16_saturating(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
-fn role_style(role: &str) -> Style {
-    match role {
-        "You" => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        "Assistant" => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        "Tool" => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        "Tool error" | "Skill error" => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        "Permission" => Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        "Reasoning" => Style::new().fg(Color::BrightBlack),
-        _ => Style::new()
-            .fg(Color::BrightBlack)
-            .add_modifier(Modifier::BOLD),
+const fn muted_style() -> Style {
+    Style::new().fg(Color::BrightBlack)
+}
+
+fn tool_result_preview(result: &str) -> String {
+    let lines = result.lines().collect::<Vec<_>>();
+    if lines.len() <= 24 {
+        return result.to_owned();
     }
+
+    let omitted = lines.len().saturating_sub(20);
+    let mut preview = lines
+        .iter()
+        .take(12)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = write!(preview, "\n… {omitted} lines omitted …\n");
+    preview.push_str(
+        &lines
+            .iter()
+            .skip(lines.len().saturating_sub(8))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    preview
 }

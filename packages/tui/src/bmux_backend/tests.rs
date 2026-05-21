@@ -548,9 +548,56 @@ fn prepended_history_coalesces_assistant_deltas() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Assistant: hello world"));
-    assert!(!output.contains("Assistant …: hello"));
-    assert_eq!(output.matches("Assistant").count(), 1);
+    assert!(output.contains("Bcode"));
+    assert!(output.contains("  hello world"));
+    assert!(!output.contains("Bcode …"));
+    assert_eq!(
+        app.transcript()
+            .iter()
+            .filter(|item| item.role() == "Assistant")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
+    let session_id = SessionId::new();
+    let full_call_id = "call_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: full_call_id.to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: r#"{"command":"cargo check","cwd":"/tmp/project"}"#.to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: full_call_id.to_owned(),
+                result: "ok".to_owned(),
+                is_error: false,
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 18));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("Tool · shell.run"));
+    assert!(output.contains("call call_ABCD"));
+    assert!(!output.contains(full_call_id));
+    assert!(output.contains("arguments:"));
+    assert!(output.contains(r#""command": "cargo check""#));
+    assert!(output.contains("Tool result · ok"));
+    assert!(output.contains("  ok"));
 }
 
 #[test]
