@@ -365,15 +365,16 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
+    let cwd = request.cwd.clone();
     let response = match request.name.as_str() {
-        "filesystem.read" => tool_read(request.arguments),
-        "filesystem.write" => tool_write(request.arguments),
-        "filesystem.edit" => tool_edit(request.arguments),
-        "filesystem.exists" => tool_exists(request.arguments),
-        "filesystem.list" => tool_list(request.arguments),
-        "filesystem.find" => tool_find(request.arguments),
-        "filesystem.grep" => tool_grep(request.arguments),
-        "filesystem.stat" => tool_stat(request.arguments),
+        "filesystem.read" => tool_read(request.arguments, cwd.as_deref()),
+        "filesystem.write" => tool_write(request.arguments, cwd.as_deref()),
+        "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref()),
+        "filesystem.exists" => tool_exists(request.arguments, cwd.as_deref()),
+        "filesystem.list" => tool_list(request.arguments, cwd.as_deref()),
+        "filesystem.find" => tool_find(request.arguments, cwd.as_deref()),
+        "filesystem.grep" => tool_grep(request.arguments, cwd.as_deref()),
+        "filesystem.stat" => tool_stat(request.arguments, cwd.as_deref()),
         _ => ToolInvocationResponse {
             output: format!("unknown filesystem tool: {}", request.name),
             is_error: true,
@@ -382,9 +383,9 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
     json_response(&response)
 }
 
-fn tool_read(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     match serde_json::from_value::<ReadRequest>(arguments) {
-        Ok(request) => match std::fs::read_to_string(&request.path) {
+        Ok(request) => match std::fs::read_to_string(resolve_session_path(cwd, &request.path)) {
             Ok(contents) => ToolInvocationResponse {
                 output: contents,
                 is_error: false,
@@ -395,71 +396,103 @@ fn tool_read(arguments: serde_json::Value) -> ToolInvocationResponse {
     }
 }
 
-fn tool_write(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     match serde_json::from_value::<WriteRequest>(arguments) {
-        Ok(request) => write_file_inner(&request.path, &request.contents).map_or_else(
-            |error| tool_io_error(&error),
-            |bytes_written| ToolInvocationResponse {
-                output: format!("wrote {bytes_written} bytes"),
-                is_error: false,
-            },
-        ),
+        Ok(mut request) => {
+            request.path = resolve_session_path(cwd, &request.path);
+            write_file_inner(&request.path, &request.contents).map_or_else(
+                |error| tool_io_error(&error),
+                |bytes_written| ToolInvocationResponse {
+                    output: format!("wrote {bytes_written} bytes"),
+                    is_error: false,
+                },
+            )
+        }
         Err(error) => tool_json_error(&error),
     }
 }
 
-fn tool_edit(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     match serde_json::from_value::<EditRequest>(arguments) {
-        Ok(request) => edit_file_inner(&request).map_or_else(
-            |error| ToolInvocationResponse {
-                output: error,
-                is_error: true,
-            },
-            |replacements| ToolInvocationResponse {
-                output: format!("applied {replacements} replacement"),
-                is_error: false,
-            },
-        ),
+        Ok(mut request) => {
+            request.path = resolve_session_path(cwd, &request.path);
+            edit_file_inner(&request).map_or_else(
+                |error| ToolInvocationResponse {
+                    output: error,
+                    is_error: true,
+                },
+                |replacements| ToolInvocationResponse {
+                    output: format!("applied {replacements} replacement"),
+                    is_error: false,
+                },
+            )
+        }
         Err(error) => tool_json_error(&error),
     }
 }
 
-fn tool_exists(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     match serde_json::from_value::<ExistsRequest>(arguments) {
         Ok(request) => ToolInvocationResponse {
-            output: request.path.exists().to_string(),
+            output: resolve_session_path(cwd, &request.path)
+                .exists()
+                .to_string(),
             is_error: false,
         },
         Err(error) => tool_json_error(&error),
     }
 }
 
-fn tool_list(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_list(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<ListRequest>(arguments)
+            .map(|mut request| {
+                request.path = resolve_session_path(cwd, &request.path);
+                request
+            })
             .and_then(|request| list_directory(&request).map_err(serde_json::Error::io)),
     )
 }
 
-fn tool_find(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_find(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<FindRequest>(arguments)
+            .map(|mut request| {
+                request.path = resolve_session_path(cwd, &request.path);
+                request
+            })
             .and_then(|request| find_paths(&request).map_err(serde_json::Error::io)),
     )
 }
 
-fn tool_grep(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_grep(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<GrepRequest>(arguments)
+            .map(|mut request| {
+                request.path = resolve_session_path(cwd, &request.path);
+                request
+            })
             .and_then(|request| grep_files(&request).map_err(serde_json::Error::io)),
     )
 }
 
-fn tool_stat(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn tool_stat(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<StatRequest>(arguments)
+            .map(|mut request| {
+                request.path = resolve_session_path(cwd, &request.path);
+                request
+            })
             .and_then(|request| stat_path(&request).map_err(serde_json::Error::io)),
     )
+}
+
+fn resolve_session_path(cwd: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.map_or_else(|| path.to_path_buf(), |cwd| cwd.join(path))
+    }
 }
 
 fn read_file(request: &ServiceRequest) -> ServiceResponse {

@@ -85,7 +85,7 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
         Err(error) => return invalid_request(&error),
     };
     let response = match request.name.as_str() {
-        "shell.run" => run_shell_tool(request.arguments),
+        "shell.run" => run_shell_tool(request.arguments, request.cwd.as_deref()),
         _ => ToolInvocationResponse {
             output: format!("unknown shell tool: {}", request.name),
             is_error: true,
@@ -94,7 +94,10 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
     json_response(&response)
 }
 
-fn run_shell_tool(arguments: serde_json::Value) -> ToolInvocationResponse {
+fn run_shell_tool(
+    arguments: serde_json::Value,
+    session_cwd: Option<&std::path::Path>,
+) -> ToolInvocationResponse {
     let arguments = match serde_json::from_value::<ShellRunArguments>(arguments) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -110,7 +113,7 @@ fn run_shell_tool(arguments: serde_json::Value) -> ToolInvocationResponse {
             is_error: true,
         };
     }
-    match run_shell_command(&arguments) {
+    match run_shell_command(&arguments, session_cwd) {
         Ok(output) => output,
         Err(error) => ToolInvocationResponse {
             output: error,
@@ -119,12 +122,16 @@ fn run_shell_tool(arguments: serde_json::Value) -> ToolInvocationResponse {
     }
 }
 
-fn run_shell_command(arguments: &ShellRunArguments) -> Result<ToolInvocationResponse, String> {
+fn run_shell_command(
+    arguments: &ShellRunArguments,
+    session_cwd: Option<&std::path::Path>,
+) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let mut command = shell_command(&arguments.command);
     configure_command_for_timeout(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(cwd) = &arguments.cwd {
+    let cwd = arguments.cwd.as_deref().or(session_cwd);
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
@@ -310,11 +317,14 @@ mod tests {
     #[test]
     fn timeout_terminates_shell_process_group() {
         let started = Instant::now();
-        let response = run_shell_command(&ShellRunArguments {
-            command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),
-            cwd: None,
-            timeout_ms: Some(100),
-        })
+        let response = run_shell_command(
+            &ShellRunArguments {
+                command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),
+                cwd: None,
+                timeout_ms: Some(100),
+            },
+            None,
+        )
         .expect("shell command should return timeout output");
 
         assert!(started.elapsed() < Duration::from_secs(2));

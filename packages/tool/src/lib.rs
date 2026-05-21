@@ -5,6 +5,7 @@
 //! Model-callable tool contract types for Bcode.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Plugin service interface for model-callable tools.
 pub const TOOL_SERVICE_INTERFACE_ID: &str = "bcode.tool/v1";
@@ -53,6 +54,9 @@ pub struct ToolInvocationRequest {
     pub tool_call_id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Canonical session working directory for this invocation.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Tool invocation response.

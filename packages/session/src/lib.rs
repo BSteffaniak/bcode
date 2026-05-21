@@ -1158,6 +1158,26 @@ impl SessionManager {
             .ok_or(SessionError::NotFound(session_id))
     }
 
+    /// Return the durable working directory associated with a session.
+    ///
+    /// This is the canonical cwd for all session-scoped server runtime,
+    /// including prompts, policy checks, and tool execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn session_working_directory(
+        &self,
+        session_id: SessionId,
+    ) -> Result<PathBuf, SessionError> {
+        let inner = self.inner.lock().await;
+        inner
+            .sessions
+            .get(&session_id)
+            .map(|state| state.working_directory.clone())
+            .ok_or(SessionError::NotFound(session_id))
+    }
+
     /// Return canonical access status for one session.
     ///
     /// # Errors

@@ -38,7 +38,6 @@ use bcode_tool::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -3983,7 +3982,9 @@ async fn build_model_turn_request(
     let selection = session_model_selection(state, session_id).await;
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;
+    let working_directory = state.sessions.session_working_directory(session_id).await?;
     let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
+        &working_directory,
         agent_context
             .as_ref()
             .and_then(|context| context.system_prompt_suffix.as_deref()),
@@ -4312,8 +4313,11 @@ const MAX_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
 const MAX_CONTEXT_FILE_CHARS: usize = 6_000;
 const MAX_GIT_STATUS_CHARS: usize = 4_000;
 
-fn build_coding_system_prompt_parts(agent_prompt_suffix: Option<&str>) -> (String, String) {
-    let (stable_context, dynamic_context) = build_repository_context_parts();
+fn build_coding_system_prompt_parts(
+    cwd: &Path,
+    agent_prompt_suffix: Option<&str>,
+) -> (String, String) {
+    let (stable_context, dynamic_context) = build_repository_context_parts(cwd);
     let mut stable = format!(
         "{DEFAULT_CODING_SYSTEM_PROMPT}\n\n{}",
         truncate_text(&stable_context, MAX_REPOSITORY_CONTEXT_CHARS)
@@ -4331,17 +4335,16 @@ fn build_coding_system_prompt_parts(agent_prompt_suffix: Option<&str>) -> (Strin
     )
 }
 
-fn build_repository_context_parts() -> (String, String) {
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let repo_root = discover_git_root(&cwd);
-    let context_root = repo_root.as_deref().unwrap_or(cwd.as_path());
+fn build_repository_context_parts(cwd: &Path) -> (String, String) {
+    let repo_root = discover_git_root(cwd);
+    let context_root = repo_root.as_deref().unwrap_or(cwd);
 
     let mut stable_lines = vec!["Stable repository context:".to_string()];
     stable_lines.push(format!(
         "* Detected project files: {}",
         detected_project_files(context_root).join(", ")
     ));
-    if let Some(instructions) = read_nearest_agent_instructions(&cwd, context_root) {
+    if let Some(instructions) = read_nearest_agent_instructions(cwd, context_root) {
         stable_lines.push(format!("* Project instructions excerpt:\n{instructions}"));
     }
 
@@ -4670,10 +4673,16 @@ async fn invoke_model_tool(
         }
         AgentDecision::Allow => {}
     }
+    let working_directory = state
+        .sessions
+        .session_working_directory(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let request = ToolInvocationRequest {
         tool_call_id: call.id.clone(),
         name: call.name.clone(),
         arguments: call.arguments.clone(),
+        cwd: Some(working_directory),
     };
     with_plugins_blocking(state, move |plugins| {
         plugins.invoke_service_json::<_, ToolInvocationResponse>(
@@ -4695,15 +4704,19 @@ async fn evaluate_agent_tool_policy(
     definition: &ServiceToolDefinition,
 ) -> EvaluateToolCallResponse {
     let agent_id = session_agent_selection(state, session_id).await;
+    let cwd = state
+        .sessions
+        .session_working_directory(session_id)
+        .await
+        .ok()
+        .map(|path| path.display().to_string());
     let request = EvaluateToolCallRequest {
         session_id,
         agent_id,
         tool_name: definition.name.clone(),
         side_effect: definition.side_effect,
         arguments: call.arguments.clone(),
-        cwd: env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string()),
+        cwd,
     };
     with_plugins_blocking(state, move |plugins| {
         plugins.invoke_service_by_interface_json::<_, EvaluateToolCallResponse>(
@@ -6205,7 +6218,8 @@ mod tests {
 
     #[test]
     fn coding_system_prompt_splits_stable_and_dynamic_context() {
-        let (stable, dynamic) = build_coding_system_prompt_parts(Some("agent suffix"));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let (stable, dynamic) = build_coding_system_prompt_parts(&cwd, Some("agent suffix"));
 
         assert!(stable.contains(DEFAULT_CODING_SYSTEM_PROMPT));
         assert!(stable.contains("Stable repository context:"));
