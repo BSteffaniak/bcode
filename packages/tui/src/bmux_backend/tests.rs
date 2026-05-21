@@ -244,6 +244,55 @@ fn input_history_moves_within_multiline_entry_before_cycling() {
     assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Down)).redraw);
     assert_eq!(app.composer().text(), "newest prompt\nnewest second line");
     assert_eq!(app.status(), "input history 2/2");
+
+    assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Down)).redraw);
+    assert!(app.composer().is_empty());
+    assert_eq!(app.status(), "draft restored");
+}
+
+#[test]
+fn input_history_restores_empty_draft_from_newest_entry_bottom() {
+    let history = [SessionInputHistoryEntry {
+        sequence: 1,
+        text: "history prompt".to_owned(),
+    }];
+    let mut app = BmuxApp::new_with_history(None, &[], &history, false);
+    app.set_composer_content_area(Rect::new(0, 0, 40, 3));
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Up)).redraw);
+    assert_eq!(app.composer().text(), "history prompt");
+    assert_eq!(app.status(), "input history 1/1");
+
+    assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Down)).redraw);
+    assert!(app.composer().is_empty());
+    assert_eq!(app.status(), "draft restored");
+}
+
+#[test]
+fn live_user_message_does_not_overwrite_saved_history_draft() {
+    let session_id = SessionId::new();
+    let history = [SessionInputHistoryEntry {
+        sequence: 1,
+        text: "older prompt".to_owned(),
+    }];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &history, false);
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Up)).redraw);
+    assert_eq!(app.composer().text(), "older prompt");
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::UserMessage {
+            text: "newly committed prompt".to_owned(),
+            client_id: ClientId::new(),
+        },
+    ));
+    assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Down)).redraw);
+
+    assert!(app.composer().is_empty());
+    assert_eq!(app.status(), "draft restored");
 }
 
 #[test]

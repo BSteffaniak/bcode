@@ -30,6 +30,7 @@ pub(super) struct InputHistory {
     entries: Vec<String>,
     sequences: BTreeSet<u64>,
     index: Option<usize>,
+    browse_len: Option<usize>,
     draft: Option<String>,
 }
 
@@ -45,6 +46,7 @@ impl InputHistory {
                 .collect(),
             sequences: entries.iter().map(|entry| entry.sequence).collect(),
             index: None,
+            browse_len: None,
             draft: None,
         }
     }
@@ -55,7 +57,6 @@ impl InputHistory {
             return;
         }
         self.entries.push(text.to_owned());
-        self.reset_navigation();
     }
 
     /// Prepend older committed user messages in chronological order.
@@ -68,8 +69,14 @@ impl InputHistory {
         if messages.is_empty() {
             return;
         }
+        let added = messages.len();
         self.entries.splice(0..0, messages);
-        self.reset_navigation();
+        if let Some(index) = &mut self.index {
+            *index = index.saturating_add(added);
+        }
+        if let Some(browse_len) = &mut self.browse_len {
+            *browse_len = browse_len.saturating_add(added);
+        }
     }
 
     /// Return previous history entry and store draft when starting navigation.
@@ -77,12 +84,14 @@ impl InputHistory {
         if self.entries.is_empty() {
             return InputHistoryOutcome::Empty;
         }
+        let browse_len = self.browse_len.unwrap_or(self.entries.len());
         let next_index = self.index.map_or_else(
-            || self.entries.len().saturating_sub(1),
+            || browse_len.saturating_sub(1),
             |index| index.saturating_sub(1),
         );
         if self.index.is_none() {
             self.draft = Some(current_draft.to_owned());
+            self.browse_len = Some(self.entries.len());
         }
         self.index = Some(next_index);
         self.entry_outcome(next_index)
@@ -93,12 +102,14 @@ impl InputHistory {
         let Some(index) = self.index else {
             return InputHistoryOutcome::NotBrowsing;
         };
-        if index + 1 < self.entries.len() {
+        let browse_len = self.browse_len.unwrap_or(self.entries.len());
+        if index + 1 < browse_len {
             let next_index = index + 1;
             self.index = Some(next_index);
             self.entry_outcome(next_index)
         } else {
             self.index = None;
+            self.browse_len = None;
             InputHistoryOutcome::DraftRestored(self.draft.take().unwrap_or_default())
         }
     }
@@ -112,6 +123,7 @@ impl InputHistory {
     /// Reset active history navigation.
     pub(super) fn reset_navigation(&mut self) {
         self.index = None;
+        self.browse_len = None;
         self.draft = None;
     }
 

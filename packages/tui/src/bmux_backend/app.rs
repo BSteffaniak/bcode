@@ -444,11 +444,11 @@ impl BmuxApp {
     pub(super) fn previous_input_history(&mut self) -> bool {
         match self.input_history.previous(self.composer.buffer().text()) {
             InputHistoryOutcome::Entry { index, total, text } => {
-                self.replace_composer_with(&text);
+                self.replace_composer_from_history(&text);
                 self.status = format!("input history {index}/{total}");
             }
             InputHistoryOutcome::DraftRestored(text) => {
-                self.replace_composer_with(&text);
+                self.replace_composer_from_history(&text);
                 "draft restored".clone_into(&mut self.status);
             }
             InputHistoryOutcome::Empty => {
@@ -465,11 +465,11 @@ impl BmuxApp {
     pub(super) fn next_input_history(&mut self) -> bool {
         match self.input_history.next() {
             InputHistoryOutcome::Entry { index, total, text } => {
-                self.replace_composer_with(&text);
+                self.replace_composer_from_history(&text);
                 self.status = format!("input history {index}/{total}");
             }
             InputHistoryOutcome::DraftRestored(text) => {
-                self.replace_composer_with(&text);
+                self.replace_composer_from_history(&text);
                 "draft restored".clone_into(&mut self.status);
             }
             InputHistoryOutcome::Empty => {
@@ -680,6 +680,17 @@ impl BmuxApp {
 
     /// Replace composer contents.
     pub(super) fn replace_composer_with(&mut self, text: &str) {
+        self.replace_composer_with_policy(text, true);
+    }
+
+    fn replace_composer_from_history(&mut self, text: &str) {
+        self.replace_composer_with_policy(text, false);
+    }
+
+    fn replace_composer_with_policy(&mut self, text: &str, reset_history: bool) {
+        if reset_history {
+            self.input_history.reset_navigation();
+        }
         self.composer.buffer_mut().clear();
         self.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
