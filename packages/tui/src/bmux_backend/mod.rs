@@ -5,6 +5,7 @@ mod chat_loop;
 mod command_palette;
 mod command_palette_render;
 mod composer_flow;
+mod diff_extract;
 mod filtered_list;
 mod helpers;
 mod history_flow;
