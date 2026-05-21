@@ -13,6 +13,7 @@ use bmux_tui::diff::{DiffFileSummary, DiffLine};
 use super::IDLE_REDRAW_INTERVAL;
 use super::diff_extract::diff_from_tool_request;
 use super::diff_panel::DiffPanel;
+use super::input_history::InputHistory;
 use super::pending_submission::PendingSubmission;
 use super::transcript::{
     TranscriptItem, merge_transcript_boundary, optional_u32, pretty_jsonish, tool_request_item,
@@ -24,9 +25,7 @@ use super::transcript::{
 pub(super) struct BmuxApp {
     session_id: Option<SessionId>,
     composer: TextEditBuffer,
-    input_history: Vec<String>,
-    input_history_index: Option<usize>,
-    input_history_draft: Option<String>,
+    input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
     diff_panel: DiffPanel,
     pending_submissions: Vec<PendingSubmission>,
@@ -56,12 +55,7 @@ impl BmuxApp {
         let mut app = Self {
             session_id,
             composer: TextEditBuffer::new(),
-            input_history: input_history
-                .iter()
-                .map(|entry| entry.text.clone())
-                .collect(),
-            input_history_index: None,
-            input_history_draft: None,
+            input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
             diff_panel: DiffPanel::new(),
             pending_submissions: Vec::new(),
@@ -245,9 +239,7 @@ impl BmuxApp {
         self.pending_submission = Some(text.clone());
         self.pending_submissions
             .push(PendingSubmission::new(text.clone()));
-        self.input_history.push(text);
-        self.input_history_index = None;
-        self.input_history_draft = None;
+        self.input_history.push_submission(text);
         self.composer.clear();
     }
 
@@ -290,37 +282,19 @@ impl BmuxApp {
 
     /// Show the previous input-history entry, if available.
     pub(super) fn previous_input_history(&mut self) -> bool {
-        if self.input_history.is_empty() {
+        let Some(text) = self.input_history.previous(self.composer.text()) else {
             return false;
-        }
-        let next_index = self.input_history_index.map_or_else(
-            || self.input_history.len().saturating_sub(1),
-            |index| index.saturating_sub(1),
-        );
-        if self.input_history_index.is_none() {
-            self.input_history_draft = Some(self.composer.text().to_owned());
-        }
-        self.input_history_index = Some(next_index);
-        let text = self.input_history[next_index].clone();
+        };
         self.replace_composer_with(&text);
         true
     }
 
     /// Show the next input-history entry, or restore the draft.
     pub(super) fn next_input_history(&mut self) -> bool {
-        let Some(index) = self.input_history_index else {
+        let Some(text) = self.input_history.next() else {
             return false;
         };
-        if index + 1 < self.input_history.len() {
-            let next_index = index + 1;
-            self.input_history_index = Some(next_index);
-            let text = self.input_history[next_index].clone();
-            self.replace_composer_with(&text);
-        } else {
-            self.input_history_index = None;
-            let draft = self.input_history_draft.take().unwrap_or_default();
-            self.replace_composer_with(&draft);
-        }
+        self.replace_composer_with(&text);
         true
     }
 

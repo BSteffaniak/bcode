@@ -11,6 +11,7 @@ mod filtered_list;
 mod helpers;
 mod history_flow;
 mod input;
+mod input_history;
 mod keymap;
 mod model_flow;
 mod model_picker;
