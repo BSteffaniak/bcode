@@ -23,6 +23,7 @@ mod picker_render;
 mod provider_picker;
 mod provider_picker_render;
 mod render;
+mod runtime;
 mod session_flow;
 mod session_picker;
 mod session_picker_render;
@@ -34,18 +35,13 @@ mod slash_flow;
 mod slash_palette;
 mod slash_palette_render;
 
-use std::io::{self, Write};
+use std::io;
 use std::time::Duration;
 
-use bcode_client::BcodeClient;
+use super::TuiError;
 use bcode_session_models::SessionId;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
 use bmux_tui::terminal::Terminal;
-use tokio::sync::mpsc;
-
-use self::app::BmuxApp;
-use self::keymap::BmuxKeyMap;
-use super::TuiError;
 
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
@@ -67,7 +63,7 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
             guard.writer_mut().expect("guard writer exists"),
             helpers::terminal_area()?,
         );
-        run_event_loop(&mut terminal, session_id).await
+        runtime::run_event_loop(&mut terminal, session_id).await
     };
 
     match result {
@@ -77,40 +73,6 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
         }
         Err(error) => Err(error),
     }
-}
-
-async fn run_event_loop<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    session_id: Option<SessionId>,
-) -> Result<(), TuiError> {
-    let client = BcodeClient::default_endpoint();
-    let config = bcode_config::load_config()?;
-    let keymap = BmuxKeyMap::from_config(&config.tui);
-    let session_id = match session_id {
-        Some(session_id) => session_id,
-        None => session_flow::pick_session(terminal, &client, &keymap).await?,
-    };
-    let (event_sender, event_receiver) = mpsc::unbounded_channel();
-    let (attached, event_task) =
-        history_flow::attach_session_event_stream(&client, session_id, event_sender.clone())
-            .await?;
-    let app = BmuxApp::new_with_history(
-        Some(session_id),
-        &attached.history,
-        &attached.input_history,
-        attached.history.len() >= INITIAL_HISTORY_EVENT_LIMIT,
-    );
-    let mut chat = session_flow::ActiveChat {
-        app,
-        session_id,
-        event_sender,
-        event_receiver,
-        event_task,
-    };
-    session_flow::hydrate_status(&client, &mut chat.app).await;
-    let result = chat_loop::run_with_client(terminal, &client, &keymap, &mut chat).await;
-    chat.event_task.abort();
-    result
 }
 
 #[cfg(test)]
