@@ -244,7 +244,7 @@ async fn handle_event<W: Write>(
             }
             chat.app.composer_mut().insert_str(&text);
             chat.app.wake_cursor();
-            update_slash_palette(client, chat, &mut modals.slash_palette).await;
+            slash_flow::update_slash_palette(client, chat, &mut modals.slash_palette).await;
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
@@ -272,30 +272,6 @@ async fn handle_event<W: Write>(
             handle_mouse(hit_id, client, chat, &mut modals.permission_dialog, mouse).await
         }
         Event::User(_) => Ok(false),
-    }
-}
-
-async fn update_slash_palette(
-    client: &BcodeClient,
-    chat: &ActiveChat,
-    slash_palette: &mut Option<slash_palette::SlashPalette>,
-) {
-    if chat.app.composer().text().starts_with('/') {
-        let previous = slash_palette
-            .as_ref()
-            .and_then(|palette| palette.selected_command().map(str::to_owned));
-        let mut next = slash_palette::SlashPalette::new(
-            client,
-            chat.app.session_id(),
-            chat.app.composer().text(),
-        )
-        .await;
-        if let Some(previous) = previous {
-            next.select_command(&previous);
-        }
-        *slash_palette = (!next.is_empty()).then_some(next);
-    } else {
-        *slash_palette = None;
     }
 }
 
@@ -352,7 +328,7 @@ async fn handle_chat_key<W: Write>(
         return Ok(true);
     }
     let outcome = input::handle_key(&mut chat.app, keymap, stroke);
-    update_slash_palette(client, chat, &mut modals.slash_palette).await;
+    slash_flow::update_slash_palette(client, chat, &mut modals.slash_palette).await;
     if outcome.submitted
         && let Err(error) = submit_composer(client, keymap, chat, terminal).await
     {

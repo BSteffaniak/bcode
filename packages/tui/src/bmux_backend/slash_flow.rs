@@ -10,8 +10,33 @@ use bmux_tui::terminal::Terminal;
 use super::keymap::BmuxKeyMap;
 use super::{
     ActiveChat, TuiError, input, report_client_error, slash_palette, slash_palette_render,
-    submit_composer, update_slash_palette,
+    submit_composer,
 };
+
+/// Refresh slash completions for the current composer text.
+pub(super) async fn update_slash_palette(
+    client: &BcodeClient,
+    chat: &ActiveChat,
+    slash_palette: &mut Option<slash_palette::SlashPalette>,
+) {
+    if chat.app.composer().text().starts_with('/') {
+        let previous = slash_palette
+            .as_ref()
+            .and_then(|palette| palette.selected_command().map(str::to_owned));
+        let mut next = slash_palette::SlashPalette::new(
+            client,
+            chat.app.session_id(),
+            chat.app.composer().text(),
+        )
+        .await;
+        if let Some(previous) = previous {
+            next.select_command(&previous);
+        }
+        *slash_palette = (!next.is_empty()).then_some(next);
+    } else {
+        *slash_palette = None;
+    }
+}
 
 /// Handle one key while the slash completion palette is open.
 pub(super) async fn handle_slash_palette_key<W: Write>(
