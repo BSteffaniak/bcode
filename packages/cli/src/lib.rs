@@ -71,6 +71,8 @@ pub enum CliError {
         log_path: String,
         recent_log: String,
     },
+    #[error("--new cannot be combined with a subcommand")]
+    NewSessionWithCommand,
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
 }
@@ -83,6 +85,17 @@ pub enum CliError {
 pub async fn run() -> Result<(), CliError> {
     init_tracing();
     let cli = Cli::parse();
+    handle_cli(cli).await
+}
+
+async fn handle_cli(cli: Cli) -> Result<(), CliError> {
+    if cli.new {
+        if cli.command.is_some() {
+            return Err(CliError::NewSessionWithCommand);
+        }
+        run_new_session_tui().await?;
+        return Ok(());
+    }
     match cli.command.unwrap_or_default() {
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => match command {
@@ -146,23 +159,7 @@ pub async fn run() -> Result<(), CliError> {
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Provider { command } => handle_provider_command(command)?,
-        Commands::Permission { command } => match command {
-            PermissionCommand::List => list_permissions().await?,
-            PermissionCommand::Approve { permission_id } => {
-                resolve_permission(permission_id, true).await?;
-            }
-            PermissionCommand::Deny { permission_id } => {
-                resolve_permission(permission_id, false).await?;
-            }
-            PermissionCommand::Add {
-                agent,
-                category,
-                pattern,
-                action,
-            } => {
-                add_permission_rule(&agent, &category, pattern, &action).await?;
-            }
-        },
+        Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::Cancel { session_id } => cancel_session_turn(session_id).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
@@ -173,6 +170,27 @@ pub async fn run() -> Result<(), CliError> {
             session_id,
             message,
         } => send_message(session_id, message).await?,
+    }
+    Ok(())
+}
+
+async fn handle_permission_command(command: PermissionCommand) -> Result<(), CliError> {
+    match command {
+        PermissionCommand::List => list_permissions().await?,
+        PermissionCommand::Approve { permission_id } => {
+            resolve_permission(permission_id, true).await?;
+        }
+        PermissionCommand::Deny { permission_id } => {
+            resolve_permission(permission_id, false).await?;
+        }
+        PermissionCommand::Add {
+            agent,
+            category,
+            pattern,
+            action,
+        } => {
+            add_permission_rule(&agent, &category, pattern, &action).await?;
+        }
     }
     Ok(())
 }
@@ -203,6 +221,9 @@ fn init_tracing() {
 #[derive(Debug, Parser)]
 #[command(name = "bcode", version, about = "TUI-first coding agent")]
 struct Cli {
+    /// Create a new session and open it in the terminal UI.
+    #[arg(short = 'n', long = "new")]
+    new: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -2231,6 +2252,14 @@ fn server_is_unreachable(error: &ClientError) -> bool {
         ),
         _ => false,
     }
+}
+
+async fn run_new_session_tui() -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let client = BcodeClient::default_endpoint();
+    let session = client.create_session(None).await?;
+    bcode_tui::run(Some(session.id)).await?;
+    Ok(())
 }
 
 async fn create_session(name: Option<String>) -> Result<(), CliError> {
