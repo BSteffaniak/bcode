@@ -466,6 +466,47 @@ fn slash_palette_renders_above_composer() {
 }
 
 #[test]
+fn assistant_final_replaces_stream_when_usage_is_interleaved() {
+    let session_id = SessionId::new();
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::AssistantDelta {
+                text: "Fixed".to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: SessionTokenUsage::default(),
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::AssistantMessage {
+                text: "Fixed.".to_owned(),
+            },
+        ),
+    ];
+    let app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+    let assistant_items = app
+        .transcript()
+        .iter()
+        .filter(|item| item.role() == "Assistant")
+        .collect::<Vec<_>>();
+
+    assert_eq!(assistant_items.len(), 1);
+    assert_eq!(assistant_items[0].text(), "Fixed.");
+    assert!(!assistant_items[0].streaming());
+    assert!(app.transcript().iter().any(|item| item.role() == "Usage"));
+}
+
+#[test]
 fn prepended_history_coalesces_assistant_deltas() {
     let session_id = SessionId::new();
     let newer = [event(

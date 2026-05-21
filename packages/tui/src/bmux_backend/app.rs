@@ -23,7 +23,8 @@ use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::transcript::{
-    TranscriptItem, merge_transcript_boundary, optional_u32, pretty_jsonish, tool_request_item,
+    TranscriptItem, finish_streaming_transcript_item, merge_transcript_boundary, optional_u32,
+    pretty_jsonish, push_streaming_transcript_item, tool_request_item,
     transcript_items_from_events, truncate_block,
 };
 use super::transcript_viewport::TranscriptViewport;
@@ -755,29 +756,11 @@ impl BmuxApp {
     }
 
     fn push_streaming_item(&mut self, role: &'static str, text: &str) {
-        if let Some(last) = self.transcript.last_mut()
-            && last.role == role
-            && last.streaming
-        {
-            last.text.push_str(text);
-            return;
-        }
-        self.transcript
-            .push(TranscriptItem::new_streaming(role, text.to_owned()));
+        push_streaming_transcript_item(&mut self.transcript, role, text);
     }
 
     fn finish_streaming_item(&mut self, role: &'static str, text: &str) {
-        if let Some(last) = self.transcript.last_mut()
-            && last.role == role
-            && last.streaming
-        {
-            last.text.clear();
-            last.text.push_str(text);
-            last.streaming = false;
-            return;
-        }
-        self.transcript
-            .push(TranscriptItem::new(role, text.to_owned()));
+        finish_streaming_transcript_item(&mut self.transcript, role, text);
     }
 
     fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {

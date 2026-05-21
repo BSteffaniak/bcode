@@ -152,32 +152,46 @@ fn push_transcript_item_from_event(items: &mut Vec<TranscriptItem>, event: &Sess
     }
 }
 
-fn push_streaming_transcript_item(items: &mut Vec<TranscriptItem>, role: &'static str, text: &str) {
-    if let Some(last) = items.last_mut()
-        && last.role == role
-        && last.streaming
-    {
-        last.text.push_str(text);
+/// Append streamed text to the currently open transcript stream for `role`.
+///
+/// Interleaved telemetry rows, such as token usage, may be appended while a model stream is open.
+/// The open stream is therefore the newest streaming row for the same role, not necessarily the
+/// final transcript row.
+pub(super) fn push_streaming_transcript_item(
+    items: &mut Vec<TranscriptItem>,
+    role: &'static str,
+    text: &str,
+) {
+    if let Some(item) = latest_streaming_item_mut(items, role) {
+        item.text.push_str(text);
         return;
     }
     items.push(TranscriptItem::new_streaming(role, text.to_owned()));
 }
 
-fn finish_streaming_transcript_item(
+/// Finish the currently open transcript stream for `role`, or append a final item if none exists.
+pub(super) fn finish_streaming_transcript_item(
     items: &mut Vec<TranscriptItem>,
     role: &'static str,
     text: &str,
 ) {
-    if let Some(last) = items.last_mut()
-        && last.role == role
-        && last.streaming
-    {
-        last.text.clear();
-        last.text.push_str(text);
-        last.streaming = false;
+    if let Some(item) = latest_streaming_item_mut(items, role) {
+        item.text.clear();
+        item.text.push_str(text);
+        item.streaming = false;
         return;
     }
     items.push(TranscriptItem::new(role, text.to_owned()));
+}
+
+fn latest_streaming_item_mut<'items>(
+    items: &'items mut [TranscriptItem],
+    role: &'static str,
+) -> Option<&'items mut TranscriptItem> {
+    items
+        .iter_mut()
+        .rev()
+        .find(|item| item.role == role && item.streaming)
 }
 
 fn non_streaming_transcript_item_from_event(event: &SessionEvent) -> Option<TranscriptItem> {
