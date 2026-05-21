@@ -12,7 +12,7 @@ use bcode_session_models::{
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -92,8 +92,11 @@ pub enum Request {
     ServerStop,
     CreateSession {
         name: Option<String>,
+        working_directory: PathBuf,
     },
-    ListSessions,
+    ListSessions {
+        working_directory: PathBuf,
+    },
     RenameSession {
         session_id: SessionId,
         name: Option<String>,
@@ -676,6 +679,16 @@ pub fn response_envelope(request_id: u64, response: &Response) -> Result<Envelop
 /// Returns an error when serialization fails.
 pub fn event_envelope(event: &Event) -> Result<Envelope, CodecError> {
     Ok(Envelope::new(0, EnvelopeKind::Event, encode(event)?))
+}
+
+/// Return the normalized current working directory for session scoping.
+#[must_use]
+pub fn current_working_directory() -> PathBuf {
+    env::current_dir().map_or_else(|_| PathBuf::from("."), |path| normalize_path(&path))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Return the default local IPC endpoint.

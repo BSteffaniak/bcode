@@ -22,6 +22,7 @@ const BUILTIN_SESSION_EVENT_MIGRATIONS: &[NoOpSessionEventMigration] = &[
     NoOpSessionEventMigration::new("sessions-events-v6-to-v7", 6, 7),
     NoOpSessionEventMigration::new("sessions-events-v7-to-v8", 7, 8),
     NoOpSessionEventMigration::new("sessions-events-v8-to-v9", 8, 9),
+    NoOpSessionEventMigration::new("sessions-events-v9-to-v10", 9, 10),
 ];
 
 trait SessionEventMigrationStep {

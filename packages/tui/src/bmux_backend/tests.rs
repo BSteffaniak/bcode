@@ -352,6 +352,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
             1,
             SessionEventKind::SessionCreated {
                 name: Some("Visual parity work".to_owned()),
+                working_directory: "/tmp/bcode-tui-test".into(),
             },
         ),
         event(

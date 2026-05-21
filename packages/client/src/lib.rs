@@ -7,8 +7,9 @@
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
     CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream, PermissionSummary,
-    PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, decode,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload,
+    current_working_directory, decode, default_endpoint, recv_envelope, request_envelope,
+    send_envelope,
 };
 use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
@@ -124,7 +125,10 @@ impl BcodeClient {
     ) -> Result<SessionSummary, ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         match connection
-            .send_request(Request::CreateSession { name })
+            .send_request(Request::CreateSession {
+                name,
+                working_directory: current_working_directory(),
+            })
             .await?
         {
             ResponsePayload::SessionCreated { session } => Ok(session),
@@ -139,7 +143,12 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::ListSessions).await? {
+        match connection
+            .send_request(Request::ListSessions {
+                working_directory: current_working_directory(),
+            })
+            .await?
+        {
             ResponsePayload::SessionList { sessions } => Ok(sessions),
             _ => Err(ClientError::UnexpectedResponse),
         }

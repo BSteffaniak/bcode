@@ -7,7 +7,7 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-pub const SESSION_INDEX_VERSION: u16 = 5;
+pub const SESSION_INDEX_VERSION: u16 = 6;
 pub const SESSION_ENTRY_INDEX_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,7 @@ pub struct SessionIndex {
     pub session_id: SessionId,
     pub file: EventFileFingerprint,
     pub summary: SessionSummary,
+    pub working_directory: PathBuf,
     pub next_sequence: u64,
     pub event_count: usize,
     pub created_at_ms: u64,
@@ -131,6 +132,7 @@ impl SessionIndex {
         report: &SessionReadReport,
     ) -> Option<Self> {
         let mut name = None;
+        let mut working_directory = None;
         let mut next_sequence = 0_u64;
         let mut has_user_message = false;
         let mut current_provider = None;
@@ -142,8 +144,14 @@ impl SessionIndex {
         for event in &report.events {
             next_sequence = next_sequence.max(event.sequence.saturating_add(1));
             match &event.kind {
-                SessionEventKind::SessionCreated { name: event_name }
-                | SessionEventKind::SessionRenamed { name: event_name } => {
+                SessionEventKind::SessionCreated {
+                    name: event_name,
+                    working_directory: event_working_directory,
+                } => {
+                    name.clone_from(event_name);
+                    working_directory = Some(event_working_directory.clone());
+                }
+                SessionEventKind::SessionRenamed { name: event_name } => {
                     name.clone_from(event_name);
                 }
                 SessionEventKind::UserMessage { .. } => has_user_message = true,
@@ -176,6 +184,7 @@ impl SessionIndex {
 
         let created_at_ms = file.created_at_ms();
         let updated_at_ms = file.modified_at_ms();
+        let working_directory = working_directory?;
 
         Some(Self {
             index_version: SESSION_INDEX_VERSION,
@@ -187,7 +196,9 @@ impl SessionIndex {
                 client_count: 0,
                 created_at_ms,
                 updated_at_ms,
+                working_directory: working_directory.clone(),
             },
+            working_directory,
             next_sequence,
             event_count: report.events.len(),
             created_at_ms,

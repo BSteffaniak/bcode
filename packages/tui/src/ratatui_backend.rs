@@ -3318,7 +3318,7 @@ impl ChatApp {
                     self.status = "compaction complete; retrying model turn".to_string();
                 }
             }
-            SessionEventKind::SessionCreated { name }
+            SessionEventKind::SessionCreated { name, .. }
             | SessionEventKind::SessionRenamed { name } => {
                 self.session_title.clone_from(name);
             }
@@ -3744,7 +3744,7 @@ impl ChatApp {
                 self.remove_committed_pending_user_message(text);
                 self.push_input_history_message(event.sequence, text);
             }
-            SessionEventKind::SessionCreated { name }
+            SessionEventKind::SessionCreated { name, .. }
             | SessionEventKind::SessionRenamed { name } => {
                 self.session_title.clone_from(name);
             }
@@ -6179,7 +6179,7 @@ fn transcript_blocks_from_event_with_thinking(
     thinking_visible: bool,
 ) -> Vec<TranscriptBlock> {
     match &event.kind {
-        SessionEventKind::SessionCreated { name } => vec![TranscriptBlock::Meta {
+        SessionEventKind::SessionCreated { name, .. } => vec![TranscriptBlock::Meta {
             text: format!("session started: {}", name.as_deref().unwrap_or("untitled")),
         }],
         SessionEventKind::SessionRenamed { name } => vec![TranscriptBlock::Meta {
@@ -7837,6 +7837,7 @@ mod tests {
             client_count: 0,
             created_at_ms: 0,
             updated_at_ms: 0,
+            working_directory: "/tmp/bcode-tui-test".into(),
         }
     }
 

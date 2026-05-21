@@ -129,6 +129,7 @@ impl From<BadReasoningOrderSessionEvent> for SessionEvent {
 enum BadReasoningOrderSessionEventKind {
     SessionCreated {
         name: Option<String>,
+        working_directory: std::path::PathBuf,
     },
     ClientAttached {
         client_id: ClientId,
@@ -248,9 +249,13 @@ impl From<BadReasoningOrderSessionEventKind> for SessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn from(value: BadReasoningOrderSessionEventKind) -> Self {
         match value {
-            BadReasoningOrderSessionEventKind::SessionCreated { name } => {
-                Self::SessionCreated { name }
-            }
+            BadReasoningOrderSessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            } => Self::SessionCreated {
+                name,
+                working_directory,
+            },
             BadReasoningOrderSessionEventKind::ClientAttached { client_id } => {
                 Self::ClientAttached { client_id }
             }
@@ -582,13 +587,29 @@ mod tests {
     #[allow(dead_code)]
     #[derive(Serialize)]
     enum BadOrderTestSessionEventKind {
-        SessionCreated { name: Option<String> },
-        ClientAttached { client_id: ClientId },
-        ClientDetached { client_id: ClientId },
-        UserMessage { client_id: ClientId, text: String },
-        AssistantReasoningDelta { text: String },
-        AssistantReasoningMessage { text: String },
-        AssistantDelta { text: String },
+        SessionCreated {
+            name: Option<String>,
+            working_directory: std::path::PathBuf,
+        },
+        ClientAttached {
+            client_id: ClientId,
+        },
+        ClientDetached {
+            client_id: ClientId,
+        },
+        UserMessage {
+            client_id: ClientId,
+            text: String,
+        },
+        AssistantReasoningDelta {
+            text: String,
+        },
+        AssistantReasoningMessage {
+            text: String,
+        },
+        AssistantDelta {
+            text: String,
+        },
     }
 
     #[test]

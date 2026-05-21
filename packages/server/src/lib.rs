@@ -435,7 +435,10 @@ impl ServerState {
     async fn status(&self) -> ServerStatus {
         ServerStatus {
             connected_client_count: self.clients.lock().await.len(),
-            sessions: self.sessions.list_sessions().await,
+            sessions: self
+                .sessions
+                .list_sessions(&bcode_ipc::current_working_directory())
+                .await,
             selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
             selected_model_id: self.selected_model_id.clone(),
         }
@@ -583,6 +586,7 @@ async fn handle_registered_client(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_request(
     request: Request,
     request_id: u64,
@@ -598,10 +602,13 @@ async fn handle_request(
         Request::Ping => handle_ping(request_id, writer).await,
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
         Request::ServerStop => handle_server_stop(request_id, state, writer).await,
-        Request::CreateSession { name } => {
-            handle_create_session(request_id, state, writer, name).await
+        Request::CreateSession {
+            name,
+            working_directory,
+        } => handle_create_session(request_id, state, writer, name, working_directory).await,
+        Request::ListSessions { working_directory } => {
+            handle_list_sessions(request_id, state, writer, &working_directory).await
         }
-        Request::ListSessions => handle_list_sessions(request_id, state, writer).await,
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
         }
@@ -685,8 +692,17 @@ async fn handle_request(
         Request::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, state, writer, provider_plugin_id).await
         }
-        request => handle_agent_permission_plugin_request(request, request_id, state, writer).await,
+        request => handle_remaining_request(request, request_id, state, writer).await,
     }
+}
+
+async fn handle_remaining_request(
+    request: Request,
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    handle_agent_permission_plugin_request(request, request_id, state, writer).await
 }
 
 async fn handle_agent_permission_plugin_request(
@@ -831,8 +847,12 @@ async fn handle_create_session(
     state: &ServerState,
     writer: &SharedWriter,
     name: Option<String>,
+    working_directory: PathBuf,
 ) -> Result<(), ServerError> {
-    let session = state.sessions.create_session(name).await?;
+    let session = state
+        .sessions
+        .create_session(name, working_directory)
+        .await?;
     if let Ok(history) = state.sessions.session_history(session.id).await
         && let Some(event) = history.last()
     {
@@ -850,8 +870,9 @@ async fn handle_list_sessions(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
+    working_directory: &Path,
 ) -> Result<(), ServerError> {
-    let session_list = state.sessions.list_sessions().await;
+    let session_list = state.sessions.list_sessions(working_directory).await;
     send_response(
         writer,
         request_id,

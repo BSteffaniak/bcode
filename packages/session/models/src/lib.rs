@@ -8,11 +8,12 @@ use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 9;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 10;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -80,6 +81,8 @@ pub struct SessionSummary {
     pub client_count: usize,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    #[serde(default)]
+    pub working_directory: PathBuf,
 }
 
 /// Direction for paged session history reads.
@@ -388,6 +391,8 @@ pub enum TraceRedaction {
 pub enum SessionEventKind {
     SessionCreated {
         name: Option<String>,
+        #[serde(default)]
+        working_directory: PathBuf,
     },
     ClientAttached {
         client_id: ClientId,

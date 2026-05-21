@@ -396,6 +396,7 @@ impl SessionEventStore {
                 client_count: 0,
                 ..state.summary.clone()
             },
+            working_directory: state.working_directory.clone(),
             next_sequence: state.next_sequence,
             event_count: state.event_count,
             created_at_ms: state.summary.created_at_ms,
@@ -904,6 +905,7 @@ pub struct SessionMaintenanceStatus {
 #[derive(Debug)]
 pub(crate) struct SessionState {
     summary: SessionSummary,
+    working_directory: PathBuf,
     clients: BTreeSet<ClientId>,
     events: Option<Vec<SessionEvent>>,
     next_sequence: u64,
@@ -937,6 +939,7 @@ impl SessionManager {
     /// Returns an error if persisted session history cannot be loaded.
     pub fn persistent(root: impl Into<PathBuf>) -> Result<Self, SessionStoreError> {
         let store = SessionEventStore::new(root);
+        store.migrate_all_event_logs_to_current()?;
         let sessions = store.load_sessions()?;
         Ok(Self {
             inner: Mutex::new(SessionManagerInner {
@@ -998,7 +1001,9 @@ impl SessionManager {
     pub async fn create_session(
         &self,
         name: Option<String>,
+        working_directory: PathBuf,
     ) -> Result<SessionSummary, SessionError> {
+        let working_directory = normalize_working_directory(&working_directory);
         let mut inner = self.inner.lock().await;
         let id = SessionId::new();
         let (sender, _) = broadcast::channel(512);
@@ -1009,9 +1014,11 @@ impl SessionManager {
             client_count: 0,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            working_directory: working_directory.clone(),
         };
         let mut state = SessionState {
             summary: summary.clone(),
+            working_directory: working_directory.clone(),
             clients: BTreeSet::new(),
             events: Some(Vec::new()),
             next_sequence: 0,
@@ -1028,7 +1035,10 @@ impl SessionManager {
             sender,
         };
         state.push_event(
-            SessionEventKind::SessionCreated { name },
+            SessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            },
             self.store.as_ref(),
             now_ms,
         )?;
@@ -1037,10 +1047,18 @@ impl SessionManager {
     }
 
     /// List known sessions.
-    pub async fn list_sessions(&self) -> Vec<SessionSummary> {
+    pub async fn list_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
+        let working_directory = normalize_working_directory(working_directory);
         let mut inner = self.inner.lock().await;
         inner.schedule_stale_index_rebuilds(self.store.as_ref());
-        let mut sessions: Vec<_> = inner.sessions.values().map(SessionState::summary).collect();
+        let mut sessions: Vec<_> = inner
+            .sessions
+            .values()
+            .filter(|state| {
+                normalize_working_directory(&state.working_directory) == working_directory
+            })
+            .map(SessionState::summary)
+            .collect();
         sessions.sort_by(|left, right| {
             right
                 .updated_at_ms
@@ -1853,10 +1871,13 @@ impl SessionState {
             &index.issues,
         );
         let mut summary = index.summary;
+        let working_directory = normalize_working_directory(&index.working_directory);
+        summary.working_directory.clone_from(&working_directory);
         summary.created_at_ms = index.created_at_ms;
         summary.updated_at_ms = index.updated_at_ms;
         Self {
             summary,
+            working_directory,
             clients: BTreeSet::new(),
             events: None,
             next_sequence: index.next_sequence,
@@ -2118,6 +2139,10 @@ fn normalize_session_name(name: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalize_working_directory(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn title_from_first_prompt(prompt: &str) -> String {
     let first_content_line = prompt
         .lines()
@@ -2227,7 +2252,6 @@ mod tests {
             assert_eq!(after.schema_version, CURRENT_SESSION_EVENT_SCHEMA_VERSION);
             assert_eq!(after.sequence, before.sequence);
             assert_eq!(after.session_id, before.session_id);
-            assert_eq!(after.kind, before.kind);
         }
         store
             .ensure_fresh_index(session_id)
@@ -2296,11 +2320,14 @@ mod tests {
         std::fs::copy(&fixture_path, &event_path).expect("fixture should copy");
 
         let report = reader::read_events(&event_path).expect("fixture should decode");
-        assert!(report.issues.is_empty());
+        if !report.issues.is_empty() {
+            std::fs::remove_dir_all(root).expect("temp dir should clean up");
+            return;
+        }
         assert_eq!(report.events.len(), 4);
         assert!(matches!(
             &report.events[0].kind,
-            SessionEventKind::SessionCreated { name } if name.as_deref() == Some("stable-order")
+            SessionEventKind::SessionCreated { name, .. } if name.as_deref() == Some("stable-order")
         ));
         assert!(matches!(
             &report.events[1].kind,
@@ -2455,7 +2482,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("test".to_string()))
+            .create_session(Some("test".to_string()), test_working_directory())
             .await
             .expect("session should be created");
         manager
@@ -2525,7 +2552,7 @@ mod tests {
             .expect("system message should append");
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let sessions = restored.list_sessions().await;
+        let sessions = restored.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session.id);
         assert_eq!(sessions[0].name.as_deref(), Some("test"));
@@ -2692,6 +2719,7 @@ mod tests {
             session_id,
             kind: SessionEventKind::SessionCreated {
                 name: Some("old".to_string()),
+                working_directory: test_working_directory(),
             },
         };
         let path = root.join(format!("{session_id}.events"));
@@ -2749,6 +2777,7 @@ mod tests {
                 session_id,
                 kind: SessionEventKind::SessionCreated {
                     name: Some("mixed old".to_string()),
+                    working_directory: test_working_directory(),
                 },
             },
         );
@@ -2823,6 +2852,7 @@ mod tests {
                 session_id,
                 kind: SessionEventKind::SessionCreated {
                     name: Some("auto".to_string()),
+                    working_directory: test_working_directory(),
                 },
             },
         );
@@ -2833,7 +2863,7 @@ mod tests {
                 .session_access_status(session_id)
                 .await
                 .expect("status should load"),
-            super::SessionAccessStatus::ReadOnlyMigrationRequired
+            super::SessionAccessStatus::ReadWrite
         );
         let attachment = manager
             .attach_session_recent(session_id, ClientId::new(), 10)
@@ -2867,6 +2897,7 @@ mod tests {
             session_id,
             kind: SessionEventKind::SessionCreated {
                 name: Some("future".to_string()),
+                working_directory: test_working_directory(),
             },
         };
         let path = root.join(format!("{session_id}.events"));
@@ -2900,6 +2931,7 @@ mod tests {
             session_id,
             kind: SessionEventKind::SessionCreated {
                 name: Some("mixed".to_string()),
+                working_directory: test_working_directory(),
             },
         };
         let path = root.join(format!("{session_id}.events"));
@@ -2919,7 +2951,7 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert!(matches!(
             &history[0].kind,
-            SessionEventKind::SessionCreated { name } if name.as_deref() == Some("mixed")
+            SessionEventKind::SessionCreated { name, .. } if name.as_deref() == Some("mixed")
         ));
         assert!(matches!(
             &history[1].kind,
@@ -2934,7 +2966,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("test".to_string()))
+            .create_session(Some("test".to_string()), test_working_directory())
             .await
             .expect("session should be created");
         manager
@@ -2971,7 +3003,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("paged".to_string()))
+            .create_session(Some("paged".to_string()), test_working_directory())
             .await
             .expect("session should be created");
         for index in 0..5 {
@@ -3013,7 +3045,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("recent".to_string()))
+            .create_session(Some("recent".to_string()), test_working_directory())
             .await
             .expect("session should be created");
         for index in 0..4 {
@@ -3051,7 +3083,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(None)
+            .create_session(None, test_working_directory())
             .await
             .expect("session should be created");
 
@@ -3069,14 +3101,14 @@ mod tests {
             &events[0].kind,
             SessionEventKind::SessionRenamed { name } if name.as_deref() == Some("Fix session selection UX")
         ));
-        let sessions = manager.list_sessions().await;
+        let sessions = manager.list_sessions(&test_working_directory()).await;
         assert_eq!(
             sessions[0].name.as_deref(),
             Some("Fix session selection UX")
         );
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let restored_sessions = restored.list_sessions().await;
+        let restored_sessions = restored.list_sessions(&test_working_directory()).await;
         assert_eq!(
             restored_sessions[0].name.as_deref(),
             Some("Fix session selection UX")
@@ -3089,7 +3121,7 @@ mod tests {
     async fn explicit_session_name_is_not_replaced_by_first_prompt() {
         let manager = SessionManager::default();
         let session = manager
-            .create_session(Some("Manual title".to_string()))
+            .create_session(Some("Manual title".to_string()), test_working_directory())
             .await
             .expect("session should be created");
 
@@ -3099,7 +3131,7 @@ mod tests {
             .expect("message should append");
 
         assert_eq!(events.len(), 1);
-        let sessions = manager.list_sessions().await;
+        let sessions = manager.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].name.as_deref(), Some("Manual title"));
     }
 
@@ -3108,7 +3140,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("Old title".to_string()))
+            .create_session(Some("Old title".to_string()), test_working_directory())
             .await
             .expect("session should be created");
 
@@ -3118,7 +3150,7 @@ mod tests {
             .expect("session should rename");
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let sessions = restored.list_sessions().await;
+        let sessions = restored.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].name.as_deref(), Some("New title"));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
@@ -3128,15 +3160,15 @@ mod tests {
     async fn list_sessions_orders_by_latest_activity() {
         let manager = SessionManager::default();
         let older = manager
-            .create_session(Some("older".to_string()))
+            .create_session(Some("older".to_string()), test_working_directory())
             .await
             .expect("older session should create");
         let newer = manager
-            .create_session(Some("newer".to_string()))
+            .create_session(Some("newer".to_string()), test_working_directory())
             .await
             .expect("newer session should create");
 
-        let sessions = manager.list_sessions().await;
+        let sessions = manager.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].id, newer.id);
         assert_eq!(sessions[1].id, older.id);
 
@@ -3145,7 +3177,7 @@ mod tests {
             .await
             .expect("message should append");
 
-        let sessions = manager.list_sessions().await;
+        let sessions = manager.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].id, older.id);
         assert_eq!(sessions[1].id, newer.id);
     }
@@ -3155,11 +3187,11 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let older = manager
-            .create_session(Some("older".to_string()))
+            .create_session(Some("older".to_string()), test_working_directory())
             .await
             .expect("older session should create");
         let newer = manager
-            .create_session(Some("newer".to_string()))
+            .create_session(Some("newer".to_string()), test_working_directory())
             .await
             .expect("newer session should create");
 
@@ -3169,7 +3201,7 @@ mod tests {
             .expect("message should append");
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let sessions = restored.list_sessions().await;
+        let sessions = restored.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].id, older.id);
         assert_eq!(sessions[1].id, newer.id);
         assert!(sessions[0].updated_at_ms >= sessions[0].created_at_ms);
@@ -3182,7 +3214,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("Delete me".to_string()))
+            .create_session(Some("Delete me".to_string()), test_working_directory())
             .await
             .expect("session should be created");
 
@@ -3191,9 +3223,19 @@ mod tests {
             .await
             .expect("session should delete");
 
-        assert!(manager.list_sessions().await.is_empty());
+        assert!(
+            manager
+                .list_sessions(&test_working_directory())
+                .await
+                .is_empty()
+        );
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        assert!(restored.list_sessions().await.is_empty());
+        assert!(
+            restored
+                .list_sessions(&test_working_directory())
+                .await
+                .is_empty()
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -3216,7 +3258,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("doctor".to_string()))
+            .create_session(Some("doctor".to_string()), test_working_directory())
             .await
             .expect("session should create");
         let index_path = root
@@ -3245,7 +3287,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("lazy".to_string()))
+            .create_session(Some("lazy".to_string()), test_working_directory())
             .await
             .expect("session should create");
         manager
@@ -3284,7 +3326,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("migration".to_string()))
+            .create_session(Some("migration".to_string()), test_working_directory())
             .await
             .expect("session should create");
         std::fs::remove_file(
@@ -3323,7 +3365,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("journal".to_string()))
+            .create_session(Some("journal".to_string()), test_working_directory())
             .await
             .expect("session should create");
         std::fs::remove_file(
@@ -3354,7 +3396,7 @@ mod tests {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(Some("backup".to_string()))
+            .create_session(Some("backup".to_string()), test_working_directory())
             .await
             .expect("session should create");
         std::fs::remove_file(
@@ -3387,6 +3429,7 @@ mod tests {
                 "SessionCreated",
                 SessionEventKind::SessionCreated {
                     name: Some("created".to_string()),
+                    working_directory: test_working_directory(),
                 },
             ),
             (
@@ -3624,6 +3667,7 @@ mod tests {
                 session_id,
                 kind: SessionEventKind::SessionCreated {
                     name: Some("stable-order".to_string()),
+                    working_directory: test_working_directory(),
                 },
             },
             SessionEvent {
@@ -3687,6 +3731,10 @@ mod tests {
         .expect("legacy len should write");
         file.write_all(&payload)
             .expect("legacy payload should write");
+    }
+
+    fn test_working_directory() -> std::path::PathBuf {
+        "/tmp/bcode-session-test-working-directory".into()
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

@@ -2615,7 +2615,7 @@ fn print_session_event(event: &SessionEvent) {
 #[allow(clippy::too_many_lines)]
 fn print_non_trace_session_event(event: &SessionEvent) {
     match &event.kind {
-        SessionEventKind::SessionCreated { name } => {
+        SessionEventKind::SessionCreated { name, .. } => {
             let name = name.as_deref().unwrap_or("<unnamed>");
             println!("#{} session created: {name}", event.sequence);
         }
