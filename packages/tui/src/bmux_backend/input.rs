@@ -84,16 +84,8 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
             interrupted: true,
         },
         BmuxAction::InputSubmit => submit(app),
-        BmuxAction::InputHistoryPrevious => KeyOutcome {
-            redraw: app.move_composer_visual_up() || app.previous_input_history(),
-            submitted: false,
-            interrupted: false,
-        },
-        BmuxAction::InputHistoryNext => KeyOutcome {
-            redraw: app.move_composer_visual_down() || app.next_input_history(),
-            submitted: false,
-            interrupted: false,
-        },
+        BmuxAction::InputHistoryPrevious => history_previous(app),
+        BmuxAction::InputHistoryNext => history_next(app),
         BmuxAction::TranscriptPageUp => KeyOutcome {
             redraw: app.scroll_transcript_up(TRANSCRIPT_PAGE_ROWS),
             submitted: false,
@@ -159,6 +151,30 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
         | BmuxAction::SkillHelp => return None,
     };
     Some(outcome)
+}
+
+fn history_previous(app: &mut BmuxApp) -> KeyOutcome {
+    KeyOutcome {
+        redraw: if app.input_history_navigation_active() {
+            app.previous_input_history()
+        } else {
+            app.move_composer_visual_up() || app.previous_input_history()
+        },
+        submitted: false,
+        interrupted: false,
+    }
+}
+
+fn history_next(app: &mut BmuxApp) -> KeyOutcome {
+    KeyOutcome {
+        redraw: if app.input_history_navigation_active() {
+            app.next_input_history()
+        } else {
+            app.move_composer_visual_down() || app.next_input_history()
+        },
+        submitted: false,
+        interrupted: false,
+    }
 }
 
 fn submit(app: &mut BmuxApp) -> KeyOutcome {

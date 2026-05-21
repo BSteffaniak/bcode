@@ -460,6 +460,12 @@ impl BmuxApp {
         true
     }
 
+    /// Return whether input-history navigation is active.
+    #[must_use]
+    pub(super) const fn input_history_navigation_active(&self) -> bool {
+        self.input_history.is_browsing()
+    }
+
     /// Reset active input-history navigation after direct composer editing.
     pub(super) fn reset_input_history_navigation(&mut self) {
         self.input_history.reset_navigation();

@@ -103,6 +103,12 @@ impl InputHistory {
         }
     }
 
+    /// Return whether history navigation is active.
+    #[must_use]
+    pub(super) const fn is_browsing(&self) -> bool {
+        self.index.is_some()
+    }
+
     /// Reset active history navigation.
     pub(super) fn reset_navigation(&mut self) {
         self.index = None;

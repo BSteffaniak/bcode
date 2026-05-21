@@ -187,6 +187,31 @@ fn composer_edit_after_history_resets_navigation() {
 }
 
 #[test]
+fn input_history_keeps_cycling_after_multiline_entry() {
+    let history = [
+        SessionInputHistoryEntry {
+            sequence: 1,
+            text: "older prompt".to_owned(),
+        },
+        SessionInputHistoryEntry {
+            sequence: 2,
+            text: "newest prompt\nsecond line".to_owned(),
+        },
+    ];
+    let mut app = BmuxApp::new_with_history(None, &[], &history, false);
+    app.set_composer_content_area(Rect::new(0, 0, 40, 3));
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    let first = input::handle_key(&mut app, &keymap, key(KeyCode::Up));
+    let second = input::handle_key(&mut app, &keymap, key(KeyCode::Up));
+
+    assert!(first.redraw);
+    assert!(second.redraw);
+    assert_eq!(app.composer().text(), "older prompt");
+    assert_eq!(app.status(), "input history 1/2");
+}
+
+#[test]
 fn empty_and_slash_submissions_do_not_enter_input_history() {
     let history = [SessionInputHistoryEntry {
         sequence: 1,
