@@ -1,8 +1,8 @@
 //! BMUX backend app state.
 
 use bcode_session_models::{
-    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId,
-    SessionInputHistoryEntry,
+    ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
+    SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -18,7 +18,7 @@ use super::cursor_blink::CursorBlink;
 use super::diff_extract::diff_from_tool_request;
 use super::diff_panel::DiffPanel;
 use super::exit_state::ExitState;
-use super::input_history::InputHistory;
+use super::input_history::{InputHistory, InputHistoryOutcome};
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
@@ -47,6 +47,7 @@ pub(super) struct BmuxApp {
     older_history: OlderHistoryState,
     activity: ActivityState,
     status: String,
+    key_hints: String,
     exit: ExitState,
     cursor: CursorBlink,
 }
@@ -77,6 +78,7 @@ impl BmuxApp {
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
+            key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
         };
@@ -216,6 +218,7 @@ impl BmuxApp {
 
     /// Extend composer selection with an editor motion.
     pub(super) fn extend_composer_selection(&mut self, motion: TextMotion) {
+        self.input_history.reset_navigation();
         let width = usize::from(self.composer.content_area().width.max(1));
         match motion {
             TextMotion::VisualUp => self.extend_composer_selection_to_visual_delta(width, -1),
@@ -233,6 +236,7 @@ impl BmuxApp {
         let outcome =
             TextInputControl::new(&composer_policy()).handle_mouse(&mut self.composer, mouse);
         if matches!(outcome, TextInputOutcome::Edited | TextInputOutcome::Redraw) {
+            self.input_history.reset_navigation();
             self.wake_cursor();
         }
         outcome
@@ -251,6 +255,7 @@ impl BmuxApp {
         if layout.cursor.row == 0 {
             return false;
         }
+        self.input_history.reset_navigation();
         self.composer.buffer_mut().move_cursor_to_wrapped_position(
             width,
             layout.cursor.row.saturating_sub(1),
@@ -267,6 +272,7 @@ impl BmuxApp {
         if layout.cursor.row.saturating_add(1) >= layout.lines.len() {
             return false;
         }
+        self.input_history.reset_navigation();
         self.composer.buffer_mut().move_cursor_to_wrapped_position(
             width,
             layout.cursor.row.saturating_add(1),
@@ -340,6 +346,17 @@ impl BmuxApp {
         &self.status
     }
 
+    /// Return configured key hints for the status line.
+    #[must_use]
+    pub(super) fn key_hints(&self) -> &str {
+        &self.key_hints
+    }
+
+    /// Store configured key hints for the status line.
+    pub(super) fn set_key_hints(&mut self, key_hints: String) {
+        self.key_hints = key_hints;
+    }
+
     /// Append a system-style transcript note.
     pub(super) fn push_system_note(&mut self, text: String) {
         self.transcript.push(TranscriptItem::new("System", text));
@@ -350,11 +367,21 @@ impl BmuxApp {
         self.status = status;
     }
 
+    /// Mark the app as waiting for turn cancellation.
+    pub(super) fn set_cancelling(&mut self) {
+        self.set_activity(ActivityState::Cancelling);
+    }
+
+    /// Return the app to idle activity.
+    pub(super) fn set_idle(&mut self) {
+        self.set_activity(ActivityState::Idle);
+    }
+
     /// Store the current composer text as a pending submission and clear input.
     pub(super) fn stage_submission(&mut self) {
         let text = self.composer.buffer().text().to_owned();
-        self.pending_submissions.stage(text.clone());
-        self.input_history.push_submission(text);
+        self.pending_submissions.stage(text);
+        self.input_history.reset_navigation();
         self.composer.buffer_mut().clear();
     }
 
@@ -393,20 +420,49 @@ impl BmuxApp {
 
     /// Show the previous input-history entry, if available.
     pub(super) fn previous_input_history(&mut self) -> bool {
-        let Some(text) = self.input_history.previous(self.composer.buffer().text()) else {
-            return false;
-        };
-        self.replace_composer_with(&text);
+        match self.input_history.previous(self.composer.buffer().text()) {
+            InputHistoryOutcome::Entry { index, total, text } => {
+                self.replace_composer_with(&text);
+                self.status = format!("input history {index}/{total}");
+            }
+            InputHistoryOutcome::DraftRestored(text) => {
+                self.replace_composer_with(&text);
+                "draft restored".clone_into(&mut self.status);
+            }
+            InputHistoryOutcome::Empty => {
+                "no input history in this session".clone_into(&mut self.status);
+            }
+            InputHistoryOutcome::NotBrowsing => {
+                "not browsing input history".clone_into(&mut self.status);
+            }
+        }
         true
     }
 
     /// Show the next input-history entry, or restore the draft.
     pub(super) fn next_input_history(&mut self) -> bool {
-        let Some(text) = self.input_history.next() else {
-            return false;
-        };
-        self.replace_composer_with(&text);
+        match self.input_history.next() {
+            InputHistoryOutcome::Entry { index, total, text } => {
+                self.replace_composer_with(&text);
+                self.status = format!("input history {index}/{total}");
+            }
+            InputHistoryOutcome::DraftRestored(text) => {
+                self.replace_composer_with(&text);
+                "draft restored".clone_into(&mut self.status);
+            }
+            InputHistoryOutcome::Empty => {
+                "no input history in this session".clone_into(&mut self.status);
+            }
+            InputHistoryOutcome::NotBrowsing => {
+                "not browsing input history".clone_into(&mut self.status);
+            }
+        }
         true
+    }
+
+    /// Reset active input-history navigation after direct composer editing.
+    pub(super) fn reset_input_history_navigation(&mut self) {
+        self.input_history.reset_navigation();
     }
 
     /// Scroll transcript up by rendered rows.
@@ -446,6 +502,12 @@ impl BmuxApp {
             return;
         }
 
+        let input_messages = events.iter().filter_map(|event| match &event.kind {
+            SessionEventKind::UserMessage { text, .. } => Some((event.sequence, text.clone())),
+            _ => None,
+        });
+        self.input_history.prepend_committed(input_messages);
+
         let mut older = transcript_items_from_events(events);
         merge_transcript_boundary(&mut older, &mut self.transcript);
         older.append(&mut self.transcript);
@@ -465,7 +527,9 @@ impl BmuxApp {
             self.viewport.preserve_for_append();
         }
         match &event.kind {
-            SessionEventKind::UserMessage { text, .. } => self.push_live_user_message(text),
+            SessionEventKind::UserMessage { text, .. } => {
+                self.push_committed_user_message(event.sequence, text);
+            }
             SessionEventKind::AssistantDelta { text } => self.push_live_assistant_delta(text),
             SessionEventKind::AssistantMessage { text } => {
                 self.finish_streaming_item("Assistant", text);
@@ -475,16 +539,13 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-            } => {
-                self.record_diff_summary(tool_name, arguments_json);
-                self.push_tool_request(tool_call_id, tool_name, arguments_json);
-            }
+            } => self.push_tool_request(tool_call_id, tool_name, arguments_json),
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
                 result,
                 is_error,
             } => {
-                self.activity = ActivityState::Thinking;
+                self.set_activity(ActivityState::Thinking);
                 self.push_tool_result(tool_call_id, result, *is_error);
             }
             SessionEventKind::PermissionRequested {
@@ -504,14 +565,14 @@ impl BmuxApp {
                 permission_id,
                 approved,
             } => {
-                self.activity = ActivityState::Thinking;
+                self.set_activity(ActivityState::Thinking);
                 self.set_permission_status(permission_id, *approved);
             }
             SessionEventKind::ModelChanged { provider, model } => {
                 self.apply_model_changed(provider, model);
             }
             SessionEventKind::ModelTurnStarted { .. } => {
-                self.activity = ActivityState::Thinking;
+                self.set_activity(ActivityState::Thinking);
                 "thinking".clone_into(&mut self.status);
             }
             SessionEventKind::ModelTurnFinished {
@@ -547,7 +608,7 @@ impl BmuxApp {
                 skill_id, error, ..
             } => self.push_skill_error(skill_id, error),
             SessionEventKind::AssistantReasoningDelta { text } => {
-                self.activity = ActivityState::Streaming;
+                self.add_streaming_delta(text);
                 self.push_streaming_item("Reasoning", text);
             }
             SessionEventKind::AssistantReasoningMessage { text } => {
@@ -557,9 +618,8 @@ impl BmuxApp {
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent_id.clone_from(agent_id);
             }
-            SessionEventKind::TraceEvent { .. }
-            | SessionEventKind::ClientAttached { .. }
-            | SessionEventKind::ClientDetached { .. } => {}
+            SessionEventKind::TraceEvent { trace } => self.apply_trace_event(trace),
+            SessionEventKind::ClientAttached { .. } | SessionEventKind::ClientDetached { .. } => {}
         }
     }
 
@@ -629,13 +689,18 @@ impl BmuxApp {
         self.pending_submissions.remove(text);
     }
 
+    fn push_committed_user_message(&mut self, sequence: u64, text: &str) {
+        self.input_history.push_committed(sequence, text);
+        self.push_live_user_message(text);
+    }
+
     fn push_live_user_message(&mut self, text: &str) {
-        self.activity = ActivityState::Thinking;
+        self.set_activity(ActivityState::Thinking);
         self.push_user_message(text);
     }
 
     fn push_live_assistant_delta(&mut self, text: &str) {
-        self.activity = ActivityState::Streaming;
+        self.add_streaming_delta(text);
         self.push_streaming_item("Assistant", text);
     }
 
@@ -680,9 +745,9 @@ impl BmuxApp {
         self.record_diff_summary(tool_name, arguments_json);
         self.transcript
             .push(tool_request_item(tool_call_id, tool_name, arguments_json));
-        self.activity = ActivityState::RunningTool {
+        self.set_activity(ActivityState::RunningTool {
             name: tool_name.to_owned(),
-        };
+        });
         self.status = format!("running tool {tool_name}");
     }
 
@@ -723,9 +788,9 @@ impl BmuxApp {
                 pretty_jsonish(arguments_json)
             ),
         ));
-        self.activity = ActivityState::WaitingPermission {
+        self.set_activity(ActivityState::WaitingPermission {
             name: tool_name.to_owned(),
-        };
+        });
         self.status = format!("waiting for permission: {tool_name}");
     }
 
@@ -771,7 +836,7 @@ impl BmuxApp {
         {
             last.streaming = false;
         }
-        self.activity = ActivityState::Idle;
+        self.set_activity(ActivityState::Idle);
     }
 
     fn push_compaction(&mut self, summary: &str) {
@@ -779,6 +844,162 @@ impl BmuxApp {
             "Compaction",
             format!("context compacted: {summary}"),
         ));
+    }
+
+    fn set_activity(&mut self, activity: ActivityState) {
+        if self.activity != activity {
+            self.activity = activity;
+        }
+    }
+
+    fn add_streaming_delta(&mut self, text: &str) {
+        let delta = text.chars().count();
+        if let ActivityState::Streaming { chars } = &mut self.activity {
+            *chars = chars.saturating_add(delta);
+        } else {
+            self.set_activity(ActivityState::Streaming { chars: delta });
+        }
+    }
+
+    fn apply_trace_event(&mut self, trace: &SessionTraceEvent) {
+        match &trace.payload {
+            SessionTracePayload::ProviderStreamEvent(event) => {
+                self.apply_provider_stream_event(event);
+            }
+            SessionTracePayload::ProviderEvent { event_type, detail } => {
+                if matches!(event_type.as_str(), "tool_call_delta" | "warning" | "error") {
+                    let detail = detail
+                        .clone()
+                        .unwrap_or_else(|| format!("provider event: {event_type}"));
+                    self.set_activity(ActivityState::ProviderStream {
+                        detail: detail.clone(),
+                    });
+                    self.status = detail;
+                }
+            }
+            SessionTracePayload::ContextCompaction {
+                reason,
+                compacted,
+                message,
+                ..
+            } => self.apply_compaction_trace(trace.phase, reason, *compacted, message.as_deref()),
+            SessionTracePayload::ModelRequestBuilt { .. }
+            | SessionTracePayload::ProviderRound { .. }
+            | SessionTracePayload::ToolInvocationStarted { .. }
+            | SessionTracePayload::ToolPolicyEvaluated { .. }
+            | SessionTracePayload::ToolPermissionWait { .. }
+            | SessionTracePayload::ToolInvocationFinished { .. } => {}
+        }
+    }
+
+    fn apply_provider_stream_event(&mut self, event: &ProviderStreamEvent) {
+        match event {
+            ProviderStreamEvent::TurnStarted => {
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: "provider stream started".to_owned(),
+                });
+                "provider stream started".clone_into(&mut self.status);
+            }
+            ProviderStreamEvent::ToolCallStarted { tool_name, .. } => {
+                let detail = format!("provider stream tool started: {tool_name}");
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: detail.clone(),
+                });
+                self.status = detail;
+            }
+            ProviderStreamEvent::ToolCallProgress {
+                tool_name,
+                argument_bytes,
+                chunk_count,
+                ..
+            } => {
+                let detail = format!(
+                    "provider stream tool progress: {tool_name} ({argument_bytes} bytes, {chunk_count} chunks)"
+                );
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: detail.clone(),
+                });
+                self.status = detail;
+            }
+            ProviderStreamEvent::ToolCallFinished { tool_name, .. } => {
+                self.status = format!("provider stream tool finished: {tool_name}");
+                if matches!(self.activity, ActivityState::ProviderStream { .. }) {
+                    self.set_activity(ActivityState::Thinking);
+                }
+            }
+            ProviderStreamEvent::NoProgressWarning {
+                idle_seconds,
+                active_tool_call,
+            } => {
+                let detail = active_tool_call.as_ref().map_or_else(
+                    || format!("provider stream idle for {idle_seconds}s"),
+                    |tool| {
+                        format!(
+                            "provider stream idle for {idle_seconds}s while streaming {}",
+                            tool.tool_name
+                        )
+                    },
+                );
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: detail.clone(),
+                });
+                self.status = detail;
+            }
+        }
+    }
+
+    fn apply_compaction_trace(
+        &mut self,
+        phase: SessionTracePhase,
+        reason: &str,
+        compacted: bool,
+        message: Option<&str>,
+    ) {
+        match phase {
+            SessionTracePhase::ContextCompactionStarted => {
+                let detail = message.map_or_else(
+                    || format!("context compaction · {reason}"),
+                    ToOwned::to_owned,
+                );
+                self.set_activity(ActivityState::Compacting {
+                    detail: detail.clone(),
+                });
+                self.status = detail;
+            }
+            SessionTracePhase::ContextCompactionFinished => {
+                let detail = message.map_or_else(
+                    || "context compaction finished".to_owned(),
+                    ToOwned::to_owned,
+                );
+                self.status = detail;
+                if compacted {
+                    self.set_activity(ActivityState::Thinking);
+                }
+            }
+            SessionTracePhase::ContextCompactionSkipped => {
+                if matches!(self.activity, ActivityState::Compacting { .. }) {
+                    self.set_activity(ActivityState::Thinking);
+                }
+                if let Some(message) = message {
+                    message.clone_into(&mut self.status);
+                }
+            }
+            SessionTracePhase::ModelRequestBuilt
+            | SessionTracePhase::ModelProviderRoundStarted
+            | SessionTracePhase::ModelProviderRoundFinished
+            | SessionTracePhase::ModelProviderEvent
+            | SessionTracePhase::ToolInvocationStarted
+            | SessionTracePhase::ToolPolicyEvaluated
+            | SessionTracePhase::ToolPermissionWaitStarted
+            | SessionTracePhase::ToolPermissionWaitFinished
+            | SessionTracePhase::ToolInvocationFinished
+            | SessionTracePhase::SkillInvoked
+            | SessionTracePhase::SkillSuggested
+            | SessionTracePhase::SkillActivated
+            | SessionTracePhase::SkillDeactivated
+            | SessionTracePhase::SkillContextLoaded
+            | SessionTracePhase::SkillInvocationFailed => {}
+        }
     }
 
     fn set_session_name_status(&mut self, name: Option<&str>) {

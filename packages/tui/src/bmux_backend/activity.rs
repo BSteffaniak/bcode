@@ -9,8 +9,21 @@ pub(super) enum ActivityState {
     Idle,
     /// Waiting for a model response.
     Thinking,
+    /// Compacting context before a model response.
+    Compacting {
+        /// User-facing progress detail.
+        detail: String,
+    },
     /// Receiving streamed model output.
-    Streaming,
+    Streaming {
+        /// Number of visible streamed characters received in this activity.
+        chars: usize,
+    },
+    /// Receiving provider stream progress.
+    ProviderStream {
+        /// User-facing progress detail.
+        detail: String,
+    },
     /// Running a tool.
     RunningTool {
         /// Tool name.
@@ -21,6 +34,8 @@ pub(super) enum ActivityState {
         /// Tool name.
         name: String,
     },
+    /// Cancelling the active turn.
+    Cancelling,
 }
 
 /// Return a status label for a model turn outcome.

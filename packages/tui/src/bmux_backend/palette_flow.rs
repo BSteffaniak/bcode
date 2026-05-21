@@ -146,11 +146,13 @@ async fn execute_palette_command<W: Write>(
                 return Ok(());
             };
             let cancelled = client.cancel_session_turn(session_id).await?;
-            chat.app.set_status(if cancelled {
-                "cancel requested".to_owned()
+            if cancelled {
+                chat.app.set_cancelling();
+                chat.app.set_status("cancel requested".to_owned());
             } else {
-                "no active turn to cancel".to_owned()
-            });
+                chat.app.set_idle();
+                chat.app.set_status("no active turn to cancel".to_owned());
+            }
         }
         PaletteCommand::CompactContext => {
             let Some(session_id) = chat.app.session_id() else {

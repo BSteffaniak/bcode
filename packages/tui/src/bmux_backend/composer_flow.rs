@@ -64,6 +64,7 @@ pub(super) async fn submit_composer<W: Write>(
     match client.send_user_message(session_id, message.clone()).await {
         Ok(acceptance) => {
             if acceptance.queued {
+                chat.app.set_idle();
                 chat.app
                     .mark_pending_submission_queued(acceptance.queue_position);
                 chat.app.set_status(format!(

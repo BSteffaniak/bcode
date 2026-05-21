@@ -78,6 +78,7 @@ pub(super) async fn handle_slash_palette_key<W: Write>(
         }
         KeyCode::Escape if stroke.modifiers.is_empty() => {
             *slash_palette = None;
+            chat.app.set_status("slash completions hidden".to_owned());
             Ok(true)
         }
         _ => {
@@ -124,6 +125,7 @@ pub(super) fn handle_slash_palette_mouse<W: Write>(
         .select_visible_row(row, usize::from(terminal.area().height))
         .map(str::to_owned)
     {
+        chat.app.reset_input_history_navigation();
         chat.app.replace_composer_with(&command);
         *slash_palette = None;
     }
@@ -136,11 +138,19 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
         return;
     };
     match client.cancel_session_turn(session_id).await {
-        Ok(true) => chat
-            .app
-            .set_status("turn cancellation requested".to_owned()),
-        Ok(false) => chat.app.set_status("no active turn".to_owned()),
-        Err(error) => chat.app.set_status(format!("cancel failed: {error}")),
+        Ok(true) => {
+            chat.app.set_cancelling();
+            chat.app
+                .set_status("turn cancellation requested".to_owned());
+        }
+        Ok(false) => {
+            chat.app.set_idle();
+            chat.app.set_status("no active turn".to_owned());
+        }
+        Err(error) => {
+            chat.app.set_idle();
+            chat.app.set_status(format!("cancel failed: {error}"));
+        }
     }
 }
 
@@ -152,7 +162,11 @@ fn accept_slash_completion(
         return;
     };
     if let Some(command) = active_palette.selected_command().map(str::to_owned) {
+        chat.app.reset_input_history_navigation();
         chat.app.replace_composer_with(&command);
+    } else {
+        chat.app
+            .set_status("no slash completion available".to_owned());
     }
     *slash_palette = None;
 }

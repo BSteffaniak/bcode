@@ -17,8 +17,6 @@ use super::transcript::TranscriptItem;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
-const KEY_HINTS: &str = "enter send · escape interrupt · ctrl+d exit · ctrl+p palette";
-
 /// Render one BMUX backend frame.
 pub(super) fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let area = frame.area();
@@ -381,25 +379,45 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let line = Line::from_spans(vec![
+    let mut spans = vec![
         Span::styled(activity_label(app.activity()), Style::new().fg(Color::Cyan)),
         Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
         Span::styled(app.status().to_owned(), Style::new().fg(Color::BrightBlack)),
+    ];
+    if app.scroll_offset() > 0 {
+        spans.push(Span::styled(
+            format!(" · {} rows from bottom", app.scroll_offset()),
+            Style::new().fg(Color::BrightBlack),
+        ));
+    }
+    spans.extend([
         Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
         Span::styled(app.token_summary(), Style::new().fg(Color::BrightBlack)),
         Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
-        Span::styled(KEY_HINTS, Style::new().fg(Color::BrightBlack)),
+        Span::styled(
+            app.key_hints().to_owned(),
+            Style::new().fg(Color::BrightBlack),
+        ),
     ]);
-    frame.write_line(area, &line);
+    frame.write_line(area, &Line::from_spans(spans));
 }
 
 fn activity_label(activity: &ActivityState) -> String {
     match activity {
         ActivityState::Idle => "ready".to_owned(),
         ActivityState::Thinking => format!("{} thinking", spinner_frame()),
-        ActivityState::Streaming => format!("{} streaming", spinner_frame()),
+        ActivityState::Compacting { detail } => {
+            format!("{} compacting · {detail}", spinner_frame())
+        }
+        ActivityState::Streaming { chars } => {
+            format!("{} streaming · {chars} chars", spinner_frame())
+        }
+        ActivityState::ProviderStream { detail } => {
+            format!("{} provider stream · {detail}", spinner_frame())
+        }
         ActivityState::RunningTool { name } => format!("{} tool {name}", spinner_frame()),
         ActivityState::WaitingPermission { name } => format!("permission {name}"),
+        ActivityState::Cancelling => format!("{} cancelling", spinner_frame()),
     }
 }
 

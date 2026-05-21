@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionEventKind, SessionId, SessionTokenUsage,
+    ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    SessionTokenUsage,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_tui::buffer::Buffer;
@@ -123,6 +124,114 @@ fn composer_double_click_selects_word_and_triple_click_selects_all() {
         app.composer().selected_text(),
         Some("hello world".to_owned())
     );
+}
+
+#[test]
+fn input_history_updates_status_and_restores_draft() {
+    let history = [
+        SessionInputHistoryEntry {
+            sequence: 1,
+            text: "first prompt".to_owned(),
+        },
+        SessionInputHistoryEntry {
+            sequence: 2,
+            text: "second prompt".to_owned(),
+        },
+    ];
+    let mut app = BmuxApp::new_with_history(None, &[], &history, false);
+    app.replace_composer_with("draft prompt");
+
+    assert!(app.previous_input_history());
+    assert_eq!(app.composer().text(), "second prompt");
+    assert_eq!(app.status(), "input history 2/2");
+
+    assert!(app.previous_input_history());
+    assert_eq!(app.composer().text(), "first prompt");
+    assert_eq!(app.status(), "input history 1/2");
+
+    assert!(app.next_input_history());
+    assert_eq!(app.composer().text(), "second prompt");
+    assert_eq!(app.status(), "input history 2/2");
+
+    assert!(app.next_input_history());
+    assert_eq!(app.composer().text(), "draft prompt");
+    assert_eq!(app.status(), "draft restored");
+}
+
+#[test]
+fn input_history_empty_and_not_browsing_update_status() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    assert!(app.previous_input_history());
+    assert_eq!(app.status(), "no input history in this session");
+
+    assert!(app.next_input_history());
+    assert_eq!(app.status(), "not browsing input history");
+}
+
+#[test]
+fn composer_edit_after_history_resets_navigation() {
+    let history = [SessionInputHistoryEntry {
+        sequence: 1,
+        text: "history prompt".to_owned(),
+    }];
+    let mut app = BmuxApp::new_with_history(None, &[], &history, false);
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    assert!(app.previous_input_history());
+    let outcome = input::handle_key(&mut app, &keymap, key(KeyCode::Char('!')));
+    assert!(outcome.redraw);
+    assert!(app.next_input_history());
+
+    assert_eq!(app.status(), "not browsing input history");
+}
+
+#[test]
+fn empty_and_slash_submissions_do_not_enter_input_history() {
+    let history = [SessionInputHistoryEntry {
+        sequence: 1,
+        text: "real prompt".to_owned(),
+    }];
+    let mut app = BmuxApp::new_with_history(None, &[], &history, false);
+
+    app.stage_submission();
+    let empty = app.take_pending_submission();
+    app.clear_pending_submission(&empty);
+    app.replace_composer_with("/help");
+    app.stage_submission();
+    let slash = app.take_pending_submission();
+    app.clear_pending_submission(&slash);
+
+    assert!(app.previous_input_history());
+    assert_eq!(app.composer().text(), "real prompt");
+    assert_eq!(app.status(), "input history 1/1");
+}
+
+#[test]
+fn status_line_includes_scroll_offset_when_scrolled() {
+    let session_id = SessionId::new();
+    let history = (0..40)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(app.scroll_transcript_up(1));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(rendered_text(&buffer).contains("1 rows from bottom"));
 }
 
 #[test]

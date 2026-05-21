@@ -39,9 +39,11 @@ pub(super) async fn run_with_client<W: Write>(
         slash_palette: None,
         permission_dialog: None,
     };
+    chat.app.set_key_hints(keymap.chat_hints());
     let mut needs_redraw = true;
 
     while !chat.app.should_exit() {
+        chat.app.set_key_hints(keymap.chat_hints());
         while let Ok(event) = chat.event_receiver.try_recv() {
             match event {
                 BcodeEvent::Session(event) if event.session_id == chat.session_id => {
@@ -123,6 +125,7 @@ async fn handle_event<W: Write>(
                 palette.state_mut().query.insert_str(&text);
                 return Ok(true);
             }
+            chat.app.reset_input_history_navigation();
             chat.app.composer_mut().insert_str(&text);
             chat.app.wake_cursor();
             slash_flow::update_slash_palette(client, chat, &mut modals.slash_palette).await;
@@ -207,6 +210,8 @@ async fn handle_chat_key<W: Write>(
     }
     if is_palette_open_key(keymap, stroke) {
         modals.palette = Some(BmuxCommandPalette::new());
+        chat.app
+            .set_status("command palette: type to filter, enter to run, esc close".to_owned());
         return Ok(true);
     }
     let outcome = input::handle_key(&mut chat.app, keymap, stroke);
@@ -228,11 +233,19 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
         return;
     };
     match client.cancel_session_turn(session_id).await {
-        Ok(true) => chat
-            .app
-            .set_status("turn cancellation requested".to_owned()),
-        Ok(false) => chat.app.set_status("no active turn".to_owned()),
-        Err(error) => chat.app.set_status(format!("cancel failed: {error}")),
+        Ok(true) => {
+            chat.app.set_cancelling();
+            chat.app
+                .set_status("turn cancellation requested".to_owned());
+        }
+        Ok(false) => {
+            chat.app.set_idle();
+            chat.app.set_status("no active turn".to_owned());
+        }
+        Err(error) => {
+            chat.app.set_idle();
+            chat.app.set_status(format!("cancel failed: {error}"));
+        }
     }
 }
 

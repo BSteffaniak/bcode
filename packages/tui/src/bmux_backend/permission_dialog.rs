@@ -37,6 +37,16 @@ impl PermissionDialogState {
         self.dialog.focused_action == 0
     }
 
+    /// Return the currently focused action label.
+    #[must_use]
+    pub(super) const fn focused_label(&self) -> &'static str {
+        if self.focused_approval() {
+            "approve"
+        } else {
+            "deny"
+        }
+    }
+
     /// Focus next action.
     pub(super) const fn focus_next(&mut self) {
         self.dialog.focus_next(2);

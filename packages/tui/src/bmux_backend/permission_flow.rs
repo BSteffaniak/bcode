@@ -26,10 +26,14 @@ pub(super) async fn handle_permission_key(
     match action {
         BmuxAction::SelectUp => {
             dialog.focus_previous();
+            chat.app
+                .set_status(format!("permission choice: {}", dialog.focused_label()));
             Ok(true)
         }
         BmuxAction::SelectDown => {
             dialog.focus_next();
+            chat.app
+                .set_status(format!("permission choice: {}", dialog.focused_label()));
             Ok(true)
         }
         BmuxAction::PermissionApprove => {

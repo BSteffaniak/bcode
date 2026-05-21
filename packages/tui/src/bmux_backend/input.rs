@@ -34,6 +34,7 @@ pub(super) fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStro
         };
     }
     if let Some(command) = keymap.editor_command_for_key(stroke) {
+        app.reset_input_history_navigation();
         app.composer_mut().apply_command(command);
         app.wake_cursor();
         return KeyOutcome {
@@ -48,6 +49,7 @@ pub(super) fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStro
     match outcome {
         TextInputKeyOutcome::Submitted => submit(app),
         TextInputKeyOutcome::Edited => {
+            app.reset_input_history_navigation();
             app.wake_cursor();
             KeyOutcome {
                 redraw: true,
@@ -65,6 +67,7 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
             if app.composer().is_empty() {
                 app.request_exit();
             } else {
+                app.reset_input_history_navigation();
                 app.composer_mut().clear();
                 app.set_status("input cleared; press exit again to quit".to_owned());
                 app.wake_cursor();
