@@ -8,10 +8,11 @@ use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
 use bmux_tui::terminal::Terminal;
 
 use super::command_palette::{BmuxCommandPalette, PaletteCommand};
+use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::session_flow::{self, ActiveChat};
-use super::{TuiError, model_flow, report_client_error, skill_flow};
+use super::{TuiError, model_flow, skill_flow};
 
 /// Handle one key while the command palette is open.
 pub(super) async fn handle_palette_key<W: Write>(
@@ -36,7 +37,7 @@ pub(super) async fn handle_palette_key<W: Write>(
                 && let Err(error) =
                     execute_palette_command(client, chat, terminal, keymap, command).await
             {
-                report_client_error(&mut chat.app, "command failed", &error);
+                helpers::report_client_error(&mut chat.app, "command failed", &error);
             }
             Ok(true)
         }
@@ -71,7 +72,7 @@ pub(super) async fn handle_palette_mouse<W: Write>(
     if let Some(command) = command
         && let Err(error) = execute_palette_command(client, chat, terminal, keymap, command).await
     {
-        report_client_error(&mut chat.app, "command failed", &error);
+        helpers::report_client_error(&mut chat.app, "command failed", &error);
     }
     Ok(true)
 }

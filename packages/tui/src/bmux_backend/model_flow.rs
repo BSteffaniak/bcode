@@ -10,12 +10,12 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
 
+use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::picker_row_from_mouse;
 use super::{
-    EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, model_picker, model_picker_render,
-    provider_picker, provider_picker_render, report_client_error, session_flow::ActiveChat,
-    terminal_area,
+    EVENT_POLL_TIMEOUT, TuiError, model_picker, model_picker_render, provider_picker,
+    provider_picker_render, session_flow::ActiveChat,
 };
 
 /// Show active model status in the transcript.
@@ -94,7 +94,7 @@ pub(super) async fn pick_model_for_session<W: Write>(
     );
     let mut picker = model_picker::ModelPickerApp::new_with_status(models, status);
     loop {
-        terminal.resize(terminal_area()?);
+        terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
         let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
             continue;
@@ -123,7 +123,7 @@ pub(super) async fn pick_model_for_session<W: Write>(
                 KeyCode::Up => picker.select_previous(),
                 KeyCode::Down => picker.select_next(),
                 _ => {
-                    let outcome = handle_text_buffer_key(
+                    let outcome = helpers::handle_text_buffer_key(
                         picker.filter_mut(),
                         keymap,
                         stroke,
@@ -171,7 +171,7 @@ async fn pick_model_provider<W: Write>(
     }
     let mut picker = provider_picker::ProviderPickerApp::new(providers);
     loop {
-        terminal.resize(terminal_area()?);
+        terminal.resize(helpers::terminal_area()?);
         terminal
             .draw(|frame| provider_picker_render::render_provider_picker(&mut picker, frame))?;
         let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
@@ -189,7 +189,7 @@ async fn pick_model_provider<W: Write>(
                 KeyCode::Up => picker.select_previous(),
                 KeyCode::Down => picker.select_next(),
                 _ => {
-                    let outcome = handle_text_buffer_key(
+                    let outcome = helpers::handle_text_buffer_key(
                         picker.filter_mut(),
                         keymap,
                         stroke,
@@ -223,7 +223,7 @@ async fn set_session_model(
         .set_session_model(session_id, provider_plugin_id.cloned(), model_id.clone())
         .await
     {
-        report_client_error(&mut chat.app, "model selection failed", &error.into());
+        helpers::report_client_error(&mut chat.app, "model selection failed", &error.into());
     } else {
         chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
             || format!("model set to {model_id}"),

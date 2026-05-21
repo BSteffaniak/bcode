@@ -11,13 +11,14 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 
 use super::command_palette::BmuxCommandPalette;
+use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
 use super::session_flow::ActiveChat;
 use super::{
     EVENT_POLL_TIMEOUT, TuiError, command_palette_render, composer_flow, history_flow, input,
-    mouse_flow, palette_flow, permission_dialog_render, permission_flow, render,
-    report_client_error, resize_from_terminal, slash_flow, slash_palette, slash_palette_render,
+    mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
+    slash_palette, slash_palette_render,
 };
 
 struct ModalState {
@@ -67,7 +68,7 @@ pub(super) async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if resize_from_terminal(terminal)? {
+        if helpers::resize_from_terminal(terminal)? {
             needs_redraw = true;
         }
 
@@ -209,7 +210,7 @@ async fn handle_chat_key<W: Write>(
     if outcome.submitted
         && let Err(error) = composer_flow::submit_composer(client, keymap, chat, terminal).await
     {
-        report_client_error(&mut chat.app, "send failed", &error);
+        helpers::report_client_error(&mut chat.app, "send failed", &error);
     }
     Ok(outcome.redraw)
 }

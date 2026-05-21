@@ -18,7 +18,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
-use super::{EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, history_flow, terminal_area};
+use super::helpers;
+use super::{EVENT_POLL_TIMEOUT, TuiError, history_flow};
 use super::{session_picker, session_picker_render};
 
 /// Active chat session state shared by BMUX backend flows.
@@ -102,7 +103,7 @@ pub(super) async fn pick_session<W: Write>(
     let sessions = client.list_sessions().await?;
     let mut picker = session_picker::SessionPickerApp::new(sessions);
     loop {
-        terminal.resize(terminal_area()?);
+        terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
         let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
             continue;
@@ -157,7 +158,7 @@ pub(super) async fn pick_session_for_mutation<W: Write>(
         }
     }
     loop {
-        terminal.resize(terminal_area()?);
+        terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
         let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
             continue;
@@ -281,7 +282,7 @@ fn handle_picker_filter_key(
             PickerKeyOutcome::Continue
         }
         _ => {
-            let outcome = handle_text_buffer_key(
+            let outcome = helpers::handle_text_buffer_key(
                 picker.filter_mut(),
                 keymap,
                 stroke,
@@ -307,7 +308,7 @@ fn handle_picker_rename_key(
     if stroke.key == KeyCode::Enter {
         return PickerKeyOutcome::Rename;
     }
-    let outcome = handle_text_buffer_key(
+    let outcome = helpers::handle_text_buffer_key(
         picker.rename_mut(),
         keymap,
         stroke,

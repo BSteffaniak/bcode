@@ -7,10 +7,10 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::terminal::Terminal;
 
+use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::{
-    TuiError, composer_flow, input, report_client_error, session_flow::ActiveChat, slash_palette,
-    slash_palette_render,
+    TuiError, composer_flow, input, session_flow::ActiveChat, slash_palette, slash_palette_render,
 };
 
 /// Refresh slash completions for the current composer text.
@@ -69,7 +69,7 @@ pub(super) async fn handle_slash_palette_key<W: Write>(
                 if let Err(error) =
                     composer_flow::submit_composer(client, keymap, chat, terminal).await
                 {
-                    report_client_error(&mut chat.app, "send failed", &error);
+                    helpers::report_client_error(&mut chat.app, "send failed", &error);
                 }
             } else {
                 accept_slash_completion(chat, slash_palette);
@@ -87,7 +87,7 @@ pub(super) async fn handle_slash_palette_key<W: Write>(
                 && let Err(error) =
                     composer_flow::submit_composer(client, keymap, chat, terminal).await
             {
-                report_client_error(&mut chat.app, "send failed", &error);
+                helpers::report_client_error(&mut chat.app, "send failed", &error);
             }
             Ok(outcome.redraw || slash_palette.is_some())
         }

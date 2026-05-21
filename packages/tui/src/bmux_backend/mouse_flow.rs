@@ -3,8 +3,9 @@
 use bcode_client::BcodeClient;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 
+use super::helpers;
 use super::permission_dialog::PermissionDialogState;
-use super::{MOUSE_WHEEL_ROWS, TuiError, permission_flow, session_flow::ActiveChat, terminal_area};
+use super::{MOUSE_WHEEL_ROWS, TuiError, permission_flow, session_flow::ActiveChat};
 
 /// Return the hit-region id under a mouse event.
 #[must_use]
@@ -42,7 +43,7 @@ pub(super) async fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             if hit_id.as_deref() == Some("composer") {
                 if let Some((row, col)) = composer_position_from_mouse(mouse) {
-                    let width = usize::from(terminal_area()?.width.saturating_sub(4));
+                    let width = usize::from(helpers::terminal_area()?.width.saturating_sub(4));
                     chat.app.move_composer_to_wrapped_position(width, row, col);
                     Ok(true)
                 } else {
@@ -71,7 +72,7 @@ fn composer_position_from_mouse(mouse: MouseEvent) -> Option<(usize, usize)> {
     let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
         return None;
     };
-    let area = terminal_area().ok()?;
+    let area = helpers::terminal_area().ok()?;
     let composer_height = area.height.clamp(3, 6);
     let composer_y = area.bottom().saturating_sub(composer_height);
     let inner_x = area.x.saturating_add(2);
@@ -93,7 +94,7 @@ fn diff_file_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
     let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
         return None;
     };
-    let area = terminal_area().ok()?;
+    let area = helpers::terminal_area().ok()?;
     let diff_top = area.height.saturating_sub(12);
     if mouse.position.y < diff_top {
         return None;

@@ -4,9 +4,10 @@ use bcode_client::BcodeClient;
 use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 
+use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
-use super::{TuiError, session_flow::ActiveChat, terminal_area};
+use super::{TuiError, session_flow::ActiveChat};
 
 /// Handle one permission-dialog key.
 pub(super) async fn handle_permission_key(
@@ -119,7 +120,7 @@ fn permission_click_approval(mouse: MouseEvent) -> Option<bool> {
     let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
         return None;
     };
-    let area = terminal_area().ok()?;
+    let area = helpers::terminal_area().ok()?;
     let dialog_width = area.width.saturating_sub(4).min(76);
     let dialog_height = area.height.saturating_sub(4).min(14);
     let dialog_x = area

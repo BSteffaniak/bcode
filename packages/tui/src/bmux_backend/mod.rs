@@ -6,6 +6,7 @@ mod command_palette;
 mod command_palette_render;
 mod composer_flow;
 mod filtered_list;
+mod helpers;
 mod history_flow;
 mod input;
 mod keymap;
@@ -38,13 +39,8 @@ use std::time::Duration;
 
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
-use bmux_keyboard::KeyStroke;
-use bmux_text_edit::keyboard::TextKeymap;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
-use bmux_tui::geometry::Rect;
-use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
-use crossterm::terminal::size;
 use tokio::sync::mpsc;
 
 use self::app::BmuxApp;
@@ -69,7 +65,7 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
     let result = {
         let mut terminal = Terminal::new(
             guard.writer_mut().expect("guard writer exists"),
-            terminal_area()?,
+            helpers::terminal_area()?,
         );
         run_event_loop(&mut terminal, session_id).await
     };
@@ -115,37 +111,6 @@ async fn run_event_loop<W: Write>(
     let result = chat_loop::run_with_client(terminal, &client, &keymap, &mut chat).await;
     chat.event_task.abort();
     result
-}
-
-fn handle_text_buffer_key(
-    buffer: &mut bmux_text_edit::TextEditBuffer,
-    keymap: &BmuxKeyMap,
-    stroke: KeyStroke,
-    enter_behavior: TextInputEnterBehavior,
-) -> TextInputKeyOutcome {
-    if let Some(command) = keymap.editor_command_for_key(stroke) {
-        buffer.apply_command(command);
-        return TextInputKeyOutcome::Edited;
-    }
-    TextInputKeyHandler::new(TextKeymap::default(), enter_behavior).handle_key(buffer, stroke)
-}
-
-fn report_client_error(app: &mut BmuxApp, label: &str, error: &TuiError) {
-    let message = format!("{label}: {error}");
-    app.set_status(message.clone());
-    app.push_system_note(message);
-}
-
-fn resize_from_terminal<W: Write>(terminal: &mut Terminal<&mut W>) -> io::Result<bool> {
-    let area = terminal_area()?;
-    let resized = terminal.area() != area;
-    terminal.resize(area);
-    Ok(resized)
-}
-
-fn terminal_area() -> io::Result<Rect> {
-    let (width, height) = size()?;
-    Ok(Rect::new(0, 0, width, height))
 }
 
 #[cfg(test)]
