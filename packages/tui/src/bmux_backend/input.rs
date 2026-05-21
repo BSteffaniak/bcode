@@ -156,7 +156,7 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
 fn history_previous(app: &mut BmuxApp) -> KeyOutcome {
     KeyOutcome {
         redraw: if app.input_history_navigation_active() {
-            app.previous_input_history()
+            app.move_composer_visual_up_preserving_history() || app.previous_input_history()
         } else {
             app.move_composer_visual_up() || app.previous_input_history()
         },
@@ -168,7 +168,7 @@ fn history_previous(app: &mut BmuxApp) -> KeyOutcome {
 fn history_next(app: &mut BmuxApp) -> KeyOutcome {
     KeyOutcome {
         redraw: if app.input_history_navigation_active() {
-            app.next_input_history()
+            app.move_composer_visual_down_preserving_history() || app.next_input_history()
         } else {
             app.move_composer_visual_down() || app.next_input_history()
         },

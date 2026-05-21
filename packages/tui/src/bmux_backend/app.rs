@@ -250,12 +250,33 @@ impl BmuxApp {
 
     /// Move the composer cursor one rendered row up, if possible.
     pub(super) fn move_composer_visual_up(&mut self) -> bool {
+        self.move_composer_visual_up_with_history_reset(true)
+    }
+
+    /// Move the composer cursor one rendered row up without leaving history navigation.
+    pub(super) fn move_composer_visual_up_preserving_history(&mut self) -> bool {
+        self.move_composer_visual_up_with_history_reset(false)
+    }
+
+    /// Move the composer cursor one rendered row down, if possible.
+    pub(super) fn move_composer_visual_down(&mut self) -> bool {
+        self.move_composer_visual_down_with_history_reset(true)
+    }
+
+    /// Move the composer cursor one rendered row down without leaving history navigation.
+    pub(super) fn move_composer_visual_down_preserving_history(&mut self) -> bool {
+        self.move_composer_visual_down_with_history_reset(false)
+    }
+
+    fn move_composer_visual_up_with_history_reset(&mut self, reset_history: bool) -> bool {
         let width = usize::from(self.composer.content_area().width.max(1));
         let layout = self.composer.buffer().wrapped_layout(width);
         if layout.cursor.row == 0 {
             return false;
         }
-        self.input_history.reset_navigation();
+        if reset_history {
+            self.input_history.reset_navigation();
+        }
         self.composer.buffer_mut().move_cursor_to_wrapped_position(
             width,
             layout.cursor.row.saturating_sub(1),
@@ -265,14 +286,15 @@ impl BmuxApp {
         true
     }
 
-    /// Move the composer cursor one rendered row down, if possible.
-    pub(super) fn move_composer_visual_down(&mut self) -> bool {
+    fn move_composer_visual_down_with_history_reset(&mut self, reset_history: bool) -> bool {
         let width = usize::from(self.composer.content_area().width.max(1));
         let layout = self.composer.buffer().wrapped_layout(width);
         if layout.cursor.row.saturating_add(1) >= layout.lines.len() {
             return false;
         }
-        self.input_history.reset_navigation();
+        if reset_history {
+            self.input_history.reset_navigation();
+        }
         self.composer.buffer_mut().move_cursor_to_wrapped_position(
             width,
             layout.cursor.row.saturating_add(1),
