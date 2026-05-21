@@ -1,7 +1,5 @@
 //! BMUX backend app state.
 
-use std::time::Instant;
-
 use bcode_session_models::{
     ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId,
     SessionInputHistoryEntry,
@@ -10,10 +8,11 @@ use bcode_skill_models::SkillSource;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::diff::{DiffFileSummary, DiffLine};
 
-use super::IDLE_REDRAW_INTERVAL;
 use super::activity::{ActivityState, model_turn_outcome_label};
+use super::cursor_blink::CursorBlink;
 use super::diff_extract::diff_from_tool_request;
 use super::diff_panel::DiffPanel;
+use super::exit_state::ExitState;
 use super::input_history::InputHistory;
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
@@ -38,9 +37,8 @@ pub(super) struct BmuxApp {
     older_history: OlderHistoryState,
     activity: ActivityState,
     status: String,
-    should_exit: bool,
-    cursor_visible: bool,
-    last_cursor_toggle: Instant,
+    exit: ExitState,
+    cursor: CursorBlink,
 }
 
 impl BmuxApp {
@@ -66,9 +64,8 @@ impl BmuxApp {
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
             status: String::from("BMUX backend connected. Enter submits; Esc/Ctrl-C exits."),
-            should_exit: false,
-            cursor_visible: true,
-            last_cursor_toggle: Instant::now(),
+            exit: ExitState::default(),
+            cursor: CursorBlink::new(),
         };
         app.absorb_history(history);
         app
@@ -485,34 +482,28 @@ impl BmuxApp {
     /// Return whether the composer cursor should be visible.
     #[must_use]
     pub(super) const fn cursor_visible(&self) -> bool {
-        self.cursor_visible
+        self.cursor.visible()
     }
 
     /// Reset cursor blink state after input.
     pub(super) fn wake_cursor(&mut self) {
-        self.cursor_visible = true;
-        self.last_cursor_toggle = Instant::now();
+        self.cursor.wake();
     }
 
     /// Advance time-based UI state.
     pub(super) fn tick(&mut self) -> bool {
-        if self.last_cursor_toggle.elapsed() < IDLE_REDRAW_INTERVAL {
-            return false;
-        }
-        self.cursor_visible = !self.cursor_visible;
-        self.last_cursor_toggle = Instant::now();
-        true
+        self.cursor.tick()
     }
 
     /// Return whether the backend should exit.
     #[must_use]
     pub(super) const fn should_exit(&self) -> bool {
-        self.should_exit
+        self.exit.requested()
     }
 
     /// Request backend shutdown.
     pub(super) const fn request_exit(&mut self) {
-        self.should_exit = true;
+        self.exit.request();
     }
 
     /// Replace composer contents.
