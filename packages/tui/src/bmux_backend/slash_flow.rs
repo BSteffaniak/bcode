@@ -9,8 +9,8 @@ use bmux_tui::terminal::Terminal;
 
 use super::keymap::BmuxKeyMap;
 use super::{
-    ActiveChat, TuiError, input, report_client_error, slash_palette, slash_palette_render,
-    submit_composer,
+    ActiveChat, TuiError, composer_flow, input, report_client_error, slash_palette,
+    slash_palette_render,
 };
 
 /// Refresh slash completions for the current composer text.
@@ -66,7 +66,9 @@ pub(super) async fn handle_slash_palette_key<W: Write>(
         KeyCode::Enter if stroke.modifiers.is_empty() => {
             if active_palette.selected_matches(chat.app.composer().text()) {
                 *slash_palette = None;
-                if let Err(error) = submit_composer(client, keymap, chat, terminal).await {
+                if let Err(error) =
+                    composer_flow::submit_composer(client, keymap, chat, terminal).await
+                {
                     report_client_error(&mut chat.app, "send failed", &error);
                 }
             } else {
@@ -82,7 +84,8 @@ pub(super) async fn handle_slash_palette_key<W: Write>(
             let outcome = input::handle_key(&mut chat.app, keymap, stroke);
             update_slash_palette(client, chat, slash_palette).await;
             if outcome.submitted
-                && let Err(error) = submit_composer(client, keymap, chat, terminal).await
+                && let Err(error) =
+                    composer_flow::submit_composer(client, keymap, chat, terminal).await
             {
                 report_client_error(&mut chat.app, "send failed", &error);
             }
