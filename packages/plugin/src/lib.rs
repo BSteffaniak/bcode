@@ -8,7 +8,7 @@ use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
     EVENT_STATUS_OK, NativeEventContext, NativeServiceContext, PluginEvent,
-    SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, ServiceRequest,
+    SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 use libloading::Library;
@@ -16,7 +16,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -121,15 +121,43 @@ pub struct RegisteredPlugin {
     pub manifest: PluginManifest,
 }
 
+/// Statically bundled plugin registration.
+#[derive(Debug, Clone, Copy)]
+pub struct StaticBundledPlugin {
+    pub manifest_toml: &'static str,
+    pub vtable: StaticPluginVtable,
+}
+
+impl StaticBundledPlugin {
+    /// Create a statically bundled plugin registration.
+    #[must_use]
+    pub const fn new(manifest_toml: &'static str, vtable: StaticPluginVtable) -> Self {
+        Self {
+            manifest_toml,
+            vtable,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LoadedPluginBackend {
+    Dynamic {
+        _library: ManuallyDrop<Library>,
+        activate: LifecycleFn,
+        deactivate: LifecycleFn,
+        invoke_service: ServiceFn,
+        handle_event: EventFn,
+    },
+    Static {
+        vtable: StaticPluginVtable,
+    },
+}
+
 /// Loaded native plugin.
 #[derive(Debug)]
 pub struct LoadedPlugin {
     manifest: PluginManifest,
-    library: ManuallyDrop<Library>,
-    activate: LifecycleFn,
-    deactivate: LifecycleFn,
-    invoke_service: ServiceFn,
-    handle_event: EventFn,
+    backend: LoadedPluginBackend,
 }
 
 impl LoadedPlugin {
@@ -145,7 +173,10 @@ impl LoadedPlugin {
     ///
     /// Returns an error if the plugin activation hook returns a non-zero code.
     pub fn activate(&self) -> Result<(), PluginLoadError> {
-        let code = unsafe { (self.activate)() };
+        let code = match &self.backend {
+            LoadedPluginBackend::Dynamic { activate, .. } => unsafe { activate() },
+            LoadedPluginBackend::Static { vtable } => (vtable.activate)(vtable.instance),
+        };
         if code == 0 {
             Ok(())
         } else {
@@ -163,7 +194,10 @@ impl LoadedPlugin {
     ///
     /// Returns an error if the plugin deactivation hook returns a non-zero code.
     pub fn deactivate(&self) -> Result<(), PluginLoadError> {
-        let code = unsafe { (self.deactivate)() };
+        let code = match &self.backend {
+            LoadedPluginBackend::Dynamic { deactivate, .. } => unsafe { deactivate() },
+            LoadedPluginBackend::Static { vtable } => (vtable.deactivate)(vtable.instance),
+        };
         if code == 0 {
             Ok(())
         } else {
@@ -197,26 +231,22 @@ impl LoadedPlugin {
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let mut output_len = 0_usize;
         let mut output = vec![0_u8; 65_536];
-        let mut status = unsafe {
-            (self.invoke_service)(
+        let mut status = self.invoke_service_raw(
+            input.as_ptr(),
+            input.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            &raw mut output_len,
+        );
+        if status == SERVICE_STATUS_BUFFER_TOO_SMALL {
+            output.resize(output_len, 0);
+            status = self.invoke_service_raw(
                 input.as_ptr(),
                 input.len(),
                 output.as_mut_ptr(),
                 output.len(),
                 &raw mut output_len,
-            )
-        };
-        if status == SERVICE_STATUS_BUFFER_TOO_SMALL {
-            output.resize(output_len, 0);
-            status = unsafe {
-                (self.invoke_service)(
-                    input.as_ptr(),
-                    input.len(),
-                    output.as_mut_ptr(),
-                    output.len(),
-                    &raw mut output_len,
-                )
-            };
+            );
         }
         if status != SERVICE_STATUS_OK {
             return Err(PluginLoadError::ServiceInvokeFailed {
@@ -246,7 +276,14 @@ impl LoadedPlugin {
             },
         };
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::EventEncode)?;
-        let status = unsafe { (self.handle_event)(input.as_ptr(), input.len()) };
+        let status = match &self.backend {
+            LoadedPluginBackend::Dynamic { handle_event, .. } => unsafe {
+                handle_event(input.as_ptr(), input.len())
+            },
+            LoadedPluginBackend::Static { vtable } => {
+                (vtable.handle_event)(vtable.instance, input.as_ptr(), input.len())
+            }
+        };
         if status == EVENT_STATUS_OK {
             Ok(())
         } else {
@@ -281,8 +318,36 @@ impl LoadedPlugin {
     /// Return true while the dynamic library is retained by this loaded plugin.
     #[must_use]
     pub const fn is_library_retained(&self) -> bool {
-        let _ = &self.library;
-        true
+        matches!(self.backend, LoadedPluginBackend::Dynamic { .. })
+    }
+
+    fn invoke_service_raw(
+        &self,
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        match &self.backend {
+            LoadedPluginBackend::Dynamic { invoke_service, .. } => unsafe {
+                invoke_service(
+                    input_ptr,
+                    input_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                )
+            },
+            LoadedPluginBackend::Static { vtable } => (vtable.invoke_service)(
+                vtable.instance,
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            ),
+        }
     }
 }
 
@@ -428,6 +493,34 @@ pub fn discover_plugins_in_roots(
     Ok(plugins)
 }
 
+/// Filter static plugin registrations according to an enable/disable policy.
+///
+/// # Errors
+///
+/// Returns an error when a static plugin manifest cannot be parsed.
+pub fn filter_selected_static_plugins(
+    plugins: &[StaticBundledPlugin],
+    selection: &PluginSelection,
+) -> Result<Vec<(PluginManifest, StaticPluginVtable)>, PluginLoadError> {
+    plugins
+        .iter()
+        .map(|plugin| {
+            let manifest: PluginManifest =
+                toml::from_str(plugin.manifest_toml).map_err(|source| {
+                    PluginLoadError::ExportedManifestParse {
+                        library: PathBuf::from("<static>"),
+                        source,
+                    }
+                })?;
+            Ok((manifest, plugin.vtable))
+        })
+        .filter(|plugin| match plugin {
+            Ok((manifest, _)) => selection.is_enabled(&manifest.id),
+            Err(_) => true,
+        })
+        .collect()
+}
+
 /// Filter registered plugins according to an enable/disable policy.
 #[must_use]
 pub fn filter_selected_plugins(
@@ -508,17 +601,43 @@ impl PluginHost {
     ///
     /// Returns an error when discovery, loading, or activation fails.
     pub fn load_defaults(selection: &PluginSelection) -> Result<Self, PluginLoadError> {
+        Self::load_defaults_with_static_bundled(selection, &[])
+    }
+
+    /// Discover, load, and activate plugins from default roots plus static bundled registrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery, loading, or activation fails.
+    pub fn load_defaults_with_static_bundled(
+        selection: &PluginSelection,
+        static_plugins: &[StaticBundledPlugin],
+    ) -> Result<Self, PluginLoadError> {
         tracing::debug!(target: "bcode_plugin::startup", "discovering plugins");
-        let plugins = filter_selected_plugins(discover_plugins()?, selection);
+        let static_plugins = filter_selected_static_plugins(static_plugins, selection)?;
+        let static_ids = static_plugins
+            .iter()
+            .map(|plugin| plugin.0.id.clone())
+            .collect::<BTreeSet<_>>();
+        let plugins = filter_selected_plugins(discover_plugins()?, selection)
+            .into_iter()
+            .filter(|plugin| !static_ids.contains(&plugin.manifest.id))
+            .collect::<Vec<_>>();
         tracing::debug!(
             target: "bcode_plugin::startup",
+            static_plugins = ?static_plugins
+                .iter()
+                .map(|plugin| plugin.0.id.as_str())
+                .collect::<Vec<_>>(),
             plugins = ?plugins
                 .iter()
                 .map(|plugin| plugin.manifest.id.as_str())
                 .collect::<Vec<_>>(),
             "plugins selected"
         );
-        Self::load_registered_plugins(&plugins)
+        let mut host = Self::load_static_plugins(&static_plugins)?;
+        host.load_registered_plugins_into(&plugins)?;
+        Ok(host)
     }
 
     /// Load and activate registered plugins.
@@ -528,15 +647,43 @@ impl PluginHost {
     /// Returns an error when loading or activation fails.
     pub fn load_registered_plugins(plugins: &[RegisteredPlugin]) -> Result<Self, PluginLoadError> {
         let mut host = Self::default();
-        for plugin in plugins {
-            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "loading plugin");
-            let loaded = load_registered_plugin(plugin)?;
+        host.load_registered_plugins_into(plugins)?;
+        Ok(host)
+    }
+
+    /// Load and activate statically bundled plugins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when loading or activation fails.
+    pub fn load_static_plugins(
+        plugins: &[(PluginManifest, StaticPluginVtable)],
+    ) -> Result<Self, PluginLoadError> {
+        let mut host = Self::default();
+        for (manifest, vtable) in plugins {
+            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %manifest.id, "loading static plugin");
+            let loaded = load_static_plugin(manifest.clone(), *vtable)?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             loaded.activate()?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
             host.loaded.push(loaded);
         }
         Ok(host)
+    }
+
+    fn load_registered_plugins_into(
+        &mut self,
+        plugins: &[RegisteredPlugin],
+    ) -> Result<(), PluginLoadError> {
+        for plugin in plugins {
+            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "loading plugin");
+            let loaded = load_registered_plugin(plugin)?;
+            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
+            loaded.activate()?;
+            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
+            self.loaded.push(loaded);
+        }
+        Ok(())
     }
 
     /// Return loaded plugins.
@@ -730,11 +877,46 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
 
     Ok(LoadedPlugin {
         manifest: plugin.manifest.clone(),
-        library: ManuallyDrop::new(library),
-        activate,
-        deactivate,
-        invoke_service,
-        handle_event,
+        backend: LoadedPluginBackend::Dynamic {
+            _library: ManuallyDrop::new(library),
+            activate,
+            deactivate,
+            invoke_service,
+            handle_event,
+        },
+    })
+}
+
+/// Load a statically linked plugin from its manifest and vtable.
+///
+/// # Errors
+///
+/// Returns an error when the manifest uses an unsupported ABI or the vtable manifest mismatches.
+pub fn load_static_plugin(
+    manifest: PluginManifest,
+    vtable: StaticPluginVtable,
+) -> Result<LoadedPlugin, PluginLoadError> {
+    let PluginRuntime::Native(runtime) = &manifest.runtime;
+    if !runtime.is_current_abi() {
+        return Err(PluginLoadError::UnsupportedAbi {
+            plugin_id: manifest.id.clone(),
+            actual: runtime.abi_version,
+            expected: CURRENT_PLUGIN_ABI_VERSION,
+        });
+    }
+
+    let manifest_cache = Box::leak(Box::new(std::sync::OnceLock::new()));
+    let exported_manifest = load_static_exported_manifest(vtable, manifest_cache)?;
+    if exported_manifest.id != manifest.id {
+        return Err(PluginLoadError::ManifestIdMismatch {
+            file_id: manifest.id.clone(),
+            library_id: exported_manifest.id,
+        });
+    }
+
+    Ok(LoadedPlugin {
+        manifest,
+        backend: LoadedPluginBackend::Static { vtable },
     })
 }
 
@@ -810,6 +992,26 @@ fn load_exported_manifest(
     })?;
     toml::from_str(manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
         library: library_path.to_path_buf(),
+        source,
+    })
+}
+
+fn load_static_exported_manifest(
+    vtable: StaticPluginVtable,
+    manifest_cache: &'static std::sync::OnceLock<Option<CString>>,
+) -> Result<PluginManifest, PluginLoadError> {
+    let ptr = (vtable.manifest)(manifest_cache);
+    if ptr.is_null() {
+        return Err(PluginLoadError::NullManifest(PathBuf::from("<static>")));
+    }
+    let manifest_toml = unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|source| {
+        PluginLoadError::ManifestUtf8 {
+            library: PathBuf::from("<static>"),
+            source,
+        }
+    })?;
+    toml::from_str(manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
+        library: PathBuf::from("<static>"),
         source,
     })
 }

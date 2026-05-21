@@ -36,3 +36,4 @@ tracing = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
+static-bundled   = []

@@ -298,5 +298,13 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    bcode_plugin_sdk::static_plugin_vtable!(
+        FakeProviderPlugin,
+        include_str!("../bcode-plugin.toml")
+    )
+}
 
 bcode_plugin_sdk::export_plugin!(FakeProviderPlugin, include_str!("../bcode-plugin.toml"));

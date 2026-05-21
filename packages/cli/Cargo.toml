@@ -35,7 +35,24 @@ tracing-subscriber   = { workspace = true }
 zeroize              = { workspace = true }
 
 [features]
-default          = ["tui-ratatui", "tui-bmux"]
+default = ["static-bundled-plugins", "tui-ratatui", "tui-bmux"]
 fail-on-warnings = []
-tui-bmux         = ["bcode_tui/tui-bmux"]
-tui-ratatui      = ["bcode_tui/tui-ratatui"]
+static-bundled-bedrock-provider-plugin = [
+    "bcode_server/static-bundled-bedrock-provider-plugin",
+]
+static-bundled-default-agents-plugin = [
+    "bcode_server/static-bundled-default-agents-plugin",
+]
+static-bundled-fake-provider-plugin = [
+    "bcode_server/static-bundled-fake-provider-plugin",
+]
+static-bundled-filesystem-plugin = [
+    "bcode_server/static-bundled-filesystem-plugin",
+]
+static-bundled-openai-compatible-provider-plugin = [
+    "bcode_server/static-bundled-openai-compatible-provider-plugin",
+]
+static-bundled-plugins = ["bcode_server/static-bundled-plugins"]
+static-bundled-shell-plugin = ["bcode_server/static-bundled-shell-plugin"]
+tui-bmux = ["bcode_tui/tui-bmux"]
+tui-ratatui = ["bcode_tui/tui-ratatui"]

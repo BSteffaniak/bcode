@@ -5,7 +5,7 @@
 //! Plugin author SDK for Bcode native plugins.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::ffi::{CString, c_char};
+use std::ffi::{CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
 /// Current stable native plugin ABI version.
@@ -409,7 +409,91 @@ pub fn handle_event_export<P: RustPlugin>(
         })
 }
 
-/// Export native plugin ABI symbols for a [`RustPlugin`] implementation.
+/// Statically linked native plugin ABI vtable.
+#[derive(Clone, Copy)]
+pub struct StaticPluginVtable {
+    /// Opaque pointer to the plugin instance holder.
+    pub instance: *const c_void,
+    /// Manifest TOML provider.
+    pub manifest: fn(&'static OnceLock<Option<CString>>) -> *const c_char,
+    /// Activation hook.
+    pub activate: fn(*const c_void) -> i32,
+    /// Deactivation hook.
+    pub deactivate: fn(*const c_void) -> i32,
+    /// Service invocation hook.
+    pub invoke_service: fn(*const c_void, *const u8, usize, *mut u8, usize, *mut usize) -> i32,
+    /// Event handling hook.
+    pub handle_event: fn(*const c_void, *const u8, usize) -> i32,
+}
+
+impl std::fmt::Debug for StaticPluginVtable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticPluginVtable").finish_non_exhaustive()
+    }
+}
+
+unsafe impl Send for StaticPluginVtable {}
+unsafe impl Sync for StaticPluginVtable {}
+
+#[doc(hidden)]
+pub fn static_manifest_export(
+    manifest_toml: &'static str,
+    cached: &'static OnceLock<Option<CString>>,
+) -> *const c_char {
+    manifest_toml_ptr(manifest_toml, cached)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn static_activate_export<P: RustPlugin>(instance: *const c_void) -> i32 {
+    let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
+    let instance = plugin_instance::<P>(instance);
+    activate_export(instance)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn static_deactivate_export<P: RustPlugin>(instance: *const c_void) -> i32 {
+    let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
+    let instance = plugin_instance::<P>(instance);
+    deactivate_export(instance)
+}
+
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn static_invoke_service_export<P: RustPlugin>(
+    instance: *const c_void,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
+    let instance = plugin_instance::<P>(instance);
+    invoke_service_export(
+        instance,
+        input_ptr,
+        input_len,
+        output_ptr,
+        output_capacity,
+        output_len,
+    )
+}
+
+#[doc(hidden)]
+#[must_use]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn static_handle_event_export<P: RustPlugin>(
+    instance: *const c_void,
+    input_ptr: *const u8,
+    input_len: usize,
+) -> i32 {
+    let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
+    let instance = plugin_instance::<P>(instance);
+    handle_event_export(instance, input_ptr, input_len)
+}
+
 #[macro_export]
 macro_rules! export_plugin {
     ($plugin:ty, $manifest_toml:expr) => {
@@ -465,6 +549,28 @@ macro_rules! export_plugin {
     };
 }
 
+/// Build a static plugin vtable for a [`RustPlugin`] implementation.
+#[macro_export]
+macro_rules! static_plugin_vtable {
+    ($plugin:ty, $manifest_toml:expr) => {{
+        static BCODE_STATIC_PLUGIN_INSTANCE: std::sync::OnceLock<std::sync::Mutex<$plugin>> =
+            std::sync::OnceLock::new();
+        fn manifest(
+            cached: &'static std::sync::OnceLock<Option<std::ffi::CString>>,
+        ) -> *const std::ffi::c_char {
+            $crate::static_manifest_export($manifest_toml, cached)
+        }
+        $crate::StaticPluginVtable {
+            instance: (&BCODE_STATIC_PLUGIN_INSTANCE as *const _) as *const std::ffi::c_void,
+            manifest,
+            activate: $crate::static_activate_export::<$plugin>,
+            deactivate: $crate::static_deactivate_export::<$plugin>,
+            invoke_service: $crate::static_invoke_service_export::<$plugin>,
+            handle_event: $crate::static_handle_event_export::<$plugin>,
+        }
+    }};
+}
+
 /// Common imports for plugin authors.
 pub mod prelude {
     pub use crate::{
@@ -474,7 +580,7 @@ pub mod prelude {
         SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
         SERVICE_STATUS_ENCODE_FAILED, SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK,
         SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceRequest, ServiceResponse,
-        export_plugin,
+        StaticPluginVtable, export_plugin, static_plugin_vtable,
     };
 }
 

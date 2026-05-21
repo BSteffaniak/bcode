@@ -453,6 +453,41 @@ impl ServerState {
     }
 }
 
+fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
+    vec![
+        #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/bedrock-provider-plugin/bcode-plugin.toml"),
+            bcode_bedrock_provider_plugin::static_plugin(),
+        ),
+        #[cfg(feature = "static-bundled-default-agents-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+            bcode_default_agents_plugin::static_plugin(),
+        ),
+        #[cfg(feature = "static-bundled-fake-provider-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+            bcode_fake_provider_plugin::static_plugin(),
+        ),
+        #[cfg(feature = "static-bundled-filesystem-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            bcode_filesystem_plugin::static_plugin(),
+        ),
+        #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
+            bcode_openai_compatible_provider_plugin::static_plugin(),
+        ),
+        #[cfg(feature = "static-bundled-shell-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        ),
+    ]
+}
+
 /// Run the local Bcode server until interrupted.
 ///
 /// # Errors
@@ -470,7 +505,11 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         "plugin selection resolved"
     );
     tracing::debug!(target: "bcode_server::startup", "loading plugins");
-    let plugins = bcode_plugin::PluginHost::load_defaults(&plugin_selection)?;
+    let static_plugins = static_bundled_plugins();
+    let plugins = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
+        &plugin_selection,
+        &static_plugins,
+    )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;

@@ -1248,6 +1248,14 @@ where
     }
 }
 
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    bcode_plugin_sdk::static_plugin_vtable!(FilesystemPlugin, include_str!("../bcode-plugin.toml"))
+}
+
+bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin.toml"));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,5 +1340,3 @@ mod tests {
         assert!(output.timed_out);
     }
 }
-
-bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin.toml"));

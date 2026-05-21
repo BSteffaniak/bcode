@@ -40,25 +40,31 @@ version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
 # Internal bcode packages
-bcode_agent_policy           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy" }
-bcode_agent_policy_models    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy/models" }
-bcode_agent_profile          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-profile" }
-bcode_cli                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
-bcode_client                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
-bcode_command                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
-bcode_config                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
-bcode_ipc                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
-bcode_model                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }
-bcode_model_provider_runtime = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
-bcode_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
-bcode_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
-bcode_server                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
-bcode_session                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
-bcode_session_models         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
-bcode_skill                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
-bcode_skill_models           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
-bcode_tool                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
-bcode_tui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
+bcode_agent_policy                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy" }
+bcode_agent_policy_models               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy/models" }
+bcode_agent_profile                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-profile" }
+bcode_bedrock_provider_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/bedrock-provider-plugin" }
+bcode_cli                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
+bcode_client                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bcode_command                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
+bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
+bcode_default_agents_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/default-agents-plugin" }
+bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
+bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }
+bcode_ipc                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
+bcode_model                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }
+bcode_model_provider_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
+bcode_openai_compatible_provider_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/openai-compatible-provider-plugin" }
+bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
+bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
+bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
+bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
+bcode_session_models                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin" }
+bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
+bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
+bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
+bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 
 # BMUX reuse
 bmux_codec          = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }

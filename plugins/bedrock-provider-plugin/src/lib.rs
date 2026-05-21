@@ -1786,6 +1786,17 @@ fn json_value_to_document(value: &serde_json::Value) -> Document {
     }
 }
 
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    bcode_plugin_sdk::static_plugin_vtable!(
+        BedrockProviderPlugin,
+        include_str!("../bcode-plugin.toml")
+    )
+}
+
+bcode_plugin_sdk::export_plugin!(BedrockProviderPlugin, include_str!("../bcode-plugin.toml"));
+
 #[cfg(test)]
 fn document_to_json_value(document: &Document) -> serde_json::Value {
     match document {
@@ -1911,8 +1922,6 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
-
-bcode_plugin_sdk::export_plugin!(BedrockProviderPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

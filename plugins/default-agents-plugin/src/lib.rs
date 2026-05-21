@@ -194,6 +194,15 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 
 export_plugin!(DefaultAgentsPlugin, MANIFEST);
 
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    bcode_plugin_sdk::static_plugin_vtable!(
+        DefaultAgentsPlugin,
+        include_str!("../bcode-plugin.toml")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
