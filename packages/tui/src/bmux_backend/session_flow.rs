@@ -6,12 +6,13 @@ use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::crossterm::poll_event;
-use bmux_tui::event::{Event, FocusEvent, MouseEvent, MouseEventKind};
+use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
 
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
+use super::picker_mouse::picker_row_from_mouse;
 use super::{EVENT_POLL_TIMEOUT, TuiError, handle_text_buffer_key, terminal_area};
 use super::{session_picker, session_picker_render};
 
@@ -311,11 +312,4 @@ async fn delete_picker_session(
         Err(error) => picker.finish_mutation(format!("delete failed: {error}")),
     }
     Ok(())
-}
-
-fn picker_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
-    if !matches!(mouse.kind, MouseEventKind::Down(_)) {
-        return None;
-    }
-    usize::from(mouse.position.y).checked_sub(5)
 }

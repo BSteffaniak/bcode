@@ -10,6 +10,7 @@ mod model_picker;
 mod model_picker_render;
 mod permission_dialog;
 mod permission_dialog_render;
+mod picker_mouse;
 mod picker_render;
 mod provider_picker;
 mod provider_picker_render;
@@ -45,6 +46,7 @@ use self::app::BmuxApp;
 use self::command_palette::{BmuxCommandPalette, PaletteCommand};
 use self::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use self::permission_dialog::PermissionDialogState;
+use self::picker_mouse::picker_row_from_mouse;
 use super::TuiError;
 
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
@@ -423,15 +425,6 @@ fn composer_position_from_mouse(mouse: MouseEvent) -> Option<(usize, usize)> {
         usize::from(mouse.position.y.saturating_sub(inner_y)),
         usize::from(mouse.position.x.saturating_sub(inner_x)),
     ))
-}
-
-fn picker_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {}
-        _ => return None,
-    }
-    let y = usize::from(mouse.position.y);
-    y.checked_sub(5)
 }
 
 fn diff_file_row_from_mouse(mouse: MouseEvent) -> Option<usize> {
