@@ -5,7 +5,7 @@ use bcode_session_models::{
     SessionInputHistoryEntry,
 };
 use bcode_skill_models::SkillSource;
-use bmux_text_edit::TextEditBuffer;
+use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::diff::{DiffFileSummary, DiffLine};
 use bmux_tui::geometry::Rect;
 
@@ -35,6 +35,7 @@ pub(super) struct BmuxApp {
     thinking_label: String,
     token_usage: TokenUsageMeter,
     composer_content_area: Rect,
+    composer_mouse_selection_active: bool,
     composer: TextEditBuffer,
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
@@ -66,6 +67,7 @@ impl BmuxApp {
             thinking_label: "default".to_owned(),
             token_usage: TokenUsageMeter::default(),
             composer_content_area: Rect::new(0, 0, 1, 1),
+            composer_mouse_selection_active: false,
             composer: TextEditBuffer::new(),
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
@@ -223,16 +225,53 @@ impl BmuxApp {
         self.diff_panel.select_previous_file()
     }
 
-    /// Move composer cursor to soft-wrapped row and column.
-    pub(super) fn move_composer_to_wrapped_position(
+    /// Extend composer selection with an editor motion.
+    pub(super) fn extend_composer_selection(&mut self, motion: TextMotion) {
+        let width = usize::from(self.composer_content_area.width.max(1));
+        match motion {
+            TextMotion::VisualUp => self.extend_composer_selection_to_visual_delta(width, -1),
+            TextMotion::VisualDown => self.extend_composer_selection_to_visual_delta(width, 1),
+            motion => self
+                .composer
+                .move_cursor_with_selection(motion, SelectionMode::Extend),
+        }
+        self.wake_cursor();
+    }
+
+    /// Begin a mouse text selection in the composer.
+    pub(super) fn begin_composer_mouse_selection(&mut self, width: usize, row: usize, col: usize) {
+        self.composer
+            .move_cursor_to_wrapped_position(width, row, col);
+        self.composer_mouse_selection_active = true;
+        self.wake_cursor();
+    }
+
+    /// Extend the active composer mouse selection.
+    pub(super) fn extend_composer_mouse_selection(
         &mut self,
         width: usize,
         row: usize,
         col: usize,
-    ) {
-        self.composer
-            .move_cursor_to_wrapped_position(width, row, col);
+    ) -> bool {
+        if !self.composer_mouse_selection_active {
+            return false;
+        }
+        self.composer.select_to_wrapped_position(width, row, col);
         self.wake_cursor();
+        true
+    }
+
+    /// End the active composer mouse selection, if any.
+    pub(super) const fn end_composer_mouse_selection(&mut self) -> bool {
+        let was_active = self.composer_mouse_selection_active;
+        self.composer_mouse_selection_active = false;
+        was_active
+    }
+
+    /// Return whether a composer mouse selection is active.
+    #[must_use]
+    pub(super) const fn composer_mouse_selection_active(&self) -> bool {
+        self.composer_mouse_selection_active
     }
 
     /// Move the composer cursor one rendered row up, if possible.
@@ -593,6 +632,21 @@ impl BmuxApp {
         self.selected_model_id = model_to_display_selection(model);
         self.token_usage.clear_model_info();
         self.status = format!("model: {provider}/{model}");
+    }
+
+    fn extend_composer_selection_to_visual_delta(&mut self, width: usize, delta: isize) {
+        let layout = self.composer.wrapped_layout(width);
+        let target_row = if delta.is_negative() {
+            layout.cursor.row.saturating_sub(delta.unsigned_abs())
+        } else {
+            layout
+                .cursor
+                .row
+                .saturating_add(delta.unsigned_abs())
+                .min(layout.lines.len().saturating_sub(1))
+        };
+        self.composer
+            .select_to_wrapped_position(width, target_row, layout.cursor.col);
     }
 
     fn rename_session(&mut self, name: Option<&str>) {

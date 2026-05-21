@@ -211,12 +211,29 @@ async fn handle_chat_key<W: Write>(
     }
     let outcome = input::handle_key(&mut chat.app, keymap, stroke);
     slash_flow::update_slash_palette(client, chat, &mut modals.slash_palette).await;
+    if outcome.interrupted {
+        request_turn_cancellation(client, chat).await;
+    }
     if outcome.submitted
         && let Err(error) = composer_flow::submit_composer(client, keymap, chat, terminal).await
     {
         helpers::report_client_error(&mut chat.app, "send failed", &error);
     }
     Ok(outcome.redraw)
+}
+
+async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return;
+    };
+    match client.cancel_session_turn(session_id).await {
+        Ok(true) => chat
+            .app
+            .set_status("turn cancellation requested".to_owned()),
+        Ok(false) => chat.app.set_status("no active turn".to_owned()),
+        Err(error) => chat.app.set_status(format!("cancel failed: {error}")),
+    }
 }
 
 fn is_palette_open_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {

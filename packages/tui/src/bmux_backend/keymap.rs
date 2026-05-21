@@ -49,6 +49,12 @@ pub(super) enum BmuxAction {
     EditorMoveWordRight,
     EditorMoveStart,
     EditorMoveEnd,
+    EditorSelectLeft,
+    EditorSelectRight,
+    EditorSelectWordLeft,
+    EditorSelectWordRight,
+    EditorSelectUp,
+    EditorSelectDown,
     EditorDeleteBackward,
     EditorDeleteForward,
     EditorDeleteWordBackward,
@@ -92,6 +98,12 @@ impl BmuxAction {
             "tui.editor.moveCursorWordRight" => Self::EditorMoveWordRight,
             "tui.editor.moveCursorStart" => Self::EditorMoveStart,
             "tui.editor.moveCursorEnd" => Self::EditorMoveEnd,
+            "tui.editor.selectCursorLeft" => Self::EditorSelectLeft,
+            "tui.editor.selectCursorRight" => Self::EditorSelectRight,
+            "tui.editor.selectCursorWordLeft" => Self::EditorSelectWordLeft,
+            "tui.editor.selectCursorWordRight" => Self::EditorSelectWordRight,
+            "tui.editor.selectCursorUp" => Self::EditorSelectUp,
+            "tui.editor.selectCursorDown" => Self::EditorSelectDown,
             "tui.editor.deleteCharBackward" => Self::EditorDeleteBackward,
             "tui.editor.deleteCharForward" => Self::EditorDeleteForward,
             "tui.editor.deleteWordBackward" => Self::EditorDeleteWordBackward,
@@ -192,6 +204,68 @@ impl BmuxKeyMap {
             | BmuxAction::SessionNew
             | BmuxAction::SessionRename
             | BmuxAction::SessionDelete
+            | BmuxAction::EditorSelectLeft
+            | BmuxAction::EditorSelectRight
+            | BmuxAction::EditorSelectWordLeft
+            | BmuxAction::EditorSelectWordRight
+            | BmuxAction::EditorSelectUp
+            | BmuxAction::EditorSelectDown
+            | BmuxAction::SkillInvoke
+            | BmuxAction::SkillActivate
+            | BmuxAction::SkillDeactivate
+            | BmuxAction::SkillHelp => return None,
+        })
+    }
+
+    /// Return the configured selection motion for `stroke`.
+    #[must_use]
+    pub(super) fn editor_selection_motion_for_key(
+        &self,
+        stroke: KeyStroke,
+    ) -> Option<bmux_text_edit::TextMotion> {
+        use bmux_text_edit::TextMotion;
+
+        Some(match self.action_for_key(BmuxScope::Chat, stroke)? {
+            BmuxAction::EditorSelectLeft => TextMotion::Left,
+            BmuxAction::EditorSelectRight => TextMotion::Right,
+            BmuxAction::EditorSelectWordLeft => TextMotion::WordLeft,
+            BmuxAction::EditorSelectWordRight => TextMotion::WordRight,
+            BmuxAction::EditorSelectUp => TextMotion::VisualUp,
+            BmuxAction::EditorSelectDown => TextMotion::VisualDown,
+            BmuxAction::InputSubmit
+            | BmuxAction::InputHistoryPrevious
+            | BmuxAction::InputHistoryNext
+            | BmuxAction::AppExit
+            | BmuxAction::AppInterrupt
+            | BmuxAction::CommandPaletteOpen
+            | BmuxAction::TranscriptPageUp
+            | BmuxAction::TranscriptPageDown
+            | BmuxAction::TranscriptTop
+            | BmuxAction::TranscriptBottom
+            | BmuxAction::TranscriptLineUp
+            | BmuxAction::TranscriptLineDown
+            | BmuxAction::PermissionApprove
+            | BmuxAction::PermissionDeny
+            | BmuxAction::SelectUp
+            | BmuxAction::SelectDown
+            | BmuxAction::SelectConfirm
+            | BmuxAction::SelectCancel
+            | BmuxAction::SessionNew
+            | BmuxAction::SessionRename
+            | BmuxAction::SessionDelete
+            | BmuxAction::InputNewLine
+            | BmuxAction::EditorMoveLeft
+            | BmuxAction::EditorMoveRight
+            | BmuxAction::EditorMoveWordLeft
+            | BmuxAction::EditorMoveWordRight
+            | BmuxAction::EditorMoveStart
+            | BmuxAction::EditorMoveEnd
+            | BmuxAction::EditorDeleteBackward
+            | BmuxAction::EditorDeleteForward
+            | BmuxAction::EditorDeleteWordBackward
+            | BmuxAction::EditorDeleteWordForward
+            | BmuxAction::EditorDeleteToStart
+            | BmuxAction::EditorDeleteToEnd
             | BmuxAction::SkillInvoke
             | BmuxAction::SkillActivate
             | BmuxAction::SkillDeactivate
@@ -209,6 +283,14 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
                 bind("shift+enter", BmuxAction::InputNewLine),
                 bind("up", BmuxAction::InputHistoryPrevious),
                 bind("down", BmuxAction::InputHistoryNext),
+                bind("shift+left", BmuxAction::EditorSelectLeft),
+                bind("shift+right", BmuxAction::EditorSelectRight),
+                bind("shift+alt+left", BmuxAction::EditorSelectWordLeft),
+                bind("shift+alt+right", BmuxAction::EditorSelectWordRight),
+                bind("shift+ctrl+left", BmuxAction::EditorSelectWordLeft),
+                bind("shift+ctrl+right", BmuxAction::EditorSelectWordRight),
+                bind("shift+up", BmuxAction::EditorSelectUp),
+                bind("shift+down", BmuxAction::EditorSelectDown),
                 bind("ctrl+d", BmuxAction::AppExit),
                 bind("escape", BmuxAction::AppInterrupt),
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),

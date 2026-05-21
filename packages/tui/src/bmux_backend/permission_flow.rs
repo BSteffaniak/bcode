@@ -64,6 +64,12 @@ pub(super) async fn handle_permission_key(
         | BmuxAction::EditorMoveWordRight
         | BmuxAction::EditorMoveStart
         | BmuxAction::EditorMoveEnd
+        | BmuxAction::EditorSelectLeft
+        | BmuxAction::EditorSelectRight
+        | BmuxAction::EditorSelectWordLeft
+        | BmuxAction::EditorSelectWordRight
+        | BmuxAction::EditorSelectUp
+        | BmuxAction::EditorSelectDown
         | BmuxAction::EditorDeleteBackward
         | BmuxAction::EditorDeleteForward
         | BmuxAction::EditorDeleteWordBackward

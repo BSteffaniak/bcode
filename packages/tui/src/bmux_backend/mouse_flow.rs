@@ -40,29 +40,27 @@ pub(super) async fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
             permission_flow::handle_permission_mouse(client, chat, permission_dialog, mouse).await
         }
-        MouseEventKind::Down(MouseButton::Left) => {
-            if hit_id.as_deref() == Some("composer") {
-                if let Some((row, col)) =
-                    composer_position_from_mouse(chat.app.composer_content_area(), mouse)
-                {
-                    let width = usize::from(chat.app.composer_content_area().width.max(1));
-                    let row = row.saturating_add(chat.app.composer_scroll_offset());
-                    chat.app.move_composer_to_wrapped_position(width, row, col);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            } else if hit_id.as_deref() == Some("diff-files") && chat.app.diff_visible() {
-                if let Some(row) = diff_file_row_from_mouse(mouse) {
-                    Ok(chat.app.select_diff_file(row))
-                } else {
-                    Ok(false)
-                }
+        MouseEventKind::Down(MouseButton::Left) if hit_id.as_deref() == Some("composer") => {
+            Ok(begin_composer_selection(chat, mouse))
+        }
+        MouseEventKind::Drag(MouseButton::Left) if chat.app.composer_mouse_selection_active() => {
+            Ok(extend_composer_selection(chat, mouse))
+        }
+        MouseEventKind::Up(MouseButton::Left) if chat.app.composer_mouse_selection_active() => {
+            Ok(chat.app.end_composer_mouse_selection())
+        }
+        MouseEventKind::Down(MouseButton::Left) if hit_id.as_deref() == Some("diff-files") => {
+            if chat.app.diff_visible()
+                && let Some(row) = diff_file_row_from_mouse(mouse)
+            {
+                Ok(chat.app.select_diff_file(row))
             } else {
                 Ok(false)
             }
         }
-        MouseEventKind::Down(MouseButton::Right | MouseButton::Middle | MouseButton::Other(_))
+        MouseEventKind::Down(
+            MouseButton::Left | MouseButton::Right | MouseButton::Middle | MouseButton::Other(_),
+        )
         | MouseEventKind::Up(_)
         | MouseEventKind::Drag(_)
         | MouseEventKind::Move
@@ -71,23 +69,37 @@ pub(super) async fn handle_mouse(
     }
 }
 
-fn composer_position_from_mouse(
-    area: bmux_tui::geometry::Rect,
-    mouse: MouseEvent,
-) -> Option<(usize, usize)> {
-    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
-        return None;
+fn begin_composer_selection(chat: &mut ActiveChat, mouse: MouseEvent) -> bool {
+    let Some((width, row, col)) = composer_position_from_mouse(chat, mouse) else {
+        return false;
     };
+    chat.app.begin_composer_mouse_selection(width, row, col);
+    true
+}
+
+fn extend_composer_selection(chat: &mut ActiveChat, mouse: MouseEvent) -> bool {
+    let Some((width, row, col)) = composer_position_from_mouse(chat, mouse) else {
+        return false;
+    };
+    chat.app.extend_composer_mouse_selection(width, row, col)
+}
+
+fn composer_position_from_mouse(
+    chat: &ActiveChat,
+    mouse: MouseEvent,
+) -> Option<(usize, usize, usize)> {
+    let area = chat.app.composer_content_area();
     if mouse.position.y < area.y || mouse.position.y >= area.bottom() {
         return None;
     }
     if mouse.position.x < area.x || mouse.position.x >= area.right() {
         return None;
     }
-    Some((
-        usize::from(mouse.position.y.saturating_sub(area.y)),
-        usize::from(mouse.position.x.saturating_sub(area.x)),
-    ))
+    let width = usize::from(area.width.max(1));
+    let row = usize::from(mouse.position.y.saturating_sub(area.y))
+        .saturating_add(chat.app.composer_scroll_offset());
+    let col = usize::from(mouse.position.x.saturating_sub(area.x));
+    Some((width, row, col))
 }
 
 fn diff_file_row_from_mouse(mouse: MouseEvent) -> Option<usize> {

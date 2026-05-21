@@ -5,11 +5,12 @@ use std::collections::BTreeSet;
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionTokenUsage,
 };
+use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_tui::buffer::Buffer;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 
-use super::{app::BmuxApp, render, slash_palette, slash_palette_render};
+use super::{app::BmuxApp, input, keymap::BmuxKeyMap, render, slash_palette, slash_palette_render};
 
 #[test]
 fn render_includes_status_and_composer() {
@@ -41,6 +42,57 @@ fn composer_expands_and_scrolls_when_input_exceeds_max_rows() {
 
     assert!(buffer.row_symbols(12).unwrap().contains("Message"));
     assert!(output.contains('9'));
+}
+
+#[test]
+fn escape_interrupt_does_not_exit_chat() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    let outcome = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
+
+    assert!(outcome.interrupted);
+    assert!(!app.should_exit());
+}
+
+#[test]
+fn ctrl_d_clears_input_before_exit() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.replace_composer_with("draft");
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    let first = input::handle_key(&mut app, &keymap, ctrl_key('d'));
+    let second = input::handle_key(&mut app, &keymap, ctrl_key('d'));
+
+    assert!(first.redraw);
+    assert!(app.composer().is_empty());
+    assert!(second.redraw);
+    assert!(app.should_exit());
+}
+
+#[test]
+fn shift_arrows_extend_composer_selection() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.replace_composer_with("hello");
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    let outcome = input::handle_key(&mut app, &keymap, shift_key(KeyCode::Left));
+
+    assert!(outcome.redraw);
+    assert_eq!(app.composer().selected_text(), Some("o".to_owned()));
+}
+
+#[test]
+fn composer_mouse_drag_extends_selection() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_composer_content_area(Rect::new(2, 8, 20, 1));
+    app.replace_composer_with("hello world");
+
+    app.begin_composer_mouse_selection(20, 0, 0);
+    assert!(app.extend_composer_mouse_selection(20, 0, 5));
+    assert!(app.end_composer_mouse_selection());
+
+    assert_eq!(app.composer().selected_text(), Some("hello".to_owned()));
 }
 
 #[test]
@@ -245,6 +297,33 @@ fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> Sessio
         sequence,
         session_id,
         kind,
+    }
+}
+
+fn key(key: KeyCode) -> KeyStroke {
+    KeyStroke {
+        key,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+fn shift_key(key: KeyCode) -> KeyStroke {
+    KeyStroke {
+        key,
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        },
+    }
+}
+
+fn ctrl_key(ch: char) -> KeyStroke {
+    KeyStroke {
+        key: KeyCode::Char(ch),
+        modifiers: Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        },
     }
 }
 
