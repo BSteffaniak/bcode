@@ -1000,6 +1000,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",
+ "bmux_tui_components",
  "crossterm",
  "ratatui",
  "serde_json",
@@ -1119,6 +1120,16 @@ dependencies = [
  "crossterm",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "bmux_tui_components"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_keyboard",
+ "bmux_text_edit",
+ "bmux_tui",
+ "unicode-segmentation",
 ]
 
 [[package]]

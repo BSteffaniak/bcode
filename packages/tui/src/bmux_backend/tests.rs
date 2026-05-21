@@ -7,8 +7,9 @@ use bcode_session_models::{
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_tui::buffer::Buffer;
+use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Point, Rect};
 
 use super::{app::BmuxApp, input, keymap::BmuxKeyMap, render, slash_palette, slash_palette_render};
 
@@ -88,11 +89,40 @@ fn composer_mouse_drag_extends_selection() {
     app.set_composer_content_area(Rect::new(2, 8, 20, 1));
     app.replace_composer_with("hello world");
 
-    app.begin_composer_mouse_selection(20, 0, 0);
-    assert!(app.extend_composer_mouse_selection(20, 0, 5));
-    assert!(app.end_composer_mouse_selection());
+    let down = app.handle_composer_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 8));
+    let drag = app.handle_composer_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 7, 8));
+    let up = app.handle_composer_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 7, 8));
 
+    assert!(matches!(
+        down,
+        bmux_tui_components::text_input::TextInputOutcome::Redraw
+    ));
+    assert!(matches!(
+        drag,
+        bmux_tui_components::text_input::TextInputOutcome::Redraw
+    ));
+    assert!(matches!(
+        up,
+        bmux_tui_components::text_input::TextInputOutcome::Redraw
+    ));
     assert_eq!(app.composer().selected_text(), Some("hello".to_owned()));
+}
+
+#[test]
+fn composer_double_click_selects_word_and_triple_click_selects_all() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_composer_content_area(Rect::new(2, 8, 20, 1));
+    app.replace_composer_with("hello world");
+
+    let _ = app.handle_composer_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 8));
+    let _ = app.handle_composer_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 8));
+    assert_eq!(app.composer().selected_text(), Some("hello".to_owned()));
+
+    let _ = app.handle_composer_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 8));
+    assert_eq!(
+        app.composer().selected_text(),
+        Some("hello world".to_owned())
+    );
 }
 
 #[test]
@@ -325,6 +355,10 @@ fn ctrl_key(ch: char) -> KeyStroke {
             ..Modifiers::NONE
         },
     }
+}
+
+fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+    MouseEvent::new(kind, Point::new(x, y))
 }
 
 fn rendered_text(buffer: &Buffer) -> String {

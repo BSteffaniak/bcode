@@ -7,7 +7,11 @@ use bcode_session_models::{
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::diff::{DiffFileSummary, DiffLine};
+use bmux_tui::event::MouseEvent;
 use bmux_tui::geometry::Rect;
+use bmux_tui_components::text_input::{
+    TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
+};
 
 use super::activity::{ActivityState, model_turn_outcome_label};
 use super::cursor_blink::CursorBlink;
@@ -34,9 +38,7 @@ pub(super) struct BmuxApp {
     current_agent_id: String,
     thinking_label: String,
     token_usage: TokenUsageMeter,
-    composer_content_area: Rect,
-    composer_mouse_selection_active: bool,
-    composer: TextEditBuffer,
+    composer: TextInputState,
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
     diff_panel: DiffPanel,
@@ -66,9 +68,7 @@ impl BmuxApp {
             current_agent_id: "build".to_owned(),
             thinking_label: "default".to_owned(),
             token_usage: TokenUsageMeter::default(),
-            composer_content_area: Rect::new(0, 0, 1, 1),
-            composer_mouse_selection_active: false,
-            composer: TextEditBuffer::new(),
+            composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
             diff_panel: DiffPanel::new(),
@@ -129,40 +129,29 @@ impl BmuxApp {
     /// Return the composer content area from the latest render.
     #[must_use]
     pub(super) const fn composer_content_area(&self) -> Rect {
-        self.composer_content_area
+        self.composer.content_area()
     }
 
     /// Store the composer content area from the latest render.
-    pub(super) const fn set_composer_content_area(&mut self, area: Rect) {
-        self.composer_content_area = area;
+    pub(super) fn set_composer_content_area(&mut self, area: Rect) {
+        self.composer.set_content_area(area, &composer_policy());
     }
 
     /// Return the current composer wrapped-row scroll offset.
     #[must_use]
-    pub(super) fn composer_scroll_offset(&self) -> usize {
-        if self.composer_content_area.height == 0 {
-            return 0;
-        }
-        let visible_rows = usize::from(self.composer_content_area.height);
-        let layout = self
-            .composer
-            .wrapped_layout(usize::from(self.composer_content_area.width.max(1)));
-        layout
-            .cursor
-            .row
-            .saturating_add(1)
-            .saturating_sub(visible_rows)
+    pub(super) const fn composer_scroll_offset(&self) -> usize {
+        self.composer.vertical_scroll()
     }
 
     /// Return the composer buffer.
     #[must_use]
     pub(super) const fn composer(&self) -> &TextEditBuffer {
-        &self.composer
+        self.composer.buffer()
     }
 
     /// Return the composer buffer mutably.
     pub(super) const fn composer_mut(&mut self) -> &mut TextEditBuffer {
-        &mut self.composer
+        self.composer.buffer_mut()
     }
 
     /// Return transcript items.
@@ -227,61 +216,42 @@ impl BmuxApp {
 
     /// Extend composer selection with an editor motion.
     pub(super) fn extend_composer_selection(&mut self, motion: TextMotion) {
-        let width = usize::from(self.composer_content_area.width.max(1));
+        let width = usize::from(self.composer.content_area().width.max(1));
         match motion {
             TextMotion::VisualUp => self.extend_composer_selection_to_visual_delta(width, -1),
             TextMotion::VisualDown => self.extend_composer_selection_to_visual_delta(width, 1),
             motion => self
                 .composer
+                .buffer_mut()
                 .move_cursor_with_selection(motion, SelectionMode::Extend),
         }
         self.wake_cursor();
     }
 
-    /// Begin a mouse text selection in the composer.
-    pub(super) fn begin_composer_mouse_selection(&mut self, width: usize, row: usize, col: usize) {
-        self.composer
-            .move_cursor_to_wrapped_position(width, row, col);
-        self.composer_mouse_selection_active = true;
-        self.wake_cursor();
-    }
-
-    /// Extend the active composer mouse selection.
-    pub(super) fn extend_composer_mouse_selection(
-        &mut self,
-        width: usize,
-        row: usize,
-        col: usize,
-    ) -> bool {
-        if !self.composer_mouse_selection_active {
-            return false;
+    /// Handle a composer mouse event through the reusable text-input component.
+    pub(super) fn handle_composer_mouse(&mut self, mouse: MouseEvent) -> TextInputOutcome {
+        let outcome =
+            TextInputControl::new(&composer_policy()).handle_mouse(&mut self.composer, mouse);
+        if matches!(outcome, TextInputOutcome::Edited | TextInputOutcome::Redraw) {
+            self.wake_cursor();
         }
-        self.composer.select_to_wrapped_position(width, row, col);
-        self.wake_cursor();
-        true
-    }
-
-    /// End the active composer mouse selection, if any.
-    pub(super) const fn end_composer_mouse_selection(&mut self) -> bool {
-        let was_active = self.composer_mouse_selection_active;
-        self.composer_mouse_selection_active = false;
-        was_active
+        outcome
     }
 
     /// Return whether a composer mouse selection is active.
     #[must_use]
     pub(super) const fn composer_mouse_selection_active(&self) -> bool {
-        self.composer_mouse_selection_active
+        self.composer.mouse_selection_active()
     }
 
     /// Move the composer cursor one rendered row up, if possible.
     pub(super) fn move_composer_visual_up(&mut self) -> bool {
-        let width = usize::from(self.composer_content_area.width.max(1));
-        let layout = self.composer.wrapped_layout(width);
+        let width = usize::from(self.composer.content_area().width.max(1));
+        let layout = self.composer.buffer().wrapped_layout(width);
         if layout.cursor.row == 0 {
             return false;
         }
-        self.composer.move_cursor_to_wrapped_position(
+        self.composer.buffer_mut().move_cursor_to_wrapped_position(
             width,
             layout.cursor.row.saturating_sub(1),
             layout.cursor.col,
@@ -292,12 +262,12 @@ impl BmuxApp {
 
     /// Move the composer cursor one rendered row down, if possible.
     pub(super) fn move_composer_visual_down(&mut self) -> bool {
-        let width = usize::from(self.composer_content_area.width.max(1));
-        let layout = self.composer.wrapped_layout(width);
+        let width = usize::from(self.composer.content_area().width.max(1));
+        let layout = self.composer.buffer().wrapped_layout(width);
         if layout.cursor.row.saturating_add(1) >= layout.lines.len() {
             return false;
         }
-        self.composer.move_cursor_to_wrapped_position(
+        self.composer.buffer_mut().move_cursor_to_wrapped_position(
             width,
             layout.cursor.row.saturating_add(1),
             layout.cursor.col,
@@ -382,10 +352,10 @@ impl BmuxApp {
 
     /// Store the current composer text as a pending submission and clear input.
     pub(super) fn stage_submission(&mut self) {
-        let text = self.composer.text().to_owned();
+        let text = self.composer.buffer().text().to_owned();
         self.pending_submissions.stage(text.clone());
         self.input_history.push_submission(text);
-        self.composer.clear();
+        self.composer.buffer_mut().clear();
     }
 
     /// Return the currently pending submission.
@@ -417,13 +387,13 @@ impl BmuxApp {
     pub(super) fn restore_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
-        self.composer.insert_str(text);
+        self.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
     }
 
     /// Show the previous input-history entry, if available.
     pub(super) fn previous_input_history(&mut self) -> bool {
-        let Some(text) = self.input_history.previous(self.composer.text()) else {
+        let Some(text) = self.input_history.previous(self.composer.buffer().text()) else {
             return false;
         };
         self.replace_composer_with(&text);
@@ -622,8 +592,8 @@ impl BmuxApp {
 
     /// Replace composer contents.
     pub(super) fn replace_composer_with(&mut self, text: &str) {
-        self.composer.clear();
-        self.composer.insert_str(text);
+        self.composer.buffer_mut().clear();
+        self.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
     }
 
@@ -635,7 +605,7 @@ impl BmuxApp {
     }
 
     fn extend_composer_selection_to_visual_delta(&mut self, width: usize, delta: isize) {
-        let layout = self.composer.wrapped_layout(width);
+        let layout = self.composer.buffer().wrapped_layout(width);
         let target_row = if delta.is_negative() {
             layout.cursor.row.saturating_sub(delta.unsigned_abs())
         } else {
@@ -646,6 +616,7 @@ impl BmuxApp {
                 .min(layout.lines.len().saturating_sub(1))
         };
         self.composer
+            .buffer_mut()
             .select_to_wrapped_position(width, target_row, layout.cursor.col);
     }
 
@@ -857,6 +828,10 @@ impl BmuxApp {
             format!("{skill_id}: {error}"),
         ));
     }
+}
+
+const fn composer_policy() -> TextInputPolicy {
+    TextInputPolicy::chat_composer()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
