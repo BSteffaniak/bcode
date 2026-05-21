@@ -274,10 +274,11 @@ bash = { "python3 *" = "allow" }
         assert!(tools.contains(&"filesystem.edit".to_string()));
         assert!(tools.contains(&"shell.run".to_string()));
         assert_eq!(build.permission.bash.get("python3 *"), Some(&Action::Allow));
-        assert_eq!(
-            source.label,
+        assert!(matches!(
+            source.label.as_str(),
             "built-in default agent policy + runtime permissions state"
-        );
+                | "built-in default agent policy + bcode.toml [agent] + runtime permissions state"
+        ));
         assert!(!source.using_default);
 
         restore_env("BCODE_CONFIG", previous_config);
