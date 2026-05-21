@@ -1,13 +1,12 @@
 //! BMUX backend session picker rendering.
 
-use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::geometry::Rect;
 use bmux_tui::input::TextInput;
-use bmux_tui::list::List;
-use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
+use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 
+use super::picker_render::{render_picker_list, render_picker_panel};
 use super::session_picker::{SessionPickerApp, SessionPickerMode};
 
 /// Render the session picker.
@@ -17,13 +16,7 @@ pub(super) fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
         return;
     }
 
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::Cyan)))
-        .title(" Sessions ")
-        .padding(Insets::new(1, 1, 1, 1));
-    panel.render(area, frame);
-
-    let inner = panel.inner_area(area);
+    let inner = render_picker_panel(" Sessions ", area, frame);
     let header = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.write_line(header, &header_line(app.mode()));
 
@@ -62,12 +55,7 @@ pub(super) fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
     }
     let list_area = Rect::new(inner.x, list_y, inner.width, list_bottom - list_y);
     let items = app.list_items();
-    let mut state = *app.list_state_mut();
-    state.ensure_selected_visible(list_area.height, items.len());
-    List::new(&items)
-        .highlight_symbol("> ")
-        .render(list_area, frame, &mut state);
-    *app.list_state_mut() = state;
+    render_picker_list(&items, app.list_state_mut(), list_area, frame);
 }
 
 fn header_line(mode: SessionPickerMode) -> Line {

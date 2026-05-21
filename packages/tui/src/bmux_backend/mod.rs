@@ -10,6 +10,7 @@ mod model_picker;
 mod model_picker_render;
 mod permission_dialog;
 mod permission_dialog_render;
+mod picker_render;
 mod provider_picker;
 mod provider_picker_render;
 mod render;

@@ -6,6 +6,8 @@ use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 
+use super::filtered_list::FilteredListState;
+
 /// Session picker mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionPickerMode {
@@ -23,8 +25,7 @@ pub(super) struct SessionPickerApp {
     sessions: Vec<SessionSummary>,
     filter: TextEditBuffer,
     rename: TextEditBuffer,
-    list_state: ListState,
-    filtered_indices: Vec<usize>,
+    list: FilteredListState,
     status: String,
     mode: SessionPickerMode,
 }
@@ -33,17 +34,12 @@ impl SessionPickerApp {
     /// Create a picker from session summaries.
     #[must_use]
     pub(super) fn new(sessions: Vec<SessionSummary>) -> Self {
-        let filtered_indices = (0..sessions.len()).collect::<Vec<_>>();
-        let mut list_state = ListState::new();
-        if !filtered_indices.is_empty() {
-            list_state.select(Some(0));
-        }
+        let list = FilteredListState::new(sessions.len());
         Self {
             sessions,
             filter: TextEditBuffer::new(),
             rename: TextEditBuffer::new(),
-            list_state,
-            filtered_indices,
+            list,
             status: "Select a session or press Ctrl-N to create one".to_owned(),
             mode: SessionPickerMode::Filter,
         }
@@ -79,7 +75,7 @@ impl SessionPickerApp {
 
     /// Return list state.
     pub(super) const fn list_state_mut(&mut self) -> &mut ListState {
-        &mut self.list_state
+        self.list.list_state_mut()
     }
 
     /// Return picker status.
@@ -102,14 +98,14 @@ impl SessionPickerApp {
     /// Return visible list items.
     #[must_use]
     pub(super) fn list_items(&self) -> Vec<ListItem> {
-        if self.filtered_indices.is_empty() {
-            return vec![ListItem::new(Line::from_spans(vec![Span::styled(
+        if self.list.indices().is_empty() {
+            return vec![empty_item(
                 "No matching sessions. Press Ctrl-N to create a new session.",
-                Style::new().fg(Color::BrightBlack),
-            )]))];
+            )];
         }
 
-        self.filtered_indices
+        self.list
+            .indices()
             .iter()
             .map(|index| session_item(&self.sessions[*index]))
             .collect()
@@ -118,26 +114,20 @@ impl SessionPickerApp {
     /// Return the selected session id.
     #[must_use]
     pub(super) fn selected_session_id(&self) -> Option<SessionId> {
-        let selected = self.list_state.selected?;
-        let index = *self.filtered_indices.get(selected)?;
+        let index = self.list.selected_source_index()?;
         Some(self.sessions[index].id)
     }
 
     /// Return selected session name.
     #[must_use]
     pub(super) fn selected_session_name(&self) -> Option<&str> {
-        let selected = self.list_state.selected?;
-        let index = *self.filtered_indices.get(selected)?;
+        let index = self.list.selected_source_index()?;
         self.sessions[index].name.as_deref()
     }
 
     /// Select a visible row by zero-based index.
     pub(super) const fn select_visible(&mut self, row: usize) -> bool {
-        if row >= self.filtered_indices.len() {
-            return false;
-        }
-        self.list_state.select(Some(row));
-        true
+        self.list.select_visible(row)
     }
 
     /// Enter rename mode for the selected session.
@@ -184,35 +174,27 @@ impl SessionPickerApp {
     /// Recompute filtered sessions after filter edits.
     pub(super) fn refresh_filter(&mut self) {
         let query = self.filter.text().trim().to_ascii_lowercase();
-        self.filtered_indices = self
+        let filtered_indices = self
             .sessions
             .iter()
             .enumerate()
             .filter_map(|(index, session)| session_matches(session, &query).then_some(index))
             .collect();
-        if self.filtered_indices.is_empty() {
-            self.list_state.select(None);
-            self.list_state.offset = 0;
-        } else {
-            self.list_state.select(Some(
-                self.list_state
-                    .selected
-                    .unwrap_or(0)
-                    .min(self.filtered_indices.len() - 1),
-            ));
-            self.list_state
-                .ensure_selected_visible(1, self.filtered_indices.len());
-        }
+        self.list.replace_indices(filtered_indices);
+        let visible_count = self.list.indices().len();
+        self.list
+            .list_state_mut()
+            .ensure_selected_visible(1, visible_count);
     }
 
     /// Move selection down.
     pub(super) fn select_next(&mut self) {
-        self.list_state.select_next(self.filtered_indices.len());
+        self.list.select_next();
     }
 
     /// Move selection up.
     pub(super) fn select_previous(&mut self) {
-        self.list_state.select_previous(self.filtered_indices.len());
+        self.list.select_previous();
     }
 }
 
@@ -238,4 +220,11 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
         .as_deref()
         .is_some_and(|name| name.to_ascii_lowercase().contains(query))
         || session.id.to_string().to_ascii_lowercase().contains(query)
+}
+
+fn empty_item(message: &str) -> ListItem {
+    ListItem::new(Line::from_spans(vec![Span::styled(
+        message.to_owned(),
+        Style::new().fg(Color::BrightBlack),
+    )]))
 }
