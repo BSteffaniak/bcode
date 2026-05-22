@@ -17,6 +17,7 @@ bcode_config         = { workspace = true }
 bcode_ipc            = { workspace = true }
 bcode_model          = { workspace = true }
 bcode_plugin         = { workspace = true }
+bcode_provider_auth  = { workspace = true }
 bcode_server         = { workspace = true }
 bcode_session        = { workspace = true }
 bcode_session_models = { workspace = true }

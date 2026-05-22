@@ -223,6 +223,21 @@ fn auth_credential_source_keys(
             .entry("api_key".to_string())
             .or_insert_with(|| api_key_env.clone());
     }
+    if matches!(
+        auth_profile.settings.get("provider").map(String::as_str),
+        Some("aws" | "bedrock")
+    ) {
+        for (credential, key) in [
+            ("access_key_id", "AWS_ACCESS_KEY_ID"),
+            ("secret_access_key", "AWS_SECRET_ACCESS_KEY"),
+            ("session_token", "AWS_SESSION_TOKEN"),
+            ("bearer_token", "AWS_BEARER_TOKEN_BEDROCK"),
+        ] {
+            source_keys
+                .entry(credential.to_string())
+                .or_insert_with(|| key.to_string());
+        }
+    }
     if auth_profile
         .settings
         .get("mode")

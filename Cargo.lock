@@ -715,6 +715,7 @@ dependencies = [
  "bcode_ipc",
  "bcode_model",
  "bcode_plugin",
+ "bcode_provider_auth",
  "bcode_server",
  "bcode_session",
  "bcode_session_models",

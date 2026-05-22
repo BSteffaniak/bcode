@@ -1748,6 +1748,9 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
+        auth_schemes: ["api_key".to_string(), "chatgpt".to_string()]
+            .into_iter()
+            .collect(),
         metadata: diagnostics_metadata(&settings, None),
     }
 }

@@ -13,7 +13,7 @@ use bcode_model::{
     ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -217,6 +217,7 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
+        auth_schemes: BTreeSet::new(),
         metadata: BTreeMap::new(),
     }
 }

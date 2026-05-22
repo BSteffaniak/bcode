@@ -167,6 +167,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             } => publish_plugin_event(&root, &topic, payload, daemon).await?,
         },
         Commands::Model { command } => handle_model_command(command).await?,
+        Commands::Auth { command } => handle_auth_command(command)?,
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Provider { command } => handle_provider_command(command)?,
         Commands::Permission { command } => handle_permission_command(command).await?,
@@ -262,6 +263,10 @@ enum Commands {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
     Login {
         #[command(subcommand)]
@@ -401,6 +406,19 @@ enum ModelCommand {
         model_id: String,
         #[arg(long)]
         provider: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    Status,
+    Login {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        #[arg(long)]
+        recipient_key: Option<String>,
     },
 }
 
@@ -651,6 +669,123 @@ fn handle_provider_command(command: ProviderCommand) -> Result<(), CliError> {
             );
         }
     }
+    Ok(())
+}
+
+fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
+    match command {
+        AuthCommand::Status => auth_status(),
+        AuthCommand::Login {
+            profile,
+            vault,
+            recipient_key,
+        } => auth_login(profile, vault, recipient_key),
+    }
+}
+
+fn auth_status() -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let selection = config.resolved_model_selection();
+    let Some(auth_profile_name) = active_login_auth_profile(&config) else {
+        println!("No active auth profile selected.");
+        return Ok(());
+    };
+    let Some(auth_profile) = config.auth.profiles.get(&auth_profile_name) else {
+        println!("Active auth profile: {auth_profile_name}");
+        println!("Status: not declared in config");
+        return Ok(());
+    };
+    let resolved = bcode_provider_auth::resolve_auth_profile(&auth_profile_name, auth_profile);
+    println!("Auth profile: {auth_profile_name}");
+    println!("Backend: {}", auth_profile.backend);
+    if let Some(scheme) = &resolved.auth.scheme {
+        println!("Scheme: {scheme}");
+    }
+    if let Some(provider) = auth_profile.settings.get("provider") {
+        println!("Provider: {provider}");
+    }
+    if let Some(provider_plugin_id) = selection.provider_plugin_id {
+        println!("Provider plugin: {provider_plugin_id}");
+    }
+    if let Some(model_id) = selection.model_id {
+        println!("Model: {model_id}");
+    }
+    if resolved.auth.storage.is_empty() {
+        println!("Credentials: no mapped credentials");
+    } else {
+        println!("Credentials:");
+        for (credential, storage) in &resolved.auth.storage {
+            let present = resolved.auth.credentials.contains_key(credential);
+            println!(
+                "  {credential}: {} ({}/{})",
+                if present { "present" } else { "missing" },
+                storage.backend,
+                storage.key
+            );
+        }
+    }
+    Ok(())
+}
+
+fn auth_login(
+    profile: Option<String>,
+    vault: Option<PathBuf>,
+    recipient_key: Option<String>,
+) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let auth_profile_name = profile
+        .or_else(|| active_login_auth_profile(&config))
+        .ok_or_else(|| {
+            CliError::LoginProfile(
+                "No active auth profile found; pass --profile or run a provider wrapper."
+                    .to_string(),
+            )
+        })?;
+    let auth_profile = config
+        .auth
+        .profiles
+        .get(&auth_profile_name)
+        .ok_or_else(|| {
+            CliError::LoginProfile(format!(
+                "Auth profile '{auth_profile_name}' is not declared in config."
+            ))
+        })?;
+    if auth_profile.backend != "sshenv" {
+        return Err(CliError::LoginProfile(format!(
+            "Auth profile '{auth_profile_name}' uses backend '{}'; generic auth login only supports sshenv profiles.",
+            auth_profile.backend
+        )));
+    }
+    let api_key_env = auth_profile
+        .map
+        .get("api_key")
+        .and_then(|mapping| mapping.env.as_ref().or(mapping.key.as_ref()))
+        .or_else(|| auth_profile.settings.get("api_key_env"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| CliError::LoginProfile(format!(
+            "Auth profile '{auth_profile_name}' does not declare an api_key mapping. Use a provider-specific login command."
+        )))?;
+    let storage_profile = auth_profile
+        .settings
+        .get("profile")
+        .cloned()
+        .unwrap_or_else(|| auth_profile_name.clone());
+    let vault_path = vault
+        .or_else(|| auth_profile.settings.get("vault").map(PathBuf::from))
+        .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let store = open_auth_store(&vault_path, recipient_key)?;
+    let api_key = rpassword::prompt_password(format!("{api_key_env}: "))?;
+    store
+        .set_secret(&storage_profile, &api_key_env, Zeroizing::new(api_key))
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to store API key: {error}"))
+        })?;
+    println!("API key saved");
+    println!("Auth profile: {auth_profile_name}");
+    println!("Credentials saved to sshenv vault profile: {storage_profile}");
+    println!("API key environment variable: {api_key_env}");
+    println!("Config is declarative; no config file update needed.");
     Ok(())
 }
 

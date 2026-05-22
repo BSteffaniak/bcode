@@ -39,6 +39,9 @@ pub struct ProviderCapabilities {
     pub display_name: String,
     #[serde(default)]
     pub capabilities: BTreeSet<ProviderCapability>,
+    /// Provider-supported auth scheme identifiers, for example `api_key` or `chatgpt`.
+    #[serde(default)]
+    pub auth_schemes: BTreeSet<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }

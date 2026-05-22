@@ -355,16 +355,19 @@ async fn bedrock_sdk_config_with_region(
 
 fn client_context_credentials(settings: &Settings) -> Option<Credentials> {
     let access_key = settings
-        .env
-        .get("AWS_ACCESS_KEY_ID")
+        .auth_credentials
+        .get("access_key_id")
+        .or_else(|| settings.env.get("AWS_ACCESS_KEY_ID"))
         .filter(|value| !value.trim().is_empty())?;
     let secret_key = settings
-        .env
-        .get("AWS_SECRET_ACCESS_KEY")
+        .auth_credentials
+        .get("secret_access_key")
+        .or_else(|| settings.env.get("AWS_SECRET_ACCESS_KEY"))
         .filter(|value| !value.trim().is_empty())?;
     let session_token = settings
-        .env
-        .get("AWS_SESSION_TOKEN")
+        .auth_credentials
+        .get("session_token")
+        .or_else(|| settings.env.get("AWS_SESSION_TOKEN"))
         .filter(|value| !value.trim().is_empty())
         .cloned();
     Some(Credentials::new(
@@ -774,6 +777,7 @@ struct Settings {
     region_source: RegionSource,
     aws_profile: Option<String>,
     endpoint_url: Option<String>,
+    auth_credentials: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
     config_source: String,
 }
@@ -811,9 +815,17 @@ impl Settings {
         let request_env = request
             .map(|request| request.provider_context.env.clone())
             .unwrap_or_default();
-        let request_auth_attributes = request
-            .and_then(|request| request.provider_context.auth.as_ref())
+        let request_auth = request.and_then(|request| request.provider_context.auth.as_ref());
+        let request_auth_attributes = request_auth
             .map(|auth| auth.attributes.clone())
+            .unwrap_or_default();
+        let request_auth_credentials = request_auth
+            .map(|auth| {
+                auth.credentials
+                    .iter()
+                    .map(|(key, credential)| (key.clone(), credential.value.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
             .unwrap_or_default();
         let profile_settings = resolved
             .as_ref()
@@ -884,6 +896,7 @@ impl Settings {
                 "BEDROCK_ENDPOINT_URL",
             ])
             .or_else(|| value(&["endpoint_url"])),
+            auth_credentials: request_auth_credentials,
             env: request_env,
             config_source: if request.is_some() {
                 "request/config/environment".to_string()
@@ -920,6 +933,12 @@ fn capabilities() -> ProviderCapabilities {
             ProviderCapability::Cancellation,
             ProviderCapability::Tools,
             ProviderCapability::PromptCaching,
+        ]
+        .into_iter()
+        .collect(),
+        auth_schemes: [
+            "aws_default_chain".to_string(),
+            "aws_credentials".to_string(),
         ]
         .into_iter()
         .collect(),
