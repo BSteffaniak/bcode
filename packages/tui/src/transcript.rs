@@ -70,23 +70,6 @@ pub enum TranscriptItemKind {
     Generic,
 }
 
-/// Parsed shell tool output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShellOutputTranscript {
-    /// Command that ran, when known from the tool request.
-    pub command: Option<String>,
-    /// Working directory, when known from the tool request.
-    pub cwd: Option<String>,
-    /// Process exit code, when reported by the tool.
-    pub exit_code: Option<i32>,
-    /// Whether the command timed out.
-    pub timed_out: bool,
-    /// Raw ANSI-preserving stdout.
-    pub stdout: String,
-    /// Raw ANSI-preserving stderr.
-    pub stderr: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ToolCallContext {
     tool_name: String,
@@ -324,49 +307,6 @@ pub fn pretty_jsonish(value: &str) -> String {
             )
         },
     )
-}
-
-pub fn shell_output_from_result(
-    tool_name: Option<&str>,
-    arguments_json: Option<&str>,
-    result: &str,
-) -> Option<ShellOutputTranscript> {
-    let tool_name = tool_name?;
-    if normalized_tool_name(tool_name) != "shell_run" {
-        return None;
-    }
-    let result_json = serde_json::from_str::<serde_json::Value>(result).ok()?;
-    let arguments_json = arguments_json
-        .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok());
-    Some(ShellOutputTranscript {
-        command: arguments_json
-            .as_ref()
-            .and_then(|arguments| string_field(arguments, "command")),
-        cwd: arguments_json
-            .as_ref()
-            .and_then(|arguments| string_field(arguments, "cwd")),
-        exit_code: result_json
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok()),
-        timed_out: result_json
-            .get("timed_out")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        stdout: string_field(&result_json, "stdout").unwrap_or_default(),
-        stderr: string_field(&result_json, "stderr").unwrap_or_default(),
-    })
-}
-
-fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn normalized_tool_name(tool_name: &str) -> String {
-    tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
 }
 
 /// Truncate long transcript blocks.

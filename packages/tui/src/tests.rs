@@ -736,11 +736,67 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
             2,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call_shell".to_owned(),
+                result: format!(
+                    "exit_code: 0\ntimed_out: false\nstdout:\n{stdout}\nstderr:\n\u{1b}[31mwarning\u{1b}[0m"
+                ),
+                is_error: false,
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("Tool result · shell.run · ok"));
+    assert!(output.contains("terminal: yes"));
+    assert!(output.contains("exit 0"));
+    assert!(output.contains("line 0"));
+    assert!(output.contains("line 39"));
+    assert!(output.contains("stdout rows hidden"));
+    assert!(!output.contains('\u{1b}'));
+    assert_eq!(
+        buffer
+            .get(Point::new(4, output_line_y(&buffer, "line 0").unwrap()))
+            .map(|cell| cell.style.fg),
+        Some(Some(bmux_tui::style::Color::Green))
+    );
+}
+
+#[test]
+fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
+    let session_id = SessionId::new();
+    let output = (0..40)
+        .map(|index| format!("\u{1b}[32mline {index}\u{1b}[0m"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call_terminal".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: serde_json::json!({
+                    "command": "git status --short && ls",
+                })
+                .to_string(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call_terminal".to_owned(),
                 result: serde_json::json!({
+                    "mode": "terminal",
                     "exit_code": 0,
                     "timed_out": false,
-                    "stdout": stdout,
-                    "stderr": "\u{1b}[31mwarning\u{1b}[0m",
+                    "output": output,
+                    "columns": 80,
+                    "rows": 10,
                 })
                 .to_string(),
                 is_error: false,
@@ -755,18 +811,10 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Tool result · shell.run · ok"));
-    assert!(output.contains("command: cargo test"));
-    assert!(output.contains("exit 0"));
+    assert!(output.contains("terminal: 80x10"));
     assert!(output.contains("line 0"));
     assert!(output.contains("line 39"));
-    assert!(output.contains("stdout rows hidden"));
     assert!(!output.contains('\u{1b}'));
-    assert_eq!(
-        buffer
-            .get(Point::new(4, output_line_y(&buffer, "line 0").unwrap()))
-            .map(|cell| cell.style.fg),
-        Some(Some(bmux_tui::style::Color::Green))
-    );
 }
 
 #[test]

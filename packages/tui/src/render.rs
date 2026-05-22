@@ -24,12 +24,10 @@ use super::app::{BmuxApp, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_present::{
-    GrepMatchPresentation, ListEntryPresentation, ToolRequestPresentation, ToolResultPresentation,
-    tool_request_presentation, tool_result_presentation,
+    GrepMatchPresentation, ListEntryPresentation, ShellResultPresentation, ToolRequestPresentation,
+    ToolResultPresentation, tool_request_presentation, tool_result_presentation,
 };
-use super::transcript::{
-    ShellOutputTranscript, TranscriptItem, TranscriptItemKind, shell_output_from_result,
-};
+use super::transcript::{TranscriptItem, TranscriptItemKind};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
@@ -301,7 +299,7 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
         TranscriptItemKind::ToolResult {
             tool_call_id,
             tool_name,
-            arguments_json,
+            arguments_json: _,
             result,
             is_error,
         } => {
@@ -311,7 +309,6 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
                 ToolResultRenderContext {
                     tool_call_id,
                     tool_name: tool_name.as_deref(),
-                    arguments_json: arguments_json.as_deref(),
                     result,
                     is_error: *is_error,
                 },
@@ -417,7 +414,6 @@ fn push_tool_request_rows(
 struct ToolResultRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: Option<&'a str>,
-    arguments_json: Option<&'a str>,
     result: &'a str,
     is_error: bool,
 }
@@ -445,11 +441,7 @@ fn push_tool_result_rows(
         },
         muted_style(),
     );
-    if let Some(output) =
-        shell_output_from_result(context.tool_name, context.arguments_json, context.result)
-    {
-        push_shell_output_rows(rows, &output, width);
-    } else if let Some(presentation) = tool_result_presentation(context.tool_name, context.result) {
+    if let Some(presentation) = tool_result_presentation(context.tool_name, context.result) {
         push_tool_result_presentation_rows(rows, &presentation, width);
     } else {
         push_labeled_text_preview(
@@ -638,6 +630,7 @@ fn push_tool_result_presentation_rows(
             width,
             |rows| push_grep_matches(rows, matches, width),
         ),
+        ToolResultPresentation::Shell(shell) => push_shell_result_rows(rows, shell, width),
         ToolResultPresentation::Stat { exists, kind, len } => {
             push_kv_row(rows, "exists", if *exists { "yes" } else { "no" }, width);
             if let Some(kind) = kind {
@@ -961,31 +954,52 @@ const fn diff_view_styles() -> DiffViewStyles {
     }
 }
 
-fn push_shell_output_rows(rows: &mut Vec<Line>, output: &ShellOutputTranscript, width: u16) {
-    if let Some(terminal) = TerminalOutputTranscript::parse(&output.stdout) {
-        push_terminal_output_rows(rows, &terminal, width);
-        return;
-    }
-    if let Some(command) = &output.command {
-        push_wrapped_styled_text(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureShellOutput {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn push_shell_result_rows(rows: &mut Vec<Line>, shell: &ShellResultPresentation, width: u16) {
+    match shell {
+        ShellResultPresentation::Terminal {
+            exit_code,
+            timed_out,
+            output,
+            columns,
+            rows: terminal_rows,
+        } => push_terminal_output_rows(
             rows,
-            vec![Span::styled("  ", muted_style())],
-            &format!("command: {command}"),
+            &TerminalOutputTranscript {
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                output: output.clone(),
+                columns: *columns,
+                rows: *terminal_rows,
+            },
             width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    if let Some(cwd) = &output.cwd {
-        push_wrapped_styled_text(
+        ),
+        ShellResultPresentation::Capture {
+            exit_code,
+            timed_out,
+            stdout,
+            stderr,
+        } => push_shell_output_rows(
             rows,
-            vec![Span::styled("  ", muted_style())],
-            &format!("cwd: {cwd}"),
+            &CaptureShellOutput {
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            },
             width,
-            muted_style(),
-            muted_style(),
-        );
+        ),
     }
+}
+
+fn push_shell_output_rows(rows: &mut Vec<Line>, output: &CaptureShellOutput, width: u16) {
     let status = shell_status(output);
     push_wrapped_styled_text(
         rows,
@@ -1011,25 +1025,12 @@ fn push_shell_output_rows(rows: &mut Vec<Line>, output: &ShellOutputTranscript, 
     );
 }
 
-#[derive(Debug, serde::Deserialize)]
 struct TerminalOutputTranscript {
-    mode: String,
     exit_code: Option<i32>,
     timed_out: bool,
     output: String,
     columns: u16,
     rows: u16,
-}
-
-impl TerminalOutputTranscript {
-    fn parse(value: &str) -> Option<Self> {
-        let output = serde_json::from_str::<Self>(value).ok()?;
-        if output.mode == "terminal" {
-            Some(output)
-        } else {
-            None
-        }
-    }
 }
 
 fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTranscript, width: u16) {
@@ -1067,11 +1068,17 @@ fn terminal_output_lines(output: &TerminalOutputTranscript) -> Vec<Line> {
     };
     stream.process(output.output.as_bytes());
     let grid = stream.grid();
-    let total_rows = grid.display_rows(0, usize::MAX).len();
-    let offset = total_rows.saturating_sub(MAX_INLINE_TOOL_TEXT_ROWS);
-    grid.display_rows(offset, MAX_INLINE_TOOL_TEXT_ROWS)
+    let mut rows = grid.all_main_rows_slow();
+    if rows.is_empty() {
+        rows = grid.display_rows(0, MAX_INLINE_TOOL_TEXT_ROWS);
+    }
+    let lines = rows
         .iter()
         .map(|row| terminal_grid_row_to_line(grid, row))
+        .collect::<Vec<_>>();
+    preview_lines(&lines, MAX_INLINE_TOOL_TEXT_ROWS)
+        .into_iter()
+        .cloned()
         .collect()
 }
 
@@ -1273,7 +1280,7 @@ fn prefix_line(mut line: Line, prefix: &str, prefix_style: Style) -> Line {
     Line::from_spans(spans)
 }
 
-fn shell_status(output: &ShellOutputTranscript) -> String {
+fn shell_status(output: &CaptureShellOutput) -> String {
     let exit = output.exit_code.map_or_else(
         || "exit unknown".to_owned(),
         |exit_code| format!("exit {exit_code}"),
@@ -1285,7 +1292,7 @@ fn shell_status(output: &ShellOutputTranscript) -> String {
     }
 }
 
-fn shell_status_style(output: &ShellOutputTranscript) -> Style {
+fn shell_status_style(output: &CaptureShellOutput) -> Style {
     if output.timed_out || output.exit_code.is_some_and(|exit_code| exit_code != 0) {
         Style::new().fg(Color::Red)
     } else {

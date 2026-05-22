@@ -148,6 +148,37 @@ pub enum ToolResultPresentation {
         /// Optional byte length.
         len: Option<u64>,
     },
+    /// Shell command result.
+    Shell(ShellResultPresentation),
+}
+
+/// Human-readable shell command result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellResultPresentation {
+    /// Pseudo-terminal execution result.
+    Terminal {
+        /// Process exit code.
+        exit_code: Option<i32>,
+        /// Whether execution timed out.
+        timed_out: bool,
+        /// Raw terminal byte stream decoded as UTF-8.
+        output: String,
+        /// Terminal columns used for execution.
+        columns: u16,
+        /// Terminal rows used for execution.
+        rows: u16,
+    },
+    /// Captured stdout/stderr execution result.
+    Capture {
+        /// Process exit code.
+        exit_code: Option<i32>,
+        /// Whether execution timed out.
+        timed_out: bool,
+        /// Raw ANSI-preserving stdout.
+        stdout: String,
+        /// Raw ANSI-preserving stderr.
+        stderr: String,
+    },
 }
 
 /// Human-readable directory entry.
@@ -225,8 +256,13 @@ pub fn tool_result_presentation(
     tool_name: Option<&str>,
     result: &str,
 ) -> Option<ToolResultPresentation> {
-    let normalized = normalized_tool_name(tool_name?);
-    match normalized.as_str() {
+    let normalized = tool_name.map(normalized_tool_name);
+    if matches!(normalized.as_deref(), Some("shell_run" | "shell"))
+        || looks_like_shell_result(result)
+    {
+        return shell_result(result).map(ToolResultPresentation::Shell);
+    }
+    match normalized?.as_str() {
         "filesystem_read" | "read" => Some(filesystem_read_result(result)),
         "filesystem_write" | "write" => Some(ToolResultPresentation::Write {
             summary: result.trim().to_owned(),
@@ -242,6 +278,76 @@ pub fn tool_result_presentation(
         "filesystem_grep" | "grep" => filesystem_grep_result(result),
         "filesystem_stat" | "stat" => filesystem_stat_result(result),
         _ => None,
+    }
+}
+
+fn looks_like_shell_result(result: &str) -> bool {
+    result.starts_with("exit_code: ")
+        || result.contains("\nstdout:\n")
+        || serde_json::from_str::<Value>(result)
+            .ok()
+            .and_then(|value| string_field(&value, "mode"))
+            .as_deref()
+            == Some("terminal")
+}
+
+fn shell_result(result: &str) -> Option<ShellResultPresentation> {
+    terminal_shell_result(result).or_else(|| capture_shell_result(result))
+}
+
+fn terminal_shell_result(result: &str) -> Option<ShellResultPresentation> {
+    let value = serde_json::from_str::<Value>(result).ok()?;
+    if string_field(&value, "mode").as_deref() != Some("terminal") {
+        return None;
+    }
+    Some(ShellResultPresentation::Terminal {
+        exit_code: i32_field(&value, "exit_code"),
+        timed_out: bool_field(&value, "timed_out"),
+        output: string_field(&value, "output").unwrap_or_default(),
+        columns: u16_field(&value, "columns").unwrap_or(120).max(1),
+        rows: u16_field(&value, "rows").unwrap_or(30).max(1),
+    })
+}
+
+fn capture_shell_result(result: &str) -> Option<ShellResultPresentation> {
+    let mut exit_code = None;
+    let mut timed_out = false;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut section = None;
+    for line in result.lines() {
+        match line {
+            line if line.starts_with("exit_code: ") => {
+                let raw = line.trim_start_matches("exit_code: ");
+                exit_code = raw.parse::<i32>().ok();
+            }
+            line if line.starts_with("timed_out: ") => {
+                timed_out = line.trim_start_matches("timed_out: ") == "true";
+            }
+            "stdout:" => section = Some("stdout"),
+            "stderr:" => section = Some("stderr"),
+            _ => match section {
+                Some("stdout") => {
+                    stdout.push_str(line);
+                    stdout.push('\n');
+                }
+                Some("stderr") => {
+                    stderr.push_str(line);
+                    stderr.push('\n');
+                }
+                _ => {}
+            },
+        }
+    }
+    if section.is_some() {
+        Some(ShellResultPresentation::Capture {
+            exit_code,
+            timed_out,
+            stdout,
+            stderr,
+        })
+    } else {
+        None
     }
 }
 
@@ -353,6 +459,20 @@ fn path_display(path: &str) -> String {
 
 fn bool_field(value: &Value, field: &str) -> bool {
     value.get(field).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn i32_field(value: &Value, field: &str) -> Option<i32> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn u16_field(value: &Value, field: &str) -> Option<u16> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
 }
 
 fn u64_field(value: &Value, field: &str) -> Option<u64> {
