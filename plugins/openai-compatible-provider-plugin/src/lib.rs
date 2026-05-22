@@ -2041,8 +2041,11 @@ fn settings() -> Settings {
 
 fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let saved = saved_openai_auth();
-    let xai_mode = saved_has_xai_keys(&saved) || env_has_xai_keys(context);
-    let chatgpt_mode = saved_openai_auth_is_chatgpt(&saved) && !xai_mode;
+    let allow_saved_auth = context.auth_profile.is_none();
+    let xai_mode = env_has_xai_keys(context) || (allow_saved_auth && saved_has_xai_keys(&saved));
+    let chatgpt_mode = (context_has_chatgpt_auth(context)
+        || (allow_saved_auth && saved_openai_auth_is_chatgpt(&saved)))
+        && !xai_mode;
     let fallback_model = if xai_mode {
         DEFAULT_XAI_MODEL_ID.to_string()
     } else if chatgpt_mode {
@@ -2171,16 +2174,24 @@ fn saved_has_xai_keys(saved: &SavedOpenAiAuth) -> bool {
 }
 
 fn env_has_xai_keys(context: &ProviderRequestContext) -> bool {
-    context_env_value(context, "BCODE_XAI_API_KEY").is_some()
-        || context_env_value(context, "XAI_API_KEY").is_some()
+    context_auth_env_value(context, "BCODE_XAI_API_KEY").is_some()
+        || context_auth_env_value(context, "XAI_API_KEY").is_some()
 }
 
+fn context_has_chatgpt_auth(context: &ProviderRequestContext) -> bool {
+    context_auth_env_value(context, "BCODE_OPENAI_CODEX_ACCESS_TOKEN").is_some()
+        || context_auth_env_value(context, "BCODE_OPENAI_AUTH_MODE")
+            .is_some_and(|mode| mode == "chatgpt")
+}
+
+#[allow(clippy::too_many_lines)]
 fn openai_auth_settings(
     saved: &SavedOpenAiAuth,
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {
+    let allow_saved_auth = context.auth_profile.is_none();
     // XAI takes precedence for generic OpenAI-compatible usage (xAI, Grok, etc.)
-    if let Some(api_key) = context_env_value(context, "BCODE_XAI_API_KEY") {
+    if let Some(api_key) = context_auth_env_value(context, "BCODE_XAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2190,7 +2201,7 @@ fn openai_auth_settings(
             },
         );
     }
-    if let Some(api_key) = context_env_value(context, "XAI_API_KEY") {
+    if let Some(api_key) = context_auth_env_value(context, "XAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2200,7 +2211,7 @@ fn openai_auth_settings(
             },
         );
     }
-    if let Some(api_key) = saved.values.get("BCODE_XAI_API_KEY").cloned() {
+    if allow_saved_auth && let Some(api_key) = saved.values.get("BCODE_XAI_API_KEY").cloned() {
         return (
             AuthSettings::ApiKey(api_key),
             saved_auth_diagnostics(
@@ -2210,13 +2221,13 @@ fn openai_auth_settings(
             ),
         );
     }
-    if let Some(api_key) = saved.values.get("XAI_API_KEY").cloned() {
+    if allow_saved_auth && let Some(api_key) = saved.values.get("XAI_API_KEY").cloned() {
         return (
             AuthSettings::ApiKey(api_key),
             saved_auth_diagnostics(saved, "api_key (xai)", "saved sshenv API key XAI_API_KEY"),
         );
     }
-    if let Some(api_key) = context_env_value(context, "BCODE_OPENAI_API_KEY") {
+    if let Some(api_key) = context_auth_env_value(context, "BCODE_OPENAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2226,7 +2237,7 @@ fn openai_auth_settings(
             },
         );
     }
-    if let Some(api_key) = context_env_value(context, "OPENAI_API_KEY") {
+    if let Some(api_key) = context_auth_env_value(context, "OPENAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2236,7 +2247,7 @@ fn openai_auth_settings(
             },
         );
     }
-    if let Some(api_key) = saved.values.get("BCODE_OPENAI_API_KEY").cloned() {
+    if allow_saved_auth && let Some(api_key) = saved.values.get("BCODE_OPENAI_API_KEY").cloned() {
         return (
             AuthSettings::ApiKey(api_key),
             saved_auth_diagnostics(
@@ -2246,17 +2257,20 @@ fn openai_auth_settings(
             ),
         );
     }
-    if let Some(api_key) = saved.values.get("OPENAI_API_KEY").cloned() {
+    if allow_saved_auth && let Some(api_key) = saved.values.get("OPENAI_API_KEY").cloned() {
         return (
             AuthSettings::ApiKey(api_key),
             saved_auth_diagnostics(saved, "api_key", "saved sshenv API key OPENAI_API_KEY"),
         );
     }
+    if context_has_chatgpt_auth(context) {
+        return context_chatgpt_auth_settings(context);
+    }
     let saved_mode = saved
         .values
         .get("BCODE_OPENAI_AUTH_MODE")
         .map(String::as_str);
-    if saved_openai_auth_is_chatgpt(saved) || saved_mode == Some("chatgpt") {
+    if allow_saved_auth && (saved_openai_auth_is_chatgpt(saved) || saved_mode == Some("chatgpt")) {
         return saved_chatgpt_auth_settings(saved);
     }
     (
@@ -2280,6 +2294,83 @@ fn openai_auth_settings(
             ),
         },
     )
+}
+
+fn context_chatgpt_auth_settings(
+    context: &ProviderRequestContext,
+) -> (AuthSettings, AuthDiagnostics) {
+    let profile = context_auth_env_value(context, "BCODE_OPENAI_AUTH_PROFILE")
+        .or_else(|| context.auth_profile.clone());
+    let vault =
+        context_auth_env_value(context, "BCODE_OPENAI_AUTH_VAULT").map(std::path::PathBuf::from);
+    let Some(access_token) = context_auth_env_value(context, "BCODE_OPENAI_CODEX_ACCESS_TOKEN")
+    else {
+        return (
+            AuthSettings::Missing,
+            AuthDiagnostics {
+                source: "runtime_context".to_string(),
+                mode: "chatgpt".to_string(),
+                detail: profile.as_ref().map_or_else(
+                    || "runtime ChatGPT auth did not contain an access token".to_string(),
+                    |profile| {
+                        format!(
+                            "runtime auth profile '{profile}' did not contain BCODE_OPENAI_CODEX_ACCESS_TOKEN"
+                        )
+                    },
+                ),
+            },
+        );
+    };
+    let account_id = context_auth_env_value(context, "BCODE_OPENAI_CODEX_ACCOUNT_ID")
+        .or_else(|| {
+            context_auth_env_value(context, "BCODE_OPENAI_CODEX_ID_TOKEN")
+                .and_then(|token| chatgpt_account_id_from_access_token(&token))
+        })
+        .or_else(|| chatgpt_account_id_from_access_token(&access_token));
+    (
+        AuthSettings::ChatGpt {
+            access_token,
+            refresh_token: context_auth_env_value(context, "BCODE_OPENAI_CODEX_REFRESH_TOKEN"),
+            expires_at: context_auth_env_value(context, "BCODE_OPENAI_CODEX_EXPIRES_AT")
+                .and_then(|value| value.parse().ok()),
+            account_id,
+            profile: profile.clone(),
+            vault: vault.clone(),
+        },
+        AuthDiagnostics {
+            source: "runtime_context".to_string(),
+            mode: "chatgpt".to_string(),
+            detail: match (&profile, &vault) {
+                (Some(profile), Some(vault)) => format!(
+                    "runtime sshenv ChatGPT/Codex auth from profile '{profile}' in vault {}",
+                    vault.display()
+                ),
+                (Some(profile), None) => {
+                    format!("runtime sshenv ChatGPT/Codex auth from profile '{profile}'")
+                }
+                (None, Some(vault)) => format!(
+                    "runtime sshenv ChatGPT/Codex auth from vault {}",
+                    vault.display()
+                ),
+                (None, None) => "runtime ChatGPT/Codex auth".to_string(),
+            },
+        },
+    )
+}
+
+fn context_auth_env_value(context: &ProviderRequestContext, name: &str) -> Option<String> {
+    context
+        .env
+        .get(name)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| {
+            context
+                .auth_profile
+                .is_none()
+                .then(|| env_value(name))
+                .flatten()
+        })
 }
 
 fn context_env_value(context: &ProviderRequestContext, name: &str) -> Option<String> {
@@ -2845,6 +2936,61 @@ mod tests {
 
     fn test_api_key_auth() -> AuthSettings {
         AuthSettings::ApiKey("token".to_string())
+    }
+
+    #[test]
+    fn runtime_context_chatgpt_auth_uses_context_env() {
+        let context = ProviderRequestContext {
+            auth_profile: Some("openai".to_string()),
+            env: BTreeMap::from([
+                (
+                    "BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_string(),
+                    "access-token".to_string(),
+                ),
+                (
+                    "BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_string(),
+                    "refresh-token".to_string(),
+                ),
+                (
+                    "BCODE_OPENAI_CODEX_EXPIRES_AT".to_string(),
+                    "12345".to_string(),
+                ),
+                (
+                    "BCODE_OPENAI_AUTH_PROFILE".to_string(),
+                    "openai".to_string(),
+                ),
+                (
+                    "BCODE_OPENAI_AUTH_VAULT".to_string(),
+                    "/tmp/bcode-auth-vault".to_string(),
+                ),
+            ]),
+            ..ProviderRequestContext::default()
+        };
+
+        let (auth, diagnostics) = openai_auth_settings(&SavedOpenAiAuth::default(), &context);
+
+        match auth {
+            AuthSettings::ChatGpt {
+                access_token,
+                refresh_token,
+                expires_at,
+                profile,
+                vault,
+                ..
+            } => {
+                assert_eq!(access_token, "access-token");
+                assert_eq!(refresh_token.as_deref(), Some("refresh-token"));
+                assert_eq!(expires_at, Some(12_345));
+                assert_eq!(profile.as_deref(), Some("openai"));
+                assert_eq!(
+                    vault.as_deref(),
+                    Some(std::path::Path::new("/tmp/bcode-auth-vault"))
+                );
+            }
+            AuthSettings::Missing | AuthSettings::ApiKey(_) => panic!("expected ChatGPT auth"),
+        }
+        assert_eq!(diagnostics.source, "runtime_context");
+        assert_eq!(diagnostics.mode, "chatgpt");
     }
 
     fn test_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {

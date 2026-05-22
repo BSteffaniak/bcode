@@ -44,6 +44,9 @@ pub struct AttachedSessionHistory {
 const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
     "BCODE_OPENAI_API_KEY",
     "OPENAI_API_KEY",
+    "BCODE_OPENAI_AUTH_MODE",
+    "BCODE_OPENAI_AUTH_PROFILE",
+    "BCODE_OPENAI_AUTH_VAULT",
     "BCODE_OPENAI_BASE_URL",
     "OPENAI_BASE_URL",
     "BCODE_OPENAI_MODEL",
@@ -57,6 +60,9 @@ const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
     "BCODE_OPENAI_CODEX_ID_TOKEN",
     "BCODE_OPENAI_CODEX_EXPIRES_AT",
     "BCODE_OPENAI_CODEX_ACCOUNT_ID",
+    "BCODE_XAI_AUTH_MODE",
+    "BCODE_XAI_AUTH_PROFILE",
+    "BCODE_XAI_AUTH_VAULT",
     "BCODE_XAI_API_KEY",
     "XAI_API_KEY",
     "BCODE_XAI_BASE_URL",
@@ -145,15 +151,40 @@ fn merge_generic_auth_profile_env(
                 .settings
                 .get("profile")
                 .map_or(auth_profile_name, String::as_str);
-            let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+            let store =
+                sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault.clone()));
             if let Ok(Some(profile_env)) = store.get_profile(profile) {
                 for (key, value) in profile_env {
                     env.entry(key).or_insert_with(|| value.to_string());
                 }
             }
+            merge_auth_profile_metadata_env(auth_profile, profile, &vault, env);
             merge_auth_profile_settings_env(auth_profile, env);
         }
         "aws" | "aws_default_chain" => merge_auth_profile_settings_env(auth_profile, env),
+        _ => {}
+    }
+}
+
+fn merge_auth_profile_metadata_env(
+    auth_profile: &bcode_config::AuthProfileConfig,
+    profile: &str,
+    vault: &std::path::Path,
+    env: &mut BTreeMap<String, String>,
+) {
+    match auth_profile.settings.get("provider").map(String::as_str) {
+        Some("openai") => {
+            env.entry("BCODE_OPENAI_AUTH_PROFILE".to_string())
+                .or_insert_with(|| profile.to_string());
+            env.entry("BCODE_OPENAI_AUTH_VAULT".to_string())
+                .or_insert_with(|| vault.display().to_string());
+        }
+        Some("xai" | "grok") => {
+            env.entry("BCODE_XAI_AUTH_PROFILE".to_string())
+                .or_insert_with(|| profile.to_string());
+            env.entry("BCODE_XAI_AUTH_VAULT".to_string())
+                .or_insert_with(|| vault.display().to_string());
+        }
         _ => {}
     }
 }
