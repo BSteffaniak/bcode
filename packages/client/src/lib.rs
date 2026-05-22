@@ -180,6 +180,7 @@ fn merge_generic_auth_profile_env(
                 }
             }
             merge_auth_profile_metadata_env(auth_profile, profile, &vault, env);
+            merge_auth_profile_api_key_env(auth_profile, env);
             merge_auth_profile_settings_env(auth_profile, env);
         }
         "aws" | "aws_default_chain" => merge_auth_profile_settings_env(auth_profile, env),
@@ -207,6 +208,24 @@ fn merge_auth_profile_metadata_env(
                 .or_insert_with(|| vault.display().to_string());
         }
         _ => {}
+    }
+}
+
+fn merge_auth_profile_api_key_env(
+    auth_profile: &bcode_config::AuthProfileConfig,
+    env: &mut BTreeMap<String, String>,
+) {
+    let Some(api_key_env) = auth_profile
+        .settings
+        .get("api_key_env")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    if let Ok(value) = std::env::var(api_key_env)
+        && !value.trim().is_empty()
+    {
+        env.entry(api_key_env.clone()).or_insert(value);
     }
 }
 
