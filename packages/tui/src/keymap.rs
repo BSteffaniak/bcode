@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bcode_config::TuiConfig;
-use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+use bmux_keyboard::{KeyCode, KeyStroke, parse_key_stroke};
 
 /// Key handling scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -427,16 +427,23 @@ fn apply_scope(
     let Some(scope_bindings) = bindings.get_mut(&scope) else {
         return;
     };
-    for (key, action_id) in configured {
-        let Some(action) = BmuxAction::from_id(action_id) else {
-            continue;
-        };
-        let Some(stroke) = parse_key(key) else {
-            continue;
-        };
-        scope_bindings.retain(|(_, existing)| *existing != action);
-        scope_bindings.push((stroke, action));
+    let configured_bindings = configured
+        .iter()
+        .filter_map(|(key, action_id)| {
+            BmuxAction::from_id(action_id)
+                .and_then(|action| parse_key(key).map(|stroke| (stroke, action)))
+        })
+        .collect::<Vec<_>>();
+    if configured_bindings.is_empty() {
+        return;
     }
+
+    scope_bindings.retain(|(existing_stroke, existing_action)| {
+        !configured_bindings
+            .iter()
+            .any(|(stroke, action)| existing_action == action || existing_stroke == stroke)
+    });
+    scope_bindings.extend(configured_bindings);
 }
 
 fn bind(key: &str, action: BmuxAction) -> (KeyStroke, BmuxAction) {
@@ -447,38 +454,5 @@ fn bind(key: &str, action: BmuxAction) -> (KeyStroke, BmuxAction) {
 }
 
 fn parse_key(input: &str) -> Option<KeyStroke> {
-    let mut modifiers = Modifiers::NONE;
-    let mut key = None;
-    for part in input.split('+') {
-        match part.trim().to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => modifiers.ctrl = true,
-            "alt" | "option" => modifiers.alt = true,
-            "shift" => modifiers.shift = true,
-            "super" | "cmd" | "command" => modifiers.super_key = true,
-            code => key = parse_key_code(code),
-        }
-    }
-    key.map(|key| KeyStroke { key, modifiers })
-}
-
-fn parse_key_code(input: &str) -> Option<KeyCode> {
-    Some(match input {
-        "enter" | "return" => KeyCode::Enter,
-        "tab" => KeyCode::Tab,
-        "backspace" => KeyCode::Backspace,
-        "delete" | "del" => KeyCode::Delete,
-        "escape" | "esc" => KeyCode::Escape,
-        "space" => KeyCode::Space,
-        "up" => KeyCode::Up,
-        "down" => KeyCode::Down,
-        "left" => KeyCode::Left,
-        "right" => KeyCode::Right,
-        "home" => KeyCode::Home,
-        "end" => KeyCode::End,
-        "pageup" | "page_up" => KeyCode::PageUp,
-        "pagedown" | "page_down" => KeyCode::PageDown,
-        "insert" | "ins" => KeyCode::Insert,
-        value if value.len() == 1 => KeyCode::Char(value.chars().next()?),
-        _ => return None,
-    })
+    parse_key_stroke(input).ok()
 }

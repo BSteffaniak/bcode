@@ -1,6 +1,6 @@
 //! TUI tests.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
@@ -13,7 +13,12 @@ use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 
-use super::{app::BmuxApp, input, keymap::BmuxKeyMap, render, slash_palette, slash_palette_render};
+use super::{
+    app::BmuxApp,
+    input,
+    keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
+    render, slash_palette, slash_palette_render,
+};
 
 #[test]
 fn render_includes_status_and_composer() {
@@ -65,6 +70,50 @@ fn escape_interrupt_does_not_exit_chat() {
 
     assert!(outcome.interrupted);
     assert!(!app.should_exit());
+}
+
+#[test]
+fn configured_ctrl_enter_submits_while_enter_inserts_newline() {
+    let mut config = bcode_config::TuiConfig::default();
+    config.keybindings.chat = BTreeMap::from([
+        ("ctrl+enter".to_owned(), "tui.input.submit".to_owned()),
+        ("enter".to_owned(), "tui.input.newLine".to_owned()),
+    ]);
+    let keymap = BmuxKeyMap::from_config(&config);
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.replace_composer_with("draft");
+
+    let enter = input::handle_key(&mut app, &keymap, key(KeyCode::Enter));
+    assert!(enter.redraw);
+    assert!(!enter.submitted);
+    assert_eq!(app.composer().text(), "draft\n");
+
+    let ctrl_enter = input::handle_key(&mut app, &keymap, ctrl_key_code(KeyCode::Enter));
+    assert!(ctrl_enter.submitted);
+}
+
+#[test]
+fn configured_bindings_can_keep_multiple_keys_for_same_action() {
+    let mut config = bcode_config::TuiConfig::default();
+    config.keybindings.chat = BTreeMap::from([
+        ("enter".to_owned(), "tui.input.newLine".to_owned()),
+        ("shift+enter".to_owned(), "tui.input.newLine".to_owned()),
+        ("ctrl+enter".to_owned(), "tui.input.submit".to_owned()),
+    ]);
+    let keymap = BmuxKeyMap::from_config(&config);
+
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, key(KeyCode::Enter)),
+        Some(BmuxAction::InputNewLine)
+    );
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, shift_key(KeyCode::Enter)),
+        Some(BmuxAction::InputNewLine)
+    );
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, ctrl_key_code(KeyCode::Enter)),
+        Some(BmuxAction::InputSubmit)
+    );
 }
 
 #[test]
@@ -774,8 +823,12 @@ fn shift_key(key: KeyCode) -> KeyStroke {
 }
 
 fn ctrl_key(ch: char) -> KeyStroke {
+    ctrl_key_code(KeyCode::Char(ch))
+}
+
+fn ctrl_key_code(key: KeyCode) -> KeyStroke {
     KeyStroke {
-        key: KeyCode::Char(ch),
+        key,
         modifiers: Modifiers {
             ctrl: true,
             ..Modifiers::NONE
