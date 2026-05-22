@@ -957,8 +957,26 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProfileConfig {
     pub backend: String,
+    /// Optional provider/plugin auth scheme, for example `api_key` or `chatgpt`.
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// Canonical credential-to-source mappings.
+    ///
+    /// Example: `map.api_key.env = "OPENROUTER_API_KEY"` reads/stores the canonical
+    /// `api_key` credential from `OPENROUTER_API_KEY` in the selected auth backend.
+    #[serde(default)]
+    pub map: BTreeMap<String, AuthCredentialMapping>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+}
+
+/// Mapping from a canonical auth credential name to a backend/environment key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCredentialMapping {
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// Per-provider authentication configuration.
@@ -1393,6 +1411,7 @@ pub fn set_openai_compatible_sshenv_auth_mode(
             AuthProfileConfig {
                 backend: "sshenv".to_string(),
                 settings,
+                ..AuthProfileConfig::default()
             },
         );
         if let Some(model_id) = config.model.model_id.clone() {
@@ -1470,6 +1489,7 @@ pub fn set_bedrock_model_profile(
             AuthProfileConfig {
                 backend: "aws_default_chain".to_string(),
                 settings: auth_settings,
+                ..AuthProfileConfig::default()
             },
         );
         Ok(())
@@ -2086,7 +2106,12 @@ fn write_auth_toml(output: &mut String, auth: &AuthConfig) {
             .expect("writing to string should not fail");
         writeln!(output, "backend = {}", toml_string(&profile.backend))
             .expect("writing to string should not fail");
+        if let Some(scheme) = &profile.scheme {
+            writeln!(output, "scheme = {}", toml_string(scheme))
+                .expect("writing to string should not fail");
+        }
         output.push('\n');
+        write_auth_mapping_tables(output, profile_name, &profile.map);
         write_string_map_table(
             output,
             &format!("auth.profiles.{}.settings", toml_key(profile_name)),
@@ -2234,6 +2259,34 @@ fn write_string_set(output: &mut String, key: &str, values: &BTreeSet<String>) {
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(output, "{key} = [{values}]").expect("writing to string should not fail");
+}
+
+fn write_auth_mapping_tables(
+    output: &mut String,
+    profile_name: &str,
+    values: &BTreeMap<String, AuthCredentialMapping>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    for (credential, mapping) in values {
+        writeln!(
+            output,
+            "[auth.profiles.{}.map.{}]",
+            toml_key(profile_name),
+            toml_key(credential)
+        )
+        .expect("writing to string should not fail");
+        if let Some(env) = &mapping.env {
+            writeln!(output, "env = {}", toml_string(env))
+                .expect("writing to string should not fail");
+        }
+        if let Some(key) = &mapping.key {
+            writeln!(output, "key = {}", toml_string(key))
+                .expect("writing to string should not fail");
+        }
+        output.push('\n');
+    }
 }
 
 fn write_string_map_table(output: &mut String, table: &str, values: &BTreeMap<String, String>) {

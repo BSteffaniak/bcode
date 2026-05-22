@@ -561,6 +561,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
                 model_profile: resolved_model.model_profile,
                 auth_profile: resolved_model.auth_profile,
                 settings: resolved_model.settings,
+                auth: None,
                 request: resolved_model.request,
                 env: BTreeMap::new(),
             },
@@ -4222,6 +4223,22 @@ async fn append_model_request_trace(
             .cloned()
             .map(|key| (key, "<redacted>".to_string()))
             .collect();
+        if let Some(auth) = &mut redacted_request.provider_context.auth {
+            auth.credentials = auth
+                .credentials
+                .keys()
+                .cloned()
+                .map(|key| {
+                    (
+                        key,
+                        bcode_model::ProviderAuthCredential {
+                            value: "<redacted>".to_string(),
+                            source: None,
+                        },
+                    )
+                })
+                .collect();
+        }
         state.trace_store.write_json_blob(
             session_id,
             &format!("model-request-round-{round}"),

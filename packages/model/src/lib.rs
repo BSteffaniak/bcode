@@ -161,6 +161,47 @@ impl From<ProviderRequestValue> for serde_json::Value {
     }
 }
 
+/// Provider-neutral authentication material resolved by the client from the selected auth profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthContext {
+    /// Auth profile ID selected by model/profile resolution.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Auth backend used to materialize the credentials, for example `sshenv`.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Provider/plugin-specific auth scheme, for example `api_key` or `chatgpt`.
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// Canonical secret names to secret values, for example `api_key`.
+    #[serde(default)]
+    pub credentials: BTreeMap<String, ProviderAuthCredential>,
+    /// Non-secret auth attributes, for example region/profile/base URL hints.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+    /// Optional persistence references for credentials that can be refreshed/updated.
+    #[serde(default)]
+    pub storage: BTreeMap<String, ProviderAuthStorageRef>,
+}
+
+/// Secret credential value supplied to a provider plugin.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthCredential {
+    pub value: String,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Location where a credential can be updated after refresh/login.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthStorageRef {
+    pub backend: String,
+    pub profile: String,
+    pub key: String,
+    #[serde(default)]
+    pub vault: Option<String>,
+}
+
 /// Provider-neutral request context resolved by the host from model/provider profiles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequestContext {
@@ -170,6 +211,9 @@ pub struct ProviderRequestContext {
     pub auth_profile: Option<String>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Semantic auth material resolved from the selected auth profile.
+    #[serde(default)]
+    pub auth: Option<ProviderAuthContext>,
     /// Provider-native request fields merged into the outbound provider request.
     ///
     /// These values are non-secret provider-specific request options resolved from model profiles

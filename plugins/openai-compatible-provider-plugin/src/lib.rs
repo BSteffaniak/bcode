@@ -2237,6 +2237,21 @@ fn openai_auth_settings(
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {
     let allow_saved_auth = context.auth_profile.is_none();
+    if let Some(auth) = &context.auth
+        && let Some(api_key) = auth.credentials.get("api_key")
+    {
+        return (
+            AuthSettings::ApiKey(api_key.value.clone()),
+            AuthDiagnostics {
+                source: "runtime_auth".to_string(),
+                mode: auth.scheme.clone().unwrap_or_else(|| "api_key".to_string()),
+                detail: auth.profile.as_ref().map_or_else(
+                    || "runtime auth credential 'api_key'".to_string(),
+                    |profile| format!("runtime auth profile '{profile}' credential 'api_key'"),
+                ),
+            },
+        );
+    }
     if let Some(api_key_env) = configured_api_key_env(context) {
         if let Some(api_key) = context_auth_env_value(context, &api_key_env) {
             return (

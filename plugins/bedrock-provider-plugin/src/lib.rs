@@ -811,6 +811,10 @@ impl Settings {
         let request_env = request
             .map(|request| request.provider_context.env.clone())
             .unwrap_or_default();
+        let request_auth_attributes = request
+            .and_then(|request| request.provider_context.auth.as_ref())
+            .map(|auth| auth.attributes.clone())
+            .unwrap_or_default();
         let profile_settings = resolved
             .as_ref()
             .map(|selection| selection.settings.clone())
@@ -830,6 +834,12 @@ impl Settings {
                 keys.iter()
                     .filter_map(|key| request_settings.get(*key).cloned()),
             )
+            .or_else(|| {
+                first_nonempty(
+                    keys.iter()
+                        .filter_map(|key| request_auth_attributes.get(*key).cloned()),
+                )
+            })
             .or_else(|| {
                 first_nonempty(
                     keys.iter()
