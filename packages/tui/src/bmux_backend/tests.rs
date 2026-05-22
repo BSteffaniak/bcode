@@ -48,6 +48,15 @@ fn composer_expands_and_scrolls_when_input_exceeds_max_rows() {
 }
 
 #[test]
+fn multiline_paste_preserves_line_breaks_in_composer() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    app.paste_composer_text("first\nsecond\r\nthird\rfourth");
+
+    assert_eq!(app.composer().text(), "first\nsecond\r\nthird\rfourth");
+}
+
+#[test]
 fn escape_interrupt_does_not_exit_chat() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());

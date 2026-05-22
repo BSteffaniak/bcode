@@ -167,6 +167,11 @@ impl BmuxApp {
         self.composer.buffer_mut()
     }
 
+    /// Insert pasted text into the composer.
+    pub(super) fn paste_composer_text(&mut self, text: &str) {
+        TextInputControl::new(&composer_policy()).handle_paste(&mut self.composer, text);
+    }
+
     /// Return transcript items.
     #[must_use]
     pub(super) fn transcript(&self) -> &[TranscriptItem] {

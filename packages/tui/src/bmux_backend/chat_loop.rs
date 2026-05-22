@@ -126,7 +126,7 @@ async fn handle_event<W: Write>(
                 return Ok(true);
             }
             chat.app.reset_input_history_navigation();
-            chat.app.composer_mut().insert_str(&text);
+            chat.app.paste_composer_text(&text);
             chat.app.wake_cursor();
             slash_flow::update_slash_palette(client, chat, &mut modals.slash_palette).await;
             Ok(true)
