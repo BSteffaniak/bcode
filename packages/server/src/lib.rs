@@ -10,10 +10,10 @@ use bcode_agent_profile::{
     OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
 };
 use bcode_ipc::{
-    CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcListener, LocalIpcStream,
-    PermissionSummary, PluginServiceError, PluginServiceResponse, PluginServiceSummary, Request,
-    Response, ResponsePayload, ServerStatus, decode, event_envelope, recv_envelope,
-    response_envelope, send_envelope,
+    ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
+    LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError, PluginServiceResponse,
+    PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus, decode, event_envelope,
+    recv_envelope, response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole,
@@ -107,6 +107,7 @@ struct ServerState {
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
+    client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
     shutdown: broadcast::Sender<()>,
 }
@@ -127,10 +128,12 @@ struct MessageQueueStatus {
 enum SessionCommand {
     UserMessage {
         client_id: ClientId,
+        runtime_context: Option<ClientRuntimeContext>,
         text: String,
     },
     SkillInvocation {
         client_id: ClientId,
+        runtime_context: Option<ClientRuntimeContext>,
         skill_id: SkillId,
         arguments: String,
         source: Option<SkillSource>,
@@ -403,6 +406,7 @@ impl ServerState {
             pending_permissions: Mutex::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
+            client_runtime_contexts: Mutex::default(),
             message_accepted_clients: Mutex::default(),
             shutdown,
         }
@@ -414,6 +418,7 @@ impl ServerState {
 
     async fn unregister_client(&self, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
+        self.client_runtime_contexts.lock().await.remove(&client_id);
         self.message_accepted_clients
             .lock()
             .await
@@ -422,6 +427,27 @@ impl ServerState {
 
     async fn register_message_accepted_client(&self, client_id: ClientId) {
         self.message_accepted_clients.lock().await.insert(client_id);
+    }
+
+    async fn set_client_runtime_context(
+        &self,
+        client_id: ClientId,
+        context: Option<ClientRuntimeContext>,
+    ) {
+        let mut contexts = self.client_runtime_contexts.lock().await;
+        if let Some(context) = context {
+            contexts.insert(client_id, context);
+        } else {
+            contexts.remove(&client_id);
+        }
+    }
+
+    async fn client_runtime_context(&self, client_id: ClientId) -> Option<ClientRuntimeContext> {
+        self.client_runtime_contexts
+            .lock()
+            .await
+            .get(&client_id)
+            .cloned()
     }
 
     async fn client_supports_message_accepted(&self, client_id: ClientId) -> bool {
@@ -535,6 +561,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
                 model_profile: resolved_model.model_profile,
                 auth_profile: resolved_model.auth_profile,
                 settings: resolved_model.settings,
+                env: BTreeMap::new(),
             },
             prompt_cache_mode: config.model.prompt_cache.mode,
             conversation_reuse_mode: config.model.conversation_reuse.mode,
@@ -634,8 +661,29 @@ async fn handle_request(
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
     match request {
-        Request::Hello { client_name } => {
-            handle_hello(request_id, client_id, state, writer, &client_name).await
+        Request::Hello {
+            client_name,
+            runtime_context,
+        } => {
+            handle_hello(
+                request_id,
+                client_id,
+                state,
+                writer,
+                &client_name,
+                runtime_context,
+            )
+            .await
+        }
+        Request::UpdateClientRuntimeContext { runtime_context } => {
+            handle_update_client_runtime_context(
+                request_id,
+                client_id,
+                state,
+                writer,
+                runtime_context,
+            )
+            .await
         }
         Request::Ping => handle_ping(request_id, writer).await,
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
@@ -725,10 +773,11 @@ async fn handle_request(
             .await
         }
         Request::SessionModelStatus { session_id } => {
-            handle_session_model_status(request_id, state, writer, session_id).await
+            handle_session_model_status(request_id, client_id, state, writer, session_id).await
         }
         Request::SessionModelList { provider_plugin_id } => {
-            handle_session_model_list(request_id, state, writer, provider_plugin_id).await
+            handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
+                .await
         }
         request => handle_remaining_request(request, request_id, state, writer).await,
     }
@@ -820,6 +869,24 @@ async fn handle_agent_permission_plugin_request(
     }
 }
 
+async fn handle_update_client_runtime_context(
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+    runtime_context: Option<ClientRuntimeContext>,
+) -> Result<(), ServerError> {
+    state
+        .set_client_runtime_context(client_id, runtime_context)
+        .await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ClientRuntimeContextUpdated),
+    )
+    .await
+}
+
 async fn handle_ping(request_id: u64, writer: &SharedWriter) -> Result<(), ServerError> {
     send_response(writer, request_id, Response::Ok(ResponsePayload::Pong)).await
 }
@@ -836,10 +903,14 @@ async fn handle_hello(
     state: &ServerState,
     writer: &SharedWriter,
     client_name: &str,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<(), ServerError> {
     if client_name_supports_message_accepted(client_name) {
         state.register_message_accepted_client(client_id).await;
     }
+    state
+        .set_client_runtime_context(client_id, runtime_context)
+        .await;
     send_response(
         writer,
         request_id,
@@ -1198,11 +1269,17 @@ async fn run_session_runtime(
     while let Some(command) = commands.recv().await {
         queued_commands.fetch_sub(1, Ordering::AcqRel);
         match command {
-            SessionCommand::UserMessage { client_id, text } => {
-                process_user_message_command(&state, &mut permit, client_id, text).await;
+            SessionCommand::UserMessage {
+                client_id,
+                runtime_context,
+                text,
+            } => {
+                process_user_message_command(&state, &mut permit, client_id, runtime_context, text)
+                    .await;
             }
             SessionCommand::SkillInvocation {
                 client_id,
+                runtime_context,
                 skill_id,
                 arguments,
                 source,
@@ -1212,6 +1289,7 @@ async fn run_session_runtime(
                     &state,
                     &mut permit,
                     client_id,
+                    runtime_context,
                     skill_id,
                     arguments,
                     source,
@@ -1228,12 +1306,13 @@ async fn process_user_message_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     client_id: ClientId,
+    runtime_context: Option<ClientRuntimeContext>,
     text: String,
 ) {
     match append_turn_user_message(state, permit, client_id, text).await {
         Ok(Some(user_event)) => {
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
-            run_model_turn(state, permit, &user_event).await;
+            run_model_turn(state, permit, &user_event, runtime_context).await;
         }
         Ok(None) => {
             append_system_event(
@@ -1259,6 +1338,7 @@ async fn process_skill_invocation_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     client_id: ClientId,
+    runtime_context: Option<ClientRuntimeContext>,
     skill_id: SkillId,
     arguments: String,
     source: Option<SkillSource>,
@@ -1298,7 +1378,7 @@ async fn process_skill_invocation_command(
                     arguments,
                 },
             );
-            run_model_turn(state, permit, &user_event).await;
+            run_model_turn(state, permit, &user_event, runtime_context).await;
         }
         Ok(None) => {
             append_system_event(
@@ -1386,6 +1466,7 @@ async fn handle_invoke_skill(
     };
     let command = SessionCommand::SkillInvocation {
         client_id,
+        runtime_context: state.client_runtime_context(client_id).await,
         skill_id,
         arguments,
         source: Some(summary.source),
@@ -1417,7 +1498,11 @@ async fn handle_user_message(
     match enqueue_session_command(
         state,
         session_id,
-        SessionCommand::UserMessage { client_id, text },
+        SessionCommand::UserMessage {
+            client_id,
+            runtime_context: state.client_runtime_context(client_id).await,
+            text,
+        },
     )
     .await
     {
@@ -1482,11 +1567,17 @@ async fn handle_set_session_model(
 
 async fn handle_session_model_status(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let selection = session_model_selection(state, session_id).await;
+    let selection = session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        state.client_runtime_context(client_id).await,
+    )
+    .await;
     let models = invoke_model_provider_json_blocking::<_, ModelList>(
         state,
         selection.provider_plugin_id.clone(),
@@ -1518,13 +1609,22 @@ async fn handle_session_model_status(
 
 async fn handle_session_model_list(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     provider_plugin_id: Option<String>,
 ) -> Result<(), ServerError> {
+    let selected_provider_plugin_id = provider_plugin_id.or_else(|| {
+        state
+            .client_runtime_contexts
+            .try_lock()
+            .ok()
+            .and_then(|contexts| contexts.get(&client_id).cloned())
+            .and_then(|context| context.selected_provider_plugin_id)
+    });
     match invoke_model_provider_json_blocking::<_, ModelList>(
         state,
-        provider_plugin_id.clone(),
+        selected_provider_plugin_id.clone(),
         OP_MODELS,
         serde_json::Value::Null,
     )
@@ -1535,7 +1635,7 @@ async fn handle_session_model_list(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::SessionModelList {
-                    provider_plugin_id,
+                    provider_plugin_id: selected_provider_plugin_id,
                     models,
                 }),
             )
@@ -2816,11 +2916,12 @@ async fn run_model_turn(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     trigger_event: &bcode_session_models::SessionEvent,
+    runtime_context: Option<ClientRuntimeContext>,
 ) {
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
-    let completion = run_model_turn_inner(state, session_id, trigger_event).await;
+    let completion = run_model_turn_inner(state, session_id, trigger_event, runtime_context).await;
     append_model_turn_finished_event(
         state,
         session_id,
@@ -2835,13 +2936,15 @@ async fn run_model_turn_inner(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> ModelTurnCompletion {
     if let Err(error) = maybe_auto_compact_session_context(state, session_id).await {
         let message = format!("auto compaction failed: {error}");
         append_system_event(state, session_id, message).await;
     }
 
-    let selection = session_model_selection(state, session_id).await;
+    let selection =
+        session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
         return ModelTurnCompletion::with_message(
             ModelTurnOutcome::ProviderUnavailable,
@@ -2861,6 +2964,7 @@ async fn run_model_turn_inner(
             provider_plugin_id.as_deref(),
             selection.model_id.as_deref(),
             recovery.retry_instruction,
+            &selection,
         )
         .await
         {
@@ -3827,6 +3931,23 @@ async fn agent_context(
     .and_then(Result::ok)
 }
 
+async fn session_model_selection_with_runtime_context(
+    state: &ServerState,
+    session_id: SessionId,
+    runtime_context: Option<ClientRuntimeContext>,
+) -> SessionModelSelection {
+    if let Some(context) = runtime_context {
+        let selection = SessionModelSelection {
+            provider_plugin_id: context.selected_provider_plugin_id,
+            model_id: context.selected_model_id,
+            thinking_level: None,
+            provider_context: context.provider_context,
+        };
+        return selection;
+    }
+    session_model_selection(state, session_id).await
+}
+
 async fn session_model_selection(
     state: &ServerState,
     session_id: SessionId,
@@ -3965,7 +4086,7 @@ where
     .map_err(|error| error.to_string())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_model_turn_request(
     state: &ServerState,
     session_id: SessionId,
@@ -3974,12 +4095,12 @@ async fn build_model_turn_request(
     provider_plugin_id: Option<&str>,
     selected_model_id: Option<&str>,
     retry_instruction: Option<&str>,
+    selection: &SessionModelSelection,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.model_context_events(session_id).await?;
     let mut messages =
         session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
-    let selection = session_model_selection(state, session_id).await;
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;
     let working_directory = state.sessions.session_working_directory(session_id).await?;
@@ -4068,7 +4189,7 @@ async fn build_model_turn_request(
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id,
-        provider_context: selection.provider_context,
+        provider_context: selection.provider_context.clone(),
         system_prompt: Some(system_prompt),
         messages,
         tools,
@@ -4092,10 +4213,18 @@ async fn append_model_request_trace(
     let request_blob = (state.observability.persist_model_requests
         || state.observability.debug_enabled())
     .then(|| {
+        let mut redacted_request = request.clone();
+        redacted_request.provider_context.env = redacted_request
+            .provider_context
+            .env
+            .keys()
+            .cloned()
+            .map(|key| (key, "<redacted>".to_string()))
+            .collect();
         state.trace_store.write_json_blob(
             session_id,
             &format!("model-request-round-{round}"),
-            request,
+            &redacted_request,
             state.observability.max_blob_bytes,
         )
     })

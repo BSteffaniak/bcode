@@ -1099,7 +1099,7 @@ fn wait_for_oauth_code(
     expected_state: &str,
 ) -> Result<String, CliError> {
     let manual_callback = spawn_manual_oauth_callback_reader();
-    let deadline = Instant::now() + Duration::from_secs(300);
+    let deadline = Instant::now() + Duration::from_mins(5);
     loop {
         if let Some(code) = poll_manual_oauth_callback(&manual_callback, expected_state)? {
             return Ok(code);

@@ -6,16 +6,17 @@
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
-    CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint, LocalIpcStream, PermissionSummary,
-    PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload,
-    current_working_directory, decode, default_endpoint, recv_envelope, request_envelope,
-    send_envelope,
+    ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
+    LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
+    Response, ResponsePayload, current_working_directory, decode, default_endpoint, recv_envelope,
+    request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
     SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Errors returned by the Bcode client.
@@ -38,6 +39,96 @@ pub enum ClientError {
 pub struct AttachedSessionHistory {
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
+}
+
+const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
+    "BCODE_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
+    "BCODE_OPENAI_BASE_URL",
+    "OPENAI_BASE_URL",
+    "BCODE_OPENAI_MODEL",
+    "OPENAI_MODEL",
+    "BCODE_OPENAI_MODELS",
+    "OPENAI_MODELS",
+    "BCODE_OPENAI_DIALECT",
+    "OPENAI_DIALECT",
+    "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
+    "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
+    "BCODE_OPENAI_CODEX_ID_TOKEN",
+    "BCODE_OPENAI_CODEX_EXPIRES_AT",
+    "BCODE_OPENAI_CODEX_ACCOUNT_ID",
+    "BCODE_XAI_API_KEY",
+    "XAI_API_KEY",
+    "BCODE_XAI_BASE_URL",
+    "XAI_BASE_URL",
+    "BCODE_XAI_MODEL",
+    "XAI_MODEL",
+    "BCODE_XAI_MODELS",
+    "XAI_MODELS",
+    "BCODE_BEDROCK_MODEL",
+    "BEDROCK_MODEL",
+    "BCODE_BEDROCK_MODELS",
+    "BEDROCK_MODELS",
+    "BCODE_BEDROCK_REGION",
+    "BEDROCK_REGION",
+    "BCODE_BEDROCK_AWS_PROFILE",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "BCODE_BEDROCK_ENDPOINT_URL",
+    "BEDROCK_ENDPOINT_URL",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+];
+
+fn current_runtime_context() -> Option<ClientRuntimeContext> {
+    let config = bcode_config::load_config().ok()?;
+    let mut env = CLIENT_RUNTIME_ENV_VARS
+        .iter()
+        .filter_map(|name| match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => Some(((*name).to_string(), value)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    merge_openai_auth_profile_env(&config, &mut env);
+    let resolved = config.resolved_model_selection();
+    let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
+    Some(ClientRuntimeContext {
+        selected_provider_plugin_id: resolved.provider_plugin_id,
+        selected_model_id: resolved.model_id,
+        provider_context: bcode_model::ProviderRequestContext {
+            model_profile: resolved.model_profile,
+            auth_profile: resolved.auth_profile,
+            settings: resolved.settings,
+            env,
+        },
+        env_keys,
+    })
+}
+
+fn merge_openai_auth_profile_env(
+    config: &bcode_config::BcodeConfig,
+    env: &mut BTreeMap<String, String>,
+) {
+    let Some(auth) = &config.auth.openai else {
+        return;
+    };
+    if auth.backend != "sshenv" {
+        return;
+    }
+    let vault = auth
+        .vault
+        .clone()
+        .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
+        return;
+    };
+    for (key, value) in profile {
+        env.entry(key).or_insert_with(|| value.to_string());
+    }
 }
 
 impl From<ErrorResponse> for ClientError {
@@ -71,6 +162,7 @@ impl MessageAcceptance {
 #[derive(Debug, Clone)]
 pub struct BcodeClient {
     endpoint: IpcEndpoint,
+    runtime_context: Option<ClientRuntimeContext>,
 }
 
 impl BcodeClient {
@@ -79,13 +171,24 @@ impl BcodeClient {
     pub fn default_endpoint() -> Self {
         Self {
             endpoint: default_endpoint(),
+            runtime_context: current_runtime_context(),
         }
     }
 
     /// Create a client for a specific endpoint.
     #[must_use]
     pub const fn new(endpoint: IpcEndpoint) -> Self {
-        Self { endpoint }
+        Self {
+            endpoint,
+            runtime_context: None,
+        }
+    }
+
+    /// Attach a client-supplied runtime context to future connections.
+    #[must_use]
+    pub fn with_runtime_context(mut self, runtime_context: Option<ClientRuntimeContext>) -> Self {
+        self.runtime_context = runtime_context;
+        self
     }
 
     /// Query local server status.
@@ -684,6 +787,7 @@ impl BcodeClient {
         match connection
             .send_request(Request::Hello {
                 client_name: format!("{client_name};cap=message_accepted"),
+                runtime_context: self.runtime_context.clone(),
             })
             .await?
         {
@@ -709,6 +813,33 @@ impl ClientConnection {
     #[must_use]
     pub const fn client_id(&self) -> Option<ClientId> {
         self.client_id
+    }
+
+    /// Replace the runtime context attached to this long-lived connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn update_runtime_context(
+        &mut self,
+        runtime_context: Option<ClientRuntimeContext>,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::UpdateClientRuntimeContext { runtime_context })
+            .await?
+        {
+            ResponsePayload::ClientRuntimeContextUpdated => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Refresh this long-lived connection's runtime context from the current process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn refresh_runtime_context(&mut self) -> Result<(), ClientError> {
+        self.update_runtime_context(current_runtime_context()).await
     }
 
     /// Attach to a session and return replayed history.

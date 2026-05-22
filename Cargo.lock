@@ -691,6 +691,7 @@ name = "bcode_bedrock_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-bedrock",
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
@@ -738,10 +739,12 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
+ "bcode_config",
  "bcode_ipc",
  "bcode_model",
  "bcode_session_models",
  "bcode_skill_models",
+ "sshenv_vault",
  "thiserror 2.0.18",
 ]
 

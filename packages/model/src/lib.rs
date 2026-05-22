@@ -117,6 +117,12 @@ pub struct ProviderRequestContext {
     pub auth_profile: Option<String>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Transient client-supplied environment values for provider authentication/configuration.
+    ///
+    /// These values are carried in-memory from the initiating client connection to the provider
+    /// plugin. They must not be persisted to session history or unredacted traces.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// Provider configuration validation response.

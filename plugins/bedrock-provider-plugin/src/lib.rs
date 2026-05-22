@@ -5,6 +5,7 @@
 //! Amazon Bedrock model provider plugin for Bcode.
 
 use aws_config::{BehaviorVersion, Region};
+use aws_credential_types::Credentials;
 use aws_sdk_bedrock as bedrock;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::DisplayErrorContext;
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
-const MODEL_DISCOVERY_TTL: Duration = Duration::from_secs(10 * 60);
+const MODEL_DISCOVERY_TTL: Duration = Duration::from_mins(10);
 const COMPATIBILITY_CACHE_VERSION: u8 = 1;
 const COMPATIBILITY_CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const STREAMING_TOOL_UNSUPPORTED_REASON: &str = "streaming_tool_use_unsupported";
@@ -346,7 +347,33 @@ async fn bedrock_sdk_config_with_region(
     if let Some(endpoint_url) = &settings.endpoint_url {
         loader = loader.endpoint_url(endpoint_url.clone());
     }
+    if let Some(credentials) = client_context_credentials(settings) {
+        loader = loader.credentials_provider(credentials);
+    }
     loader.load().await
+}
+
+fn client_context_credentials(settings: &Settings) -> Option<Credentials> {
+    let access_key = settings
+        .env
+        .get("AWS_ACCESS_KEY_ID")
+        .filter(|value| !value.trim().is_empty())?;
+    let secret_key = settings
+        .env
+        .get("AWS_SECRET_ACCESS_KEY")
+        .filter(|value| !value.trim().is_empty())?;
+    let session_token = settings
+        .env
+        .get("AWS_SESSION_TOKEN")
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+    Some(Credentials::new(
+        access_key.clone(),
+        secret_key.clone(),
+        session_token,
+        None,
+        "bcode-client-context",
+    ))
 }
 
 async fn read_bedrock_stream(
@@ -747,6 +774,7 @@ struct Settings {
     region_source: RegionSource,
     aws_profile: Option<String>,
     endpoint_url: Option<String>,
+    env: BTreeMap<String, String>,
     config_source: String,
 }
 
@@ -780,6 +808,9 @@ impl Settings {
         let request_settings = request
             .map(|request| request.provider_context.settings.clone())
             .unwrap_or_default();
+        let request_env = request
+            .map(|request| request.provider_context.env.clone())
+            .unwrap_or_default();
         let profile_settings = resolved
             .as_ref()
             .map(|selection| selection.settings.clone())
@@ -812,10 +843,14 @@ impl Settings {
                 )
             })
         };
-        let default_model = first_env(["BCODE_BEDROCK_MODEL", "BEDROCK_MODEL"])
+        let first_context_env = |keys: &[&str]| {
+            first_nonempty(keys.iter().filter_map(|key| request_env.get(*key).cloned()))
+                .or_else(|| first_nonempty(keys.iter().filter_map(|key| std::env::var(key).ok())))
+        };
+        let default_model = first_context_env(&["BCODE_BEDROCK_MODEL", "BEDROCK_MODEL"])
             .or_else(|| value(&["model", "model_id"]))
             .or_else(|| resolved.and_then(|selection| selection.model_id));
-        let model_ids_value = first_env(["BCODE_BEDROCK_MODELS", "BEDROCK_MODELS"])
+        let model_ids_value = first_context_env(&["BCODE_BEDROCK_MODELS", "BEDROCK_MODELS"])
             .or_else(|| value(&["models", "model_ids"]));
         let mut model_ids = model_ids_value
             .as_deref()
@@ -825,17 +860,21 @@ impl Settings {
         {
             model_ids.insert(0, default_model.clone());
         }
-        let (region, region_source) = resolve_configured_region(&value);
+        let (region, region_source) = resolve_configured_region(&value, &first_context_env);
         Self {
             default_model,
             model_ids,
             model_ids_are_explicit: model_ids_value.is_some(),
             region,
             region_source,
-            aws_profile: first_env(["BCODE_BEDROCK_AWS_PROFILE", "AWS_PROFILE"])
+            aws_profile: first_context_env(&["BCODE_BEDROCK_AWS_PROFILE", "AWS_PROFILE"])
                 .or_else(|| value(&["profile", "aws_profile"])),
-            endpoint_url: first_env(["BCODE_BEDROCK_ENDPOINT_URL", "BEDROCK_ENDPOINT_URL"])
-                .or_else(|| value(&["endpoint_url"])),
+            endpoint_url: first_context_env(&[
+                "BCODE_BEDROCK_ENDPOINT_URL",
+                "BEDROCK_ENDPOINT_URL",
+            ])
+            .or_else(|| value(&["endpoint_url"])),
+            env: request_env,
             config_source: if request.is_some() {
                 "request/config/environment".to_string()
             } else {
@@ -847,11 +886,12 @@ impl Settings {
 
 fn resolve_configured_region(
     value: &impl Fn(&[&str]) -> Option<String>,
+    first_context_env: &impl Fn(&[&str]) -> Option<String>,
 ) -> (Option<String>, RegionSource) {
-    if let Some(region) = first_env(["BCODE_BEDROCK_REGION"]) {
+    if let Some(region) = first_context_env(&["BCODE_BEDROCK_REGION"]) {
         return (Some(region), RegionSource::BcodeEnv);
     }
-    if let Some(region) = first_env(["AWS_REGION", "AWS_DEFAULT_REGION"]) {
+    if let Some(region) = first_context_env(&["AWS_REGION", "AWS_DEFAULT_REGION"]) {
         return (Some(region), RegionSource::AwsEnv);
     }
     if let Some(region) = value(&["region"]) {
@@ -1752,15 +1792,6 @@ fn parse_model_list(value: &str) -> Vec<String> {
 
 fn first_nonempty(values: impl IntoIterator<Item = String>) -> Option<String> {
     values.into_iter().find(|value| !value.trim().is_empty())
-}
-
-fn first_env<const N: usize>(names: [&str; N]) -> Option<String> {
-    names
-        .into_iter()
-        .find_map(|name| match std::env::var(name) {
-            Ok(value) if !value.trim().is_empty() => Some(value),
-            _ => None,
-        })
 }
 
 fn json_value_to_document(value: &serde_json::Value) -> Document {

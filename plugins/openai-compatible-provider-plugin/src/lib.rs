@@ -544,7 +544,7 @@ async fn stream_chat_completion_inner(
         ));
     }
     let client = Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_mins(2))
         .build()
         .map_err(|error| {
             provider_error(
@@ -2041,7 +2041,7 @@ fn settings() -> Settings {
 
 fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let saved = saved_openai_auth();
-    let xai_mode = saved_has_xai_keys(&saved) || env_has_xai_keys();
+    let xai_mode = saved_has_xai_keys(&saved) || env_has_xai_keys(context);
     let chatgpt_mode = saved_openai_auth_is_chatgpt(&saved) && !xai_mode;
     let fallback_model = if xai_mode {
         DEFAULT_XAI_MODEL_ID.to_string()
@@ -2050,19 +2050,25 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     } else {
         DEFAULT_MODEL_ID.to_string()
     };
-    let default_model = first_env([
-        "BCODE_XAI_MODEL",
-        "XAI_MODEL",
-        "BCODE_OPENAI_MODEL",
-        "OPENAI_MODEL",
-    ])
+    let default_model = first_context_env(
+        context,
+        [
+            "BCODE_XAI_MODEL",
+            "XAI_MODEL",
+            "BCODE_OPENAI_MODEL",
+            "OPENAI_MODEL",
+        ],
+    )
     .or_else(|| chatgpt_mode.then(|| DEFAULT_CODEX_MODEL_ID.to_string()));
-    let model_ids_env = first_env([
-        "BCODE_XAI_MODELS",
-        "XAI_MODELS",
-        "BCODE_OPENAI_MODELS",
-        "OPENAI_MODELS",
-    ]);
+    let model_ids_env = first_context_env(
+        context,
+        [
+            "BCODE_XAI_MODELS",
+            "XAI_MODELS",
+            "BCODE_OPENAI_MODELS",
+            "OPENAI_MODELS",
+        ],
+    );
     let mut model_ids = model_ids_env
         .as_deref()
         .map_or_else(|| default_model_ids(chatgpt_mode), parse_model_list);
@@ -2071,7 +2077,7 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     {
         model_ids.insert(0, default_model.clone());
     }
-    let (auth, auth_diagnostics) = openai_auth_settings(&saved);
+    let (auth, auth_diagnostics) = openai_auth_settings(&saved, context);
     let base_url = first_context_or_env(
         context,
         "base_url",
@@ -2164,13 +2170,17 @@ fn saved_has_xai_keys(saved: &SavedOpenAiAuth) -> bool {
         || saved.values.contains_key("BCODE_XAI_CODEX_ACCESS_TOKEN") // unlikely but for symmetry
 }
 
-fn env_has_xai_keys() -> bool {
-    env_value("BCODE_XAI_API_KEY").is_some() || env_value("XAI_API_KEY").is_some()
+fn env_has_xai_keys(context: &ProviderRequestContext) -> bool {
+    context_env_value(context, "BCODE_XAI_API_KEY").is_some()
+        || context_env_value(context, "XAI_API_KEY").is_some()
 }
 
-fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnostics) {
+fn openai_auth_settings(
+    saved: &SavedOpenAiAuth,
+    context: &ProviderRequestContext,
+) -> (AuthSettings, AuthDiagnostics) {
     // XAI takes precedence for generic OpenAI-compatible usage (xAI, Grok, etc.)
-    if let Some(api_key) = env_value("BCODE_XAI_API_KEY") {
+    if let Some(api_key) = context_env_value(context, "BCODE_XAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2180,7 +2190,7 @@ fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnosti
             },
         );
     }
-    if let Some(api_key) = env_value("XAI_API_KEY") {
+    if let Some(api_key) = context_env_value(context, "XAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2206,7 +2216,7 @@ fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnosti
             saved_auth_diagnostics(saved, "api_key (xai)", "saved sshenv API key XAI_API_KEY"),
         );
     }
-    if let Some(api_key) = env_value("BCODE_OPENAI_API_KEY") {
+    if let Some(api_key) = context_env_value(context, "BCODE_OPENAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2216,7 +2226,7 @@ fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnosti
             },
         );
     }
-    if let Some(api_key) = env_value("OPENAI_API_KEY") {
+    if let Some(api_key) = context_env_value(context, "OPENAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
@@ -2270,6 +2280,15 @@ fn openai_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDiagnosti
             ),
         },
     )
+}
+
+fn context_env_value(context: &ProviderRequestContext, name: &str) -> Option<String> {
+    context
+        .env
+        .get(name)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| env_value(name))
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -2612,13 +2631,13 @@ fn parse_model_list(models: &str) -> Vec<String> {
         .collect()
 }
 
-fn first_env<const N: usize>(names: [&str; N]) -> Option<String> {
-    names
+fn first_context_env<const N: usize>(
+    context: &ProviderRequestContext,
+    env_names: [&str; N],
+) -> Option<String> {
+    env_names
         .into_iter()
-        .find_map(|name| match std::env::var(name) {
-            Ok(value) if !value.is_empty() => Some(value),
-            _ => None,
-        })
+        .find_map(|name| context_env_value(context, name))
 }
 
 fn first_context_or_env<const N: usize>(
@@ -2633,7 +2652,7 @@ fn first_context_or_env<const N: usize>(
         .or_else(|| context.settings.get(key))
         .filter(|value| !value.trim().is_empty())
         .cloned()
-        .or_else(|| first_env(env_names))
+        .or_else(|| first_context_env(context, env_names))
 }
 
 fn resolve_dialect(

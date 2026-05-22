@@ -11,6 +11,7 @@ use bcode_session_models::{
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -86,6 +87,8 @@ impl Envelope {
 pub enum Request {
     Hello {
         client_name: String,
+        #[serde(default)]
+        runtime_context: Option<ClientRuntimeContext>,
     },
     Ping,
     ServerStatus,
@@ -193,6 +196,24 @@ pub enum Request {
         topic: String,
         payload: Vec<u8>,
     },
+    UpdateClientRuntimeContext {
+        #[serde(default)]
+        runtime_context: Option<ClientRuntimeContext>,
+    },
+}
+
+/// Per-client model/provider/auth context supplied at connection time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRuntimeContext {
+    #[serde(default)]
+    pub selected_provider_plugin_id: Option<String>,
+    #[serde(default)]
+    pub selected_model_id: Option<String>,
+    #[serde(default)]
+    pub provider_context: bcode_model::ProviderRequestContext,
+    /// Redacted names of transient environment variables included in `provider_context.env`.
+    #[serde(default)]
+    pub env_keys: BTreeMap<String, bool>,
 }
 
 /// Local server status summary.
@@ -343,6 +364,7 @@ pub enum ResponsePayload {
         provider_plugin_id: Option<String>,
         models: bcode_model::ModelList,
     },
+    ClientRuntimeContextUpdated,
 }
 
 /// Structured error response.
