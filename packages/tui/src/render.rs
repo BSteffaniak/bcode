@@ -1068,10 +1068,7 @@ fn terminal_output_lines(output: &TerminalOutputTranscript) -> Vec<Line> {
     };
     stream.process(output.output.as_bytes());
     let grid = stream.grid();
-    let mut rows = grid.all_main_rows_slow();
-    if rows.is_empty() {
-        rows = grid.display_rows(0, MAX_INLINE_TOOL_TEXT_ROWS);
-    }
+    let rows = grid.main_content_rows();
     let lines = rows
         .iter()
         .map(|row| terminal_grid_row_to_line(grid, row))

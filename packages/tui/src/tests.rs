@@ -818,6 +818,38 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
 }
 
 #[test]
+fn transcript_renders_terminal_shell_output_without_viewport_padding() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call_terminal".to_owned(),
+            result: serde_json::json!({
+                "mode": "terminal",
+                "exit_code": 0,
+                "timed_out": false,
+                "output": "one\r\ntwo",
+                "columns": 80,
+                "rows": 10,
+            })
+            .to_string(),
+            is_error: false,
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 18));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("one"));
+    assert!(output.contains("two"));
+    assert!(output.contains("Message"));
+}
+
+#[test]
 fn scroll_up_requests_older_history_only_after_top() {
     let session_id = SessionId::new();
     let history = (10..60)
