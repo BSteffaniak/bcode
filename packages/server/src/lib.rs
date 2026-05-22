@@ -561,6 +561,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
                 model_profile: resolved_model.model_profile,
                 auth_profile: resolved_model.auth_profile,
                 settings: resolved_model.settings,
+                request: resolved_model.request,
                 env: BTreeMap::new(),
             },
             prompt_cache_mode: config.model.prompt_cache.mode,

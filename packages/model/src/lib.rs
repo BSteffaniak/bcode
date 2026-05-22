@@ -108,6 +108,59 @@ pub struct ValidateConfigRequest {
     pub config: BTreeMap<String, String>,
 }
 
+/// Binary-codec-safe provider-native request option value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderRequestValue {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    Array(Vec<Self>),
+    Object(BTreeMap<String, Self>),
+}
+
+impl From<serde_json::Value> for ProviderRequestValue {
+    fn from(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(value) => Self::Bool(value),
+            serde_json::Value::Number(value) => Self::Number(value.to_string()),
+            serde_json::Value::String(value) => Self::String(value),
+            serde_json::Value::Array(values) => {
+                Self::Array(values.into_iter().map(Self::from).collect())
+            }
+            serde_json::Value::Object(values) => Self::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::from(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<ProviderRequestValue> for serde_json::Value {
+    fn from(value: ProviderRequestValue) -> Self {
+        match value {
+            ProviderRequestValue::Null => Self::Null,
+            ProviderRequestValue::Bool(value) => Self::Bool(value),
+            ProviderRequestValue::Number(value) => value
+                .parse::<serde_json::Number>()
+                .map_or_else(|_| Self::String(value), Self::Number),
+            ProviderRequestValue::String(value) => Self::String(value),
+            ProviderRequestValue::Array(values) => {
+                Self::Array(values.into_iter().map(Self::from).collect())
+            }
+            ProviderRequestValue::Object(values) => Self::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::from(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// Provider-neutral request context resolved by the host from model/provider profiles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequestContext {
@@ -117,6 +170,12 @@ pub struct ProviderRequestContext {
     pub auth_profile: Option<String>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Provider-native request fields merged into the outbound provider request.
+    ///
+    /// These values are non-secret provider-specific request options resolved from model profiles
+    /// and aliases. Providers should validate/reserve core fields before merging.
+    #[serde(default)]
+    pub request: BTreeMap<String, ProviderRequestValue>,
     /// Transient client-supplied environment values for provider authentication/configuration.
     ///
     /// These values are carried in-memory from the initiating client connection to the provider

@@ -109,6 +109,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
             model_profile: resolved.model_profile,
             auth_profile: resolved.auth_profile,
             settings: resolved.settings,
+            request: resolved.request,
             env,
         },
         env_keys,

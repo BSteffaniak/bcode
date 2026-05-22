@@ -1290,7 +1290,7 @@ fn build_responses_request(
     settings: &Settings,
     request: &ModelTurnRequest,
     model_id: &str,
-) -> Result<ResponsesRequest, ProviderError> {
+) -> Result<serde_json::Value, ProviderError> {
     let previous_response_id = responses_previous_response_id(settings, request);
     let projection = responses_projection(
         request,
@@ -1298,7 +1298,7 @@ fn build_responses_request(
         settings.dialect.projects_reused_history() && previous_response_id.is_some(),
         settings.dialect,
     );
-    Ok(ResponsesRequest {
+    let typed_request = ResponsesRequest {
         model: model_id.to_string(),
         instructions: projection.instructions,
         input: projection.input,
@@ -1327,7 +1327,54 @@ fn build_responses_request(
         temperature: request.parameters.temperature,
         max_output_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
-    })
+    };
+    let mut body = serde_json::to_value(typed_request).map_err(|error| {
+        provider_error(
+            "request_encode_failed",
+            ProviderErrorCategory::InvalidRequest,
+            error.to_string(),
+        )
+    })?;
+    merge_provider_request_options(&mut body, &request.provider_context.request)?;
+    Ok(body)
+}
+
+fn merge_provider_request_options(
+    body: &mut serde_json::Value,
+    request_options: &BTreeMap<String, bcode_model::ProviderRequestValue>,
+) -> Result<(), ProviderError> {
+    let Some(body_object) = body.as_object_mut() else {
+        return Err(provider_error(
+            "invalid_provider_request",
+            ProviderErrorCategory::InvalidRequest,
+            "provider request body is not a JSON object",
+        ));
+    };
+    for (key, value) in request_options {
+        if is_reserved_responses_request_key(key) {
+            return Err(provider_error(
+                "reserved_provider_request_option",
+                ProviderErrorCategory::InvalidRequest,
+                format!("provider request option '{key}' is reserved and cannot be overridden"),
+            ));
+        }
+        body_object.insert(key.clone(), serde_json::Value::from(value.clone()));
+    }
+    Ok(())
+}
+
+fn is_reserved_responses_request_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "input"
+            | "messages"
+            | "stream"
+            | "tools"
+            | "tool_choice"
+            | "instructions"
+            | "previous_response_id"
+    )
 }
 
 const fn responses_instruction_strategy(_settings: &Settings) -> ResponsesInstructionStrategy {
@@ -3011,6 +3058,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn responses_request_merges_generic_provider_options() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.provider_context.request = BTreeMap::from([
+            (
+                "service_tier".to_string(),
+                bcode_model::ProviderRequestValue::from(serde_json::json!("priority")),
+            ),
+            (
+                "custom_boolean".to_string(),
+                bcode_model::ProviderRequestValue::from(serde_json::json!(true)),
+            ),
+        ]);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body =
+            build_responses_request(&settings, &request, "gpt-5.5").expect("request should build");
+
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            body.get("service_tier").and_then(serde_json::Value::as_str),
+            Some("priority")
+        );
+        assert_eq!(
+            body.get("custom_boolean")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn responses_request_rejects_reserved_provider_options() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.provider_context.request = BTreeMap::from([(
+            "model".to_string(),
+            bcode_model::ProviderRequestValue::from(serde_json::json!("other-model")),
+        )]);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let error = build_responses_request(&settings, &request, "gpt-5.5")
+            .expect_err("reserved field should be rejected");
+
+        assert_eq!(error.code, "reserved_provider_request_option");
+        assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+    }
+
     fn text_message(role: MessageRole, text: &str) -> ModelMessage {
         ModelMessage {
             role,
@@ -3208,15 +3304,15 @@ mod tests {
         };
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
 
-        let body =
+        let encoded =
             build_responses_request(&settings, &request, "model").expect("request should build");
-        let encoded = serde_json::to_value(&body).expect("request should serialize");
         let encoded_text = encoded.to_string();
 
         assert!(
-            body.instructions.as_deref().is_some_and(|text| {
-                text.contains("top-level") && text.contains("dynamic system")
-            })
+            encoded
+                .get("instructions")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains("top-level") && text.contains("dynamic system"))
         );
         assert!(!encoded_text.contains(r#""role":"system""#));
         assert!(encoded.get("instructions").is_some());
@@ -3293,11 +3389,16 @@ mod tests {
         };
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
 
-        let body =
+        let encoded =
             build_responses_request(&settings, &request, "model").expect("request should build");
-        let encoded = serde_json::to_value(&body).expect("request should serialize");
 
-        assert_eq!(body.input.len(), 3);
+        assert_eq!(
+            encoded
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
         assert_eq!(
             encoded.get("store").and_then(serde_json::Value::as_bool),
             Some(false)
@@ -3335,9 +3436,21 @@ mod tests {
         let body =
             build_responses_request(&settings, &request, "model").expect("request should build");
 
-        assert_eq!(body.previous_response_id.as_deref(), Some("resp_1"));
-        assert!(body.store);
-        assert_eq!(body.input.len(), 1);
+        assert_eq!(
+            body.get("previous_response_id")
+                .and_then(serde_json::Value::as_str),
+            Some("resp_1")
+        );
+        assert_eq!(
+            body.get("store").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]

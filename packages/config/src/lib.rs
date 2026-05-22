@@ -134,9 +134,11 @@ impl BcodeConfig {
         let mut selection = ResolvedModelSelection {
             provider_plugin_id: self.model.provider_plugin_id.clone(),
             model_id: self.model.model_id.clone(),
+            selected_model_id: self.model.model_id.clone(),
             model_profile: self.model.profile.clone(),
             auth_profile: None,
             settings: BTreeMap::new(),
+            request: BTreeMap::new(),
         };
         if let Some(profile_name) = &self.model.profile
             && let Some(profile) = self.model.profiles.get(profile_name)
@@ -147,7 +149,9 @@ impl BcodeConfig {
             }
             selection.auth_profile.clone_from(&profile.auth_profile);
             selection.settings = profile.settings.clone();
+            selection.request = provider_request_values_from_json(&profile.request);
         }
+        self.apply_model_alias(&mut selection);
         if selection.provider_plugin_id.is_none()
             && let Some(config_provider) = self.provider_plugin_id_from_config_auth()
         {
@@ -178,6 +182,24 @@ impl BcodeConfig {
         selection
     }
 
+    fn apply_model_alias(&self, selection: &mut ResolvedModelSelection) {
+        let Some(selected_model_id) = selection.model_id.clone() else {
+            return;
+        };
+        let Some(alias) = self.model.aliases.get(&selected_model_id) else {
+            selection.selected_model_id = Some(selected_model_id);
+            return;
+        };
+        selection.selected_model_id = Some(selected_model_id);
+        if let Some(provider_plugin_id) = &alias.provider_plugin_id {
+            selection.provider_plugin_id = Some(provider_plugin_id.clone());
+        }
+        selection.model_id = Some(alias.model_id.clone());
+        let mut request = provider_request_values_from_json(&alias.request);
+        request.extend(selection.request.clone());
+        selection.request = request;
+    }
+
     fn provider_plugin_id_from_config_auth(&self) -> Option<String> {
         PROVIDER_ENVIRONMENT_SPECS
             .iter()
@@ -196,6 +218,20 @@ fn openai_config_auth_is_configured(config: &BcodeConfig) -> bool {
         .openai
         .as_ref()
         .is_some_and(|auth| auth.backend == "sshenv")
+}
+
+fn provider_request_values_from_json(
+    values: &BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, bcode_model::ProviderRequestValue> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                bcode_model::ProviderRequestValue::from(value.clone()),
+            )
+        })
+        .collect()
 }
 
 /// Return a provider plugin ID explicitly or implicitly selected by environment variables.
@@ -973,6 +1009,8 @@ pub struct ModelConfig {
     pub profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ModelProfileConfig>,
+    #[serde(default)]
+    pub aliases: BTreeMap<String, ModelAliasConfig>,
 }
 
 impl ModelConfig {
@@ -1153,6 +1191,18 @@ pub struct ModelProfileConfig {
     pub auth_profile: Option<String>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub request: BTreeMap<String, serde_json::Value>,
+}
+
+/// Generic model alias resolved before provider requests are built.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAliasConfig {
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    pub model_id: String,
+    #[serde(default)]
+    pub request: BTreeMap<String, serde_json::Value>,
 }
 
 /// Resolved model selection after applying the active model profile, if any.
@@ -1160,9 +1210,11 @@ pub struct ModelProfileConfig {
 pub struct ResolvedModelSelection {
     pub provider_plugin_id: Option<String>,
     pub model_id: Option<String>,
+    pub selected_model_id: Option<String>,
     pub model_profile: Option<String>,
     pub auth_profile: Option<String>,
     pub settings: BTreeMap<String, String>,
+    pub request: BTreeMap<String, bcode_model::ProviderRequestValue>,
 }
 
 /// Plugin configuration.
@@ -1353,6 +1405,7 @@ pub fn set_openai_compatible_sshenv_auth_mode(
                     model_id: Some(model_id),
                     auth_profile: Some(profile),
                     settings: BTreeMap::new(),
+                    request: BTreeMap::new(),
                 });
         }
         Ok(())
@@ -1402,6 +1455,7 @@ pub fn set_bedrock_model_profile(
                 model_id: Some(model_id),
                 auth_profile: Some(auth_profile.clone()),
                 settings,
+                request: BTreeMap::new(),
             },
         );
         let mut auth_settings = BTreeMap::new();
@@ -1729,6 +1783,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         || model.default_thinking_level.is_some()
         || model.max_tool_rounds.is_some()
         || model.profile.is_some()
+        || !model.aliases.is_empty()
         || model.prompt_cache != PromptCacheConfig::default()
         || model.conversation_reuse != ConversationReuseConfig::default()
         || model.tool_output != ToolOutputConfig::default()
@@ -1787,7 +1842,12 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
     if model.compaction != CompactionConfig::default() {
         write_model_compaction_toml(output, &model.compaction);
     }
-    for (profile_name, profile) in &model.profiles {
+    write_model_profiles_toml(output, &model.profiles);
+    write_model_aliases_toml(output, &model.aliases);
+}
+
+fn write_model_profiles_toml(output: &mut String, profiles: &BTreeMap<String, ModelProfileConfig>) {
+    for (profile_name, profile) in profiles {
         writeln!(output, "[model.profiles.{}]", toml_key(profile_name))
             .expect("writing to string should not fail");
         writeln!(
@@ -1809,6 +1869,34 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
             output,
             &format!("model.profiles.{}.settings", toml_key(profile_name)),
             &profile.settings,
+        );
+        write_json_map_table(
+            output,
+            &format!("model.profiles.{}.request", toml_key(profile_name)),
+            &profile.request,
+        );
+    }
+}
+
+fn write_model_aliases_toml(output: &mut String, aliases: &BTreeMap<String, ModelAliasConfig>) {
+    for (alias_name, alias) in aliases {
+        writeln!(output, "[model.aliases.{}]", toml_key(alias_name))
+            .expect("writing to string should not fail");
+        if let Some(provider_plugin_id) = &alias.provider_plugin_id {
+            writeln!(
+                output,
+                "provider_plugin_id = {}",
+                toml_string(provider_plugin_id)
+            )
+            .expect("writing to string should not fail");
+        }
+        writeln!(output, "model_id = {}", toml_string(&alias.model_id))
+            .expect("writing to string should not fail");
+        output.push('\n');
+        write_json_map_table(
+            output,
+            &format!("model.aliases.{}.request", toml_key(alias_name)),
+            &alias.request,
         );
     }
 }
@@ -2158,6 +2246,73 @@ fn write_string_map_table(output: &mut String, table: &str, values: &BTreeMap<St
             .expect("writing to string should not fail");
     }
     output.push('\n');
+}
+
+fn write_json_map_table(
+    output: &mut String,
+    table: &str,
+    values: &BTreeMap<String, serde_json::Value>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    writeln!(output, "[{table}]").expect("writing to string should not fail");
+    for (key, value) in values {
+        write_json_toml_value(output, table, key, value);
+    }
+    output.push('\n');
+}
+
+fn write_json_toml_value(output: &mut String, table: &str, key: &str, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(values) => {
+            output.push('\n');
+            writeln!(output, "[{table}.{}]", toml_key(key))
+                .expect("writing to string should not fail");
+            for (child_key, child_value) in values {
+                write_json_toml_value(
+                    output,
+                    &format!("{table}.{}", toml_key(key)),
+                    child_key,
+                    child_value,
+                );
+            }
+        }
+        serde_json::Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(json_toml_inline_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(output, "{} = [{values}]", toml_key(key))
+                .expect("writing to string should not fail");
+        }
+        _ => writeln!(
+            output,
+            "{} = {}",
+            toml_key(key),
+            json_toml_inline_value(value)
+        )
+        .expect("writing to string should not fail"),
+    }
+}
+
+fn json_toml_inline_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "\"\"".to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => toml_string(value),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(json_toml_inline_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        serde_json::Value::Object(_) => toml_string(&value.to_string()),
+    }
 }
 
 fn toml_key(value: &str) -> String {
@@ -2559,6 +2714,53 @@ profile = "work"
         assert_eq!(
             selection.settings.get("region"),
             Some(&"us-east-1".to_string())
+        );
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn resolves_model_alias_request_options() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model]
+profile = "openai-fast"
+
+[model.profiles.openai-fast]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-5.5-fast"
+
+[model.profiles.openai-fast.request]
+custom_boolean = true
+
+[model.aliases."gpt-5.5-fast"]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-5.5"
+
+[model.aliases."gpt-5.5-fast".request]
+service_tier = "priority"
+custom_boolean = false
+"#,
+        )
+        .expect("alias config should parse");
+
+        let selection = config.resolved_model_selection();
+        assert_eq!(selection.selected_model_id.as_deref(), Some("gpt-5.5-fast"));
+        assert_eq!(selection.model_id.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            selection.request.get("service_tier"),
+            Some(&bcode_model::ProviderRequestValue::from(serde_json::json!(
+                "priority"
+            )))
+        );
+        assert_eq!(
+            selection.request.get("custom_boolean"),
+            Some(&bcode_model::ProviderRequestValue::from(serde_json::json!(
+                true
+            ))),
+            "profile request options override alias defaults"
         );
 
         restore_provider_env(previous_env);
