@@ -163,6 +163,12 @@ pub enum ShellResultPresentation {
         timed_out: bool,
         /// Raw terminal byte stream decoded as UTF-8.
         output: String,
+        /// Whether the terminal stream was truncated before serialization.
+        output_truncated: bool,
+        /// Original terminal stream byte count before truncation.
+        output_bytes: Option<u64>,
+        /// Retained terminal stream byte count after truncation.
+        retained_output_bytes: Option<u64>,
         /// Terminal columns used for execution.
         columns: u16,
         /// Terminal rows used for execution.
@@ -304,6 +310,9 @@ fn terminal_shell_result(result: &str) -> Option<ShellResultPresentation> {
         exit_code: i32_field(&value, "exit_code"),
         timed_out: bool_field(&value, "timed_out"),
         output: string_field(&value, "output").unwrap_or_default(),
+        output_truncated: bool_field(&value, "output_truncated"),
+        output_bytes: u64_field(&value, "output_bytes"),
+        retained_output_bytes: u64_field(&value, "retained_output_bytes"),
         columns: u16_field(&value, "columns").unwrap_or(120).max(1),
         rows: u16_field(&value, "rows").unwrap_or(30).max(1),
     })

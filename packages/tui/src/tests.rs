@@ -850,6 +850,43 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
 }
 
 #[test]
+fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call_terminal".to_owned(),
+            result: serde_json::json!({
+                "mode": "terminal",
+                "exit_code": 0,
+                "timed_out": false,
+                "output": "one\r\ntwo",
+                "output_truncated": true,
+                "output_bytes": 70000,
+                "retained_output_bytes": 65536,
+                "columns": 80,
+                "rows": 10,
+            })
+            .to_string(),
+            is_error: false,
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("output truncated"));
+    assert!(output.contains("showing 65536 of 70000 bytes"));
+    assert!(output.contains("one"));
+    assert!(output.contains("two"));
+    assert!(!output.contains("{\"mode\":\"terminal\""));
+}
+
+#[test]
 fn scroll_up_requests_older_history_only_after_top() {
     let session_id = SessionId::new();
     let history = (10..60)

@@ -146,8 +146,19 @@ struct TerminalCommandOutput {
     exit_code: Option<i32>,
     timed_out: bool,
     output: String,
+    output_truncated: bool,
+    output_bytes: u64,
+    retained_output_bytes: u64,
     columns: u16,
     rows: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LimitedOutput {
+    text: String,
+    original_bytes: usize,
+    retained_bytes: usize,
+    truncated: bool,
 }
 
 fn run_terminal_shell_command(
@@ -219,7 +230,10 @@ fn run_terminal_shell_command_inner(
         mode: "terminal",
         exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
         timed_out,
-        output,
+        output: output.text,
+        output_truncated: output.truncated,
+        output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
+        retained_output_bytes: u64::try_from(output.retained_bytes).unwrap_or(u64::MAX),
         columns,
         rows,
     };
@@ -269,7 +283,7 @@ fn run_shell_command(
 
     let stdout = join_reader(stdout_reader)?;
     let stderr = join_reader(stderr_reader)?;
-    let output = format_command_output(status.code(), timed_out, &stdout, &stderr);
+    let output = format_command_output(status.code(), timed_out, &stdout.text, &stderr.text);
     Ok(ToolInvocationResponse {
         output,
         is_error: timed_out || !status.success(),
@@ -355,21 +369,40 @@ fn send_signal_to_process_group(process_group_id: i32, signal: i32) -> Result<()
     Err(error.to_string())
 }
 
-fn read_limited<R>(mut reader: R) -> Result<String, String>
+fn read_limited<R>(mut reader: R) -> Result<LimitedOutput, String>
 where
     R: Read,
 {
     let mut bytes = Vec::new();
-    let limit = u64::try_from(MAX_OUTPUT_BYTES).map_err(|error| error.to_string())?;
     reader
-        .by_ref()
-        .take(limit)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(limit_output_bytes(&bytes, MAX_OUTPUT_BYTES))
 }
 
-fn join_reader(handle: std::thread::JoinHandle<Result<String, String>>) -> Result<String, String> {
+fn limit_output_bytes(bytes: &[u8], max_bytes: usize) -> LimitedOutput {
+    let original_bytes = bytes.len();
+    let retained_len = valid_utf8_prefix_len(bytes, max_bytes.min(original_bytes));
+    let text = String::from_utf8_lossy(&bytes[..retained_len]).into_owned();
+    LimitedOutput {
+        text,
+        original_bytes,
+        retained_bytes: retained_len,
+        truncated: retained_len < original_bytes,
+    }
+}
+
+fn valid_utf8_prefix_len(bytes: &[u8], max_len: usize) -> usize {
+    let mut len = max_len.min(bytes.len());
+    while len > 0 && std::str::from_utf8(&bytes[..len]).is_err() {
+        len = len.saturating_sub(1);
+    }
+    len
+}
+
+fn join_reader(
+    handle: std::thread::JoinHandle<Result<LimitedOutput, String>>,
+) -> Result<LimitedOutput, String> {
     handle
         .join()
         .map_err(|_| "output reader thread panicked".to_string())?
@@ -441,5 +474,46 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(response.is_error);
         assert!(response.output.contains("timed_out: true"));
+    }
+
+    #[test]
+    fn limit_output_bytes_truncates_at_utf8_boundary() {
+        let output = limit_output_bytes("abcé".as_bytes(), 4);
+
+        assert_eq!(output.text, "abc");
+        assert_eq!(output.original_bytes, 5);
+        assert_eq!(output.retained_bytes, 3);
+        assert!(output.truncated);
+    }
+
+    #[test]
+    fn terminal_output_json_stays_valid_when_output_is_truncated() {
+        let bytes = vec![b'x'; MAX_OUTPUT_BYTES + 1];
+        let output = limit_output_bytes(&bytes, MAX_OUTPUT_BYTES);
+        let terminal_output = TerminalCommandOutput {
+            mode: "terminal",
+            exit_code: Some(0),
+            timed_out: false,
+            output: output.text,
+            output_truncated: output.truncated,
+            output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
+            retained_output_bytes: u64::try_from(output.retained_bytes).unwrap_or(u64::MAX),
+            columns: DEFAULT_TERMINAL_COLUMNS,
+            rows: DEFAULT_TERMINAL_ROWS,
+        };
+
+        let encoded = serde_json::to_string(&terminal_output).expect("terminal output encodes");
+        let value = serde_json::from_str::<serde_json::Value>(&encoded).expect("valid json");
+
+        assert_eq!(
+            value.get("mode").and_then(serde_json::Value::as_str),
+            Some("terminal")
+        );
+        assert_eq!(
+            value
+                .get("output_truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 }

@@ -968,6 +968,9 @@ fn push_shell_result_rows(rows: &mut Vec<Line>, shell: &ShellResultPresentation,
             exit_code,
             timed_out,
             output,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
             columns,
             rows: terminal_rows,
         } => push_terminal_output_rows(
@@ -976,6 +979,9 @@ fn push_shell_result_rows(rows: &mut Vec<Line>, shell: &ShellResultPresentation,
                 exit_code: *exit_code,
                 timed_out: *timed_out,
                 output: output.clone(),
+                output_truncated: *output_truncated,
+                output_bytes: *output_bytes,
+                retained_output_bytes: *retained_output_bytes,
                 columns: *columns,
                 rows: *terminal_rows,
             },
@@ -1029,6 +1035,9 @@ struct TerminalOutputTranscript {
     exit_code: Option<i32>,
     timed_out: bool,
     output: String,
+    output_truncated: bool,
+    output_bytes: Option<u64>,
+    retained_output_bytes: Option<u64>,
     columns: u16,
     rows: u16,
 }
@@ -1051,8 +1060,27 @@ fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTransc
         muted_style(),
         muted_style(),
     );
+    if output.output_truncated {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &terminal_truncation_status(output),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
     for line in terminal_output_lines(output) {
         rows.push(prefix_line(line, "    ", muted_style()));
+    }
+}
+
+fn terminal_truncation_status(output: &TerminalOutputTranscript) -> String {
+    match (output.retained_output_bytes, output.output_bytes) {
+        (Some(retained), Some(original)) => {
+            format!("output truncated · showing {retained} of {original} bytes")
+        }
+        _ => "output truncated".to_owned(),
     }
 }
 
