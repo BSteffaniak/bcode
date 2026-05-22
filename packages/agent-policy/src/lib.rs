@@ -277,8 +277,9 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
             None,
         );
     };
+    let rules = compile_rules(config);
     if writes_disabled(config)
-        && let Some(part) = mutating_shell_command_part(command)
+        && let Some(part) = mutating_shell_command_part(command, &rules)
     {
         return evaluation(
             AgentDecision::Deny,
@@ -290,7 +291,6 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
             Some(part.to_string()),
         );
     }
-    let rules = compile_rules(config);
     if let Some(denied) = denied_command_part(command, &rules) {
         let rule_pattern = denied.rule.as_ref().map(|rule| rule.pattern.clone());
         return match denied.action {
@@ -405,10 +405,14 @@ fn writes_disabled(config: &AgentConfig) -> bool {
         .any(|tool| config.tools.get(*tool) == Some(&false))
 }
 
-fn mutating_shell_command_part(command: &str) -> Option<&str> {
+fn mutating_shell_command_part<'a>(command: &'a str, rules: &[Rule]) -> Option<&'a str> {
     command_parts(command)
         .into_iter()
-        .find(|part| shell_part_writes_files(part))
+        .find(|part| shell_part_writes_files(part) && !explicitly_allows_shell_part(part, rules))
+}
+
+fn explicitly_allows_shell_part(part: &str, rules: &[Rule]) -> bool {
+    matching_rule(part, rules).is_some_and(|rule| rule.action == Action::Allow)
 }
 
 fn shell_part_writes_files(part: &str) -> bool {
@@ -785,6 +789,25 @@ mod tests {
     }
 
     #[test]
+    fn default_plan_allows_validation_commands() {
+        let config = default_config();
+        let plan = agent_config(&config, PLAN_AGENT);
+
+        for command in ["cargo check", "cargo test", "cargo test --workspace"] {
+            let result = evaluate_tool_call(
+                &plan,
+                &request(PLAN_AGENT, command),
+                Path::new("/tmp/project"),
+            );
+            assert_eq!(
+                result.response.decision,
+                AgentDecision::Allow,
+                "{command} should be allowed"
+            );
+        }
+    }
+
+    #[test]
     fn plan_denies_mutable_git_command_in_chain() {
         let config = default_config();
         let plan = agent_config(&config, PLAN_AGENT);
@@ -799,7 +822,21 @@ mod tests {
     }
 
     #[test]
-    fn plan_denies_shell_redirection_even_when_echo_is_allowed() {
+    fn plan_denies_allowed_validation_chain_with_mutating_part() {
+        let config = default_config();
+        let plan = agent_config(&config, PLAN_AGENT);
+        let result = evaluate_tool_call(
+            &plan,
+            &request(PLAN_AGENT, "cargo test && touch generated.txt"),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+        assert_eq!(result.command_part.as_deref(), Some("touch generated.txt"));
+    }
+
+    #[test]
+    fn plan_allows_explicit_shell_rule_even_when_command_may_write() {
         let config = AgentPermissionConfig {
             agent: BTreeMap::from([(
                 PLAN_AGENT.to_string(),
@@ -820,57 +857,36 @@ mod tests {
                 },
             )]),
         };
-        let plan = agent_config(&config, PLAN_AGENT);
+        let plan_config = agent_config(&config, PLAN_AGENT);
 
-        let denied = evaluate_tool_call(
-            &plan,
+        let redirected = evaluate_tool_call(
+            &plan_config,
             &request(PLAN_AGENT, "echo \"hello\" > test.txt"),
             Path::new("/tmp/project"),
         );
-        let allowed = evaluate_tool_call(
-            &plan,
+        let plain_echo = evaluate_tool_call(
+            &plan_config,
             &request(PLAN_AGENT, "echo hello"),
             Path::new("/tmp/project"),
         );
 
-        assert_eq!(denied.response.decision, AgentDecision::Deny);
-        assert_eq!(
-            denied.command_part.as_deref(),
-            Some("echo \"hello\" > test.txt")
-        );
-        assert_eq!(allowed.response.decision, AgentDecision::Allow);
+        assert_eq!(redirected.response.decision, AgentDecision::Allow);
+        assert_eq!(plain_echo.response.decision, AgentDecision::Allow);
     }
 
     #[test]
-    fn plan_denies_tee_as_shell_file_write() {
-        let config = AgentPermissionConfig {
-            agent: BTreeMap::from([(
-                PLAN_AGENT.to_string(),
-                AgentConfig {
-                    tools: BTreeMap::from([
-                        ("bash".to_string(), true),
-                        ("write".to_string(), false),
-                    ]),
-                    permission: PermissionConfig {
-                        bash: BTreeMap::from([
-                            ("*".to_string(), Action::Deny),
-                            ("tee *".to_string(), Action::Allow),
-                        ]),
-                        external_directory: Action::Allow,
-                        ..PermissionConfig::default()
-                    },
-                },
-            )]),
-        };
+    fn plan_denies_mutating_shell_command_without_explicit_allow() {
+        let config = default_config();
         let plan = agent_config(&config, PLAN_AGENT);
 
         let denied = evaluate_tool_call(
             &plan,
-            &request(PLAN_AGENT, "tee test.txt"),
+            &request(PLAN_AGENT, "touch test.txt"),
             Path::new("/tmp/project"),
         );
 
         assert_eq!(denied.response.decision, AgentDecision::Deny);
+        assert_eq!(denied.command_part.as_deref(), Some("touch test.txt"));
     }
 
     #[test]
