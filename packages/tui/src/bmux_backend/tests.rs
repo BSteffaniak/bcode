@@ -53,7 +53,7 @@ fn multiline_paste_preserves_line_breaks_in_composer() {
 
     app.paste_composer_text("first\nsecond\r\nthird\rfourth");
 
-    assert_eq!(app.composer().text(), "first\nsecond\r\nthird\rfourth");
+    assert_eq!(app.composer().text(), "first\nsecond\nthird\nfourth");
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn composer_drag_beyond_visible_edge_scrolls_selection() {
         outcome,
         bmux_tui_components::text_input::TextInputOutcome::Redraw
     ));
-    assert_eq!(app.composer_scroll_offset(), 1);
+    assert_eq!(app.composer_scroll_offset_for_render(), 1);
     assert_eq!(app.composer().selected_text(), Some("0\n1\n".to_owned()));
 }
 

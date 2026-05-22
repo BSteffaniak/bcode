@@ -13,9 +13,10 @@ use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_block::{TextBlock, TextWrap};
+use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
-use super::app::BmuxApp;
+use super::app::{BmuxApp, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::transcript::{ShellOutputTranscript, TranscriptItem, TranscriptItemKind};
@@ -65,13 +66,9 @@ fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
         return 0;
     }
     let content_width = area.width.saturating_sub(4).max(1);
-    let rows = app
-        .composer()
-        .wrapped_layout(usize::from(content_width))
-        .lines
-        .len()
-        .max(1);
-    let content_rows = usize_to_u16_saturating(rows).clamp(1, MAX_COMPOSER_ROWS);
+    let rows = TextInputControl::new(&composer_policy())
+        .visible_rows_for_width(app.composer_state(), content_width);
+    let content_rows = rows.clamp(1, MAX_COMPOSER_ROWS);
     content_rows
         .saturating_add(2)
         .min(area.height.saturating_sub(2).max(3))
@@ -1045,7 +1042,7 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     TextInput::new(app.composer())
         .placeholder("Ask Bcode…")
         .placeholder_style(Style::new().fg(Color::BrightBlack))
-        .vertical_scroll(app.composer_scroll_offset())
+        .vertical_scroll(app.composer_scroll_offset_for_render())
         .cursor_visible(app.cursor_visible())
         .render(inner, frame);
 }
@@ -1085,10 +1082,6 @@ fn truncate_end(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     output.push('…');
     output
-}
-
-fn usize_to_u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 const fn muted_style() -> Style {

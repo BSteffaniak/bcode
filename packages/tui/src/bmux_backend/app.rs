@@ -150,10 +150,21 @@ impl BmuxApp {
         self.composer.set_content_area(area, &composer_policy());
     }
 
-    /// Return the current composer wrapped-row scroll offset.
+    /// Return the composer scroll offset that should be used for the latest content area.
+    pub(super) fn composer_scroll_offset_for_render(&self) -> usize {
+        if self.composer.vertical_scroll() == usize::MAX {
+            self.composer
+                .cursor_scroll_offset(&composer_policy())
+                .unwrap_or(0)
+        } else {
+            self.composer.vertical_scroll()
+        }
+    }
+
+    /// Return the composer text input state.
     #[must_use]
-    pub(super) const fn composer_scroll_offset(&self) -> usize {
-        self.composer.vertical_scroll()
+    pub(super) const fn composer_state(&self) -> &TextInputState {
+        &self.composer
     }
 
     /// Return the composer buffer.
@@ -1081,7 +1092,7 @@ impl BmuxApp {
     }
 }
 
-const fn composer_policy() -> TextInputPolicy {
+pub(super) const fn composer_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
 }
 
