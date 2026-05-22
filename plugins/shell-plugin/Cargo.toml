@@ -14,11 +14,13 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_plugin_sdk = { workspace = true }
-bcode_tool       = { workspace = true }
-portable-pty     = { workspace = true }
-serde            = { workspace = true, features = ["derive", "std"] }
-serde_json       = { workspace = true }
+bcode_plugin_sdk   = { workspace = true }
+bcode_tool         = { workspace = true }
+bcode_tool_runtime = { workspace = true }
+portable-pty       = { workspace = true }
+serde              = { workspace = true, features = ["derive", "std"] }
+serde_json         = { workspace = true }
+tokio              = { workspace = true, features = ["rt"] }
 
 [features]
 default          = []

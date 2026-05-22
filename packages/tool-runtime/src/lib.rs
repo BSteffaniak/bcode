@@ -14,7 +14,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Semaphore};
 
 /// Unique managed tool execution identifier.
@@ -183,7 +183,8 @@ async fn run_process_inner(
     if let Some(cwd) = request.cwd {
         command.current_dir(cwd);
     }
-    let mut child = command.spawn()?;
+    configure_command_for_timeout(&mut command);
+    let mut child = command.kill_on_drop(true).spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = tokio::spawn(read_limited(stdout, request.max_output_bytes));
@@ -192,14 +193,21 @@ async fn run_process_inner(
         if let Ok(status) = tokio::time::timeout(timeout, child.wait()).await {
             (status?, false)
         } else {
-            let _ = child.kill().await;
-            (child.wait().await?, true)
+            (terminate_child_after_timeout(&mut child).await?, true)
         }
     } else {
         (child.wait().await?, false)
     };
-    let stdout = stdout_task.await??;
-    let stderr = stderr_task.await??;
+    let stdout = if timed_out {
+        Vec::new()
+    } else {
+        stdout_task.await??
+    };
+    let stderr = if timed_out {
+        Vec::new()
+    } else {
+        stderr_task.await??
+    };
     Ok(ProcessExecutionResult {
         id,
         exit_code: status.code(),
@@ -207,6 +215,72 @@ async fn run_process_inner(
         stdout,
         stderr,
     })
+}
+
+#[cfg(unix)]
+fn configure_command_for_timeout(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_command_for_timeout(_command: &mut Command) {}
+
+#[cfg(unix)]
+async fn terminate_child_after_timeout(
+    child: &mut Child,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    let Some(child_id) = child.id() else {
+        return child.wait().await;
+    };
+    let process_group_id = i32::try_from(child_id).unwrap_or(i32::MAX);
+    let _ = send_signal_to_process_group(process_group_id, SIGTERM);
+    let grace_deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= grace_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = send_signal_to_process_group(process_group_id, SIGKILL);
+    child.wait().await
+}
+
+#[cfg(not(unix))]
+async fn terminate_child_after_timeout(
+    child: &mut Child,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    let _ = child.kill().await;
+    child.wait().await
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group(process_group_id: i32, signal: i32) -> Result<(), std::io::Error> {
+    let target = -process_group_id;
+    // SAFETY: `kill` is called with a process-group target created by `process_group(0)`.
+    let result = unsafe { kill(target, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        return Ok(());
+    }
+    Err(error)
 }
 
 async fn read_limited(
