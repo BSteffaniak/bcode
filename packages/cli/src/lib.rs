@@ -1930,7 +1930,7 @@ const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
 ];
 
 fn ensure_bundled_plugins_installed() -> Result<(), CliError> {
-    if cfg!(feature = "static-bundled-plugins")
+    if cfg!(feature = "_static-bundled")
         || std::env::var_os("BCODE_SKIP_BUNDLED_PLUGIN_INSTALL").is_some()
     {
         return Ok(());

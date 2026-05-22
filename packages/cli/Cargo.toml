@@ -35,24 +35,31 @@ tracing-subscriber   = { workspace = true }
 zeroize              = { workspace = true }
 
 [features]
+_static-bundled = []
 default = ["static-bundled-plugins"]
 fail-on-warnings = []
 static-bundled-bedrock-provider-plugin = [
+    "_static-bundled",
     "bcode_server/static-bundled-bedrock-provider-plugin",
 ]
 static-bundled-default-agents-plugin = [
+    "_static-bundled",
     "bcode_server/static-bundled-default-agents-plugin",
 ]
 static-bundled-fake-provider-plugin = [
+    "_static-bundled",
     "bcode_server/static-bundled-fake-provider-plugin",
 ]
 static-bundled-filesystem-plugin = [
+    "_static-bundled",
     "bcode_server/static-bundled-filesystem-plugin",
 ]
 static-bundled-openai-compatible-provider-plugin = [
+    "_static-bundled",
     "bcode_server/static-bundled-openai-compatible-provider-plugin",
 ]
 static-bundled-plugins = [
+    "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
     "static-bundled-default-agents-plugin",
     "static-bundled-fake-provider-plugin",
@@ -60,4 +67,7 @@ static-bundled-plugins = [
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-shell-plugin",
 ]
-static-bundled-shell-plugin = ["bcode_server/static-bundled-shell-plugin"]
+static-bundled-shell-plugin = [
+    "_static-bundled",
+    "bcode_server/static-bundled-shell-plugin",
+]
