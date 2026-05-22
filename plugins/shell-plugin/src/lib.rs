@@ -9,10 +9,10 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
     ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
+const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const TERMINATION_GRACE_MS: u64 = 500;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -54,6 +56,12 @@ struct ShellRunArguments {
     cwd: Option<PathBuf>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    terminal: bool,
+    #[serde(default)]
+    columns: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
@@ -70,7 +78,10 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                 "properties": {
                     "command": { "type": "string" },
                     "cwd": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 }
+                    "timeout_ms": { "type": "integer", "minimum": 1 },
+                    "terminal": { "type": "boolean", "description": "Run under a pseudo-terminal for human-like CLI formatting" },
+                    "columns": { "type": "integer", "minimum": 1 },
+                    "rows": { "type": "integer", "minimum": 1 }
                 }
             }),
             side_effect: ToolSideEffect::ExecuteProcess,
@@ -113,6 +124,9 @@ fn run_shell_tool(
             is_error: true,
         };
     }
+    if arguments.terminal {
+        return run_terminal_shell_command(&arguments, session_cwd);
+    }
     match run_shell_command(&arguments, session_cwd) {
         Ok(output) => output,
         Err(error) => ToolInvocationResponse {
@@ -120,6 +134,96 @@ fn run_shell_tool(
             is_error: true,
         },
     }
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalCommandOutput {
+    mode: &'static str,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output: String,
+    columns: u16,
+    rows: u16,
+}
+
+fn run_terminal_shell_command(
+    arguments: &ShellRunArguments,
+    session_cwd: Option<&Path>,
+) -> ToolInvocationResponse {
+    match run_terminal_shell_command_inner(arguments, session_cwd) {
+        Ok(response) => response,
+        Err(error) => ToolInvocationResponse {
+            output: error,
+            is_error: true,
+        },
+    }
+}
+
+fn run_terminal_shell_command_inner(
+    arguments: &ShellRunArguments,
+    session_cwd: Option<&Path>,
+) -> Result<ToolInvocationResponse, String> {
+    let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+    let columns = arguments.columns.unwrap_or(DEFAULT_TERMINAL_COLUMNS).max(1);
+    let rows = arguments.rows.unwrap_or(DEFAULT_TERMINAL_ROWS).max(1);
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows,
+            cols: columns,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut command = portable_pty::CommandBuilder::new("sh");
+    command.arg("-c");
+    command.arg(&arguments.command);
+    if let Some(cwd) = arguments.cwd.as_deref().or(session_cwd) {
+        command.cwd(cwd);
+    }
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| error.to_string())?;
+    drop(pair.slave);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| error.to_string())?;
+    let reader_thread = std::thread::spawn(move || read_limited(&mut reader));
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            child.kill().map_err(|error| error.to_string())?;
+            break child.wait().map_err(|error| error.to_string())?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(pair.master);
+    let output = join_reader(reader_thread)?;
+    let terminal_output = TerminalCommandOutput {
+        mode: "terminal",
+        exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
+        timed_out,
+        output,
+        columns,
+        rows,
+    };
+    let encoded = serde_json::to_string(&terminal_output).map_err(|error| error.to_string())?;
+    Ok(ToolInvocationResponse {
+        output: encoded,
+        is_error: timed_out || !status.success(),
+    })
 }
 
 fn run_shell_command(
@@ -322,6 +426,9 @@ mod tests {
                 command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),
                 cwd: None,
                 timeout_ms: Some(100),
+                terminal: false,
+                columns: None,
+                rows: None,
             },
             None,
         )

@@ -1,5 +1,9 @@
 //! TUI rendering.
 
+use bmux_terminal_grid::{
+    Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
+    TerminalGridStream,
+};
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::diff::{
@@ -957,6 +961,10 @@ const fn diff_view_styles() -> DiffViewStyles {
 }
 
 fn push_shell_output_rows(rows: &mut Vec<Line>, output: &ShellOutputTranscript, width: u16) {
+    if let Some(terminal) = TerminalOutputTranscript::parse(&output.stdout) {
+        push_terminal_output_rows(rows, &terminal, width);
+        return;
+    }
     if let Some(command) = &output.command {
         push_wrapped_styled_text(
             rows,
@@ -1000,6 +1008,179 @@ fn push_shell_output_rows(rows: &mut Vec<Line>, output: &ShellOutputTranscript, 
         width,
         MAX_INLINE_STDERR_ROWS,
     );
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TerminalOutputTranscript {
+    mode: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output: String,
+    columns: u16,
+    rows: u16,
+}
+
+impl TerminalOutputTranscript {
+    fn parse(value: &str) -> Option<Self> {
+        let output = serde_json::from_str::<Self>(value).ok()?;
+        if output.mode == "terminal" {
+            Some(output)
+        } else {
+            None
+        }
+    }
+}
+
+fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTranscript, width: u16) {
+    let status = terminal_status(output);
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &status,
+        width,
+        terminal_status_style(output),
+        muted_style(),
+    );
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!("terminal: {}x{}", output.columns, output.rows),
+        width,
+        muted_style(),
+        muted_style(),
+    );
+    for line in terminal_output_lines(output) {
+        rows.push(prefix_line(line, "    ", muted_style()));
+    }
+}
+
+fn terminal_output_lines(output: &TerminalOutputTranscript) -> Vec<Line> {
+    let Ok(mut stream) = TerminalGridStream::new(
+        output.columns.max(1),
+        output.rows.max(1),
+        GridLimits {
+            scrollback_rows: MAX_INLINE_TOOL_TEXT_ROWS.saturating_mul(8),
+        },
+    ) else {
+        return ansi_to_lines(&output.output);
+    };
+    stream.process(output.output.as_bytes());
+    let grid = stream.grid();
+    let total_rows = grid.display_rows(0, usize::MAX).len();
+    let offset = total_rows.saturating_sub(MAX_INLINE_TOOL_TEXT_ROWS);
+    grid.display_rows(offset, MAX_INLINE_TOOL_TEXT_ROWS)
+        .iter()
+        .map(|row| terminal_grid_row_to_line(grid, row))
+        .collect()
+}
+
+fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
+    let mut spans = Vec::new();
+    let mut current_style = None;
+    let mut current_text = String::new();
+    for cell in row.cells() {
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let style = terminal_grid_style(grid.palette().get(cell.style()));
+        if current_style == Some(style) {
+            current_text.push_str(cell.text());
+            continue;
+        }
+        if !current_text.is_empty() {
+            spans.push(Span::styled(
+                current_text,
+                current_style.unwrap_or_default(),
+            ));
+            current_text = String::new();
+        }
+        current_style = Some(style);
+        current_text.push_str(cell.text());
+    }
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            current_style.unwrap_or_default(),
+        ));
+    }
+    Line::from_spans(spans)
+}
+
+fn terminal_grid_style(style: GridStyle) -> Style {
+    let mut output = Style::new();
+    if let Some(fg) = style.fg {
+        output = output.fg(terminal_grid_color(fg));
+    }
+    if let Some(bg) = style.bg {
+        output = output.bg(terminal_grid_color(bg));
+    }
+    let mut modifier = Modifier::EMPTY;
+    if style.bold {
+        modifier |= Modifier::BOLD;
+    }
+    if style.italic {
+        modifier |= Modifier::ITALIC;
+    }
+    if style.underline {
+        modifier |= Modifier::UNDERLINE;
+    }
+    if style.dim {
+        modifier |= Modifier::DIM;
+    }
+    if style.inverse {
+        modifier |= Modifier::REVERSED;
+    }
+    if style.strike {
+        modifier |= Modifier::CROSSED_OUT;
+    }
+    output.add_modifier(modifier)
+}
+
+const fn terminal_grid_color(color: GridColor) -> Color {
+    match color {
+        GridColor::Indexed(index) => ansi_indexed_color(index),
+        GridColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
+    }
+}
+
+const fn ansi_indexed_color(index: u8) -> Color {
+    match index {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::White,
+        8 => Color::BrightBlack,
+        9 => Color::BrightRed,
+        10 => Color::BrightGreen,
+        11 => Color::BrightYellow,
+        12 => Color::BrightBlue,
+        13 => Color::BrightMagenta,
+        14 => Color::BrightCyan,
+        15 => Color::BrightWhite,
+        other => Color::Indexed(other),
+    }
+}
+
+fn terminal_status(output: &TerminalOutputTranscript) -> String {
+    let exit_code = output
+        .exit_code
+        .map_or_else(|| "signal".to_owned(), |code| code.to_string());
+    format!(
+        "exit code {exit_code} · terminal · timed out {}",
+        output.timed_out
+    )
+}
+
+fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {
+    if output.timed_out || output.exit_code.is_some_and(|code| code != 0) {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new().fg(Color::Green)
+    }
 }
 
 fn push_ansi_output_preview(

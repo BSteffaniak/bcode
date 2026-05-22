@@ -72,6 +72,7 @@ bcode_tui                               = { version = "0.0.1-alpha.0", default-f
 bmux_codec          = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_ipc            = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_keyboard       = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_terminal_grid  = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_text_edit      = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui            = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
@@ -98,6 +99,7 @@ clap = { version = "4.5.40", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 globset = { version = "0.4.18", default-features = false }
 libloading = { version = "0.9.0", default-features = false }
+portable-pty = { version = "0.9.0", default-features = false }
 rand = { version = "0.9.4", default-features = false, features = [
     "os_rng",
     "std",
@@ -165,6 +167,7 @@ opt-level = 0
 # bmux_codec                 = { path = "../wt-bmux/text-inputs/packages/codec" }
 # bmux_ipc                   = { path = "../wt-bmux/text-inputs/packages/ipc" }
 # bmux_keyboard              = { path = "../wt-bmux/text-inputs/packages/keyboard" }
+# bmux_terminal_grid         = { path = "../wt-bmux/text-inputs/packages/terminal-grid" }
 # bmux_text_edit             = { path = "../wt-bmux/text-inputs/packages/text-edit" }
 # bmux_tui                   = { path = "../wt-bmux/text-inputs/packages/tui" }
 # bmux_tui_components        = { path = "../wt-bmux/text-inputs/packages/tui-components" }
