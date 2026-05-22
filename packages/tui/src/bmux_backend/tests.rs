@@ -634,13 +634,19 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert!(!output.contains("\"old_text\""));
     assert_eq!(
         buffer
-            .get(Point::new(2, output_line_y(&buffer, "41").unwrap()))
+            .get(Point::new(
+                2,
+                output_line_y(&buffer, "-   2 │     41").unwrap()
+            ))
             .map(|cell| cell.style.fg),
         Some(Some(bmux_tui::style::Color::BrightRed))
     );
     assert_eq!(
         buffer
-            .get(Point::new(2, output_line_y(&buffer, "42").unwrap()))
+            .get(Point::new(
+                2,
+                output_line_y(&buffer, "+   2 │     42").unwrap()
+            ))
             .map(|cell| cell.style.fg),
         Some(Some(bmux_tui::style::Color::BrightGreen))
     );
