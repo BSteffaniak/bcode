@@ -757,7 +757,7 @@ async fn handle_request(
             handle_cancel_session_turn(request_id, state, writer, session_id).await
         }
         Request::CompactSession { session_id } => {
-            handle_compact_session(request_id, state, writer, session_id).await
+            handle_compact_session(request_id, client_id, state, writer, session_id).await
         }
         Request::SetSessionModel {
             session_id,
@@ -1963,11 +1963,18 @@ async fn handle_cancel_session_turn(
 
 async fn handle_compact_session(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    match compact_session_context(state, session_id).await {
+    let selection = session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        state.client_runtime_context(client_id).await,
+    )
+    .await;
+    match compact_session_context(state, session_id, &selection).await {
         Ok(message) => {
             send_response(
                 writer,
@@ -2291,21 +2298,25 @@ const COMPACTION_TOOL_RESULT_CHARS: usize = 2_000;
 async fn compact_session_context(
     state: &ServerState,
     session_id: SessionId,
+    selection: &SessionModelSelection,
 ) -> Result<String, CompactionError> {
-    compact_session_context_with_limit(state, session_id, None).await
+    compact_session_context_with_limit(state, session_id, selection, None).await
 }
 
 async fn compact_session_context_before_sequence(
     state: &ServerState,
     session_id: SessionId,
+    selection: &SessionModelSelection,
     first_kept_sequence: u64,
 ) -> Result<String, CompactionError> {
-    compact_session_context_with_limit(state, session_id, Some(first_kept_sequence)).await
+    compact_session_context_with_limit(state, session_id, selection, Some(first_kept_sequence))
+        .await
 }
 
 async fn compact_session_context_with_limit(
     state: &ServerState,
     session_id: SessionId,
+    selection: &SessionModelSelection,
     first_kept_sequence: Option<u64>,
 ) -> Result<String, CompactionError> {
     if state.active_turns.lock().await.contains_key(&session_id) {
@@ -2331,12 +2342,11 @@ async fn compact_session_context_with_limit(
         ));
     };
 
-    let selection = session_model_selection(state, session_id).await;
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
         return Err(CompactionError::ProviderUnavailable);
     }
 
-    let summary = collect_compaction_summary(state, session_id, &selection, &transcript).await?;
+    let summary = collect_compaction_summary(state, session_id, selection, &transcript).await?;
     let summary = summary.trim().to_string();
     if summary.is_empty() {
         return Err(CompactionError::Provider(
@@ -2359,6 +2369,7 @@ async fn compact_session_context_with_limit(
 async fn maybe_auto_compact_session_context(
     state: &ServerState,
     session_id: SessionId,
+    selection: &SessionModelSelection,
 ) -> Result<(), CompactionError> {
     if !state.auto_compaction.mode.is_proactive_enabled()
         || state.auto_compaction.context_chars == 0
@@ -2397,7 +2408,7 @@ async fn maybe_auto_compact_session_context(
         )),
     )
     .await;
-    let message = compact_session_context(state, session_id).await?;
+    let message = compact_session_context(state, session_id, selection).await?;
     append_context_compaction_trace(
         state,
         session_id,
@@ -2940,13 +2951,13 @@ async fn run_model_turn_inner(
     trigger_event: &bcode_session_models::SessionEvent,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> ModelTurnCompletion {
-    if let Err(error) = maybe_auto_compact_session_context(state, session_id).await {
+    let selection =
+        session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
+
+    if let Err(error) = maybe_auto_compact_session_context(state, session_id, &selection).await {
         let message = format!("auto compaction failed: {error}");
         append_system_event(state, session_id, message).await;
     }
-
-    let selection =
-        session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
         return ModelTurnCompletion::with_message(
             ModelTurnOutcome::ProviderUnavailable,
@@ -2998,6 +3009,7 @@ async fn run_model_turn_inner(
             trigger_event.sequence,
             &request.turn_id,
             &outcome,
+            &selection,
             &mut recovery,
         )
         .await
@@ -3043,6 +3055,7 @@ async fn maybe_retry_after_provider_error(
     trigger_event_sequence: u64,
     turn_id: &str,
     outcome: &ModelPollOutcome,
+    selection: &SessionModelSelection,
     recovery: &mut ModelTurnRecoveryState,
 ) -> ModelTurnRetry {
     let Some(error) = outcome.provider_error.as_ref() else {
@@ -3074,6 +3087,7 @@ async fn maybe_retry_after_provider_error(
         return match compact_session_after_context_overflow(
             state,
             session_id,
+            selection,
             trigger_event_sequence,
             error,
         )
@@ -3107,6 +3121,7 @@ fn should_retry_after_malformed_tool_arguments(
 async fn compact_session_after_context_overflow(
     state: &ServerState,
     session_id: SessionId,
+    selection: &SessionModelSelection,
     first_kept_sequence: u64,
     error: &bcode_model::ProviderError,
 ) -> Result<(), ModelTurnCompletion> {
@@ -3122,7 +3137,9 @@ async fn compact_session_after_context_overflow(
         )),
     )
     .await;
-    match compact_session_context_before_sequence(state, session_id, first_kept_sequence).await {
+    match compact_session_context_before_sequence(state, session_id, selection, first_kept_sequence)
+        .await
+    {
         Ok(message) => {
             append_context_compaction_trace(
                 state,
