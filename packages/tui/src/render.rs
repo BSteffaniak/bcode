@@ -21,8 +21,11 @@ use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_present::{
     GrepMatchPresentation, ListEntryPresentation, ToolRequestPresentation, ToolResultPresentation,
+    tool_request_presentation, tool_result_presentation,
 };
-use super::transcript::{ShellOutputTranscript, TranscriptItem, TranscriptItemKind};
+use super::transcript::{
+    ShellOutputTranscript, TranscriptItem, TranscriptItemKind, shell_output_from_result,
+};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
@@ -278,24 +281,24 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
         TranscriptItemKind::ToolRequest {
             tool_call_id,
             tool_name,
+            arguments_json,
             file_edit,
-            presentation,
         } => {
             push_tool_request_rows(
                 rows,
                 item,
                 tool_call_id,
                 tool_name,
+                arguments_json,
                 file_edit.as_ref(),
-                presentation.as_ref(),
                 width,
             );
         }
         TranscriptItemKind::ToolResult {
             tool_call_id,
             tool_name,
-            shell_output,
-            presentation,
+            arguments_json,
+            result,
             is_error,
         } => {
             push_tool_result_rows(
@@ -304,8 +307,8 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
                 ToolResultRenderContext {
                     tool_call_id,
                     tool_name: tool_name.as_deref(),
-                    shell_output: shell_output.as_ref(),
-                    presentation: presentation.as_ref(),
+                    arguments_json: arguments_json.as_deref(),
+                    result,
                     is_error: *is_error,
                 },
                 width,
@@ -376,8 +379,8 @@ fn push_tool_request_rows(
     item: &TranscriptItem,
     tool_call_id: &str,
     tool_name: &str,
+    arguments_json: &str,
     file_edit: Option<&FileEditTranscript>,
-    presentation: Option<&ToolRequestPresentation>,
     width: u16,
 ) {
     push_wrapped_styled_text(
@@ -398,8 +401,8 @@ fn push_tool_request_rows(
     );
     if let Some(edit) = file_edit {
         push_file_edit_preview_rows(rows, edit, width);
-    } else if let Some(presentation) = presentation {
-        push_tool_request_presentation_rows(rows, presentation, width);
+    } else if let Some(presentation) = tool_request_presentation(tool_name, arguments_json) {
+        push_tool_request_presentation_rows(rows, &presentation, width);
     } else if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
     }
@@ -410,8 +413,8 @@ fn push_tool_request_rows(
 struct ToolResultRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: Option<&'a str>,
-    shell_output: Option<&'a ShellOutputTranscript>,
-    presentation: Option<&'a ToolResultPresentation>,
+    arguments_json: Option<&'a str>,
+    result: &'a str,
     is_error: bool,
 }
 
@@ -438,10 +441,12 @@ fn push_tool_result_rows(
         },
         muted_style(),
     );
-    if let Some(output) = context.shell_output {
-        push_shell_output_rows(rows, output, width);
-    } else if let Some(presentation) = context.presentation {
-        push_tool_result_presentation_rows(rows, presentation, width);
+    if let Some(output) =
+        shell_output_from_result(context.tool_name, context.arguments_json, context.result)
+    {
+        push_shell_output_rows(rows, &output, width);
+    } else if let Some(presentation) = tool_result_presentation(context.tool_name, context.result) {
+        push_tool_result_presentation_rows(rows, &presentation, width);
     } else {
         push_labeled_text_preview(
             rows,
