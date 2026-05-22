@@ -73,6 +73,8 @@ pub enum CliError {
     },
     #[error("--new cannot be combined with a subcommand")]
     NewSessionWithCommand,
+    #[error("{0}")]
+    LoginProfile(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
 }
@@ -453,8 +455,8 @@ enum LoginCommand {
         /// Use device-code login. Requires `Codex` device authorization enabled in `ChatGPT` settings.
         #[arg(long)]
         headless: bool,
-        #[arg(long, default_value = "openai")]
-        profile: String,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         vault: Option<PathBuf>,
         #[arg(long)]
@@ -470,8 +472,8 @@ enum LoginCommand {
         /// Store an xAI-compatible API base URL (defaults to <https://api.x.ai/v1>).
         #[arg(long)]
         base_url: Option<String>,
-        #[arg(long, default_value = "xai")]
-        profile: String,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         vault: Option<PathBuf>,
         #[arg(long)]
@@ -705,7 +707,7 @@ struct OpenAiLoginOptions {
     chatgpt: bool,
     browser: bool,
     headless: bool,
-    profile: String,
+    profile: Option<String>,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
     model: Option<String>,
@@ -714,22 +716,19 @@ struct OpenAiLoginOptions {
 struct XaiLoginOptions {
     api_key: Option<String>,
     base_url: Option<String>,
-    profile: String,
+    profile: Option<String>,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
     model: Option<String>,
 }
 
 async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
-    let vault_path = options
-        .vault
-        .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let store = open_auth_store(&vault_path, options.recipient_key)?;
+    let target = resolve_login_target(LoginProvider::OpenAi, options.profile, options.vault)?;
+    let store = open_auth_store(&target.vault_path, options.recipient_key)?;
     if options.api_key.is_some() || (options.base_url.is_some() && !options.chatgpt) {
         login_openai_api_key(
             &store,
-            &options.profile,
-            vault_path,
+            &target,
             options.api_key,
             options.base_url,
             options.model,
@@ -740,8 +739,170 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
         } else {
             OpenAiLoginFlow::Browser
         };
-        login_openai_chatgpt(&store, options.profile, vault_path, options.model, flow).await
+        login_openai_chatgpt(&store, target, options.model, flow).await
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginProvider {
+    OpenAi,
+    Xai,
+}
+
+impl LoginProvider {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI",
+            Self::Xai => "xAI",
+        }
+    }
+
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OPENAI",
+            Self::Xai => "XAI",
+        }
+    }
+
+    const fn subcommand(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Xai => "xai",
+        }
+    }
+
+    const fn wrapper_example(self) -> &'static str {
+        match self {
+            Self::OpenAi => "bcode-openai login openai",
+            Self::Xai => "bcode-xai login xai",
+        }
+    }
+
+    const fn explicit_example(self) -> &'static str {
+        match self {
+            Self::OpenAi => "bcode login openai --profile openai",
+            Self::Xai => "bcode login xai --profile xai",
+        }
+    }
+
+    fn accepts_config_provider(self, provider: &str) -> bool {
+        match self {
+            Self::OpenAi => matches!(provider, "openai"),
+            Self::Xai => matches!(provider, "xai" | "grok"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginConfigUpdate {
+    Declarative,
+    Writable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoginTarget {
+    auth_profile: String,
+    storage_profile: String,
+    vault_path: PathBuf,
+    config_update: LoginConfigUpdate,
+}
+
+fn resolve_login_target(
+    provider: LoginProvider,
+    explicit_profile: Option<String>,
+    explicit_vault: Option<PathBuf>,
+) -> Result<LoginTarget, CliError> {
+    if let Some(profile) = explicit_profile {
+        let config = bcode_config::load_config().ok();
+        if let Some(auth_profile) = config
+            .as_ref()
+            .and_then(|config| config.auth.profiles.get(&profile))
+        {
+            return login_target_from_declarative_auth_profile(
+                provider,
+                &profile,
+                auth_profile,
+                explicit_vault,
+            );
+        }
+        let vault_path = explicit_vault.unwrap_or_else(bcode_config::default_auth_vault_path);
+        return Ok(LoginTarget {
+            auth_profile: profile.clone(),
+            storage_profile: profile,
+            vault_path,
+            config_update: LoginConfigUpdate::Writable,
+        });
+    }
+
+    let config = bcode_config::load_config()?;
+    let auth_profile = active_login_auth_profile(&config).ok_or_else(|| {
+        CliError::LoginProfile(format!(
+            "No active {} auth profile found.\n\nRun a provider wrapper such as:\n  {}\n\nOr pass one explicitly:\n  {}",
+            provider.label(),
+            provider.wrapper_example(),
+            provider.explicit_example()
+        ))
+    })?;
+    let Some(configured_auth_profile) = config.auth.profiles.get(&auth_profile) else {
+        return Err(CliError::LoginProfile(format!(
+            "Active {} auth profile '{auth_profile}' is selected, but it is not declared in [auth.profiles.{auth_profile}].\n\nUpdate the active config or pass a profile explicitly:\n  bcode login {} --profile {auth_profile}",
+            provider.label(),
+            provider.subcommand()
+        )));
+    };
+    login_target_from_declarative_auth_profile(
+        provider,
+        &auth_profile,
+        configured_auth_profile,
+        explicit_vault,
+    )
+}
+
+fn active_login_auth_profile(config: &bcode_config::BcodeConfig) -> Option<String> {
+    std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
+        .ok()
+        .filter(|profile| !profile.trim().is_empty())
+        .or_else(|| config.resolved_model_selection().auth_profile)
+}
+
+fn login_target_from_declarative_auth_profile(
+    provider: LoginProvider,
+    auth_profile_name: &str,
+    auth_profile: &bcode_config::AuthProfileConfig,
+    explicit_vault: Option<PathBuf>,
+) -> Result<LoginTarget, CliError> {
+    if auth_profile.backend != "sshenv" {
+        return Err(CliError::LoginProfile(format!(
+            "Auth profile '{auth_profile_name}' uses backend '{}', but `bcode login {}` can only update sshenv-backed auth profiles.",
+            auth_profile.backend,
+            provider.subcommand()
+        )));
+    }
+    if let Some(config_provider) = auth_profile.settings.get("provider")
+        && !provider.accepts_config_provider(config_provider)
+    {
+        return Err(CliError::LoginProfile(format!(
+            "Auth profile '{auth_profile_name}' is configured for provider '{config_provider}', not {}.",
+            provider.label()
+        )));
+    }
+    let storage_profile = auth_profile
+        .settings
+        .get("profile")
+        .cloned()
+        .unwrap_or_else(|| auth_profile_name.to_string());
+    let vault_path = auth_profile
+        .settings
+        .get("vault")
+        .map(PathBuf::from)
+        .or(explicit_vault)
+        .unwrap_or_else(bcode_config::default_auth_vault_path);
+    Ok(LoginTarget {
+        auth_profile: auth_profile_name.to_string(),
+        storage_profile,
+        vault_path,
+        config_update: LoginConfigUpdate::Declarative,
+    })
 }
 
 fn open_auth_store(
@@ -766,13 +927,13 @@ fn open_auth_store(
 /// `prefix` is "OPENAI" or "XAI" (used for env-style secret keys stored in the vault).
 fn login_compatible_api_key(
     store: &sshenv_vault::SshenvStore,
-    profile: &str,
-    vault_path: PathBuf,
+    target: &LoginTarget,
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
-    prefix: &str,
+    provider: LoginProvider,
 ) -> Result<(), CliError> {
+    let prefix = provider.prefix();
     let prompt = format!("{prefix} API key: ");
     let api_key = match api_key {
         Some(api_key) => api_key,
@@ -784,7 +945,7 @@ fn login_compatible_api_key(
 
     store
         .set_secret(
-            profile,
+            &target.storage_profile,
             &auth_mode_key,
             Zeroizing::new("api_key".to_string()),
         )
@@ -792,7 +953,11 @@ fn login_compatible_api_key(
             CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
         })?;
     store
-        .set_secret(profile, &api_key_key, Zeroizing::new(api_key))
+        .set_secret(
+            &target.storage_profile,
+            &api_key_key,
+            Zeroizing::new(api_key),
+        )
         .map_err(|error| {
             CliError::BundledPluginInstallFailed(format!(
                 "failed to store {prefix} API key: {error}"
@@ -801,7 +966,11 @@ fn login_compatible_api_key(
     let config_base_url = base_url.clone();
     if let Some(base_url) = base_url {
         store
-            .set_secret(profile, &base_url_key, Zeroizing::new(base_url))
+            .set_secret(
+                &target.storage_profile,
+                &base_url_key,
+                Zeroizing::new(base_url),
+            )
             .map_err(|error| {
                 CliError::BundledPluginInstallFailed(format!(
                     "failed to store {prefix} base URL: {error}"
@@ -810,18 +979,20 @@ fn login_compatible_api_key(
     }
 
     // Always route through the shared OpenAI-compatible provider plugin.
-    report_login_config_update(
-        bcode_config::set_openai_compatible_sshenv_auth_mode(
-            compatible_provider_name(prefix),
-            profile.to_string(),
-            vault_path,
-            model,
-            AuthMode::ApiKey,
-            config_base_url.as_deref(),
-        ),
+    report_login_completion(
         &format!("{prefix} API credentials saved"),
-        profile,
+        target,
         prefix,
+        || {
+            bcode_config::set_openai_compatible_sshenv_auth_mode(
+                compatible_provider_name(prefix),
+                target.auth_profile.clone(),
+                target.vault_path.clone(),
+                model,
+                AuthMode::ApiKey,
+                config_base_url.as_deref(),
+            )
+        },
     );
     Ok(())
 }
@@ -835,26 +1006,27 @@ fn compatible_provider_name(prefix: &str) -> &'static str {
 
 fn login_openai_api_key(
     store: &sshenv_vault::SshenvStore,
-    profile: &str,
-    vault_path: PathBuf,
+    target: &LoginTarget,
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
 ) -> Result<(), CliError> {
     login_compatible_api_key(
-        store, profile, vault_path, api_key, base_url, model, "OPENAI",
+        store,
+        target,
+        api_key,
+        base_url,
+        model,
+        LoginProvider::OpenAi,
     )
 }
 
 fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
-    let vault_path = options
-        .vault
-        .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let store = open_auth_store(&vault_path, options.recipient_key)?;
+    let target = resolve_login_target(LoginProvider::Xai, options.profile, options.vault)?;
+    let store = open_auth_store(&target.vault_path, options.recipient_key)?;
     login_compatible_api_key(
         &store,
-        &options.profile,
-        vault_path,
+        &target,
         options.api_key,
         Some(
             options
@@ -862,14 +1034,13 @@ fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
                 .unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
         ),
         options.model,
-        "XAI",
+        LoginProvider::Xai,
     )
 }
 
 async fn login_openai_chatgpt(
     store: &sshenv_vault::SshenvStore,
-    profile: String,
-    vault_path: PathBuf,
+    target: LoginTarget,
     model: Option<String>,
     flow: OpenAiLoginFlow,
 ) -> Result<(), CliError> {
@@ -882,7 +1053,7 @@ async fn login_openai_chatgpt(
         .or_else(|| chatgpt_account_id_from_access_token(&oauth.access_token));
     store
         .set_secret(
-            &profile,
+            &target.storage_profile,
             "BCODE_OPENAI_AUTH_MODE",
             Zeroizing::new("chatgpt".to_string()),
         )
@@ -891,7 +1062,7 @@ async fn login_openai_chatgpt(
         })?;
     store
         .set_secret(
-            &profile,
+            &target.storage_profile,
             "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
             Zeroizing::new(oauth.access_token),
         )
@@ -901,7 +1072,7 @@ async fn login_openai_chatgpt(
     if let Some(id_token) = oauth.id_token {
         store
             .set_secret(
-                &profile,
+                &target.storage_profile,
                 "BCODE_OPENAI_CODEX_ID_TOKEN",
                 Zeroizing::new(id_token),
             )
@@ -912,7 +1083,7 @@ async fn login_openai_chatgpt(
     if let Some(refresh_token) = oauth.refresh_token {
         store
             .set_secret(
-                &profile,
+                &target.storage_profile,
                 "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
                 Zeroizing::new(refresh_token),
             )
@@ -924,7 +1095,7 @@ async fn login_openai_chatgpt(
     }
     store
         .set_secret(
-            &profile,
+            &target.storage_profile,
             "BCODE_OPENAI_CODEX_EXPIRES_AT",
             Zeroizing::new(expires_at.to_string()),
         )
@@ -934,7 +1105,7 @@ async fn login_openai_chatgpt(
     if let Some(account_id) = account_id {
         store
             .set_secret(
-                &profile,
+                &target.storage_profile,
                 "BCODE_OPENAI_CODEX_ACCOUNT_ID",
                 Zeroizing::new(account_id),
             )
@@ -945,35 +1116,47 @@ async fn login_openai_chatgpt(
             })?;
     }
 
-    report_login_config_update(
-        bcode_config::set_openai_sshenv_auth_mode(
-            profile.clone(),
-            vault_path,
-            model,
-            AuthMode::ChatGpt,
-        ),
+    report_login_completion(
         "OpenAI ChatGPT subscription login saved",
-        &profile,
+        &target,
         "OPENAI",
+        || {
+            bcode_config::set_openai_sshenv_auth_mode(
+                target.auth_profile.clone(),
+                target.vault_path.clone(),
+                model,
+                AuthMode::ChatGpt,
+            )
+        },
     );
     Ok(())
 }
 
-fn report_login_config_update(
-    result: Result<PathBuf, bcode_config::ConfigError>,
+fn report_login_completion(
     saved_message: &str,
-    profile: &str,
+    target: &LoginTarget,
     provider: &str,
+    update_config: impl FnOnce() -> Result<PathBuf, bcode_config::ConfigError>,
 ) {
-    match result {
-        Ok(config_path) => println!("{saved_message}; config updated: {}", config_path.display()),
-        Err(error) => {
-            println!("{saved_message}; auth profile '{profile}' updated");
-            eprintln!("config was not updated: {error}");
-            eprintln!(
-                "use a writable config or select an existing declarative model/auth profile for '{provider}'"
-            );
+    println!("{saved_message}");
+    println!("Auth profile: {}", target.auth_profile);
+    println!(
+        "Credentials saved to sshenv vault profile: {}",
+        target.storage_profile
+    );
+    match target.config_update {
+        LoginConfigUpdate::Declarative => {
+            println!("Config is declarative; no config file update needed.");
         }
+        LoginConfigUpdate::Writable => match update_config() {
+            Ok(config_path) => println!("Config updated: {}", config_path.display()),
+            Err(error) => {
+                eprintln!("Config update failed: {error}");
+                eprintln!(
+                    "Credentials were saved. To use them, run a provider wrapper with a declarative {provider} auth profile or update a writable config."
+                );
+            }
+        },
     }
 }
 
@@ -996,7 +1179,7 @@ async fn run_openai_codex_browser_oauth() -> Result<OpenAiOauthTokenResponse, Cl
     println!("OpenAI ChatGPT subscription browser login");
     println!("Open this URL if your browser does not open automatically:\n{authorize_url}\n");
     println!(
-        "If your browser says localhost refused to connect, copy the full redirected localhost URL, paste it here, and press Enter."
+        "After signing in, return here. If the browser cannot reach localhost, copy the full redirected localhost URL, paste it here, and press Enter."
     );
     open_browser(&authorize_url);
     let code = wait_for_oauth_code(&listeners, &state)?;
