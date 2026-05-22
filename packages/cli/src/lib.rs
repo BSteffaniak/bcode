@@ -787,7 +787,7 @@ impl LoginProvider {
 
     fn accepts_config_provider(self, provider: &str) -> bool {
         match self {
-            Self::OpenAi => matches!(provider, "openai"),
+            Self::OpenAi => !matches!(provider, "xai" | "grok"),
             Self::Xai => matches!(provider, "xai" | "grok"),
         }
     }
@@ -804,6 +804,7 @@ struct LoginTarget {
     auth_profile: String,
     storage_profile: String,
     vault_path: PathBuf,
+    api_key_env: Option<String>,
     config_update: LoginConfigUpdate,
 }
 
@@ -830,6 +831,7 @@ fn resolve_login_target(
             auth_profile: profile.clone(),
             storage_profile: profile,
             vault_path,
+            api_key_env: None,
             config_update: LoginConfigUpdate::Writable,
         });
     }
@@ -891,6 +893,11 @@ fn login_target_from_declarative_auth_profile(
         .get("profile")
         .cloned()
         .unwrap_or_else(|| auth_profile_name.to_string());
+    let api_key_env = auth_profile
+        .settings
+        .get("api_key_env")
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
     let vault_path = auth_profile
         .settings
         .get("vault")
@@ -901,6 +908,7 @@ fn login_target_from_declarative_auth_profile(
         auth_profile: auth_profile_name.to_string(),
         storage_profile,
         vault_path,
+        api_key_env,
         config_update: LoginConfigUpdate::Declarative,
     })
 }
@@ -940,7 +948,10 @@ fn login_compatible_api_key(
         None => rpassword::prompt_password(&prompt)?,
     };
     let auth_mode_key = format!("BCODE_{prefix}_AUTH_MODE");
-    let api_key_key = format!("BCODE_{prefix}_API_KEY");
+    let api_key_key = target
+        .api_key_env
+        .clone()
+        .unwrap_or_else(|| format!("BCODE_{prefix}_API_KEY"));
     let base_url_key = format!("BCODE_{prefix}_BASE_URL");
 
     store
@@ -1144,6 +1155,9 @@ fn report_login_completion(
         "Credentials saved to sshenv vault profile: {}",
         target.storage_profile
     );
+    if let Some(api_key_env) = &target.api_key_env {
+        println!("API key environment variable: {api_key_env}");
+    }
     match target.config_update {
         LoginConfigUpdate::Declarative => {
             println!("Config is declarative; no config file update needed.");

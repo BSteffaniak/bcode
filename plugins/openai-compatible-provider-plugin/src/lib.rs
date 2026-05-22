@@ -2237,6 +2237,28 @@ fn openai_auth_settings(
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {
     let allow_saved_auth = context.auth_profile.is_none();
+    if let Some(api_key_env) = configured_api_key_env(context) {
+        if let Some(api_key) = context_auth_env_value(context, &api_key_env) {
+            return (
+                AuthSettings::ApiKey(api_key),
+                AuthDiagnostics {
+                    source: "runtime_context".to_string(),
+                    mode: "api_key".to_string(),
+                    detail: format!("configured API key environment variable {api_key_env}"),
+                },
+            );
+        }
+        if allow_saved_auth && let Some(api_key) = saved.values.get(&api_key_env).cloned() {
+            return (
+                AuthSettings::ApiKey(api_key),
+                saved_auth_diagnostics(
+                    saved,
+                    "api_key",
+                    &format!("saved sshenv API key {api_key_env}"),
+                ),
+            );
+        }
+    }
     // XAI takes precedence for generic OpenAI-compatible usage (xAI, Grok, etc.)
     if let Some(api_key) = context_auth_env_value(context, "BCODE_XAI_API_KEY") {
         return (
@@ -2341,6 +2363,15 @@ fn openai_auth_settings(
             ),
         },
     )
+}
+
+fn configured_api_key_env(context: &ProviderRequestContext) -> Option<String> {
+    context
+        .settings
+        .get("openai.api_key_env")
+        .or_else(|| context.settings.get("api_key_env"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
 }
 
 fn context_chatgpt_auth_settings(
