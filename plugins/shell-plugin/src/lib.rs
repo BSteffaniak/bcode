@@ -56,12 +56,16 @@ struct ShellRunArguments {
     cwd: Option<PathBuf>,
     #[serde(default)]
     timeout_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default = "default_terminal_mode")]
     terminal: bool,
     #[serde(default)]
     columns: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
+}
+
+const fn default_terminal_mode() -> bool {
+    true
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
@@ -71,7 +75,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     json_response(&ToolList {
         tools: vec![ToolDefinition {
             name: "shell.run".to_string(),
-            description: "Run a shell command with stdout/stderr capture".to_string(),
+            description: "Run a shell command. Defaults to pseudo-terminal mode for human-like CLI colors and formatting; set terminal=false for separate stdout/stderr capture.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
@@ -79,7 +83,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                     "command": { "type": "string" },
                     "cwd": { "type": "string" },
                     "timeout_ms": { "type": "integer", "minimum": 1 },
-                    "terminal": { "type": "boolean", "description": "Run under a pseudo-terminal for human-like CLI formatting" },
+                    "terminal": { "type": "boolean", "default": true, "description": "Run under a pseudo-terminal for human-like CLI formatting. Set false only when separate stdout/stderr capture is required." },
                     "columns": { "type": "integer", "minimum": 1 },
                     "rows": { "type": "integer", "minimum": 1 }
                 }

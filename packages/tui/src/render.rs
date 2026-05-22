@@ -491,6 +491,7 @@ fn push_tool_request_presentation_rows(
             if let Some(timeout_ms) = timeout_ms {
                 push_kv_row(rows, "timeout", &format!("{timeout_ms}ms"), width);
             }
+            push_kv_row(rows, "terminal", "yes", width);
         }
         ToolRequestPresentation::Read { path }
         | ToolRequestPresentation::Exists { path }
