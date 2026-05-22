@@ -894,8 +894,10 @@ fn login_target_from_declarative_auth_profile(
         .cloned()
         .unwrap_or_else(|| auth_profile_name.to_string());
     let api_key_env = auth_profile
-        .settings
-        .get("api_key_env")
+        .map
+        .get("api_key")
+        .and_then(|mapping| mapping.env.as_ref().or(mapping.key.as_ref()))
+        .or_else(|| auth_profile.settings.get("api_key_env"))
         .filter(|value| !value.trim().is_empty())
         .cloned();
     let vault_path = auth_profile

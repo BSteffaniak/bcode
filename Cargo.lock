@@ -742,6 +742,7 @@ dependencies = [
  "bcode_config",
  "bcode_ipc",
  "bcode_model",
+ "bcode_provider_auth",
  "bcode_session_models",
  "bcode_skill_models",
  "sshenv_vault",
@@ -884,6 +885,15 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bcode_provider_auth"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_config",
+ "bcode_model",
+ "sshenv_vault",
 ]
 
 [[package]]

@@ -1392,6 +1392,7 @@ pub fn set_openai_compatible_sshenv_auth_mode(
         if let Some(model_id) = model_id {
             config.model.model_id = Some(model_id);
         }
+        let auth_map = openai_compatible_auth_map(provider, &mode);
         config.auth.openai = Some(AuthProviderConfig {
             backend: "sshenv".to_string(),
             mode,
@@ -1410,8 +1411,9 @@ pub fn set_openai_compatible_sshenv_auth_mode(
             profile.clone(),
             AuthProfileConfig {
                 backend: "sshenv".to_string(),
+                scheme: Some(mode_setting.to_string()),
+                map: auth_map,
                 settings,
-                ..AuthProfileConfig::default()
             },
         );
         if let Some(model_id) = config.model.model_id.clone() {
@@ -1429,6 +1431,61 @@ pub fn set_openai_compatible_sshenv_auth_mode(
         }
         Ok(())
     })
+}
+
+fn openai_compatible_auth_map(
+    provider: &str,
+    mode: &AuthMode,
+) -> BTreeMap<String, AuthCredentialMapping> {
+    match mode {
+        AuthMode::ApiKey => BTreeMap::from([(
+            "api_key".to_string(),
+            AuthCredentialMapping {
+                env: Some(match provider {
+                    "xai" | "grok" => "BCODE_XAI_API_KEY".to_string(),
+                    _ => "BCODE_OPENAI_API_KEY".to_string(),
+                }),
+                key: None,
+            },
+        )]),
+        AuthMode::ChatGpt => BTreeMap::from([
+            (
+                "access_token".to_string(),
+                AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_string()),
+                    key: None,
+                },
+            ),
+            (
+                "refresh_token".to_string(),
+                AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_string()),
+                    key: None,
+                },
+            ),
+            (
+                "id_token".to_string(),
+                AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_ID_TOKEN".to_string()),
+                    key: None,
+                },
+            ),
+            (
+                "expires_at".to_string(),
+                AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_EXPIRES_AT".to_string()),
+                    key: None,
+                },
+            ),
+            (
+                "account_id".to_string(),
+                AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_ACCOUNT_ID".to_string()),
+                    key: None,
+                },
+            ),
+        ]),
+    }
 }
 
 const fn auth_mode_setting(mode: &AuthMode) -> &'static str {
@@ -1488,6 +1545,7 @@ pub fn set_bedrock_model_profile(
             auth_profile,
             AuthProfileConfig {
                 backend: "aws_default_chain".to_string(),
+                scheme: Some("aws_default_chain".to_string()),
                 settings: auth_settings,
                 ..AuthProfileConfig::default()
             },

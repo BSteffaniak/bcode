@@ -227,6 +227,7 @@ enum AuthSettings {
         account_id: Option<String>,
         profile: Option<String>,
         vault: Option<std::path::PathBuf>,
+        storage: BTreeMap<String, bcode_model::ProviderAuthStorageRef>,
     },
 }
 
@@ -2237,20 +2238,23 @@ fn openai_auth_settings(
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {
     let allow_saved_auth = context.auth_profile.is_none();
-    if let Some(auth) = &context.auth
-        && let Some(api_key) = auth.credentials.get("api_key")
-    {
-        return (
-            AuthSettings::ApiKey(api_key.value.clone()),
-            AuthDiagnostics {
-                source: "runtime_auth".to_string(),
-                mode: auth.scheme.clone().unwrap_or_else(|| "api_key".to_string()),
-                detail: auth.profile.as_ref().map_or_else(
-                    || "runtime auth credential 'api_key'".to_string(),
-                    |profile| format!("runtime auth profile '{profile}' credential 'api_key'"),
-                ),
-            },
-        );
+    if let Some(auth) = &context.auth {
+        if let Some(api_key) = auth.credentials.get("api_key") {
+            return (
+                AuthSettings::ApiKey(api_key.value.clone()),
+                AuthDiagnostics {
+                    source: "runtime_auth".to_string(),
+                    mode: auth.scheme.clone().unwrap_or_else(|| "api_key".to_string()),
+                    detail: auth.profile.as_ref().map_or_else(
+                        || "runtime auth credential 'api_key'".to_string(),
+                        |profile| format!("runtime auth profile '{profile}' credential 'api_key'"),
+                    ),
+                },
+            );
+        }
+        if auth.credentials.contains_key("access_token") {
+            return semantic_chatgpt_auth_settings(auth);
+        }
     }
     if let Some(api_key_env) = configured_api_key_env(context) {
         if let Some(api_key) = context_auth_env_value(context, &api_key_env) {
@@ -2389,6 +2393,81 @@ fn configured_api_key_env(context: &ProviderRequestContext) -> Option<String> {
         .cloned()
 }
 
+fn semantic_chatgpt_auth_settings(
+    auth: &bcode_model::ProviderAuthContext,
+) -> (AuthSettings, AuthDiagnostics) {
+    let profile = auth.profile.clone();
+    let vault = auth
+        .storage
+        .values()
+        .find_map(|storage| storage.vault.as_ref())
+        .map(std::path::PathBuf::from);
+    let Some(access_token) = auth
+        .credentials
+        .get("access_token")
+        .map(|credential| credential.value.clone())
+    else {
+        return (
+            AuthSettings::Missing,
+            AuthDiagnostics {
+                source: "runtime_auth".to_string(),
+                mode: "chatgpt".to_string(),
+                detail: profile.as_ref().map_or_else(
+                    || "runtime auth did not contain access_token".to_string(),
+                    |profile| {
+                        format!("runtime auth profile '{profile}' did not contain access_token")
+                    },
+                ),
+            },
+        );
+    };
+    let id_token = auth
+        .credentials
+        .get("id_token")
+        .map(|credential| credential.value.as_str());
+    let account_id = auth
+        .credentials
+        .get("account_id")
+        .map(|credential| credential.value.clone())
+        .or_else(|| id_token.and_then(chatgpt_account_id_from_access_token))
+        .or_else(|| chatgpt_account_id_from_access_token(&access_token));
+    (
+        AuthSettings::ChatGpt {
+            access_token,
+            refresh_token: auth
+                .credentials
+                .get("refresh_token")
+                .map(|credential| credential.value.clone()),
+            expires_at: auth
+                .credentials
+                .get("expires_at")
+                .and_then(|credential| credential.value.parse().ok()),
+            account_id,
+            profile: profile.clone(),
+            vault: vault.clone(),
+            storage: auth.storage.clone(),
+        },
+        AuthDiagnostics {
+            source: "runtime_auth".to_string(),
+            mode: "chatgpt".to_string(),
+            detail: match (&profile, &vault) {
+                (Some(profile), Some(vault)) => format!(
+                    "runtime semantic ChatGPT/Codex auth from profile '{profile}' in vault {}",
+                    vault.display()
+                ),
+                (Some(profile), None) => {
+                    format!("runtime semantic ChatGPT/Codex auth from profile '{profile}'")
+                }
+                (None, Some(vault)) => format!(
+                    "runtime semantic ChatGPT/Codex auth from vault {}",
+                    vault.display()
+                ),
+                (None, None) => "runtime semantic ChatGPT/Codex auth".to_string(),
+            },
+        },
+    )
+}
+
 fn context_chatgpt_auth_settings(
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {
@@ -2429,6 +2508,7 @@ fn context_chatgpt_auth_settings(
             account_id,
             profile: profile.clone(),
             vault: vault.clone(),
+            storage: BTreeMap::new(),
         },
         AuthDiagnostics {
             source: "runtime_context".to_string(),
@@ -2541,6 +2621,7 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
             account_id,
             profile: saved.profile.clone(),
             vault: saved.vault.clone(),
+            storage: BTreeMap::new(),
         },
         saved_auth_diagnostics(saved, "chatgpt", "saved sshenv ChatGPT/Codex auth"),
     )
@@ -2631,6 +2712,7 @@ async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), P
         expires_at,
         profile,
         vault,
+        storage,
         ..
     } = &settings.auth
     else {
@@ -2658,6 +2740,7 @@ async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), P
         store_refreshed_chatgpt_auth(
             profile,
             vault,
+            storage,
             &refreshed,
             &next_refresh_token,
             next_expires_at,
@@ -2671,6 +2754,7 @@ async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), P
         account_id,
         profile: profile.clone(),
         vault: vault.clone(),
+        storage: storage.clone(),
     };
     Ok(())
 }
@@ -2678,6 +2762,7 @@ async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), P
 fn store_refreshed_chatgpt_auth(
     profile: &str,
     vault: &std::path::Path,
+    storage: &BTreeMap<String, bcode_model::ProviderAuthStorageRef>,
     refreshed: &OpenAiOauthTokenResponse,
     next_refresh_token: &str,
     next_expires_at: u64,
@@ -2687,38 +2772,48 @@ fn store_refreshed_chatgpt_auth(
     set_codex_secret(
         &store,
         profile,
-        "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
+        chatgpt_storage_key(storage, "access_token", "BCODE_OPENAI_CODEX_ACCESS_TOKEN"),
         refreshed.access_token.clone(),
     )?;
     if let Some(id_token) = &refreshed.id_token {
         set_codex_secret(
             &store,
             profile,
-            "BCODE_OPENAI_CODEX_ID_TOKEN",
+            chatgpt_storage_key(storage, "id_token", "BCODE_OPENAI_CODEX_ID_TOKEN"),
             id_token.clone(),
         )?;
     }
     set_codex_secret(
         &store,
         profile,
-        "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
+        chatgpt_storage_key(storage, "refresh_token", "BCODE_OPENAI_CODEX_REFRESH_TOKEN"),
         next_refresh_token.to_string(),
     )?;
     set_codex_secret(
         &store,
         profile,
-        "BCODE_OPENAI_CODEX_EXPIRES_AT",
+        chatgpt_storage_key(storage, "expires_at", "BCODE_OPENAI_CODEX_EXPIRES_AT"),
         next_expires_at.to_string(),
     )?;
     if let Some(account_id) = account_id {
         set_codex_secret(
             &store,
             profile,
-            "BCODE_OPENAI_CODEX_ACCOUNT_ID",
+            chatgpt_storage_key(storage, "account_id", "BCODE_OPENAI_CODEX_ACCOUNT_ID"),
             account_id.to_string(),
         )?;
     }
     Ok(())
+}
+
+fn chatgpt_storage_key<'a>(
+    storage: &'a BTreeMap<String, bcode_model::ProviderAuthStorageRef>,
+    credential: &str,
+    fallback: &'a str,
+) -> &'a str {
+    storage
+        .get(credential)
+        .map_or(fallback, |storage| storage.key.as_str())
 }
 
 fn set_codex_secret(
@@ -3024,6 +3119,7 @@ mod tests {
             account_id: None,
             profile: None,
             vault: None,
+            storage: BTreeMap::new(),
         }
     }
 

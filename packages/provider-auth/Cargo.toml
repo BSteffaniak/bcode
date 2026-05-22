@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Provider auth materialization helpers for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "auth", "provider"]
+license     = { workspace = true }
+name        = "bcode_provider_auth"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_config = { workspace = true }
+bcode_model  = { workspace = true }
+sshenv_vault = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

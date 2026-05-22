@@ -838,6 +838,52 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn runtime_context_with_semantic_auth_round_trips() {
+        let request = Request::Hello {
+            client_name: "test".to_string(),
+            runtime_context: Some(ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                selected_model_id: Some("model".to_string()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    auth_profile: Some("openrouter".to_string()),
+                    auth: Some(bcode_model::ProviderAuthContext {
+                        profile: Some("openrouter".to_string()),
+                        backend: Some("sshenv".to_string()),
+                        scheme: Some("api_key".to_string()),
+                        credentials: BTreeMap::from([(
+                            "api_key".to_string(),
+                            bcode_model::ProviderAuthCredential {
+                                value: "secret".to_string(),
+                                source: Some("OPENROUTER_API_KEY".to_string()),
+                            },
+                        )]),
+                        attributes: BTreeMap::from([(
+                            "base_url".to_string(),
+                            "https://openrouter.ai/api/v1".to_string(),
+                        )]),
+                        storage: BTreeMap::from([(
+                            "api_key".to_string(),
+                            bcode_model::ProviderAuthStorageRef {
+                                backend: "sshenv".to_string(),
+                                profile: "openrouter".to_string(),
+                                key: "OPENROUTER_API_KEY".to_string(),
+                                vault: Some("/tmp/vault".to_string()),
+                            },
+                        )]),
+                    }),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                env_keys: BTreeMap::from([("OPENROUTER_API_KEY".to_string(), true)]),
+            }),
+        };
+
+        let encoded = encode(&request).expect("request should encode");
+        let decoded: Request = decode(&encoded).expect("request should decode");
+
+        assert_eq!(decoded, request);
+    }
+
     #[tokio::test]
     async fn oversized_response_envelope_round_trips_across_chunked_frames() {
         let payload = vec![b'x'; MAX_FRAME_PAYLOAD_SIZE + 100_000];
