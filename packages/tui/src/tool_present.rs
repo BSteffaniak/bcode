@@ -1,0 +1,360 @@
+//! Bcode-specific tool-call presentation models for transcript rendering.
+
+use std::path::Path;
+
+use serde_json::Value;
+
+/// Human-readable presentation for a known tool request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolRequestPresentation {
+    /// Shell command execution request.
+    ShellRun {
+        /// Command line that will run.
+        command: String,
+        /// Optional working directory.
+        cwd: Option<String>,
+        /// Optional timeout in milliseconds.
+        timeout_ms: Option<u64>,
+    },
+    /// Filesystem read request.
+    Read {
+        /// Path to read.
+        path: String,
+    },
+    /// Filesystem write request.
+    Write {
+        /// Path to write.
+        path: String,
+        /// Byte length of the requested contents.
+        bytes: usize,
+        /// Line count of the requested contents.
+        lines: usize,
+    },
+    /// Filesystem existence check request.
+    Exists {
+        /// Path to inspect.
+        path: String,
+    },
+    /// Filesystem list request.
+    List {
+        /// Directory path to list.
+        path: String,
+        /// Whether listing is recursive.
+        recursive: bool,
+        /// Optional maximum entry count.
+        max_entries: Option<u64>,
+    },
+    /// Filesystem find request.
+    Find {
+        /// Root path to search.
+        path: String,
+        /// Glob pattern.
+        pattern: String,
+        /// Optional maximum result count.
+        max_results: Option<u64>,
+    },
+    /// Filesystem grep request.
+    Grep {
+        /// Root path to search.
+        path: String,
+        /// Literal search pattern.
+        pattern: String,
+        /// Optional glob filter.
+        glob: Option<String>,
+        /// Whether matching ignores case.
+        ignore_case: bool,
+        /// Optional maximum match count.
+        max_matches: Option<u64>,
+    },
+    /// Filesystem stat request.
+    Stat {
+        /// Path to inspect.
+        path: String,
+    },
+}
+
+/// Human-readable presentation for a known tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolResultPresentation {
+    /// Filesystem read result.
+    Read {
+        /// Read contents.
+        contents: String,
+        /// Byte length of the read contents.
+        bytes: usize,
+        /// Line count of the read contents.
+        lines: usize,
+    },
+    /// Filesystem write result.
+    Write {
+        /// Human-readable plugin output.
+        summary: String,
+    },
+    /// Filesystem edit result.
+    Edit {
+        /// Human-readable plugin output.
+        summary: String,
+    },
+    /// Filesystem existence check result.
+    Exists {
+        /// Whether the path exists.
+        exists: bool,
+    },
+    /// Filesystem list result.
+    List {
+        /// Directory entries.
+        entries: Vec<ListEntryPresentation>,
+        /// Whether the result timed out.
+        timed_out: bool,
+        /// Whether the result is partial.
+        partial: bool,
+        /// Number of visited entries reported by the tool runtime.
+        visited_entries: Option<u64>,
+        /// Optional tool runtime message.
+        message: Option<String>,
+    },
+    /// Filesystem find result.
+    Find {
+        /// Matching paths.
+        paths: Vec<String>,
+        /// Whether the result timed out.
+        timed_out: bool,
+        /// Whether the result is partial.
+        partial: bool,
+        /// Number of visited entries reported by the tool runtime.
+        visited_entries: Option<u64>,
+        /// Optional tool runtime message.
+        message: Option<String>,
+    },
+    /// Filesystem grep result.
+    Grep {
+        /// Matching lines.
+        matches: Vec<GrepMatchPresentation>,
+        /// Whether the result timed out.
+        timed_out: bool,
+        /// Whether the result is partial.
+        partial: bool,
+        /// Number of visited entries reported by the tool runtime.
+        visited_entries: Option<u64>,
+        /// Optional tool runtime message.
+        message: Option<String>,
+    },
+    /// Filesystem stat result.
+    Stat {
+        /// Whether the path exists.
+        exists: bool,
+        /// File kind reported by the tool runtime.
+        kind: Option<String>,
+        /// Optional byte length.
+        len: Option<u64>,
+    },
+}
+
+/// Human-readable directory entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEntryPresentation {
+    /// Entry path.
+    pub path: String,
+    /// Entry kind.
+    pub kind: String,
+}
+
+/// Human-readable grep match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepMatchPresentation {
+    /// Match path.
+    pub path: String,
+    /// One-based line number.
+    pub line_number: Option<u64>,
+    /// Matching line text.
+    pub line: String,
+}
+
+/// Build a known-tool request presentation from raw tool arguments.
+#[must_use]
+pub fn tool_request_presentation(
+    tool_name: &str,
+    arguments_json: &str,
+) -> Option<ToolRequestPresentation> {
+    let value = serde_json::from_str::<Value>(arguments_json).ok()?;
+    let normalized = normalized_tool_name(tool_name);
+    match normalized.as_str() {
+        "shell_run" | "shell" => Some(ToolRequestPresentation::ShellRun {
+            command: string_field(&value, "command")?,
+            cwd: string_field(&value, "cwd"),
+            timeout_ms: u64_field(&value, "timeout_ms"),
+        }),
+        "filesystem_read" | "read" => Some(ToolRequestPresentation::Read {
+            path: path_field(&value, "path")?,
+        }),
+        "filesystem_write" | "write" => Some(ToolRequestPresentation::Write {
+            path: path_field(&value, "path")?,
+            bytes: string_field(&value, "contents").map_or(0, |contents| contents.len()),
+            lines: string_field(&value, "contents").map_or(0, |contents| contents.lines().count()),
+        }),
+        "filesystem_exists" | "exists" => Some(ToolRequestPresentation::Exists {
+            path: path_field(&value, "path")?,
+        }),
+        "filesystem_list" | "list" => Some(ToolRequestPresentation::List {
+            path: path_field(&value, "path")?,
+            recursive: bool_field(&value, "recursive"),
+            max_entries: u64_field(&value, "max_entries"),
+        }),
+        "filesystem_find" | "find" => Some(ToolRequestPresentation::Find {
+            path: path_field(&value, "path")?,
+            pattern: string_field(&value, "pattern")?,
+            max_results: u64_field(&value, "max_results"),
+        }),
+        "filesystem_grep" | "grep" => Some(ToolRequestPresentation::Grep {
+            path: path_field(&value, "path")?,
+            pattern: string_field(&value, "pattern")?,
+            glob: string_field(&value, "glob"),
+            ignore_case: bool_field(&value, "ignore_case"),
+            max_matches: u64_field(&value, "max_matches"),
+        }),
+        "filesystem_stat" | "stat" => Some(ToolRequestPresentation::Stat {
+            path: path_field(&value, "path")?,
+        }),
+        _ => None,
+    }
+}
+
+/// Build a known-tool result presentation from raw tool output.
+#[must_use]
+pub fn tool_result_presentation(
+    tool_name: Option<&str>,
+    result: &str,
+) -> Option<ToolResultPresentation> {
+    let normalized = normalized_tool_name(tool_name?);
+    match normalized.as_str() {
+        "filesystem_read" | "read" => Some(filesystem_read_result(result)),
+        "filesystem_write" | "write" => Some(ToolResultPresentation::Write {
+            summary: result.trim().to_owned(),
+        }),
+        "filesystem_edit" | "edit" => Some(ToolResultPresentation::Edit {
+            summary: result.trim().to_owned(),
+        }),
+        "filesystem_exists" | "exists" => Some(ToolResultPresentation::Exists {
+            exists: result.trim() == "true",
+        }),
+        "filesystem_list" | "list" => filesystem_list_result(result),
+        "filesystem_find" | "find" => filesystem_find_result(result),
+        "filesystem_grep" | "grep" => filesystem_grep_result(result),
+        "filesystem_stat" | "stat" => filesystem_stat_result(result),
+        _ => None,
+    }
+}
+
+fn filesystem_read_result(result: &str) -> ToolResultPresentation {
+    let contents = serde_json::from_str::<Value>(result)
+        .ok()
+        .and_then(|value| string_field(&value, "contents"))
+        .unwrap_or_else(|| result.to_owned());
+    ToolResultPresentation::Read {
+        bytes: contents.len(),
+        lines: contents.lines().count(),
+        contents,
+    }
+}
+
+fn filesystem_list_result(result: &str) -> Option<ToolResultPresentation> {
+    let value = serde_json::from_str::<Value>(result).ok()?;
+    let entries = value
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .filter_map(|entry| {
+            Some(ListEntryPresentation {
+                path: string_field(entry, "path")?,
+                kind: string_field(entry, "kind").unwrap_or_else(|| "unknown".to_owned()),
+            })
+        })
+        .collect();
+    Some(ToolResultPresentation::List {
+        entries,
+        timed_out: bool_field(&value, "timed_out"),
+        partial: bool_field(&value, "partial"),
+        visited_entries: u64_field(&value, "visited_entries"),
+        message: string_field(&value, "message"),
+    })
+}
+
+fn filesystem_find_result(result: &str) -> Option<ToolResultPresentation> {
+    let value = serde_json::from_str::<Value>(result).ok()?;
+    let paths = value
+        .get("paths")?
+        .as_array()?
+        .iter()
+        .filter_map(|path| path.as_str().map(ToOwned::to_owned))
+        .collect();
+    Some(ToolResultPresentation::Find {
+        paths,
+        timed_out: bool_field(&value, "timed_out"),
+        partial: bool_field(&value, "partial"),
+        visited_entries: u64_field(&value, "visited_entries"),
+        message: string_field(&value, "message"),
+    })
+}
+
+fn filesystem_grep_result(result: &str) -> Option<ToolResultPresentation> {
+    let value = serde_json::from_str::<Value>(result).ok()?;
+    let matches = value
+        .get("matches")?
+        .as_array()?
+        .iter()
+        .filter_map(|entry| {
+            Some(GrepMatchPresentation {
+                path: string_field(entry, "path")?,
+                line_number: u64_field(entry, "line_number"),
+                line: string_field(entry, "line").unwrap_or_default(),
+            })
+        })
+        .collect();
+    Some(ToolResultPresentation::Grep {
+        matches,
+        timed_out: bool_field(&value, "timed_out"),
+        partial: bool_field(&value, "partial"),
+        visited_entries: u64_field(&value, "visited_entries"),
+        message: string_field(&value, "message"),
+    })
+}
+
+fn filesystem_stat_result(result: &str) -> Option<ToolResultPresentation> {
+    let value = serde_json::from_str::<Value>(result).ok()?;
+    Some(ToolResultPresentation::Stat {
+        exists: bool_field(&value, "exists"),
+        kind: string_field(&value, "kind"),
+        len: u64_field(&value, "len"),
+    })
+}
+
+fn normalized_tool_name(tool_name: &str) -> String {
+    tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+    match value.get(field)? {
+        Value::String(text) => Some(text.clone()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn path_field(value: &Value, field: &str) -> Option<String> {
+    string_field(value, field).map(|path| path_display(&path))
+}
+
+fn path_display(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| path.to_owned(), |_| path.to_owned())
+}
+
+fn bool_field(value: &Value, field: &str) -> bool {
+    value.get(field).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn u64_field(value: &Value, field: &str) -> Option<u64> {
+    value.get(field).and_then(Value::as_u64)
+}

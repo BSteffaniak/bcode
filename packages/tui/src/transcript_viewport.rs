@@ -1,0 +1,81 @@
+//! Transcript viewport scrolling state.
+
+use super::older_history::OlderHistoryState;
+
+/// Rendered transcript viewport state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranscriptViewport {
+    offset: usize,
+    max_offset: usize,
+    preserve_max_offset: Option<usize>,
+}
+
+impl TranscriptViewport {
+    /// Return the number of transcript rows hidden below the viewport.
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Preserve viewport position before live transcript rows append.
+    pub const fn preserve_for_append(&mut self) {
+        if self.offset > 0 {
+            self.preserve_max_offset = Some(self.max_offset);
+        }
+    }
+
+    /// Scroll up by rendered rows.
+    pub fn scroll_up(&mut self, rows: usize, older_history: &mut OlderHistoryState) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        let previous = self.offset;
+        let previous_request = older_history.reveal_request();
+        let desired = self.offset.saturating_add(rows);
+        self.offset = desired.min(self.max_offset);
+        if desired > self.max_offset {
+            request_older_history_load(older_history, desired.saturating_sub(self.max_offset));
+        }
+        self.offset != previous || older_history.reveal_request() != previous_request
+    }
+
+    /// Scroll down by rendered rows.
+    pub const fn scroll_down(&mut self, rows: usize) -> bool {
+        let previous = self.offset;
+        self.offset = self.offset.saturating_sub(rows);
+        self.offset != previous
+    }
+
+    /// Pin transcript to the newest rows.
+    pub const fn scroll_to_bottom(&mut self, older_history: &mut OlderHistoryState) -> bool {
+        let changed = self.offset != 0;
+        self.offset = 0;
+        older_history.clear_reveal_request();
+        changed
+    }
+
+    /// Sync cached rendered transcript scroll bounds from the latest frame.
+    pub fn sync_max(&mut self, max_offset: usize, older_history: &mut OlderHistoryState) {
+        let previous_max = self.max_offset;
+        self.max_offset = max_offset;
+        if let Some(requested_rows) = older_history.take_reveal_request() {
+            let inserted_rows = max_offset.saturating_sub(previous_max);
+            let reveal_rows = requested_rows.min(inserted_rows);
+            self.offset = self.offset.saturating_add(reveal_rows);
+        }
+        if let Some(preserve_max) = self.preserve_max_offset.take()
+            && self.offset > 0
+        {
+            let appended_rows = max_offset.saturating_sub(preserve_max);
+            self.offset = self.offset.saturating_add(appended_rows);
+        }
+        self.offset = self.offset.min(self.max_offset);
+    }
+}
+
+fn request_older_history_load(older_history: &mut OlderHistoryState, reveal_rows: usize) {
+    if older_history.cursor().is_none() || older_history.loading() {
+        return;
+    }
+    older_history.request_load(reveal_rows.max(1));
+}
