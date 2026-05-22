@@ -19,6 +19,9 @@ use super::activity::ActivityState;
 use super::app::{BmuxApp, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
+use super::tool_present::{
+    GrepMatchPresentation, ListEntryPresentation, ToolRequestPresentation, ToolResultPresentation,
+};
 use super::transcript::{ShellOutputTranscript, TranscriptItem, TranscriptItemKind};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -276,6 +279,7 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
             tool_call_id,
             tool_name,
             file_edit,
+            presentation,
         } => {
             push_tool_request_rows(
                 rows,
@@ -283,6 +287,7 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
                 tool_call_id,
                 tool_name,
                 file_edit.as_ref(),
+                presentation.as_ref(),
                 width,
             );
         }
@@ -290,15 +295,19 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
             tool_call_id,
             tool_name,
             shell_output,
+            presentation,
             is_error,
         } => {
             push_tool_result_rows(
                 rows,
                 item,
-                tool_call_id,
-                tool_name.as_deref(),
-                shell_output.as_ref(),
-                *is_error,
+                ToolResultRenderContext {
+                    tool_call_id,
+                    tool_name: tool_name.as_deref(),
+                    shell_output: shell_output.as_ref(),
+                    presentation: presentation.as_ref(),
+                    is_error: *is_error,
+                },
                 width,
             );
         }
@@ -368,6 +377,7 @@ fn push_tool_request_rows(
     tool_call_id: &str,
     tool_name: &str,
     file_edit: Option<&FileEditTranscript>,
+    presentation: Option<&ToolRequestPresentation>,
     width: u16,
 ) {
     push_wrapped_styled_text(
@@ -388,23 +398,31 @@ fn push_tool_request_rows(
     );
     if let Some(edit) = file_edit {
         push_file_edit_preview_rows(rows, edit, width);
+    } else if let Some(presentation) = presentation {
+        push_tool_request_presentation_rows(rows, presentation, width);
     } else if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
     }
     rows.push(Line::default());
 }
 
+#[derive(Clone, Copy)]
+struct ToolResultRenderContext<'a> {
+    tool_call_id: &'a str,
+    tool_name: Option<&'a str>,
+    shell_output: Option<&'a ShellOutputTranscript>,
+    presentation: Option<&'a ToolResultPresentation>,
+    is_error: bool,
+}
+
 fn push_tool_result_rows(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    shell_output: Option<&ShellOutputTranscript>,
-    is_error: bool,
+    context: ToolResultRenderContext<'_>,
     width: u16,
 ) {
-    let status = if is_error { "failed" } else { "ok" };
-    let title = tool_name.map_or_else(
+    let status = if context.is_error { "failed" } else { "ok" };
+    let title = context.tool_name.map_or_else(
         || format!("Tool result · {status}"),
         |name| format!("Tool result · {name} · {status}"),
     );
@@ -413,15 +431,17 @@ fn push_tool_result_rows(
         Vec::new(),
         &title,
         width,
-        if is_error {
+        if context.is_error {
             Style::new().fg(Color::Red)
         } else {
             Style::new().fg(Color::Yellow)
         },
         muted_style(),
     );
-    if let Some(output) = shell_output {
+    if let Some(output) = context.shell_output {
         push_shell_output_rows(rows, output, width);
+    } else if let Some(presentation) = context.presentation {
+        push_tool_result_presentation_rows(rows, presentation, width);
     } else {
         push_labeled_text_preview(
             rows,
@@ -431,17 +451,334 @@ fn push_tool_result_rows(
             MAX_INLINE_TOOL_TEXT_ROWS,
         );
     }
-    if is_error {
+    if context.is_error {
         push_wrapped_styled_text(
             rows,
             vec![Span::styled("  ", muted_style())],
-            &format!("tool call {}", truncate_middle(tool_call_id, 20)),
+            &format!("tool call {}", truncate_middle(context.tool_call_id, 20)),
             width,
             muted_style(),
             muted_style(),
         );
     }
     rows.push(Line::default());
+}
+
+fn push_tool_request_presentation_rows(
+    rows: &mut Vec<Line>,
+    presentation: &ToolRequestPresentation,
+    width: u16,
+) {
+    match presentation {
+        ToolRequestPresentation::ShellRun {
+            command,
+            cwd,
+            timeout_ms,
+        } => {
+            push_kv_row(rows, "command", command, width);
+            if let Some(cwd) = cwd {
+                push_kv_row(rows, "cwd", cwd, width);
+            }
+            if let Some(timeout_ms) = timeout_ms {
+                push_kv_row(rows, "timeout", &format!("{timeout_ms}ms"), width);
+            }
+        }
+        ToolRequestPresentation::Read { path }
+        | ToolRequestPresentation::Exists { path }
+        | ToolRequestPresentation::Stat { path } => {
+            push_kv_row(rows, "path", path, width);
+        }
+        ToolRequestPresentation::Write { path, bytes, lines } => {
+            push_kv_row(rows, "path", path, width);
+            push_kv_row(
+                rows,
+                "contents",
+                &format!("{bytes} bytes · {lines} lines"),
+                width,
+            );
+        }
+        ToolRequestPresentation::List {
+            path,
+            recursive,
+            max_entries,
+        } => {
+            push_kv_row(rows, "path", path, width);
+            push_kv_row(
+                rows,
+                "mode",
+                if *recursive { "recursive" } else { "direct" },
+                width,
+            );
+            if let Some(max_entries) = max_entries {
+                push_kv_row(rows, "limit", &format!("{max_entries} entries"), width);
+            }
+        }
+        ToolRequestPresentation::Find {
+            path,
+            pattern,
+            max_results,
+        } => {
+            push_kv_row(rows, "path", path, width);
+            push_kv_row(rows, "pattern", pattern, width);
+            if let Some(max_results) = max_results {
+                push_kv_row(rows, "limit", &format!("{max_results} results"), width);
+            }
+        }
+        ToolRequestPresentation::Grep {
+            path,
+            pattern,
+            glob,
+            ignore_case,
+            max_matches,
+        } => {
+            push_kv_row(rows, "path", path, width);
+            push_kv_row(rows, "pattern", pattern, width);
+            if let Some(glob) = glob {
+                push_kv_row(rows, "glob", glob, width);
+            }
+            if *ignore_case {
+                push_kv_row(rows, "match", "ignore case", width);
+            }
+            if let Some(max_matches) = max_matches {
+                push_kv_row(rows, "limit", &format!("{max_matches} matches"), width);
+            }
+        }
+    }
+}
+
+fn push_tool_result_presentation_rows(
+    rows: &mut Vec<Line>,
+    presentation: &ToolResultPresentation,
+    width: u16,
+) {
+    match presentation {
+        ToolResultPresentation::Read {
+            contents,
+            bytes,
+            lines,
+        } => {
+            push_kv_row(
+                rows,
+                "read",
+                &format!("{bytes} bytes · {lines} lines"),
+                width,
+            );
+            push_labeled_text_preview(rows, "preview", contents, width, MAX_INLINE_TOOL_TEXT_ROWS);
+        }
+        ToolResultPresentation::Write { summary } | ToolResultPresentation::Edit { summary } => {
+            push_kv_row(rows, "result", summary, width);
+        }
+        ToolResultPresentation::Exists { exists } => {
+            push_kv_row(rows, "exists", if *exists { "yes" } else { "no" }, width);
+        }
+        ToolResultPresentation::List {
+            entries,
+            timed_out,
+            partial,
+            visited_entries,
+            message,
+        } => push_tool_collection_rows(
+            rows,
+            CollectionStatus {
+                count: entries.len(),
+                noun: "entries",
+                timed_out: *timed_out,
+                partial: *partial,
+                visited_entries: *visited_entries,
+                message: message.as_deref(),
+            },
+            width,
+            |rows| push_list_entries(rows, entries, width),
+        ),
+        ToolResultPresentation::Find {
+            paths,
+            timed_out,
+            partial,
+            visited_entries,
+            message,
+        } => push_tool_collection_rows(
+            rows,
+            CollectionStatus {
+                count: paths.len(),
+                noun: "paths",
+                timed_out: *timed_out,
+                partial: *partial,
+                visited_entries: *visited_entries,
+                message: message.as_deref(),
+            },
+            width,
+            |rows| push_path_results(rows, paths, width),
+        ),
+        ToolResultPresentation::Grep {
+            matches,
+            timed_out,
+            partial,
+            visited_entries,
+            message,
+        } => push_tool_collection_rows(
+            rows,
+            CollectionStatus {
+                count: matches.len(),
+                noun: "matches",
+                timed_out: *timed_out,
+                partial: *partial,
+                visited_entries: *visited_entries,
+                message: message.as_deref(),
+            },
+            width,
+            |rows| push_grep_matches(rows, matches, width),
+        ),
+        ToolResultPresentation::Stat { exists, kind, len } => {
+            push_kv_row(rows, "exists", if *exists { "yes" } else { "no" }, width);
+            if let Some(kind) = kind {
+                push_kv_row(rows, "kind", kind, width);
+            }
+            if let Some(len) = len {
+                push_kv_row(rows, "size", &format!("{len} bytes"), width);
+            }
+        }
+    }
+}
+
+fn push_kv_row(rows: &mut Vec<Line>, label: &str, value: &str, width: u16) {
+    push_wrapped_styled_text(
+        rows,
+        vec![
+            Span::styled("  ", muted_style()),
+            Span::styled(
+                format!("{label}: "),
+                muted_style().add_modifier(Modifier::BOLD),
+            ),
+        ],
+        value,
+        width,
+        Style::new().fg(Color::BrightWhite),
+        muted_style(),
+    );
+}
+
+fn push_tool_collection_rows(
+    rows: &mut Vec<Line>,
+    status: CollectionStatus<'_>,
+    width: u16,
+    push_items: impl FnOnce(&mut Vec<Line>),
+) {
+    push_collection_status(rows, status, width);
+    push_items(rows);
+}
+
+fn push_path_results(rows: &mut Vec<Line>, paths: &[String], width: u16) {
+    for path in preview_values(paths, MAX_INLINE_TOOL_TEXT_ROWS) {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("    ", muted_style())],
+            path,
+            width,
+            Style::new(),
+            muted_style(),
+        );
+    }
+    push_hidden_count(rows, paths.len(), MAX_INLINE_TOOL_TEXT_ROWS, "paths", width);
+}
+
+#[derive(Clone, Copy)]
+struct CollectionStatus<'a> {
+    count: usize,
+    noun: &'a str,
+    timed_out: bool,
+    partial: bool,
+    visited_entries: Option<u64>,
+    message: Option<&'a str>,
+}
+
+fn push_collection_status(rows: &mut Vec<Line>, status: CollectionStatus<'_>, width: u16) {
+    let mut text = format!("{} {}", status.count, status.noun);
+    if let Some(visited_entries) = status.visited_entries {
+        text.push_str(" · visited ");
+        text.push_str(&visited_entries.to_string());
+    }
+    if status.timed_out {
+        text.push_str(" · timed out");
+    }
+    if status.partial {
+        text.push_str(" · partial");
+    }
+    push_kv_row(rows, "result", &text, width);
+    if let Some(message) = status.message {
+        push_kv_row(rows, "note", message, width);
+    }
+}
+
+fn push_list_entries(rows: &mut Vec<Line>, entries: &[ListEntryPresentation], width: u16) {
+    for entry in preview_values(entries, MAX_INLINE_TOOL_TEXT_ROWS) {
+        let icon = match entry.kind.as_str() {
+            "directory" => "dir ",
+            "file" => "file",
+            other => other,
+        };
+        push_wrapped_styled_text(
+            rows,
+            vec![
+                Span::styled("    ", muted_style()),
+                Span::styled(format!("{icon} "), muted_style()),
+            ],
+            &entry.path,
+            width,
+            Style::new(),
+            muted_style(),
+        );
+    }
+    push_hidden_count(
+        rows,
+        entries.len(),
+        MAX_INLINE_TOOL_TEXT_ROWS,
+        "entries",
+        width,
+    );
+}
+
+fn push_grep_matches(rows: &mut Vec<Line>, matches: &[GrepMatchPresentation], width: u16) {
+    for grep_match in preview_values(matches, MAX_INLINE_TOOL_TEXT_ROWS) {
+        let location = grep_match.line_number.map_or_else(
+            || grep_match.path.clone(),
+            |line_number| format!("{}:{line_number}", grep_match.path),
+        );
+        push_wrapped_styled_text(
+            rows,
+            vec![
+                Span::styled("    ", muted_style()),
+                Span::styled(format!("{location}: "), muted_style()),
+            ],
+            &grep_match.line,
+            width,
+            Style::new(),
+            muted_style(),
+        );
+    }
+    push_hidden_count(
+        rows,
+        matches.len(),
+        MAX_INLINE_TOOL_TEXT_ROWS,
+        "matches",
+        width,
+    );
+}
+
+fn preview_values<T>(values: &[T], max_rows: usize) -> impl Iterator<Item = &T> {
+    values.iter().take(max_rows)
+}
+
+fn push_hidden_count(rows: &mut Vec<Line>, total: usize, shown: usize, noun: &str, width: u16) {
+    if total > shown {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("    ", muted_style())],
+            &format!("… {} {noun} hidden …", total - shown),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
 }
 
 fn push_file_edit_preview_rows(rows: &mut Vec<Line>, edit: &FileEditTranscript, width: u16) {

@@ -604,8 +604,8 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
     assert!(output.contains("Tool · shell.run"));
     assert!(output.contains("call call_ABCD"));
     assert!(!output.contains(full_call_id));
-    assert!(output.contains("arguments"));
-    assert!(output.contains(r#""command": "cargo check""#));
+    assert!(output.contains("command: cargo check"));
+    assert!(output.contains("cwd: /tmp/project"));
     assert!(output.contains("Tool result · shell.run · ok"));
     assert!(output.contains("    ok"));
 }

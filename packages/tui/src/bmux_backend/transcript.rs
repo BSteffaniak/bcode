@@ -5,6 +5,10 @@ use std::collections::BTreeMap;
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionTokenUsage};
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
+use super::tool_present::{
+    ToolRequestPresentation, ToolResultPresentation, tool_request_presentation,
+    tool_result_presentation,
+};
 
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +27,8 @@ pub(super) enum TranscriptItemKind {
         tool_name: String,
         /// Optional semantic file edit extracted from filesystem tools.
         file_edit: Option<FileEditTranscript>,
+        /// Optional semantic presentation for known tool calls.
+        presentation: Option<ToolRequestPresentation>,
     },
     /// Tool-call result with structured metadata.
     ToolResult {
@@ -32,6 +38,8 @@ pub(super) enum TranscriptItemKind {
         tool_name: Option<String>,
         /// Parsed shell output, when the result came from a shell tool.
         shell_output: Option<ShellOutputTranscript>,
+        /// Optional semantic presentation for known tool results.
+        presentation: Option<ToolResultPresentation>,
         /// Whether the tool failed.
         is_error: bool,
     },
@@ -209,6 +217,7 @@ pub(super) fn tool_request_item(
     arguments_json: &str,
 ) -> TranscriptItem {
     let file_edit = file_edit_from_tool_request(tool_name, arguments_json);
+    let presentation = tool_request_presentation(tool_name, arguments_json);
     TranscriptItem::with_kind(
         "Tool",
         pretty_jsonish(arguments_json),
@@ -217,6 +226,7 @@ pub(super) fn tool_request_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             file_edit,
+            presentation,
         },
     )
 }
@@ -238,6 +248,7 @@ pub(super) fn tool_result_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             shell_output: shell_output_from_result(tool_name, arguments_json, result),
+            presentation: tool_result_presentation(tool_name, result),
             is_error,
         },
     )
