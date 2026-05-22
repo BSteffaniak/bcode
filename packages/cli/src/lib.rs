@@ -704,11 +704,23 @@ fn auth_status() -> Result<(), CliError> {
     if let Some(provider) = auth_profile.settings.get("provider") {
         println!("Provider: {provider}");
     }
-    if let Some(provider_plugin_id) = selection.provider_plugin_id {
+    if let Some(provider_plugin_id) = &selection.provider_plugin_id {
         println!("Provider plugin: {provider_plugin_id}");
     }
-    if let Some(model_id) = selection.model_id {
-        println!("Model: {model_id}");
+    match (&selection.selected_model_id, &selection.model_id) {
+        (Some(configured_model), Some(resolved_model)) if configured_model != resolved_model => {
+            println!("Configured model: {configured_model}");
+            println!("Resolved model: {resolved_model}");
+        }
+        (_, Some(model_id)) => println!("Model: {model_id}"),
+        (Some(model_id), None) => println!("Configured model: {model_id}"),
+        (None, None) => {}
+    }
+    if !selection.request.is_empty() {
+        println!("Request options:");
+        for (key, value) in &selection.request {
+            println!("  {key}: {}", format_provider_request_value(value));
+        }
     }
     if resolved.auth.storage.is_empty() {
         println!("Credentials: no mapped credentials");
@@ -725,6 +737,31 @@ fn auth_status() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn format_provider_request_value(value: &bcode_model::ProviderRequestValue) -> String {
+    match value {
+        bcode_model::ProviderRequestValue::Null => "null".to_string(),
+        bcode_model::ProviderRequestValue::Bool(value) => value.to_string(),
+        bcode_model::ProviderRequestValue::Number(value)
+        | bcode_model::ProviderRequestValue::String(value) => value.clone(),
+        bcode_model::ProviderRequestValue::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(format_provider_request_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        bcode_model::ProviderRequestValue::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", format_provider_request_value(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn auth_login(
