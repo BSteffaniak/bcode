@@ -1878,7 +1878,9 @@ const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
 ];
 
 fn ensure_bundled_plugins_installed() -> Result<(), CliError> {
-    if std::env::var_os("BCODE_SKIP_BUNDLED_PLUGIN_INSTALL").is_some() {
+    if cfg!(feature = "static-bundled-plugins")
+        || std::env::var_os("BCODE_SKIP_BUNDLED_PLUGIN_INSTALL").is_some()
+    {
         return Ok(());
     }
     let executable_dir = executable_dir()?;
