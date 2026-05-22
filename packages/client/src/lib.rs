@@ -100,6 +100,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
         .collect::<BTreeMap<_, _>>();
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
+    merge_configured_api_key_env(&resolved, &mut env);
     merge_selected_auth_profile_env(&config, resolved.auth_profile.as_deref(), &mut env);
     let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
     Some(ClientRuntimeContext {
@@ -114,6 +115,25 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
         },
         env_keys,
     })
+}
+
+fn merge_configured_api_key_env(
+    resolved: &bcode_config::ResolvedModelSelection,
+    env: &mut BTreeMap<String, String>,
+) {
+    let Some(api_key_env) = resolved
+        .settings
+        .get("openai.api_key_env")
+        .or_else(|| resolved.settings.get("api_key_env"))
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    if let Ok(value) = std::env::var(api_key_env)
+        && !value.trim().is_empty()
+    {
+        env.entry(api_key_env.clone()).or_insert(value);
+    }
 }
 
 fn selected_auth_profile(resolved: &bcode_config::ResolvedModelSelection) -> Option<String> {
