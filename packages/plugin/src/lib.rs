@@ -19,7 +19,11 @@ use std::env;
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -601,15 +605,90 @@ impl PluginServiceRegistry {
 }
 
 /// Plugin service execution concurrency policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginConcurrency {
     /// Serialize invocations for this plugin on a dedicated worker.
     #[default]
     Exclusive,
+    /// Reserve support for bounded concurrent plugin execution.
+    Limited(usize),
+    /// Reserve support for unconstrained concurrent plugin execution.
+    Concurrent,
+}
+
+/// Plugin invocation scheduling class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginInvocationClass {
+    /// Control-plane requests that should remain responsive.
+    Control,
+    /// Metadata or discovery requests.
+    Query,
+    /// Long-running tool execution requests.
+    ToolExecution,
+    /// Model provider requests.
+    ModelProvider,
+    /// Event delivery requests.
+    EventDelivery,
+    /// Unclassified plugin request.
+    #[default]
+    Service,
+}
+
+/// Runtime plugin invocation identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PluginInvocationId(u64);
+
+impl PluginInvocationId {
+    /// Return the numeric invocation identifier.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Plugin executor status snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginExecutorStatus {
+    pub plugin_id: String,
+    pub concurrency: PluginConcurrency,
+    pub running: usize,
+    pub queued: usize,
+    pub completed: u64,
+    pub failed: u64,
+}
+
+#[derive(Debug, Default)]
+struct PluginExecutorMetrics {
+    running: AtomicUsize,
+    queued: AtomicUsize,
+    completed: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl PluginExecutorMetrics {
+    fn snapshot(&self, plugin_id: String, concurrency: PluginConcurrency) -> PluginExecutorStatus {
+        PluginExecutorStatus {
+            plugin_id,
+            concurrency,
+            running: self.running.load(Ordering::Relaxed),
+            queued: self.queued.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static NEXT_PLUGIN_INVOCATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_plugin_invocation_id() -> PluginInvocationId {
+    PluginInvocationId(NEXT_PLUGIN_INVOCATION_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Debug)]
 struct PluginInvocation {
+    id: PluginInvocationId,
+    class: PluginInvocationClass,
+    enqueued_at: Instant,
     interface_id: String,
     operation: String,
     payload: Vec<u8>,
@@ -618,6 +697,9 @@ struct PluginInvocation {
 
 #[derive(Debug)]
 struct PluginEventInvocation {
+    id: PluginInvocationId,
+    class: PluginInvocationClass,
+    enqueued_at: Instant,
     topic: String,
     payload: Vec<u8>,
     response: oneshot::Sender<Result<(), PluginLoadError>>,
@@ -636,6 +718,7 @@ pub struct PluginExecutorHandle {
     manifest: PluginManifest,
     concurrency: PluginConcurrency,
     sender: mpsc::Sender<PluginExecutorMessage>,
+    metrics: Arc<PluginExecutorMetrics>,
 }
 
 impl PluginExecutorHandle {
@@ -644,11 +727,13 @@ impl PluginExecutorHandle {
         manifest: PluginManifest,
         concurrency: PluginConcurrency,
         sender: mpsc::Sender<PluginExecutorMessage>,
+        metrics: Arc<PluginExecutorMetrics>,
     ) -> Self {
         Self {
             manifest,
             concurrency,
             sender,
+            metrics,
         }
     }
 
@@ -664,6 +749,13 @@ impl PluginExecutorHandle {
         self.concurrency
     }
 
+    /// Return a point-in-time executor status snapshot.
+    #[must_use]
+    pub fn status(&self) -> PluginExecutorStatus {
+        self.metrics
+            .snapshot(self.manifest.id.clone(), self.concurrency)
+    }
+
     async fn invoke_service(
         &self,
         interface_id: String,
@@ -671,15 +763,22 @@ impl PluginExecutorHandle {
         payload: Vec<u8>,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let (response, receiver) = oneshot::channel();
+        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
         self.sender
             .send(PluginExecutorMessage::Service(PluginInvocation {
+                id: next_plugin_invocation_id(),
+                class: classify_invocation(&interface_id, &operation),
+                enqueued_at: Instant::now(),
                 interface_id,
                 operation,
                 payload,
                 response,
             }))
             .await
-            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+            .map_err(|_| {
+                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+            })?;
         receiver
             .await
             .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
@@ -687,14 +786,21 @@ impl PluginExecutorHandle {
 
     async fn handle_event(&self, topic: String, payload: Vec<u8>) -> Result<(), PluginLoadError> {
         let (response, receiver) = oneshot::channel();
+        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
         self.sender
             .send(PluginExecutorMessage::Event(PluginEventInvocation {
+                id: next_plugin_invocation_id(),
+                class: PluginInvocationClass::EventDelivery,
+                enqueued_at: Instant::now(),
                 topic,
                 payload,
                 response,
             }))
             .await
-            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+            .map_err(|_| {
+                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+            })?;
         receiver
             .await
             .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
@@ -781,6 +887,15 @@ impl PluginRuntimeHost {
     #[must_use]
     pub fn executors(&self) -> &BTreeMap<String, Arc<PluginExecutorHandle>> {
         &self.executors
+    }
+
+    /// Return plugin executor status snapshots.
+    #[must_use]
+    pub fn executor_statuses(&self) -> Vec<PluginExecutorStatus> {
+        self.executors
+            .values()
+            .map(|executor| executor.status())
+            .collect()
     }
 
     /// Return plugin service summaries without waiting for plugin execution.
@@ -950,13 +1065,15 @@ impl From<PluginHost> for PluginRuntimeHost {
             let plugin_id = manifest.id.clone();
             manifests.insert(plugin_id.clone(), manifest.clone());
             let (sender, receiver) = mpsc::channel(32);
-            spawn_exclusive_plugin_executor(plugin, receiver);
+            let metrics = Arc::new(PluginExecutorMetrics::default());
+            spawn_exclusive_plugin_executor(plugin, receiver, Arc::clone(&metrics));
             executors.insert(
                 plugin_id,
                 Arc::new(PluginExecutorHandle::new(
                     manifest,
                     PluginConcurrency::Exclusive,
                     sender,
+                    metrics,
                 )),
             );
         }
@@ -970,12 +1087,26 @@ impl From<PluginHost> for PluginRuntimeHost {
 fn spawn_exclusive_plugin_executor(
     plugin: LoadedPlugin,
     mut receiver: mpsc::Receiver<PluginExecutorMessage>,
+    metrics: Arc<PluginExecutorMetrics>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut active = true;
         while let Some(message) = receiver.blocking_recv() {
             match message {
                 PluginExecutorMessage::Service(invocation) => {
+                    metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                    metrics.running.fetch_add(1, Ordering::Relaxed);
+                    let started_at = Instant::now();
+                    tracing::debug!(
+                        target: "bcode_plugin::runtime",
+                        plugin_id = %plugin.manifest.id,
+                        invocation_id = invocation.id.get(),
+                        class = ?invocation.class,
+                        queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
+                        interface_id = %invocation.interface_id,
+                        operation = %invocation.operation,
+                        "plugin service invocation started"
+                    );
                     let response = if active {
                         plugin.invoke_service(
                             invocation.interface_id,
@@ -985,14 +1116,54 @@ fn spawn_exclusive_plugin_executor(
                     } else {
                         Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
                     };
+                    metrics.running.fetch_sub(1, Ordering::Relaxed);
+                    if response.is_ok() {
+                        metrics.completed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        metrics.failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::debug!(
+                        target: "bcode_plugin::runtime",
+                        plugin_id = %plugin.manifest.id,
+                        invocation_id = invocation.id.get(),
+                        duration_ms = started_at.elapsed().as_millis(),
+                        success = response.is_ok(),
+                        "plugin service invocation finished"
+                    );
                     let _ = invocation.response.send(response);
                 }
                 PluginExecutorMessage::Event(invocation) => {
+                    metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                    metrics.running.fetch_add(1, Ordering::Relaxed);
+                    let started_at = Instant::now();
+                    tracing::debug!(
+                        target: "bcode_plugin::runtime",
+                        plugin_id = %plugin.manifest.id,
+                        invocation_id = invocation.id.get(),
+                        class = ?invocation.class,
+                        queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
+                        topic = %invocation.topic,
+                        "plugin event invocation started"
+                    );
                     let response = if active {
                         plugin.handle_event(invocation.topic, invocation.payload)
                     } else {
                         Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
                     };
+                    metrics.running.fetch_sub(1, Ordering::Relaxed);
+                    if response.is_ok() {
+                        metrics.completed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        metrics.failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::debug!(
+                        target: "bcode_plugin::runtime",
+                        plugin_id = %plugin.manifest.id,
+                        invocation_id = invocation.id.get(),
+                        duration_ms = started_at.elapsed().as_millis(),
+                        success = response.is_ok(),
+                        "plugin event invocation finished"
+                    );
                     let _ = invocation.response.send(response);
                 }
                 PluginExecutorMessage::Deactivate(response) => {
@@ -1011,6 +1182,19 @@ fn spawn_exclusive_plugin_executor(
             let _ = plugin.deactivate();
         }
     });
+}
+
+fn classify_invocation(interface_id: &str, operation: &str) -> PluginInvocationClass {
+    match (interface_id, operation) {
+        ("bcode.tool", "invoke_tool") => PluginInvocationClass::ToolExecution,
+        ("bcode.tool", "list_tools") => PluginInvocationClass::Query,
+        ("bcode.model", _) => PluginInvocationClass::ModelProvider,
+        ("bcode.agent_profile", "policy_status" | "list_agents" | "agent_context") => {
+            PluginInvocationClass::Control
+        }
+        ("bcode.agent_profile", "evaluate_tool_call") => PluginInvocationClass::Control,
+        _ => PluginInvocationClass::Service,
+    }
 }
 
 fn manifest_subscribes_to(manifest: &PluginManifest, topic: &str) -> bool {
@@ -1523,8 +1707,10 @@ fn default_event_symbol() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CURRENT_PLUGIN_ABI_VERSION, PluginRuntime, discover_plugins_in_roots};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use super::*;
+    use semver::Version;
+    use std::path::PathBuf;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn discovers_plugin_manifest_in_child_directory() {
@@ -1558,6 +1744,171 @@ library = "libexample_plugin.dylib"
         ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn runtime_status_tracks_plugin_local_queueing() {
+        use bcode_plugin_sdk::{
+            SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, StaticPluginVtable,
+        };
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Mutex as StdMutex, OnceLock};
+        use std::time::Duration;
+
+        static SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static SLOW_GATE: OnceLock<StdMutex<()>> = OnceLock::new();
+
+        fn activate(_: *const c_void) -> i32 {
+            0
+        }
+
+        fn deactivate(_: *const c_void) -> i32 {
+            0
+        }
+
+        fn handle_event(_: *const c_void, _: *const u8, _: usize) -> i32 {
+            bcode_plugin_sdk::EVENT_STATUS_OK
+        }
+
+        fn write_response(
+            response: &ServiceResponse,
+            output: *mut u8,
+            cap: usize,
+            len: *mut usize,
+        ) -> i32 {
+            let encoded = serde_json::to_vec(response).expect("service response encodes");
+            unsafe {
+                *len = encoded.len();
+            }
+            if output.is_null() || cap < encoded.len() {
+                return SERVICE_STATUS_BUFFER_TOO_SMALL;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
+            }
+            SERVICE_STATUS_OK
+        }
+
+        fn slow_service(
+            _: *const c_void,
+            _: *const u8,
+            _: usize,
+            output: *mut u8,
+            cap: usize,
+            len: *mut usize,
+        ) -> i32 {
+            SLOW_CALLS.fetch_add(1, Ordering::SeqCst);
+            let _guard = SLOW_GATE
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .expect("gate locks");
+            std::thread::sleep(Duration::from_millis(150));
+            write_response(&ServiceResponse::text("slow"), output, cap, len)
+        }
+
+        fn fast_service(
+            _: *const c_void,
+            _: *const u8,
+            _: usize,
+            output: *mut u8,
+            cap: usize,
+            len: *mut usize,
+        ) -> i32 {
+            FAST_CALLS.fetch_add(1, Ordering::SeqCst);
+            write_response(&ServiceResponse::text("fast"), output, cap, len)
+        }
+
+        fn manifest(id: &str) -> PluginManifest {
+            PluginManifest {
+                id: id.to_string(),
+                name: id.to_string(),
+                version: Version::new(0, 0, 1),
+                services: vec![PluginService {
+                    interface_id: id.to_string(),
+                    name: None,
+                    description: None,
+                }],
+                event_subscriptions: Vec::new(),
+                runtime: PluginRuntime::Native(NativePluginRuntime {
+                    abi_version: CURRENT_PLUGIN_ABI_VERSION,
+                    library: PathBuf::from("test"),
+                    manifest_symbol: DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string(),
+                    activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
+                    deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
+                    service_symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
+                    event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
+                }),
+            }
+        }
+
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        tokio.block_on(async {
+            let runtime = PluginRuntimeHost::from(PluginHost {
+                loaded: vec![
+                    LoadedPlugin {
+                        manifest: manifest("slow"),
+                        backend: LoadedPluginBackend::Static {
+                            vtable: StaticPluginVtable {
+                                instance: std::ptr::null(),
+                                manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
+                                    std::ptr::null()
+                                },
+                                activate,
+                                deactivate,
+                                invoke_service: slow_service,
+                                handle_event,
+                            },
+                        },
+                    },
+                    LoadedPlugin {
+                        manifest: manifest("fast"),
+                        backend: LoadedPluginBackend::Static {
+                            vtable: StaticPluginVtable {
+                                instance: std::ptr::null(),
+                                manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
+                                    std::ptr::null()
+                                },
+                                activate,
+                                deactivate,
+                                invoke_service: fast_service,
+                                handle_event,
+                            },
+                        },
+                    },
+                ],
+            });
+            let slow = runtime.clone();
+            let slow_task = tokio::spawn(async move {
+                slow.invoke_service("slow", "slow", "run", Vec::new()).await
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let fast_start = Instant::now();
+            let fast = runtime
+                .invoke_service("fast", "fast", "run", Vec::new())
+                .await
+                .expect("fast service returns");
+            assert!(fast_start.elapsed() < Duration::from_millis(100));
+            assert_eq!(fast.payload, b"fast");
+            assert!(
+                runtime
+                    .executor_statuses()
+                    .into_iter()
+                    .any(|status| status.plugin_id == "slow" && status.running == 1)
+            );
+            let slow = slow_task
+                .await
+                .expect("slow task joins")
+                .expect("slow returns");
+            assert_eq!(slow.payload, b"slow");
+        });
+        assert_eq!(SLOW_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(FAST_CALLS.load(Ordering::SeqCst), 1);
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

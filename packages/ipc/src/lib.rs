@@ -225,6 +225,8 @@ pub struct ServerStatus {
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
     pub selected_model_id: Option<String>,
+    #[serde(default)]
+    pub plugin_runtime: Vec<bcode_plugin::PluginExecutorStatus>,
 }
 
 /// Active model metadata for a session.

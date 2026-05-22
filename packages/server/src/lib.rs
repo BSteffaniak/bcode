@@ -466,6 +466,7 @@ impl ServerState {
                 .await,
             selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
             selected_model_id: self.selected_model_id.clone(),
+            plugin_runtime: self.plugins.executor_statuses(),
         }
     }
 

@@ -21,6 +21,9 @@ tokio            = { workspace = true, features = ["rt", "sync"] }
 toml             = { workspace = true }
 tracing          = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "time"] }
+
 [features]
 default          = []
 fail-on-warnings = []

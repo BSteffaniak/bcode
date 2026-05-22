@@ -829,6 +829,7 @@ dependencies = [
  "bcode_agent_profile",
  "bcode_command",
  "bcode_model",
+ "bcode_plugin",
  "bcode_session_models",
  "bcode_skill_models",
  "bmux_codec",
