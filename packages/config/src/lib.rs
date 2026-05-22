@@ -19,11 +19,16 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 pub const BCODE_CONFIG_ENV: &str = "BCODE_CONFIG";
 /// Environment variable containing raw TOML config overlay data.
 pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
+/// Environment variable selecting the active model profile.
+pub const BCODE_MODEL_PROFILE_ENV: &str = "BCODE_MODEL_PROFILE";
+/// Environment variable selecting the active auth profile for this client.
+pub const BCODE_AUTH_PROFILE_ENV: &str = "BCODE_AUTH_PROFILE";
 
 const DEFAULT_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
 const DEFAULT_FILESYSTEM_PLUGIN_ID: &str = "bcode.filesystem";
 const DEFAULT_SHELL_PLUGIN_ID: &str = "bcode.shell";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_ID: &str = "bcode.openai-compatible";
+const DEFAULT_MODEL_PROVIDER_PLUGIN_IDS: &[&str] = &["bcode.openai-compatible", "bcode.bedrock"];
 const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
     DEFAULT_FILESYSTEM_PLUGIN_ID,
     DEFAULT_SHELL_PLUGIN_ID,
@@ -292,7 +297,13 @@ impl ConfigLoadOverrides {
         Self {
             base_config_path: None,
             env_config_path: env::var_os(BCODE_CONFIG_ENV).map(PathBuf::from),
-            env_config_toml: env::var(BCODE_CONFIG_TOML_ENV).ok(),
+            env_config_toml: merge_config_toml_overrides(
+                env::var(BCODE_CONFIG_TOML_ENV).ok(),
+                env::var(BCODE_MODEL_PROFILE_ENV)
+                    .ok()
+                    .filter(|profile| !profile.trim().is_empty())
+                    .map(|profile| model_profile_override_toml(&profile)),
+            ),
             cli_config_path,
             cli_config_toml,
         }
@@ -313,6 +324,27 @@ impl ConfigLoadOverrides {
     pub fn with_base_config_path(mut self, path: Option<PathBuf>) -> Self {
         self.base_config_path = path;
         self
+    }
+}
+
+/// Build a TOML override selecting a model profile.
+#[must_use]
+pub fn model_profile_override_toml(profile: &str) -> String {
+    format!("[model]\nprofile = {}\n", toml_string(profile))
+}
+
+fn merge_config_toml_overrides(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(mut left), Some(right)) => {
+            if !left.ends_with('\n') {
+                left.push('\n');
+            }
+            left.push_str(&right);
+            Some(left)
+        }
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 
@@ -1163,11 +1195,11 @@ impl From<&BcodeConfig> for PluginSelection {
             .unwrap_or_else(|| DEFAULT_MODEL_PROVIDER_PLUGIN_ID.to_string());
 
         enable_default_core_plugins(&mut selection);
+        enable_default_model_provider_plugins(&mut selection);
         if !had_explicit_enabled_plugins {
             enable_plugin_unless_disabled(&mut selection, &provider);
         } else if let Some(env_provider) = env_provider {
             enable_plugin_unless_disabled(&mut selection, &env_provider);
-            remove_other_model_providers(&mut selection.enabled, &env_provider);
         } else if let Some(resolved_provider) = resolved_provider {
             enable_plugin_unless_disabled(&mut selection, &resolved_provider);
         }
@@ -1181,17 +1213,15 @@ fn enable_default_core_plugins(selection: &mut PluginSelection) {
     }
 }
 
-fn enable_plugin_unless_disabled(selection: &mut PluginSelection, plugin_id: &str) {
-    if !selection.disabled.contains(plugin_id) {
-        selection.enabled.insert(plugin_id.to_string());
+fn enable_default_model_provider_plugins(selection: &mut PluginSelection) {
+    for plugin_id in DEFAULT_MODEL_PROVIDER_PLUGIN_IDS {
+        enable_plugin_unless_disabled(selection, plugin_id);
     }
 }
 
-fn remove_other_model_providers(enabled: &mut BTreeSet<String>, selected_provider: &str) {
-    for provider in ["bcode.bedrock", "bcode.openai-compatible"] {
-        if provider != selected_provider {
-            enabled.remove(provider);
-        }
+fn enable_plugin_unless_disabled(selection: &mut PluginSelection, plugin_id: &str) {
+    if !selection.disabled.contains(plugin_id) {
+        selection.enabled.insert(plugin_id.to_string());
     }
 }
 
@@ -1264,7 +1294,25 @@ pub fn set_openai_sshenv_auth_mode(
     model_id: Option<String>,
     mode: AuthMode,
 ) -> Result<PathBuf, ConfigError> {
+    set_openai_compatible_sshenv_auth_mode("openai", profile, vault, model_id, mode, None)
+}
+
+/// Configure an OpenAI-compatible provider auth profile backed by an `sshenv` vault.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, updated, or written.
+pub fn set_openai_compatible_sshenv_auth_mode(
+    provider: &str,
+    profile: String,
+    vault: PathBuf,
+    model_id: Option<String>,
+    mode: AuthMode,
+    base_url: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
     update_writable_config(|config| {
+        let vault_setting = vault.display().to_string();
+        let mode_setting = auth_mode_setting(&mode);
         config
             .plugins
             .enabled
@@ -1277,11 +1325,45 @@ pub fn set_openai_sshenv_auth_mode(
         config.auth.openai = Some(AuthProviderConfig {
             backend: "sshenv".to_string(),
             mode,
-            profile,
+            profile: profile.clone(),
             vault: Some(vault),
         });
+        let mut settings = BTreeMap::new();
+        settings.insert("provider".to_string(), provider.to_string());
+        settings.insert("profile".to_string(), profile.clone());
+        settings.insert("vault".to_string(), vault_setting);
+        settings.insert("mode".to_string(), mode_setting.to_string());
+        if let Some(base_url) = base_url {
+            settings.insert("base_url".to_string(), base_url.to_string());
+        }
+        config.auth.profiles.insert(
+            profile.clone(),
+            AuthProfileConfig {
+                backend: "sshenv".to_string(),
+                settings,
+            },
+        );
+        if let Some(model_id) = config.model.model_id.clone() {
+            config
+                .model
+                .profiles
+                .entry(profile.clone())
+                .or_insert_with(|| ModelProfileConfig {
+                    provider_plugin_id: "bcode.openai-compatible".to_string(),
+                    model_id: Some(model_id),
+                    auth_profile: Some(profile),
+                    settings: BTreeMap::new(),
+                });
+        }
         Ok(())
     })
+}
+
+const fn auth_mode_setting(mode: &AuthMode) -> &'static str {
+    match mode {
+        AuthMode::ApiKey => "api_key",
+        AuthMode::ChatGpt => "chatgpt",
+    }
 }
 
 /// Configure a generic Bedrock model profile using AWS's default credential chain.
@@ -2727,8 +2809,8 @@ model_id = "gpt-4.1-mini"
 
         let plugin_selection = PluginSelection::from(&config);
         assert!(plugin_selection.enabled.contains("bcode.bedrock"));
+        assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
         assert_default_core_plugins_enabled(&plugin_selection);
-        assert!(!plugin_selection.enabled.contains("bcode.openai-compatible"));
 
         restore_provider_env(previous_env);
     }
@@ -2761,8 +2843,8 @@ model_id = "anthropic.claude-test"
 
         let plugin_selection = PluginSelection::from(&config);
         assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
+        assert!(plugin_selection.enabled.contains("bcode.bedrock"));
         assert_default_core_plugins_enabled(&plugin_selection);
-        assert!(!plugin_selection.enabled.contains("bcode.bedrock"));
 
         restore_provider_env(previous_env);
     }

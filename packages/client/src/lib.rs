@@ -92,8 +92,9 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    merge_openai_auth_profile_env(&config, &mut env);
-    let resolved = config.resolved_model_selection();
+    let mut resolved = config.resolved_model_selection();
+    resolved.auth_profile = selected_auth_profile(&resolved);
+    merge_selected_auth_profile_env(&config, resolved.auth_profile.as_deref(), &mut env);
     let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
     Some(ClientRuntimeContext {
         selected_provider_plugin_id: resolved.provider_plugin_id,
@@ -108,7 +109,102 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
     })
 }
 
-fn merge_openai_auth_profile_env(
+fn selected_auth_profile(resolved: &bcode_config::ResolvedModelSelection) -> Option<String> {
+    std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
+        .ok()
+        .filter(|profile| !profile.trim().is_empty())
+        .or_else(|| resolved.auth_profile.clone())
+}
+
+fn merge_selected_auth_profile_env(
+    config: &bcode_config::BcodeConfig,
+    auth_profile: Option<&str>,
+    env: &mut BTreeMap<String, String>,
+) {
+    if let Some(auth_profile_name) = auth_profile {
+        if let Some(auth_profile) = config.auth.profiles.get(auth_profile_name) {
+            merge_generic_auth_profile_env(auth_profile_name, auth_profile, env);
+        }
+        return;
+    }
+    merge_legacy_openai_auth_profile_env(config, env);
+}
+
+fn merge_generic_auth_profile_env(
+    auth_profile_name: &str,
+    auth_profile: &bcode_config::AuthProfileConfig,
+    env: &mut BTreeMap<String, String>,
+) {
+    match auth_profile.backend.as_str() {
+        "sshenv" => {
+            let vault = auth_profile.settings.get("vault").map_or_else(
+                bcode_config::default_auth_vault_path,
+                std::path::PathBuf::from,
+            );
+            let profile = auth_profile
+                .settings
+                .get("profile")
+                .map_or(auth_profile_name, String::as_str);
+            let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+            if let Ok(Some(profile_env)) = store.get_profile(profile) {
+                for (key, value) in profile_env {
+                    env.entry(key).or_insert_with(|| value.to_string());
+                }
+            }
+            merge_auth_profile_settings_env(auth_profile, env);
+        }
+        "aws" | "aws_default_chain" => merge_auth_profile_settings_env(auth_profile, env),
+        _ => {}
+    }
+}
+
+fn merge_auth_profile_settings_env(
+    auth_profile: &bcode_config::AuthProfileConfig,
+    env: &mut BTreeMap<String, String>,
+) {
+    for (key, value) in &auth_profile.settings {
+        if let Some(env_key) = key.strip_prefix("env.") {
+            env.entry(env_key.to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    match auth_profile.settings.get("provider").map(String::as_str) {
+        Some("openai") => {
+            copy_setting_to_env(auth_profile, env, "mode", "BCODE_OPENAI_AUTH_MODE");
+            copy_setting_to_env(auth_profile, env, "base_url", "BCODE_OPENAI_BASE_URL");
+        }
+        Some("xai" | "grok") => {
+            copy_setting_to_env(auth_profile, env, "base_url", "BCODE_XAI_BASE_URL");
+        }
+        Some("aws" | "bedrock") => {
+            copy_setting_to_env(auth_profile, env, "profile", "AWS_PROFILE");
+            copy_setting_to_env(auth_profile, env, "profile", "BCODE_BEDROCK_AWS_PROFILE");
+            copy_setting_to_env(auth_profile, env, "region", "AWS_REGION");
+            copy_setting_to_env(auth_profile, env, "region", "BCODE_BEDROCK_REGION");
+            copy_setting_to_env(
+                auth_profile,
+                env,
+                "endpoint_url",
+                "BCODE_BEDROCK_ENDPOINT_URL",
+            );
+        }
+        _ => {}
+    }
+}
+
+fn copy_setting_to_env(
+    auth_profile: &bcode_config::AuthProfileConfig,
+    env: &mut BTreeMap<String, String>,
+    setting_key: &str,
+    env_key: &str,
+) {
+    if let Some(value) = auth_profile.settings.get(setting_key) {
+        env.entry(env_key.to_string())
+            .or_insert_with(|| value.clone());
+    }
+}
+
+fn merge_legacy_openai_auth_profile_env(
     config: &bcode_config::BcodeConfig,
     env: &mut BTreeMap<String, String>,
 ) {

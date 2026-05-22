@@ -89,6 +89,14 @@ pub async fn run() -> Result<(), CliError> {
 }
 
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
+    let _config_override = cli.profile.as_deref().map(|profile| {
+        bcode_config::push_process_config_overrides(
+            bcode_config::ConfigLoadOverrides::from_env_with_cli(
+                None,
+                Some(bcode_config::model_profile_override_toml(profile)),
+            ),
+        )
+    });
     if cli.new {
         if cli.command.is_some() {
             return Err(CliError::NewSessionWithCommand);
@@ -224,6 +232,9 @@ struct Cli {
     /// Create a new session and open it in the terminal UI.
     #[arg(short = 'n', long = "new")]
     new: bool,
+    /// Select a model profile from configuration for this client connection.
+    #[arg(long, value_name = "MODEL_PROFILE")]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -442,7 +453,7 @@ enum LoginCommand {
         /// Use device-code login. Requires `Codex` device authorization enabled in `ChatGPT` settings.
         #[arg(long)]
         headless: bool,
-        #[arg(long, default_value = "bcode-openai")]
+        #[arg(long, default_value = "openai")]
         profile: String,
         #[arg(long)]
         vault: Option<PathBuf>,
@@ -459,7 +470,7 @@ enum LoginCommand {
         /// Store an xAI-compatible API base URL (defaults to <https://api.x.ai/v1>).
         #[arg(long)]
         base_url: Option<String>,
-        #[arg(long, default_value = "bcode-xai")]
+        #[arg(long, default_value = "xai")]
         profile: String,
         #[arg(long)]
         vault: Option<PathBuf>,
@@ -717,7 +728,7 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
     if options.api_key.is_some() || (options.base_url.is_some() && !options.chatgpt) {
         login_openai_api_key(
             &store,
-            options.profile,
+            &options.profile,
             vault_path,
             options.api_key,
             options.base_url,
@@ -755,7 +766,7 @@ fn open_auth_store(
 /// `prefix` is "OPENAI" or "XAI" (used for env-style secret keys stored in the vault).
 fn login_compatible_api_key(
     store: &sshenv_vault::SshenvStore,
-    profile: String,
+    profile: &str,
     vault_path: PathBuf,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -773,7 +784,7 @@ fn login_compatible_api_key(
 
     store
         .set_secret(
-            &profile,
+            profile,
             &auth_mode_key,
             Zeroizing::new("api_key".to_string()),
         )
@@ -781,15 +792,16 @@ fn login_compatible_api_key(
             CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
         })?;
     store
-        .set_secret(&profile, &api_key_key, Zeroizing::new(api_key))
+        .set_secret(profile, &api_key_key, Zeroizing::new(api_key))
         .map_err(|error| {
             CliError::BundledPluginInstallFailed(format!(
                 "failed to store {prefix} API key: {error}"
             ))
         })?;
+    let config_base_url = base_url.clone();
     if let Some(base_url) = base_url {
         store
-            .set_secret(&profile, &base_url_key, Zeroizing::new(base_url))
+            .set_secret(profile, &base_url_key, Zeroizing::new(base_url))
             .map_err(|error| {
                 CliError::BundledPluginInstallFailed(format!(
                     "failed to store {prefix} base URL: {error}"
@@ -797,20 +809,33 @@ fn login_compatible_api_key(
             })?;
     }
 
-    // Always route through the shared OpenAI-compatible provider plugin
-    let config_path =
-        bcode_config::set_openai_sshenv_auth_mode(profile, vault_path, model, AuthMode::ApiKey)?;
-    println!(
-        "{} API credentials saved; config updated: {}",
+    // Always route through the shared OpenAI-compatible provider plugin.
+    report_login_config_update(
+        bcode_config::set_openai_compatible_sshenv_auth_mode(
+            compatible_provider_name(prefix),
+            profile.to_string(),
+            vault_path,
+            model,
+            AuthMode::ApiKey,
+            config_base_url.as_deref(),
+        ),
+        &format!("{prefix} API credentials saved"),
+        profile,
         prefix,
-        config_path.display()
     );
     Ok(())
 }
 
+fn compatible_provider_name(prefix: &str) -> &'static str {
+    match prefix {
+        "XAI" => "xai",
+        _ => "openai",
+    }
+}
+
 fn login_openai_api_key(
     store: &sshenv_vault::SshenvStore,
-    profile: String,
+    profile: &str,
     vault_path: PathBuf,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -828,10 +853,14 @@ fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
     let store = open_auth_store(&vault_path, options.recipient_key)?;
     login_compatible_api_key(
         &store,
-        options.profile,
+        &options.profile,
         vault_path,
         options.api_key,
-        options.base_url,
+        Some(
+            options
+                .base_url
+                .unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
+        ),
         options.model,
         "XAI",
     )
@@ -916,13 +945,36 @@ async fn login_openai_chatgpt(
             })?;
     }
 
-    let config_path =
-        bcode_config::set_openai_sshenv_auth_mode(profile, vault_path, model, AuthMode::ChatGpt)?;
-    println!(
-        "OpenAI ChatGPT subscription login saved; config updated: {}",
-        config_path.display()
+    report_login_config_update(
+        bcode_config::set_openai_sshenv_auth_mode(
+            profile.clone(),
+            vault_path,
+            model,
+            AuthMode::ChatGpt,
+        ),
+        "OpenAI ChatGPT subscription login saved",
+        &profile,
+        "OPENAI",
     );
     Ok(())
+}
+
+fn report_login_config_update(
+    result: Result<PathBuf, bcode_config::ConfigError>,
+    saved_message: &str,
+    profile: &str,
+    provider: &str,
+) {
+    match result {
+        Ok(config_path) => println!("{saved_message}; config updated: {}", config_path.display()),
+        Err(error) => {
+            println!("{saved_message}; auth profile '{profile}' updated");
+            eprintln!("config was not updated: {error}");
+            eprintln!(
+                "use a writable config or select an existing declarative model/auth profile for '{provider}'"
+            );
+        }
+    }
 }
 
 async fn run_openai_codex_oauth(
