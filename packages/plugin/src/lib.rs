@@ -19,7 +19,9 @@ use std::env;
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 
 /// Default plugin manifest file name.
 pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
@@ -543,14 +545,24 @@ impl PluginServiceRegistry {
     /// Build a registry from loaded plugins.
     #[must_use]
     pub fn from_loaded_plugins(plugins: &[LoadedPlugin]) -> Self {
+        let manifests = plugins
+            .iter()
+            .map(LoadedPlugin::manifest)
+            .collect::<Vec<_>>();
+        Self::from_manifests(manifests)
+    }
+
+    /// Build a registry from loaded plugin manifests.
+    #[must_use]
+    pub fn from_manifests<'a>(manifests: impl IntoIterator<Item = &'a PluginManifest>) -> Self {
         let mut registry = Self::default();
-        for plugin in plugins {
-            for service in &plugin.manifest.services {
+        for manifest in manifests {
+            for service in &manifest.services {
                 registry
                     .providers
                     .entry(service.interface_id.clone())
                     .or_default()
-                    .insert(plugin.manifest.id.clone());
+                    .insert(manifest.id.clone());
             }
         }
         registry
@@ -586,6 +598,426 @@ impl PluginServiceRegistry {
             .map(String::as_str)
             .ok_or_else(|| PluginLoadError::ServiceNotRegistered(interface_id.to_string()))
     }
+}
+
+/// Plugin service execution concurrency policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginConcurrency {
+    /// Serialize invocations for this plugin on a dedicated worker.
+    #[default]
+    Exclusive,
+}
+
+#[derive(Debug)]
+struct PluginInvocation {
+    interface_id: String,
+    operation: String,
+    payload: Vec<u8>,
+    response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
+}
+
+#[derive(Debug)]
+struct PluginEventInvocation {
+    topic: String,
+    payload: Vec<u8>,
+    response: oneshot::Sender<Result<(), PluginLoadError>>,
+}
+
+#[derive(Debug)]
+enum PluginExecutorMessage {
+    Service(PluginInvocation),
+    Event(PluginEventInvocation),
+    Deactivate(oneshot::Sender<Result<(), PluginLoadError>>),
+}
+
+/// Handle to a plugin-local executor.
+#[derive(Debug)]
+pub struct PluginExecutorHandle {
+    manifest: PluginManifest,
+    concurrency: PluginConcurrency,
+    sender: mpsc::Sender<PluginExecutorMessage>,
+}
+
+impl PluginExecutorHandle {
+    #[must_use]
+    const fn new(
+        manifest: PluginManifest,
+        concurrency: PluginConcurrency,
+        sender: mpsc::Sender<PluginExecutorMessage>,
+    ) -> Self {
+        Self {
+            manifest,
+            concurrency,
+            sender,
+        }
+    }
+
+    /// Return the loaded plugin manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    /// Return the plugin concurrency policy.
+    #[must_use]
+    pub const fn concurrency(&self) -> PluginConcurrency {
+        self.concurrency
+    }
+
+    async fn invoke_service(
+        &self,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(PluginExecutorMessage::Service(PluginInvocation {
+                interface_id,
+                operation,
+                payload,
+                response,
+            }))
+            .await
+            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+        receiver
+            .await
+            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+    }
+
+    async fn handle_event(&self, topic: String, payload: Vec<u8>) -> Result<(), PluginLoadError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(PluginExecutorMessage::Event(PluginEventInvocation {
+                topic,
+                payload,
+                response,
+            }))
+            .await
+            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+        receiver
+            .await
+            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+    }
+
+    async fn deactivate(&self) -> Result<(), PluginLoadError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(PluginExecutorMessage::Deactivate(response))
+            .await
+            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+        receiver
+            .await
+            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+    }
+}
+
+/// Immutable plugin registry used for routing and metadata.
+#[derive(Debug, Clone)]
+pub struct PluginRegistry {
+    manifests: BTreeMap<String, PluginManifest>,
+    service_registry: PluginServiceRegistry,
+}
+
+impl PluginRegistry {
+    #[must_use]
+    fn from_manifests(manifests: BTreeMap<String, PluginManifest>) -> Self {
+        let service_registry = PluginServiceRegistry::from_manifests(manifests.values());
+        Self {
+            manifests,
+            service_registry,
+        }
+    }
+
+    /// Return loaded plugin manifests keyed by plugin ID.
+    #[must_use]
+    pub const fn manifests(&self) -> &BTreeMap<String, PluginManifest> {
+        &self.manifests
+    }
+
+    /// Return the service interface registry.
+    #[must_use]
+    pub const fn service_registry(&self) -> &PluginServiceRegistry {
+        &self.service_registry
+    }
+}
+
+/// Concurrent plugin runtime with plugin-local execution isolation.
+#[derive(Debug, Clone)]
+pub struct PluginRuntimeHost {
+    registry: Arc<PluginRegistry>,
+    executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
+}
+
+impl PluginRuntimeHost {
+    /// Discover, load, activate, and start plugin executors from default roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery, loading, activation, or executor startup fails.
+    pub fn load_defaults(selection: &PluginSelection) -> Result<Self, PluginLoadError> {
+        Self::load_defaults_with_static_bundled(selection, &[])
+    }
+
+    /// Discover, load, activate, and start plugin executors from default roots plus static bundled registrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery, loading, activation, or executor startup fails.
+    pub fn load_defaults_with_static_bundled(
+        selection: &PluginSelection,
+        static_plugins: &[StaticBundledPlugin],
+    ) -> Result<Self, PluginLoadError> {
+        PluginHost::load_defaults_with_static_bundled(selection, static_plugins).map(Self::from)
+    }
+
+    /// Return the immutable plugin registry.
+    #[must_use]
+    pub fn registry(&self) -> &PluginRegistry {
+        &self.registry
+    }
+
+    /// Return loaded plugin executor handles keyed by plugin ID.
+    #[must_use]
+    pub fn executors(&self) -> &BTreeMap<String, Arc<PluginExecutorHandle>> {
+        &self.executors
+    }
+
+    /// Return plugin service summaries without waiting for plugin execution.
+    #[must_use]
+    pub fn service_summaries(&self) -> Vec<(String, PluginService)> {
+        self.registry
+            .manifests
+            .values()
+            .flat_map(|manifest| {
+                manifest
+                    .services
+                    .iter()
+                    .cloned()
+                    .map(|service| (manifest.id.clone(), service))
+            })
+            .collect()
+    }
+
+    /// Invoke a service operation on a loaded plugin by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded or service invocation fails.
+    pub async fn invoke_service(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let executor = self
+            .executors
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
+        executor
+            .invoke_service(interface_id.into(), operation.into(), payload)
+            .await
+    }
+
+    /// Invoke a service operation by service interface ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no loaded plugin provides the interface, more than one loaded plugin
+    /// provides the interface, or service invocation fails.
+    pub async fn invoke_service_by_interface(
+        &self,
+        interface_id: &str,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let plugin_id = self
+            .registry
+            .service_registry
+            .unique_provider(interface_id)?;
+        self.invoke_service(plugin_id, interface_id, operation, payload)
+            .await
+    }
+
+    /// Invoke a service operation on a loaded plugin by ID with JSON payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed request cannot be encoded, invocation fails, the plugin
+    /// returns a service error, or the typed response cannot be decoded.
+    pub async fn invoke_service_json<Q, R>(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        let interface_id = interface_id.into();
+        let operation = operation.into();
+        let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
+        let response = self
+            .invoke_service(plugin_id, interface_id, operation, payload)
+            .await?;
+        decode_service_response(response)
+    }
+
+    /// Invoke a service operation by service interface ID with JSON payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when routing fails, the typed request cannot be encoded, invocation fails,
+    /// the plugin returns a service error, or the typed response cannot be decoded.
+    pub async fn invoke_service_by_interface_json<Q, R>(
+        &self,
+        interface_id: &str,
+        operation: impl Into<String>,
+        request: &Q,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        let operation = operation.into();
+        let plugin_id = self
+            .registry
+            .service_registry
+            .unique_provider(interface_id)?;
+        self.invoke_service_json(plugin_id, interface_id, operation, request)
+            .await
+    }
+
+    /// Publish an event to loaded plugins that subscribed to the event topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first event handler error.
+    pub async fn publish_event(
+        &self,
+        topic: impl Into<String>,
+        payload: &[u8],
+    ) -> Result<usize, PluginLoadError> {
+        let topic = topic.into();
+        let subscribers = self
+            .registry
+            .manifests
+            .values()
+            .filter(|manifest| manifest_subscribes_to(manifest, &topic))
+            .map(|manifest| manifest.id.clone())
+            .collect::<Vec<_>>();
+        let mut delivered = 0;
+        for plugin_id in subscribers {
+            let executor = self
+                .executors
+                .get(&plugin_id)
+                .cloned()
+                .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.clone()))?;
+            executor
+                .handle_event(topic.clone(), payload.to_vec())
+                .await?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Deactivate all loaded plugins through their plugin-local executors.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first deactivation error.
+    pub async fn deactivate_all(&self) -> Result<(), PluginLoadError> {
+        for plugin_id in self.registry.manifests.keys().rev() {
+            if let Some(executor) = self.executors.get(plugin_id) {
+                executor.deactivate().await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<PluginHost> for PluginRuntimeHost {
+    fn from(mut host: PluginHost) -> Self {
+        let loaded = std::mem::take(&mut host.loaded);
+        let mut manifests = BTreeMap::new();
+        let mut executors = BTreeMap::new();
+        for plugin in loaded {
+            let manifest = plugin.manifest().clone();
+            let plugin_id = manifest.id.clone();
+            manifests.insert(plugin_id.clone(), manifest.clone());
+            let (sender, receiver) = mpsc::channel(32);
+            spawn_exclusive_plugin_executor(plugin, receiver);
+            executors.insert(
+                plugin_id,
+                Arc::new(PluginExecutorHandle::new(
+                    manifest,
+                    PluginConcurrency::Exclusive,
+                    sender,
+                )),
+            );
+        }
+        Self {
+            registry: Arc::new(PluginRegistry::from_manifests(manifests)),
+            executors: Arc::new(executors),
+        }
+    }
+}
+
+fn spawn_exclusive_plugin_executor(
+    plugin: LoadedPlugin,
+    mut receiver: mpsc::Receiver<PluginExecutorMessage>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut active = true;
+        while let Some(message) = receiver.blocking_recv() {
+            match message {
+                PluginExecutorMessage::Service(invocation) => {
+                    let response = if active {
+                        plugin.invoke_service(
+                            invocation.interface_id,
+                            invocation.operation,
+                            invocation.payload,
+                        )
+                    } else {
+                        Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
+                    };
+                    let _ = invocation.response.send(response);
+                }
+                PluginExecutorMessage::Event(invocation) => {
+                    let response = if active {
+                        plugin.handle_event(invocation.topic, invocation.payload)
+                    } else {
+                        Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
+                    };
+                    let _ = invocation.response.send(response);
+                }
+                PluginExecutorMessage::Deactivate(response) => {
+                    let result = if active {
+                        active = false;
+                        plugin.deactivate()
+                    } else {
+                        Ok(())
+                    };
+                    let _ = response.send(result);
+                    break;
+                }
+            }
+        }
+        if active {
+            let _ = plugin.deactivate();
+        }
+    });
+}
+
+fn manifest_subscribes_to(manifest: &PluginManifest, topic: &str) -> bool {
+    manifest
+        .event_subscriptions
+        .iter()
+        .any(|subscription| subscription.topic == topic)
 }
 
 /// Loaded plugin host retaining activated plugins.

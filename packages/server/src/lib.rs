@@ -83,7 +83,7 @@ pub enum ServerError {
 #[derive(Debug)]
 struct ServerState {
     sessions: SessionManager,
-    plugins: Arc<Mutex<bcode_plugin::PluginHost>>,
+    plugins: bcode_plugin::PluginRuntimeHost,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
@@ -376,13 +376,13 @@ struct ServerStateInit {
 impl ServerState {
     fn new(
         sessions: SessionManager,
-        plugins: bcode_plugin::PluginHost,
+        plugins: bcode_plugin::PluginRuntimeHost,
         init: ServerStateInit,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions,
-            plugins: Arc::new(Mutex::new(plugins)),
+            plugins,
             selected_provider_plugin_id: init.selected_provider_plugin_id,
             selected_model_id: init.selected_model_id,
             selected_provider_context: init.selected_provider_context,
@@ -531,7 +531,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     );
     tracing::debug!(target: "bcode_server::startup", "loading plugins");
     let static_plugins = static_bundled_plugins();
-    let plugins = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
+    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &plugin_selection,
         &static_plugins,
     )?;
@@ -596,7 +596,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         }
     }
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
-    state.plugins.lock().await.deactivate_all()?;
+    state.plugins.deactivate_all().await?;
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
     Ok(())
 }
@@ -2342,7 +2342,7 @@ async fn compact_session_context_with_limit(
         ));
     };
 
-    if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
+    if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
         return Err(CompactionError::ProviderUnavailable);
     }
 
@@ -2958,7 +2958,7 @@ async fn run_model_turn_inner(
         let message = format!("auto compaction failed: {error}");
         append_system_event(state, session_id, message).await;
     }
-    if !has_model_provider(state, selection.provider_plugin_id.as_deref()).await {
+    if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
         return ModelTurnCompletion::with_message(
             ModelTurnOutcome::ProviderUnavailable,
             "model provider unavailable",
@@ -3836,30 +3836,28 @@ async fn update_provider_metadata_state(
 }
 
 async fn agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse> {
-    with_plugins_blocking(state, |plugins| {
-        plugins.invoke_service_by_interface_json::<_, PolicyStatusResponse>(
+    state
+        .plugins
+        .invoke_service_by_interface_json::<_, PolicyStatusResponse>(
             AGENT_PROFILE_INTERFACE_ID,
             OP_POLICY_STATUS,
             &serde_json::json!({}),
         )
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
+        .await
+        .ok()
 }
 
 async fn list_agent_profiles(state: &ServerState) -> Vec<AgentInfo> {
-    with_plugins_blocking(state, |plugins| {
-        plugins.invoke_service_by_interface_json::<_, AgentList>(
+    state
+        .plugins
+        .invoke_service_by_interface_json::<_, AgentList>(
             AGENT_PROFILE_INTERFACE_ID,
             OP_LIST_AGENTS,
             &serde_json::json!({}),
         )
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .map_or_else(default_agent_profiles, |list| list.agents)
+        .await
+        .ok()
+        .map_or_else(default_agent_profiles, |list| list.agents)
 }
 
 async fn warn_on_unregistered_agent_ids(state: &ServerState, configured_agent_ids: &[String]) {
@@ -3938,16 +3936,15 @@ async fn agent_context(
         session_id,
         agent_id: agent_id.to_string(),
     };
-    with_plugins_blocking(state, move |plugins| {
-        plugins.invoke_service_by_interface_json::<_, AgentContextResponse>(
+    state
+        .plugins
+        .invoke_service_by_interface_json::<_, AgentContextResponse>(
             AGENT_PROFILE_INTERFACE_ID,
             OP_AGENT_CONTEXT,
             &request,
         )
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
+        .await
+        .ok()
 }
 
 async fn session_model_selection_with_runtime_context(
@@ -4015,71 +4012,26 @@ fn model_to_selection(model: &str) -> Option<String> {
     }
 }
 
-async fn has_model_provider(state: &ServerState, provider_plugin_id: Option<&str>) -> bool {
-    let provider_plugin_id = provider_plugin_id.map(ToString::to_string);
-    with_plugins_blocking(state, move |plugins| {
-        if let Some(provider_plugin_id) = provider_plugin_id {
-            return plugins.loaded_plugins().iter().any(|plugin| {
-                plugin.manifest().id == provider_plugin_id
-                    && plugin
-                        .manifest()
-                        .services
-                        .iter()
-                        .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID)
+fn has_model_provider(state: &ServerState, provider_plugin_id: Option<&str>) -> bool {
+    if let Some(provider_plugin_id) = provider_plugin_id {
+        return state
+            .plugins
+            .registry()
+            .manifests()
+            .get(provider_plugin_id)
+            .is_some_and(|manifest| {
+                manifest
+                    .services
+                    .iter()
+                    .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID)
             });
-        }
-        plugins
-            .service_registry()
-            .providers_for(MODEL_PROVIDER_INTERFACE_ID)
-            .is_some()
-    })
-    .await
-    .unwrap_or(false)
-}
-
-fn invoke_model_provider_json<Q, R>(
-    plugins: &bcode_plugin::PluginHost,
-    provider_plugin_id: Option<&str>,
-    operation: &str,
-    request: &Q,
-) -> Result<R, bcode_plugin::PluginServiceCallError>
-where
-    Q: serde::Serialize,
-    R: serde::de::DeserializeOwned,
-{
-    provider_plugin_id.map_or_else(
-        || {
-            plugins.invoke_service_by_interface_json(
-                MODEL_PROVIDER_INTERFACE_ID,
-                operation,
-                request,
-            )
-        },
-        |provider_plugin_id| {
-            plugins.invoke_service_json(
-                provider_plugin_id,
-                MODEL_PROVIDER_INTERFACE_ID,
-                operation,
-                request,
-            )
-        },
-    )
-}
-
-async fn with_plugins_blocking<R>(
-    state: &ServerState,
-    invoke: impl FnOnce(&bcode_plugin::PluginHost) -> R + Send + 'static,
-) -> Result<R, ServerError>
-where
-    R: Send + 'static,
-{
-    let plugins = Arc::clone(&state.plugins);
-    tokio::task::spawn_blocking(move || {
-        let plugins = plugins.blocking_lock();
-        invoke(&plugins)
-    })
-    .await
-    .map_err(ServerError::from)
+    }
+    state
+        .plugins
+        .registry()
+        .service_registry()
+        .providers_for(MODEL_PROVIDER_INTERFACE_ID)
+        .is_some()
 }
 
 async fn invoke_model_provider_json_blocking<Q, R>(
@@ -4089,19 +4041,32 @@ async fn invoke_model_provider_json_blocking<Q, R>(
     request: Q,
 ) -> Result<R, String>
 where
-    Q: serde::Serialize + Send + 'static,
+    Q: serde::Serialize + Send + Sync + 'static,
     R: serde::de::DeserializeOwned + Send + 'static,
 {
-    with_plugins_blocking(state, move |plugins| {
-        invoke_model_provider_json::<_, R>(
-            plugins,
-            provider_plugin_id.as_deref(),
-            operation,
-            &request,
-        )
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    match provider_plugin_id.as_deref() {
+        Some(provider_plugin_id) => {
+            state
+                .plugins
+                .invoke_service_json::<_, R>(
+                    provider_plugin_id,
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    operation,
+                    &request,
+                )
+                .await
+        }
+        None => {
+            state
+                .plugins
+                .invoke_service_by_interface_json::<_, R>(
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    operation,
+                    &request,
+                )
+                .await
+        }
+    }
     .map_err(|error| error.to_string())
 }
 
@@ -4655,65 +4620,50 @@ async fn collect_model_tools(
     enabled_tools: Option<Vec<String>>,
 ) -> Vec<bcode_model::ToolDefinition> {
     let enabled_tools = enabled_tools.map(|tools| tools.into_iter().collect::<BTreeSet<_>>());
-    with_plugins_blocking(state, move |plugins| {
-        let mut tools = Vec::new();
-        for plugin in plugins.loaded_plugins() {
-            if !plugin
-                .manifest()
-                .services
-                .iter()
-                .any(|service| service.interface_id == TOOL_SERVICE_INTERFACE_ID)
-            {
-                continue;
-            }
-            let response = plugins.invoke_service_json::<_, ToolList>(
-                &plugin.manifest().id,
+    let mut tools = Vec::new();
+    for plugin_id in tool_provider_plugin_ids(state) {
+        let response = state
+            .plugins
+            .invoke_service_json::<_, ToolList>(
+                &plugin_id,
                 TOOL_SERVICE_INTERFACE_ID,
                 OP_LIST_TOOLS,
                 &ListToolsRequest::default(),
-            );
-            match response {
-                Ok(list) => {
-                    tools.extend(
-                        list.tools
-                            .into_iter()
-                            .filter(|tool| {
-                                enabled_tools
-                                    .as_ref()
-                                    .is_none_or(|enabled| enabled.contains(&tool.name))
-                            })
-                            .map(|tool| bcode_model::ToolDefinition {
-                                name: tool.name,
-                                description: tool.description,
-                                input_schema: tool.input_schema,
-                                side_effect: match tool.side_effect {
-                                    bcode_tool::ToolSideEffect::ReadOnly => {
-                                        bcode_model::ToolSideEffect::ReadOnly
-                                    }
-                                    bcode_tool::ToolSideEffect::WriteFiles => {
-                                        bcode_model::ToolSideEffect::WriteFiles
-                                    }
-                                    bcode_tool::ToolSideEffect::ExecuteProcess => {
-                                        bcode_model::ToolSideEffect::ExecuteProcess
-                                    }
-                                },
-                                requires_permission: tool.requires_permission,
-                            }),
-                    );
-                }
-                Err(error) => eprintln!(
-                    "failed to list tools from {}: {error}",
-                    plugin.manifest().id
-                ),
+            )
+            .await;
+        match response {
+            Ok(list) => {
+                tools.extend(
+                    list.tools
+                        .into_iter()
+                        .filter(|tool| {
+                            enabled_tools
+                                .as_ref()
+                                .is_none_or(|enabled| enabled.contains(&tool.name))
+                        })
+                        .map(|tool| bcode_model::ToolDefinition {
+                            name: tool.name,
+                            description: tool.description,
+                            input_schema: tool.input_schema,
+                            side_effect: match tool.side_effect {
+                                bcode_tool::ToolSideEffect::ReadOnly => {
+                                    bcode_model::ToolSideEffect::ReadOnly
+                                }
+                                bcode_tool::ToolSideEffect::WriteFiles => {
+                                    bcode_model::ToolSideEffect::WriteFiles
+                                }
+                                bcode_tool::ToolSideEffect::ExecuteProcess => {
+                                    bcode_model::ToolSideEffect::ExecuteProcess
+                                }
+                            },
+                            requires_permission: tool.requires_permission,
+                        }),
+                );
             }
+            Err(error) => eprintln!("failed to list tools from {plugin_id}: {error}"),
         }
-        tools
-    })
-    .await
-    .unwrap_or_else(|error| {
-        eprintln!("failed to collect model tools: {error}");
-        Vec::new()
-    })
+    }
+    tools
 }
 
 async fn execute_model_tool(
@@ -4848,17 +4798,16 @@ async fn invoke_model_tool(
         arguments: call.arguments.clone(),
         cwd: Some(working_directory),
     };
-    with_plugins_blocking(state, move |plugins| {
-        plugins.invoke_service_json::<_, ToolInvocationResponse>(
+    state
+        .plugins
+        .invoke_service_json::<_, ToolInvocationResponse>(
             &plugin_id,
             TOOL_SERVICE_INTERFACE_ID,
             OP_INVOKE_TOOL,
             &request,
         )
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn evaluate_agent_tool_policy(
@@ -4882,57 +4831,61 @@ async fn evaluate_agent_tool_policy(
         arguments: call.arguments.clone(),
         cwd,
     };
-    with_plugins_blocking(state, move |plugins| {
-        plugins.invoke_service_by_interface_json::<_, EvaluateToolCallResponse>(
+    state
+        .plugins
+        .invoke_service_by_interface_json::<_, EvaluateToolCallResponse>(
             AGENT_PROFILE_INTERFACE_ID,
             OP_EVALUATE_TOOL_CALL,
             &request,
         )
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or(EvaluateToolCallResponse {
-        decision: if definition.requires_permission {
-            AgentDecision::Ask
-        } else {
-            AgentDecision::Allow
-        },
-        reason: None,
-    })
+        .await
+        .ok()
+        .unwrap_or(EvaluateToolCallResponse {
+            decision: if definition.requires_permission {
+                AgentDecision::Ask
+            } else {
+                AgentDecision::Allow
+            },
+            reason: None,
+        })
 }
 
 async fn find_tool_provider(
     state: &ServerState,
     tool_name: &str,
 ) -> Result<Option<(String, ServiceToolDefinition)>, String> {
-    let tool_name = tool_name.to_string();
-    with_plugins_blocking(state, move |plugins| {
-        for plugin in plugins.loaded_plugins() {
-            if !plugin
-                .manifest()
+    for plugin_id in tool_provider_plugin_ids(state) {
+        let list = state
+            .plugins
+            .invoke_service_json::<_, ToolList>(
+                &plugin_id,
+                TOOL_SERVICE_INTERFACE_ID,
+                OP_LIST_TOOLS,
+                &ListToolsRequest::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(tool) = list.tools.into_iter().find(|tool| tool.name == tool_name) {
+            return Ok(Some((plugin_id, tool)));
+        }
+    }
+    Ok(None)
+}
+
+fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
+    state
+        .plugins
+        .registry()
+        .manifests()
+        .values()
+        .filter(|manifest| {
+            manifest
                 .services
                 .iter()
                 .any(|service| service.interface_id == TOOL_SERVICE_INTERFACE_ID)
-            {
-                continue;
-            }
-            let list = plugins
-                .invoke_service_json::<_, ToolList>(
-                    &plugin.manifest().id,
-                    TOOL_SERVICE_INTERFACE_ID,
-                    OP_LIST_TOOLS,
-                    &ListToolsRequest::default(),
-                )
-                .map_err(|error| error.to_string())?;
-            if let Some(tool) = list.tools.into_iter().find(|tool| tool.name == tool_name) {
-                return Ok(Some((plugin.manifest().id.clone(), tool)));
-            }
-        }
-        Ok(None)
-    })
-    .await
-    .map_err(|error| error.to_string())?
+        })
+        .map(|manifest| manifest.id.clone())
+        .collect()
 }
 
 async fn request_tool_permission(
@@ -5354,7 +5307,7 @@ async fn handle_list_plugin_services(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let services = with_plugins_blocking(state, plugin_service_summaries).await?;
+    let services = plugin_service_summaries(&state.plugins);
     send_response(
         writer,
         request_id,
@@ -5374,10 +5327,10 @@ async fn handle_invoke_plugin_service(
 ) -> Result<(), ServerError> {
     let plugin_id = plugin_id.to_string();
     let interface_id = interface_id.to_string();
-    let response = with_plugins_blocking(state, move |plugins| {
-        plugins.invoke_service(&plugin_id, interface_id, operation, payload)
-    })
-    .await?;
+    let response = state
+        .plugins
+        .invoke_service(&plugin_id, interface_id, operation, payload)
+        .await;
     send_plugin_service_response(writer, request_id, response).await
 }
 
@@ -5390,10 +5343,10 @@ async fn handle_call_plugin_service(
     payload: Vec<u8>,
 ) -> Result<(), ServerError> {
     let interface_id = interface_id.to_string();
-    let response = with_plugins_blocking(state, move |plugins| {
-        plugins.invoke_service_by_interface(&interface_id, operation, payload)
-    })
-    .await?;
+    let response = state
+        .plugins
+        .invoke_service_by_interface(&interface_id, operation, payload)
+        .await;
     send_plugin_service_response(writer, request_id, response).await
 }
 
@@ -5406,10 +5359,7 @@ async fn handle_publish_plugin_event(
 ) -> Result<(), ServerError> {
     let topic = topic.to_string();
     let payload = payload.to_vec();
-    let response = with_plugins_blocking(state, move |plugins| {
-        plugins.publish_event(&topic, &payload)
-    })
-    .await?;
+    let response = state.plugins.publish_event(&topic, &payload).await;
     match response {
         Ok(delivered) => {
             send_response(
@@ -5450,19 +5400,19 @@ async fn send_plugin_service_response(
     send_response(writer, request_id, response).await
 }
 
-fn plugin_service_summaries(plugins: &bcode_plugin::PluginHost) -> Vec<PluginServiceSummary> {
-    let mut services = Vec::new();
-    for plugin in plugins.loaded_plugins() {
-        for service in &plugin.manifest().services {
-            services.push(PluginServiceSummary {
-                plugin_id: plugin.manifest().id.clone(),
-                interface_id: service.interface_id.clone(),
-                name: service.name.clone(),
-                description: service.description.clone(),
-            });
-        }
-    }
-    services
+fn plugin_service_summaries(
+    plugins: &bcode_plugin::PluginRuntimeHost,
+) -> Vec<PluginServiceSummary> {
+    plugins
+        .service_summaries()
+        .into_iter()
+        .map(|(plugin_id, service)| PluginServiceSummary {
+            plugin_id,
+            interface_id: service.interface_id,
+            name: service.name,
+            description: service.description,
+        })
+        .collect()
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
@@ -5473,13 +5423,12 @@ async fn publish_session_event(state: &ServerState, event: &bcode_session_models
             return;
         }
     };
-    let response = with_plugins_blocking(state, move |plugins| {
-        plugins.publish_event(SESSION_EVENT_PLUGIN_TOPIC, &payload)
-    })
-    .await;
+    let response = state
+        .plugins
+        .publish_event(SESSION_EVENT_PLUGIN_TOPIC, &payload)
+        .await;
     match response {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => eprintln!("failed to publish plugin session event: {error}"),
+        Ok(_) => {}
         Err(error) => eprintln!("failed to publish plugin session event: {error}"),
     }
 }
