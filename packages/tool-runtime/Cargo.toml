@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Managed tool execution runtime for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "tool", "runtime"]
+license     = { workspace = true }
+name        = "bcode_tool_runtime"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+thiserror = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = [
+    "io-util",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -45,6 +45,8 @@ pub struct PluginManifest {
     pub services: Vec<PluginService>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
+    #[serde(default)]
+    pub concurrency: PluginConcurrencyConfig,
     pub runtime: PluginRuntime,
 }
 
@@ -56,6 +58,10 @@ pub struct PluginService {
     pub name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub concurrency: Option<PluginConcurrencyConfig>,
+    #[serde(default)]
+    pub class: Option<PluginInvocationClass>,
 }
 
 /// Event subscription declared by a plugin manifest.
@@ -604,6 +610,29 @@ impl PluginServiceRegistry {
     }
 }
 
+/// Plugin manifest concurrency policy configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginConcurrencyConfig {
+    /// Serialize invocations for this plugin or service.
+    #[default]
+    Exclusive,
+    /// Allow up to `max` concurrent invocations.
+    Limited { max: usize },
+    /// Allow the runtime to execute invocations concurrently.
+    Concurrent,
+}
+
+impl From<&PluginConcurrencyConfig> for PluginConcurrency {
+    fn from(config: &PluginConcurrencyConfig) -> Self {
+        match config {
+            PluginConcurrencyConfig::Exclusive => Self::Exclusive,
+            PluginConcurrencyConfig::Limited { max } => Self::Limited(*max),
+            PluginConcurrencyConfig::Concurrent => Self::Concurrent,
+        }
+    }
+}
+
 /// Plugin service execution concurrency policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginConcurrency {
@@ -761,13 +790,14 @@ impl PluginExecutorHandle {
         interface_id: String,
         operation: String,
         payload: Vec<u8>,
+        class: PluginInvocationClass,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let (response, receiver) = oneshot::channel();
         self.metrics.queued.fetch_add(1, Ordering::Relaxed);
         self.sender
             .send(PluginExecutorMessage::Service(PluginInvocation {
                 id: next_plugin_invocation_id(),
-                class: classify_invocation(&interface_id, &operation),
+                class,
                 enqueued_at: Instant::now(),
                 interface_id,
                 operation,
@@ -823,15 +853,32 @@ impl PluginExecutorHandle {
 pub struct PluginRegistry {
     manifests: BTreeMap<String, PluginManifest>,
     service_registry: PluginServiceRegistry,
+    service_policies: BTreeMap<(String, String), ServiceRuntimePolicy>,
 }
 
 impl PluginRegistry {
     #[must_use]
     fn from_manifests(manifests: BTreeMap<String, PluginManifest>) -> Self {
         let service_registry = PluginServiceRegistry::from_manifests(manifests.values());
+        let mut service_policies = BTreeMap::new();
+        for manifest in manifests.values() {
+            for service in &manifest.services {
+                service_policies.insert(
+                    (manifest.id.clone(), service.interface_id.clone()),
+                    ServiceRuntimePolicy {
+                        concurrency: service.concurrency.as_ref().map_or_else(
+                            || PluginConcurrency::from(&manifest.concurrency),
+                            PluginConcurrency::from,
+                        ),
+                        class: service.class,
+                    },
+                );
+            }
+        }
         Self {
             manifests,
             service_registry,
+            service_policies,
         }
     }
 
@@ -846,6 +893,24 @@ impl PluginRegistry {
     pub const fn service_registry(&self) -> &PluginServiceRegistry {
         &self.service_registry
     }
+
+    /// Return runtime policy metadata for a plugin service interface.
+    #[must_use]
+    pub fn service_policy(
+        &self,
+        plugin_id: &str,
+        interface_id: &str,
+    ) -> Option<&ServiceRuntimePolicy> {
+        self.service_policies
+            .get(&(plugin_id.to_string(), interface_id.to_string()))
+    }
+}
+
+/// Runtime policy metadata for a declared plugin service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceRuntimePolicy {
+    pub concurrency: PluginConcurrency,
+    pub class: Option<PluginInvocationClass>,
 }
 
 /// Concurrent plugin runtime with plugin-local execution isolation.
@@ -926,13 +991,20 @@ impl PluginRuntimeHost {
         operation: impl Into<String>,
         payload: Vec<u8>,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        let interface_id = interface_id.into();
+        let operation = operation.into();
         let executor = self
             .executors
             .get(plugin_id)
             .cloned()
             .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
+        let class = self
+            .registry
+            .service_policy(plugin_id, &interface_id)
+            .and_then(|policy| policy.class)
+            .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
         executor
-            .invoke_service(interface_id.into(), operation.into(), payload)
+            .invoke_service(interface_id, operation, payload, class)
             .await
     }
 
@@ -1070,8 +1142,8 @@ impl From<PluginHost> for PluginRuntimeHost {
             executors.insert(
                 plugin_id,
                 Arc::new(PluginExecutorHandle::new(
-                    manifest,
-                    PluginConcurrency::Exclusive,
+                    manifest.clone(),
+                    PluginConcurrency::from(&manifest.concurrency),
                     sender,
                     metrics,
                 )),
@@ -1830,8 +1902,11 @@ library = "libexample_plugin.dylib"
                     interface_id: id.to_string(),
                     name: None,
                     description: None,
+                    concurrency: None,
+                    class: None,
                 }],
                 event_subscriptions: Vec::new(),
+                concurrency: PluginConcurrencyConfig::Exclusive,
                 runtime: PluginRuntime::Native(NativePluginRuntime {
                     abi_version: CURRENT_PLUGIN_ABI_VERSION,
                     library: PathBuf::from("test"),

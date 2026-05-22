@@ -995,6 +995,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_tool_runtime"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "bcode_tui"
 version = "0.0.1-alpha.0"
 dependencies = [

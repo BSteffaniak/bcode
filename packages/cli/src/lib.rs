@@ -2645,6 +2645,20 @@ async fn server_status() -> Result<(), CliError> {
         status.selected_model_id.as_deref().unwrap_or("<default>")
     );
     println!("sessions: {}", status.sessions.len());
+    if !status.plugin_runtime.is_empty() {
+        println!("plugin runtime:");
+        for plugin in &status.plugin_runtime {
+            println!(
+                "  {}: policy={:?} running={} queued={} completed={} failed={}",
+                plugin.plugin_id,
+                plugin.concurrency,
+                plugin.running,
+                plugin.queued,
+                plugin.completed,
+                plugin.failed
+            );
+        }
+    }
     println!("log: {}", daemon_log_path().display());
     for session in status.sessions {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());

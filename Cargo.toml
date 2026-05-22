@@ -26,6 +26,7 @@ members = [
     "packages/skill",
     "packages/skill/models",
     "packages/tool",
+    "packages/tool-runtime",
     "packages/tui",
     "packages/session/models",
 ]
@@ -66,6 +67,7 @@ bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-f
 bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
 bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
 bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
+bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 
 # BMUX reuse
