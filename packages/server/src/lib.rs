@@ -266,10 +266,6 @@ impl TraceStore {
         Self { root }
     }
 
-    fn blob_path(&self, reference: &TraceBlobRef) -> PathBuf {
-        self.root.join(&reference.path)
-    }
-
     fn write_json_blob(
         &self,
         session_id: SessionId,
@@ -2911,7 +2907,7 @@ fn session_event_compaction_line(
         } => Some(format!(
             "#{} tool result {tool_call_id} (error={is_error}):\n{}",
             event.sequence,
-            tool_result_for_model(
+            project_tool_result_for_model_context(
                 result,
                 None,
                 tool_output_context_chars.min(COMPACTION_TOOL_RESULT_CHARS),
@@ -4572,7 +4568,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn tool_result_for_model(
+fn project_tool_result_for_model_context(
     result: &str,
     full_output_path: Option<PathBuf>,
     max_context_chars: usize,
@@ -4711,14 +4707,7 @@ async fn execute_model_tool(
         },
     )
     .await;
-    let model_result = tool_result_for_model(
-        &result.output,
-        output_blob
-            .as_ref()
-            .map(|blob| state.trace_store.blob_path(blob)),
-        state.tool_output_context_chars,
-    );
-    append_tool_finished_event(state, session_id, call.id, model_result, result.is_error).await;
+    append_tool_finished_event(state, session_id, call.id, result.output, result.is_error).await;
 }
 
 async fn invoke_model_tool(
@@ -5098,7 +5087,11 @@ fn session_event_to_model_message_with_limit(
             content: vec![ContentBlock::ToolResult {
                 result: bcode_model::ToolResult {
                     call_id: tool_call_id.clone(),
-                    output: tool_result_for_model(result, None, tool_output_context_chars),
+                    output: project_tool_result_for_model_context(
+                        result,
+                        None,
+                        tool_output_context_chars,
+                    ),
                     is_error: *is_error,
                 },
             }],
@@ -5227,14 +5220,26 @@ async fn append_tool_finished_event(
     result: String,
     is_error: bool,
 ) {
-    match state
+    if let Err(error) =
+        append_tool_finished_event_inner(state, session_id, tool_call_id, result, is_error).await
+    {
+        eprintln!("failed to append tool result: {error}");
+    }
+}
+
+async fn append_tool_finished_event_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: String,
+    result: String,
+    is_error: bool,
+) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
+    let event = state
         .sessions
         .append_tool_call_finished(session_id, tool_call_id, result, is_error)
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append tool result: {error}"),
-    }
+        .await?;
+    publish_session_event(state, &event).await;
+    Ok(event)
 }
 
 async fn append_system_event(state: &ServerState, session_id: SessionId, text: String) {
@@ -5779,6 +5784,10 @@ mod tests {
             session_id,
             kind,
         }
+    }
+
+    fn test_working_directory() -> PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
     fn test_tool_call() -> bcode_model::ToolCall {
@@ -6362,24 +6371,85 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_for_model_preserves_small_output() {
+    fn project_tool_result_for_model_context_preserves_small_output() {
         let output = "short tool output";
 
-        assert_eq!(tool_result_for_model(output, None, 4_000), output);
+        assert_eq!(
+            project_tool_result_for_model_context(output, None, 4_000),
+            output
+        );
     }
 
     #[test]
-    fn tool_result_for_model_truncates_large_output_with_artifact_path() {
+    fn project_tool_result_for_model_context_truncates_large_output_with_artifact_path() {
         let output = format!("{}middle{}", "a".repeat(4_000), "z".repeat(4_000));
 
-        let truncated =
-            tool_result_for_model(&output, Some(PathBuf::from("/tmp/full-output.txt")), 1_000);
+        let truncated = project_tool_result_for_model_context(
+            &output,
+            Some(PathBuf::from("/tmp/full-output.txt")),
+            1_000,
+        );
 
         assert!(truncated.chars().count() <= 1_000);
         assert!(truncated.starts_with('a'));
         assert!(truncated.contains("tool output truncated"));
         assert!(truncated.contains("/tmp/full-output.txt"));
         assert!(!truncated.ends_with('z'));
+    }
+
+    #[tokio::test]
+    async fn append_tool_finished_event_inner_preserves_canonical_result() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let canonical_result = serde_json::json!({
+            "mode": "terminal",
+            "exit_code": 0,
+            "timed_out": false,
+            "output": "x".repeat(4_001),
+            "columns": 80,
+            "rows": 10,
+        })
+        .to_string();
+        let state = ServerState::new(
+            sessions,
+            bcode_plugin::PluginHost::default().into(),
+            ServerStateInit {
+                selected_provider_plugin_id: None,
+                selected_model_id: None,
+                selected_provider_context: bcode_model::ProviderRequestContext::default(),
+                prompt_cache_mode: bcode_model::PromptCacheMode::default(),
+                conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
+                provider_state: ProviderStateStore::load(PathBuf::new()),
+                observability: bcode_config::ObservabilityConfig::default(),
+                trace_store: TraceStore::new(PathBuf::new()),
+                max_tool_rounds: None,
+                tool_output_context_chars: 1_000,
+                model_streaming: bcode_config::StreamingConfig::default(),
+                auto_compaction: bcode_config::CompactionConfig::default(),
+                skills: None,
+                skill_context_bytes: 0,
+            },
+        );
+
+        let event = append_tool_finished_event_inner(
+            &state,
+            session_id,
+            "call-1".to_owned(),
+            canonical_result.clone(),
+            false,
+        )
+        .await
+        .expect("tool result event should append");
+
+        let SessionEventKind::ToolCallFinished { result, .. } = event.kind else {
+            panic!("expected tool result event");
+        };
+        assert_eq!(result, canonical_result);
+        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
     }
 
     #[test]
