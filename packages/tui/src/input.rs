@@ -1,10 +1,10 @@
 //! TUI input handling.
 
 use bmux_keyboard::KeyStroke;
-use bmux_text_edit::keyboard::TextKeymap;
-use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
+use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 
 use super::app::BmuxApp;
+use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 const TRANSCRIPT_SCROLL_ROWS: usize = 3;
 const TRANSCRIPT_PAGE_ROWS: usize = 10;
@@ -44,8 +44,11 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
         };
     }
 
-    let outcome = TextInputKeyHandler::new(TextKeymap::default(), TextInputEnterBehavior::Submit)
-        .handle_key(app.composer_mut(), stroke);
+    let outcome = helpers::handle_default_text_key(
+        app.composer_mut(),
+        stroke,
+        TextInputEnterBehavior::Submit,
+    );
     match outcome {
         TextInputKeyOutcome::Submitted => submit(app),
         TextInputKeyOutcome::Edited => {

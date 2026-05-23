@@ -400,9 +400,9 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
                 bind("down", BmuxAction::SelectDown),
                 bind("j", BmuxAction::SelectDown),
                 bind("enter", BmuxAction::SelectConfirm),
-                bind("n", BmuxAction::SessionNew),
-                bind("r", BmuxAction::SessionRename),
-                bind("d", BmuxAction::SessionDelete),
+                bind("ctrl+n", BmuxAction::SessionNew),
+                bind("ctrl+r", BmuxAction::SessionRename),
+                bind("ctrl+d", BmuxAction::SessionDelete),
                 bind("escape", BmuxAction::SelectCancel),
                 bind("ctrl+c", BmuxAction::SelectCancel),
             ],
@@ -461,4 +461,44 @@ fn bind(key: &str, action: BmuxAction) -> (KeyStroke, BmuxAction) {
 
 fn parse_key(input: &str) -> Option<KeyStroke> {
     parse_key_stroke(input).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use bcode_config::TuiConfig;
+    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+
+    use super::{BmuxAction, BmuxKeyMap, BmuxScope};
+
+    fn default_keymap() -> BmuxKeyMap {
+        BmuxKeyMap::from_config(&TuiConfig::default())
+    }
+
+    #[test]
+    fn session_picker_plain_n_is_text_not_new_session() {
+        let keymap = default_keymap();
+        let action = keymap.action_for_key(
+            BmuxScope::SessionPicker,
+            KeyStroke::simple(KeyCode::Char('n')),
+        );
+
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn session_picker_ctrl_n_creates_new_session() {
+        let keymap = default_keymap();
+        let action = keymap.action_for_key(
+            BmuxScope::SessionPicker,
+            KeyStroke::with_modifiers(
+                KeyCode::Char('n'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::NONE
+                },
+            ),
+        );
+
+        assert_eq!(action, Some(BmuxAction::SessionNew));
+    }
 }
