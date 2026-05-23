@@ -299,24 +299,56 @@ impl TerminalMarkdownRenderer {
 
     fn render_list(&mut self, container: &Container, ordered: bool, style: TextStyle) {
         self.flush_line();
-        for (index, child) in container.children.iter().enumerate() {
-            if matches!(child.element, Element::ListItem) {
-                let marker = if ordered {
-                    format!("{}. ", index.saturating_add(1))
-                } else {
-                    "• ".to_owned()
-                };
-                self.push_text(
-                    &marker,
-                    TextStyle {
-                        style: Style::new().fg(Color::BrightBlack),
-                        preserve_whitespace: false,
-                    },
-                );
-                self.render_container(child, style);
-            }
+        let list_items = container
+            .children
+            .iter()
+            .filter(|child| matches!(child.element, Element::ListItem))
+            .collect::<Vec<_>>();
+        if list_items.is_empty() {
+            self.ensure_blank_line();
+            return;
+        }
+
+        let marker_digits = if ordered {
+            decimal_digits(list_items.len())
+        } else {
+            0
+        };
+        for (index, child) in list_items.iter().enumerate() {
+            let marker = if ordered {
+                format!("{:>marker_digits$}.  ", index.saturating_add(1))
+            } else {
+                "•  ".to_owned()
+            };
+            self.render_prefixed_list_item(child, style, &marker);
         }
         self.ensure_blank_line();
+    }
+
+    fn render_prefixed_list_item(&mut self, item: &Container, style: TextStyle, marker: &str) {
+        let marker_width = text_display_width(marker);
+        let nested_width =
+            u16::try_from(self.width.saturating_sub(marker_width).max(1)).unwrap_or(u16::MAX);
+        let mut nested = Self::new(nested_width);
+        nested.render_container_children(item, style);
+        nested.flush_line();
+        let mut item_rows = nested.finish();
+        if item_rows.is_empty() {
+            item_rows.push(Line::default());
+        }
+
+        let muted = Style::new().fg(Color::BrightBlack);
+        let continuation = " ".repeat(marker_width);
+        for (row_index, row) in item_rows.into_iter().enumerate() {
+            let prefix = if row_index == 0 {
+                marker
+            } else {
+                &continuation
+            };
+            let mut spans = vec![Span::styled(prefix.to_owned(), muted)];
+            spans.extend(row.spans);
+            self.rows.push(Line::from_spans(spans));
+        }
     }
 
     fn render_table(&mut self, container: &Container, style: TextStyle) {
@@ -431,6 +463,10 @@ impl TerminalMarkdownRenderer {
             self.current_width = self.current_width.saturating_add(grapheme_width);
         }
     }
+}
+
+fn decimal_digits(value: usize) -> usize {
+    value.max(1).to_string().len()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,8 +697,8 @@ mod tests {
     fn renders_lists_with_markers() {
         let output = rendered_text("- one\n- two");
 
-        assert!(output.contains("• one"));
-        assert!(output.contains("• two"));
+        assert!(output.contains("•  one"));
+        assert!(output.contains("•  two"));
     }
 
     #[test]
@@ -719,6 +755,59 @@ mod tests {
         .join("\n");
 
         assert!(output.lines().filter(|line| line.starts_with("│ ")).count() >= 2);
+    }
+
+    #[test]
+    fn ordered_list_wraps_with_hanging_indent() {
+        let output = render_markdown_lines(
+            "1. a very long item that should wrap under the text instead of under the marker",
+            MarkdownRenderOptions {
+                width: 30,
+                streaming: false,
+            },
+        )
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(
+            output
+                .lines()
+                .next()
+                .is_some_and(|line| line.starts_with("1.  "))
+        );
+        assert!(output.lines().skip(1).any(|line| line.starts_with("    ")));
+    }
+
+    #[test]
+    fn nested_unordered_list_is_indented() {
+        let output = rendered_text("1. parent\n   - child");
+
+        assert!(output.contains("1.  parent"));
+        assert!(output.contains("    •  child"));
+    }
+
+    #[test]
+    fn list_item_code_block_is_indented() {
+        let output = rendered_text("1. example\n\n   ```rust\n   fn main() {}\n   ```");
+
+        assert!(output.contains("1.  example"));
+        assert!(output.contains("    ╭─ rust"));
+        assert!(output.contains("    │ fn main() {}"));
+    }
+
+    #[test]
+    fn blockquote_inside_list_is_indented() {
+        let output = rendered_text("1. note\n\n   > quoted");
+
+        assert!(output.contains("1.  note"));
+        assert!(output.contains("    │ quoted"));
     }
 
     #[test]
