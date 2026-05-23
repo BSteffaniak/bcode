@@ -51,6 +51,7 @@ pub(crate) mod slash_palette_render;
 pub(crate) mod tests;
 pub(crate) mod tool_present;
 pub(crate) mod transcript;
+pub(crate) mod transcript_layout;
 pub(crate) mod transcript_viewport;
 
 use std::io;

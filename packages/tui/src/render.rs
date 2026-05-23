@@ -27,6 +27,7 @@ use super::tool_present::{
     ToolResultPresentation, tool_request_presentation, tool_result_presentation,
 };
 use super::transcript::{TranscriptItem, TranscriptItemKind};
+use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
@@ -56,6 +57,7 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
     let transcript_area = transcript_area_for_body(app, body);
+    sync_transcript_layout(app, transcript_area.width);
     app.sync_transcript_scroll_max(max_transcript_scroll_offset(app, transcript_area));
     render_body(app, body, frame);
 
@@ -159,8 +161,8 @@ fn max_transcript_scroll_offset(app: &BmuxApp, area: Rect) -> usize {
     if area.is_empty() || app.transcript().is_empty() && app.pending_submissions().is_empty() {
         return 0;
     }
-    transcript_render_rows(app, area.width)
-        .len()
+    app.transcript_layout()
+        .total_rows()
         .saturating_sub(usize::from(area.height))
 }
 
@@ -172,20 +174,41 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     }
 
-    let transcript_rows = transcript_render_rows(app, area.width);
-    let end = transcript_rows
-        .len()
-        .saturating_sub(app.scroll_offset())
-        .min(transcript_rows.len());
-    let start = end.saturating_sub(usize::from(area.height));
     let mut y = area.y;
-    for row in &transcript_rows[start..end] {
+    for visible in app
+        .transcript_layout()
+        .visible_lines(app.scroll_offset(), area.height)
+    {
         if y >= area.bottom() {
             break;
         }
-        frame.write_line(Rect::new(area.x, y, area.width, 1), row);
-        y = y.saturating_add(1);
+        if let Some(row) = app.transcript_layout().line(visible) {
+            frame.write_line(Rect::new(area.x, y, area.width, 1), row);
+            y = y.saturating_add(1);
+        }
     }
+}
+
+fn sync_transcript_layout(app: &mut BmuxApp, width: u16) {
+    let transcript = app.transcript().to_vec();
+    let pending_submissions = app.pending_submissions().to_vec();
+    let has_older_history = app.has_older_history();
+    let loading_older_history = app.loading_older_history();
+    app.transcript_layout_mut().sync(TranscriptLayoutSpec {
+        width,
+        transcript_len: transcript.len(),
+        pending_len: pending_submissions.len(),
+        transcript_signature: |index| transcript_item_signature(&transcript[index], width),
+        transcript_rows: |index| transcript_item_rows(&transcript[index], width),
+        pending_signature: |index| pending_submission_signature(&pending_submissions[index], width),
+        pending_rows: |index| pending_submission_rows(&pending_submissions[index], width),
+        history_banner_signature: || {
+            history_banner_text(has_older_history, loading_older_history)
+                .map(|text| TranscriptLayoutSignature::new(format!("history:{width}:{text}")))
+        },
+        history_banner_rows: || history_banner_rows(has_older_history, loading_older_history),
+        reset: || false,
+    });
 }
 
 fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -238,29 +261,61 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         .render(detail_area, frame, &mut diff_state);
 }
 
-fn transcript_render_rows(app: &BmuxApp, width: u16) -> Vec<Line> {
+fn transcript_item_rows(item: &TranscriptItem, width: u16) -> Vec<Line> {
     let mut rows = Vec::new();
-    for item in app.transcript() {
-        push_transcript_item_rows(&mut rows, item, width);
-    }
-    for pending in app.pending_submissions() {
-        push_pending_submission_rows(&mut rows, pending, width);
-    }
-    if app.has_older_history() || app.loading_older_history() {
-        rows.insert(
-            0,
-            Line::from_spans(vec![Span::styled(
-                if app.loading_older_history() {
-                    "Loading older history…"
-                } else {
-                    "Scroll up to load older history"
-                },
-                Style::new().fg(Color::BrightBlack),
-            )]),
-        );
-    }
+    push_transcript_item_rows(&mut rows, item, width);
     rows
 }
+
+fn pending_submission_rows(pending: &PendingSubmission, width: u16) -> Vec<Line> {
+    let mut rows = Vec::new();
+    push_pending_submission_rows(&mut rows, pending, width);
+    rows
+}
+
+fn history_banner_rows(has_older_history: bool, loading_older_history: bool) -> Vec<Line> {
+    history_banner_text(has_older_history, loading_older_history).map_or_else(Vec::new, |text| {
+        vec![Line::from_spans(vec![Span::styled(
+            text,
+            Style::new().fg(Color::BrightBlack),
+        )])]
+    })
+}
+
+const fn history_banner_text(
+    has_older_history: bool,
+    loading_older_history: bool,
+) -> Option<&'static str> {
+    if loading_older_history {
+        Some("Loading older history…")
+    } else if has_older_history {
+        Some("Scroll up to load older history")
+    } else {
+        None
+    }
+}
+
+fn transcript_item_signature(item: &TranscriptItem, width: u16) -> TranscriptLayoutSignature {
+    TranscriptLayoutSignature::new(format!(
+        "item:{width}:{}:{}:{:?}:{}",
+        item.role(),
+        item.streaming(),
+        item.kind(),
+        item.text()
+    ))
+}
+
+fn pending_submission_signature(
+    pending: &PendingSubmission,
+    width: u16,
+) -> TranscriptLayoutSignature {
+    TranscriptLayoutSignature::new(format!(
+        "pending:{width}:{:?}:{}",
+        pending.state(),
+        pending.text()
+    ))
+}
+
 fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
     match item.kind() {
         TranscriptItemKind::UserMessage => {

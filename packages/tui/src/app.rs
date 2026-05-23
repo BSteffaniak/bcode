@@ -29,6 +29,7 @@ use super::transcript::{
     permission_request_item, permission_result_item, push_streaming_transcript_item,
     tool_request_item, tool_result_item, transcript_items_from_events,
 };
+use super::transcript_layout::TranscriptLayoutCache;
 use super::transcript_viewport::TranscriptViewport;
 
 /// State owned by the terminal user interface.
@@ -47,6 +48,7 @@ pub struct BmuxApp {
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
+    transcript_layout: TranscriptLayoutCache,
     viewport: TranscriptViewport,
     older_history: OlderHistoryState,
     activity: ActivityState,
@@ -85,6 +87,7 @@ impl BmuxApp {
             tool_call_contexts: BTreeMap::new(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
+            transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
@@ -346,6 +349,18 @@ impl BmuxApp {
     #[must_use]
     pub fn pending_submissions(&self) -> &[PendingSubmission] {
         self.pending_submissions.items()
+    }
+
+    /// Return cached transcript layout.
+    #[must_use]
+    pub const fn transcript_layout(&self) -> &TranscriptLayoutCache {
+        &self.transcript_layout
+    }
+
+    /// Return mutable cached transcript layout.
+    #[must_use]
+    pub const fn transcript_layout_mut(&mut self) -> &mut TranscriptLayoutCache {
+        &mut self.transcript_layout
     }
 
     /// Return the number of transcript rows hidden below the viewport.
