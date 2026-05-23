@@ -11,7 +11,9 @@
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use hyperchad_color::Color as HyperChadColor;
-use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
+use hyperchad_markdown::{
+    MarkdownOptions, MarkdownStylePolicy, markdown_to_container_with_options,
+};
 use hyperchad_transformer::{Container, Element};
 use hyperchad_transformer_models::{FontWeight, TextDecorationLine};
 use unicode_segmentation::UnicodeSegmentation;
@@ -53,6 +55,7 @@ fn hyperchad_markdown_options() -> MarkdownOptions {
         emoji_enabled: false,
         xss_protection: true,
         syntax_highlighting: false,
+        style_policy: MarkdownStylePolicy::SemanticOnly,
         link_resolver: None,
     }
 }
@@ -75,11 +78,37 @@ impl Default for TextStyle {
 impl TextStyle {
     fn merge_container(self, container: &Container) -> Self {
         let mut output = self;
-        if let Some(color) = container.color {
-            output.style = output.style.fg(hyperchad_color_to_tui(color));
+        if container
+            .classes
+            .iter()
+            .any(|class| class == "markdown-link")
+        {
+            output.style = output
+                .style
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINE);
         }
-        if let Some(background) = container.background {
-            output.style = output.style.bg(hyperchad_color_to_tui(background));
+        if container
+            .classes
+            .iter()
+            .any(|class| class == "markdown-strong")
+        {
+            output.style = output.style.add_modifier(Modifier::BOLD);
+        }
+        if container.classes.iter().any(|class| class == "markdown-em") {
+            output.style = output.style.add_modifier(Modifier::ITALIC);
+        }
+        if container
+            .classes
+            .iter()
+            .any(|class| class == "inline-code" || class == "markdown-code-block")
+        {
+            output.style = output.style.fg(Color::Yellow);
+        }
+        if let Some(color) = container.color
+            && !container_has_markdown_terminal_theme(container)
+        {
+            output.style = output.style.fg(hyperchad_color_to_tui(color));
         }
         if container.font_weight.is_some_and(is_bold_weight) {
             output.style = output.style.add_modifier(Modifier::BOLD);
@@ -97,13 +126,6 @@ impl TextStyle {
             .is_some_and(|decoration| decoration.line.contains(&TextDecorationLine::LineThrough))
         {
             output.style = output.style.add_modifier(Modifier::CROSSED_OUT);
-        }
-        if container
-            .font_family
-            .as_ref()
-            .is_some_and(|families| families.iter().any(|family| family == "monospace"))
-        {
-            output.style = output.style.fg(Color::Yellow);
         }
         output
     }
@@ -335,6 +357,20 @@ const fn is_block_container(container: &Container) -> bool {
             | Element::Main
             | Element::Form { .. }
     )
+}
+
+fn container_has_markdown_terminal_theme(container: &Container) -> bool {
+    container.classes.iter().any(|class| {
+        matches!(
+            class.as_str(),
+            "inline-code"
+                | "markdown-code-block"
+                | "markdown-link"
+                | "markdown-strong"
+                | "markdown-em"
+                | "markdown-strikethrough"
+        )
+    })
 }
 
 fn normalize_inline_whitespace(text: &str) -> String {
