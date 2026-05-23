@@ -17,9 +17,9 @@ use bcode_ipc::{
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageContent,
-    ImageMetadata as ModelImageMetadata, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList,
-    ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    ImageMetadata as ModelImageMetadata, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability,
+    ModelList, ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN,
+    OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_session::SessionManager;
@@ -4069,6 +4069,84 @@ where
     .map_err(|error| error.to_string())
 }
 
+async fn apply_image_capability_gating(
+    state: &ServerState,
+    messages: &mut [ModelMessage],
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+) {
+    let image_count = count_image_blocks(messages);
+    if image_count == 0 {
+        return;
+    }
+    let Some(model) =
+        selected_model_capabilities(state, provider_plugin_id, selected_model_id).await
+    else {
+        return;
+    };
+    if model.capabilities.contains(&ModelCapability::ImageInput) {
+        return;
+    }
+    replace_image_blocks_with_text(
+        messages,
+        "[Image omitted: selected model does not declare image input support.]",
+    );
+}
+
+async fn selected_model_capabilities(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+) -> Option<bcode_model::ModelInfo> {
+    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        provider_plugin_id.map(str::to_string),
+        OP_MODELS,
+        serde_json::Value::Null,
+    )
+    .await
+    .ok()?;
+    select_model_info(&models.models, selected_model_id)
+}
+
+fn count_image_blocks(messages: &[ModelMessage]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, ContentBlock::Image { .. }))
+        .count()
+}
+
+fn replace_image_blocks_with_text(messages: &mut [ModelMessage], replacement: &str) {
+    for message in messages {
+        for block in &mut message.content {
+            if matches!(block, ContentBlock::Image { .. }) {
+                *block = ContentBlock::Text {
+                    text: replacement.to_string(),
+                };
+            }
+            if let ContentBlock::ToolResult { result } = block {
+                let omitted = result
+                    .content
+                    .iter()
+                    .filter(|content| {
+                        matches!(content, bcode_model::ToolResultContent::Image { .. })
+                    })
+                    .count();
+                if omitted > 0 {
+                    result.content.retain(|content| {
+                        !matches!(content, bcode_model::ToolResultContent::Image { .. })
+                    });
+                    let _ = write!(
+                        result.output,
+                        "\n\n{replacement} Omitted {omitted} image attachment(s)."
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_model_turn_request(
     state: &ServerState,
@@ -4083,6 +4161,8 @@ async fn build_model_turn_request(
     let history = state.sessions.model_context_events(session_id).await?;
     let mut messages =
         session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
+    apply_image_capability_gating(state, &mut messages, provider_plugin_id, selected_model_id)
+        .await;
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;

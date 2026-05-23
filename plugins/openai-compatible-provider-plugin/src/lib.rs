@@ -352,11 +352,30 @@ struct ChatToolFunction {
 struct ChatMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<ChatMessageContent>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     tool_calls: Vec<ChatMessageToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatMessageContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatMessageContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ChatImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct ChatImageUrl {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1558,7 +1577,7 @@ fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessag
     if let Some(system_prompt) = &request.system_prompt {
         messages.push(ChatMessage {
             role: "system",
-            content: Some(system_prompt.clone()),
+            content: Some(ChatMessageContent::Text(system_prompt.clone())),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -1586,11 +1605,48 @@ fn text_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
         MessageRole::User => "user",
         _ => return None,
     };
-    let content = joined_text_content(message);
-    (!content.is_empty()).then_some(ChatMessage {
+    chat_message_with_content(role, message, Vec::new())
+}
+
+fn chat_message_with_content(
+    role: &'static str,
+    message: &ModelMessage,
+    tool_calls: Vec<ChatMessageToolCall>,
+) -> Option<ChatMessage> {
+    let text = joined_text_content(message);
+    let images = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image { image } => Some(image),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if text.is_empty() && images.is_empty() && tool_calls.is_empty() {
+        return None;
+    }
+    let content = if images.is_empty() {
+        (!text.is_empty()).then_some(ChatMessageContent::Text(text))
+    } else {
+        let mut parts = Vec::new();
+        if !text.is_empty() {
+            parts.push(ChatMessageContentPart::Text { text });
+        }
+        parts.extend(
+            images
+                .into_iter()
+                .map(|image| ChatMessageContentPart::ImageUrl {
+                    image_url: ChatImageUrl {
+                        url: image_data_url(image),
+                    },
+                }),
+        );
+        Some(ChatMessageContent::Parts(parts))
+    };
+    Some(ChatMessage {
         role,
-        content: Some(content),
-        tool_calls: Vec::new(),
+        content,
+        tool_calls,
         tool_call_id: None,
     })
 }
@@ -1617,7 +1673,7 @@ fn assistant_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
     } else {
         Some(ChatMessage {
             role: "assistant",
-            content: (!content.is_empty()).then_some(content),
+            content: (!content.is_empty()).then_some(ChatMessageContent::Text(content)),
             tool_calls,
             tool_call_id: None,
         })
@@ -1628,7 +1684,7 @@ fn tool_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
     message.content.iter().find_map(|block| match block {
         ContentBlock::ToolResult { result } => Some(ChatMessage {
             role: "tool",
-            content: Some(result.output.clone()),
+            content: Some(ChatMessageContent::Text(result.output.clone())),
             tool_calls: Vec::new(),
             tool_call_id: Some(result.call_id.clone()),
         }),
