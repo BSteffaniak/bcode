@@ -145,7 +145,7 @@ impl SessionEventStore {
         Self { root: root.into() }
     }
 
-    fn load_sessions(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
+    fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
         let mut sessions = BTreeMap::new();
         if !self.root.exists() {
             return Ok(sessions);
@@ -159,17 +159,53 @@ impl SessionEventStore {
             let session_id = parse_session_file_name(&path)?;
             if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
                 sessions.insert(session_id, index.into_state());
-            } else if let Some(index) =
-                index::rebuild_index_metadata(&self.root, session_id, &path)?
-            {
-                let mut state = index.into_state();
-                state.index_status = SessionIndexStatusKind::Stale;
-                state.access_status = self.inspect_access_status(session_id)?;
+            }
+        }
+
+        Ok(sessions)
+    }
+
+    fn load_sessions(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
+        let mut sessions = self.load_catalog()?;
+        if !self.root.exists() {
+            return Ok(sessions);
+        }
+
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
+                continue;
+            }
+            let session_id = parse_session_file_name(&path)?;
+            if sessions.contains_key(&session_id) {
+                continue;
+            }
+            if let Some(state) = self.load_session(session_id)? {
                 sessions.insert(session_id, state);
             }
         }
 
         Ok(sessions)
+    }
+
+    fn load_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionState>, SessionStoreError> {
+        let path = self.event_path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
+            return Ok(Some(index.into_state()));
+        }
+        let Some(index) = index::rebuild_index_metadata(&self.root, session_id, &path)? else {
+            return Ok(None);
+        };
+        let mut state = index.into_state();
+        state.index_status = SessionIndexStatusKind::Stale;
+        state.access_status = self.inspect_access_status(session_id)?;
+        Ok(Some(state))
     }
 
     fn append(&self, event: &SessionEvent) -> Result<index::SessionIndexEntry, SessionStoreError> {
@@ -881,6 +917,7 @@ pub struct SessionManager {
 #[derive(Debug, Default)]
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionState>,
+    catalog_loaded: bool,
     activity_clock_ms: u64,
     index_rebuilds: BTreeMap<SessionId, JoinHandle<()>>,
     completed_rebuilds: usize,
@@ -941,22 +978,71 @@ impl SessionManager {
         let store = SessionEventStore::new(root);
         store.migrate_all_event_logs_to_current()?;
         let sessions = store.load_sessions()?;
-        Ok(Self {
+        Ok(Self::from_store(store, sessions, true))
+    }
+
+    /// Create a session manager whose catalog and event logs are loaded on demand.
+    #[must_use]
+    pub fn persistent_lazy(root: impl Into<PathBuf>) -> Self {
+        let store = SessionEventStore::new(root);
+        Self::from_store(store, BTreeMap::new(), false)
+    }
+
+    fn from_store(
+        store: SessionEventStore,
+        sessions: BTreeMap<SessionId, SessionState>,
+        catalog_loaded: bool,
+    ) -> Self {
+        Self {
             inner: Mutex::new(SessionManagerInner {
                 sessions,
+                catalog_loaded,
                 activity_clock_ms: current_unix_millis(),
                 index_rebuilds: BTreeMap::new(),
                 completed_rebuilds: 0,
                 failed_rebuilds: 0,
             }),
             store: Some(store),
-        })
+        }
+    }
+
+    async fn ensure_session_loaded(&self, session_id: SessionId) -> Result<(), SessionError> {
+        if self.inner.lock().await.sessions.contains_key(&session_id) {
+            return Ok(());
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        let Some(state) = store.load_session(session_id)? else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        let mut inner = self.inner.lock().await;
+        inner.sessions.entry(session_id).or_insert(state);
+        Ok(())
+    }
+
+    async fn ensure_catalog_loaded(&self) -> Result<(), SessionStoreError> {
+        if self.inner.lock().await.catalog_loaded {
+            return Ok(());
+        }
+        let Some(store) = &self.store else {
+            self.inner.lock().await.catalog_loaded = true;
+            return Ok(());
+        };
+        let sessions = store.load_catalog()?;
+        let mut inner = self.inner.lock().await;
+        for (session_id, state) in sessions {
+            inner.sessions.entry(session_id).or_insert(state);
+        }
+        inner.catalog_loaded = true;
+        Ok(())
     }
 
     async fn migrate_session_to_current_if_required(
         &self,
         session_id: SessionId,
     ) -> Result<(), SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let should_migrate = {
             let inner = self.inner.lock().await;
             let state = inner
@@ -1046,27 +1132,24 @@ impl SessionManager {
         Ok(summary)
     }
 
-    /// List known sessions.
+    /// List known sessions from the session catalog.
     pub async fn list_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
+        if let Err(error) = self.ensure_catalog_loaded().await {
+            eprintln!("failed to load session catalog: {error}");
+        }
+        self.cached_sessions(working_directory).await
+    }
+
+    /// List already-loaded sessions without touching persistent storage.
+    pub async fn cached_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
         let working_directory = normalize_working_directory(working_directory);
-        let mut inner = self.inner.lock().await;
-        inner.schedule_stale_index_rebuilds(self.store.as_ref());
-        let mut sessions: Vec<_> = inner
-            .sessions
-            .values()
-            .filter(|state| {
-                normalize_working_directory(&state.working_directory) == working_directory
-            })
-            .map(SessionState::summary)
-            .collect();
-        sessions.sort_by(|left, right| {
-            right
-                .updated_at_ms
-                .cmp(&left.updated_at_ms)
-                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        sessions
+        let inner = self.inner.lock().await;
+        sorted_session_summaries(&inner.sessions, &working_directory)
+    }
+
+    /// Return true once the persistent session catalog has been discovered.
+    pub async fn catalog_loaded(&self) -> bool {
+        self.inner.lock().await.catalog_loaded
     }
 
     /// Return background maintenance status.
@@ -1089,6 +1172,8 @@ impl SessionManager {
         session_id: SessionId,
         name: Option<String>,
     ) -> Result<SessionEvent, SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
         let normalized_name = normalize_session_name(name);
         let event = {
             let mut inner = self.inner.lock().await;
@@ -1123,6 +1208,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let mut inner = self.inner.lock().await;
         let state = inner
             .sessions
@@ -1150,6 +1236,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         inner
             .sessions
@@ -1170,6 +1257,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<PathBuf, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         inner
             .sessions
@@ -1187,6 +1275,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionAccessStatus, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         inner
             .sessions
@@ -1204,6 +1293,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         let state = inner
             .sessions
@@ -1229,6 +1319,7 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let should_mark_current = {
             let inner = self.inner.lock().await;
             let state = inner
@@ -1260,6 +1351,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         let state = inner
             .sessions
@@ -1284,6 +1376,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         let state = inner
             .sessions
@@ -1308,6 +1401,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Option<(String, String)>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         let state = inner
             .sessions
@@ -1328,6 +1422,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Option<String>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let inner = self.inner.lock().await;
         let state = inner
             .sessions
@@ -1453,6 +1548,7 @@ impl SessionManager {
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<Option<SessionEvent>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let mut inner = self.inner.lock().await;
         let activity_timestamp_ms = inner.next_activity_timestamp_ms();
         let Some(state) = inner.sessions.get_mut(&session_id) else {
@@ -1484,6 +1580,8 @@ impl SessionManager {
         client_id: ClientId,
         text: String,
     ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
         let events = {
             let mut inner = self.inner.lock().await;
             let activity_timestamp_ms = inner.next_activity_timestamp_ms();
@@ -1821,6 +1919,8 @@ impl SessionManager {
         session_id: SessionId,
         kind: SessionEventKind,
     ) -> Result<SessionEvent, SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
         let event = {
             let mut inner = self.inner.lock().await;
             let activity_timestamp_ms = inner.next_activity_timestamp_ms();
@@ -1870,46 +1970,6 @@ impl SessionManagerInner {
             running_rebuilds: self.index_rebuilds.len(),
             completed_rebuilds: self.completed_rebuilds,
             failed_rebuilds: self.failed_rebuilds,
-        }
-    }
-
-    fn schedule_index_rebuild(&mut self, store: Option<&SessionEventStore>, session_id: SessionId) {
-        let Some(store) = store.cloned() else {
-            return;
-        };
-        if self
-            .sessions
-            .get(&session_id)
-            .is_none_or(|state| state.index_status == SessionIndexStatusKind::Current)
-        {
-            return;
-        }
-        if self
-            .index_rebuilds
-            .get(&session_id)
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return;
-        }
-        let handle = tokio::spawn(async move {
-            if let Err(error) = store.reindex_session(session_id) {
-                eprintln!("failed to rebuild session index for {session_id}: {error}");
-            }
-        });
-        self.index_rebuilds.insert(session_id, handle);
-    }
-
-    fn schedule_stale_index_rebuilds(&mut self, store: Option<&SessionEventStore>) {
-        self.collect_finished_rebuilds();
-        let session_ids = self
-            .sessions
-            .iter()
-            .filter_map(|(session_id, state)| {
-                (state.index_status == SessionIndexStatusKind::Stale).then_some(*session_id)
-            })
-            .collect::<Vec<_>>();
-        for session_id in session_ids {
-            self.schedule_index_rebuild(store, session_id);
         }
     }
 
@@ -2024,6 +2084,25 @@ impl SessionState {
         let _ = self.sender.send(event.clone());
         Ok(event)
     }
+}
+
+fn sorted_session_summaries(
+    sessions: &BTreeMap<SessionId, SessionState>,
+    working_directory: &Path,
+) -> Vec<SessionSummary> {
+    let mut sessions = sessions
+        .values()
+        .filter(|state| normalize_working_directory(&state.working_directory) == working_directory)
+        .map(SessionState::summary)
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    sessions
 }
 
 fn input_history_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistoryEntry> {
@@ -3335,6 +3414,38 @@ mod tests {
             .doctor_session_with_fix(session.id, true)
             .expect("doctor fix should run");
         assert!(index_path.exists());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn lazy_persistent_manager_defers_catalog_until_requested() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("lazy catalog".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+
+        let restored = SessionManager::persistent_lazy(&root);
+        assert!(!restored.catalog_loaded().await);
+        assert!(
+            restored
+                .cached_sessions(&test_working_directory())
+                .await
+                .is_empty()
+        );
+
+        let summary = restored
+            .session_summary(session.id)
+            .await
+            .expect("targeted session load should work");
+        assert_eq!(summary.name.as_deref(), Some("lazy catalog"));
+        assert!(!restored.catalog_loaded().await);
+
+        let sessions = restored.list_sessions(&test_working_directory()).await;
+        assert_eq!(sessions.len(), 1);
+        assert!(restored.catalog_loaded().await);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

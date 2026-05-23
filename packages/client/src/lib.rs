@@ -227,6 +227,19 @@ impl BcodeClient {
         self
     }
 
+    /// Check whether the local server accepts requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn ping(&self) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(Request::Ping).await? {
+            ResponsePayload::Pong => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Query local server status.
     ///
     /// # Errors

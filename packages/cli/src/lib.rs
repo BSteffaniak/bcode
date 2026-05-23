@@ -2529,7 +2529,7 @@ async fn run_server_foreground() -> Result<(), CliError> {
 
 async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    if client.server_status().await.is_ok() {
+    if server_ping_ready(&client).await {
         if !quiet {
             println!("server already running");
             println!("log: {}", daemon_log_path().display());
@@ -2584,7 +2584,7 @@ async fn wait_for_server_ready(
     log_path: &Path,
 ) -> Result<(), CliError> {
     for _ in 0..50 {
-        if client.server_status().await.is_ok() {
+        if server_ping_ready(client).await {
             tokio::time::sleep(Duration::from_millis(250)).await;
             if let Some(status) = child.try_wait()? {
                 return Err(CliError::DaemonExited {
@@ -2593,7 +2593,7 @@ async fn wait_for_server_ready(
                     recent_log: recent_log_excerpt(log_path),
                 });
             }
-            if client.server_status().await.is_ok() {
+            if server_ping_ready(client).await {
                 return Ok(());
             }
             return Err(CliError::DaemonHealthCheckFailed {
@@ -2615,6 +2615,13 @@ async fn wait_for_server_ready(
         log_path: log_path.display().to_string(),
         recent_log: recent_log_excerpt(log_path),
     })
+}
+
+async fn server_ping_ready(client: &BcodeClient) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_millis(250), client.ping()).await,
+        Ok(Ok(()))
+    )
 }
 
 fn recent_log_excerpt(log_path: &Path) -> String {
@@ -2648,7 +2655,14 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
         "model: {}",
         status.selected_model_id.as_deref().unwrap_or("<default>")
     );
-    println!("sessions: {}", status.sessions.len());
+    if status.session_catalog_loaded {
+        println!("sessions: {}", status.sessions.len());
+    } else {
+        println!(
+            "sessions: {} cached (catalog not loaded)",
+            status.sessions.len()
+        );
+    }
     print_runtime_summary(&status.plugin_runtime, verbose);
     println!("log: {}", daemon_log_path().display());
     for session in status.sessions {

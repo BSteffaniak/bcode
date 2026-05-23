@@ -4,7 +4,7 @@ use std::io::Write;
 
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
-use bcode_session_models::SessionId;
+use bcode_session_models::{SessionId, SessionSummary};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::crossterm::poll_event;
 use bmux_tui::event::{Event, FocusEvent};
@@ -97,15 +97,53 @@ enum PickerKeyOutcome {
     Canceled,
 }
 
+type SessionListTask = JoinHandle<Result<Vec<SessionSummary>, bcode_client::ClientError>>;
+
+fn spawn_session_list(client: &BcodeClient) -> SessionListTask {
+    let client = client.clone();
+    tokio::spawn(async move { client.list_sessions().await })
+}
+
+async fn poll_session_list(
+    picker: &mut session_picker::SessionPickerApp,
+    session_load: &mut Option<SessionListTask>,
+) {
+    if !session_load
+        .as_ref()
+        .is_some_and(tokio::task::JoinHandle::is_finished)
+    {
+        return;
+    }
+    let Some(task) = session_load.take() else {
+        return;
+    };
+    match task.await {
+        Ok(Ok(sessions)) => {
+            picker.replace_sessions(sessions);
+            picker.set_status("Select a session or press Ctrl-N to create one".to_owned());
+        }
+        Ok(Err(error)) => picker.set_status(format!("Session load failed: {error}")),
+        Err(error) => picker.set_status(format!("Session load task failed: {error}")),
+    }
+}
+
+fn abort_session_list(session_load: &mut Option<SessionListTask>) {
+    if let Some(task) = session_load.take() {
+        task.abort();
+    }
+}
+
 /// Pick an existing session or create one.
 pub async fn pick_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
 ) -> Result<SessionId, TuiError> {
-    let sessions = client.list_sessions().await?;
-    let mut picker = session_picker::SessionPickerApp::new(sessions);
+    let mut picker = session_picker::SessionPickerApp::new(Vec::new());
+    picker.set_status("Loading sessions; press Ctrl-N to create one".to_owned());
+    let mut session_load = Some(spawn_session_list(client));
     loop {
+        poll_session_list(&mut picker, &mut session_load).await;
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
         let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
@@ -119,22 +157,30 @@ pub async fn pick_session<W: Write>(
             }
             Event::Key(stroke) => match handle_picker_key(&mut picker, keymap, stroke) {
                 PickerKeyOutcome::Continue => {}
-                PickerKeyOutcome::Create => return Ok(client.create_session(None).await?.id),
+                PickerKeyOutcome::Create => {
+                    abort_session_list(&mut session_load);
+                    return Ok(client.create_session(None).await?.id);
+                }
                 PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Selected => {
                     if let Some(session_id) = picker.selected_session_id() {
+                        abort_session_list(&mut session_load);
                         return Ok(session_id);
                     }
                     picker.set_status("No session selected; press Ctrl-N to create one".to_owned());
                 }
-                PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
+                PickerKeyOutcome::Canceled => {
+                    abort_session_list(&mut session_load);
+                    return Err(TuiError::Canceled);
+                }
             },
             Event::Mouse(mouse) => {
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)
                     && let Some(session_id) = picker.selected_session_id()
                 {
+                    abort_session_list(&mut session_load);
                     return Ok(session_id);
                 }
             }
@@ -150,17 +196,24 @@ pub async fn pick_session_for_mutation<W: Write>(
     start_mode: SessionPickerStartMode,
 ) -> Result<(), TuiError> {
     let keymap = BmuxKeyMap::from_config(&bcode_config::load_config()?.tui);
-    let sessions = client.list_sessions().await?;
-    let mut picker = session_picker::SessionPickerApp::new(sessions);
-    match start_mode {
-        SessionPickerStartMode::Rename => {
-            picker.start_rename();
-        }
-        SessionPickerStartMode::Delete => {
-            picker.start_delete_confirmation();
-        }
-    }
+    let mut picker = session_picker::SessionPickerApp::new(Vec::new());
+    picker.set_status("Loading sessions".to_owned());
+    let mut session_load = Some(spawn_session_list(client));
+    let mut pending_start_mode = Some(start_mode);
     loop {
+        poll_session_list(&mut picker, &mut session_load).await;
+        if session_load.is_none()
+            && let Some(start_mode) = pending_start_mode.take()
+        {
+            match start_mode {
+                SessionPickerStartMode::Rename => {
+                    picker.start_rename();
+                }
+                SessionPickerStartMode::Delete => {
+                    picker.start_delete_confirmation();
+                }
+            }
+        }
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
         let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
@@ -182,7 +235,10 @@ pub async fn pick_session_for_mutation<W: Write>(
                 | PickerKeyOutcome::Selected => {}
                 PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
-                PickerKeyOutcome::Canceled => return Ok(()),
+                PickerKeyOutcome::Canceled => {
+                    abort_session_list(&mut session_load);
+                    return Ok(());
+                }
             },
             Event::Mouse(mouse) => {
                 if let Some(row) = picker_row_from_mouse(mouse) {

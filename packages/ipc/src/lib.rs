@@ -222,6 +222,8 @@ pub struct ServerStatus {
     pub connected_client_count: usize,
     pub sessions: Vec<SessionSummary>,
     #[serde(default)]
+    pub session_catalog_loaded: bool,
+    #[serde(default)]
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
     pub selected_model_id: Option<String>,

@@ -458,8 +458,9 @@ impl ServerState {
             connected_client_count: self.clients.lock().await.len(),
             sessions: self
                 .sessions
-                .list_sessions(&bcode_ipc::current_working_directory())
+                .cached_sessions(&bcode_ipc::current_working_directory())
                 .await,
+            session_catalog_loaded: self.sessions.catalog_loaded().await,
             selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
             selected_model_id: self.selected_model_id.clone(),
             plugin_runtime: self.plugins.executor_statuses(),
@@ -536,9 +537,9 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
     tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
-    tracing::debug!(target: "bcode_server::startup", "opening session store");
-    let sessions = SessionManager::persistent(default_session_store_dir())?;
-    tracing::debug!(target: "bcode_server::startup", "session store ready");
+    tracing::debug!(target: "bcode_server::startup", "initializing lazy session services");
+    let sessions = SessionManager::persistent_lazy(default_session_store_dir());
+    tracing::debug!(target: "bcode_server::startup", "lazy session services ready");
     let resolved_model = config.resolved_model_selection();
     tracing::debug!(
         target: "bcode_server::startup",
