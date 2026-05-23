@@ -57,6 +57,8 @@ pub enum SessionError {
         session_id: SessionId,
         status: SessionAccessStatus,
     },
+    #[error("model request error: {0}")]
+    ModelRequest(String),
 }
 
 /// Canonical session access status used to gate reads and writes.
