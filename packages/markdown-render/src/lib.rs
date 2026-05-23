@@ -220,35 +220,38 @@ impl TerminalMarkdownRenderer {
             self.render_code_block(container, style);
             return;
         }
+        if container
+            .classes
+            .iter()
+            .any(|class| class == "markdown-blockquote")
+        {
+            self.render_blockquote(container, style);
+            return;
+        }
         let is_block = is_block_container(container);
         if is_block {
             self.flush_line();
         }
-        if is_block
-            && container
-                .classes
-                .iter()
-                .any(|class| class == "markdown-blockquote")
-        {
-            self.push_text(
-                "│ ",
-                TextStyle {
-                    style: Style::new().fg(Color::BrightBlack),
-                    preserve_whitespace: false,
-                },
-            );
-        }
         self.render_container_children(container, style);
         if is_block {
             self.flush_line();
-            if container
-                .classes
-                .iter()
-                .any(|class| class == "markdown-blockquote")
-            {
-                self.ensure_blank_line();
-            }
         }
+    }
+
+    fn render_blockquote(&mut self, container: &Container, style: TextStyle) {
+        self.flush_line();
+        let mut nested =
+            Self::new(u16::try_from(self.width.saturating_sub(2).max(1)).unwrap_or(u16::MAX));
+        nested.render_container_children(container, style);
+        nested.flush_line();
+        let rows = nested.finish();
+        let border_style = Style::new().fg(Color::BrightBlack);
+        for line in rows {
+            let mut spans = vec![Span::styled("│ ", border_style)];
+            spans.extend(line.spans);
+            self.rows.push(Line::from_spans(spans));
+        }
+        self.ensure_blank_line();
     }
 
     fn render_code_block(&mut self, container: &Container, style: TextStyle) {
@@ -324,7 +327,7 @@ impl TerminalMarkdownRenderer {
             return;
         }
 
-        let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let column_count = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
         if column_count == 0 {
             self.ensure_blank_line();
             return;
@@ -342,8 +345,8 @@ impl TerminalMarkdownRenderer {
             .push(table_border_line('┌', '┬', '┐', &widths, border_style));
         for (row_index, row) in rows.iter().enumerate() {
             self.rows
-                .push(table_content_line(row, &widths, border_style));
-            if row_index == 0 && rows.len() > 1 {
+                .push(table_content_line(&row.cells, &widths, border_style));
+            if (row.header || row_index == 0) && rows.len() > 1 {
                 self.rows
                     .push(table_border_line('├', '┼', '┤', &widths, border_style));
             }
@@ -353,13 +356,13 @@ impl TerminalMarkdownRenderer {
         self.ensure_blank_line();
     }
 
-    fn render_stacked_table_rows(&mut self, rows: &[Vec<Vec<Span>>]) {
+    fn render_stacked_table_rows(&mut self, rows: &[TableRow]) {
         let muted = Style::new().fg(Color::BrightBlack);
         for (row_index, row) in rows.iter().enumerate() {
             if row_index > 0 {
                 self.rows.push(Line::default());
             }
-            for (column_index, cell) in row.iter().enumerate() {
+            for (column_index, cell) in row.cells.iter().enumerate() {
                 let mut spans = vec![Span::styled(format!("{}: ", column_index + 1), muted)];
                 spans.extend(cell.clone());
                 self.rows.push(Line::from_spans(spans));
@@ -430,23 +433,34 @@ impl TerminalMarkdownRenderer {
     }
 }
 
-fn table_rows(container: &Container, style: TextStyle) -> Vec<Vec<Vec<Span>>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableRow {
+    cells: Vec<Vec<Span>>,
+    header: bool,
+}
+
+fn table_rows(container: &Container, style: TextStyle) -> Vec<TableRow> {
     let mut rows = Vec::new();
     collect_table_rows(container, style, &mut rows);
     rows
 }
 
-fn collect_table_rows(container: &Container, style: TextStyle, rows: &mut Vec<Vec<Vec<Span>>>) {
+fn collect_table_rows(container: &Container, style: TextStyle, rows: &mut Vec<TableRow>) {
     let style = style.merge_container(container);
     if matches!(container.element, Element::TR) {
-        rows.push(
-            container
+        let header = container
+            .children
+            .iter()
+            .any(|child| matches!(child.element, Element::TH { .. }));
+        rows.push(TableRow {
+            cells: container
                 .children
                 .iter()
                 .filter(|child| matches!(child.element, Element::TH { .. } | Element::TD { .. }))
                 .map(|cell| inline_spans_for_container(cell, style))
                 .collect(),
-        );
+            header,
+        });
         return;
     }
     for child in &container.children {
@@ -466,10 +480,10 @@ fn inline_spans_for_container(container: &Container, style: TextStyle) -> Vec<Sp
         .collect()
 }
 
-fn table_column_widths(rows: &[Vec<Vec<Span>>], column_count: usize) -> Vec<usize> {
+fn table_column_widths(rows: &[TableRow], column_count: usize) -> Vec<usize> {
     let mut widths = vec![1; column_count];
     for row in rows {
-        for (index, cell) in row.iter().enumerate() {
+        for (index, cell) in row.cells.iter().enumerate() {
             widths[index] = widths[index].max(spans_width(cell));
         }
     }
@@ -683,5 +697,49 @@ mod tests {
         assert!(output.contains("┌"));
         assert!(output.contains("│ 1 │ 2 │"));
         assert!(output.contains("└"));
+    }
+
+    #[test]
+    fn blockquote_wraps_with_bar_on_each_line() {
+        let output = render_markdown_lines(
+            "> a very long quoted line that should wrap when rendered with the test width",
+            MarkdownRenderOptions {
+                width: 24,
+                streaming: false,
+            },
+        )
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(output.lines().filter(|line| line.starts_with("│ ")).count() >= 2);
+    }
+
+    #[test]
+    fn streaming_partial_code_fence_renders() {
+        let output = render_markdown_lines(
+            "```rust\nfn main() {",
+            MarkdownRenderOptions {
+                width: 80,
+                streaming: true,
+            },
+        )
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(output.contains("fn main()"));
     }
 }
