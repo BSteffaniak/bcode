@@ -839,6 +839,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
  "image",
+ "png",
  "serde",
  "serde_json",
 ]

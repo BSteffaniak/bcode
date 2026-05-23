@@ -12,6 +12,7 @@ use bcode_tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -29,6 +30,8 @@ const MAX_EXTERNAL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RUST_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const TERMINATION_GRACE_MS: u64 = 500;
 const MAX_IMAGE_READ_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_READ_MAX_LINES: usize = 1_000;
+const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 
 /// Bundled filesystem plugin.
 #[derive(Default)]
@@ -50,6 +53,10 @@ impl RustPlugin for FilesystemPlugin {
 #[derive(Debug, Deserialize)]
 struct ReadRequest {
     path: PathBuf,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,7 +240,11 @@ fn read_tool_definition() -> ToolDefinition {
         input_schema: json!({
             "type": "object",
             "required": ["path"],
-            "properties": { "path": { "type": "string" } }
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-indexed line number to start reading from for text files" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of text lines to return" }
+            }
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
@@ -388,23 +399,68 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
 
 fn tool_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     match serde_json::from_value::<ReadRequest>(arguments) {
-        Ok(request) => read_path_for_tool(&resolve_session_path(cwd, &request.path)),
+        Ok(request) => read_path_for_tool(&resolve_session_path(cwd, &request.path), &request),
         Err(error) => tool_json_error(&error),
     }
 }
 
-fn read_path_for_tool(path: &Path) -> ToolInvocationResponse {
+fn read_path_for_tool(path: &Path, request: &ReadRequest) -> ToolInvocationResponse {
     match image_file_metadata(path) {
         Ok(Some(image)) => image_tool_response(path, image),
-        Ok(None) => match std::fs::read_to_string(path) {
-            Ok(contents) => ToolInvocationResponse {
-                output: contents,
-                is_error: false,
-                content: Vec::new(),
-            },
+        Ok(None) => match std::fs::read(path) {
+            Ok(bytes) => text_tool_response(path, request, &bytes),
             Err(error) => tool_io_error(&error),
         },
         Err(error) => tool_io_error(&error),
+    }
+}
+
+fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolInvocationResponse {
+    let Ok(contents) = std::str::from_utf8(bytes) else {
+        return ToolInvocationResponse {
+            output: format!(
+                "Binary file could not be decoded as UTF-8.\nPath: {}\nSize: {} bytes\nUse a specialized tool to inspect this file type.",
+                path.display(),
+                bytes.len()
+            ),
+            is_error: true,
+            content: Vec::new(),
+        };
+    };
+    let lines = contents.lines().collect::<Vec<_>>();
+    let total_lines = lines.len();
+    let start_line = request
+        .offset
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .min(total_lines);
+    let max_lines = request.limit.unwrap_or(DEFAULT_READ_MAX_LINES);
+    let mut selected = Vec::new();
+    let mut retained_bytes = 0usize;
+    let mut byte_truncated = false;
+    for line in lines.iter().skip(start_line).take(max_lines) {
+        let line_bytes = line.len().saturating_add(1);
+        if retained_bytes.saturating_add(line_bytes) > DEFAULT_READ_MAX_BYTES {
+            byte_truncated = true;
+            break;
+        }
+        selected.push(*line);
+        retained_bytes = retained_bytes.saturating_add(line_bytes);
+    }
+    let mut output = selected.join("\n");
+    let next_line = start_line.saturating_add(selected.len()).saturating_add(1);
+    if next_line <= total_lines || byte_truncated {
+        let _ = write!(
+            output,
+            "\n\n[Showing lines {}-{} of {total_lines}. Use offset={next_line} to continue.]",
+            start_line.saturating_add(1),
+            start_line.saturating_add(selected.len())
+        );
+    }
+    ToolInvocationResponse {
+        output,
+        is_error: false,
+        content: Vec::new(),
     }
 }
 
@@ -466,11 +522,10 @@ struct ImageFileMetadata {
 }
 
 fn image_file_metadata(path: &Path) -> std::io::Result<Option<ImageFileMetadata>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let Some(mime_type) = sniff_supported_image_mime(&bytes) else {
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0_u8; 32];
+    let read = file.read(&mut header)?;
+    let Some(mime_type) = sniff_supported_image_mime(&header[..read]) else {
         return Ok(None);
     };
     let Ok((width, height)) = image::image_dimensions(path) else {
@@ -1467,6 +1522,64 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn read_text_supports_offset_and_limit() {
+        let root = temp_dir("read-offset-limit");
+        let file = root.join("file.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\n").expect("write file");
+
+        let response = read_path_for_tool(
+            &file,
+            &ReadRequest {
+                path: file.clone(),
+                offset: Some(2),
+                limit: Some(2),
+            },
+        );
+
+        assert!(!response.is_error);
+        assert!(response.output.starts_with("two\nthree"));
+        assert!(response.output.contains("Use offset=4 to continue"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_image_returns_structured_image_content() {
+        let root = temp_dir("read-image");
+        let file = root.join("image.png");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("write header");
+            writer
+                .write_image_data(&[255, 0, 0, 255])
+                .expect("write image");
+        }
+        std::fs::write(&file, bytes).expect("write image file");
+
+        let response = read_path_for_tool(
+            &file,
+            &ReadRequest {
+                path: file.clone(),
+                offset: None,
+                limit: None,
+            },
+        );
+
+        assert!(!response.is_error);
+        assert!(response.output.contains("Read image file [image/png]"));
+        assert_eq!(response.content.len(), 1);
+        let ToolResultContent::Image { image } = &response.content[0] else {
+            panic!("expected image content");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.metadata.width, Some(1));
+        assert_eq!(image.metadata.height, Some(1));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn external_command_timeout_kills_process_group() {
         let mut command = Command::new("sh");
