@@ -7,6 +7,7 @@
 pub(crate) mod activity;
 pub(crate) mod app;
 pub(crate) mod chat_loop;
+pub(crate) mod clipboard_image;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
 pub(crate) mod composer_flow;

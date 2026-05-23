@@ -93,6 +93,30 @@ fn configured_ctrl_enter_submits_while_enter_inserts_newline() {
 }
 
 #[test]
+fn default_ctrl_v_maps_to_clipboard_image_paste() {
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, ctrl_key('v')),
+        Some(BmuxAction::ClipboardPasteImage)
+    );
+}
+
+#[test]
+fn configured_clipboard_image_paste_binding_can_be_changed() {
+    let mut config = bcode_config::TuiConfig::default();
+    config.keybindings.chat =
+        BTreeMap::from([("alt+v".to_owned(), "app.clipboard.pasteImage".to_owned())]);
+    let keymap = BmuxKeyMap::from_config(&config);
+
+    assert_eq!(keymap.action_for_key(BmuxScope::Chat, ctrl_key('v')), None);
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, alt_char('v')),
+        Some(BmuxAction::ClipboardPasteImage)
+    );
+}
+
+#[test]
 fn configured_bindings_can_keep_multiple_keys_for_same_action() {
     let mut config = bcode_config::TuiConfig::default();
     config.keybindings.chat = BTreeMap::from([
@@ -941,6 +965,16 @@ fn shift_key(key: KeyCode) -> KeyStroke {
 
 fn ctrl_key(ch: char) -> KeyStroke {
     ctrl_key_code(KeyCode::Char(ch))
+}
+
+fn alt_char(ch: char) -> KeyStroke {
+    KeyStroke {
+        key: KeyCode::Char(ch),
+        modifiers: Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        },
+    }
 }
 
 fn ctrl_key_code(key: KeyCode) -> KeyStroke {

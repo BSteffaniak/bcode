@@ -10,6 +10,7 @@ use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 
+use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -214,6 +215,11 @@ async fn handle_chat_key<W: Write>(
             .set_status("command palette: type to filter, enter to run, esc close".to_owned());
         return Ok(true);
     }
+    if is_clipboard_image_paste_key(keymap, stroke) {
+        paste_clipboard_image(chat);
+        slash_flow::update_slash_palette(client, chat, &mut modals.slash_palette).await;
+        return Ok(true);
+    }
     let outcome = input::handle_key(&mut chat.app, keymap, stroke);
     slash_flow::update_slash_palette(client, chat, &mut modals.slash_palette).await;
     if outcome.interrupted {
@@ -251,4 +257,24 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
 
 fn is_palette_open_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {
     keymap.action_for_key(BmuxScope::Chat, stroke) == Some(BmuxAction::CommandPaletteOpen)
+}
+
+fn is_clipboard_image_paste_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {
+    keymap.action_for_key(BmuxScope::Chat, stroke) == Some(BmuxAction::ClipboardPasteImage)
+}
+
+fn paste_clipboard_image(chat: &mut ActiveChat) {
+    match clipboard_image::save_clipboard_image(chat.app.session_id()) {
+        Ok(path) => {
+            let text = clipboard_image::pasted_image_text(&path);
+            chat.app.reset_input_history_navigation();
+            chat.app.paste_composer_text(&text);
+            chat.app.wake_cursor();
+            chat.app
+                .set_status(format!("Image pasted: {}", path.display()));
+        }
+        Err(error) => {
+            chat.app.set_status(format!("image paste failed: {error}"));
+        }
+    }
 }

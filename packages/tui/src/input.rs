@@ -116,7 +116,8 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
             submitted: false,
             interrupted: false,
         },
-        BmuxAction::CommandPaletteOpen
+        BmuxAction::ClipboardPasteImage
+        | BmuxAction::CommandPaletteOpen
         | BmuxAction::PermissionApprove
         | BmuxAction::PermissionDeny
         | BmuxAction::SelectUp

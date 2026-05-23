@@ -51,6 +51,7 @@ pub async fn handle_permission_key(
         | BmuxAction::InputHistoryNext
         | BmuxAction::AppExit
         | BmuxAction::AppInterrupt
+        | BmuxAction::ClipboardPasteImage
         | BmuxAction::CommandPaletteOpen
         | BmuxAction::TranscriptPageUp
         | BmuxAction::TranscriptPageDown

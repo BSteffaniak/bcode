@@ -26,6 +26,7 @@ pub enum BmuxAction {
     InputHistoryNext,
     AppExit,
     AppInterrupt,
+    ClipboardPasteImage,
     CommandPaletteOpen,
     TranscriptPageUp,
     TranscriptPageDown,
@@ -75,6 +76,7 @@ impl BmuxAction {
             "tui.input.historyNext" => Self::InputHistoryNext,
             "app.exit" => Self::AppExit,
             "app.interrupt" => Self::AppInterrupt,
+            "app.clipboard.pasteImage" => Self::ClipboardPasteImage,
             "app.command_palette" => Self::CommandPaletteOpen,
             "transcript.pageUp" => Self::TranscriptPageUp,
             "transcript.pageDown" => Self::TranscriptPageDown,
@@ -166,6 +168,7 @@ impl BmuxKeyMap {
             (BmuxAction::InputSubmit, "send"),
             (BmuxAction::AppInterrupt, "interrupt"),
             (BmuxAction::AppExit, "exit"),
+            (BmuxAction::ClipboardPasteImage, "paste image"),
             (BmuxAction::CommandPaletteOpen, "palette"),
         ]
         .into_iter()
@@ -214,6 +217,7 @@ impl BmuxKeyMap {
             | BmuxAction::InputHistoryNext
             | BmuxAction::AppExit
             | BmuxAction::AppInterrupt
+            | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
@@ -263,6 +267,7 @@ impl BmuxKeyMap {
             | BmuxAction::InputHistoryNext
             | BmuxAction::AppExit
             | BmuxAction::AppInterrupt
+            | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
@@ -361,6 +366,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
                 bind("shift+down", BmuxAction::EditorSelectDown),
                 bind("ctrl+d", BmuxAction::AppExit),
                 bind("escape", BmuxAction::AppInterrupt),
+                bind("ctrl+v", BmuxAction::ClipboardPasteImage),
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),
                 bind("pageUp", BmuxAction::TranscriptPageUp),
                 bind("pageDown", BmuxAction::TranscriptPageDown),

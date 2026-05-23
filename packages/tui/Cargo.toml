@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+arboard               = { workspace = true }
 bcode_client          = { workspace = true }
 bcode_command         = { workspace = true }
 bcode_config          = { workspace = true }
@@ -25,11 +26,13 @@ bmux_text_edit        = { workspace = true }
 bmux_tui              = { workspace = true, features = ["crossterm", "diff"] }
 bmux_tui_components   = { workspace = true, features = ["text-input"] }
 crossterm             = { workspace = true, features = ["bracketed-paste", "events"] }
+png                   = { workspace = true }
 serde                 = { workspace = true, features = ["derive", "std"] }
 serde_json            = { workspace = true }
 thiserror             = { workspace = true }
 tokio                 = { workspace = true, features = ["sync"] }
 unicode-segmentation  = { workspace = true }
+uuid                  = { workspace = true, features = ["v4"] }
 
 [features]
 default          = []
