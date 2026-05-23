@@ -5177,7 +5177,72 @@ fn session_events_to_model_messages_with_limit(
             session_event_to_model_message_with_limit(event, tool_output_context_chars)
         }));
     }
-    messages
+    complete_orphaned_tool_calls_for_model_context(messages)
+}
+
+fn complete_orphaned_tool_calls_for_model_context(
+    messages: Vec<ModelMessage>,
+) -> Vec<ModelMessage> {
+    let mut completed = Vec::with_capacity(messages.len());
+    let mut pending_tool_call_ids = Vec::<String>::new();
+
+    for message in messages {
+        if message.role != MessageRole::Tool && !pending_tool_call_ids.is_empty() {
+            append_missing_tool_results(&mut completed, &mut pending_tool_call_ids);
+        }
+
+        collect_tool_results(&message, &mut pending_tool_call_ids);
+        let tool_call_ids = assistant_tool_call_ids(&message);
+        completed.push(message);
+        pending_tool_call_ids.extend(tool_call_ids);
+    }
+
+    append_missing_tool_results(&mut completed, &mut pending_tool_call_ids);
+    completed
+}
+
+fn assistant_tool_call_ids(message: &ModelMessage) -> Vec<String> {
+    if message.role != MessageRole::Assistant {
+        return Vec::new();
+    }
+    message
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            ContentBlock::ToolCall { call } => Some(call.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_tool_results(message: &ModelMessage, pending_tool_call_ids: &mut Vec<String>) {
+    if message.role != MessageRole::Tool {
+        return;
+    }
+    for call_id in message.content.iter().filter_map(|content| match content {
+        ContentBlock::ToolResult { result } => Some(&result.call_id),
+        _ => None,
+    }) {
+        pending_tool_call_ids.retain(|pending_call_id| pending_call_id != call_id);
+    }
+}
+
+fn append_missing_tool_results(
+    messages: &mut Vec<ModelMessage>,
+    pending_tool_call_ids: &mut Vec<String>,
+) {
+    messages.extend(pending_tool_call_ids.drain(..).map(|call_id| ModelMessage {
+        role: MessageRole::Tool,
+        content: vec![ContentBlock::ToolResult {
+            result: bcode_model::ToolResult {
+                call_id,
+                output: "tool invocation was interrupted before Bcode could persist a result"
+                    .to_string(),
+                is_error: true,
+                content: Vec::new(),
+            },
+        }],
+    }));
 }
 
 fn session_event_to_model_message_with_limit(
@@ -6287,6 +6352,79 @@ mod tests {
         assert!(matches!(
             &messages[1].content[0],
             ContentBlock::Text { text } if text == "current request"
+        ));
+    }
+
+    #[test]
+    fn session_projection_synthesizes_missing_tool_result_before_next_user_message() {
+        let session_id = SessionId::new();
+        let client_id = ClientId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                0,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "shell.run".to_string(),
+                    arguments_json: r#"{"command":"true"}"#.to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id,
+                    text: "continue".to_string(),
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&history);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert_eq!(messages[2].role, MessageRole::User);
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolResult { result }
+                if result.call_id == "call-1" && result.is_error
+        ));
+    }
+
+    #[test]
+    fn session_projection_keeps_existing_tool_result_for_tool_call() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                0,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "shell.run".to_string(),
+                    arguments_json: r#"{"command":"true"}"#.to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_string(),
+                    result: "ok".to_string(),
+                    is_error: false,
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&history);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolResult { result }
+                if result.call_id == "call-1" && result.output == "ok" && !result.is_error
         ));
     }
 

@@ -284,6 +284,8 @@ impl LoadedPlugin {
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let mut output_len = 0_usize;
         let mut output = vec![0_u8; 65_536];
+        let mut event_callback: &mut dyn FnMut(Vec<u8>) = &mut on_event;
+        let event_user_data = (&raw mut event_callback).cast::<std::ffi::c_void>();
         let mut status = self.invoke_service_raw(
             input.as_ptr(),
             input.len(),
@@ -291,7 +293,7 @@ impl LoadedPlugin {
             output.len(),
             &raw mut output_len,
             Some(service_event_callback),
-            (&raw mut on_event).cast::<std::ffi::c_void>(),
+            event_user_data,
         );
         if status == SERVICE_STATUS_BUFFER_TOO_SMALL {
             output.resize(output_len, 0);
@@ -302,7 +304,7 @@ impl LoadedPlugin {
                 output.len(),
                 &raw mut output_len,
                 Some(service_event_callback),
-                (&raw mut on_event).cast::<std::ffi::c_void>(),
+                event_user_data,
             );
         }
         if status != SERVICE_STATUS_OK {
@@ -922,18 +924,18 @@ impl PluginExecutorHandle {
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
         let (response, response_receiver) = oneshot::channel();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
-        let invocation = PluginInvocation {
-            id: next_plugin_invocation_id(),
-            class,
-            enqueued_at: Instant::now(),
-            interface_id,
-            operation,
-            payload,
-            response,
-            event_sender: Some(event_sender),
-        };
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
+                let invocation = PluginInvocation {
+                    id: next_plugin_invocation_id(),
+                    class,
+                    enqueued_at: Instant::now(),
+                    interface_id,
+                    operation,
+                    payload,
+                    response,
+                    event_sender: Some(event_sender),
+                };
                 self.metrics.enqueue(class);
                 sender
                     .send(PluginExecutorMessage::Service(invocation))
@@ -952,6 +954,17 @@ impl PluginExecutorHandle {
                     }
                     None => None,
                 };
+                let (unused_response, _) = oneshot::channel();
+                let invocation = PluginInvocation {
+                    id: next_plugin_invocation_id(),
+                    class,
+                    enqueued_at: Instant::now(),
+                    interface_id,
+                    operation,
+                    payload,
+                    response: unused_response,
+                    event_sender: Some(event_sender),
+                };
                 let plugin = Arc::clone(plugin);
                 let metrics = Arc::clone(&self.metrics);
                 tokio::task::spawn(async move {
@@ -961,8 +974,7 @@ impl PluginExecutorHandle {
                     })
                     .await
                     .unwrap_or_else(|error| Err(PluginLoadError::Io(std::io::Error::other(error))));
-                    // The blocking invocation sends its own response through the invocation channel.
-                    let _ = result;
+                    let _ = response.send(result);
                 });
             }
         }
@@ -2239,6 +2251,58 @@ library = "libexample_plugin.dylib"
     }
 
     #[test]
+    fn static_service_event_callback_delivers_stream_events() {
+        let plugin = LoadedPlugin {
+            manifest: test_manifest("events"),
+            backend: LoadedPluginBackend::Static {
+                vtable: test_streaming_vtable(),
+            },
+        };
+        let mut events = Vec::new();
+
+        let response = plugin
+            .invoke_service_with_events("events", "run", Vec::new(), |event| events.push(event))
+            .expect("service should invoke");
+
+        assert_eq!(response.payload, b"ok");
+        assert_eq!(events, vec![b"event".to_vec()]);
+    }
+
+    #[test]
+    fn concurrent_streaming_service_sends_response_and_events() {
+        let mut manifest = test_manifest("events");
+        manifest.concurrency = PluginConcurrencyConfig::Limited { max: 1 };
+        let runtime = PluginRuntimeHost::from(PluginHost {
+            loaded: vec![LoadedPlugin {
+                manifest,
+                backend: LoadedPluginBackend::Static {
+                    vtable: test_streaming_vtable(),
+                },
+            }],
+        });
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+
+        tokio.block_on(async {
+            let mut invocation = runtime
+                .invoke_service_with_events("events", "events", "run", Vec::new())
+                .await
+                .expect("service should start");
+            let event = invocation.events.recv().await.expect("event should emit");
+            let response = invocation
+                .response
+                .await
+                .expect("response sender should stay alive")
+                .expect("service should invoke");
+
+            assert_eq!(event, b"event".to_vec());
+            assert_eq!(response.payload, b"ok");
+        });
+    }
+
+    #[test]
     fn discovers_plugin_manifest_in_child_directory() {
         let root = unique_temp_dir();
         let plugin_dir = root.join("example-plugin");
@@ -2475,6 +2539,104 @@ library = "libexample_plugin.dylib"
         });
         assert_eq!(SLOW_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(FAST_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    fn test_activate(_: *const std::ffi::c_void) -> i32 {
+        0
+    }
+
+    fn test_deactivate(_: *const std::ffi::c_void) -> i32 {
+        0
+    }
+
+    fn test_handle_event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
+        bcode_plugin_sdk::EVENT_STATUS_OK
+    }
+
+    fn test_service(
+        _: *const std::ffi::c_void,
+        _: *const u8,
+        _: usize,
+        output: *mut u8,
+        cap: usize,
+        len: *mut usize,
+    ) -> i32 {
+        write_test_response(&ServiceResponse::text("ok"), output, cap, len)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_streaming_service(
+        instance: *const std::ffi::c_void,
+        input_ptr: *const u8,
+        input_len: usize,
+        output: *mut u8,
+        cap: usize,
+        len: *mut usize,
+        callback: Option<ServiceEventCallback>,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        if let Some(callback) = callback {
+            callback(b"event".as_ptr(), b"event".len(), user_data);
+        }
+        test_service(instance, input_ptr, input_len, output, cap, len)
+    }
+
+    fn test_streaming_vtable() -> StaticPluginVtable {
+        StaticPluginVtable {
+            instance: std::ptr::null(),
+            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
+            activate: test_activate,
+            deactivate: test_deactivate,
+            invoke_service: test_service,
+            invoke_service_streaming: test_streaming_service,
+            handle_event: test_handle_event,
+        }
+    }
+
+    fn test_manifest(id: &str) -> PluginManifest {
+        PluginManifest {
+            id: id.to_string(),
+            name: id.to_string(),
+            version: Version::new(0, 0, 1),
+            services: vec![PluginService {
+                interface_id: id.to_string(),
+                name: None,
+                description: None,
+                concurrency: None,
+                class: None,
+            }],
+            event_subscriptions: Vec::new(),
+            concurrency: PluginConcurrencyConfig::Exclusive,
+            runtime: PluginRuntime::Native(NativePluginRuntime {
+                abi_version: CURRENT_PLUGIN_ABI_VERSION,
+                library: PathBuf::from("test"),
+                manifest_symbol: DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string(),
+                activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
+                deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
+                service_symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
+                streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
+                event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
+            }),
+        }
+    }
+
+    fn write_test_response(
+        response: &ServiceResponse,
+        output: *mut u8,
+        cap: usize,
+        len: *mut usize,
+    ) -> i32 {
+        let encoded = serde_json::to_vec(response).expect("service response encodes");
+        unsafe {
+            *len = encoded.len();
+        }
+        if output.is_null() || cap < encoded.len() {
+            return SERVICE_STATUS_BUFFER_TOO_SMALL;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
+        }
+        SERVICE_STATUS_OK
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {
