@@ -25,7 +25,7 @@ use std::sync::{
 };
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 /// Default plugin manifest file name.
 pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
@@ -785,8 +785,14 @@ enum PluginExecutorMessage {
 pub struct PluginExecutorHandle {
     manifest: PluginManifest,
     concurrency: PluginConcurrency,
-    sender: mpsc::Sender<PluginExecutorMessage>,
+    executor: PluginExecutorKind,
     metrics: Arc<PluginExecutorMetrics>,
+}
+
+#[derive(Debug)]
+enum PluginExecutorKind {
+    Exclusive(mpsc::Sender<PluginExecutorMessage>),
+    Concurrent(Arc<LoadedPlugin>, Option<Arc<Semaphore>>),
 }
 
 impl PluginExecutorHandle {
@@ -794,13 +800,13 @@ impl PluginExecutorHandle {
     const fn new(
         manifest: PluginManifest,
         concurrency: PluginConcurrency,
-        sender: mpsc::Sender<PluginExecutorMessage>,
+        executor: PluginExecutorKind,
         metrics: Arc<PluginExecutorMetrics>,
     ) -> Self {
         Self {
             manifest,
             concurrency,
-            sender,
+            executor,
             metrics,
         }
     }
@@ -831,59 +837,121 @@ impl PluginExecutorHandle {
         payload: Vec<u8>,
         class: PluginInvocationClass,
     ) -> Result<ServiceResponse, PluginLoadError> {
-        let (response, receiver) = oneshot::channel();
-        self.metrics.enqueue(class);
-        self.sender
-            .send(PluginExecutorMessage::Service(PluginInvocation {
-                id: next_plugin_invocation_id(),
-                class,
-                enqueued_at: Instant::now(),
-                interface_id,
-                operation,
-                payload,
-                response,
-            }))
-            .await
-            .map_err(|_| {
-                self.metrics.dequeue(class);
-                PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
-            })?;
-        receiver
-            .await
-            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+        let invocation = PluginInvocation {
+            id: next_plugin_invocation_id(),
+            class,
+            enqueued_at: Instant::now(),
+            interface_id,
+            operation,
+            payload,
+            response: oneshot::channel().0,
+        };
+        match &self.executor {
+            PluginExecutorKind::Exclusive(sender) => {
+                let (response, receiver) = oneshot::channel();
+                let invocation = PluginInvocation {
+                    response,
+                    ..invocation
+                };
+                self.metrics.enqueue(class);
+                sender
+                    .send(PluginExecutorMessage::Service(invocation))
+                    .await
+                    .map_err(|_| {
+                        self.metrics.dequeue(class);
+                        PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+                    })?;
+                receiver
+                    .await
+                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+            }
+            PluginExecutorKind::Concurrent(plugin, semaphore) => {
+                let permit = match semaphore {
+                    Some(semaphore) => {
+                        Some(semaphore.clone().acquire_owned().await.map_err(|_| {
+                            PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+                        })?)
+                    }
+                    None => None,
+                };
+                let plugin = Arc::clone(plugin);
+                let metrics = Arc::clone(&self.metrics);
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    execute_plugin_service_invocation(&plugin, invocation, &metrics)
+                })
+                .await
+                .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+            }
+        }
     }
 
     async fn handle_event(&self, topic: String, payload: Vec<u8>) -> Result<(), PluginLoadError> {
-        let (response, receiver) = oneshot::channel();
-        self.metrics.enqueue(PluginInvocationClass::EventDelivery);
-        self.sender
-            .send(PluginExecutorMessage::Event(PluginEventInvocation {
-                id: next_plugin_invocation_id(),
-                class: PluginInvocationClass::EventDelivery,
-                enqueued_at: Instant::now(),
-                topic,
-                payload,
-                response,
-            }))
-            .await
-            .map_err(|_| {
-                self.metrics.dequeue(PluginInvocationClass::EventDelivery);
-                PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
-            })?;
-        receiver
-            .await
-            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+        match &self.executor {
+            PluginExecutorKind::Exclusive(sender) => {
+                let (response, receiver) = oneshot::channel();
+                self.metrics.enqueue(PluginInvocationClass::EventDelivery);
+                sender
+                    .send(PluginExecutorMessage::Event(PluginEventInvocation {
+                        id: next_plugin_invocation_id(),
+                        class: PluginInvocationClass::EventDelivery,
+                        enqueued_at: Instant::now(),
+                        topic,
+                        payload,
+                        response,
+                    }))
+                    .await
+                    .map_err(|_| {
+                        self.metrics.dequeue(PluginInvocationClass::EventDelivery);
+                        PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+                    })?;
+                receiver
+                    .await
+                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+            }
+            PluginExecutorKind::Concurrent(plugin, semaphore) => {
+                let permit = match semaphore {
+                    Some(semaphore) => {
+                        Some(semaphore.clone().acquire_owned().await.map_err(|_| {
+                            PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+                        })?)
+                    }
+                    None => None,
+                };
+                let plugin = Arc::clone(plugin);
+                let metrics = Arc::clone(&self.metrics);
+                let invocation = PluginEventInvocation {
+                    id: next_plugin_invocation_id(),
+                    class: PluginInvocationClass::EventDelivery,
+                    enqueued_at: Instant::now(),
+                    topic,
+                    payload,
+                    response: oneshot::channel().0,
+                };
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    execute_plugin_event_invocation(&plugin, invocation, &metrics)
+                })
+                .await
+                .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+            }
+        }
     }
 
     async fn deactivate(&self) -> Result<(), PluginLoadError> {
         let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(PluginExecutorMessage::Deactivate(response))
-            .await
-            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
-        receiver
-            .await
-            .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+        match &self.executor {
+            PluginExecutorKind::Exclusive(sender) => {
+                sender
+                    .send(PluginExecutorMessage::Deactivate(response))
+                    .await
+                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+                receiver
+                    .await
+                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+            }
+            PluginExecutorKind::Concurrent(plugin, _) => plugin.deactivate(),
+        }
     }
 }
 
@@ -1183,15 +1251,28 @@ impl From<PluginHost> for PluginRuntimeHost {
             let manifest = plugin.manifest().clone();
             let plugin_id = manifest.id.clone();
             manifests.insert(plugin_id.clone(), manifest.clone());
-            let (sender, receiver) = mpsc::channel(32);
             let metrics = Arc::new(PluginExecutorMetrics::default());
-            spawn_exclusive_plugin_executor(plugin, receiver, Arc::clone(&metrics));
+            let concurrency = PluginConcurrency::from(&manifest.concurrency);
+            let executor = match concurrency {
+                PluginConcurrency::Exclusive => {
+                    let (sender, receiver) = mpsc::channel(32);
+                    spawn_exclusive_plugin_executor(plugin, receiver, Arc::clone(&metrics));
+                    PluginExecutorKind::Exclusive(sender)
+                }
+                PluginConcurrency::Limited(max) => PluginExecutorKind::Concurrent(
+                    Arc::new(plugin),
+                    Some(Arc::new(Semaphore::new(max.max(1)))),
+                ),
+                PluginConcurrency::Concurrent => {
+                    PluginExecutorKind::Concurrent(Arc::new(plugin), None)
+                }
+            };
             executors.insert(
                 plugin_id,
                 Arc::new(PluginExecutorHandle::new(
                     manifest.clone(),
-                    PluginConcurrency::from(&manifest.concurrency),
-                    sender,
+                    concurrency,
+                    executor,
                     metrics,
                 )),
             );
@@ -1201,6 +1282,79 @@ impl From<PluginHost> for PluginRuntimeHost {
             executors: Arc::new(executors),
         }
     }
+}
+
+fn execute_plugin_service_invocation(
+    plugin: &LoadedPlugin,
+    invocation: PluginInvocation,
+    metrics: &PluginExecutorMetrics,
+) -> Result<ServiceResponse, PluginLoadError> {
+    metrics.running.fetch_add(1, Ordering::Relaxed);
+    let started_at = Instant::now();
+    tracing::debug!(
+        target: "bcode_plugin::runtime",
+        plugin_id = %plugin.manifest.id,
+        invocation_id = invocation.id.get(),
+        class = ?invocation.class,
+        queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
+        interface_id = %invocation.interface_id,
+        operation = %invocation.operation,
+        "plugin service invocation started"
+    );
+    let response = plugin.invoke_service(
+        invocation.interface_id,
+        invocation.operation,
+        invocation.payload,
+    );
+    metrics.running.fetch_sub(1, Ordering::Relaxed);
+    if response.is_ok() {
+        metrics.completed.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.failed.fetch_add(1, Ordering::Relaxed);
+    }
+    tracing::debug!(
+        target: "bcode_plugin::runtime",
+        plugin_id = %plugin.manifest.id,
+        invocation_id = invocation.id.get(),
+        duration_ms = started_at.elapsed().as_millis(),
+        success = response.is_ok(),
+        "plugin service invocation finished"
+    );
+    response
+}
+
+fn execute_plugin_event_invocation(
+    plugin: &LoadedPlugin,
+    invocation: PluginEventInvocation,
+    metrics: &PluginExecutorMetrics,
+) -> Result<(), PluginLoadError> {
+    metrics.running.fetch_add(1, Ordering::Relaxed);
+    let started_at = Instant::now();
+    tracing::debug!(
+        target: "bcode_plugin::runtime",
+        plugin_id = %plugin.manifest.id,
+        invocation_id = invocation.id.get(),
+        class = ?invocation.class,
+        queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
+        topic = %invocation.topic,
+        "plugin event invocation started"
+    );
+    let response = plugin.handle_event(invocation.topic, invocation.payload);
+    metrics.running.fetch_sub(1, Ordering::Relaxed);
+    if response.is_ok() {
+        metrics.completed.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.failed.fetch_add(1, Ordering::Relaxed);
+    }
+    tracing::debug!(
+        target: "bcode_plugin::runtime",
+        plugin_id = %plugin.manifest.id,
+        invocation_id = invocation.id.get(),
+        duration_ms = started_at.elapsed().as_millis(),
+        success = response.is_ok(),
+        "plugin event invocation finished"
+    );
+    response
 }
 
 fn spawn_exclusive_plugin_executor(
