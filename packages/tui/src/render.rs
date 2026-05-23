@@ -16,7 +16,6 @@ use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
-use bmux_tui::text_block::{TextBlock, TextWrap};
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
@@ -84,17 +83,15 @@ fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
 }
 
 fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
-    let session_id = app.session_id().map_or_else(
-        || "new".to_owned(),
-        |id| truncate_middle(&id.to_string(), 12),
-    );
-    let session_title = app.session_title().map_or_else(
-        || "Untitled session".to_owned(),
-        |title| truncate_end(title, 28),
-    );
-    let provider = truncate_middle(app.selected_provider_plugin_id().unwrap_or("auto"), 22);
-    let model = truncate_middle(app.selected_model_id().unwrap_or("default"), 30);
-    let agent = truncate_middle(app.current_agent_id(), 18);
+    let session_id = app
+        .session_id()
+        .map_or_else(|| "new".to_owned(), |id| id.to_string());
+    let session_title = app
+        .session_title()
+        .map_or_else(|| "Untitled session".to_owned(), ToOwned::to_owned);
+    let provider = app.selected_provider_plugin_id().unwrap_or("auto");
+    let model = app.selected_model_id().unwrap_or("default");
+    let agent = app.current_agent_id();
     let line = Line::from_spans(vec![
         Span::styled(
             "bcode",
@@ -172,11 +169,6 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     }
     if app.transcript().is_empty() && app.pending_submissions().is_empty() {
-        TextBlock::new(
-            "TUI is attached. Composer submissions are sent to the active Bcode session; live transcript events will appear here.",
-        )
-        .wrap(TextWrap::Character)
-        .render(area.inset(Insets::all(1)), frame);
         return;
     }
 
@@ -395,7 +387,7 @@ fn push_tool_request_rows(
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
-        &format!("call {}", truncate_middle(tool_call_id, 20)),
+        &format!("call {tool_call_id}"),
         width,
         muted_style(),
         muted_style(),
@@ -456,7 +448,7 @@ fn push_tool_result_rows(
         push_wrapped_styled_text(
             rows,
             vec![Span::styled("  ", muted_style())],
-            &format!("tool call {}", truncate_middle(context.tool_call_id, 20)),
+            &format!("tool call {}", context.tool_call_id),
             width,
             muted_style(),
             muted_style(),
@@ -1326,11 +1318,7 @@ fn shell_status_style(output: &CaptureShellOutput) -> Style {
 }
 
 fn push_usage_rows(rows: &mut Vec<Line>, item: &TranscriptItem, turn_id: &str, width: u16) {
-    push_meta_block(
-        rows,
-        &format!("Usage · {} · {}", truncate_middle(turn_id, 18), item.text()),
-        width,
-    );
+    push_meta_block(rows, &format!("Usage · {turn_id} · {}", item.text()), width);
 }
 
 fn push_permission_request_rows(
@@ -1343,8 +1331,8 @@ fn push_permission_request_rows(
 ) {
     let body = format!(
         "permission {}\ntool call {}\narguments:\n{}",
-        truncate_middle(permission_id, 20),
-        truncate_middle(tool_call_id, 20),
+        permission_id,
+        tool_call_id,
         item.text()
     );
     push_detail_block(
@@ -1601,43 +1589,6 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         .vertical_scroll(app.composer_scroll_offset_for_render())
         .cursor_visible(app.cursor_visible())
         .render(inner, frame);
-}
-
-fn truncate_middle(value: &str, max_chars: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() <= max_chars {
-        return value.to_owned();
-    }
-    if max_chars <= 1 {
-        return "…".to_owned();
-    }
-    let left = max_chars / 2;
-    let right = max_chars.saturating_sub(left).saturating_sub(1);
-    let mut output = chars.iter().take(left).collect::<String>();
-    output.push('…');
-    output.extend(
-        chars
-            .iter()
-            .skip(chars.len().saturating_sub(right))
-            .copied(),
-    );
-    output
-}
-
-fn truncate_end(value: &str, max_chars: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() <= max_chars {
-        return value.to_owned();
-    }
-    if max_chars <= 1 {
-        return "…".to_owned();
-    }
-    let mut output = chars
-        .iter()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    output.push('…');
-    output
 }
 
 const fn muted_style() -> Style {

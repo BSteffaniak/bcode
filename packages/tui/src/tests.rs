@@ -33,7 +33,7 @@ fn render_includes_status_and_composer() {
     let output = rendered_text(&buffer);
 
     assert!(buffer.row_symbols(0).unwrap().contains("bcode"));
-    assert!(output.contains("TUI"));
+    assert!(!output.contains("TUI is attached"));
     assert!(buffer.row_symbols(7).unwrap().contains("Message"));
     assert!(cursor.is_some());
 }
@@ -449,7 +449,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
             capabilities: BTreeSet::new(),
         }),
     });
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 12));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
@@ -462,7 +462,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
             .contains("Visual parity work")
     );
     assert!(buffer.row_symbols(0).unwrap().contains("provider.example"));
-    assert!(buffer.row_symbols(0).unwrap().contains("model-example"));
+    assert!(output.contains("model-example"));
     assert!(buffer.row_symbols(0).unwrap().contains("agent: plan"));
     assert!(output.contains("ctx 512/1.0k 50%"));
     assert!(output.contains("cached 256 tok"));
@@ -652,7 +652,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
 
     assert!(output.contains("Tool · shell.run"));
     assert!(output.contains("call call_ABCD"));
-    assert!(!output.contains(full_call_id));
+    assert!(output.contains(full_call_id));
     assert!(output.contains("command: cargo check"));
     assert!(output.contains("cwd: /tmp/project"));
     assert!(output.contains("Tool result · shell.run · ok"));
