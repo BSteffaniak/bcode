@@ -727,6 +727,7 @@ dependencies = [
  "aws-sdk-bedrock",
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bcode_config",
  "bcode_model",
  "bcode_model_provider_runtime",

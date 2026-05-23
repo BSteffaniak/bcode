@@ -11,12 +11,14 @@ use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::DisplayErrorContext;
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock as BedrockContentBlock, ContentBlockDelta,
-    ContentBlockStart, ConversationRole, ConverseStreamOutput, InferenceConfiguration,
-    Message as BedrockMessage, StopReason as BedrockStopReason, SystemContentBlock, Tool,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
-    ToolSpecification, ToolUseBlock,
+    ContentBlockStart, ConversationRole, ConverseStreamOutput, ImageBlock, ImageFormat,
+    ImageSource, InferenceConfiguration, Message as BedrockMessage,
+    StopReason as BedrockStopReason, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
+    ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
 };
+use aws_smithy_types::Blob;
 use aws_smithy_types::{Document, Number};
+use base64::Engine as _;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
@@ -634,6 +636,9 @@ fn bedrock_content_blocks(
     if !text.is_empty() {
         blocks.push(BedrockContentBlock::Text(text));
     }
+    for image in message_image_blocks(message) {
+        blocks.push(BedrockContentBlock::Image(bedrock_image_block(image)?));
+    }
     for block in &message.content {
         match block {
             ContentBlock::ToolCall { call } => {
@@ -650,6 +655,12 @@ fn bedrock_content_blocks(
                 let mut builder = ToolResultBlock::builder()
                     .tool_use_id(result.call_id.clone())
                     .content(ToolResultContentBlock::Text(result.output.clone()));
+                for content in &result.content {
+                    if let bcode_model::ToolResultContent::Image { image } = content {
+                        builder = builder
+                            .content(ToolResultContentBlock::Image(bedrock_image_block(image)?));
+                    }
+                }
                 if result.is_error {
                     builder = builder.status(ToolResultStatus::Error);
                 }
@@ -666,6 +677,49 @@ fn bedrock_content_blocks(
         }
     }
     Ok(blocks)
+}
+
+fn message_image_blocks(
+    message: &ModelMessage,
+) -> impl Iterator<Item = &bcode_model::ImageContent> {
+    message.content.iter().filter_map(|block| match block {
+        ContentBlock::Image { image } => Some(image),
+        _ => None,
+    })
+}
+
+fn bedrock_image_block(image: &bcode_model::ImageContent) -> Result<ImageBlock, ProviderError> {
+    let format = bedrock_image_format(&image.mime_type).ok_or_else(|| {
+        provider_error(
+            "bedrock_unsupported_image_mime_type",
+            ProviderErrorCategory::UnsupportedFeature,
+            format!("unsupported Bedrock image MIME type: {}", image.mime_type),
+        )
+    })?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&image.data_base64)
+        .map_err(|error| {
+            provider_error(
+                "bedrock_invalid_image_data",
+                ProviderErrorCategory::InvalidRequest,
+                format!("invalid image data: {error}"),
+            )
+        })?;
+    ImageBlock::builder()
+        .format(format)
+        .source(ImageSource::Bytes(Blob::new(bytes)))
+        .build()
+        .map_err(|error| build_error(&error))
+}
+
+fn bedrock_image_format(mime_type: &str) -> Option<ImageFormat> {
+    match mime_type {
+        "image/png" => Some(ImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::Webp),
+        _ => None,
+    }
 }
 
 fn joined_text_content(message: &ModelMessage) -> String {
