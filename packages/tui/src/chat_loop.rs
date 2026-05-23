@@ -265,13 +265,15 @@ fn is_clipboard_image_paste_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool 
 
 fn paste_clipboard_image(chat: &mut ActiveChat) {
     match clipboard_image::save_clipboard_image(chat.app.session_id()) {
-        Ok(path) => {
-            let text = clipboard_image::pasted_image_text(&path);
+        Ok(artifact) => {
+            let text = clipboard_image::pasted_image_text(&artifact.model);
             chat.app.reset_input_history_navigation();
             chat.app.paste_composer_text(&text);
             chat.app.wake_cursor();
-            chat.app
-                .set_status(format!("Image pasted: {}", path.display()));
+            chat.app.set_status(format!(
+                "Image pasted: {}; source saved in session artifacts",
+                artifact.model.display()
+            ));
         }
         Err(error) => {
             chat.app.set_status(format!("image paste failed: {error}"));

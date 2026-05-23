@@ -4,7 +4,6 @@
 
 //! Local Bcode daemon runtime.
 
-use base64::Engine as _;
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
     AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
@@ -18,9 +17,9 @@ use bcode_ipc::{
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageContent,
-    ImageMetadata as ModelImageMetadata, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability,
-    ModelList, ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN,
-    OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    ImageMetadata as ModelImageMetadata, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList,
+    ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_session::SessionManager;
@@ -4070,30 +4069,6 @@ where
     .map_err(|error| error.to_string())
 }
 
-async fn selected_model_capabilities(
-    state: &ServerState,
-    provider_plugin_id: Option<&str>,
-    selected_model_id: Option<&str>,
-) -> Option<bcode_model::ModelInfo> {
-    let models = invoke_model_provider_json_blocking::<_, ModelList>(
-        state,
-        provider_plugin_id.map(str::to_string),
-        OP_MODELS,
-        serde_json::Value::Null,
-    )
-    .await
-    .ok()?;
-    select_model_info(&models.models, selected_model_id)
-}
-
-fn count_image_blocks(messages: &[ModelMessage]) -> usize {
-    messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .filter(|block| matches!(block, ContentBlock::Image { .. }))
-        .count()
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_model_turn_request(
     state: &ServerState,
@@ -4106,22 +4081,12 @@ async fn build_model_turn_request(
     selection: &SessionModelSelection,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let history = state.sessions.model_context_events(session_id).await?;
-    let working_directory = state.sessions.session_working_directory(session_id).await?;
     let mut messages =
         session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
-    materialize_user_image_paths(&mut messages, &working_directory);
-    let image_capability =
-        selected_model_capabilities(state, provider_plugin_id, selected_model_id)
-            .await
-            .map(|model| model.capabilities.contains(&ModelCapability::ImageInput));
-    if image_capability == Some(false) && count_image_blocks(&messages) > 0 {
-        return Err(bcode_session::SessionError::ModelRequest(
-            "selected model does not declare image input support".to_string(),
-        ));
-    }
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;
+    let working_directory = state.sessions.session_working_directory(session_id).await?;
     let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
         &working_directory,
         agent_context
@@ -5159,119 +5124,6 @@ fn session_event_to_model_message_with_limit(
     }
 }
 
-fn materialize_user_image_paths(messages: &mut [ModelMessage], working_directory: &Path) {
-    for message in messages {
-        if message.role != MessageRole::User {
-            continue;
-        }
-        let mut content = Vec::new();
-        for block in std::mem::take(&mut message.content) {
-            match block {
-                ContentBlock::Text { text } => {
-                    content.extend(text_with_image_path_blocks(&text, working_directory));
-                }
-                other => content.push(other),
-            }
-        }
-        message.content = content;
-    }
-}
-
-fn text_with_image_path_blocks(text: &str, working_directory: &Path) -> Vec<ContentBlock> {
-    let mut blocks = Vec::new();
-    let mut text_start = 0;
-    for (start, end, image) in image_references_in_text(text, working_directory) {
-        if start > text_start {
-            blocks.push(ContentBlock::Text {
-                text: text[text_start..start].to_string(),
-            });
-        }
-        blocks.push(ContentBlock::Image { image });
-        text_start = end;
-    }
-    if text_start < text.len() || blocks.is_empty() {
-        blocks.push(ContentBlock::Text {
-            text: text[text_start..].to_string(),
-        });
-    }
-    blocks
-}
-
-fn image_references_in_text(
-    text: &str,
-    working_directory: &Path,
-) -> Vec<(usize, usize, ImageContent)> {
-    text.char_indices()
-        .filter(|(_, character)| !is_path_char(*character))
-        .map(|(index, _)| index)
-        .chain(std::iter::once(text.len()))
-        .scan(0, |start, end| {
-            let token = &text[*start..end];
-            let current_start = *start;
-            *start = end + text[end..].chars().next().map_or(0, char::len_utf8);
-            Some((current_start, end, token))
-        })
-        .filter_map(|(start, _end, token)| {
-            let trimmed = token.trim_matches(is_path_wrapper);
-            if trimmed.is_empty() {
-                return None;
-            }
-            let trim_start = token.find(trimmed).unwrap_or(0);
-            let path_start = start + trim_start;
-            let path_end = path_start + trimmed.len();
-            image_content_from_path(trimmed, working_directory)
-                .map(|image| (path_start, path_end, image))
-        })
-        .collect()
-}
-
-const fn is_path_char(character: char) -> bool {
-    !character.is_whitespace()
-}
-
-const fn is_path_wrapper(character: char) -> bool {
-    matches!(
-        character,
-        '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
-    )
-}
-
-fn image_content_from_path(raw_path: &str, working_directory: &Path) -> Option<ImageContent> {
-    let path = Path::new(raw_path);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        working_directory.join(path)
-    };
-    let bytes = fs::read(&path).ok()?;
-    let mime_type = sniff_supported_image_mime(&bytes)?;
-    let dimensions = image::image_dimensions(&path).ok();
-    Some(ImageContent {
-        mime_type: mime_type.to_string(),
-        data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-        metadata: ModelImageMetadata {
-            width: dimensions.map(|(width, _)| width),
-            height: dimensions.map(|(_, height)| height),
-            byte_len: Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
-            source_path: Some(path.to_string_lossy().into_owned()),
-        },
-    })
-}
-
-fn sniff_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
 fn tool_result_content_from_output(output: &str) -> Vec<bcode_model::ToolResultContent> {
     let Some(marker_index) = output.find("\n\n[structured tool content attached]") else {
         return Vec::new();
@@ -6277,69 +6129,6 @@ mod tests {
         assert!(matches!(
             &messages[1].content[0],
             ContentBlock::Text { text } if text == "new request"
-        ));
-    }
-
-    #[test]
-    fn materialize_user_image_paths_replaces_existing_image_path_with_image_block() {
-        let mut image_path = std::env::temp_dir();
-        image_path.push(format!(
-            "bcode-test-image-{}-{}.png",
-            std::process::id(),
-            current_time_ms()
-        ));
-        std::fs::write(
-            &image_path,
-            [
-                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
-                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248,
-                15, 4, 0, 9, 251, 3, 253, 167, 105, 177, 220, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
-                96, 130,
-            ],
-        )
-        .unwrap();
-        let mut messages = vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: format!("look at {} please", image_path.display()),
-            }],
-        }];
-
-        materialize_user_image_paths(&mut messages, Path::new("."));
-
-        assert!(matches!(
-            &messages[0].content[0],
-            ContentBlock::Text { text } if text == "look at "
-        ));
-        assert!(matches!(
-            &messages[0].content[1],
-            ContentBlock::Image { image }
-                if image.mime_type == "image/png"
-                    && image.metadata.width == Some(1)
-                    && image.metadata.height == Some(1)
-                    && image.metadata.source_path.as_deref() == Some(image_path.to_string_lossy().as_ref())
-        ));
-        assert!(matches!(
-            &messages[0].content[2],
-            ContentBlock::Text { text } if text == " please"
-        ));
-        let _ = std::fs::remove_file(image_path);
-    }
-
-    #[test]
-    fn materialize_user_image_paths_ignores_missing_paths() {
-        let mut messages = vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: "/tmp/does-not-exist-bcode-image.png".to_string(),
-            }],
-        }];
-
-        materialize_user_image_paths(&mut messages, Path::new("."));
-
-        assert!(matches!(
-            &messages[0].content[0],
-            ContentBlock::Text { text } if text == "/tmp/does-not-exist-bcode-image.png"
         ));
     }
 
