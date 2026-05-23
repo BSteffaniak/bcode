@@ -172,11 +172,11 @@ inherits  = "dev"
 opt-level = 0
 
 # HyperChad local development patches
-# [patch.crates-io]
-# hyperchad_color              = { path = "../MoosicBox/packages/hyperchad/color" }
-# hyperchad_markdown           = { path = "../MoosicBox/packages/hyperchad/markdown" }
-# hyperchad_transformer        = { path = "../MoosicBox/packages/hyperchad/transformer" }
-# hyperchad_transformer_models = { path = "../MoosicBox/packages/hyperchad/transformer/models" }
+[patch.crates-io]
+hyperchad_color              = { path = "../MoosicBox/packages/hyperchad/color" }
+hyperchad_markdown           = { path = "../MoosicBox/packages/hyperchad/markdown" }
+hyperchad_transformer        = { path = "../MoosicBox/packages/hyperchad/transformer" }
+hyperchad_transformer_models = { path = "../MoosicBox/packages/hyperchad/transformer/models" }
 
 # BMUX local development patches
 # [patch."https://github.com/BSteffaniak/bmux.git"]
