@@ -268,53 +268,31 @@ impl SessionEventStore {
     ) -> Result<SessionHistoryPage, SessionStoreError> {
         let event_path = self.event_path(session_id);
         let index = self.ensure_fresh_index(session_id)?;
-        let mut entries = match index::read_entries(&self.root, session_id) {
+        let entries = match index::read_entries(&self.root, session_id) {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
                 let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
                 index::read_entries(&self.root, session_id)?
             }
         };
-        entries.sort_by_key(|entry| entry.sequence);
         let limit = query.limit.max(1);
-        let selected = match query.direction {
-            SessionHistoryDirection::Forward => entries
-                .into_iter()
-                .filter(|entry| {
-                    query
-                        .cursor
-                        .is_none_or(|cursor| entry.sequence >= cursor.sequence)
-                })
-                .take(limit.saturating_add(1))
-                .collect::<Vec<_>>(),
-            SessionHistoryDirection::Backward => {
-                let mut selected = entries
-                    .into_iter()
-                    .rev()
-                    .filter(|entry| {
-                        query
-                            .cursor
-                            .is_none_or(|cursor| entry.sequence <= cursor.sequence)
-                    })
-                    .take(limit.saturating_add(1))
-                    .collect::<Vec<_>>();
-                selected.reverse();
-                selected
+        let (page_entries, mut has_more) = select_history_page_entries(entries, query, limit);
+        let mut events = read_indexed_events(&event_path, &page_entries);
+        if events.is_err() {
+            let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
+            let rebuilt_index = self.ensure_fresh_index(session_id)?;
+            let rebuilt_entries = index::read_entries(&self.root, session_id)?;
+            if rebuilt_entries.len() != rebuilt_index.event_count {
+                return Err(SessionStoreError::InvalidSessionId(format!(
+                    "rebuilt session index entry count mismatch for {session_id}"
+                )));
             }
-        };
-        let has_more = selected.len() > limit;
-        let page_entries = if has_more {
-            match query.direction {
-                SessionHistoryDirection::Forward => selected.into_iter().take(limit).collect(),
-                SessionHistoryDirection::Backward => selected.into_iter().skip(1).collect(),
-            }
-        } else {
-            selected
-        };
-        let mut events = Vec::with_capacity(page_entries.len());
-        for entry in &page_entries {
-            events.push(reader::read_event_at(&event_path, entry.offset)?);
+            let (rebuilt_page_entries, rebuilt_has_more) =
+                select_history_page_entries(rebuilt_entries, query, limit);
+            has_more = rebuilt_has_more;
+            events = read_indexed_events(&event_path, &rebuilt_page_entries);
         }
+        let events = events?;
         let next_cursor = if has_more {
             events.last().map(|event| SessionHistoryCursor {
                 sequence: match query.direction {
@@ -905,6 +883,59 @@ impl SessionEventStore {
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
     }
+}
+
+fn select_history_page_entries(
+    mut entries: Vec<index::SessionIndexEntry>,
+    query: SessionHistoryQuery,
+    limit: usize,
+) -> (Vec<index::SessionIndexEntry>, bool) {
+    entries.sort_by_key(|entry| entry.sequence);
+    let selected = match query.direction {
+        SessionHistoryDirection::Forward => entries
+            .into_iter()
+            .filter(|entry| {
+                query
+                    .cursor
+                    .is_none_or(|cursor| entry.sequence >= cursor.sequence)
+            })
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>(),
+        SessionHistoryDirection::Backward => {
+            let mut selected = entries
+                .into_iter()
+                .rev()
+                .filter(|entry| {
+                    query
+                        .cursor
+                        .is_none_or(|cursor| entry.sequence <= cursor.sequence)
+                })
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>();
+            selected.reverse();
+            selected
+        }
+    };
+    let has_more = selected.len() > limit;
+    let page_entries = if has_more {
+        match query.direction {
+            SessionHistoryDirection::Forward => selected.into_iter().take(limit).collect(),
+            SessionHistoryDirection::Backward => selected.into_iter().skip(1).collect(),
+        }
+    } else {
+        selected
+    };
+    (page_entries, has_more)
+}
+
+fn read_indexed_events(
+    event_path: &Path,
+    entries: &[index::SessionIndexEntry],
+) -> Result<Vec<SessionEvent>, SessionStoreError> {
+    entries
+        .iter()
+        .map(|entry| reader::read_event_at(event_path, entry.offset))
+        .collect()
 }
 
 /// In-memory session manager with optional append-only persistence.
@@ -2394,6 +2425,50 @@ mod tests {
             .ensure_fresh_index(session_id)
             .expect("migrated fixture should reindex");
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[test]
+    fn tool_stream_session_event_round_trips_through_bmux_codec() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 0,
+            session_id,
+            kind: SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call".to_string(),
+                    stream: ToolOutputStream::Stdout,
+                    sequence: 1,
+                    text: "output".to_string(),
+                    byte_len: 6,
+                },
+            },
+        };
+
+        let bytes = bmux_codec::to_vec(&event).expect("tool stream event should encode");
+        let decoded: SessionEvent =
+            bmux_codec::from_bytes(&bytes).expect("tool stream event should decode");
+
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn tool_stream_trace_payload_round_trips_through_bmux_codec() {
+        let payload = SessionTracePayload::ToolInvocationStreamEvent(
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call".to_string(),
+                stream: ToolOutputStream::Stdout,
+                sequence: 1,
+                text: "output".to_string(),
+                byte_len: 6,
+            },
+        );
+
+        let bytes = bmux_codec::to_vec(&payload).expect("tool stream payload should encode");
+        let decoded: SessionTracePayload =
+            bmux_codec::from_bytes(&bytes).expect("tool stream payload should decode");
+
+        assert_eq!(decoded, payload);
     }
 
     #[test]

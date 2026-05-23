@@ -190,8 +190,12 @@ pub struct SessionEvent {
 }
 
 /// Incremental event emitted while a tool invocation is running.
+///
+/// This enum is persisted inside [`SessionEventKind`]. Keep the default
+/// externally tagged representation so binary codecs do not need
+/// self-describing `deserialize_any` support.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ToolInvocationStreamEvent {
     /// Tool execution has started inside the provider plugin.
     Started {
