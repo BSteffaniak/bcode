@@ -3,9 +3,14 @@ name    = "Bcode Shell Plugin"
 version = "0.0.1"
 
 [[services]]
+class        = "tool_execution"
 description  = "Permissioned model-callable shell execution tools"
 interface_id = "bcode.tool/v1"
 name         = "Shell Tools"
+
+[concurrency]
+max  = 2
+type = "limited"
 
 [runtime]
 abi_version    = 1

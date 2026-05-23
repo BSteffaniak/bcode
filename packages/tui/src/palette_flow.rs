@@ -104,6 +104,9 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::ShowServerModelStatus => {
             model_flow::show_server_model_status(client, chat).await?;
         }
+        PaletteCommand::ShowRuntimeStatus => {
+            model_flow::show_runtime_status(client, chat).await?;
+        }
         PaletteCommand::SelectModel => {
             model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;
         }

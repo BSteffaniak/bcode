@@ -15,6 +15,8 @@ pub enum PaletteCommand {
     ShowModelStatus,
     /// Show server default model/provider.
     ShowServerModelStatus,
+    /// Show runtime status.
+    ShowRuntimeStatus,
     /// Select active session model.
     SelectModel,
     /// Toggle diff panel.
@@ -42,6 +44,7 @@ impl PaletteCommand {
             Self::SwitchSession => "session.switch",
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
+            Self::ShowRuntimeStatus => "runtime.status",
             Self::SelectModel => "model.select",
             Self::ToggleDiff => "diff.toggle",
             Self::ListSkills => "skills.list",
@@ -60,6 +63,7 @@ impl PaletteCommand {
             "session.switch" => Some(Self::SwitchSession),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
+            "runtime.status" => Some(Self::ShowRuntimeStatus),
             "model.select" => Some(Self::SelectModel),
             "diff.toggle" => Some(Self::ToggleDiff),
             "skills.list" => Some(Self::ListSkills),
@@ -136,6 +140,12 @@ fn palette_items() -> Vec<PaletteItem> {
             "Show Server Model Defaults",
             "Show selected default provider/model",
             "server model provider default status",
+        ),
+        item(
+            PaletteCommand::ShowRuntimeStatus,
+            "Show Runtime Status",
+            "Show active daemon/plugin work",
+            "runtime daemon plugin tool status active work",
         ),
         item(
             PaletteCommand::SelectModel,

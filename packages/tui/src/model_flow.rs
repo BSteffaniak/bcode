@@ -72,6 +72,50 @@ pub async fn show_server_model_status(
     Ok(())
 }
 
+/// Show daemon runtime status in the transcript.
+pub async fn show_runtime_status(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let status = client.server_status().await?;
+    let running = status
+        .plugin_runtime
+        .iter()
+        .map(|plugin| plugin.running)
+        .sum::<usize>();
+    let queued = status
+        .plugin_runtime
+        .iter()
+        .map(|plugin| plugin.queued)
+        .sum::<usize>();
+    let tool_queued = status
+        .plugin_runtime
+        .iter()
+        .map(|plugin| plugin.queued_tool_execution)
+        .sum::<usize>();
+    let mut lines = vec![format!(
+        "Runtime: {running} running, {queued} queued ({tool_queued} tool queued)"
+    )];
+    for plugin in status
+        .plugin_runtime
+        .iter()
+        .filter(|plugin| plugin.running > 0 || plugin.queued > 0)
+    {
+        lines.push(format!(
+            "{}: running {}, queued {}",
+            plugin.plugin_id, plugin.running, plugin.queued
+        ));
+    }
+    if lines.len() == 1 {
+        lines.push("No active plugin work.".to_string());
+    }
+    let text = lines.join("\n");
+    chat.app
+        .set_status(format!("runtime: {running} running, {queued} queued"));
+    chat.app.push_system_note(text);
+    Ok(())
+}
+
 /// Pick and set the active model for the current session.
 pub async fn pick_model_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,

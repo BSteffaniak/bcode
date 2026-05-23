@@ -8,9 +8,14 @@ interface_id = "bcode.filesystem/v1"
 name         = "Filesystem"
 
 [[services]]
+class        = "tool_execution"
 description  = "Model-callable filesystem tools"
 interface_id = "bcode.tool/v1"
 name         = "Filesystem Tools"
+
+[concurrency]
+max  = 4
+type = "limited"
 
 [runtime]
 abi_version    = 1

@@ -308,7 +308,10 @@ enum ServerCommand {
         foreground: bool,
     },
     Run,
-    Status,
+    Status {
+        #[arg(long)]
+        verbose: bool,
+    },
     Stop,
 }
 
@@ -618,7 +621,7 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
             }
         }
         ServerCommand::Run => run_server_foreground().await?,
-        ServerCommand::Status => server_status().await?,
+        ServerCommand::Status { verbose } => server_status(verbose).await?,
         ServerCommand::Stop => server_stop().await?,
     }
     Ok(())
@@ -2629,9 +2632,10 @@ fn recent_log_excerpt(log_path: &Path) -> String {
     excerpt
 }
 
-async fn server_status() -> Result<(), CliError> {
+async fn server_status(verbose: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let status = client.server_status().await?;
+    println!("daemon: running");
     println!("connected clients: {}", status.connected_client_count);
     println!(
         "model provider: {}",
@@ -2645,9 +2649,31 @@ async fn server_status() -> Result<(), CliError> {
         status.selected_model_id.as_deref().unwrap_or("<default>")
     );
     println!("sessions: {}", status.sessions.len());
-    if !status.plugin_runtime.is_empty() {
+    print_runtime_summary(&status.plugin_runtime, verbose);
+    println!("log: {}", daemon_log_path().display());
+    for session in status.sessions {
+        let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
+        println!("{}	{}	{} clients", name, session.id, session.client_count);
+    }
+    Ok(())
+}
+
+fn print_runtime_summary(runtime: &[bcode_plugin::PluginExecutorStatus], verbose: bool) {
+    let running = runtime.iter().map(|plugin| plugin.running).sum::<usize>();
+    let queued = runtime.iter().map(|plugin| plugin.queued).sum::<usize>();
+    let tool_queued = runtime
+        .iter()
+        .map(|plugin| plugin.queued_tool_execution)
+        .sum::<usize>();
+    println!("runtime: {running} running, {queued} queued ({tool_queued} tool queued)");
+    if running == 0 && queued == 0 {
+        println!("active work: none");
+    } else {
+        println!("active work: plugin work in progress; use --verbose for queue details");
+    }
+    if verbose && !runtime.is_empty() {
         println!("plugin runtime:");
-        for plugin in &status.plugin_runtime {
+        for plugin in runtime {
             println!(
                 "  {}: policy={:?} running={} queued={} [control={} query={} tool={} model={} event={} service={}] completed={} failed={}",
                 plugin.plugin_id,
@@ -2665,12 +2691,6 @@ async fn server_status() -> Result<(), CliError> {
             );
         }
     }
-    println!("log: {}", daemon_log_path().display());
-    for session in status.sessions {
-        let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
-        println!("{}\t{}\t{} clients", name, session.id, session.client_count);
-    }
-    Ok(())
 }
 
 async fn server_stop() -> Result<(), CliError> {

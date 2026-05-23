@@ -43,6 +43,25 @@ async fn describe_skill(
     )))
 }
 
+async fn runtime_status(
+    client: &BcodeClient,
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    let status = client.server_status().await?;
+    let running = status
+        .plugin_runtime
+        .iter()
+        .map(|plugin| plugin.running)
+        .sum::<usize>();
+    let queued = status
+        .plugin_runtime
+        .iter()
+        .map(|plugin| plugin.queued)
+        .sum::<usize>();
+    Ok(SlashCommandOutcome::Handled(format!(
+        "runtime: {running} running, {queued} queued"
+    )))
+}
+
 /// Execute a slash command.
 ///
 /// # Errors
@@ -137,6 +156,7 @@ pub async fn execute(
                 format!("skill {skill_id} invoked")
             }))
         }
+        "runtime" | "status" => runtime_status(client).await,
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }
 }
