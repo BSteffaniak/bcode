@@ -100,6 +100,7 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
         _ => ToolInvocationResponse {
             output: format!("unknown shell tool: {}", request.name),
             is_error: true,
+            content: Vec::new(),
         },
     };
     json_response(&response)
@@ -115,6 +116,7 @@ fn run_shell_tool(
             return ToolInvocationResponse {
                 output: error.to_string(),
                 is_error: true,
+                content: Vec::new(),
             };
         }
     };
@@ -122,6 +124,7 @@ fn run_shell_tool(
         return ToolInvocationResponse {
             output: "command must not be empty".to_string(),
             is_error: true,
+            content: Vec::new(),
         };
     }
     if arguments.terminal {
@@ -132,6 +135,7 @@ fn run_shell_tool(
         Err(error) => ToolInvocationResponse {
             output: error,
             is_error: true,
+            content: Vec::new(),
         },
     }
 }
@@ -166,6 +170,7 @@ fn run_terminal_shell_command(
         Err(error) => ToolInvocationResponse {
             output: error,
             is_error: true,
+            content: Vec::new(),
         },
     }
 }
@@ -237,6 +242,7 @@ fn run_terminal_shell_command_inner(
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: timed_out || !status.success(),
+        content: Vec::new(),
     })
 }
 
@@ -279,6 +285,7 @@ fn run_shell_command(
     Ok(ToolInvocationResponse {
         output,
         is_error: result.timed_out || result.exit_code.is_none_or(|code| code != 0),
+        content: Vec::new(),
     })
 }
 

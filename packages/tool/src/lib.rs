@@ -65,4 +65,36 @@ pub struct ToolInvocationResponse {
     pub output: String,
     #[serde(default)]
     pub is_error: bool,
+    #[serde(default)]
+    pub content: Vec<ToolResultContent>,
+}
+
+/// Structured model-visible tool result content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultContent {
+    Text { text: String },
+    Image { image: ImageContent },
+}
+
+/// Model-visible image content returned by a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub mime_type: String,
+    pub data_base64: String,
+    #[serde(default)]
+    pub metadata: ImageMetadata,
+}
+
+/// Image metadata useful for diagnostics and transcript display.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageMetadata {
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub byte_len: Option<u64>,
+    #[serde(default)]
+    pub source_path: Option<String>,
 }

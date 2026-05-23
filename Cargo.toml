@@ -111,6 +111,12 @@ hyperchad_markdown = { version = "0.3.0", default-features = false, features = [
 ] }
 hyperchad_transformer = { version = "0.3.0", default-features = false }
 hyperchad_transformer_models = { version = "0.3.0", default-features = false }
+image = { version = "0.25.10", default-features = false, features = [
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
 libloading = { version = "0.9.0", default-features = false }
 png = { version = "0.18.1", default-features = false }
 portable-pty = { version = "0.9.0", default-features = false }

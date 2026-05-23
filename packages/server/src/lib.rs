@@ -16,9 +16,10 @@ use bcode_ipc::{
     recv_envelope, response_envelope, send_envelope,
 };
 use bcode_model::{
-    CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID, MessageRole,
-    ModelList, ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN,
-    OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageContent,
+    ImageMetadata as ModelImageMetadata, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList,
+    ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_session::SessionManager;
@@ -34,7 +35,7 @@ use bcode_skill_models::{
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolList,
+    ToolList, ToolResultContent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2465,11 +2466,11 @@ fn model_message_context_chars(message: &ModelMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.chars().count(),
+            ContentBlock::Image { .. } | ContentBlock::CachePoint { .. } => 0,
             ContentBlock::ToolCall { call } => {
                 call.name.chars().count() + call.arguments.to_string().chars().count()
             }
             ContentBlock::ToolResult { result } => result.output.chars().count(),
-            ContentBlock::CachePoint { .. } => 0,
             ContentBlock::ProviderExtension { value } => value.to_string().chars().count(),
         })
         .sum()
@@ -4683,6 +4684,7 @@ async fn execute_model_tool(
         .unwrap_or_else(|error| ToolInvocationResponse {
             output: error,
             is_error: true,
+            content: Vec::new(),
         });
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
@@ -4708,7 +4710,15 @@ async fn execute_model_tool(
         },
     )
     .await;
-    append_tool_finished_event(state, session_id, call.id, result.output, result.is_error).await;
+    append_tool_finished_event(
+        state,
+        session_id,
+        call.id,
+        result.output,
+        result.is_error,
+        result.content,
+    )
+    .await;
 }
 
 async fn invoke_model_tool(
@@ -4766,6 +4776,7 @@ async fn invoke_model_tool(
                     .reason
                     .unwrap_or_else(|| "tool denied by active agent policy".to_string()),
                 is_error: true,
+                content: Vec::new(),
             });
         }
         AgentDecision::Ask => {
@@ -4773,6 +4784,7 @@ async fn invoke_model_tool(
                 return Ok(ToolInvocationResponse {
                     output: "permission denied".to_string(),
                     is_error: true,
+                    content: Vec::new(),
                 });
             }
         }
@@ -5094,6 +5106,7 @@ fn session_event_to_model_message_with_limit(
                         tool_output_context_chars,
                     ),
                     is_error: *is_error,
+                    content: tool_result_content_from_output(result),
                 },
             }],
         }),
@@ -5109,6 +5122,48 @@ fn session_event_to_model_message_with_limit(
         }),
         _ => None,
     }
+}
+
+fn tool_result_content_from_output(output: &str) -> Vec<bcode_model::ToolResultContent> {
+    let Some(marker_index) = output.find("\n\n[structured tool content attached]") else {
+        return Vec::new();
+    };
+    let note = &output[marker_index..];
+    note.lines()
+        .filter_map(parse_image_tool_content_note)
+        .map(|image| bcode_model::ToolResultContent::Image { image })
+        .collect()
+}
+
+fn parse_image_tool_content_note(line: &str) -> Option<ImageContent> {
+    let line = line.strip_prefix("image ")?;
+    let (_number, fields) = line.split_once(": ")?;
+    let mut mime_type = None;
+    let mut source_path = None;
+    let mut width = None;
+    let mut height = None;
+    for field in fields.split_whitespace() {
+        if let Some(value) = field.strip_prefix("mime=") {
+            mime_type = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("path=") {
+            source_path = Some(value.to_string());
+        } else if let Some((raw_width, raw_height)) = field.split_once('x') {
+            width = raw_width.parse::<u32>().ok();
+            height = raw_height.parse::<u32>().ok();
+        }
+    }
+    let source_path = source_path?;
+    let bytes = fs::read(&source_path).ok()?;
+    Some(ImageContent {
+        mime_type: mime_type.unwrap_or_else(|| "image/png".to_string()),
+        data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+        metadata: ModelImageMetadata {
+            width,
+            height,
+            byte_len: None,
+            source_path: Some(source_path),
+        },
+    })
 }
 
 async fn append_trace_event(
@@ -5252,9 +5307,11 @@ async fn append_tool_finished_event(
     tool_call_id: String,
     result: String,
     is_error: bool,
+    content: Vec<ToolResultContent>,
 ) {
     if let Err(error) =
-        append_tool_finished_event_inner(state, session_id, tool_call_id, result, is_error).await
+        append_tool_finished_event_inner(state, session_id, tool_call_id, result, is_error, content)
+            .await
     {
         eprintln!("failed to append tool result: {error}");
     }
@@ -5266,12 +5323,19 @@ async fn append_tool_finished_event_inner(
     tool_call_id: String,
     result: String,
     is_error: bool,
+    content: Vec<ToolResultContent>,
 ) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
+    let content_note = tool_result_content_model_note(&tool_call_id, &content);
     let event = state
         .sessions
-        .append_tool_call_finished(session_id, tool_call_id, result, is_error)
+        .append_tool_call_finished(
+            session_id,
+            tool_call_id,
+            format!("{result}{content_note}"),
+            is_error,
+        )
         .await?;
     publish_session_event(state, &event).await;
     if let Ok(runtime_event) = state
@@ -5288,6 +5352,39 @@ async fn append_tool_finished_event_inner(
         publish_session_event(state, &runtime_event).await;
     }
     Ok(event)
+}
+
+fn tool_result_content_model_note(tool_call_id: &str, content: &[ToolResultContent]) -> String {
+    let images = content
+        .iter()
+        .filter_map(|item| match item {
+            ToolResultContent::Image { image } => Some(image),
+            ToolResultContent::Text { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return String::new();
+    }
+    let mut note = String::from("\n\n[structured tool content attached]");
+    for (index, image) in images.iter().enumerate() {
+        let image_number = index + 1;
+        let dimensions = image
+            .metadata
+            .width
+            .zip(image.metadata.height)
+            .map_or_else(String::new, |(width, height)| format!(" {width}x{height}"));
+        let path = image
+            .metadata
+            .source_path
+            .as_deref()
+            .map_or_else(String::new, |path| format!(" path={path}"));
+        let _ = write!(
+            note,
+            "\nimage {image_number}: call_id={tool_call_id} mime={}{}{}",
+            image.mime_type, dimensions, path
+        );
+    }
+    note
 }
 
 fn runtime_work_status_from_tool_result(result: &str, is_error: bool) -> RuntimeWorkStatus {
@@ -6501,6 +6598,7 @@ mod tests {
             "call-1".to_owned(),
             canonical_result.clone(),
             false,
+            Vec::new(),
         )
         .await
         .expect("tool result event should append");

@@ -14,8 +14,10 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+base64           = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_tool       = { workspace = true }
+image            = { workspace = true }
 serde            = { workspace = true, features = ["derive", "std"] }
 serde_json       = { workspace = true }
 

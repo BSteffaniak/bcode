@@ -660,7 +660,9 @@ fn bedrock_content_blocks(
             ContentBlock::CachePoint { .. } => {
                 blocks.push(BedrockContentBlock::CachePoint(default_cache_point()));
             }
-            ContentBlock::Text { .. } | ContentBlock::ProviderExtension { .. } => {}
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ProviderExtension { .. } => {}
         }
     }
     Ok(blocks)

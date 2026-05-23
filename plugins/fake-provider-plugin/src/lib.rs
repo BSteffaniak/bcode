@@ -271,6 +271,7 @@ fn last_user_text(messages: &[ModelMessage]) -> String {
         .and_then(|message| {
             message.content.iter().find_map(|block| match block {
                 ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::Image { image } => Some(format!("[image: {}]", image.mime_type)),
                 _ => None,
             })
         })

@@ -323,6 +323,7 @@ enum ResponsesInputItem {
 enum ResponsesContent {
     InputText { text: String },
     OutputText { text: String },
+    InputImage { image_url: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -1467,37 +1468,44 @@ fn model_message_to_responses_input(
 ) -> Vec<ResponsesInputItem> {
     match message.role {
         MessageRole::System => Vec::new(),
-        MessageRole::User => responses_text_message("user", message, true),
+        MessageRole::User => responses_message("user", message, true),
         MessageRole::Assistant => responses_assistant_items(message, dialect),
         MessageRole::Tool => responses_tool_items(message),
     }
 }
 
-fn responses_text_message(
+fn responses_message(
     role: &'static str,
     message: &ModelMessage,
     input_text: bool,
 ) -> Vec<ResponsesInputItem> {
+    let mut content = Vec::new();
     let text = joined_text_content(message);
-    if text.is_empty() {
+    if !text.is_empty() {
+        content.push(if input_text {
+            ResponsesContent::InputText { text }
+        } else {
+            ResponsesContent::OutputText { text }
+        });
+    }
+    for block in &message.content {
+        if let ContentBlock::Image { image } = block {
+            content.push(ResponsesContent::InputImage {
+                image_url: image_data_url(image),
+            });
+        }
+    }
+    if content.is_empty() {
         return Vec::new();
     }
-    let content = if input_text {
-        ResponsesContent::InputText { text }
-    } else {
-        ResponsesContent::OutputText { text }
-    };
-    vec![ResponsesInputItem::Message {
-        role,
-        content: vec![content],
-    }]
+    vec![ResponsesInputItem::Message { role, content }]
 }
 
 fn responses_assistant_items(
     message: &ModelMessage,
     dialect: OpenAiCompatibleDialect,
 ) -> Vec<ResponsesInputItem> {
-    let mut items = responses_text_message("assistant", message, false);
+    let mut items = responses_message("assistant", message, false);
     items.extend(message.content.iter().filter_map(|block| match block {
         ContentBlock::ToolCall { call } => Some(ResponsesInputItem::FunctionCall {
             call_id: call.id.clone(),
@@ -1510,17 +1518,39 @@ fn responses_assistant_items(
 }
 
 fn responses_tool_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult { result } => Some(ResponsesInputItem::FunctionCallOutput {
-                call_id: result.call_id.clone(),
-                output: result.output.clone(),
-            }),
-            _ => None,
-        })
-        .collect()
+    let mut items = Vec::new();
+    for block in &message.content {
+        let ContentBlock::ToolResult { result } = block else {
+            continue;
+        };
+        items.push(ResponsesInputItem::FunctionCallOutput {
+            call_id: result.call_id.clone(),
+            output: result.output.clone(),
+        });
+        for content in &result.content {
+            if let bcode_model::ToolResultContent::Image { image } = content {
+                items.push(ResponsesInputItem::Message {
+                    role: "user",
+                    content: vec![
+                        ResponsesContent::InputText {
+                            text: format!(
+                                "Image content returned by tool call {}:",
+                                result.call_id
+                            ),
+                        },
+                        ResponsesContent::InputImage {
+                            image_url: image_data_url(image),
+                        },
+                    ],
+                });
+            }
+        }
+    }
+    items
+}
+
+fn image_data_url(image: &bcode_model::ImageContent) -> String {
+    format!("data:{};base64,{}", image.mime_type, image.data_base64)
 }
 
 fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessage> {

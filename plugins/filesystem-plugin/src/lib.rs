@@ -6,8 +6,9 @@
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
+    ImageContent, ImageMetadata, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
+    TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolList, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,6 +28,7 @@ const DEFAULT_LIST_MAX_ENTRIES: usize = 1_000;
 const MAX_EXTERNAL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RUST_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const TERMINATION_GRACE_MS: u64 = 500;
+const MAX_IMAGE_READ_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Bundled filesystem plugin.
 #[derive(Default)]
@@ -227,7 +229,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
 fn read_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "filesystem.read".to_string(),
-        description: "Read a UTF-8 text file".to_string(),
+        description: "Read a file. Supports UTF-8 text files and images (PNG, JPEG, GIF, WebP). Image files are returned as model-visible image attachments with metadata.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["path"],
@@ -378,6 +380,7 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
         _ => ToolInvocationResponse {
             output: format!("unknown filesystem tool: {}", request.name),
             is_error: true,
+            content: Vec::new(),
         },
     };
     json_response(&response)
@@ -385,14 +388,112 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
 
 fn tool_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
     match serde_json::from_value::<ReadRequest>(arguments) {
-        Ok(request) => match std::fs::read_to_string(resolve_session_path(cwd, &request.path)) {
+        Ok(request) => read_path_for_tool(&resolve_session_path(cwd, &request.path)),
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn read_path_for_tool(path: &Path) -> ToolInvocationResponse {
+    match image_file_metadata(path) {
+        Ok(Some(image)) => image_tool_response(path, image),
+        Ok(None) => match std::fs::read_to_string(path) {
             Ok(contents) => ToolInvocationResponse {
                 output: contents,
                 is_error: false,
+                content: Vec::new(),
             },
             Err(error) => tool_io_error(&error),
         },
-        Err(error) => tool_json_error(&error),
+        Err(error) => tool_io_error(&error),
+    }
+}
+
+fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationResponse {
+    let metadata = std::fs::metadata(path);
+    let byte_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+    if byte_len > MAX_IMAGE_READ_BYTES {
+        return ToolInvocationResponse {
+            output: format!(
+                "Image file [{}] is too large to attach ({} bytes; limit {} bytes): {}",
+                image.mime_type,
+                byte_len,
+                MAX_IMAGE_READ_BYTES,
+                path.display()
+            ),
+            is_error: true,
+            content: Vec::new(),
+        };
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let output = format!(
+                "Read image file [{}]\nPath: {}\nDimensions: {}x{}\nSize: {} bytes\nAttached image content for visual inspection.",
+                image.mime_type,
+                path.display(),
+                image.width,
+                image.height,
+                bytes.len()
+            );
+            ToolInvocationResponse {
+                output,
+                is_error: false,
+                content: vec![ToolResultContent::Image {
+                    image: ImageContent {
+                        mime_type: image.mime_type,
+                        data_base64: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &bytes,
+                        ),
+                        metadata: ImageMetadata {
+                            width: Some(image.width),
+                            height: Some(image.height),
+                            byte_len: Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+                            source_path: Some(path.display().to_string()),
+                        },
+                    },
+                }],
+            }
+        }
+        Err(error) => tool_io_error(&error),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageFileMetadata {
+    mime_type: String,
+    width: u32,
+    height: u32,
+}
+
+fn image_file_metadata(path: &Path) -> std::io::Result<Option<ImageFileMetadata>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let Some(mime_type) = sniff_supported_image_mime(&bytes) else {
+        return Ok(None);
+    };
+    let Ok((width, height)) = image::image_dimensions(path) else {
+        return Ok(None);
+    };
+    Ok(Some(ImageFileMetadata {
+        mime_type: mime_type.to_string(),
+        width,
+        height,
+    }))
+}
+
+fn sniff_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -405,6 +506,7 @@ fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocatio
                 |bytes_written| ToolInvocationResponse {
                     output: format!("wrote {bytes_written} bytes"),
                     is_error: false,
+                    content: Vec::new(),
                 },
             )
         }
@@ -420,10 +522,12 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                 |error| ToolInvocationResponse {
                     output: error,
                     is_error: true,
+                    content: Vec::new(),
                 },
                 |replacements| ToolInvocationResponse {
                     output: format!("applied {replacements} replacement"),
                     is_error: false,
+                    content: Vec::new(),
                 },
             )
         }
@@ -438,6 +542,7 @@ fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocati
                 .exists()
                 .to_string(),
             is_error: false,
+            content: Vec::new(),
         },
         Err(error) => tool_json_error(&error),
     }
@@ -1255,6 +1360,7 @@ fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
     ToolInvocationResponse {
         output: error.to_string(),
         is_error: true,
+        content: Vec::new(),
     }
 }
 
@@ -1262,6 +1368,7 @@ fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
     ToolInvocationResponse {
         output: error.to_string(),
         is_error: true,
+        content: Vec::new(),
     }
 }
 
@@ -1273,10 +1380,12 @@ where
         Ok(output) => ToolInvocationResponse {
             output,
             is_error: false,
+            content: Vec::new(),
         },
         Err(error) => ToolInvocationResponse {
             output: error.to_string(),
             is_error: true,
+            content: Vec::new(),
         },
     }
 }

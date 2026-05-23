@@ -44,7 +44,7 @@ pub fn handle_default_text_key(
     TextInputKeyHandler::new(TextKeymap::default(), enter_behavior).handle_key(buffer, stroke)
 }
 
-fn shifted_text_character(stroke: KeyStroke) -> Option<char> {
+const fn shifted_text_character(stroke: KeyStroke) -> Option<char> {
     if !stroke.modifiers.shift
         || stroke.modifiers.ctrl
         || stroke.modifiers.alt

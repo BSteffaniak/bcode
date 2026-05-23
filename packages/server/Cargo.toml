@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+base64 = { workspace = true }
 bcode_agent_profile = { workspace = true }
 bcode_bedrock_provider_plugin = { workspace = true, optional = true }
 bcode_command = { workspace = true }
