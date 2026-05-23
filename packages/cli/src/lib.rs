@@ -3243,6 +3243,30 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             "#{} skill invocation failed: {skill_id}: {error}",
             event.sequence
         ),
+        SessionEventKind::RuntimeWorkStarted {
+            work_id,
+            kind,
+            label,
+            cancellable,
+            ..
+        } => println!(
+            "#{} runtime work started: {work_id} {kind:?} {label} cancellable={cancellable}",
+            event.sequence
+        ),
+        SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => println!(
+            "#{} runtime work cancel requested: {work_id}",
+            event.sequence
+        ),
+        SessionEventKind::RuntimeWorkFinished {
+            work_id,
+            status,
+            message,
+            ..
+        } => println!(
+            "#{} runtime work finished: {work_id} {status:?} {}",
+            event.sequence,
+            message.as_deref().unwrap_or("")
+        ),
         SessionEventKind::TraceEvent { .. } => {}
     }
 }

@@ -5,7 +5,10 @@ use crate::migration::{
     SessionMigrationReportItem,
 };
 use crate::{SessionEventStore, SessionStoreError, current_unix_millis, reader, write_event_frame};
-use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionId};
+use bcode_session_models::{
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
+    SessionEvent, SessionEventKind, SessionId,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
@@ -23,6 +26,7 @@ const BUILTIN_SESSION_EVENT_MIGRATIONS: &[NoOpSessionEventMigration] = &[
     NoOpSessionEventMigration::new("sessions-events-v7-to-v8", 7, 8),
     NoOpSessionEventMigration::new("sessions-events-v8-to-v9", 8, 9),
     NoOpSessionEventMigration::new("sessions-events-v9-to-v10", 9, 10),
+    NoOpSessionEventMigration::new("sessions-events-v10-to-v11", 10, 11),
 ];
 
 trait SessionEventMigrationStep {
@@ -32,7 +36,7 @@ trait SessionEventMigrationStep {
     fn migrate_event(
         &self,
         event: SessionEvent,
-    ) -> Result<SessionEvent, SessionEventLogMigrationError>;
+    ) -> Result<Vec<SessionEvent>, SessionEventLogMigrationError>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,8 +72,11 @@ impl SessionEventMigrationStep for NoOpSessionEventMigration {
     fn migrate_event(
         &self,
         event: SessionEvent,
-    ) -> Result<SessionEvent, SessionEventLogMigrationError> {
-        Ok(event)
+    ) -> Result<Vec<SessionEvent>, SessionEventLogMigrationError> {
+        if self.from_schema == 10 && self.to_schema == 11 {
+            return Ok(migrate_v10_event_to_v11(event));
+        }
+        Ok(vec![event])
     }
 }
 
@@ -96,8 +103,8 @@ where
     fn migrate_event(
         &self,
         event: SessionEvent,
-    ) -> Result<SessionEvent, SessionEventLogMigrationError> {
-        self.migration.migrate_event(event)
+    ) -> Result<Vec<SessionEvent>, SessionEventLogMigrationError> {
+        self.migration.migrate_event(event).map(|event| vec![event])
     }
 }
 
@@ -314,16 +321,21 @@ impl SessionEventStore {
         let mut tmp = fs::File::create(&tmp_path)?;
         let mut migrated_count = 0_usize;
         let mut used_steps = BTreeSet::new();
+        let mut next_sequence = 0_u64;
         for event in report.events {
-            let event = migrate_event_to_schema(
+            let events = migrate_event_to_schema(
                 event,
                 session_id,
                 target_schema,
                 &steps_by_from,
                 &mut used_steps,
             )?;
-            write_event_frame(&mut tmp, &event)?;
-            migrated_count = migrated_count.saturating_add(1);
+            for mut event in events {
+                event.sequence = next_sequence;
+                next_sequence = next_sequence.saturating_add(1);
+                write_event_frame(&mut tmp, &event)?;
+                migrated_count = migrated_count.saturating_add(1);
+            }
         }
         tmp.flush()?;
         drop(tmp);
@@ -390,12 +402,12 @@ fn validate_event_migration_steps<'a>(
 }
 
 fn migrate_event_to_schema(
-    mut event: SessionEvent,
+    event: SessionEvent,
     session_id: SessionId,
     target_schema: u16,
     steps_by_from: &BTreeMap<u16, &dyn SessionEventMigrationStep>,
     used_steps: &mut BTreeSet<&'static str>,
-) -> Result<SessionEvent, SessionStoreError> {
+) -> Result<Vec<SessionEvent>, SessionStoreError> {
     if event.session_id != session_id {
         return Err(SessionStoreError::InvalidSessionId(format!(
             "session {session_id} contains event for different session {} at sequence {}",
@@ -408,20 +420,86 @@ fn migrate_event_to_schema(
             event.sequence, event.schema_version
         )));
     }
-    while event.schema_version < target_schema {
-        let from_schema = event.schema_version;
+    let mut events = vec![event];
+    loop {
+        let Some(from_schema) = events.iter().map(|event| event.schema_version).min() else {
+            return Ok(events);
+        };
+        if from_schema >= target_schema {
+            return Ok(events);
+        }
         let step = steps_by_from.get(&from_schema).ok_or_else(|| {
             SessionStoreError::InvalidSessionId(format!(
-                "session {session_id} event {} cannot migrate schema {from_schema} to {target_schema}: missing {from_schema}->{} step",
-                event.sequence,
+                "session {session_id} cannot migrate schema {from_schema} to {target_schema}: missing {from_schema}->{} step",
                 from_schema.saturating_add(1)
             ))
         })?;
-        event = step
-            .migrate_event(event)
-            .map_err(|error| SessionStoreError::InvalidSessionId(error.to_string()))?;
-        event.schema_version = step.target_schema();
+        let mut next_events = Vec::new();
+        for event in events {
+            if event.schema_version == from_schema {
+                for mut migrated in step
+                    .migrate_event(event)
+                    .map_err(|error| SessionStoreError::InvalidSessionId(error.to_string()))?
+                {
+                    migrated.schema_version = step.target_schema();
+                    next_events.push(migrated);
+                }
+            } else {
+                next_events.push(event);
+            }
+        }
+        events = next_events;
         used_steps.insert(step.id());
     }
-    Ok(event)
+}
+
+fn migrate_v10_event_to_v11(event: SessionEvent) -> Vec<SessionEvent> {
+    match &event.kind {
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            ..
+        } => {
+            let mut started = event.clone();
+            started.kind = SessionEventKind::RuntimeWorkStarted {
+                work_id: RuntimeWorkId::new(format!("tool_{tool_call_id}")),
+                kind: RuntimeWorkKind::Tool,
+                label: tool_name.clone(),
+                tool_call_id: Some(tool_call_id.clone()),
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                started_at_ms: None,
+                cancellable: false,
+            };
+            vec![event, started]
+        }
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            result,
+            is_error,
+        } => {
+            let mut finished = event.clone();
+            finished.kind = SessionEventKind::RuntimeWorkFinished {
+                work_id: RuntimeWorkId::new(format!("tool_{tool_call_id}")),
+                status: infer_runtime_work_status(result, *is_error),
+                finished_at_ms: None,
+                message: None,
+            };
+            vec![event, finished]
+        }
+        _ => vec![event],
+    }
+}
+
+fn infer_runtime_work_status(result: &str, is_error: bool) -> RuntimeWorkStatus {
+    if !is_error {
+        return RuntimeWorkStatus::Completed;
+    }
+    let lower = result.to_ascii_lowercase();
+    if lower.contains("timed_out: true") || lower.contains("\"timed_out\":true") {
+        RuntimeWorkStatus::TimedOut
+    } else {
+        RuntimeWorkStatus::Failed
+    }
 }

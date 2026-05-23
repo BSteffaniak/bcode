@@ -477,23 +477,7 @@ fn non_streaming_transcript_item_from_event(
             false,
             TranscriptItemKind::SkillError,
         )),
-        SessionEventKind::AssistantDelta { .. }
-        | SessionEventKind::AssistantMessage { .. }
-        | SessionEventKind::AssistantReasoningDelta { .. }
-        | SessionEventKind::AssistantReasoningMessage { .. }
-        | SessionEventKind::ModelChanged { .. }
-        | SessionEventKind::ModelTurnStarted { .. }
-        | SessionEventKind::ModelTurnFinished { .. }
-        | SessionEventKind::SessionRenamed { .. }
-        | SessionEventKind::SkillSuggested { .. }
-        | SessionEventKind::SkillActivated { .. }
-        | SessionEventKind::SkillDeactivated { .. }
-        | SessionEventKind::SkillContextLoaded { .. }
-        | SessionEventKind::TraceEvent { .. }
-        | SessionEventKind::SessionCreated { .. }
-        | SessionEventKind::ClientAttached { .. }
-        | SessionEventKind::ClientDetached { .. }
-        | SessionEventKind::AgentChanged { .. } => None,
+        _ => None,
     }
 }
 

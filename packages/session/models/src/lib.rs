@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 10;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 11;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -123,6 +123,61 @@ pub struct SessionHistoryPage {
 pub struct SessionInputHistoryEntry {
     pub sequence: u64,
     pub text: String,
+}
+
+/// Durable runtime work identifier used across session history, IPC, and UI surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuntimeWorkId(pub String);
+
+impl RuntimeWorkId {
+    /// Create a runtime work identifier.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl Display for RuntimeWorkId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Durable runtime work category.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeWorkKind {
+    /// Model-callable tool execution.
+    #[default]
+    Tool,
+    /// Plugin service invocation.
+    PluginInvocation,
+    /// Model-provider turn.
+    ModelTurn,
+    /// Plugin event delivery.
+    EventDelivery,
+}
+
+/// Durable runtime work terminal/current status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeWorkStatus {
+    /// Work has been queued.
+    Queued,
+    /// Work is running.
+    #[default]
+    Running,
+    /// Cancellation has been requested.
+    Cancelling,
+    /// Work completed successfully.
+    Completed,
+    /// Work failed.
+    Failed,
+    /// Work timed out.
+    TimedOut,
+    /// Work was cancelled.
+    Cancelled,
 }
 
 /// Replayable event emitted by a session.
@@ -506,5 +561,40 @@ pub enum SessionEventKind {
     /// Completed provider-exposed reasoning text.
     AssistantReasoningMessage {
         text: String,
+    },
+    /// Durable runtime work start marker.
+    RuntimeWorkStarted {
+        work_id: RuntimeWorkId,
+        kind: RuntimeWorkKind,
+        label: String,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        plugin_id: Option<String>,
+        #[serde(default)]
+        service_interface: Option<String>,
+        #[serde(default)]
+        operation: Option<String>,
+        #[serde(default)]
+        started_at_ms: Option<u64>,
+        #[serde(default)]
+        cancellable: bool,
+    },
+    /// Durable runtime work cancellation request marker.
+    RuntimeWorkCancelRequested {
+        work_id: RuntimeWorkId,
+        #[serde(default)]
+        requested_at_ms: Option<u64>,
+        #[serde(default)]
+        client_id: Option<ClientId>,
+    },
+    /// Durable runtime work finish marker.
+    RuntimeWorkFinished {
+        work_id: RuntimeWorkId,
+        status: RuntimeWorkStatus,
+        #[serde(default)]
+        finished_at_ms: Option<u64>,
+        #[serde(default)]
+        message: Option<String>,
     },
 }

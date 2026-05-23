@@ -23,9 +23,9 @@ use bcode_model::{
 };
 use bcode_session::SessionManager;
 use bcode_session_models::{
-    ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, SessionEventKind,
-    SessionId, SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    TraceBlobRef, TraceRedaction,
+    ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -5196,6 +5196,14 @@ async fn append_assistant_message_event(state: &ServerState, session_id: Session
     }
 }
 
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 async fn append_tool_request_event(
     state: &ServerState,
     session_id: SessionId,
@@ -5203,6 +5211,9 @@ async fn append_tool_request_event(
     tool_name: String,
     arguments_json: String,
 ) {
+    let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
+    let runtime_label = tool_name.clone();
+    let runtime_tool_call_id = tool_call_id.clone();
     match state
         .sessions
         .append_tool_call_requested(session_id, tool_call_id, tool_name, arguments_json)
@@ -5210,6 +5221,27 @@ async fn append_tool_request_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append tool request: {error}"),
+    }
+    match state
+        .sessions
+        .append_runtime_work_started(
+            session_id,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: runtime_work_id,
+                kind: RuntimeWorkKind::Tool,
+                label: runtime_label,
+                tool_call_id: Some(runtime_tool_call_id),
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                started_at_ms: Some(current_unix_millis()),
+                cancellable: false,
+            },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append runtime work start: {error}"),
     }
 }
 
@@ -5234,12 +5266,39 @@ async fn append_tool_finished_event_inner(
     result: String,
     is_error: bool,
 ) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
+    let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
+    let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
     let event = state
         .sessions
         .append_tool_call_finished(session_id, tool_call_id, result, is_error)
         .await?;
     publish_session_event(state, &event).await;
+    if let Ok(runtime_event) = state
+        .sessions
+        .append_runtime_work_finished(
+            session_id,
+            runtime_work_id,
+            runtime_status,
+            Some(current_unix_millis()),
+            None,
+        )
+        .await
+    {
+        publish_session_event(state, &runtime_event).await;
+    }
     Ok(event)
+}
+
+fn runtime_work_status_from_tool_result(result: &str, is_error: bool) -> RuntimeWorkStatus {
+    if !is_error {
+        return RuntimeWorkStatus::Completed;
+    }
+    let lower = result.to_ascii_lowercase();
+    if lower.contains("timed_out: true") || lower.contains("\"timed_out\":true") {
+        RuntimeWorkStatus::TimedOut
+    } else {
+        RuntimeWorkStatus::Failed
+    }
 }
 
 async fn append_system_event(state: &ServerState, session_id: SessionId, text: String) {

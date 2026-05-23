@@ -485,6 +485,9 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SkillInvocationFailed { .. } => "skill_invocation_failed",
         SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
         SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
+        SessionEventKind::RuntimeWorkStarted { .. } => "runtime_work_started",
+        SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
+        SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
     }
 }
 

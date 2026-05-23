@@ -689,7 +689,7 @@ impl BmuxApp {
                 self.current_agent_id.clone_from(agent_id);
             }
             SessionEventKind::TraceEvent { trace } => self.apply_trace_event(trace),
-            SessionEventKind::ClientAttached { .. } | SessionEventKind::ClientDetached { .. } => {}
+            _ => {}
         }
     }
 
@@ -1231,6 +1231,9 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ContextCompacted { .. }
         | SessionEventKind::SkillInvoked { .. }
         | SessionEventKind::SkillInvocationFailed { .. }
+        | SessionEventKind::RuntimeWorkStarted { .. }
+        | SessionEventKind::RuntimeWorkCancelRequested { .. }
+        | SessionEventKind::RuntimeWorkFinished { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
