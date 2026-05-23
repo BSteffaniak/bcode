@@ -1097,16 +1097,24 @@ impl PluginRuntimeHost {
             .filter(|manifest| manifest_subscribes_to(manifest, &topic))
             .map(|manifest| manifest.id.clone())
             .collect::<Vec<_>>();
-        let mut delivered = 0;
+        let mut deliveries = Vec::new();
         for plugin_id in subscribers {
             let executor = self
                 .executors
                 .get(&plugin_id)
                 .cloned()
                 .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.clone()))?;
-            executor
-                .handle_event(topic.clone(), payload.to_vec())
-                .await?;
+            let topic = topic.clone();
+            let payload = payload.to_vec();
+            deliveries.push(tokio::spawn(async move {
+                executor.handle_event(topic, payload).await
+            }));
+        }
+        let mut delivered = 0;
+        for delivery in deliveries {
+            delivery
+                .await
+                .map_err(|_| PluginLoadError::PluginNotLoaded("event subscriber".to_string()))??;
             delivered += 1;
         }
         Ok(delivered)

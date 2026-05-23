@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// Unique managed tool execution identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -45,6 +45,7 @@ pub struct ProcessExecutionResult {
     pub id: ToolExecutionId,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    pub cancelled: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
@@ -56,6 +57,7 @@ pub struct ToolRuntimeStatus {
     pub queued: usize,
     pub completed: u64,
     pub failed: u64,
+    pub cancelled: u64,
 }
 
 #[derive(Debug)]
@@ -64,6 +66,32 @@ struct RuntimeMetrics {
     queued: usize,
     completed: u64,
     failed: u64,
+    cancelled: u64,
+}
+
+#[derive(Debug)]
+struct RunningExecution {
+    cancel: Arc<Notify>,
+}
+
+/// Cancellation handle for a managed tool execution.
+#[derive(Debug, Clone)]
+pub struct ToolExecutionCancelHandle {
+    id: ToolExecutionId,
+    notify: Arc<Notify>,
+}
+
+impl ToolExecutionCancelHandle {
+    /// Return the managed execution identifier.
+    #[must_use]
+    pub const fn id(&self) -> ToolExecutionId {
+        self.id
+    }
+
+    /// Request cancellation of the managed execution.
+    pub fn cancel(&self) {
+        self.notify.notify_waiters();
+    }
 }
 
 /// Errors from managed tool execution.
@@ -85,7 +113,7 @@ pub struct ToolExecutionRuntime {
     next_id: Arc<AtomicU64>,
     semaphore: Arc<Semaphore>,
     metrics: Arc<Mutex<RuntimeMetrics>>,
-    running: Arc<Mutex<BTreeMap<ToolExecutionId, Instant>>>,
+    running: Arc<Mutex<BTreeMap<ToolExecutionId, RunningExecution>>>,
 }
 
 impl ToolExecutionRuntime {
@@ -101,6 +129,7 @@ impl ToolExecutionRuntime {
                 queued: 0,
                 completed: 0,
                 failed: 0,
+                cancelled: 0,
             })),
             running: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -114,7 +143,32 @@ impl ToolExecutionRuntime {
             queued: metrics.queued,
             completed: metrics.completed,
             failed: metrics.failed,
+            cancelled: metrics.cancelled,
         }
+    }
+
+    /// Create a cancellation handle for the next managed process execution.
+    #[must_use]
+    pub fn cancellation_handle(&self) -> ToolExecutionCancelHandle {
+        ToolExecutionCancelHandle {
+            id: ToolExecutionId(self.next_id.load(Ordering::Relaxed)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Cancel a currently running execution by ID.
+    pub async fn cancel(&self, id: ToolExecutionId) -> bool {
+        let cancel = {
+            let running = self.running.lock().await;
+            running
+                .get(&id)
+                .map(|execution| Arc::clone(&execution.cancel))
+        };
+        if let Some(cancel) = cancel {
+            cancel.notify_waiters();
+            return true;
+        }
+        false
     }
 
     /// Run a process to completion under runtime accounting and concurrency limits.
@@ -132,6 +186,7 @@ impl ToolExecutionRuntime {
             ));
         }
         let id = ToolExecutionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let cancel = Arc::new(Notify::new());
         {
             let mut metrics = self.metrics.lock().await;
             metrics.queued += 1;
@@ -147,17 +202,22 @@ impl ToolExecutionRuntime {
             metrics.queued = metrics.queued.saturating_sub(1);
             metrics.running += 1;
         }
-        self.running.lock().await.insert(id, Instant::now());
-        let result = run_process_inner(id, request).await;
+        self.running.lock().await.insert(
+            id,
+            RunningExecution {
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        let result = run_process_inner(id, request, cancel).await;
         drop(permit);
         self.running.lock().await.remove(&id);
         {
             let mut metrics = self.metrics.lock().await;
             metrics.running = metrics.running.saturating_sub(1);
-            if result.is_ok() {
-                metrics.completed += 1;
-            } else {
-                metrics.failed += 1;
+            match &result {
+                Ok(result) if result.cancelled => metrics.cancelled += 1,
+                Ok(_) => metrics.completed += 1,
+                Err(_) => metrics.failed += 1,
             }
         }
         result
@@ -173,6 +233,7 @@ impl Default for ToolExecutionRuntime {
 async fn run_process_inner(
     id: ToolExecutionId,
     request: ProcessExecutionRequest,
+    cancel: Arc<Notify>,
 ) -> Result<ProcessExecutionResult, ToolRuntimeError> {
     let mut command = Command::new(&request.program);
     command
@@ -189,15 +250,8 @@ async fn run_process_inner(
     let stderr = child.stderr.take();
     let stdout_task = tokio::spawn(read_limited(stdout, request.max_output_bytes));
     let stderr_task = tokio::spawn(read_limited(stderr, request.max_output_bytes));
-    let (status, timed_out) = if let Some(timeout) = request.timeout {
-        if let Ok(status) = tokio::time::timeout(timeout, child.wait()).await {
-            (status?, false)
-        } else {
-            (terminate_child_after_timeout(&mut child).await?, true)
-        }
-    } else {
-        (child.wait().await?, false)
-    };
+    let (status, timed_out, cancelled) =
+        wait_for_process(&mut child, request.timeout, cancel).await?;
     let stdout = if timed_out {
         Vec::new()
     } else {
@@ -212,9 +266,36 @@ async fn run_process_inner(
         id,
         exit_code: status.code(),
         timed_out,
+        cancelled,
         stdout,
         stderr,
     })
+}
+
+async fn wait_for_process(
+    child: &mut Child,
+    timeout: Option<Duration>,
+    cancel: Arc<Notify>,
+) -> Result<(std::process::ExitStatus, bool, bool), std::io::Error> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false, false));
+        }
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            return terminate_child_after_timeout(child)
+                .await
+                .map(|status| (status, true, false));
+        }
+        if tokio::time::timeout(Duration::from_millis(10), cancel.notified())
+            .await
+            .is_ok()
+        {
+            return terminate_child_after_timeout(child)
+                .await
+                .map(|status| (status, false, true));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -304,4 +385,46 @@ async fn read_limited(
         output.extend_from_slice(&buffer[..read.min(remaining)]);
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn process_timeout_is_recorded() {
+        let runtime = ToolExecutionRuntime::new(1);
+        let result = runtime
+            .run_process(ProcessExecutionRequest {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 5".to_string()],
+                cwd: None,
+                timeout: Some(Duration::from_millis(100)),
+                max_output_bytes: 1024,
+            })
+            .await
+            .expect("process returns timeout result");
+        assert!(result.timed_out);
+        assert!(!result.cancelled);
+        let status = runtime.status().await;
+        assert_eq!(status.running, 0);
+        assert_eq!(status.completed, 1);
+    }
+
+    #[tokio::test]
+    async fn process_output_is_limited() {
+        let runtime = ToolExecutionRuntime::new(1);
+        let result = runtime
+            .run_process(ProcessExecutionRequest {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "printf abcdef".to_string()],
+                cwd: None,
+                timeout: Some(Duration::from_secs(1)),
+                max_output_bytes: 3,
+            })
+            .await
+            .expect("process returns output");
+        assert_eq!(result.stdout, b"abc");
+        assert_eq!(result.stderr, b"");
+    }
 }

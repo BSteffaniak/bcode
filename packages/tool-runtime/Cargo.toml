@@ -15,8 +15,9 @@ serde = { workspace = true, features = ["derive", "std"] }
 thiserror = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = [
     "io-util",
+    "macros",
     "process",
-    "rt",
+    "rt-multi-thread",
     "sync",
     "time",
 ] }
