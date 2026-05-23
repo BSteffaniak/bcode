@@ -280,6 +280,7 @@ impl LoadedPlugin {
                 operation: operation.into(),
                 payload,
             },
+            events: bcode_plugin_sdk::ServiceEventEmitter::default(),
         };
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let mut output_len = 0_usize;
@@ -2265,7 +2266,7 @@ library = "libexample_plugin.dylib"
             .expect("service should invoke");
 
         assert_eq!(response.payload, b"ok");
-        assert_eq!(events, vec![b"event".to_vec()]);
+        assert_eq!(events, vec![b"event".to_vec(), b"thread-event".to_vec()]);
     }
 
     #[test]
@@ -2298,6 +2299,12 @@ library = "libexample_plugin.dylib"
                 .expect("service should invoke");
 
             assert_eq!(event, b"event".to_vec());
+            let thread_event = invocation
+                .events
+                .recv()
+                .await
+                .expect("thread event should emit");
+            assert_eq!(thread_event, b"thread-event".to_vec());
             assert_eq!(response.payload, b"ok");
         });
     }
@@ -2577,6 +2584,16 @@ library = "libexample_plugin.dylib"
     ) -> i32 {
         if let Some(callback) = callback {
             callback(b"event".as_ptr(), b"event".len(), user_data);
+            let user_data = user_data as usize;
+            std::thread::spawn(move || {
+                callback(
+                    b"thread-event".as_ptr(),
+                    b"thread-event".len(),
+                    user_data as *mut std::ffi::c_void,
+                );
+            })
+            .join()
+            .expect("event thread should join");
         }
         test_service(instance, input_ptr, input_len, output, cap, len)
     }

@@ -4,7 +4,6 @@
 
 //! Bundled shell execution tool plugin for Bcode.
 
-use bcode_plugin_sdk::emit_service_event;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
@@ -38,7 +37,7 @@ impl RustPlugin for ShellPlugin {
 
         match context.request.operation.as_str() {
             OP_LIST_TOOLS => list_tools(&context.request),
-            OP_INVOKE_TOOL => invoke_tool(&context.request),
+            OP_INVOKE_TOOL => invoke_tool(&context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported tool service operation",
@@ -92,13 +91,14 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     })
 }
 
-fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ToolInvocationRequest>() {
+fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ToolInvocationRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
     let response = match request.name.as_str() {
         "shell.run" => run_shell_tool(
+            context.events,
             &request.tool_call_id,
             request.name.as_str(),
             request.arguments,
@@ -114,6 +114,7 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
 }
 
 fn run_shell_tool(
+    events: ServiceEventEmitter,
     tool_call_id: &str,
     tool_name: &str,
     arguments: serde_json::Value,
@@ -136,14 +137,17 @@ fn run_shell_tool(
             content: Vec::new(),
         };
     }
-    emit_tool_stream_event(&ToolInvocationStreamEvent::Started {
-        tool_call_id: tool_call_id.to_owned(),
-        tool_name: tool_name.to_owned(),
-    });
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::Started {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+        },
+    );
     let response = if arguments.terminal {
-        run_terminal_shell_command(tool_call_id, &arguments, session_cwd)
+        run_terminal_shell_command(events, tool_call_id, &arguments, session_cwd)
     } else {
-        match run_shell_command(tool_call_id, &arguments, session_cwd) {
+        match run_shell_command(events, tool_call_id, &arguments, session_cwd) {
             Ok(output) => output,
             Err(error) => ToolInvocationResponse {
                 output: error,
@@ -152,11 +156,14 @@ fn run_shell_tool(
             },
         }
     };
-    emit_tool_stream_event(&ToolInvocationStreamEvent::Finished {
-        tool_call_id: tool_call_id.to_owned(),
-        sequence: 0,
-        is_error: response.is_error,
-    });
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::Finished {
+            tool_call_id: tool_call_id.to_owned(),
+            sequence: 0,
+            is_error: response.is_error,
+        },
+    );
     response
 }
 
@@ -182,11 +189,12 @@ struct LimitedOutput {
 }
 
 fn run_terminal_shell_command(
+    events: ServiceEventEmitter,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
 ) -> ToolInvocationResponse {
-    match run_terminal_shell_command_inner(tool_call_id, arguments, session_cwd) {
+    match run_terminal_shell_command_inner(events, tool_call_id, arguments, session_cwd) {
         Ok(response) => response,
         Err(error) => ToolInvocationResponse {
             output: error,
@@ -197,6 +205,7 @@ fn run_terminal_shell_command(
 }
 
 fn run_terminal_shell_command_inner(
+    events: ServiceEventEmitter,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
@@ -234,7 +243,7 @@ fn run_terminal_shell_command_inner(
         .map_err(|error| error.to_string())?;
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
-        move || read_limited_streaming(&mut reader, &tool_call_id, ToolOutputStream::Pty)
+        move || read_limited_streaming(&mut reader, events, &tool_call_id, ToolOutputStream::Pty)
     });
 
     let started = Instant::now();
@@ -272,6 +281,7 @@ fn run_terminal_shell_command_inner(
 }
 
 fn run_shell_command(
+    events: ServiceEventEmitter,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&std::path::Path>,
@@ -307,7 +317,13 @@ fn run_shell_command(
                                 ToolOutputStream::Stderr
                             }
                         };
-                        emit_tool_output_delta(&tool_call_id, stream, event.sequence, &event.bytes);
+                        emit_tool_output_delta(
+                            events,
+                            &tool_call_id,
+                            stream,
+                            event.sequence,
+                            &event.bytes,
+                        );
                     },
                 )
                 .await
@@ -351,6 +367,7 @@ fn shell_args(command: &str) -> Vec<String> {
 
 fn read_limited_streaming<R>(
     mut reader: R,
+    events: ServiceEventEmitter,
     tool_call_id: &str,
     stream: ToolOutputStream,
 ) -> Result<LimitedOutput, String>
@@ -368,7 +385,7 @@ where
             break;
         }
         sequence = sequence.saturating_add(1);
-        emit_tool_output_delta(tool_call_id, stream, sequence, &buffer[..read]);
+        emit_tool_output_delta(events, tool_call_id, stream, sequence, &buffer[..read]);
         let remaining = MAX_OUTPUT_BYTES.saturating_sub(bytes.len());
         if remaining == 0 {
             continue;
@@ -379,23 +396,27 @@ where
 }
 
 fn emit_tool_output_delta(
+    events: ServiceEventEmitter,
     tool_call_id: &str,
     stream: ToolOutputStream,
     sequence: u64,
     bytes: &[u8],
 ) {
-    emit_tool_stream_event(&ToolInvocationStreamEvent::OutputDelta {
-        tool_call_id: tool_call_id.to_owned(),
-        stream,
-        sequence,
-        text: String::from_utf8_lossy(bytes).into_owned(),
-        byte_len: bytes.len(),
-    });
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id: tool_call_id.to_owned(),
+            stream,
+            sequence,
+            text: String::from_utf8_lossy(bytes).into_owned(),
+            byte_len: bytes.len(),
+        },
+    );
 }
 
-fn emit_tool_stream_event(event: &ToolInvocationStreamEvent) {
+fn emit_tool_stream_event(events: ServiceEventEmitter, event: &ToolInvocationStreamEvent) {
     if let Ok(payload) = serde_json::to_vec(event) {
-        emit_service_event(&payload);
+        events.emit(&payload);
     }
 }
 
@@ -465,6 +486,7 @@ mod tests {
     fn timeout_terminates_shell_process_group() {
         let started = Instant::now();
         let response = run_shell_command(
+            ServiceEventEmitter::default(),
             "test",
             &ShellRunArguments {
                 command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),

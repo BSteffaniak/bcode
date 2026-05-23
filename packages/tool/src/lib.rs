@@ -116,6 +116,16 @@ pub struct ToolInvocationResponse {
 pub enum ToolResultContent {
     Text { text: String },
     Image { image: ImageContent },
+    ImageRef { image: ImageRefContent },
+}
+
+/// Model-visible image reference returned by a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRefContent {
+    pub path: String,
+    pub mime_type: String,
+    #[serde(default)]
+    pub metadata: ImageMetadata,
 }
 
 /// Model-visible image content returned by a tool.

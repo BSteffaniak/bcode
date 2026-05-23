@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
-    SessionTokenUsage,
+    SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -935,6 +935,53 @@ fn scroll_up_requests_older_history_only_after_top() {
 
     assert!(app.scroll_transcript_up(usize::MAX / 2));
     assert!(app.should_load_older_history());
+}
+
+#[test]
+fn streamed_tool_output_is_not_duplicated_by_final_result() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "filesystem.shell.run".to_owned(),
+            arguments_json: "{}".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-1".to_owned(),
+                stream: ToolOutputStream::Stdout,
+                sequence: 0,
+                text: "first\n".to_owned(),
+                byte_len: "first\n".len(),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-1".to_owned(),
+            result: "first\n".to_owned(),
+            is_error: false,
+        },
+    ));
+
+    let tool_results = app
+        .transcript()
+        .iter()
+        .filter(|item| item.text() == "first\n")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0].text(), "first\n");
+    assert!(!tool_results[0].streaming());
 }
 
 fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {

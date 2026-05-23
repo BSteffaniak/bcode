@@ -16,9 +16,9 @@ use bcode_ipc::{
     recv_envelope, response_envelope, send_envelope,
 };
 use bcode_model::{
-    CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageContent,
-    ImageMetadata as ModelImageMetadata, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList,
-    ModelMessage, ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
+    CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
+    ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
+    ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
     OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
@@ -5312,11 +5312,11 @@ fn tool_result_content_from_output(output: &str) -> Vec<bcode_model::ToolResultC
     let note = &output[marker_index..];
     note.lines()
         .filter_map(parse_image_tool_content_note)
-        .map(|image| bcode_model::ToolResultContent::Image { image })
+        .map(|image| bcode_model::ToolResultContent::ImageRef { image })
         .collect()
 }
 
-fn parse_image_tool_content_note(line: &str) -> Option<ImageContent> {
+fn parse_image_tool_content_note(line: &str) -> Option<ImageRefContent> {
     let line = line.strip_prefix("image ")?;
     let (_number, fields) = line.split_once(": ")?;
     let mut mime_type = None;
@@ -5334,10 +5334,9 @@ fn parse_image_tool_content_note(line: &str) -> Option<ImageContent> {
         }
     }
     let source_path = source_path?;
-    let bytes = fs::read(&source_path).ok()?;
-    Some(ImageContent {
+    Some(ImageRefContent {
+        path: source_path.clone(),
         mime_type: mime_type.unwrap_or_else(|| "image/png".to_string()),
-        data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
         metadata: ModelImageMetadata {
             width,
             height,
@@ -5539,7 +5538,16 @@ fn tool_result_content_model_note(tool_call_id: &str, content: &[ToolResultConte
     let images = content
         .iter()
         .filter_map(|item| match item {
-            ToolResultContent::Image { image } => Some(image),
+            ToolResultContent::Image { image } => Some((
+                image.mime_type.as_str(),
+                &image.metadata,
+                image.metadata.source_path.as_deref(),
+            )),
+            ToolResultContent::ImageRef { image } => Some((
+                image.mime_type.as_str(),
+                &image.metadata,
+                Some(image.path.as_str()),
+            )),
             ToolResultContent::Text { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -5547,22 +5555,16 @@ fn tool_result_content_model_note(tool_call_id: &str, content: &[ToolResultConte
         return String::new();
     }
     let mut note = String::from("\n\n[structured tool content attached]");
-    for (index, image) in images.iter().enumerate() {
+    for (index, (mime_type, metadata, path)) in images.iter().enumerate() {
         let image_number = index + 1;
-        let dimensions = image
-            .metadata
+        let dimensions = metadata
             .width
-            .zip(image.metadata.height)
+            .zip(metadata.height)
             .map_or_else(String::new, |(width, height)| format!(" {width}x{height}"));
-        let path = image
-            .metadata
-            .source_path
-            .as_deref()
-            .map_or_else(String::new, |path| format!(" path={path}"));
+        let path = path.map_or_else(String::new, |path| format!(" path={path}"));
         let _ = write!(
             note,
-            "\nimage {image_number}: call_id={tool_call_id} mime={}{}{}",
-            image.mime_type, dimensions, path
+            "\nimage {image_number}: call_id={tool_call_id} mime={mime_type}{dimensions}{path}"
         );
     }
     note

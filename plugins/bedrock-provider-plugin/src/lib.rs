@@ -656,9 +656,35 @@ fn bedrock_content_blocks(
                     .tool_use_id(result.call_id.clone())
                     .content(ToolResultContentBlock::Text(result.output.clone()));
                 for content in &result.content {
-                    if let bcode_model::ToolResultContent::Image { image } = content {
-                        builder = builder
-                            .content(ToolResultContentBlock::Image(bedrock_image_block(image)?));
+                    match content {
+                        bcode_model::ToolResultContent::Image { image } => {
+                            builder = builder.content(ToolResultContentBlock::Image(
+                                bedrock_image_block(image)?,
+                            ));
+                        }
+                        bcode_model::ToolResultContent::ImageRef { image } => {
+                            builder = builder.content(ToolResultContentBlock::Text(format!(
+                                "[image reference: {} {}{}{}]",
+                                image.path,
+                                image.mime_type,
+                                image
+                                    .metadata
+                                    .width
+                                    .zip(image.metadata.height)
+                                    .map_or_else(String::new, |(width, height)| format!(
+                                        " {width}x{height}"
+                                    )),
+                                image
+                                    .metadata
+                                    .byte_len
+                                    .map_or_else(String::new, |byte_len| format!(
+                                        " {byte_len} bytes"
+                                    ))
+                            )));
+                        }
+                        bcode_model::ToolResultContent::Text { text } => {
+                            builder = builder.content(ToolResultContentBlock::Text(text.clone()));
+                        }
                     }
                 }
                 if result.is_error {

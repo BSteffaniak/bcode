@@ -8,11 +8,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::ffi::{CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
-thread_local! {
-    static SERVICE_EVENT_SINK: std::cell::RefCell<Option<ServiceEventSink>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 /// ABI-safe callback used by plugins to emit incremental service events.
 pub type ServiceEventCallback = extern "C" fn(*const u8, usize, *mut c_void);
 
@@ -27,11 +22,43 @@ pub type StreamingServiceFn = fn(
     *mut c_void,
 ) -> i32;
 
-#[derive(Clone, Copy)]
-struct ServiceEventSink {
-    callback: ServiceEventCallback,
-    user_data: *mut c_void,
+/// Cloneable event emitter scoped to one service invocation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServiceEventEmitter {
+    callback: Option<ServiceEventCallback>,
+    user_data: usize,
 }
+
+impl ServiceEventEmitter {
+    /// Create an emitter from raw ABI callback parts.
+    #[must_use]
+    pub fn new(callback: Option<ServiceEventCallback>, user_data: *mut c_void) -> Self {
+        Self {
+            callback,
+            user_data: user_data as usize,
+        }
+    }
+
+    /// Return whether this invocation supports incremental events.
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        self.callback.is_some()
+    }
+
+    /// Emit an incremental service event payload.
+    pub fn emit(self, payload: &[u8]) {
+        if let Some(callback) = self.callback {
+            callback(
+                payload.as_ptr(),
+                payload.len(),
+                self.user_data as *mut c_void,
+            );
+        }
+    }
+}
+
+unsafe impl Send for ServiceEventEmitter {}
+unsafe impl Sync for ServiceEventEmitter {}
 
 /// Current stable native plugin ABI version.
 pub const CURRENT_PLUGIN_ABI_VERSION: u16 = 1;
@@ -151,10 +178,12 @@ impl From<&str> for PluginError {
 }
 
 /// Host request delivered to a native plugin service.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeServiceContext {
     pub plugin_id: String,
     pub request: ServiceRequest,
+    #[serde(skip)]
+    pub events: ServiceEventEmitter,
 }
 
 /// Host event delivered to a native plugin.
@@ -378,24 +407,27 @@ pub fn deactivate_export<P: RustPlugin>(instance: &'static Mutex<P>) -> i32 {
     })
 }
 
+/// Decode and invoke a service with an explicit invocation-scoped event emitter.
 #[doc(hidden)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn invoke_service_export<P: RustPlugin>(
+pub fn invoke_service_with_emitter_export<P: RustPlugin>(
     instance: &'static Mutex<P>,
     input_ptr: *const u8,
     input_len: usize,
     output_ptr: *mut u8,
     output_capacity: usize,
     output_len: *mut usize,
+    events: ServiceEventEmitter,
 ) -> i32 {
     if input_ptr.is_null() || output_len.is_null() {
         return SERVICE_STATUS_INVALID_ARGUMENT;
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let Ok(context) = serde_json::from_slice::<NativeServiceContext>(input) else {
+    let Ok(mut context) = serde_json::from_slice::<NativeServiceContext>(input) else {
         return SERVICE_STATUS_DECODE_FAILED;
     };
+    context.events = events;
     let response = match instance.lock() {
         Ok(mut plugin) => plugin.invoke_service(context),
         Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
@@ -416,39 +448,43 @@ pub fn invoke_service_export<P: RustPlugin>(
     SERVICE_STATUS_OK
 }
 
-/// Emit an incremental event for the currently running service invocation.
-pub fn emit_service_event(payload: &[u8]) {
-    SERVICE_EVENT_SINK.with(|sink| {
-        if let Some(sink) = *sink.borrow() {
-            (sink.callback)(payload.as_ptr(), payload.len(), sink.user_data);
-        }
-    });
-}
-
-/// Invoke a closure while a service event sink is installed for this thread.
-pub fn with_service_event_sink<T>(
-    callback: Option<ServiceEventCallback>,
-    user_data: *mut c_void,
-    f: impl FnOnce() -> T,
-) -> T {
-    struct Reset(Option<ServiceEventSink>);
-
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            SERVICE_EVENT_SINK.with(|sink| {
-                *sink.borrow_mut() = self.0;
-            });
-        }
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn invoke_service_export<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if input_ptr.is_null() || output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
     }
 
-    let previous = SERVICE_EVENT_SINK.with(|sink| {
-        sink.replace(callback.map(|callback| ServiceEventSink {
-            callback,
-            user_data,
-        }))
-    });
-    let _reset = Reset(previous);
-    f()
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let Ok(mut context) = serde_json::from_slice::<NativeServiceContext>(input) else {
+        return SERVICE_STATUS_DECODE_FAILED;
+    };
+    context.events = ServiceEventEmitter::default();
+    let response = match instance.lock() {
+        Ok(mut plugin) => plugin.invoke_service(context),
+        Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
+    };
+    let Ok(encoded) = serde_json::to_vec(&response) else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
+
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if output_ptr.is_null() || output_capacity < encoded.len() {
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    SERVICE_STATUS_OK
 }
 
 #[doc(hidden)]
@@ -464,16 +500,15 @@ pub fn invoke_service_streaming_export<P: RustPlugin>(
     event_callback: Option<ServiceEventCallback>,
     event_user_data: *mut c_void,
 ) -> i32 {
-    with_service_event_sink(event_callback, event_user_data, || {
-        invoke_service_export(
-            instance,
-            input_ptr,
-            input_len,
-            output_ptr,
-            output_capacity,
-            output_len,
-        )
-    })
+    invoke_service_with_emitter_export(
+        instance,
+        input_ptr,
+        input_len,
+        output_ptr,
+        output_capacity,
+        output_len,
+        ServiceEventEmitter::new(event_callback, event_user_data),
+    )
 }
 
 #[doc(hidden)]
@@ -723,8 +758,8 @@ pub mod prelude {
         NativeServiceContext, PluginError, PluginEvent, RustPlugin,
         SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
         SERVICE_STATUS_ENCODE_FAILED, SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK,
-        SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceEventCallback, ServiceRequest,
-        ServiceResponse, StaticPluginVtable, StreamingServiceFn, emit_service_event, export_plugin,
+        SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceEventCallback, ServiceEventEmitter,
+        ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn, export_plugin,
         static_plugin_vtable,
     };
 }

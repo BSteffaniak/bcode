@@ -510,6 +510,16 @@ pub struct ToolResult {
 pub enum ToolResultContent {
     Text { text: String },
     Image { image: ImageContent },
+    ImageRef { image: ImageRefContent },
+}
+
+/// Provider-neutral image reference content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRefContent {
+    pub path: String,
+    pub mime_type: String,
+    #[serde(default)]
+    pub metadata: ImageMetadata,
 }
 
 /// Normalized provider stream event.

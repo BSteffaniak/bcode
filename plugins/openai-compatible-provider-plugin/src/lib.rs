@@ -1547,25 +1547,57 @@ fn responses_tool_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
             output: result.output.clone(),
         });
         for content in &result.content {
-            if let bcode_model::ToolResultContent::Image { image } = content {
-                items.push(ResponsesInputItem::Message {
-                    role: "user",
-                    content: vec![
-                        ResponsesContent::InputText {
-                            text: format!(
-                                "Image content returned by tool call {}:",
-                                result.call_id
-                            ),
-                        },
-                        ResponsesContent::InputImage {
-                            image_url: image_data_url(image),
-                        },
-                    ],
-                });
+            match content {
+                bcode_model::ToolResultContent::Image { image } => {
+                    items.push(ResponsesInputItem::Message {
+                        role: "user",
+                        content: vec![
+                            ResponsesContent::InputText {
+                                text: format!(
+                                    "Image content returned by tool call {}:",
+                                    result.call_id
+                                ),
+                            },
+                            ResponsesContent::InputImage {
+                                image_url: image_data_url(image),
+                            },
+                        ],
+                    });
+                }
+                bcode_model::ToolResultContent::ImageRef { image } => {
+                    items.push(ResponsesInputItem::Message {
+                        role: "user",
+                        content: vec![ResponsesContent::InputText {
+                            text: image_ref_text(&result.call_id, image),
+                        }],
+                    });
+                }
+                bcode_model::ToolResultContent::Text { text } => {
+                    items.push(ResponsesInputItem::Message {
+                        role: "user",
+                        content: vec![ResponsesContent::InputText { text: text.clone() }],
+                    });
+                }
             }
         }
     }
     items
+}
+
+fn image_ref_text(call_id: &str, image: &bcode_model::ImageRefContent) -> String {
+    let dimensions = image
+        .metadata
+        .width
+        .zip(image.metadata.height)
+        .map_or_else(String::new, |(width, height)| format!(" {width}x{height}"));
+    let byte_len = image
+        .metadata
+        .byte_len
+        .map_or_else(String::new, |byte_len| format!(" {byte_len} bytes"));
+    format!(
+        "Image reference returned by tool call {call_id}: {} {}{}{}",
+        image.path, image.mime_type, dimensions, byte_len
+    )
 }
 
 fn image_data_url(image: &bcode_model::ImageContent) -> String {

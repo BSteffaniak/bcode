@@ -835,16 +835,25 @@ impl BmuxApp {
         self.diff_panel.record(summary, lines);
     }
 
-    fn finish_live_tool_output(&mut self, tool_call_id: &str) {
+    fn finish_live_tool_output(&mut self, tool_call_id: &str) -> bool {
         if let Some(index) = self.live_tool_output_items.remove(tool_call_id)
             && let Some(item) = self.transcript.get_mut(index)
         {
             item.finish_streaming();
+            return true;
         }
+        false
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
-        self.finish_live_tool_output(tool_call_id);
+        if self.finish_live_tool_output(tool_call_id) {
+            if is_error {
+                "tool failed".clone_into(&mut self.status);
+            } else {
+                "tool finished".clone_into(&mut self.status);
+            }
+            return;
+        }
         let context = self.tool_call_contexts.get(tool_call_id);
         self.transcript.push(tool_result_item(
             tool_call_id,

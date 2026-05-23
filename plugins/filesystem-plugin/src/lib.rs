@@ -6,7 +6,7 @@
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ImageContent, ImageMetadata, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
+    ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
     TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolList, ToolResultContent, ToolSideEffect,
 };
@@ -29,7 +29,6 @@ const DEFAULT_LIST_MAX_ENTRIES: usize = 1_000;
 const MAX_EXTERNAL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RUST_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const TERMINATION_GRACE_MS: u64 = 500;
-const MAX_IMAGE_READ_BYTES: u64 = 20 * 1024 * 1024;
 const DEFAULT_READ_MAX_LINES: usize = 1_000;
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 
@@ -467,50 +466,29 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
 fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationResponse {
     let metadata = std::fs::metadata(path);
     let byte_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-    if byte_len > MAX_IMAGE_READ_BYTES {
-        return ToolInvocationResponse {
-            output: format!(
-                "Image file [{}] is too large to attach ({} bytes; limit {} bytes): {}",
-                image.mime_type,
-                byte_len,
-                MAX_IMAGE_READ_BYTES,
-                path.display()
-            ),
-            is_error: true,
-            content: Vec::new(),
-        };
-    }
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let output = format!(
-                "Read image file [{}]\nPath: {}\nDimensions: {}x{}\nSize: {} bytes\nAttached image content for visual inspection.",
-                image.mime_type,
-                path.display(),
-                image.width,
-                image.height,
-                bytes.len()
-            );
-            ToolInvocationResponse {
-                output,
-                is_error: false,
-                content: vec![ToolResultContent::Image {
-                    image: ImageContent {
-                        mime_type: image.mime_type,
-                        data_base64: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &bytes,
-                        ),
-                        metadata: ImageMetadata {
-                            width: Some(image.width),
-                            height: Some(image.height),
-                            byte_len: Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
-                            source_path: Some(path.display().to_string()),
-                        },
-                    },
-                }],
-            }
-        }
-        Err(error) => tool_io_error(&error),
+    let output = format!(
+        "Read image file [{}]\nPath: {}\nDimensions: {}x{}\nSize: {} bytes\nReturned image reference for visual inspection.",
+        image.mime_type,
+        path.display(),
+        image.width,
+        image.height,
+        byte_len
+    );
+    ToolInvocationResponse {
+        output,
+        is_error: false,
+        content: vec![ToolResultContent::ImageRef {
+            image: ImageRefContent {
+                path: path.display().to_string(),
+                mime_type: image.mime_type,
+                metadata: ImageMetadata {
+                    width: Some(image.width),
+                    height: Some(image.height),
+                    byte_len: Some(byte_len),
+                    source_path: Some(path.display().to_string()),
+                },
+            },
+        }],
     }
 }
 
@@ -1571,10 +1549,11 @@ mod tests {
         assert!(!response.is_error);
         assert!(response.output.contains("Read image file [image/png]"));
         assert_eq!(response.content.len(), 1);
-        let ToolResultContent::Image { image } = &response.content[0] else {
-            panic!("expected image content");
+        let ToolResultContent::ImageRef { image } = &response.content[0] else {
+            panic!("expected image reference content");
         };
         assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.path, file.display().to_string());
         assert_eq!(image.metadata.width, Some(1));
         assert_eq!(image.metadata.height, Some(1));
         let _ = std::fs::remove_dir_all(root);
