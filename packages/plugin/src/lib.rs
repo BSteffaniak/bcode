@@ -682,6 +682,12 @@ pub struct PluginExecutorStatus {
     pub concurrency: PluginConcurrency,
     pub running: usize,
     pub queued: usize,
+    pub queued_control: usize,
+    pub queued_query: usize,
+    pub queued_tool_execution: usize,
+    pub queued_model_provider: usize,
+    pub queued_event_delivery: usize,
+    pub queued_service: usize,
     pub completed: u64,
     pub failed: u64,
 }
@@ -690,6 +696,12 @@ pub struct PluginExecutorStatus {
 struct PluginExecutorMetrics {
     running: AtomicUsize,
     queued: AtomicUsize,
+    queued_control: AtomicUsize,
+    queued_query: AtomicUsize,
+    queued_tool_execution: AtomicUsize,
+    queued_model_provider: AtomicUsize,
+    queued_event_delivery: AtomicUsize,
+    queued_service: AtomicUsize,
     completed: AtomicU64,
     failed: AtomicU64,
 }
@@ -701,8 +713,35 @@ impl PluginExecutorMetrics {
             concurrency,
             running: self.running.load(Ordering::Relaxed),
             queued: self.queued.load(Ordering::Relaxed),
+            queued_control: self.queued_control.load(Ordering::Relaxed),
+            queued_query: self.queued_query.load(Ordering::Relaxed),
+            queued_tool_execution: self.queued_tool_execution.load(Ordering::Relaxed),
+            queued_model_provider: self.queued_model_provider.load(Ordering::Relaxed),
+            queued_event_delivery: self.queued_event_delivery.load(Ordering::Relaxed),
+            queued_service: self.queued_service.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn enqueue(&self, class: PluginInvocationClass) {
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        self.queue_for_class(class).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dequeue(&self, class: PluginInvocationClass) {
+        self.queued.fetch_sub(1, Ordering::Relaxed);
+        self.queue_for_class(class).fetch_sub(1, Ordering::Relaxed);
+    }
+
+    const fn queue_for_class(&self, class: PluginInvocationClass) -> &AtomicUsize {
+        match class {
+            PluginInvocationClass::Control => &self.queued_control,
+            PluginInvocationClass::Query => &self.queued_query,
+            PluginInvocationClass::ToolExecution => &self.queued_tool_execution,
+            PluginInvocationClass::ModelProvider => &self.queued_model_provider,
+            PluginInvocationClass::EventDelivery => &self.queued_event_delivery,
+            PluginInvocationClass::Service => &self.queued_service,
         }
     }
 }
@@ -793,7 +832,7 @@ impl PluginExecutorHandle {
         class: PluginInvocationClass,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let (response, receiver) = oneshot::channel();
-        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        self.metrics.enqueue(class);
         self.sender
             .send(PluginExecutorMessage::Service(PluginInvocation {
                 id: next_plugin_invocation_id(),
@@ -806,7 +845,7 @@ impl PluginExecutorHandle {
             }))
             .await
             .map_err(|_| {
-                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                self.metrics.dequeue(class);
                 PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
             })?;
         receiver
@@ -816,7 +855,7 @@ impl PluginExecutorHandle {
 
     async fn handle_event(&self, topic: String, payload: Vec<u8>) -> Result<(), PluginLoadError> {
         let (response, receiver) = oneshot::channel();
-        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        self.metrics.enqueue(PluginInvocationClass::EventDelivery);
         self.sender
             .send(PluginExecutorMessage::Event(PluginEventInvocation {
                 id: next_plugin_invocation_id(),
@@ -828,7 +867,7 @@ impl PluginExecutorHandle {
             }))
             .await
             .map_err(|_| {
-                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                self.metrics.dequeue(PluginInvocationClass::EventDelivery);
                 PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
             })?;
         receiver
@@ -1174,7 +1213,7 @@ fn spawn_exclusive_plugin_executor(
         while let Some(message) = receiver.blocking_recv() {
             match message {
                 PluginExecutorMessage::Service(invocation) => {
-                    metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                    metrics.dequeue(invocation.class);
                     metrics.running.fetch_add(1, Ordering::Relaxed);
                     let started_at = Instant::now();
                     tracing::debug!(
@@ -1213,7 +1252,7 @@ fn spawn_exclusive_plugin_executor(
                     let _ = invocation.response.send(response);
                 }
                 PluginExecutorMessage::Event(invocation) => {
-                    metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                    metrics.dequeue(invocation.class);
                     metrics.running.fetch_add(1, Ordering::Relaxed);
                     let started_at = Instant::now();
                     tracing::debug!(

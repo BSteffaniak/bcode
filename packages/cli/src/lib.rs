@@ -2649,11 +2649,17 @@ async fn server_status() -> Result<(), CliError> {
         println!("plugin runtime:");
         for plugin in &status.plugin_runtime {
             println!(
-                "  {}: policy={:?} running={} queued={} completed={} failed={}",
+                "  {}: policy={:?} running={} queued={} [control={} query={} tool={} model={} event={} service={}] completed={} failed={}",
                 plugin.plugin_id,
                 plugin.concurrency,
                 plugin.running,
                 plugin.queued,
+                plugin.queued_control,
+                plugin.queued_query,
+                plugin.queued_tool_execution,
+                plugin.queued_model_provider,
+                plugin.queued_event_delivery,
+                plugin.queued_service,
                 plugin.completed,
                 plugin.failed
             );
