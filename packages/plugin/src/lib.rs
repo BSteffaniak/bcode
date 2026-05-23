@@ -647,6 +647,7 @@ pub enum PluginConcurrency {
 
 /// Plugin invocation scheduling class.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PluginInvocationClass {
     /// Control-plane requests that should remain responsive.
     Control,
@@ -1984,6 +1985,50 @@ mod tests {
     use semver::Version;
     use std::path::PathBuf;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_invocation_class_names_as_manifest_snake_case() {
+        let manifest: PluginManifest = toml::from_str(&format!(
+            r#"
+id = "example.plugin"
+name = "Example Plugin"
+version = "0.1.0"
+
+[[services]]
+interface_id = "bcode.tool/v1"
+class = "tool_execution"
+
+[runtime]
+type = "native"
+abi_version = {CURRENT_PLUGIN_ABI_VERSION}
+library = "libexample_plugin.dylib"
+"#,
+        ))
+        .expect("manifest should parse");
+
+        assert_eq!(
+            manifest.services[0].class,
+            Some(PluginInvocationClass::ToolExecution)
+        );
+
+        let encoded = serde_json::to_value(PluginInvocationClass::ToolExecution)
+            .expect("invocation class should encode");
+        assert_eq!(encoded, serde_json::json!("tool_execution"));
+    }
+
+    #[test]
+    fn bundled_plugin_manifests_parse() {
+        for manifest_toml in [
+            include_str!("../../../plugins/bedrock-provider-plugin/bcode-plugin.toml"),
+            include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+        ] {
+            toml::from_str::<PluginManifest>(manifest_toml).expect("bundled manifest should parse");
+        }
+    }
 
     #[test]
     fn discovers_plugin_manifest_in_child_directory() {

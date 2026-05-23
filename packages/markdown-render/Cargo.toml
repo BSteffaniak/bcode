@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "rendering", "text-processing"]
+description = "Markdown to terminal line rendering for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "markdown", "tui"]
+license     = { workspace = true }
+name        = "bcode_markdown_render"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_tui                     = { workspace = true }
+hyperchad_color              = { workspace = true }
+hyperchad_markdown           = { workspace = true }
+hyperchad_transformer        = { workspace = true }
+hyperchad_transformer_models = { workspace = true }
+unicode-segmentation         = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

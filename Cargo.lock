@@ -840,6 +840,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_markdown_render"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_tui",
+ "hyperchad_color",
+ "hyperchad_markdown",
+ "hyperchad_transformer",
+ "hyperchad_transformer_models",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "bcode_model"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1013,6 +1025,7 @@ dependencies = [
  "bcode_command",
  "bcode_config",
  "bcode_ipc",
+ "bcode_markdown_render",
  "bcode_model",
  "bcode_session_models",
  "bcode_skill_models",
@@ -1354,6 +1367,21 @@ name = "cmov"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
+
+[[package]]
+name = "color-hex"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecdffb913a326b6c642290a0d0ec8e8d6597291acdc07cc4c9cb4b3635d44cf9"
+
+[[package]]
+name = "colored"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "const-oid"
@@ -1806,6 +1834,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "free_log_client"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db6af4e00ca798b38580f356d769d86afdd361ead5bcba2c33874634753c3a3b"
+dependencies = [
+ "free_log_models",
+ "serde_json",
+ "strum 0.26.3",
+ "strum_macros 0.26.4",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "free_log_models"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89dab3c7ff6e0a6e93af9cb87b41a98eb1b5635f5fd0d97fe552103f0290367"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "strum 0.26.3",
+ "strum_macros 0.26.4",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2076,6 +2134,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "html-escape"
+version = "0.2.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d1ad449764d627e22bfd7cd5e8868264fc9236e07c752972b4080cd351cb476"
+dependencies = [
+ "utf8-width",
+]
+
+[[package]]
 name = "http"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2249,6 +2316,84 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "hyperchad_actions"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73b0a4dbe3cef4ca8352e32a9f76107b135a0166a8db939d56cbf95b2ae46a8f"
+dependencies = [
+ "hyperchad_color",
+ "hyperchad_transformer_models",
+ "log",
+ "moosicbox_arb",
+ "moosicbox_assert",
+ "serde",
+ "serde_json",
+ "switchy_time",
+]
+
+[[package]]
+name = "hyperchad_color"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f82023271365481876ca47ebc57869b83fd82fb79d48b60c61f3cf48ad40c404"
+dependencies = [
+ "color-hex",
+ "log",
+ "moosicbox_assert",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hyperchad_markdown"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40cf9c3d397d2301f97e9d3c298eb31410a6b8bcf180ffa0c7b4529fb6406fc9"
+dependencies = [
+ "hyperchad_color",
+ "hyperchad_transformer",
+ "hyperchad_transformer_models",
+ "log",
+ "moosicbox_assert",
+ "pulldown-cmark",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hyperchad_transformer"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "158ee62631ca5859f3bcaec613b8d2ce3befb27365a618be936d8cc82d0ddc8e"
+dependencies = [
+ "html-escape",
+ "hyperchad_actions",
+ "hyperchad_color",
+ "hyperchad_transformer_models",
+ "log",
+ "moosicbox_assert",
+ "moosicbox_logging",
+ "paste",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "switchy_env",
+ "switchy_time",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hyperchad_transformer_models"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32be2854946b339398144a5e25e2b5ca2b8f5450ed0edf958ff3cb73aeb6db85"
+dependencies = [
+ "log",
+ "moosicbox_assert",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2626,6 +2771,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "moosicbox_arb"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e78b8c2768002033b63396bdf4f780ccc399d9c52f7234809b6948ac816494cb"
+dependencies = [
+ "log",
+ "moosicbox_assert",
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
+name = "moosicbox_assert"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8590534ef4768900b44696032edce2cc0a8bbc4f51cbc66bc68ff52dc194322a"
+dependencies = [
+ "colored",
+ "moosicbox_env_utils",
+]
+
+[[package]]
+name = "moosicbox_env_utils"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb09f0a01204c8640457146369aea65d4652f6d3fca535c19d38c1833d85584f"
+
+[[package]]
+name = "moosicbox_logging"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43c43fddf98c3dda38e8894d79b4f15fe0187a64148b22160bfecf35932da612"
+dependencies = [
+ "free_log_client",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nix"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2798,6 +2982,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pbkdf2"
@@ -2996,6 +3186,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
+dependencies = [
+ "bitflags 2.11.1",
+ "num-traits",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.11.1",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3128,6 +3344,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+dependencies = [
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -3869,10 +4094,69 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "strum"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
+
+[[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "switchy_env"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5512dbdbe003cbc33e56d1a27d6eaa3d6bc5105fc037bb16b4ae7bddaa017c5"
+dependencies = [
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "switchy_time"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23d0b066a9627281f5f9465122cbb851e9031d3caaebb217246689bb8e5d4ce4"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "syn"
@@ -4204,6 +4488,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+ "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
 ]
 
 [[package]]
@@ -4217,9 +4513,11 @@ dependencies = [
  "once_cell",
  "regex-automata",
  "sharded-slab",
+ "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
+ "tracing-log",
 ]
 
 [[package]]
@@ -4244,6 +4542,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
 name = "unic-langid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4261,6 +4565,12 @@ dependencies = [
  "serde",
  "tinystr",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"
@@ -4321,6 +4631,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
+name = "utf8-width"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1292c0d970b54115d14f2492fe0170adf21d68a1de108eebc51c1df4f346a091"
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4337,6 +4653,12 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "version_check"

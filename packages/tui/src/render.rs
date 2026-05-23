@@ -1,5 +1,6 @@
 //! TUI rendering.
 
+use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
     TerminalGridStream,
@@ -410,7 +411,60 @@ fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         Color::Green
     };
-    push_message_block(rows, title, item.text(), color, width);
+    push_markdown_message_block(
+        rows,
+        title,
+        item.text(),
+        color,
+        width,
+        item.streaming(),
+        true,
+    );
+}
+
+fn push_markdown_message_block(
+    rows: &mut Vec<Line>,
+    title: &str,
+    body: &str,
+    color: Color,
+    width: u16,
+    streaming: bool,
+    prominent: bool,
+) {
+    let heading_style = if prominent {
+        Style::new().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(color)
+    };
+    push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
+
+    if body.is_empty() {
+        rows.push(Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled(
+                "·",
+                if prominent {
+                    Style::new()
+                } else {
+                    muted_style()
+                },
+            ),
+        ]));
+    } else {
+        for line in render_markdown_lines(
+            body,
+            MarkdownRenderOptions {
+                width: width.saturating_sub(2).max(1),
+                streaming,
+            },
+        ) {
+            let mut spans = vec![Span::styled("  ", muted_style())];
+            spans.extend(line.spans);
+            rows.push(Line::from_spans(spans));
+        }
+    }
+
+    rows.push(Line::default());
 }
 
 fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
@@ -419,7 +473,15 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         "thinking"
     };
-    push_detail_block(rows, title, item.text(), Color::BrightBlack, width);
+    push_markdown_message_block(
+        rows,
+        title,
+        item.text(),
+        Color::BrightBlack,
+        width,
+        item.streaming(),
+        false,
+    );
 }
 
 fn push_tool_request_rows(
