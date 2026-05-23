@@ -52,7 +52,7 @@ fn hyperchad_markdown_options() -> MarkdownOptions {
         enable_smart_punctuation: true,
         emoji_enabled: false,
         xss_protection: true,
-        syntax_highlighting: false,
+        syntax_highlighting: true,
         link_resolver: None,
     }
 }

@@ -13,7 +13,7 @@ version     = { workspace = true }
 [dependencies]
 bmux_tui                     = { workspace = true }
 hyperchad_color              = { workspace = true }
-hyperchad_markdown           = { workspace = true }
+hyperchad_markdown           = { workspace = true, features = ["syntax-highlighting"] }
 hyperchad_transformer        = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
 unicode-segmentation         = { workspace = true }
