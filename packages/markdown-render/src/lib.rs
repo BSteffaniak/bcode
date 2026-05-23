@@ -8,13 +8,73 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::style::{Color, Modifier};
+use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use hyperchad_color::Color as HyperChadColor;
 use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
 use hyperchad_transformer::{Container, Element, Input};
 use hyperchad_transformer_models::{FontWeight, TextDecorationLine};
 use unicode_segmentation::UnicodeSegmentation;
+
+/// Terminal styles used for Markdown rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownTheme {
+    /// Base text style.
+    pub text: Style,
+    /// Heading style.
+    pub heading: Style,
+    /// Link style.
+    pub link: Style,
+    /// Strong emphasis style.
+    pub strong: Style,
+    /// Emphasis style.
+    pub emphasis: Style,
+    /// Strikethrough style.
+    pub strikethrough: Style,
+    /// Inline code style.
+    pub inline_code: Style,
+    /// Code block text fallback style.
+    pub code_block_text: Style,
+    /// Code block border style.
+    pub code_block_border: Style,
+    /// Blockquote bar style.
+    pub blockquote_bar: Style,
+    /// List marker style.
+    pub list_marker: Style,
+    /// Checked task marker style.
+    pub task_checked: Style,
+    /// Unchecked task marker style.
+    pub task_unchecked: Style,
+    /// Table border style.
+    pub table_border: Style,
+    /// Horizontal rule style.
+    pub horizontal_rule: Style,
+}
+
+impl Default for MarkdownTheme {
+    /// Create the default terminal Markdown theme.
+    fn default() -> Self {
+        let muted = Style::new().fg(Color::BrightBlack);
+        Self {
+            text: Style::new(),
+            heading: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            link: Style::new()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINE),
+            strong: Style::new().add_modifier(Modifier::BOLD),
+            emphasis: Style::new().add_modifier(Modifier::ITALIC),
+            strikethrough: Style::new().add_modifier(Modifier::CROSSED_OUT),
+            inline_code: Style::new().fg(Color::Yellow),
+            code_block_text: Style::new().fg(Color::Yellow),
+            code_block_border: muted,
+            blockquote_bar: muted,
+            list_marker: muted,
+            task_checked: muted,
+            task_unchecked: muted,
+            table_border: muted,
+            horizontal_rule: muted,
+        }
+    }
+}
 
 /// Options controlling terminal Markdown rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,14 +83,43 @@ pub struct MarkdownRenderOptions {
     pub width: u16,
     /// Whether the source Markdown is still streaming.
     pub streaming: bool,
+    /// Theme used for terminal Markdown styles.
+    pub theme: MarkdownTheme,
 }
 
 impl Default for MarkdownRenderOptions {
+    /// Create default Markdown render options.
     fn default() -> Self {
         Self {
             width: 80,
             streaming: false,
+            theme: MarkdownTheme::default(),
         }
+    }
+}
+
+impl MarkdownRenderOptions {
+    /// Create render options for a terminal width.
+    #[must_use]
+    pub fn new(width: u16) -> Self {
+        Self {
+            width,
+            ..Self::default()
+        }
+    }
+
+    /// Return options with a custom theme.
+    #[must_use]
+    pub const fn with_theme(mut self, theme: MarkdownTheme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Return options with streaming mode set.
+    #[must_use]
+    pub const fn streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
     }
 }
 
@@ -38,8 +127,14 @@ impl Default for MarkdownRenderOptions {
 #[must_use]
 pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> Vec<Line> {
     let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
-    let mut renderer = TerminalMarkdownRenderer::new(options.width);
-    renderer.render_container_children(&container, TextStyle::default());
+    let mut renderer = TerminalMarkdownRenderer::new(options.width, options.theme);
+    renderer.render_container_children(
+        &container,
+        TextStyle {
+            style: options.theme.text,
+            preserve_whitespace: false,
+        },
+    );
     renderer.finish()
 }
 
@@ -73,10 +168,10 @@ impl Default for TextStyle {
 }
 
 impl TextStyle {
-    fn merge_container(self, container: &Container) -> Self {
+    fn merge_container(self, container: &Container, theme: MarkdownTheme) -> Self {
         let mut output = self;
-        if let Some(color) = semantic_markdown_color(container) {
-            output.style = output.style.fg(color);
+        if let Some(style) = semantic_markdown_style(container, theme) {
+            output.style = style;
         } else if let Some(color) = container.color {
             output.style = output.style.fg(hyperchad_color_to_tui(color));
         }
@@ -85,20 +180,20 @@ impl TextStyle {
             .iter()
             .any(|class| class == "markdown-link")
         {
-            output.style = output.style.add_modifier(Modifier::UNDERLINE);
+            output.style = theme.link;
         }
         if container
             .classes
             .iter()
             .any(|class| class == "markdown-strong")
         {
-            output.style = output.style.add_modifier(Modifier::BOLD);
+            output.style = theme.strong;
         }
         if container.classes.iter().any(|class| class == "markdown-em") {
-            output.style = output.style.add_modifier(Modifier::ITALIC);
+            output.style = theme.emphasis;
         }
         if container.font_weight.is_some_and(is_bold_weight) {
-            output.style = output.style.add_modifier(Modifier::BOLD);
+            output.style = theme.strong;
         }
         if container
             .text_decoration
@@ -112,7 +207,7 @@ impl TextStyle {
             .as_ref()
             .is_some_and(|decoration| decoration.line.contains(&TextDecorationLine::LineThrough))
         {
-            output.style = output.style.add_modifier(Modifier::CROSSED_OUT);
+            output.style = theme.strikethrough;
         }
         output
     }
@@ -125,16 +220,18 @@ struct TerminalMarkdownRenderer {
     current_spans: Vec<Span>,
     current_width: usize,
     in_table_collection: bool,
+    theme: MarkdownTheme,
 }
 
 impl TerminalMarkdownRenderer {
-    fn new(width: u16) -> Self {
+    fn new(width: u16, theme: MarkdownTheme) -> Self {
         Self {
             width: usize::from(width.max(1)),
             rows: Vec::new(),
             current_spans: Vec::new(),
             current_width: 0,
             in_table_collection: false,
+            theme,
         }
     }
 
@@ -155,7 +252,7 @@ impl TerminalMarkdownRenderer {
             return;
         }
 
-        let style = style.merge_container(container);
+        let style = style.merge_container(container, self.theme);
         match &container.element {
             Element::Text { value } | Element::Raw { value } => {
                 self.push_text(value, style);
@@ -174,7 +271,7 @@ impl TerminalMarkdownRenderer {
                 self.render_container_children(
                     container,
                     TextStyle {
-                        style: style.style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        style: self.theme.heading,
                         preserve_whitespace: style.preserve_whitespace,
                     },
                 );
@@ -215,10 +312,15 @@ impl TerminalMarkdownRenderer {
                 } else {
                     "☐ "
                 };
+                let marker_style = if checked.unwrap_or(false) {
+                    self.theme.task_checked
+                } else {
+                    self.theme.task_unchecked
+                };
                 self.push_text(
                     marker,
                     TextStyle {
-                        style: Style::new().fg(Color::BrightBlack),
+                        style: marker_style,
                         preserve_whitespace: false,
                     },
                 );
@@ -264,12 +366,14 @@ impl TerminalMarkdownRenderer {
 
     fn render_blockquote(&mut self, container: &Container, style: TextStyle) {
         self.flush_line();
-        let mut nested =
-            Self::new(u16::try_from(self.width.saturating_sub(2).max(1)).unwrap_or(u16::MAX));
+        let mut nested = Self::new(
+            u16::try_from(self.width.saturating_sub(2).max(1)).unwrap_or(u16::MAX),
+            self.theme,
+        );
         nested.render_container_children(container, style);
         nested.flush_line();
         let rows = nested.finish();
-        let border_style = Style::new().fg(Color::BrightBlack);
+        let border_style = self.theme.blockquote_bar;
         for line in rows {
             let mut spans = vec![Span::styled("│ ", border_style)];
             spans.extend(line.spans);
@@ -278,21 +382,21 @@ impl TerminalMarkdownRenderer {
         self.ensure_blank_line();
     }
 
-    fn render_code_block(&mut self, container: &Container, style: TextStyle) {
+    fn render_code_block(&mut self, container: &Container, _style: TextStyle) {
         self.flush_line();
         self.ensure_blank_line();
-        let border_style = Style::new().fg(Color::BrightBlack);
+        let border_style = self.theme.code_block_border;
         let language = container.data.get("language").map(String::as_str);
         let header = language.map_or_else(|| "╭─".to_owned(), |language| format!("╭─ {language}"));
         self.rows
             .push(Line::from_spans(vec![Span::styled(header, border_style)]));
 
         let nested_width = u16::try_from(self.width.saturating_sub(2).max(1)).unwrap_or(u16::MAX);
-        let mut nested = Self::new(nested_width);
+        let mut nested = Self::new(nested_width, self.theme);
         nested.render_container_children(
             container,
             TextStyle {
-                style: style.style.fg(Color::Yellow),
+                style: self.theme.code_block_text,
                 preserve_whitespace: true,
             },
         );
@@ -316,7 +420,7 @@ impl TerminalMarkdownRenderer {
         self.ensure_blank_line();
         self.rows.push(Line::from_spans(vec![Span::styled(
             "─".repeat(self.width.max(1)),
-            Style::new().fg(Color::BrightBlack),
+            self.theme.horizontal_rule,
         )]));
         self.ensure_blank_line();
     }
@@ -353,7 +457,7 @@ impl TerminalMarkdownRenderer {
         let marker_width = text_display_width(marker);
         let nested_width =
             u16::try_from(self.width.saturating_sub(marker_width).max(1)).unwrap_or(u16::MAX);
-        let mut nested = Self::new(nested_width);
+        let mut nested = Self::new(nested_width, self.theme);
         nested.render_container_children(item, style);
         nested.flush_line();
         let mut item_rows = nested.finish();
@@ -361,7 +465,7 @@ impl TerminalMarkdownRenderer {
             item_rows.push(Line::default());
         }
 
-        let muted = Style::new().fg(Color::BrightBlack);
+        let muted = self.theme.list_marker;
         let continuation = " ".repeat(marker_width);
         for (row_index, row) in item_rows.into_iter().enumerate() {
             let prefix = if row_index == 0 {
@@ -377,7 +481,7 @@ impl TerminalMarkdownRenderer {
 
     fn render_table(&mut self, container: &Container, style: TextStyle) {
         self.flush_line();
-        let rows = table_rows(container, style);
+        let rows = table_rows(container, style, self.theme);
         if rows.is_empty() {
             self.ensure_blank_line();
             return;
@@ -396,7 +500,7 @@ impl TerminalMarkdownRenderer {
             return;
         }
 
-        let border_style = Style::new().fg(Color::BrightBlack);
+        let border_style = self.theme.table_border;
         self.rows
             .push(table_border_line('┌', '┬', '┐', &widths, border_style));
         for (row_index, row) in rows.iter().enumerate() {
@@ -413,7 +517,7 @@ impl TerminalMarkdownRenderer {
     }
 
     fn render_stacked_table_rows(&mut self, rows: &[TableRow]) {
-        let muted = Style::new().fg(Color::BrightBlack);
+        let muted = self.theme.table_border;
         for (row_index, row) in rows.iter().enumerate() {
             if row_index > 0 {
                 self.rows.push(Line::default());
@@ -434,7 +538,7 @@ impl TerminalMarkdownRenderer {
                 self.push_text(
                     " │ ",
                     TextStyle {
-                        style: Style::new().fg(Color::BrightBlack),
+                        style: self.theme.table_border,
                         preserve_whitespace: false,
                     },
                 );
@@ -499,14 +603,19 @@ struct TableRow {
     header: bool,
 }
 
-fn table_rows(container: &Container, style: TextStyle) -> Vec<TableRow> {
+fn table_rows(container: &Container, style: TextStyle, theme: MarkdownTheme) -> Vec<TableRow> {
     let mut rows = Vec::new();
-    collect_table_rows(container, style, &mut rows);
+    collect_table_rows(container, style, theme, &mut rows);
     rows
 }
 
-fn collect_table_rows(container: &Container, style: TextStyle, rows: &mut Vec<TableRow>) {
-    let style = style.merge_container(container);
+fn collect_table_rows(
+    container: &Container,
+    style: TextStyle,
+    theme: MarkdownTheme,
+    rows: &mut Vec<TableRow>,
+) {
+    let style = style.merge_container(container, theme);
     if matches!(container.element, Element::TR) {
         let header = container
             .children
@@ -517,21 +626,25 @@ fn collect_table_rows(container: &Container, style: TextStyle, rows: &mut Vec<Ta
                 .children
                 .iter()
                 .filter(|child| matches!(child.element, Element::TH { .. } | Element::TD { .. }))
-                .map(|cell| inline_spans_for_container(cell, style))
+                .map(|cell| inline_spans_for_container(cell, style, theme))
                 .collect(),
             header,
         });
         return;
     }
     for child in &container.children {
-        collect_table_rows(child, style, rows);
+        collect_table_rows(child, style, theme, rows);
     }
 }
 
-fn inline_spans_for_container(container: &Container, style: TextStyle) -> Vec<Span> {
-    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX);
+fn inline_spans_for_container(
+    container: &Container,
+    style: TextStyle,
+    theme: MarkdownTheme,
+) -> Vec<Span> {
+    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX, theme);
     renderer.in_table_collection = true;
-    renderer.render_container_children(container, style.merge_container(container));
+    renderer.render_container_children(container, style.merge_container(container, theme));
     renderer.flush_line();
     renderer
         .finish()
@@ -601,19 +714,21 @@ const fn is_block_container(container: &Container) -> bool {
     )
 }
 
-fn semantic_markdown_color(container: &Container) -> Option<Color> {
-    if container
+fn semantic_markdown_style(container: &Container, theme: MarkdownTheme) -> Option<Style> {
+    if container.classes.iter().any(|class| class == "inline-code") {
+        Some(theme.inline_code)
+    } else if container
         .classes
         .iter()
-        .any(|class| class == "inline-code" || class == "markdown-code-block")
+        .any(|class| class == "markdown-code-block")
     {
-        Some(Color::Yellow)
+        Some(theme.code_block_text)
     } else if container
         .classes
         .iter()
         .any(|class| class == "markdown-link")
     {
-        Some(Color::Blue)
+        Some(theme.link)
     } else {
         None
     }
@@ -688,25 +803,20 @@ fn char_display_width(ch: char) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarkdownRenderOptions, render_markdown_lines};
+    use super::{MarkdownRenderOptions, MarkdownTheme, render_markdown_lines};
+    use bmux_tui::prelude::{Color, Style};
 
     fn rendered_text(markdown: &str) -> String {
-        render_markdown_lines(
-            markdown,
-            MarkdownRenderOptions {
-                width: 80,
-                streaming: false,
-            },
-        )
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .into_iter()
-                .map(|span| span.content)
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        render_markdown_lines(markdown, MarkdownRenderOptions::new(80))
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -763,10 +873,7 @@ mod tests {
     fn blockquote_wraps_with_bar_on_each_line() {
         let output = render_markdown_lines(
             "> a very long quoted line that should wrap when rendered with the test width",
-            MarkdownRenderOptions {
-                width: 24,
-                streaming: false,
-            },
+            MarkdownRenderOptions::new(24),
         )
         .into_iter()
         .map(|line| {
@@ -793,10 +900,7 @@ mod tests {
     fn ordered_list_wraps_with_hanging_indent() {
         let output = render_markdown_lines(
             "1. a very long item that should wrap under the text instead of under the marker",
-            MarkdownRenderOptions {
-                width: 30,
-                streaming: false,
-            },
+            MarkdownRenderOptions::new(30),
         )
         .into_iter()
         .map(|line| {
@@ -843,13 +947,63 @@ mod tests {
     }
 
     #[test]
+    fn custom_theme_styles_link_spans() {
+        let theme = MarkdownTheme {
+            link: Style::new().fg(Color::Red),
+            ..MarkdownTheme::default()
+        };
+        let lines = render_markdown_lines(
+            "[Bcode](https://example.com)",
+            MarkdownRenderOptions::new(80).with_theme(theme),
+        );
+
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.style == Style::new().fg(Color::Red))
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+                .contains("Bcode")
+        );
+    }
+
+    #[test]
+    fn custom_theme_styles_code_block_border() {
+        let theme = MarkdownTheme {
+            code_block_border: Style::new().fg(Color::Magenta),
+            ..MarkdownTheme::default()
+        };
+        let lines = render_markdown_lines(
+            "```rust\nfn main() {}\n```",
+            MarkdownRenderOptions::new(80).with_theme(theme),
+        );
+
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("╭─ rust") && span.style == Style::new().fg(Color::Magenta)
+        }));
+    }
+
+    #[test]
+    fn options_builder_sets_width_streaming_and_theme() {
+        let theme = MarkdownTheme {
+            horizontal_rule: Style::new().fg(Color::Green),
+            ..MarkdownTheme::default()
+        };
+        let options = MarkdownRenderOptions::new(42)
+            .streaming(true)
+            .with_theme(theme);
+
+        assert_eq!(options.width, 42);
+        assert!(options.streaming);
+        assert_eq!(options.theme.horizontal_rule, Style::new().fg(Color::Green));
+    }
+
+    #[test]
     fn streaming_partial_code_fence_renders() {
         let output = render_markdown_lines(
             "```rust\nfn main() {",
-            MarkdownRenderOptions {
-                width: 80,
-                streaming: true,
-            },
+            MarkdownRenderOptions::new(80).streaming(true),
         )
         .into_iter()
         .map(|line| {

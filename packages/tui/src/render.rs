@@ -453,10 +453,7 @@ fn push_markdown_message_block(
     } else {
         for line in render_markdown_lines(
             body,
-            MarkdownRenderOptions {
-                width: width.saturating_sub(2).max(1),
-                streaming,
-            },
+            MarkdownRenderOptions::new(width.saturating_sub(2).max(1)).streaming(streaming),
         ) {
             let mut spans = vec![Span::styled("  ", muted_style())];
             spans.extend(line.spans);
