@@ -18,6 +18,9 @@ hyperchad_transformer        = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
 unicode-segmentation         = { workspace = true }
 
+[dev-dependencies]
+test-log = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

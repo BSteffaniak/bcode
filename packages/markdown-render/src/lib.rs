@@ -124,6 +124,7 @@ struct TerminalMarkdownRenderer {
     rows: Vec<Line>,
     current_spans: Vec<Span>,
     current_width: usize,
+    in_table_collection: bool,
 }
 
 impl TerminalMarkdownRenderer {
@@ -133,6 +134,7 @@ impl TerminalMarkdownRenderer {
             rows: Vec::new(),
             current_spans: Vec::new(),
             current_width: 0,
+            in_table_collection: false,
         }
     }
 
@@ -158,14 +160,15 @@ impl TerminalMarkdownRenderer {
             Element::Text { value } | Element::Raw { value } => {
                 self.push_text(value, style);
             }
-            Element::Span
-            | Element::Anchor { .. }
-            | Element::THead
-            | Element::TBody
-            | Element::TH { .. }
-            | Element::TD { .. } => {
+            Element::Span | Element::Anchor { .. } | Element::THead | Element::TBody => {
                 self.render_container_children(container, style);
             }
+            Element::TH { .. } | Element::TD { .. } => {
+                if !self.in_table_collection {
+                    self.render_container_children(container, style);
+                }
+            }
+            Element::Table => self.render_table(container, style),
             Element::Heading { .. } => {
                 self.ensure_blank_line();
                 self.render_container_children(
@@ -183,9 +186,10 @@ impl TerminalMarkdownRenderer {
                 self.render_container_children(container, style);
                 self.flush_line();
             }
-            Element::Table => self.render_table(container, style),
             Element::TR => {
-                self.render_table_row(container, style);
+                if !self.in_table_collection {
+                    self.render_table_row(container, style);
+                }
             }
             Element::Input { .. } => {
                 self.push_text("☐", style);
@@ -198,67 +202,114 @@ impl TerminalMarkdownRenderer {
                 self.push_text(&format!("[image: {image}]"), style);
             }
             _ => {
-                let is_block = is_block_container(container);
-                if is_block {
-                    self.flush_line();
-                }
-                if is_block
-                    && container
-                        .classes
-                        .iter()
-                        .any(|class| class == "markdown-blockquote")
-                {
-                    self.push_text(
-                        "│ ",
-                        TextStyle {
-                            style: Style::new().fg(Color::BrightBlack),
-                            preserve_whitespace: false,
-                        },
-                    );
-                }
-                let child_style = if container
-                    .classes
-                    .iter()
-                    .any(|class| class == "markdown-code-block")
-                {
-                    TextStyle {
-                        style: style.style.fg(Color::Yellow),
-                        preserve_whitespace: true,
-                    }
-                } else {
-                    style
-                };
-                self.render_container_children(container, child_style);
-                if is_block {
-                    self.flush_line();
-                    if container.classes.iter().any(|class| {
-                        class == "markdown-code-block" || class == "markdown-blockquote"
-                    }) {
-                        self.ensure_blank_line();
-                    }
-                }
+                self.render_special_block_container(container, style);
             }
         }
+    }
+
+    fn render_special_block_container(&mut self, container: &Container, style: TextStyle) {
+        if container.classes.iter().any(|class| class == "markdown-hr") {
+            self.render_horizontal_rule();
+            return;
+        }
+        if container
+            .classes
+            .iter()
+            .any(|class| class == "markdown-code-block")
+        {
+            self.render_code_block(container, style);
+            return;
+        }
+        let is_block = is_block_container(container);
+        if is_block {
+            self.flush_line();
+        }
+        if is_block
+            && container
+                .classes
+                .iter()
+                .any(|class| class == "markdown-blockquote")
+        {
+            self.push_text(
+                "│ ",
+                TextStyle {
+                    style: Style::new().fg(Color::BrightBlack),
+                    preserve_whitespace: false,
+                },
+            );
+        }
+        self.render_container_children(container, style);
+        if is_block {
+            self.flush_line();
+            if container
+                .classes
+                .iter()
+                .any(|class| class == "markdown-blockquote")
+            {
+                self.ensure_blank_line();
+            }
+        }
+    }
+
+    fn render_code_block(&mut self, container: &Container, style: TextStyle) {
+        self.flush_line();
+        self.ensure_blank_line();
+        let border_style = Style::new().fg(Color::BrightBlack);
+        let language = container.data.get("language").map(String::as_str);
+        let header = language.map_or_else(|| "╭─".to_owned(), |language| format!("╭─ {language}"));
+        self.rows
+            .push(Line::from_spans(vec![Span::styled(header, border_style)]));
+
+        let nested_width = u16::try_from(self.width.saturating_sub(2).max(1)).unwrap_or(u16::MAX);
+        let mut nested = Self::new(nested_width);
+        nested.render_container_children(
+            container,
+            TextStyle {
+                style: style.style.fg(Color::Yellow),
+                preserve_whitespace: true,
+            },
+        );
+        nested.flush_line();
+        let mut code_rows = nested.finish();
+        if code_rows.is_empty() {
+            code_rows.push(Line::default());
+        }
+        for line in code_rows {
+            let mut spans = vec![Span::styled("│ ", border_style)];
+            spans.extend(line.spans);
+            self.rows.push(Line::from_spans(spans));
+        }
+        self.rows
+            .push(Line::from_spans(vec![Span::styled("╰─", border_style)]));
+        self.ensure_blank_line();
+    }
+
+    fn render_horizontal_rule(&mut self) {
+        self.flush_line();
+        self.ensure_blank_line();
+        self.rows.push(Line::from_spans(vec![Span::styled(
+            "─".repeat(self.width.max(1)),
+            Style::new().fg(Color::BrightBlack),
+        )]));
+        self.ensure_blank_line();
     }
 
     fn render_list(&mut self, container: &Container, ordered: bool, style: TextStyle) {
         self.flush_line();
         for (index, child) in container.children.iter().enumerate() {
             if matches!(child.element, Element::ListItem) {
-                if matches!(child.element, Element::ListItem) {
-                    let marker = if ordered {
-                        format!("{}. ", index.saturating_add(1))
-                    } else {
-                        "• ".to_owned()
-                    };
-                    self.push_text(
-                        &marker,
-                        TextStyle {
-                            style: Style::new().fg(Color::BrightBlack),
-                            preserve_whitespace: false,
-                        },
-                    );
-                }
+                let marker = if ordered {
+                    format!("{}. ", index.saturating_add(1))
+                } else {
+                    "• ".to_owned()
+                };
+                self.push_text(
+                    &marker,
+                    TextStyle {
+                        style: Style::new().fg(Color::BrightBlack),
+                        preserve_whitespace: false,
+                    },
+                );
                 self.render_container(child, style);
             }
         }
@@ -267,7 +318,53 @@ impl TerminalMarkdownRenderer {
 
     fn render_table(&mut self, container: &Container, style: TextStyle) {
         self.flush_line();
-        self.render_container_children(container, style);
+        let rows = table_rows(container, style);
+        if rows.is_empty() {
+            self.ensure_blank_line();
+            return;
+        }
+
+        let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+        if column_count == 0 {
+            self.ensure_blank_line();
+            return;
+        }
+
+        let widths = table_column_widths(&rows, column_count);
+        let total_width = widths.iter().sum::<usize>() + column_count.saturating_mul(3) + 1;
+        if total_width > self.width {
+            self.render_stacked_table_rows(&rows);
+            return;
+        }
+
+        let border_style = Style::new().fg(Color::BrightBlack);
+        self.rows
+            .push(table_border_line('┌', '┬', '┐', &widths, border_style));
+        for (row_index, row) in rows.iter().enumerate() {
+            self.rows
+                .push(table_content_line(row, &widths, border_style));
+            if row_index == 0 && rows.len() > 1 {
+                self.rows
+                    .push(table_border_line('├', '┼', '┤', &widths, border_style));
+            }
+        }
+        self.rows
+            .push(table_border_line('└', '┴', '┘', &widths, border_style));
+        self.ensure_blank_line();
+    }
+
+    fn render_stacked_table_rows(&mut self, rows: &[Vec<Vec<Span>>]) {
+        let muted = Style::new().fg(Color::BrightBlack);
+        for (row_index, row) in rows.iter().enumerate() {
+            if row_index > 0 {
+                self.rows.push(Line::default());
+            }
+            for (column_index, cell) in row.iter().enumerate() {
+                let mut spans = vec![Span::styled(format!("{}: ", column_index + 1), muted)];
+                spans.extend(cell.clone());
+                self.rows.push(Line::from_spans(spans));
+            }
+        }
         self.ensure_blank_line();
     }
 
@@ -331,6 +428,90 @@ impl TerminalMarkdownRenderer {
             self.current_width = self.current_width.saturating_add(grapheme_width);
         }
     }
+}
+
+fn table_rows(container: &Container, style: TextStyle) -> Vec<Vec<Vec<Span>>> {
+    let mut rows = Vec::new();
+    collect_table_rows(container, style, &mut rows);
+    rows
+}
+
+fn collect_table_rows(container: &Container, style: TextStyle, rows: &mut Vec<Vec<Vec<Span>>>) {
+    let style = style.merge_container(container);
+    if matches!(container.element, Element::TR) {
+        rows.push(
+            container
+                .children
+                .iter()
+                .filter(|child| matches!(child.element, Element::TH { .. } | Element::TD { .. }))
+                .map(|cell| inline_spans_for_container(cell, style))
+                .collect(),
+        );
+        return;
+    }
+    for child in &container.children {
+        collect_table_rows(child, style, rows);
+    }
+}
+
+fn inline_spans_for_container(container: &Container, style: TextStyle) -> Vec<Span> {
+    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX);
+    renderer.in_table_collection = true;
+    renderer.render_container_children(container, style.merge_container(container));
+    renderer.flush_line();
+    renderer
+        .finish()
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .collect()
+}
+
+fn table_column_widths(rows: &[Vec<Vec<Span>>], column_count: usize) -> Vec<usize> {
+    let mut widths = vec![1; column_count];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(spans_width(cell));
+        }
+    }
+    widths
+}
+
+fn table_border_line(
+    left: char,
+    middle: char,
+    right: char,
+    widths: &[usize],
+    style: Style,
+) -> Line {
+    let mut text = String::new();
+    text.push(left);
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            text.push(middle);
+        }
+        text.push_str(&"─".repeat(width.saturating_add(2)));
+    }
+    text.push(right);
+    Line::from_spans(vec![Span::styled(text, style)])
+}
+
+fn table_content_line(row: &[Vec<Span>], widths: &[usize], border_style: Style) -> Line {
+    let mut spans = vec![Span::styled("│", border_style)];
+    for (index, width) in widths.iter().enumerate() {
+        spans.push(Span::raw(" "));
+        if let Some(cell) = row.get(index) {
+            spans.extend(cell.clone());
+            let padding = width.saturating_sub(spans_width(cell));
+            if padding > 0 {
+                spans.push(Span::raw(" ".repeat(padding)));
+            }
+        } else {
+            spans.push(Span::raw(" ".repeat(*width)));
+        }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("│", border_style));
+    }
+    Line::from_spans(spans)
 }
 
 const fn is_block_container(container: &Container) -> bool {
@@ -408,6 +589,13 @@ const fn hyperchad_color_to_tui(color: HyperChadColor) -> Color {
     Color::Rgb(color.r, color.g, color.b)
 }
 
+fn spans_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|span| text_display_width(&span.content))
+        .sum()
+}
+
 fn text_display_width(text: &str) -> usize {
     text.chars().map(char_display_width).sum()
 }
@@ -468,5 +656,32 @@ mod tests {
         let output = rendered_text("```rust\nfn main() {}\n```");
 
         assert!(output.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn renders_code_block_frame_with_language() {
+        let output = rendered_text("```rust\nfn main() {}\n```");
+
+        assert!(output.contains("╭─ rust"));
+        assert!(output.contains("│ fn main() {}"));
+        assert!(output.contains("╰─"));
+    }
+
+    #[test]
+    fn renders_horizontal_rule() {
+        let output = rendered_text("before\n\n---\n\nafter");
+
+        assert!(output.contains("before"));
+        assert!(output.contains("────"));
+        assert!(output.contains("after"));
+    }
+
+    #[test]
+    fn renders_table_with_borders() {
+        let output = rendered_text("| A | B |\n|---|---|\n| 1 | 2 |");
+
+        assert!(output.contains("┌"));
+        assert!(output.contains("│ 1 │ 2 │"));
+        assert!(output.contains("└"));
     }
 }

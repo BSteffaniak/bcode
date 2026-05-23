@@ -130,6 +130,7 @@ serde_json = { version = "1.0.149", default-features = false, features = [
 ] }
 sha2 = { version = "0.10.9", default-features = false }
 sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", rev = "87973bb7681c68cb9c787931b0ab402468adb517", default-features = false }
+test-log = { version = "0.2.20", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
 toml = { version = "1.1.2", default-features = false, features = [
@@ -181,6 +182,10 @@ hyperchad_color              = { path = "../MoosicBox/packages/hyperchad/color" 
 hyperchad_markdown           = { path = "../MoosicBox/packages/hyperchad/markdown" }
 hyperchad_transformer        = { path = "../MoosicBox/packages/hyperchad/transformer" }
 hyperchad_transformer_models = { path = "../MoosicBox/packages/hyperchad/transformer/models" }
+moosicbox_assert             = { path = "../MoosicBox/packages/assert" }
+moosicbox_logging            = { path = "../MoosicBox/packages/logging" }
+switchy_env                  = { path = "../MoosicBox/packages/switchy/env" }
+switchy_time                 = { path = "../MoosicBox/packages/switchy/time" }
 
 # BMUX local development patches
 # [patch."https://github.com/BSteffaniak/bmux.git"]
