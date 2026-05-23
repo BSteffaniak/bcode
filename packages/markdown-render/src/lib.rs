@@ -12,7 +12,7 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use hyperchad_color::Color as HyperChadColor;
 use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
-use hyperchad_transformer::{Container, Element};
+use hyperchad_transformer::{Container, Element, Input};
 use hyperchad_transformer_models::{FontWeight, TextDecorationLine};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -191,8 +191,8 @@ impl TerminalMarkdownRenderer {
                     self.render_table_row(container, style);
                 }
             }
-            Element::Input { .. } => {
-                self.push_text("☐", style);
+            Element::Input { input, .. } => {
+                self.render_input(input, style);
             }
             Element::Image { alt, source, .. } => {
                 let image = alt
@@ -203,6 +203,30 @@ impl TerminalMarkdownRenderer {
             }
             _ => {
                 self.render_special_block_container(container, style);
+            }
+        }
+    }
+
+    fn render_input(&mut self, input: &Input, style: TextStyle) {
+        match input {
+            Input::Checkbox { checked } => {
+                let marker = if checked.unwrap_or(false) {
+                    "☑ "
+                } else {
+                    "☐ "
+                };
+                self.push_text(
+                    marker,
+                    TextStyle {
+                        style: Style::new().fg(Color::BrightBlack),
+                        preserve_whitespace: false,
+                    },
+                );
+            }
+            Input::Text { value, .. } | Input::Password { value, .. } | Input::Hidden { value } => {
+                if let Some(value) = value {
+                    self.push_text(value, style);
+                }
             }
         }
     }
@@ -755,6 +779,14 @@ mod tests {
         .join("\n");
 
         assert!(output.lines().filter(|line| line.starts_with("│ ")).count() >= 2);
+    }
+
+    #[test]
+    fn renders_task_list_markers() {
+        let output = rendered_text("- [x] done\n- [ ] todo");
+
+        assert!(output.contains("•  ☑ done"));
+        assert!(output.contains("•  ☐ todo"));
     }
 
     #[test]
