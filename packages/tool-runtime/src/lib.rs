@@ -50,6 +50,22 @@ pub struct ProcessExecutionResult {
     pub stderr: Vec<u8>,
 }
 
+/// Incremental process output event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOutputEvent {
+    pub id: ToolExecutionId,
+    pub stream: ProcessOutputStream,
+    pub sequence: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Process output stream identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOutputStream {
+    Stdout,
+    Stderr,
+}
+
 /// Runtime status snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRuntimeStatus {
@@ -180,6 +196,19 @@ impl ToolExecutionRuntime {
         &self,
         request: ProcessExecutionRequest,
     ) -> Result<ProcessExecutionResult, ToolRuntimeError> {
+        self.run_process_streaming(request, |_| {}).await
+    }
+
+    /// Run a process and emit output events as chunks are read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when process spawning, output collection, or task joining fails.
+    pub async fn run_process_streaming(
+        &self,
+        request: ProcessExecutionRequest,
+        on_output: impl FnMut(ProcessOutputEvent) + Send + 'static,
+    ) -> Result<ProcessExecutionResult, ToolRuntimeError> {
         if request.program.trim().is_empty() {
             return Err(ToolRuntimeError::InvalidRequest(
                 "program must not be empty".to_string(),
@@ -208,7 +237,7 @@ impl ToolExecutionRuntime {
                 cancel: Arc::clone(&cancel),
             },
         );
-        let result = run_process_inner(id, request, cancel).await;
+        let result = run_process_inner(id, request, cancel, on_output).await;
         drop(permit);
         self.running.lock().await.remove(&id);
         {
@@ -234,6 +263,7 @@ async fn run_process_inner(
     id: ToolExecutionId,
     request: ProcessExecutionRequest,
     cancel: Arc<Notify>,
+    on_output: impl FnMut(ProcessOutputEvent) + Send + 'static,
 ) -> Result<ProcessExecutionResult, ToolRuntimeError> {
     let mut command = Command::new(&request.program);
     command
@@ -248,8 +278,21 @@ async fn run_process_inner(
     let mut child = command.kill_on_drop(true).spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_task = tokio::spawn(read_limited(stdout, request.max_output_bytes));
-    let stderr_task = tokio::spawn(read_limited(stderr, request.max_output_bytes));
+    let output_callback = Arc::new(std::sync::Mutex::new(on_output));
+    let stdout_task = tokio::spawn(read_limited(
+        id,
+        ProcessOutputStream::Stdout,
+        stdout,
+        request.max_output_bytes,
+        Arc::clone(&output_callback),
+    ));
+    let stderr_task = tokio::spawn(read_limited(
+        id,
+        ProcessOutputStream::Stderr,
+        stderr,
+        request.max_output_bytes,
+        output_callback,
+    ));
     let (status, timed_out, cancelled) =
         wait_for_process(&mut child, request.timeout, cancel).await?;
     let stdout = if timed_out {
@@ -365,18 +408,31 @@ fn send_signal_to_process_group(process_group_id: i32, signal: i32) -> Result<()
 }
 
 async fn read_limited(
+    id: ToolExecutionId,
+    stream: ProcessOutputStream,
     reader: Option<impl tokio::io::AsyncRead + Unpin>,
     max_bytes: usize,
+    on_output: Arc<std::sync::Mutex<impl FnMut(ProcessOutputEvent)>>,
 ) -> Result<Vec<u8>, std::io::Error> {
     let Some(mut reader) = reader else {
         return Ok(Vec::new());
     };
     let mut output = Vec::new();
     let mut buffer = [0_u8; 4096];
+    let mut sequence = 0_u64;
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
+        }
+        sequence = sequence.saturating_add(1);
+        if let Ok(mut on_output) = on_output.lock() {
+            on_output(ProcessOutputEvent {
+                id,
+                stream,
+                sequence,
+                bytes: buffer[..read].to_vec(),
+            });
         }
         let remaining = max_bytes.saturating_sub(output.len());
         if remaining == 0 {

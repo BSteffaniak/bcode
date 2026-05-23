@@ -59,6 +59,47 @@ pub struct ToolInvocationRequest {
     pub cwd: Option<PathBuf>,
 }
 
+/// Incremental event emitted while a tool invocation is running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolInvocationStreamEvent {
+    /// Tool execution has started inside the provider plugin.
+    Started {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    /// A chunk of live tool output is available.
+    OutputDelta {
+        tool_call_id: String,
+        stream: ToolOutputStream,
+        sequence: u64,
+        text: String,
+        #[serde(default)]
+        byte_len: usize,
+    },
+    /// Human-readable progress status from a long-running tool.
+    Status {
+        tool_call_id: String,
+        sequence: u64,
+        message: String,
+    },
+    /// Tool execution has finished inside the provider plugin.
+    Finished {
+        tool_call_id: String,
+        sequence: u64,
+        is_error: bool,
+    },
+}
+
+/// Logical output stream for an incremental tool output chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
+    Pty,
+}
+
 /// Tool invocation response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationResponse {

@@ -130,6 +130,19 @@ impl TranscriptItem {
         &self.text
     }
 
+    /// Append text to this transcript item.
+    pub fn append_text(&mut self, text: &str) {
+        self.text.push_str(text);
+        if let TranscriptItemKind::ToolResult { result, .. } = &mut self.kind {
+            result.push_str(text);
+        }
+    }
+
+    /// Mark this transcript item as no longer streaming.
+    pub const fn finish_streaming(&mut self) {
+        self.streaming = false;
+    }
+
     /// Return semantic item kind.
     #[must_use]
     pub const fn kind(&self) -> &TranscriptItemKind {
@@ -205,6 +218,28 @@ pub fn tool_request_item(
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
             file_edit,
+        },
+    )
+}
+
+/// Build a streaming transcript item for live tool output.
+#[must_use]
+pub fn streaming_tool_output_item(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    text: &str,
+) -> TranscriptItem {
+    TranscriptItem::with_kind(
+        "Tool",
+        text.to_owned(),
+        true,
+        TranscriptItemKind::ToolResult {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.map(ToOwned::to_owned),
+            arguments_json: arguments_json.map(ToOwned::to_owned),
+            result: text.to_owned(),
+            is_error: false,
         },
     )
 }

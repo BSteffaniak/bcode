@@ -8,6 +8,31 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::ffi::{CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
+thread_local! {
+    static SERVICE_EVENT_SINK: std::cell::RefCell<Option<ServiceEventSink>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// ABI-safe callback used by plugins to emit incremental service events.
+pub type ServiceEventCallback = extern "C" fn(*const u8, usize, *mut c_void);
+
+pub type StreamingServiceFn = fn(
+    *const c_void,
+    *const u8,
+    usize,
+    *mut u8,
+    usize,
+    *mut usize,
+    Option<ServiceEventCallback>,
+    *mut c_void,
+) -> i32;
+
+#[derive(Clone, Copy)]
+struct ServiceEventSink {
+    callback: ServiceEventCallback,
+    user_data: *mut c_void,
+}
+
 /// Current stable native plugin ABI version.
 pub const CURRENT_PLUGIN_ABI_VERSION: u16 = 1;
 
@@ -22,6 +47,10 @@ pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bcode_plugin_deactivate_v1";
 
 /// Default service invocation export symbol for native plugins.
 pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bcode_plugin_invoke_service_v1";
+
+/// Default streaming service invocation export symbol for native plugins.
+pub const DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL: &str =
+    "bcode_plugin_invoke_service_streaming_v1";
 
 /// Default event handler export symbol for native plugins.
 pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bcode_plugin_handle_event_v1";
@@ -387,6 +416,66 @@ pub fn invoke_service_export<P: RustPlugin>(
     SERVICE_STATUS_OK
 }
 
+/// Emit an incremental event for the currently running service invocation.
+pub fn emit_service_event(payload: &[u8]) {
+    SERVICE_EVENT_SINK.with(|sink| {
+        if let Some(sink) = *sink.borrow() {
+            (sink.callback)(payload.as_ptr(), payload.len(), sink.user_data);
+        }
+    });
+}
+
+/// Invoke a closure while a service event sink is installed for this thread.
+pub fn with_service_event_sink<T>(
+    callback: Option<ServiceEventCallback>,
+    user_data: *mut c_void,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<ServiceEventSink>);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SERVICE_EVENT_SINK.with(|sink| {
+                *sink.borrow_mut() = self.0;
+            });
+        }
+    }
+
+    let previous = SERVICE_EVENT_SINK.with(|sink| {
+        sink.replace(callback.map(|callback| ServiceEventSink {
+            callback,
+            user_data,
+        }))
+    });
+    let _reset = Reset(previous);
+    f()
+}
+
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub fn invoke_service_streaming_export<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+    event_callback: Option<ServiceEventCallback>,
+    event_user_data: *mut c_void,
+) -> i32 {
+    with_service_event_sink(event_callback, event_user_data, || {
+        invoke_service_export(
+            instance,
+            input_ptr,
+            input_len,
+            output_ptr,
+            output_capacity,
+            output_len,
+        )
+    })
+}
+
 #[doc(hidden)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn handle_event_export<P: RustPlugin>(
@@ -422,6 +511,8 @@ pub struct StaticPluginVtable {
     pub deactivate: fn(*const c_void) -> i32,
     /// Service invocation hook.
     pub invoke_service: fn(*const c_void, *const u8, usize, *mut u8, usize, *mut usize) -> i32,
+    /// Streaming service invocation hook.
+    pub invoke_service_streaming: StreamingServiceFn,
     /// Event handling hook.
     pub handle_event: fn(*const c_void, *const u8, usize) -> i32,
 }
@@ -484,6 +575,34 @@ pub fn static_invoke_service_export<P: RustPlugin>(
 #[doc(hidden)]
 #[must_use]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub fn static_invoke_service_streaming_export<P: RustPlugin>(
+    instance: *const c_void,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+    event_callback: Option<ServiceEventCallback>,
+    event_user_data: *mut c_void,
+) -> i32 {
+    let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
+    let instance = plugin_instance::<P>(instance);
+    invoke_service_streaming_export(
+        instance,
+        input_ptr,
+        input_len,
+        output_ptr,
+        output_capacity,
+        output_len,
+        event_callback,
+        event_user_data,
+    )
+}
+
+#[doc(hidden)]
+#[must_use]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn static_handle_event_export<P: RustPlugin>(
     instance: *const c_void,
     input_ptr: *const u8,
@@ -539,6 +658,29 @@ macro_rules! export_plugin {
         }
 
         #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_invoke_service_streaming_v1(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+            event_callback: Option<$crate::ServiceEventCallback>,
+            event_user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let instance = $crate::plugin_instance::<$plugin>(&BCODE_PLUGIN_INSTANCE);
+            $crate::invoke_service_streaming_export(
+                instance,
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+                event_callback,
+                event_user_data,
+            )
+        }
+
+        #[unsafe(no_mangle)]
         pub extern "C" fn bcode_plugin_handle_event_v1(
             input_ptr: *const u8,
             input_len: usize,
@@ -566,6 +708,7 @@ macro_rules! static_plugin_vtable {
             activate: $crate::static_activate_export::<$plugin>,
             deactivate: $crate::static_deactivate_export::<$plugin>,
             invoke_service: $crate::static_invoke_service_export::<$plugin>,
+            invoke_service_streaming: $crate::static_invoke_service_streaming_export::<$plugin>,
             handle_event: $crate::static_handle_event_export::<$plugin>,
         }
     }};
@@ -574,13 +717,15 @@ macro_rules! static_plugin_vtable {
 /// Common imports for plugin authors.
 pub mod prelude {
     pub use crate::{
-        CURRENT_PLUGIN_ABI_VERSION, EVENT_STATUS_DECODE_FAILED, EVENT_STATUS_INVALID_ARGUMENT,
-        EVENT_STATUS_OK, EVENT_STATUS_PLUGIN_UNAVAILABLE, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE,
-        NativeEventContext, NativeServiceContext, PluginError, PluginEvent, RustPlugin,
+        CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL,
+        EVENT_STATUS_DECODE_FAILED, EVENT_STATUS_INVALID_ARGUMENT, EVENT_STATUS_OK,
+        EVENT_STATUS_PLUGIN_UNAVAILABLE, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, NativeEventContext,
+        NativeServiceContext, PluginError, PluginEvent, RustPlugin,
         SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
         SERVICE_STATUS_ENCODE_FAILED, SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK,
-        SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceRequest, ServiceResponse,
-        StaticPluginVtable, export_plugin, static_plugin_vtable,
+        SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceEventCallback, ServiceRequest,
+        ServiceResponse, StaticPluginVtable, StreamingServiceFn, emit_service_event, export_plugin,
+        static_plugin_vtable,
     };
 }
 

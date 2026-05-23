@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 11;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 12;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -189,6 +189,47 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
+/// Incremental event emitted while a tool invocation is running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolInvocationStreamEvent {
+    /// Tool execution has started inside the provider plugin.
+    Started {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    /// A chunk of live tool output is available.
+    OutputDelta {
+        tool_call_id: String,
+        stream: ToolOutputStream,
+        sequence: u64,
+        text: String,
+        #[serde(default)]
+        byte_len: usize,
+    },
+    /// Human-readable progress status from a long-running tool.
+    Status {
+        tool_call_id: String,
+        sequence: u64,
+        message: String,
+    },
+    /// Tool execution has finished inside the provider plugin.
+    Finished {
+        tool_call_id: String,
+        sequence: u64,
+        is_error: bool,
+    },
+}
+
+/// Logical output stream for an incremental tool output chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
+    Pty,
+}
+
 /// Model turn terminal outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -288,6 +329,7 @@ pub enum SessionTracePhase {
     ContextCompactionSkipped,
     ContextCompactionStarted,
     ContextCompactionFinished,
+    ToolInvocationOutput,
 }
 
 /// Structured model-provider streaming event for user-facing progress and debug correlation.
@@ -411,6 +453,7 @@ pub enum SessionTracePayload {
         message: Option<String>,
     },
     ProviderStreamEvent(ProviderStreamEvent),
+    ToolInvocationStreamEvent(ToolInvocationStreamEvent),
 }
 
 /// Reference to a trace payload stored outside the main session event stream.
@@ -596,5 +639,9 @@ pub enum SessionEventKind {
         finished_at_ms: Option<u64>,
         #[serde(default)]
         message: Option<String>,
+    },
+    /// Incremental tool invocation event emitted while a tool is running.
+    ToolInvocationStream {
+        event: ToolInvocationStreamEvent,
     },
 }

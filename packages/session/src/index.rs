@@ -488,6 +488,7 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkStarted { .. } => "runtime_work_started",
         SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
         SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
+        SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
     }
 }
 

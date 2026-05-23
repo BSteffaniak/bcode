@@ -3171,6 +3171,11 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence
             );
         }
+        SessionEventKind::ToolInvocationStream {
+            event: stream_event,
+        } => {
+            println!("#{} tool stream: {stream_event:?}", event.sequence);
+        }
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,
@@ -3473,6 +3478,9 @@ fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) ->
         } => format!(
             "tool finished {tool_call_id} duration_ms={duration_ms} error={is_error} output_bytes={output_bytes}"
         ),
+        bcode_session_models::SessionTracePayload::ToolInvocationStreamEvent(event) => {
+            format!("tool stream {event:?}")
+        }
         bcode_session_models::SessionTracePayload::ContextCompaction {
             reason,
             projected_context_chars,

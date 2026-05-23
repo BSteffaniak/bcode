@@ -26,7 +26,8 @@ use bcode_session::SessionManager;
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
     RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, TraceBlobRef, TraceRedaction,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
+    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -35,7 +36,8 @@ use bcode_skill_models::{
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolList, ToolResultContent,
+    ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
+    ToolResultContent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -4721,6 +4723,7 @@ async fn execute_model_tool(
     .await;
 }
 
+#[allow(clippy::too_many_lines)]
 async fn invoke_model_tool(
     state: &ServerState,
     session_id: SessionId,
@@ -4801,16 +4804,129 @@ async fn invoke_model_tool(
         arguments: call.arguments.clone(),
         cwd: Some(working_directory),
     };
-    state
+    let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let mut invocation = state
         .plugins
-        .invoke_service_json::<_, ToolInvocationResponse>(
+        .invoke_service_with_events(
             &plugin_id,
             TOOL_SERVICE_INTERFACE_ID,
             OP_INVOKE_TOOL,
-            &request,
+            payload,
         )
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let response = loop {
+        tokio::select! {
+            Some(payload) = invocation.events.recv() => {
+                if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
+                    append_tool_stream_event(state, session_id, convert_tool_stream_event(event)).await;
+                }
+            }
+            response = &mut invocation.response => {
+                break response
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    };
+    while let Ok(payload) = invocation.events.try_recv() {
+        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
+            append_tool_stream_event(state, session_id, convert_tool_stream_event(event)).await;
+        }
+    }
+    bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())
+}
+
+async fn append_tool_stream_event(
+    state: &ServerState,
+    session_id: SessionId,
+    event: ToolInvocationStreamEvent,
+) {
+    if let ToolInvocationStreamEvent::OutputDelta {
+        tool_call_id,
+        stream,
+        sequence,
+        text,
+        byte_len,
+    } = event.clone()
+    {
+        append_trace_event(
+            state,
+            session_id,
+            None,
+            SessionTracePhase::ToolInvocationOutput,
+            SessionTracePayload::ToolInvocationStreamEvent(
+                ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id,
+                    stream,
+                    sequence,
+                    text: text.clone(),
+                    byte_len,
+                },
+            ),
+        )
+        .await;
+    }
+
+    match state
+        .sessions
+        .append_event(session_id, SessionEventKind::ToolInvocationStream { event })
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append tool stream event: {error}"),
+    }
+}
+
+fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInvocationStreamEvent {
+    match event {
+        ServiceToolInvocationStreamEvent::Started {
+            tool_call_id,
+            tool_name,
+        } => ToolInvocationStreamEvent::Started {
+            tool_call_id,
+            tool_name,
+        },
+        ServiceToolInvocationStreamEvent::OutputDelta {
+            tool_call_id,
+            stream,
+            sequence,
+            text,
+            byte_len,
+        } => ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id,
+            stream: convert_tool_output_stream(stream),
+            sequence,
+            text,
+            byte_len,
+        },
+        ServiceToolInvocationStreamEvent::Status {
+            tool_call_id,
+            sequence,
+            message,
+        } => ToolInvocationStreamEvent::Status {
+            tool_call_id,
+            sequence,
+            message,
+        },
+        ServiceToolInvocationStreamEvent::Finished {
+            tool_call_id,
+            sequence,
+            is_error,
+        } => ToolInvocationStreamEvent::Finished {
+            tool_call_id,
+            sequence,
+            is_error,
+        },
+    }
+}
+
+const fn convert_tool_output_stream(stream: ToolOutputStream) -> SessionToolOutputStream {
+    match stream {
+        ToolOutputStream::Stdout => SessionToolOutputStream::Stdout,
+        ToolOutputStream::Stderr => SessionToolOutputStream::Stderr,
+        ToolOutputStream::Pty => SessionToolOutputStream::Pty,
+    }
 }
 
 async fn evaluate_agent_tool_policy(

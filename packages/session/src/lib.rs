@@ -2337,9 +2337,10 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 mod tests {
     use super::{SessionAccessStatus, SessionManager, access_status_from_report, reader};
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, SessionEvent,
-        SessionEventKind, SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent,
-        SessionTracePayload, SessionTracePhase, TraceBlobRef,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
+        RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+        SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent, SessionTracePayload,
+        SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -2437,12 +2438,34 @@ mod tests {
     fn session_event_kind_binary_tags_are_append_only() {
         let cases = session_event_kind_tag_cases();
         for (expected_tag, name, kind) in cases {
-            let bytes = bmux_codec::to_vec(&kind).expect("event kind should encode");
-            let (actual_tag, _) =
-                bmux_codec::varint::decode_u32(&bytes).expect("event kind tag should decode");
             assert_eq!(
-                actual_tag, expected_tag,
+                encoded_variant_tag(&kind),
+                expected_tag,
                 "persisted SessionEventKind tag changed for {name}; append new variants only or add compatibility decoding/migration plus binary fixtures"
+            );
+        }
+    }
+
+    #[test]
+    fn session_trace_phase_binary_tags_are_append_only() {
+        let cases = session_trace_phase_tag_cases();
+        for (expected_tag, name, phase) in cases {
+            assert_eq!(
+                encoded_variant_tag(&phase),
+                expected_tag,
+                "persisted SessionTracePhase tag changed for {name}; append new variants only or add compatibility decoding/migration plus binary fixtures"
+            );
+        }
+    }
+
+    #[test]
+    fn session_trace_payload_binary_tags_are_append_only() {
+        let cases = session_trace_payload_tag_cases();
+        for (expected_tag, name, payload) in cases {
+            assert_eq!(
+                encoded_variant_tag(&payload),
+                expected_tag,
+                "persisted SessionTracePayload tag changed for {name}; append new variants only or add compatibility decoding/migration plus binary fixtures"
             );
         }
     }
@@ -3821,7 +3844,256 @@ mod tests {
                     text: "reasoning".to_string(),
                 },
             ),
+            (
+                27,
+                "RuntimeWorkStarted",
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: RuntimeWorkId::new("work"),
+                    kind: RuntimeWorkKind::Tool,
+                    label: "tool".to_string(),
+                    tool_call_id: Some("call".to_string()),
+                    plugin_id: Some("plugin".to_string()),
+                    service_interface: Some("service".to_string()),
+                    operation: Some("invoke".to_string()),
+                    started_at_ms: Some(1),
+                    cancellable: true,
+                },
+            ),
+            (
+                28,
+                "RuntimeWorkCancelRequested",
+                SessionEventKind::RuntimeWorkCancelRequested {
+                    work_id: RuntimeWorkId::new("work"),
+                    requested_at_ms: Some(2),
+                    client_id: Some(client_id),
+                },
+            ),
+            (
+                29,
+                "RuntimeWorkFinished",
+                SessionEventKind::RuntimeWorkFinished {
+                    work_id: RuntimeWorkId::new("work"),
+                    status: RuntimeWorkStatus::Completed,
+                    finished_at_ms: Some(3),
+                    message: None,
+                },
+            ),
+            (
+                30,
+                "ToolInvocationStream",
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "call".to_string(),
+                        stream: ToolOutputStream::Stdout,
+                        sequence: 1,
+                        text: "output".to_string(),
+                        byte_len: 6,
+                    },
+                },
+            ),
         ]
+    }
+
+    fn session_trace_phase_tag_cases() -> Vec<(u32, &'static str, SessionTracePhase)> {
+        vec![
+            (0, "ModelRequestBuilt", SessionTracePhase::ModelRequestBuilt),
+            (
+                1,
+                "ModelProviderRoundStarted",
+                SessionTracePhase::ModelProviderRoundStarted,
+            ),
+            (
+                2,
+                "ModelProviderRoundFinished",
+                SessionTracePhase::ModelProviderRoundFinished,
+            ),
+            (
+                3,
+                "ModelProviderEvent",
+                SessionTracePhase::ModelProviderEvent,
+            ),
+            (
+                4,
+                "ToolInvocationStarted",
+                SessionTracePhase::ToolInvocationStarted,
+            ),
+            (
+                5,
+                "ToolPolicyEvaluated",
+                SessionTracePhase::ToolPolicyEvaluated,
+            ),
+            (
+                6,
+                "ToolPermissionWaitStarted",
+                SessionTracePhase::ToolPermissionWaitStarted,
+            ),
+            (
+                7,
+                "ToolPermissionWaitFinished",
+                SessionTracePhase::ToolPermissionWaitFinished,
+            ),
+            (
+                8,
+                "ToolInvocationFinished",
+                SessionTracePhase::ToolInvocationFinished,
+            ),
+            (9, "SkillInvoked", SessionTracePhase::SkillInvoked),
+            (10, "SkillSuggested", SessionTracePhase::SkillSuggested),
+            (11, "SkillActivated", SessionTracePhase::SkillActivated),
+            (12, "SkillDeactivated", SessionTracePhase::SkillDeactivated),
+            (
+                13,
+                "SkillContextLoaded",
+                SessionTracePhase::SkillContextLoaded,
+            ),
+            (
+                14,
+                "SkillInvocationFailed",
+                SessionTracePhase::SkillInvocationFailed,
+            ),
+            (
+                15,
+                "ContextCompactionSkipped",
+                SessionTracePhase::ContextCompactionSkipped,
+            ),
+            (
+                16,
+                "ContextCompactionStarted",
+                SessionTracePhase::ContextCompactionStarted,
+            ),
+            (
+                17,
+                "ContextCompactionFinished",
+                SessionTracePhase::ContextCompactionFinished,
+            ),
+            (
+                18,
+                "ToolInvocationOutput",
+                SessionTracePhase::ToolInvocationOutput,
+            ),
+        ]
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn session_trace_payload_tag_cases() -> Vec<(u32, &'static str, SessionTracePayload)> {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("conversation_hash".to_string(), "abc123".to_string());
+        vec![
+            (
+                0,
+                "ModelRequestBuilt",
+                SessionTracePayload::ModelRequestBuilt {
+                    provider: "provider".to_string(),
+                    model: "model".to_string(),
+                    agent_id: "build".to_string(),
+                    message_count: 1,
+                    tool_count: 2,
+                    system_prompt_chars: 3,
+                    prompt_cache_mode: "auto".to_string(),
+                    conversation_reuse_mode: "auto".to_string(),
+                    uses_previous_provider_response: false,
+                    metadata,
+                    request: None,
+                },
+            ),
+            (
+                1,
+                "ProviderRound",
+                SessionTracePayload::ProviderRound {
+                    provider_turn_id: Some("provider-turn".to_string()),
+                    provider: "provider".to_string(),
+                    round: Some(1),
+                    stop_reason: Some("stop".to_string()),
+                    duration_ms: Some(42),
+                    error: None,
+                },
+            ),
+            (
+                2,
+                "ProviderEvent",
+                SessionTracePayload::ProviderEvent {
+                    event_type: "event".to_string(),
+                    detail: Some("detail".to_string()),
+                },
+            ),
+            (
+                3,
+                "ToolInvocationStarted",
+                SessionTracePayload::ToolInvocationStarted {
+                    tool_call_id: "call".to_string(),
+                    plugin_id: "plugin".to_string(),
+                    tool_name: "tool".to_string(),
+                    side_effect: "read_only".to_string(),
+                    requires_permission: false,
+                    arguments: None,
+                },
+            ),
+            (
+                4,
+                "ToolPolicyEvaluated",
+                SessionTracePayload::ToolPolicyEvaluated {
+                    tool_call_id: "call".to_string(),
+                    agent_id: "build".to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                },
+            ),
+            (
+                5,
+                "ToolPermissionWait",
+                SessionTracePayload::ToolPermissionWait {
+                    permission_id: "permission".to_string(),
+                    tool_call_id: "call".to_string(),
+                    approved: Some(true),
+                    duration_ms: Some(7),
+                },
+            ),
+            (
+                6,
+                "ToolInvocationFinished",
+                SessionTracePayload::ToolInvocationFinished {
+                    tool_call_id: "call".to_string(),
+                    duration_ms: 9,
+                    is_error: false,
+                    output_bytes: 12,
+                    output: None,
+                },
+            ),
+            (
+                7,
+                "ContextCompaction",
+                SessionTracePayload::ContextCompaction {
+                    reason: "manual".to_string(),
+                    projected_context_chars: 123,
+                    compacted: true,
+                    message: None,
+                },
+            ),
+            (
+                8,
+                "ProviderStreamEvent",
+                SessionTracePayload::ProviderStreamEvent(ProviderStreamEvent::TurnStarted),
+            ),
+            (
+                9,
+                "ToolInvocationStreamEvent",
+                SessionTracePayload::ToolInvocationStreamEvent(
+                    ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "call".to_string(),
+                        stream: ToolOutputStream::Stdout,
+                        sequence: 1,
+                        text: "output".to_string(),
+                        byte_len: 6,
+                    },
+                ),
+            ),
+        ]
+    }
+
+    fn encoded_variant_tag(value: &impl Serialize) -> u32 {
+        let bytes = bmux_codec::to_vec(value).expect("value should encode");
+        let (tag, _) = bmux_codec::varint::decode_u32(&bytes).expect("variant tag should decode");
+        tag
     }
 
     fn stable_order_binary_fixture_events() -> Vec<SessionEvent> {

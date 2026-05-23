@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use bcode_session_models::{
     ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
     SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    ToolInvocationStreamEvent,
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -27,7 +28,7 @@ use super::pending_submissions::PendingSubmissions;
 use super::transcript::{
     TranscriptItem, finish_streaming_transcript_item, merge_transcript_boundary, model_usage_item,
     permission_request_item, permission_result_item, push_streaming_transcript_item,
-    tool_request_item, tool_result_item, transcript_items_from_events,
+    streaming_tool_output_item, tool_request_item, tool_result_item, transcript_items_from_events,
 };
 use super::transcript_layout::TranscriptLayoutCache;
 use super::transcript_viewport::TranscriptViewport;
@@ -46,6 +47,7 @@ pub struct BmuxApp {
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
+    live_tool_output_items: BTreeMap<String, usize>,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
@@ -85,6 +87,7 @@ impl BmuxApp {
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
             tool_call_contexts: BTreeMap::new(),
+            live_tool_output_items: BTreeMap::new(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
@@ -592,6 +595,7 @@ impl BmuxApp {
     }
 
     /// Absorb one live session event.
+    #[allow(clippy::too_many_lines)]
     pub fn absorb_session_event(&mut self, event: &SessionEvent) {
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();
@@ -617,6 +621,9 @@ impl BmuxApp {
             } => {
                 self.set_activity(ActivityState::Thinking);
                 self.push_tool_result(tool_call_id, result, *is_error);
+            }
+            SessionEventKind::ToolInvocationStream { event } => {
+                self.apply_tool_stream_event(event);
             }
             SessionEventKind::PermissionRequested {
                 permission_id,
@@ -828,7 +835,16 @@ impl BmuxApp {
         self.diff_panel.record(summary, lines);
     }
 
+    fn finish_live_tool_output(&mut self, tool_call_id: &str) {
+        if let Some(index) = self.live_tool_output_items.remove(tool_call_id)
+            && let Some(item) = self.transcript.get_mut(index)
+        {
+            item.finish_streaming();
+        }
+    }
+
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
+        self.finish_live_tool_output(tool_call_id);
         let context = self.tool_call_contexts.get(tool_call_id);
         self.transcript.push(tool_result_item(
             tool_call_id,
@@ -842,6 +858,46 @@ impl BmuxApp {
         } else {
             "tool finished".clone_into(&mut self.status);
         }
+    }
+
+    fn apply_tool_stream_event(&mut self, event: &ToolInvocationStreamEvent) {
+        match event {
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id, text, ..
+            } => self.push_tool_output_delta(tool_call_id, text),
+            ToolInvocationStreamEvent::Status { message, .. } => {
+                message.clone_into(&mut self.status);
+            }
+            ToolInvocationStreamEvent::Started { tool_name, .. } => {
+                self.status = format!("running tool {tool_name}");
+            }
+            ToolInvocationStreamEvent::Finished { tool_call_id, .. } => {
+                self.finish_live_tool_output(tool_call_id);
+            }
+        }
+    }
+
+    fn push_tool_output_delta(&mut self, tool_call_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(index) = self.live_tool_output_items.get(tool_call_id).copied()
+            && let Some(item) = self.transcript.get_mut(index)
+        {
+            item.append_text(text);
+            return;
+        }
+        let context = self.tool_call_contexts.get(tool_call_id);
+        self.transcript.push(streaming_tool_output_item(
+            tool_call_id,
+            context.map(|context| context.tool_name.as_str()),
+            context.map(|context| context.arguments_json.as_str()),
+            text,
+        ));
+        self.live_tool_output_items.insert(
+            tool_call_id.to_owned(),
+            self.transcript.len().saturating_sub(1),
+        );
     }
 
     fn push_permission_request(
@@ -944,7 +1000,8 @@ impl BmuxApp {
             | SessionTracePayload::ToolInvocationStarted { .. }
             | SessionTracePayload::ToolPolicyEvaluated { .. }
             | SessionTracePayload::ToolPermissionWait { .. }
-            | SessionTracePayload::ToolInvocationFinished { .. } => {}
+            | SessionTracePayload::ToolInvocationFinished { .. }
+            | SessionTracePayload::ToolInvocationStreamEvent(_) => {}
         }
     }
 
@@ -1049,6 +1106,7 @@ impl BmuxApp {
             | SessionTracePhase::ToolPermissionWaitStarted
             | SessionTracePhase::ToolPermissionWaitFinished
             | SessionTracePhase::ToolInvocationFinished
+            | SessionTracePhase::ToolInvocationOutput
             | SessionTracePhase::SkillInvoked
             | SessionTracePhase::SkillSuggested
             | SessionTracePhase::SkillActivated
@@ -1234,6 +1292,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::RuntimeWorkStarted { .. }
         | SessionEventKind::RuntimeWorkCancelRequested { .. }
         | SessionEventKind::RuntimeWorkFinished { .. }
+        | SessionEventKind::ToolInvocationStream { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),

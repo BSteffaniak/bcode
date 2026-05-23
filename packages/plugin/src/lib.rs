@@ -7,8 +7,9 @@
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
-    EVENT_STATUS_OK, NativeEventContext, NativeServiceContext, PluginEvent,
-    SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, ServiceRequest, StaticPluginVtable,
+    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_OK, NativeEventContext,
+    NativeServiceContext, PluginEvent, SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK,
+    ServiceEventCallback, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 use libloading::Library;
@@ -33,7 +34,29 @@ pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
 type ManifestFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
 type LifecycleFn = unsafe extern "C" fn() -> i32;
 type ServiceFn = unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
+type StreamingServiceFn = unsafe extern "C" fn(
+    *const u8,
+    usize,
+    *mut u8,
+    usize,
+    *mut usize,
+    Option<ServiceEventCallback>,
+    *mut std::ffi::c_void,
+) -> i32;
 type EventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
+
+extern "C" fn service_event_callback(
+    payload_ptr: *const u8,
+    payload_len: usize,
+    user_data: *mut std::ffi::c_void,
+) {
+    if payload_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+    let payload = unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }.to_vec();
+    let callback = unsafe { &mut *user_data.cast::<&mut dyn FnMut(Vec<u8>)>() };
+    callback(payload);
+}
 
 /// Plugin manifest loaded from `bcode-plugin.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +113,8 @@ pub struct NativePluginRuntime {
     pub deactivate_symbol: String,
     #[serde(default = "default_service_symbol")]
     pub service_symbol: String,
+    #[serde(default = "default_streaming_service_symbol")]
+    pub streaming_service_symbol: String,
     #[serde(default = "default_event_symbol")]
     pub event_symbol: String,
 }
@@ -158,6 +183,7 @@ enum LoadedPluginBackend {
         activate: LifecycleFn,
         deactivate: LifecycleFn,
         invoke_service: ServiceFn,
+        invoke_service_streaming: Option<StreamingServiceFn>,
         handle_event: EventFn,
     },
     Static {
@@ -232,6 +258,21 @@ impl LoadedPlugin {
         operation: impl Into<String>,
         payload: Vec<u8>,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        self.invoke_service_with_events(interface_id, operation, payload, |_| {})
+    }
+
+    /// Invoke a service operation on this plugin and receive incremental service events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request encoding, FFI invocation, or response decoding fails.
+    pub fn invoke_service_with_events(
+        &self,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        mut on_event: impl FnMut(Vec<u8>),
+    ) -> Result<ServiceResponse, PluginLoadError> {
         let context = NativeServiceContext {
             plugin_id: self.manifest.id.clone(),
             request: ServiceRequest {
@@ -249,6 +290,8 @@ impl LoadedPlugin {
             output.as_mut_ptr(),
             output.len(),
             &raw mut output_len,
+            Some(service_event_callback),
+            (&raw mut on_event).cast::<std::ffi::c_void>(),
         );
         if status == SERVICE_STATUS_BUFFER_TOO_SMALL {
             output.resize(output_len, 0);
@@ -258,6 +301,8 @@ impl LoadedPlugin {
                 output.as_mut_ptr(),
                 output.len(),
                 &raw mut output_len,
+                Some(service_event_callback),
+                (&raw mut on_event).cast::<std::ffi::c_void>(),
             );
         }
         if status != SERVICE_STATUS_OK {
@@ -333,6 +378,7 @@ impl LoadedPlugin {
         matches!(self.backend, LoadedPluginBackend::Dynamic { .. })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn invoke_service_raw(
         &self,
         input_ptr: *const u8,
@@ -340,24 +386,47 @@ impl LoadedPlugin {
         output_ptr: *mut u8,
         output_capacity: usize,
         output_len: *mut usize,
+        event_callback: Option<ServiceEventCallback>,
+        event_user_data: *mut std::ffi::c_void,
     ) -> i32 {
         match &self.backend {
-            LoadedPluginBackend::Dynamic { invoke_service, .. } => unsafe {
-                invoke_service(
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
+            LoadedPluginBackend::Dynamic {
+                invoke_service,
+                invoke_service_streaming,
+                ..
+            } => unsafe {
+                invoke_service_streaming.as_ref().map_or_else(
+                    || {
+                        invoke_service(
+                            input_ptr,
+                            input_len,
+                            output_ptr,
+                            output_capacity,
+                            output_len,
+                        )
+                    },
+                    |invoke_service_streaming| {
+                        invoke_service_streaming(
+                            input_ptr,
+                            input_len,
+                            output_ptr,
+                            output_capacity,
+                            output_len,
+                            event_callback,
+                            event_user_data,
+                        )
+                    },
                 )
             },
-            LoadedPluginBackend::Static { vtable } => (vtable.invoke_service)(
+            LoadedPluginBackend::Static { vtable } => (vtable.invoke_service_streaming)(
                 vtable.instance,
                 input_ptr,
                 input_len,
                 output_ptr,
                 output_capacity,
                 output_len,
+                event_callback,
+                event_user_data,
             ),
         }
     }
@@ -444,7 +513,12 @@ pub enum PluginServiceCallError {
     ResponseDecode(#[source] serde_json::Error),
 }
 
-fn decode_service_response<R: DeserializeOwned>(
+/// Decode a plugin service response as JSON.
+///
+/// # Errors
+///
+/// Returns an error when the service returned an error payload or response decoding fails.
+pub fn decode_service_response<R: DeserializeOwned>(
     response: ServiceResponse,
 ) -> Result<R, PluginServiceCallError> {
     if let Some(error) = response.error {
@@ -762,6 +836,7 @@ struct PluginInvocation {
     operation: String,
     payload: Vec<u8>,
     response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
+    event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -779,6 +854,13 @@ enum PluginExecutorMessage {
     Service(PluginInvocation),
     Event(PluginEventInvocation),
     Deactivate(oneshot::Sender<Result<(), PluginLoadError>>),
+}
+
+/// Running streaming plugin service invocation.
+#[derive(Debug)]
+pub struct StreamingServiceInvocation {
+    pub response: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
+    pub events: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
 /// Handle to a plugin-local executor.
@@ -831,12 +913,71 @@ impl PluginExecutorHandle {
             .snapshot(self.manifest.id.clone(), self.concurrency)
     }
 
-    async fn invoke_service(
+    async fn start_service_with_events(
         &self,
         interface_id: String,
         operation: String,
         payload: Vec<u8>,
         class: PluginInvocationClass,
+    ) -> Result<StreamingServiceInvocation, PluginLoadError> {
+        let (response, response_receiver) = oneshot::channel();
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let invocation = PluginInvocation {
+            id: next_plugin_invocation_id(),
+            class,
+            enqueued_at: Instant::now(),
+            interface_id,
+            operation,
+            payload,
+            response,
+            event_sender: Some(event_sender),
+        };
+        match &self.executor {
+            PluginExecutorKind::Exclusive(sender) => {
+                self.metrics.enqueue(class);
+                sender
+                    .send(PluginExecutorMessage::Service(invocation))
+                    .await
+                    .map_err(|_| {
+                        self.metrics.dequeue(class);
+                        PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+                    })?;
+            }
+            PluginExecutorKind::Concurrent(plugin, semaphore) => {
+                let permit = match semaphore {
+                    Some(semaphore) => {
+                        Some(semaphore.clone().acquire_owned().await.map_err(|_| {
+                            PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+                        })?)
+                    }
+                    None => None,
+                };
+                let plugin = Arc::clone(plugin);
+                let metrics = Arc::clone(&self.metrics);
+                tokio::task::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        execute_plugin_service_invocation(&plugin, invocation, &metrics)
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(PluginLoadError::Io(std::io::Error::other(error))));
+                    // The blocking invocation sends its own response through the invocation channel.
+                    let _ = result;
+                });
+            }
+        }
+        Ok(StreamingServiceInvocation {
+            response: response_receiver,
+            events: event_receiver,
+        })
+    }
+    async fn invoke_service_inner(
+        &self,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+        class: PluginInvocationClass,
+        event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let invocation = PluginInvocation {
             id: next_plugin_invocation_id(),
@@ -846,6 +987,7 @@ impl PluginExecutorHandle {
             operation,
             payload,
             response: oneshot::channel().0,
+            event_sender,
         };
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
@@ -885,6 +1027,17 @@ impl PluginExecutorHandle {
                 .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
             }
         }
+    }
+
+    async fn invoke_service(
+        &self,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+        class: PluginInvocationClass,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        self.invoke_service_inner(interface_id, operation, payload, class, None)
+            .await
     }
 
     async fn handle_event(&self, topic: String, payload: Vec<u8>) -> Result<(), PluginLoadError> {
@@ -1116,6 +1269,35 @@ impl PluginRuntimeHost {
             .await
     }
 
+    /// Invoke a service operation on a loaded plugin by ID and collect incremental events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded or service invocation fails.
+    pub async fn invoke_service_with_events(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<StreamingServiceInvocation, PluginLoadError> {
+        let interface_id = interface_id.into();
+        let operation = operation.into();
+        let executor = self
+            .executors
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
+        let class = self
+            .registry
+            .service_policy(plugin_id, &interface_id)
+            .and_then(|policy| policy.class)
+            .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
+        executor
+            .start_service_with_events(interface_id, operation, payload, class)
+            .await
+    }
+
     /// Invoke a service operation by service interface ID.
     ///
     /// # Errors
@@ -1302,10 +1484,15 @@ fn execute_plugin_service_invocation(
         operation = %invocation.operation,
         "plugin service invocation started"
     );
-    let response = plugin.invoke_service(
+    let response = plugin.invoke_service_with_events(
         invocation.interface_id,
         invocation.operation,
         invocation.payload,
+        |event| {
+            if let Some(sender) = &invocation.event_sender {
+                let _ = sender.send(event);
+            }
+        },
     );
     metrics.running.fetch_sub(1, Ordering::Relaxed);
     if response.is_ok() {
@@ -1382,10 +1569,15 @@ fn spawn_exclusive_plugin_executor(
                         "plugin service invocation started"
                     );
                     let response = if active {
-                        plugin.invoke_service(
+                        plugin.invoke_service_with_events(
                             invocation.interface_id,
                             invocation.operation,
                             invocation.payload,
+                            |event| {
+                                if let Some(sender) = &invocation.event_sender {
+                                    let _ = sender.send(event);
+                                }
+                            },
                         )
                     } else {
                         Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
@@ -1762,6 +1954,8 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
     let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
     let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
     let invoke_service = load_service_symbol(&library, &library_path, &runtime.service_symbol)?;
+    let invoke_service_streaming =
+        load_streaming_service_symbol(&library, &runtime.streaming_service_symbol);
     let handle_event = load_event_symbol(&library, &library_path, &runtime.event_symbol)?;
     tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "native symbols loaded");
 
@@ -1772,6 +1966,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
             activate,
             deactivate,
             invoke_service,
+            invoke_service_streaming,
             handle_event,
         },
     })
@@ -1936,6 +2131,15 @@ fn load_service_symbol(
     Ok(*loaded)
 }
 
+fn load_streaming_service_symbol(
+    library: &Library,
+    symbol_name: &str,
+) -> Option<StreamingServiceFn> {
+    let mut symbol = symbol_name.as_bytes().to_vec();
+    symbol.push(0);
+    unsafe { library.get::<StreamingServiceFn>(&*symbol).ok().map(|s| *s) }
+}
+
 fn load_event_symbol(
     library: &Library,
     library_path: &Path,
@@ -1973,6 +2177,10 @@ fn default_deactivate_symbol() -> String {
 
 fn default_service_symbol() -> String {
     DEFAULT_NATIVE_SERVICE_SYMBOL.to_string()
+}
+
+fn default_streaming_service_symbol() -> String {
+    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string()
 }
 
 fn default_event_symbol() -> String {
@@ -2160,6 +2368,7 @@ library = "libexample_plugin.dylib"
                     activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
                     deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
                     service_symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
+                    streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
                     event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
                 }),
             }
@@ -2183,6 +2392,24 @@ library = "libexample_plugin.dylib"
                                 activate,
                                 deactivate,
                                 invoke_service: slow_service,
+                                invoke_service_streaming:
+                                    |_,
+                                     input_ptr,
+                                     input_len,
+                                     output_ptr,
+                                     output_capacity,
+                                     output_len,
+                                     _,
+                                     _| {
+                                        slow_service(
+                                            std::ptr::null(),
+                                            input_ptr,
+                                            input_len,
+                                            output_ptr,
+                                            output_capacity,
+                                            output_len,
+                                        )
+                                    },
                                 handle_event,
                             },
                         },
@@ -2198,6 +2425,24 @@ library = "libexample_plugin.dylib"
                                 activate,
                                 deactivate,
                                 invoke_service: fast_service,
+                                invoke_service_streaming:
+                                    |_,
+                                     input_ptr,
+                                     input_len,
+                                     output_ptr,
+                                     output_capacity,
+                                     output_len,
+                                     _,
+                                     _| {
+                                        fast_service(
+                                            std::ptr::null(),
+                                            input_ptr,
+                                            input_len,
+                                            output_ptr,
+                                            output_capacity,
+                                            output_len,
+                                        )
+                                    },
                                 handle_event,
                             },
                         },
