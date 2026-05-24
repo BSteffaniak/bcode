@@ -139,6 +139,7 @@ impl BcodeConfig {
             auth_profile: None,
             settings: BTreeMap::new(),
             request: BTreeMap::new(),
+            reasoning: self.model.reasoning.clone(),
         };
         if let Some(profile_name) = &self.model.profile
             && let Some(profile) = self.model.profiles.get(profile_name)
@@ -150,6 +151,7 @@ impl BcodeConfig {
             selection.auth_profile.clone_from(&profile.auth_profile);
             selection.settings = profile.settings.clone();
             selection.request = provider_request_values_from_json(&profile.request);
+            selection.reasoning = merge_reasoning_config(&self.model.reasoning, &profile.reasoning);
         }
         self.apply_model_alias(&mut selection);
         if selection.provider_plugin_id.is_none()
@@ -1012,6 +1014,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub default_thinking_level: Option<bcode_model::ReasoningEffort>,
     #[serde(default)]
+    pub reasoning: ReasoningConfig,
+    #[serde(default)]
     pub max_tool_rounds: Option<u32>,
     #[serde(default)]
     pub prompt_cache: PromptCacheConfig,
@@ -1036,6 +1040,15 @@ impl ModelConfig {
     pub fn effective_max_tool_rounds(&self) -> Option<u32> {
         self.max_tool_rounds.filter(|rounds| *rounds > 0)
     }
+}
+
+/// Reasoning / thinking request configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningConfig {
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// Prompt cache configuration.
@@ -1210,6 +1223,8 @@ pub struct ModelProfileConfig {
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
     #[serde(default)]
+    pub reasoning: ReasoningConfig,
+    #[serde(default)]
     pub request: BTreeMap<String, serde_json::Value>,
 }
 
@@ -1233,6 +1248,7 @@ pub struct ResolvedModelSelection {
     pub auth_profile: Option<String>,
     pub settings: BTreeMap<String, String>,
     pub request: BTreeMap<String, bcode_model::ProviderRequestValue>,
+    pub reasoning: ReasoningConfig,
 }
 
 /// Plugin configuration.
@@ -1242,6 +1258,13 @@ pub struct PluginConfig {
     pub enabled: BTreeSet<String>,
     #[serde(default)]
     pub disabled: BTreeSet<String>,
+}
+
+fn merge_reasoning_config(base: &ReasoningConfig, overlay: &ReasoningConfig) -> ReasoningConfig {
+    ReasoningConfig {
+        effort: overlay.effort.clone().or_else(|| base.effort.clone()),
+        summary: overlay.summary.clone().or_else(|| base.summary.clone()),
+    }
 }
 
 impl From<&PluginConfig> for PluginSelection {
@@ -1426,6 +1449,7 @@ pub fn set_openai_compatible_sshenv_auth_mode(
                     model_id: Some(model_id),
                     auth_profile: Some(profile),
                     settings: BTreeMap::new(),
+                    reasoning: ReasoningConfig::default(),
                     request: BTreeMap::new(),
                 });
         }
@@ -1531,6 +1555,7 @@ pub fn set_bedrock_model_profile(
                 model_id: Some(model_id),
                 auth_profile: Some(auth_profile.clone()),
                 settings,
+                reasoning: ReasoningConfig::default(),
                 request: BTreeMap::new(),
             },
         );
@@ -1859,6 +1884,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
     if model.provider_plugin_id.is_some()
         || model.model_id.is_some()
         || model.default_thinking_level.is_some()
+        || model.reasoning != ReasoningConfig::default()
         || model.max_tool_rounds.is_some()
         || model.profile.is_some()
         || !model.aliases.is_empty()
@@ -1889,6 +1915,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
             writeln!(output, "default_thinking_level = \"{level:?}\"")
                 .expect("writing to string should not fail");
         }
+        write_reasoning_inline_toml(output, &model.reasoning);
         if let Some(max_tool_rounds) = model.max_tool_rounds {
             writeln!(output, "max_tool_rounds = {max_tool_rounds}")
                 .expect("writing to string should not fail");
@@ -1924,6 +1951,17 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
     write_model_aliases_toml(output, &model.aliases);
 }
 
+fn write_reasoning_inline_toml(output: &mut String, reasoning: &ReasoningConfig) {
+    if let Some(effort) = &reasoning.effort {
+        writeln!(output, "reasoning_effort = {}", toml_string(effort))
+            .expect("writing to string should not fail");
+    }
+    if let Some(summary) = &reasoning.summary {
+        writeln!(output, "reasoning_summary = {}", toml_string(summary))
+            .expect("writing to string should not fail");
+    }
+}
+
 fn write_model_profiles_toml(output: &mut String, profiles: &BTreeMap<String, ModelProfileConfig>) {
     for (profile_name, profile) in profiles {
         writeln!(output, "[model.profiles.{}]", toml_key(profile_name))
@@ -1942,6 +1980,7 @@ fn write_model_profiles_toml(output: &mut String, profiles: &BTreeMap<String, Mo
             writeln!(output, "auth_profile = {}", toml_string(auth_profile))
                 .expect("writing to string should not fail");
         }
+        write_reasoning_inline_toml(output, &profile.reasoning);
         output.push('\n');
         write_string_map_table(
             output,

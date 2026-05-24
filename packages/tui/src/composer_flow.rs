@@ -29,6 +29,23 @@ pub async fn submit_composer<W: Write>(
         chat.app.clear_pending_submission(&message);
         match slash_commands::execute(client, session_id, &message).await? {
             slash_commands::SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
+            slash_commands::SlashCommandOutcome::SetThinkingDisplay(show) => {
+                chat.app.set_reasoning_visible(show);
+                chat.app.set_status(if show {
+                    "thinking display shown".to_owned()
+                } else {
+                    "thinking display hidden".to_owned()
+                });
+            }
+            slash_commands::SlashCommandOutcome::ToggleThinkingDisplay => {
+                let show = !chat.app.reasoning_visible();
+                chat.app.set_reasoning_visible(show);
+                chat.app.set_status(if show {
+                    "thinking display shown".to_owned()
+                } else {
+                    "thinking display hidden".to_owned()
+                });
+            }
             slash_commands::SlashCommandOutcome::SystemNote(note) => {
                 chat.app.push_system_note(note);
                 chat.app.set_status("slash command handled".to_owned());

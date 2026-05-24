@@ -354,7 +354,18 @@ impl BmuxApp {
         if status.model_id.is_some() {
             self.selected_model_id = status.model_id;
         }
-        self.token_usage.apply_model_info(status.model.as_ref());
+        let model = status
+            .context_window
+            .map(|context_window| bcode_model::ModelInfo {
+                model_id: self.selected_model_id.clone().unwrap_or_default(),
+                display_name: self.selected_model_id.clone().unwrap_or_default(),
+                is_default: false,
+                context_window: Some(context_window),
+                max_output_tokens: status.max_output_tokens,
+                capabilities: std::collections::BTreeSet::new(),
+                reasoning: status.reasoning.clone(),
+            });
+        self.token_usage.apply_model_info(model.as_ref());
     }
 
     /// Return pending submissions that have not been committed by the session stream.
@@ -441,6 +452,17 @@ impl BmuxApp {
     /// Replace the current status line.
     pub fn set_status(&mut self, status: String) {
         self.status = status;
+    }
+
+    /// Return whether reasoning transcript items are visible.
+    #[must_use]
+    pub fn reasoning_visible(&self) -> bool {
+        self.thinking_label != "hidden"
+    }
+
+    /// Set whether reasoning transcript items are visible.
+    pub fn set_reasoning_visible(&mut self, visible: bool) {
+        if visible { "shown" } else { "hidden" }.clone_into(&mut self.thinking_label);
     }
 
     /// Mark the app as waiting for turn cancellation.

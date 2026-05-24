@@ -1,6 +1,6 @@
 //! TUI tests.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
@@ -465,14 +465,11 @@ fn header_and_footer_include_model_agent_and_token_context() {
     app.apply_model_status(bcode_ipc::SessionModelStatus {
         provider_plugin_id: Some("provider.example".to_owned()),
         model_id: Some("model-example".to_owned()),
-        model: Some(bcode_model::ModelInfo {
-            model_id: "model-example".to_owned(),
-            display_name: "Model Example".to_owned(),
-            is_default: false,
-            context_window: Some(1024),
-            max_output_tokens: None,
-            capabilities: BTreeSet::new(),
-        }),
+        context_window: Some(1024),
+        max_output_tokens: None,
+        reasoning: None,
+        reasoning_effort: None,
+        reasoning_summary: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
     let mut frame = Frame::new(&mut buffer);

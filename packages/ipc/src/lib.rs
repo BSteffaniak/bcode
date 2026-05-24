@@ -145,6 +145,11 @@ pub enum Request {
         provider_plugin_id: Option<String>,
         model_id: String,
     },
+    SetSessionReasoning {
+        session_id: SessionId,
+        effort: Option<String>,
+        summary: Option<String>,
+    },
     SessionModelStatus {
         session_id: SessionId,
     },
@@ -242,7 +247,15 @@ pub struct SessionModelStatus {
     #[serde(default)]
     pub model_id: Option<String>,
     #[serde(default)]
-    pub model: Option<bcode_model::ModelInfo>,
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning: Option<bcode_model::ModelReasoningInfo>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_summary: Option<String>,
 }
 
 /// Service interface provided by a loaded plugin.

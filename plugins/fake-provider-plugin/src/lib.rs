@@ -233,6 +233,7 @@ fn models() -> ModelList {
             capabilities: [ModelCapability::StreamingText, ModelCapability::ToolCalls]
                 .into_iter()
                 .collect(),
+            reasoning: None,
         }],
     }
 }

@@ -77,6 +77,31 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub capabilities: BTreeSet<ModelCapability>,
+    #[serde(default)]
+    pub reasoning: Option<ModelReasoningInfo>,
+}
+
+/// Per-model reasoning/thinking controls exposed by a provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelReasoningInfo {
+    /// Provider-native effort values accepted by the model.
+    #[serde(default)]
+    pub effort_values: Vec<String>,
+    /// Provider-native default effort value, when known.
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    /// Whether provider-visible reasoning summaries can be requested.
+    #[serde(default)]
+    pub visible_summary_supported: bool,
+    /// Provider-native summary/detail values accepted by the model.
+    #[serde(default)]
+    pub summary_values: Vec<String>,
+    /// Provider-native default summary/detail value, when known.
+    #[serde(default)]
+    pub default_summary: Option<String>,
+    /// Whether raw provider reasoning text can be requested.
+    #[serde(default)]
+    pub raw_reasoning_supported: bool,
 }
 
 /// Per-model capability.
@@ -461,6 +486,10 @@ pub struct ModelParameters {
     pub reasoning_budget_tokens: Option<u32>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub reasoning_effort_value: Option<String>,
+    #[serde(default)]
+    pub reasoning_summary: Option<String>,
 }
 
 /// Tool definition supplied to a provider.

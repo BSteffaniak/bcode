@@ -17,6 +17,10 @@ pub enum SlashCommandOutcome {
     PickSkill,
     /// Toggle diff panel.
     ToggleDiff,
+    /// Toggle local thinking display.
+    SetThinkingDisplay(bool),
+    /// Toggle local thinking display.
+    ToggleThinkingDisplay,
     /// Show a system note.
     SystemNote(String),
     /// Unknown slash command.
@@ -60,6 +64,86 @@ async fn runtime_status(
     Ok(SlashCommandOutcome::Handled(format!(
         "runtime: {running} running, {queued} queued"
     )))
+}
+
+async fn thinking_command(
+    client: &BcodeClient,
+    session_id: SessionId,
+    parts: &[&str],
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    let status = client.session_model_status(session_id).await?;
+    match parts.get(1).copied() {
+        Some("capabilities") => Ok(SlashCommandOutcome::Handled(thinking_capabilities(&status))),
+        Some("status") | None => Ok(SlashCommandOutcome::Handled(thinking_status(&status))),
+        Some("effort") if parts.len() > 2 => {
+            let effort = parts[2].to_owned();
+            client
+                .set_session_reasoning(session_id, Some(effort.clone()), None)
+                .await?;
+            Ok(SlashCommandOutcome::Handled(format!(
+                "thinking effort set to {effort}"
+            )))
+        }
+        Some("summary") if parts.len() > 2 => {
+            let summary = parts[2].to_owned();
+            client
+                .set_session_reasoning(session_id, None, Some(summary.clone()))
+                .await?;
+            Ok(SlashCommandOutcome::Handled(format!(
+                "thinking summary set to {summary}"
+            )))
+        }
+        Some("show") => Ok(SlashCommandOutcome::SetThinkingDisplay(true)),
+        Some("hide") => Ok(SlashCommandOutcome::SetThinkingDisplay(false)),
+        Some("toggle") => Ok(SlashCommandOutcome::ToggleThinkingDisplay),
+        Some(value) => {
+            client
+                .set_session_reasoning(session_id, Some(value.to_owned()), None)
+                .await?;
+            Ok(SlashCommandOutcome::Handled(format!(
+                "thinking effort set to {value}"
+            )))
+        }
+    }
+}
+
+fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {
+    format!(
+        "thinking: effort={}, summary={}{}",
+        status.reasoning_effort.as_deref().unwrap_or("default"),
+        status.reasoning_summary.as_deref().unwrap_or("default"),
+        status
+            .reasoning
+            .as_ref()
+            .map_or_else(String::new, |reasoning| format!(
+                "\navailable effort: {}\navailable summary: {}",
+                list_or_default(&reasoning.effort_values),
+                list_or_default(&reasoning.summary_values)
+            ))
+    )
+}
+
+fn thinking_capabilities(status: &bcode_ipc::SessionModelStatus) -> String {
+    let Some(reasoning) = &status.reasoning else {
+        return "thinking: no provider-declared reasoning capabilities for this model".to_owned();
+    };
+    format!(
+        "thinking capabilities\neffort: {}\ndefault effort: {}\nvisible summary: {}\nsummary values: {}\ndefault summary: {}\nraw reasoning: {}",
+        list_or_default(&reasoning.effort_values),
+        reasoning.default_effort.as_deref().unwrap_or("unknown"),
+        reasoning.visible_summary_supported,
+        list_or_default(&reasoning.summary_values),
+        reasoning.default_summary.as_deref().unwrap_or("unknown"),
+        reasoning.raw_reasoning_supported,
+    )
+}
+
+fn list_or_default(values: &[String]) -> String {
+    if values.is_empty() {
+        "unknown".to_owned()
+    } else {
+        values.join(", ")
+    }
 }
 
 /// Execute a slash command.
@@ -156,6 +240,7 @@ pub async fn execute(
                 format!("skill {skill_id} invoked")
             }))
         }
+        "thinking" => thinking_command(client, session_id, &parts).await,
         "runtime" | "status" => runtime_status(client).await,
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }

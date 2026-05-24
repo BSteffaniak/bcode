@@ -34,17 +34,9 @@ pub async fn show_model_status(
         .unwrap_or("default provider");
     let model = status.model_id.as_deref().unwrap_or("default model");
     let mut lines = vec![format!("Active model: {provider}/{model}")];
-    if let Some(info) = status.model {
-        lines.push(format!("Display name: {}", info.display_name));
-        if let Some(context_window) = info.context_window {
-            lines.push(format!("Context window: {context_window}"));
-        }
-        if let Some(max_output_tokens) = info.max_output_tokens {
-            lines.push(format!("Max output tokens: {max_output_tokens}"));
-        }
-        if !info.capabilities.is_empty() {
-            lines.push(format!("Capabilities: {:?}", info.capabilities));
-        }
+    if let Some(reasoning) = status.reasoning {
+        lines.push(format!("Reasoning effort: {:?}", reasoning.effort_values));
+        lines.push(format!("Reasoning summary: {:?}", reasoning.summary_values));
     }
     let text = lines.join("\n");
     chat.app.set_status(format!("model: {provider}/{model}"));

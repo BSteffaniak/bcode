@@ -281,6 +281,8 @@ struct ResponsesRequest {
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<ResponsesTextOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesReasoningOptions>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     include: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -291,6 +293,14 @@ struct ResponsesRequest {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesReasoningOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1336,11 +1346,8 @@ fn build_responses_request(
             .dialect
             .uses_codex_request_shape()
             .then_some(ResponsesTextOptions { verbosity: "low" }),
-        include: if settings.dialect.uses_codex_request_shape() {
-            vec!["reasoning.encrypted_content"]
-        } else {
-            Vec::new()
-        },
+        reasoning: responses_reasoning_options(request),
+        include: responses_include(settings, request),
         prompt_cache_key: settings
             .dialect
             .uses_codex_request_shape()
@@ -1358,6 +1365,41 @@ fn build_responses_request(
     })?;
     merge_provider_request_options(&mut body, &request.provider_context.request)?;
     Ok(body)
+}
+
+fn responses_reasoning_options(request: &ModelTurnRequest) -> Option<ResponsesReasoningOptions> {
+    let effort = request
+        .parameters
+        .reasoning_effort_value
+        .clone()
+        .or_else(|| {
+            request
+                .parameters
+                .reasoning_effort
+                .map(reasoning_effort_name)
+        });
+    let summary = request.parameters.reasoning_summary.clone();
+    (effort.is_some() || summary.is_some()).then_some(ResponsesReasoningOptions { effort, summary })
+}
+
+fn responses_include(settings: &Settings, request: &ModelTurnRequest) -> Vec<&'static str> {
+    let mut include = Vec::new();
+    if settings.dialect.uses_codex_request_shape() {
+        include.push("reasoning.encrypted_content");
+    }
+    if request.parameters.reasoning_summary.is_some() {
+        include.push("reasoning.summary");
+    }
+    include
+}
+
+fn reasoning_effort_name(effort: bcode_model::ReasoningEffort) -> String {
+    match effort {
+        bcode_model::ReasoningEffort::Low => "low",
+        bcode_model::ReasoningEffort::Medium => "medium",
+        bcode_model::ReasoningEffort::High => "high",
+    }
+    .to_string()
 }
 
 fn merge_provider_request_options(
@@ -1933,18 +1975,42 @@ fn model_infos_from_items(
         .map(|model| ModelInfo {
             is_default: selected_default.as_deref() == Some(model.id.as_str()),
             model_id: model.id.clone(),
-            display_name: model.id,
+            display_name: model.id.clone(),
             context_window: None,
             max_output_tokens: None,
             capabilities: [
                 ModelCapability::StreamingText,
                 ModelCapability::ToolCalls,
                 ModelCapability::PromptCaching,
+                ModelCapability::Reasoning,
             ]
             .into_iter()
             .collect(),
+            reasoning: reasoning_info_for_model(&model.id),
         })
         .collect()
+}
+
+fn reasoning_info_for_model(model_id: &str) -> Option<bcode_model::ModelReasoningInfo> {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.contains("gpt-5") || lower.contains("o3") || lower.contains("o4") {
+        Some(bcode_model::ModelReasoningInfo {
+            effort_values: vec!["minimal", "low", "medium", "high"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            default_effort: Some("medium".to_string()),
+            visible_summary_supported: true,
+            summary_values: vec!["auto", "concise", "detailed"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            default_summary: Some("auto".to_string()),
+            raw_reasoning_supported: false,
+        })
+    } else {
+        None
+    }
 }
 
 fn select_default_model_info(models: &[ModelInfo]) -> Option<&ModelInfo> {

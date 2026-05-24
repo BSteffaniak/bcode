@@ -423,6 +423,31 @@ impl BcodeClient {
         }
     }
 
+    /// Set a session-specific reasoning selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn set_session_reasoning(
+        &self,
+        session_id: SessionId,
+        effort: Option<String>,
+        summary: Option<String>,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::SetSessionReasoning {
+                session_id,
+                effort,
+                summary,
+            })
+            .await?
+        {
+            ResponsePayload::SessionModelSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return active model metadata for a session.
     ///
     /// # Errors

@@ -1146,6 +1146,7 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             ]
             .into_iter()
             .collect(),
+            reasoning: None,
         })
         .collect()
 }
@@ -1736,6 +1737,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             ]
             .into_iter()
             .collect(),
+            reasoning: None,
         })
         .collect();
     Ok(ModelDiscovery {

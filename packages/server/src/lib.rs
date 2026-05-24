@@ -92,6 +92,7 @@ struct ServerState {
     selected_provider_context: bcode_model::ProviderRequestContext,
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
+    selected_reasoning: bcode_config::ReasoningConfig,
     provider_state: Mutex<ProviderStateStore>,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
@@ -256,6 +257,8 @@ struct SessionModelSelection {
     provider_plugin_id: Option<String>,
     model_id: Option<String>,
     thinking_level: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
+    reasoning_summary: Option<String>,
     provider_context: bcode_model::ProviderRequestContext,
 }
 
@@ -361,6 +364,7 @@ struct ServerStateInit {
     selected_provider_context: bcode_model::ProviderRequestContext,
     prompt_cache_mode: bcode_model::PromptCacheMode,
     conversation_reuse_mode: bcode_model::ConversationReuseMode,
+    selected_reasoning: bcode_config::ReasoningConfig,
     provider_state: ProviderStateStore,
     observability: bcode_config::ObservabilityConfig,
     trace_store: TraceStore,
@@ -387,6 +391,7 @@ impl ServerState {
             selected_provider_context: init.selected_provider_context,
             prompt_cache_mode: init.prompt_cache_mode,
             conversation_reuse_mode: init.conversation_reuse_mode,
+            selected_reasoning: init.selected_reasoning,
             provider_state: Mutex::new(init.provider_state),
             observability: init.observability,
             trace_store: init.trace_store,
@@ -568,6 +573,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             },
             prompt_cache_mode: config.model.prompt_cache.mode,
             conversation_reuse_mode: config.model.conversation_reuse.mode,
+            selected_reasoning: resolved_model.reasoning,
             provider_state: ProviderStateStore::load(default_provider_state_path()),
             observability: config.observability,
             trace_store: TraceStore::new(default_trace_store_dir()),
@@ -774,6 +780,14 @@ async fn handle_request(
                 model_id,
             )
             .await
+        }
+        Request::SetSessionReasoning {
+            session_id,
+            effort,
+            summary,
+        } => {
+            handle_set_session_reasoning(request_id, state, writer, session_id, effort, summary)
+                .await
         }
         Request::SessionModelStatus { session_id } => {
             handle_session_model_status(request_id, client_id, state, writer, session_id).await
@@ -1543,6 +1557,8 @@ async fn handle_set_session_model(
                 provider_plugin_id: provider_to_selection(&provider),
                 model_id: model_to_selection(&model_id),
                 thinking_level: None,
+                reasoning_effort: state.selected_reasoning.effort.clone(),
+                reasoning_summary: state.selected_reasoning.summary.clone(),
                 provider_context: state.selected_provider_context.clone(),
             };
             state
@@ -1567,6 +1583,42 @@ async fn handle_set_session_model(
             .await
         }
     }
+}
+
+#[allow(clippy::significant_drop_tightening)]
+async fn handle_set_session_reasoning(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    effort: Option<String>,
+    summary: Option<String>,
+) -> Result<(), ServerError> {
+    {
+        let mut selections = state.session_model_selections.lock().await;
+        let selection = selections
+            .entry(session_id)
+            .or_insert_with(|| SessionModelSelection {
+                provider_plugin_id: state.selected_provider_plugin_id.clone(),
+                model_id: state.selected_model_id.clone(),
+                thinking_level: None,
+                reasoning_effort: state.selected_reasoning.effort.clone(),
+                reasoning_summary: state.selected_reasoning.summary.clone(),
+                provider_context: state.selected_provider_context.clone(),
+            });
+        if effort.is_some() {
+            selection.reasoning_effort = effort;
+        }
+        if summary.is_some() {
+            selection.reasoning_summary = summary;
+        }
+    }
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionModelSet),
+    )
+    .await
 }
 
 async fn handle_session_model_status(
@@ -1604,7 +1656,11 @@ async fn handle_session_model_status(
             status: bcode_ipc::SessionModelStatus {
                 provider_plugin_id: selection.provider_plugin_id,
                 model_id,
-                model,
+                context_window: model.as_ref().and_then(|model| model.context_window),
+                max_output_tokens: model.as_ref().and_then(|model| model.max_output_tokens),
+                reasoning: model.as_ref().and_then(|model| model.reasoning.clone()),
+                reasoning_effort: selection.reasoning_effort,
+                reasoning_summary: selection.reasoning_summary,
             },
         }),
     )
@@ -3959,6 +4015,8 @@ async fn session_model_selection_with_runtime_context(
             provider_plugin_id: context.selected_provider_plugin_id,
             model_id: context.selected_model_id,
             thinking_level: None,
+            reasoning_effort: state.selected_reasoning.effort.clone(),
+            reasoning_summary: state.selected_reasoning.summary.clone(),
             provider_context: context.provider_context,
         };
         return selection;
@@ -3980,6 +4038,8 @@ async fn session_model_selection(
             provider_plugin_id: provider_to_selection(&provider),
             model_id: model_to_selection(&model),
             thinking_level: None,
+            reasoning_effort: state.selected_reasoning.effort.clone(),
+            reasoning_summary: state.selected_reasoning.summary.clone(),
             provider_context: state.selected_provider_context.clone(),
         }
     } else {
@@ -3987,6 +4047,8 @@ async fn session_model_selection(
             provider_plugin_id: state.selected_provider_plugin_id.clone(),
             model_id: state.selected_model_id.clone(),
             thinking_level: None,
+            reasoning_effort: state.selected_reasoning.effort.clone(),
+            reasoning_summary: state.selected_reasoning.summary.clone(),
             provider_context: state.selected_provider_context.clone(),
         }
     };
@@ -4156,6 +4218,12 @@ async fn build_model_turn_request(
         let mut p = ModelParameters::default();
         if let Some(level) = &selection.thinking_level {
             p.reasoning_effort = Some(*level);
+        }
+        if let Some(effort) = &selection.reasoning_effort {
+            p.reasoning_effort_value = Some(effort.clone());
+        }
+        if let Some(summary) = &selection.reasoning_summary {
+            p.reasoning_summary = Some(summary.clone());
         }
         p
     };
@@ -6692,6 +6760,7 @@ mod tests {
                 context_window: Some(8_000),
                 max_output_tokens: Some(1_000),
                 capabilities: BTreeSet::new(),
+                reasoning: None,
             },
             bcode_model::ModelInfo {
                 model_id: "selected".to_string(),
@@ -6700,6 +6769,7 @@ mod tests {
                 context_window: Some(16_000),
                 max_output_tokens: Some(2_000),
                 capabilities: BTreeSet::new(),
+                reasoning: None,
             },
         ];
 
@@ -6827,6 +6897,7 @@ mod tests {
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 prompt_cache_mode: bcode_model::PromptCacheMode::default(),
                 conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
+                selected_reasoning: bcode_config::ReasoningConfig::default(),
                 provider_state: ProviderStateStore::load(PathBuf::new()),
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
@@ -6901,6 +6972,7 @@ mod tests {
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 prompt_cache_mode: bcode_model::PromptCacheMode::default(),
                 conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
+                selected_reasoning: bcode_config::ReasoningConfig::default(),
                 provider_state: ProviderStateStore::load(PathBuf::new()),
                 observability: bcode_config::ObservabilityConfig::default(),
                 trace_store: TraceStore::new(PathBuf::new()),
