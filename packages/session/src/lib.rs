@@ -1729,6 +1729,9 @@ impl SessionManager {
     /// Publish a transient event to currently attached session subscribers without
     /// appending it to durable history.
     ///
+    /// This is intended for live-only data such as tool output deltas. Callers
+    /// must not use it for lifecycle or semantic events that should survive
+    /// session reloads.
     /// Returns `None` when the session is not loaded or has no active subscribers.
     pub async fn publish_transient_event(
         &self,

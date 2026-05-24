@@ -559,6 +559,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_result_tail_marks_truncation_and_byte_counts() {
+        let output = LimitedOutput {
+            text: format!("{}tail", "x".repeat(MAX_FINAL_TERMINAL_OUTPUT_BYTES + 128)),
+            original_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
+            retained_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
+            truncated: false,
+        };
+
+        let limited = limit_terminal_final_output(&output);
+
+        assert!(limited.truncated);
+        assert_eq!(limited.original_bytes, output.original_bytes);
+        assert!(limited.retained_bytes <= MAX_FINAL_TERMINAL_OUTPUT_BYTES);
+        assert!(limited.text.ends_with("tail"));
+    }
+
+    #[test]
     fn terminal_final_output_is_smaller_tail() {
         let output = LimitedOutput {
             text: format!("{}tail", "x".repeat(MAX_FINAL_TERMINAL_OUTPUT_BYTES + 128)),

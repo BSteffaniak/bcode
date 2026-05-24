@@ -4838,6 +4838,13 @@ async fn invoke_model_tool(
     bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())
 }
 
+/// Append durable tool stream lifecycle events or publish ephemeral output deltas.
+///
+/// `OutputDelta` carries raw live tool output, including PTY bytes. These chunks
+/// are intentionally transient: they are broadcast to currently attached clients
+/// and must not be appended to the session event log. Durable history stores the
+/// tool request, stream lifecycle metadata, final status, and final bounded tool
+/// result instead.
 async fn append_tool_stream_event(
     state: &ServerState,
     session_id: SessionId,
@@ -6797,6 +6804,75 @@ mod tests {
         assert!(truncated.contains("tool output truncated"));
         assert!(truncated.contains("/tmp/full-output.txt"));
         assert!(!truncated.ends_with('z'));
+    }
+
+    #[tokio::test]
+    async fn tool_output_delta_is_transient_not_durable() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = ServerState::new(
+            sessions,
+            bcode_plugin::PluginHost::default().into(),
+            ServerStateInit {
+                selected_provider_plugin_id: None,
+                selected_model_id: None,
+                selected_provider_context: bcode_model::ProviderRequestContext::default(),
+                prompt_cache_mode: bcode_model::PromptCacheMode::default(),
+                conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
+                provider_state: ProviderStateStore::load(PathBuf::new()),
+                observability: bcode_config::ObservabilityConfig::default(),
+                trace_store: TraceStore::new(PathBuf::new()),
+                max_tool_rounds: None,
+                tool_output_context_chars: 1_000,
+                model_streaming: bcode_config::StreamingConfig::default(),
+                auto_compaction: bcode_config::CompactionConfig::default(),
+                skills: None,
+                skill_context_bytes: 0,
+            },
+        );
+        let delta = ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id: "call-1".to_owned(),
+            stream: SessionToolOutputStream::Pty,
+            sequence: 1,
+            text: "live".to_owned(),
+            byte_len: 4,
+        };
+
+        append_tool_stream_event(&state, session_id, delta.clone()).await;
+
+        let received = loop {
+            let event = attachment
+                .events
+                .recv()
+                .await
+                .expect("subscriber should receive transient delta");
+            if matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }) {
+                break event;
+            }
+        };
+        assert_eq!(
+            received.kind,
+            SessionEventKind::ToolInvocationStream { event: delta }
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { .. }
+            }
+        )));
     }
 
     #[tokio::test]
