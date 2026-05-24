@@ -23,6 +23,9 @@ serde                = { workspace = true, features = ["derive", "std"] }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["io-util"] }
 
+[build-dependencies]
+sha2 = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 

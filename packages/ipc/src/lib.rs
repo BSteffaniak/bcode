@@ -30,6 +30,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Current Bcode IPC protocol version.
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
 
+/// Build-scoped daemon fingerprint generated at compile time.
+pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
+
 /// Protocol version used in IPC envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
@@ -717,6 +720,12 @@ fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Return the daemon namespace for this build and IPC protocol version.
+#[must_use]
+pub fn daemon_namespace() -> String {
+    format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{BUILD_FINGERPRINT}")
+}
+
 /// Return the default local IPC endpoint.
 #[must_use]
 pub fn default_endpoint() -> IpcEndpoint {
@@ -727,7 +736,7 @@ pub fn default_endpoint() -> IpcEndpoint {
     #[cfg(windows)]
     {
         let user = env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
-        IpcEndpoint::windows_named_pipe(format!(r"\\.\pipe\bcode-{user}"))
+        IpcEndpoint::windows_named_pipe(format!(r"\\.\pipe\bcode-{user}-{}", daemon_namespace()))
     }
 }
 
@@ -737,7 +746,7 @@ fn default_socket_path() -> PathBuf {
         return PathBuf::from(path);
     }
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
-    env::temp_dir().join(format!("bcode-{user}.sock"))
+    env::temp_dir().join(format!("bcode-{user}-{}.sock", daemon_namespace()))
 }
 
 #[cfg(test)]

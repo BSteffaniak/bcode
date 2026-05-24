@@ -2532,6 +2532,7 @@ async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     if server_ping_ready(&client).await {
         if !quiet {
             println!("server already running");
+            println!("namespace: {}", bcode_ipc::daemon_namespace());
             println!("log: {}", daemon_log_path().display());
         }
         return Ok(());
@@ -2562,6 +2563,7 @@ async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     wait_for_server_ready(&client, &mut child, &log_path).await?;
     if !quiet {
         println!("server started");
+        println!("namespace: {}", bcode_ipc::daemon_namespace());
         println!("log: {}", log_path.display());
     }
     Ok(())
@@ -2572,7 +2574,7 @@ fn daemon_log_path() -> PathBuf {
         || {
             bcode_config::default_state_dir()
                 .join("logs")
-                .join("daemon.log")
+                .join(format!("daemon-{}.log", bcode_ipc::daemon_namespace()))
         },
         PathBuf::from,
     )
@@ -2643,6 +2645,7 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let status = client.server_status().await?;
     println!("daemon: running");
+    println!("namespace: {}", bcode_ipc::daemon_namespace());
     println!("connected clients: {}", status.connected_client_count);
     println!(
         "model provider: {}",
