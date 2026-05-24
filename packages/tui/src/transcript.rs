@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionTokenUsage};
+use bcode_session_models::{
+    SessionEvent, SessionEventKind, SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
+};
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
 
@@ -37,6 +39,21 @@ pub enum TranscriptItemKind {
         /// Raw tool result.
         result: String,
         /// Whether the tool failed.
+        is_error: bool,
+    },
+    /// Live or replayed terminal output from a tool.
+    TerminalOutput {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name, when the matching request is known.
+        tool_name: Option<String>,
+        /// Raw terminal stream decoded as UTF-8.
+        output: String,
+        /// Terminal columns used by the producer.
+        columns: u16,
+        /// Terminal rows used by the producer.
+        rows: u16,
+        /// Whether the terminal command failed once finished.
         is_error: bool,
     },
     /// Token usage telemetry for a model turn.
@@ -133,8 +150,23 @@ impl TranscriptItem {
     /// Append text to this transcript item.
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);
-        if let TranscriptItemKind::ToolResult { result, .. } = &mut self.kind {
-            result.push_str(text);
+        match &mut self.kind {
+            TranscriptItemKind::ToolResult { result, .. }
+            | TranscriptItemKind::TerminalOutput { output: result, .. } => {
+                result.push_str(text);
+            }
+            _ => {}
+        }
+    }
+
+    /// Mark a terminal output item as failed or successful.
+    pub const fn set_terminal_error(&mut self, is_error: bool) {
+        if let TranscriptItemKind::TerminalOutput {
+            is_error: terminal_error,
+            ..
+        } = &mut self.kind
+        {
+            *terminal_error = is_error;
         }
     }
 
@@ -166,15 +198,29 @@ pub fn transcript_items_from_events(events: &[SessionEvent]) -> Vec<TranscriptIt
     projector.finish()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamedToolReplayContext {
+    index: Option<usize>,
+    columns: u16,
+    rows: u16,
+    saw_output: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct TranscriptProjector {
     items: Vec<TranscriptItem>,
     tool_calls: BTreeMap<String, ToolCallContext>,
+    streamed_tool_results: BTreeMap<String, StreamedToolReplayContext>,
 }
 
 impl TranscriptProjector {
     fn push_event(&mut self, event: &SessionEvent) {
-        push_transcript_item_from_event(&mut self.items, &mut self.tool_calls, event);
+        push_transcript_item_from_event(
+            &mut self.items,
+            &mut self.tool_calls,
+            &mut self.streamed_tool_results,
+            event,
+        );
     }
 
     fn finish(self) -> Vec<TranscriptItem> {
@@ -218,6 +264,30 @@ pub fn tool_request_item(
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
             file_edit,
+        },
+    )
+}
+
+/// Build a streaming transcript item for live terminal output.
+#[must_use]
+pub fn streaming_terminal_output_item(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    text: &str,
+    columns: u16,
+    rows: u16,
+) -> TranscriptItem {
+    TranscriptItem::with_kind(
+        "Terminal",
+        text.to_owned(),
+        true,
+        TranscriptItemKind::TerminalOutput {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.map(ToOwned::to_owned),
+            output: text.to_owned(),
+            columns,
+            rows,
+            is_error: false,
         },
     )
 }
@@ -361,6 +431,7 @@ pub fn truncate_block(value: &str, max_chars: usize) -> String {
 fn push_transcript_item_from_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
+    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
     event: &SessionEvent,
 ) {
     match &event.kind {
@@ -376,8 +447,40 @@ fn push_transcript_item_from_event(
         SessionEventKind::AssistantReasoningMessage { text } => {
             finish_streaming_transcript_item(items, "Reasoning", text);
         }
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            is_error,
+            ..
+        } => {
+            let should_render_final =
+                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id) {
+                    if let Some(index) = replay.index
+                        && let Some(item) = items.get_mut(index)
+                    {
+                        item.set_terminal_error(*is_error);
+                        item.finish_streaming();
+                    }
+                    !replay.saw_output
+                } else {
+                    true
+                };
+            if should_render_final
+                && let Some(item) = non_streaming_transcript_item_from_event(
+                    event,
+                    tool_calls,
+                    streamed_tool_results,
+                )
+            {
+                items.push(item);
+            }
+        }
+        SessionEventKind::ToolInvocationStream { event } => {
+            apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
+        }
         _ => {
-            if let Some(item) = non_streaming_transcript_item_from_event(event, tool_calls) {
+            if let Some(item) =
+                non_streaming_transcript_item_from_event(event, tool_calls, streamed_tool_results)
+            {
                 items.push(item);
             }
         }
@@ -429,6 +532,7 @@ fn latest_streaming_item_mut<'items>(
 fn non_streaming_transcript_item_from_event(
     event: &SessionEvent,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
+    streamed_tool_results: &BTreeMap<String, StreamedToolReplayContext>,
 ) -> Option<TranscriptItem> {
     match &event.kind {
         SessionEventKind::UserMessage { text, .. } => {
@@ -456,6 +560,12 @@ fn non_streaming_transcript_item_from_event(
             result,
             is_error,
         } => {
+            if streamed_tool_results
+                .get(tool_call_id)
+                .is_some_and(|stream| stream.saw_output)
+            {
+                return None;
+            }
             let context = tool_calls.get(tool_call_id);
             Some(tool_result_item(
                 tool_call_id,
@@ -513,6 +623,85 @@ fn non_streaming_transcript_item_from_event(
             TranscriptItemKind::SkillError,
         )),
         _ => None,
+    }
+}
+
+fn apply_tool_invocation_stream_event(
+    items: &mut Vec<TranscriptItem>,
+    tool_calls: &BTreeMap<String, ToolCallContext>,
+    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    event: &ToolInvocationStreamEvent,
+) {
+    match event {
+        ToolInvocationStreamEvent::Started {
+            tool_call_id,
+            terminal,
+            columns,
+            rows,
+            ..
+        } => {
+            if *terminal {
+                streamed_tool_results.insert(
+                    tool_call_id.clone(),
+                    StreamedToolReplayContext {
+                        index: None,
+                        columns: columns.unwrap_or(120).max(1),
+                        rows: rows.unwrap_or(24).max(1),
+                        saw_output: false,
+                    },
+                );
+            }
+        }
+        ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id,
+            stream,
+            text,
+            ..
+        } if *stream == ToolOutputStream::Pty => {
+            let replay = streamed_tool_results.get(tool_call_id).cloned();
+            if let Some(replay) = replay.as_ref()
+                && let Some(index) = replay.index
+            {
+                if let Some(item) = items.get_mut(index) {
+                    item.append_text(text);
+                }
+                return;
+            }
+            let context = tool_calls.get(tool_call_id);
+            let (columns, rows) = replay
+                .as_ref()
+                .map_or((120, 24), |replay| (replay.columns, replay.rows));
+            items.push(streaming_terminal_output_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                text,
+                columns,
+                rows,
+            ));
+            streamed_tool_results.insert(
+                tool_call_id.clone(),
+                StreamedToolReplayContext {
+                    index: Some(items.len().saturating_sub(1)),
+                    columns,
+                    rows,
+                    saw_output: true,
+                },
+            );
+        }
+        ToolInvocationStreamEvent::Finished {
+            tool_call_id,
+            is_error,
+            ..
+        } => {
+            if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
+                && let Some(index) = replay.index
+                && let Some(item) = items.get_mut(index)
+            {
+                item.set_terminal_error(*is_error);
+                item.finish_streaming();
+            }
+        }
+        _ => {}
     }
 }
 

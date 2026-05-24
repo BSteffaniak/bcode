@@ -354,7 +354,7 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
             push_tool_result_rows(
                 rows,
                 item,
-                ToolResultRenderContext {
+                &ToolResultRenderContext {
                     tool_call_id,
                     tool_name: tool_name.as_deref(),
                     result,
@@ -362,6 +362,9 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
                 },
                 width,
             );
+        }
+        TranscriptItemKind::TerminalOutput { .. } => {
+            push_terminal_transcript_item_rows(rows, item, width);
         }
         TranscriptItemKind::Usage { turn_id } => {
             push_usage_rows(rows, item, turn_id, width);
@@ -516,7 +519,101 @@ fn push_tool_request_rows(
     rows.push(Line::default());
 }
 
+fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
+    let TranscriptItemKind::TerminalOutput {
+        tool_call_id,
+        tool_name,
+        output,
+        columns,
+        rows: terminal_rows,
+        is_error,
+    } = item.kind()
+    else {
+        return;
+    };
+    push_terminal_tool_result_rows(
+        rows,
+        TerminalToolRenderContext {
+            tool_call_id,
+            tool_name: tool_name.as_deref(),
+            output,
+            columns: *columns,
+            rows: *terminal_rows,
+            is_error: *is_error,
+            streaming: item.streaming(),
+        },
+        width,
+    );
+}
+
 #[derive(Clone, Copy)]
+struct TerminalToolRenderContext<'a> {
+    tool_call_id: &'a str,
+    tool_name: Option<&'a str>,
+    output: &'a str,
+    columns: u16,
+    rows: u16,
+    is_error: bool,
+    streaming: bool,
+}
+
+fn push_terminal_tool_result_rows(
+    rows: &mut Vec<Line>,
+    context: TerminalToolRenderContext<'_>,
+    width: u16,
+) {
+    let status = if context.streaming {
+        "running"
+    } else if context.is_error {
+        "failed"
+    } else {
+        "ok"
+    };
+    let title = context.tool_name.map_or_else(
+        || format!("Terminal · {status}"),
+        |name| format!("Terminal · {name} · {status}"),
+    );
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &title,
+        width,
+        if context.is_error {
+            Style::new().fg(Color::Red)
+        } else if context.streaming {
+            Style::new().fg(Color::Cyan)
+        } else {
+            Style::new().fg(Color::Yellow)
+        },
+        muted_style(),
+    );
+    push_terminal_output_rows(
+        rows,
+        &TerminalOutputTranscript {
+            exit_code: if context.is_error { Some(1) } else { Some(0) },
+            timed_out: false,
+            output: context.output.to_owned(),
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+            columns: context.columns,
+            rows: context.rows,
+        },
+        width,
+    );
+    if context.is_error {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("tool call {}", context.tool_call_id),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    rows.push(Line::default());
+}
+
 struct ToolResultRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: Option<&'a str>,
@@ -527,7 +624,7 @@ struct ToolResultRenderContext<'a> {
 fn push_tool_result_rows(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
-    context: ToolResultRenderContext<'_>,
+    context: &ToolResultRenderContext<'_>,
     width: u16,
 ) {
     let status = if context.is_error { "failed" } else { "ok" };

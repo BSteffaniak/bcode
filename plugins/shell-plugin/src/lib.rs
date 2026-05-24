@@ -21,6 +21,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_FINAL_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
 
 /// Bundled shell plugin.
 #[derive(Default)]
@@ -59,6 +60,22 @@ struct ShellRunArguments {
     columns: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
+}
+
+impl ShellRunArguments {
+    const fn terminal_columns(&self) -> u16 {
+        match self.columns {
+            Some(columns) if columns > 0 => columns,
+            _ => DEFAULT_TERMINAL_COLUMNS,
+        }
+    }
+
+    const fn terminal_rows(&self) -> u16 {
+        match self.rows {
+            Some(rows) if rows > 0 => rows,
+            _ => DEFAULT_TERMINAL_ROWS,
+        }
+    }
 }
 
 const fn default_terminal_mode() -> bool {
@@ -142,6 +159,9 @@ fn run_shell_tool(
         &ToolInvocationStreamEvent::Started {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
+            terminal: arguments.terminal,
+            columns: arguments.terminal.then_some(arguments.terminal_columns()),
+            rows: arguments.terminal.then_some(arguments.terminal_rows()),
         },
     );
     let response = if arguments.terminal {
@@ -211,8 +231,8 @@ fn run_terminal_shell_command_inner(
     session_cwd: Option<&Path>,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-    let columns = arguments.columns.unwrap_or(DEFAULT_TERMINAL_COLUMNS).max(1);
-    let rows = arguments.rows.unwrap_or(DEFAULT_TERMINAL_ROWS).max(1);
+    let columns = arguments.terminal_columns();
+    let rows = arguments.terminal_rows();
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(portable_pty::PtySize {
@@ -261,14 +281,15 @@ fn run_terminal_shell_command_inner(
     };
     drop(pair.master);
     let output = join_reader(reader_thread)?;
+    let terminal_output = limit_terminal_final_output(&output);
     let terminal_output = TerminalCommandOutput {
         mode: "terminal",
         exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
         timed_out,
-        output: output.text,
-        output_truncated: output.truncated,
-        output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
-        retained_output_bytes: u64::try_from(output.retained_bytes).unwrap_or(u64::MAX),
+        output: terminal_output.text,
+        output_truncated: terminal_output.truncated,
+        output_bytes: u64::try_from(terminal_output.original_bytes).unwrap_or(u64::MAX),
+        retained_output_bytes: u64::try_from(terminal_output.retained_bytes).unwrap_or(u64::MAX),
         columns,
         rows,
     };
@@ -278,6 +299,27 @@ fn run_terminal_shell_command_inner(
         is_error: timed_out || !status.success(),
         content: Vec::new(),
     })
+}
+
+fn limit_terminal_final_output(output: &LimitedOutput) -> LimitedOutput {
+    let bytes = output.text.as_bytes();
+    let limit = MAX_FINAL_TERMINAL_OUTPUT_BYTES.min(bytes.len());
+    let start = bytes.len().saturating_sub(limit);
+    let start = utf8_boundary_at_or_after(&output.text, start);
+    let text = output.text[start..].to_owned();
+    LimitedOutput {
+        text,
+        original_bytes: output.original_bytes,
+        retained_bytes: bytes.len().saturating_sub(start),
+        truncated: output.truncated || start > 0,
+    }
+}
+
+const fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
+    while index < value.len() && !value.is_char_boundary(index) {
+        index = index.saturating_add(1);
+    }
+    index
 }
 
 fn run_shell_command(
@@ -513,6 +555,22 @@ mod tests {
         assert_eq!(output.original_bytes, 5);
         assert_eq!(output.retained_bytes, 3);
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn terminal_final_output_is_smaller_tail() {
+        let output = LimitedOutput {
+            text: format!("{}tail", "x".repeat(MAX_FINAL_TERMINAL_OUTPUT_BYTES + 128)),
+            original_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
+            retained_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
+            truncated: false,
+        };
+
+        let limited = limit_terminal_final_output(&output);
+
+        assert!(limited.truncated);
+        assert!(limited.retained_bytes <= MAX_FINAL_TERMINAL_OUTPUT_BYTES);
+        assert!(limited.text.ends_with("tail"));
     }
 
     #[test]

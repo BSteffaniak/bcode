@@ -4883,9 +4883,15 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
         ServiceToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
+            terminal,
+            columns,
+            rows,
         } => ToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
+            terminal,
+            columns,
+            rows,
         },
         ServiceToolInvocationStreamEvent::OutputDelta {
             tool_call_id,

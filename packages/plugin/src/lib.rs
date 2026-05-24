@@ -8,8 +8,8 @@ use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
     DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_OK, NativeEventContext,
-    NativeServiceContext, PluginEvent, SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK,
-    ServiceEventCallback, ServiceRequest, StaticPluginVtable,
+    NativeServiceContext, PluginEvent, SERVICE_STATUS_OK, ServiceEventCallback, ServiceRequest,
+    StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 use libloading::Library;
@@ -283,11 +283,12 @@ impl LoadedPlugin {
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
         };
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
+        let output_capacity = 1024 * 1024;
         let mut output_len = 0_usize;
-        let mut output = vec![0_u8; 65_536];
+        let mut output = vec![0_u8; output_capacity];
         let mut event_callback: &mut dyn FnMut(Vec<u8>) = &mut on_event;
         let event_user_data = (&raw mut event_callback).cast::<std::ffi::c_void>();
-        let mut status = self.invoke_service_raw(
+        let status = self.invoke_service_raw(
             input.as_ptr(),
             input.len(),
             output.as_mut_ptr(),
@@ -296,17 +297,12 @@ impl LoadedPlugin {
             Some(service_event_callback),
             event_user_data,
         );
-        if status == SERVICE_STATUS_BUFFER_TOO_SMALL {
-            output.resize(output_len, 0);
-            status = self.invoke_service_raw(
-                input.as_ptr(),
-                input.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                &raw mut output_len,
-                Some(service_event_callback),
-                event_user_data,
-            );
+        if output_len > output_capacity {
+            return Err(PluginLoadError::ServiceResponseTooLarge {
+                plugin_id: self.manifest.id.clone(),
+                capacity: output_capacity,
+                required: output_len,
+            });
         }
         if status != SERVICE_STATUS_OK {
             return Err(PluginLoadError::ServiceInvokeFailed {
@@ -489,6 +485,14 @@ pub enum PluginLoadError {
     ServiceEncode(#[source] serde_json::Error),
     #[error("failed to decode service response: {0}")]
     ServiceDecode(#[source] serde_json::Error),
+    #[error(
+        "plugin '{plugin_id}' service response exceeded {capacity} byte buffer ({required} bytes required)"
+    )]
+    ServiceResponseTooLarge {
+        plugin_id: String,
+        capacity: usize,
+        required: usize,
+    },
     #[error("plugin '{plugin_id}' service invocation failed with code {code}")]
     ServiceInvokeFailed { plugin_id: String, code: i32 },
     #[error("failed to encode plugin event: {0}")]
@@ -2203,6 +2207,7 @@ fn default_event_symbol() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_plugin_sdk::{SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK};
     use semver::Version;
     use std::path::PathBuf;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -2307,6 +2312,27 @@ library = "libexample_plugin.dylib"
             assert_eq!(thread_event, b"thread-event".to_vec());
             assert_eq!(response.payload, b"ok");
         });
+    }
+
+    #[test]
+    fn oversized_service_response_is_not_retried() {
+        LARGE_CALLS.store(0, Ordering::SeqCst);
+        let plugin = LoadedPlugin {
+            manifest: test_manifest("large"),
+            backend: LoadedPluginBackend::Static {
+                vtable: test_large_vtable(),
+            },
+        };
+
+        let error = plugin
+            .invoke_service("large", "run", Vec::new())
+            .expect_err("oversized response should fail without retry");
+
+        assert_eq!(LARGE_CALLS.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            error,
+            PluginLoadError::ServiceResponseTooLarge { .. }
+        ));
     }
 
     #[test]
@@ -2596,6 +2622,35 @@ library = "libexample_plugin.dylib"
             .expect("event thread should join");
         }
         test_service(instance, input_ptr, input_len, output, cap, len)
+    }
+
+    static LARGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_large_service(
+        _: *const std::ffi::c_void,
+        _: *const u8,
+        _: usize,
+        output: *mut u8,
+        cap: usize,
+        len: *mut usize,
+    ) -> i32 {
+        LARGE_CALLS.fetch_add(1, Ordering::SeqCst);
+        let response = ServiceResponse::text("x".repeat(1024 * 1024 + 1));
+        write_test_response(&response, output, cap, len)
+    }
+
+    fn test_large_vtable() -> StaticPluginVtable {
+        StaticPluginVtable {
+            instance: std::ptr::null(),
+            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
+            activate: test_activate,
+            deactivate: test_deactivate,
+            invoke_service: test_large_service,
+            invoke_service_streaming: |instance, input_ptr, input_len, output, cap, len, _, _| {
+                test_large_service(instance, input_ptr, input_len, output, cap, len)
+            },
+            handle_event: test_handle_event,
+        }
     }
 
     fn test_streaming_vtable() -> StaticPluginVtable {

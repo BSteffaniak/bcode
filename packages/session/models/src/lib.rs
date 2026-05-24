@@ -201,6 +201,12 @@ pub enum ToolInvocationStreamEvent {
     Started {
         tool_call_id: String,
         tool_name: String,
+        #[serde(default)]
+        terminal: bool,
+        #[serde(default)]
+        columns: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
     },
     /// A chunk of live tool output is available.
     OutputDelta {

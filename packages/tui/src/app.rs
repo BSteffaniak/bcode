@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use bcode_session_models::{
     ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
     SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationStreamEvent,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -28,7 +28,8 @@ use super::pending_submissions::PendingSubmissions;
 use super::transcript::{
     TranscriptItem, finish_streaming_transcript_item, merge_transcript_boundary, model_usage_item,
     permission_request_item, permission_result_item, push_streaming_transcript_item,
-    streaming_tool_output_item, tool_request_item, tool_result_item, transcript_items_from_events,
+    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
+    tool_result_item, transcript_items_from_events,
 };
 use super::transcript_layout::TranscriptLayoutCache;
 use super::transcript_viewport::TranscriptViewport;
@@ -47,7 +48,7 @@ pub struct BmuxApp {
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
-    live_tool_output_items: BTreeMap<String, usize>,
+    streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
@@ -64,6 +65,14 @@ pub struct BmuxApp {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamedToolResultContext {
+    index: Option<usize>,
+    columns: u16,
+    rows: u16,
+    saw_output: bool,
 }
 
 impl BmuxApp {
@@ -87,7 +96,7 @@ impl BmuxApp {
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
             tool_call_contexts: BTreeMap::new(),
-            live_tool_output_items: BTreeMap::new(),
+            streamed_tool_results: BTreeMap::new(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
@@ -835,18 +844,23 @@ impl BmuxApp {
         self.diff_panel.record(summary, lines);
     }
 
-    fn finish_live_tool_output(&mut self, tool_call_id: &str) -> bool {
-        if let Some(index) = self.live_tool_output_items.remove(tool_call_id)
-            && let Some(item) = self.transcript.get_mut(index)
-        {
-            item.finish_streaming();
-            return true;
+    fn finish_live_tool_output(&mut self, tool_call_id: &str, is_error: Option<bool>) -> bool {
+        if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id) {
+            if let Some(index) = context.index
+                && let Some(item) = self.transcript.get_mut(index)
+            {
+                if let Some(is_error) = is_error {
+                    item.set_terminal_error(is_error);
+                }
+                item.finish_streaming();
+            }
+            return context.saw_output;
         }
         false
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
-        if self.finish_live_tool_output(tool_call_id) {
+        if self.finish_live_tool_output(tool_call_id, Some(is_error)) {
             if is_error {
                 "tool failed".clone_into(&mut self.status);
             } else {
@@ -872,25 +886,54 @@ impl BmuxApp {
     fn apply_tool_stream_event(&mut self, event: &ToolInvocationStreamEvent) {
         match event {
             ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id, text, ..
-            } => self.push_tool_output_delta(tool_call_id, text),
+                tool_call_id,
+                stream,
+                text,
+                ..
+            } => self.push_tool_output_delta(tool_call_id, *stream, text),
             ToolInvocationStreamEvent::Status { message, .. } => {
                 message.clone_into(&mut self.status);
             }
-            ToolInvocationStreamEvent::Started { tool_name, .. } => {
+            ToolInvocationStreamEvent::Started {
+                tool_call_id,
+                tool_name,
+                terminal,
+                columns,
+                rows,
+            } => {
+                if *terminal {
+                    self.streamed_tool_results.insert(
+                        tool_call_id.clone(),
+                        StreamedToolResultContext {
+                            index: None,
+                            columns: columns.unwrap_or(120).max(1),
+                            rows: rows.unwrap_or(24).max(1),
+                            saw_output: false,
+                        },
+                    );
+                }
                 self.status = format!("running tool {tool_name}");
             }
-            ToolInvocationStreamEvent::Finished { tool_call_id, .. } => {
-                self.finish_live_tool_output(tool_call_id);
+            ToolInvocationStreamEvent::Finished {
+                tool_call_id,
+                is_error,
+                ..
+            } => {
+                self.finish_live_tool_output(tool_call_id, Some(*is_error));
             }
         }
     }
 
-    fn push_tool_output_delta(&mut self, tool_call_id: &str, text: &str) {
+    fn push_tool_output_delta(&mut self, tool_call_id: &str, stream: ToolOutputStream, text: &str) {
         if text.is_empty() {
             return;
         }
-        if let Some(index) = self.live_tool_output_items.get(tool_call_id).copied()
+        if stream == ToolOutputStream::Pty {
+            self.push_terminal_output_delta(tool_call_id, text);
+            return;
+        }
+        if let Some(context) = self.streamed_tool_results.get(tool_call_id)
+            && let Some(index) = context.index
             && let Some(item) = self.transcript.get_mut(index)
         {
             item.append_text(text);
@@ -903,9 +946,53 @@ impl BmuxApp {
             context.map(|context| context.arguments_json.as_str()),
             text,
         ));
-        self.live_tool_output_items.insert(
+        self.streamed_tool_results.insert(
             tool_call_id.to_owned(),
-            self.transcript.len().saturating_sub(1),
+            StreamedToolResultContext {
+                index: Some(self.transcript.len().saturating_sub(1)),
+                columns: 0,
+                rows: 0,
+                saw_output: true,
+            },
+        );
+    }
+
+    fn push_terminal_output_delta(&mut self, tool_call_id: &str, text: &str) {
+        if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id) {
+            context.saw_output = true;
+            if let Some(index) = context.index {
+                if let Some(item) = self.transcript.get_mut(index) {
+                    item.append_text(text);
+                }
+                return;
+            }
+            let tool_context = self.tool_call_contexts.get(tool_call_id);
+            self.transcript.push(streaming_terminal_output_item(
+                tool_call_id,
+                tool_context.map(|context| context.tool_name.as_str()),
+                text,
+                context.columns,
+                context.rows,
+            ));
+            context.index = Some(self.transcript.len().saturating_sub(1));
+            return;
+        }
+        let tool_context = self.tool_call_contexts.get(tool_call_id);
+        self.transcript.push(streaming_terminal_output_item(
+            tool_call_id,
+            tool_context.map(|context| context.tool_name.as_str()),
+            text,
+            120,
+            24,
+        ));
+        self.streamed_tool_results.insert(
+            tool_call_id.to_owned(),
+            StreamedToolResultContext {
+                index: Some(self.transcript.len().saturating_sub(1)),
+                columns: 120,
+                rows: 24,
+                saw_output: true,
+            },
         );
     }
 

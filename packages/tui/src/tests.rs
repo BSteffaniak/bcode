@@ -18,6 +18,7 @@ use super::{
     input,
     keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
     render, slash_palette, slash_palette_render,
+    transcript::{TranscriptItemKind, transcript_items_from_events},
 };
 
 #[test]
@@ -955,9 +956,22 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
         session_id,
         2,
         SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "filesystem.shell.run".to_owned(),
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolInvocationStream {
             event: ToolInvocationStreamEvent::OutputDelta {
                 tool_call_id: "call-1".to_owned(),
-                stream: ToolOutputStream::Stdout,
+                stream: ToolOutputStream::Pty,
                 sequence: 0,
                 text: "first\n".to_owned(),
                 byte_len: "first\n".len(),
@@ -966,7 +980,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
     ));
     app.absorb_session_event(&event(
         session_id,
-        3,
+        4,
         SessionEventKind::ToolCallFinished {
             tool_call_id: "call-1".to_owned(),
             result: "first\n".to_owned(),
@@ -982,6 +996,153 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].text(), "first\n");
     assert!(!tool_results[0].streaming());
+}
+
+#[test]
+fn streamed_terminal_history_suppresses_final_tool_result_tail() {
+    let session_id = SessionId::new();
+    let events = streamed_terminal_tool_events(session_id);
+
+    let transcript = transcript_items_from_events(&events);
+    let terminal_items = transcript
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("final duplicate tail"))
+    );
+
+    assert_eq!(terminal_items.len(), 1);
+    assert_eq!(terminal_items[0].text(), "live output\n");
+    assert!(!terminal_items[0].streaming());
+}
+
+#[test]
+fn streamed_terminal_live_suppresses_final_tool_result_tail() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    for event in streamed_terminal_tool_events(session_id) {
+        app.absorb_session_event(&event);
+    }
+
+    let terminal_items = app
+        .transcript()
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        !app.transcript()
+            .iter()
+            .any(|item| item.text().contains("final duplicate tail"))
+    );
+
+    assert_eq!(terminal_items.len(), 1);
+    assert_eq!(terminal_items[0].text(), "live output\n");
+    assert!(!terminal_items[0].streaming());
+}
+
+#[test]
+fn streamed_tool_without_output_renders_final_result() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-empty".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-empty".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    terminal: true,
+                    columns: Some(120),
+                    rows: Some(40),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-empty".to_owned(),
+                result: "final result".to_owned(),
+                is_error: false,
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events(&events);
+
+    assert!(transcript.iter().any(|item| item.text() == "final result"));
+}
+
+fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
+    vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-stream".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-stream".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    terminal: true,
+                    columns: Some(120),
+                    rows: Some(40),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-stream".to_owned(),
+                    stream: ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: "live output\n".to_owned(),
+                    byte_len: "live output\n".len(),
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Finished {
+                    tool_call_id: "call-stream".to_owned(),
+                    sequence: 2,
+                    is_error: false,
+                },
+            },
+        ),
+        event(
+            session_id,
+            5,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-stream".to_owned(),
+                result: "final duplicate tail".to_owned(),
+                is_error: false,
+            },
+        ),
+    ]
 }
 
 fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
