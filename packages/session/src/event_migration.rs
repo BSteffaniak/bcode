@@ -4,7 +4,10 @@ use crate::migration::{
     SessionMigrationJournalStatus, SessionMigrationPlanItem, SessionMigrationReport,
     SessionMigrationReportItem,
 };
-use crate::{SessionEventStore, SessionStoreError, current_unix_millis, reader, write_event_frame};
+use crate::{
+    SessionEventStore, SessionStoreError, current_unix_millis, read_issue_blocks_access, reader,
+    write_event_frame,
+};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
     SessionEvent, SessionEventKind, SessionId, ToolInvocationStreamEvent,
@@ -144,8 +147,9 @@ impl SessionEventStore {
     /// Rewrite all older readable event logs in this store to the current event
     /// schema through the built-in step-by-step migration chain.
     ///
-    /// Logs with read issues or future schema versions are left untouched so the
-    /// caller can surface repair/future-version diagnostics normally.
+    /// Logs with blocking read issues or future schema versions are left untouched so the
+    /// caller can surface repair/future-version diagnostics normally. Non-blocking
+    /// decode issues are omitted from the rewritten canonical log.
     ///
     /// # Errors
     ///
@@ -165,7 +169,7 @@ impl SessionEventStore {
             }
             let session_id = crate::parse_session_file_name(&path)?;
             let report = reader::read_events(&path)?;
-            if !report.issues.is_empty()
+            if report.issues.iter().any(read_issue_blocks_access)
                 || report
                     .max_schema_version
                     .is_some_and(|version| version > CURRENT_SESSION_EVENT_SCHEMA_VERSION)
@@ -287,9 +291,9 @@ impl SessionEventStore {
     ) -> Result<SessionMigrationReport, SessionStoreError> {
         let path = self.event_path(session_id);
         let report = reader::read_events(&path)?;
-        if !report.issues.is_empty() {
+        if report.issues.iter().any(read_issue_blocks_access) {
             return Err(SessionStoreError::InvalidSessionId(format!(
-                "session {session_id} has read issues and must be repaired before event migration"
+                "session {session_id} has blocking read issues and must be repaired before event migration"
             )));
         }
         if report.min_schema_version == Some(target_schema)

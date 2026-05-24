@@ -1258,6 +1258,17 @@ impl SessionManager {
         Ok(removed.summary)
     }
 
+    /// Ensure the session's canonical event log has been migrated to the current schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist, has blocking read issues,
+    /// or cannot be migrated.
+    pub async fn ensure_session_current(&self, session_id: SessionId) -> Result<(), SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await
+    }
+
     /// Return a summary for one session.
     ///
     /// # Errors
@@ -2283,7 +2294,7 @@ fn access_status_from_index(
     )
 }
 
-fn read_issue_blocks_access(issue: &reader::SessionReadIssue) -> bool {
+pub(crate) fn read_issue_blocks_access(issue: &reader::SessionReadIssue) -> bool {
     match &issue.kind {
         reader::SessionReadIssueKind::Decode { message } => decode_issue_blocks_access(message),
         reader::SessionReadIssueKind::TruncatedLength { .. }
@@ -2512,6 +2523,9 @@ mod tests {
         {
             let mut file = std::fs::File::create(&path).expect("event log should be writable");
             for event in &events {
+                if event.sequence == 3 {
+                    append_invalid_legacy_payload(&mut file);
+                }
                 super::write_event_frame(&mut file, event).expect("event frame should write");
             }
         }
@@ -4412,6 +4426,18 @@ mod tests {
             .open(path)
             .expect("event file should open");
         write_legacy_event_payload(&mut file, event);
+    }
+
+    fn append_invalid_legacy_payload(file: &mut std::fs::File) {
+        let payload = [0xff_u8, 0x00, 0x01];
+        file.write_all(
+            &u32::try_from(payload.len())
+                .expect("payload should fit")
+                .to_le_bytes(),
+        )
+        .expect("invalid len should write");
+        file.write_all(&payload)
+            .expect("invalid payload should write");
     }
 
     fn write_legacy_event_payload(file: &mut std::fs::File, event: &SessionEvent) {
