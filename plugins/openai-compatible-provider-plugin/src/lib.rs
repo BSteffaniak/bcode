@@ -209,6 +209,47 @@ impl OpenAiCompatibleDialect {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReasoningRequestShape {
+    supports_reasoning_object: bool,
+    include_state: &'static [&'static str],
+    include_summary: &'static [&'static str],
+    fallback_effort_values: &'static [&'static str],
+    fallback_summary_values: &'static [&'static str],
+}
+
+impl OpenAiCompatibleDialect {
+    const fn reasoning_request_shape(self) -> ReasoningRequestShape {
+        match self {
+            Self::ChatCompletions => ReasoningRequestShape {
+                supports_reasoning_object: false,
+                include_state: &[],
+                include_summary: &[],
+                fallback_effort_values: &["low", "medium", "high"],
+                fallback_summary_values: &[],
+            },
+            Self::ResponsesApi => ReasoningRequestShape {
+                supports_reasoning_object: true,
+                include_state: &[],
+                include_summary: &["reasoning.summary"],
+                fallback_effort_values: &["minimal", "low", "medium", "high"],
+                fallback_summary_values: &["auto", "concise", "detailed"],
+            },
+            Self::ChatGptCodex => ReasoningRequestShape {
+                supports_reasoning_object: true,
+                include_state: &["reasoning.encrypted_content"],
+                include_summary: &["reasoning.summary"],
+                fallback_effort_values: &["minimal", "low", "medium", "high"],
+                fallback_summary_values: &["auto", "concise", "detailed"],
+            },
+        }
+    }
+}
+
+const fn default_reasoning_request_shape() -> ReasoningRequestShape {
+    OpenAiCompatibleDialect::ChatGptCodex.reasoning_request_shape()
+}
+
 #[derive(Debug, Clone)]
 struct AuthDiagnostics {
     source: String,
@@ -448,6 +489,8 @@ struct ModelResponseItem {
     id: String,
     #[serde(default)]
     created: Option<i64>,
+    #[serde(flatten)]
+    metadata: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1347,7 +1390,7 @@ fn build_responses_request(
             .uses_codex_request_shape()
             .then_some(ResponsesTextOptions { verbosity: "low" }),
         reasoning: responses_reasoning_options(request),
-        include: responses_include(settings, request),
+        include: responses_include(settings.dialect.reasoning_request_shape(), request),
         prompt_cache_key: settings
             .dialect
             .uses_codex_request_shape()
@@ -1382,13 +1425,14 @@ fn responses_reasoning_options(request: &ModelTurnRequest) -> Option<ResponsesRe
     (effort.is_some() || summary.is_some()).then_some(ResponsesReasoningOptions { effort, summary })
 }
 
-fn responses_include(settings: &Settings, request: &ModelTurnRequest) -> Vec<&'static str> {
+fn responses_include(
+    shape: ReasoningRequestShape,
+    request: &ModelTurnRequest,
+) -> Vec<&'static str> {
     let mut include = Vec::new();
-    if settings.dialect.uses_codex_request_shape() {
-        include.push("reasoning.encrypted_content");
-    }
+    include.extend_from_slice(shape.include_state);
     if request.parameters.reasoning_summary.is_some() {
-        include.push("reasoning.summary");
+        include.extend_from_slice(shape.include_summary);
     }
     include
 }
@@ -1939,6 +1983,7 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             .map(|model_id| ModelResponseItem {
                 id: model_id.clone(),
                 created: None,
+                metadata: BTreeMap::new(),
             })
             .collect(),
         default_model,
@@ -1962,6 +2007,7 @@ fn model_infos_from_items(
             ModelResponseItem {
                 id: default_model.to_string(),
                 created: None,
+                metadata: BTreeMap::new(),
             },
         );
     }
@@ -1986,31 +2032,90 @@ fn model_infos_from_items(
             ]
             .into_iter()
             .collect(),
-            reasoning: reasoning_info_for_model(&model.id),
+            reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
         })
         .collect()
 }
 
-fn reasoning_info_for_model(model_id: &str) -> Option<bcode_model::ModelReasoningInfo> {
-    let lower = model_id.to_ascii_lowercase();
+fn reasoning_info_for_model(
+    model: &ModelResponseItem,
+    shape: ReasoningRequestShape,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    let metadata_reasoning = reasoning_info_from_metadata(&model.metadata);
+    if metadata_reasoning.is_some() {
+        return metadata_reasoning;
+    }
+    let lower = model.id.to_ascii_lowercase();
     if lower.contains("gpt-5") || lower.contains("o3") || lower.contains("o4") {
         Some(bcode_model::ModelReasoningInfo {
-            effort_values: vec!["minimal", "low", "medium", "high"]
-                .into_iter()
-                .map(str::to_string)
+            effort_values: shape
+                .fallback_effort_values
+                .iter()
+                .map(|value| (*value).to_string())
                 .collect(),
-            default_effort: Some("medium".to_string()),
-            visible_summary_supported: true,
-            summary_values: vec!["auto", "concise", "detailed"]
-                .into_iter()
-                .map(str::to_string)
+            default_effort: shape
+                .fallback_effort_values
+                .contains(&"medium")
+                .then(|| "medium".to_string()),
+            visible_summary_supported: !shape.include_summary.is_empty(),
+            summary_values: shape
+                .fallback_summary_values
+                .iter()
+                .map(|value| (*value).to_string())
                 .collect(),
-            default_summary: Some("auto".to_string()),
+            default_summary: shape
+                .fallback_summary_values
+                .contains(&"auto")
+                .then(|| "auto".to_string()),
             raw_reasoning_supported: false,
         })
     } else {
         None
     }
+}
+
+fn reasoning_info_from_metadata(
+    metadata: &BTreeMap<String, serde_json::Value>,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    let reasoning = metadata.get("reasoning")?.as_object()?;
+    Some(bcode_model::ModelReasoningInfo {
+        effort_values: string_array_field(reasoning, "effort_values"),
+        default_effort: string_field(reasoning, "default_effort"),
+        visible_summary_supported: bool_field(reasoning, "visible_summary_supported"),
+        summary_values: string_array_field(reasoning, "summary_values"),
+        default_summary: string_field(reasoning, "default_summary"),
+        raw_reasoning_supported: bool_field(reasoning, "raw_reasoning_supported"),
+    })
+}
+
+fn string_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map_or_else(Vec::new, |values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+}
+
+fn string_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn bool_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_default()
 }
 
 fn select_default_model_info(models: &[ModelInfo]) -> Option<&ModelInfo> {
@@ -3278,6 +3383,7 @@ mod tests {
         ModelResponseItem {
             id: id.to_string(),
             created: Some(created),
+            metadata: BTreeMap::new(),
         }
     }
 

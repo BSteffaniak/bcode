@@ -1049,6 +1049,18 @@ pub struct ReasoningConfig {
     pub effort: Option<String>,
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub effort_values: Vec<String>,
+    #[serde(default)]
+    pub summary_values: Vec<String>,
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    #[serde(default)]
+    pub default_summary: Option<String>,
+    #[serde(default)]
+    pub visible_summary_supported: Option<bool>,
+    #[serde(default)]
+    pub raw_reasoning_supported: Option<bool>,
 }
 
 /// Prompt cache configuration.
@@ -1264,6 +1276,30 @@ fn merge_reasoning_config(base: &ReasoningConfig, overlay: &ReasoningConfig) -> 
     ReasoningConfig {
         effort: overlay.effort.clone().or_else(|| base.effort.clone()),
         summary: overlay.summary.clone().or_else(|| base.summary.clone()),
+        effort_values: if overlay.effort_values.is_empty() {
+            base.effort_values.clone()
+        } else {
+            overlay.effort_values.clone()
+        },
+        summary_values: if overlay.summary_values.is_empty() {
+            base.summary_values.clone()
+        } else {
+            overlay.summary_values.clone()
+        },
+        default_effort: overlay
+            .default_effort
+            .clone()
+            .or_else(|| base.default_effort.clone()),
+        default_summary: overlay
+            .default_summary
+            .clone()
+            .or_else(|| base.default_summary.clone()),
+        visible_summary_supported: overlay
+            .visible_summary_supported
+            .or(base.visible_summary_supported),
+        raw_reasoning_supported: overlay
+            .raw_reasoning_supported
+            .or(base.raw_reasoning_supported),
     }
 }
 
@@ -1960,6 +1996,49 @@ fn write_reasoning_inline_toml(output: &mut String, reasoning: &ReasoningConfig)
         writeln!(output, "reasoning_summary = {}", toml_string(summary))
             .expect("writing to string should not fail");
     }
+    if !reasoning.effort_values.is_empty() {
+        write_string_array(output, "reasoning_effort_values", &reasoning.effort_values);
+    }
+    if !reasoning.summary_values.is_empty() {
+        write_string_array(
+            output,
+            "reasoning_summary_values",
+            &reasoning.summary_values,
+        );
+    }
+    if let Some(default_effort) = &reasoning.default_effort {
+        writeln!(
+            output,
+            "reasoning_default_effort = {}",
+            toml_string(default_effort)
+        )
+        .expect("writing to string should not fail");
+    }
+    if let Some(default_summary) = &reasoning.default_summary {
+        writeln!(
+            output,
+            "reasoning_default_summary = {}",
+            toml_string(default_summary)
+        )
+        .expect("writing to string should not fail");
+    }
+    if let Some(supported) = reasoning.visible_summary_supported {
+        writeln!(output, "reasoning_visible_summary_supported = {supported}")
+            .expect("writing to string should not fail");
+    }
+    if let Some(supported) = reasoning.raw_reasoning_supported {
+        writeln!(output, "reasoning_raw_supported = {supported}")
+            .expect("writing to string should not fail");
+    }
+}
+
+fn write_string_array(output: &mut String, key: &str, values: &[String]) {
+    let rendered = values
+        .iter()
+        .map(|value| toml_string(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(output, "{key} = [{rendered}]").expect("writing to string should not fail");
 }
 
 fn write_model_profiles_toml(output: &mut String, profiles: &BTreeMap<String, ModelProfileConfig>) {
