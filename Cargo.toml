@@ -105,12 +105,12 @@ base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 clap = { version = "4.5.40", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 globset = { version = "0.4.18", default-features = false }
-hyperchad_color = { version = "0.3.0", default-features = false }
-hyperchad_markdown = { version = "0.3.0", default-features = false, features = [
+hyperchad_color = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
+hyperchad_markdown = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
     "xss-protection",
 ] }
-hyperchad_transformer = { version = "0.3.0", default-features = false }
-hyperchad_transformer_models = { version = "0.3.0", default-features = false }
+hyperchad_transformer = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
+hyperchad_transformer_models = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 image = { version = "0.25.10", default-features = false, features = [
     "gif",
     "jpeg",
@@ -183,15 +183,15 @@ inherits  = "dev"
 opt-level = 0
 
 # HyperChad local development patches
-[patch.crates-io]
-hyperchad_color              = { path = "../MoosicBox/packages/hyperchad/color" }
-hyperchad_markdown           = { path = "../MoosicBox/packages/hyperchad/markdown" }
-hyperchad_transformer        = { path = "../MoosicBox/packages/hyperchad/transformer" }
-hyperchad_transformer_models = { path = "../MoosicBox/packages/hyperchad/transformer/models" }
-moosicbox_assert             = { path = "../MoosicBox/packages/assert" }
-moosicbox_logging            = { path = "../MoosicBox/packages/logging" }
-switchy_env                  = { path = "../MoosicBox/packages/switchy/env" }
-switchy_time                 = { path = "../MoosicBox/packages/switchy/time" }
+# [patch.crates-io]
+# hyperchad_color              = { path = "../MoosicBox/packages/hyperchad/color" }
+# hyperchad_markdown           = { path = "../MoosicBox/packages/hyperchad/markdown" }
+# hyperchad_transformer        = { path = "../MoosicBox/packages/hyperchad/transformer" }
+# hyperchad_transformer_models = { path = "../MoosicBox/packages/hyperchad/transformer/models" }
+# moosicbox_assert             = { path = "../MoosicBox/packages/assert" }
+# moosicbox_logging            = { path = "../MoosicBox/packages/logging" }
+# switchy_env                  = { path = "../MoosicBox/packages/switchy/env" }
+# switchy_time                 = { path = "../MoosicBox/packages/switchy/time" }
 
 # BMUX local development patches
 # [patch."https://github.com/BSteffaniak/bmux.git"]
