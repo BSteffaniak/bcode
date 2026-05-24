@@ -1490,15 +1490,9 @@ fn push_labeled_text_preview(
 }
 
 fn preview_lines(lines: &[Line], max_rows: usize) -> Vec<&Line> {
-    if lines.len() <= max_rows || max_rows < 4 {
-        return lines.iter().take(max_rows).collect();
-    }
-    let head = max_rows / 2;
-    let tail = max_rows.saturating_sub(head);
     lines
         .iter()
-        .take(head)
-        .chain(lines.iter().skip(lines.len().saturating_sub(tail)))
+        .skip(lines.len().saturating_sub(max_rows))
         .collect()
 }
 

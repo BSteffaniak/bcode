@@ -778,13 +778,13 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
     assert!(output.contains("Tool result · shell.run · ok"));
     assert!(output.contains("terminal: yes"));
     assert!(output.contains("exit 0"));
-    assert!(output.contains("line 0"));
+    assert!(!output.contains("line 0"));
     assert!(output.contains("line 39"));
     assert!(output.contains("stdout rows hidden"));
     assert!(!output.contains('\u{1b}'));
     assert_eq!(
         buffer
-            .get(Point::new(4, output_line_y(&buffer, "line 0").unwrap()))
+            .get(Point::new(4, output_line_y(&buffer, "line 39").unwrap()))
             .map(|cell| cell.style.fg),
         Some(Some(bmux_tui::style::Color::Green))
     );
@@ -837,7 +837,8 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
 
     assert!(output.contains("Tool result · shell.run · ok"));
     assert!(output.contains("terminal: 80x10"));
-    assert!(output.contains("line 0"));
+    assert!(!output.contains("line 0"));
+    assert!(output.contains("line 12"));
     assert!(output.contains("line 39"));
     assert!(!output.contains('\u{1b}'));
 }
