@@ -6,7 +6,7 @@ use bmux_tui_components::text_input::TextInputOutcome;
 
 use super::helpers;
 use super::permission_dialog::PermissionDialogState;
-use super::{MOUSE_WHEEL_ROWS, TuiError, permission_flow, session_flow::ActiveChat};
+use super::{TuiError, permission_flow, session_flow::ActiveChat};
 
 /// Return the hit-region id under a mouse event.
 #[must_use]
@@ -22,21 +22,22 @@ pub async fn handle_mouse(
     chat: &mut ActiveChat,
     permission_dialog: &mut Option<PermissionDialogState>,
     mouse: MouseEvent,
+    scroll_rows: usize,
 ) -> Result<bool, TuiError> {
     match mouse.kind {
         MouseEventKind::ScrollUp => match hit_id.as_deref() {
             Some("composer") => Ok(chat.app.previous_input_history()),
             Some("diff-files" | "diff-detail") if chat.app.diff_visible() => {
-                Ok(chat.app.scroll_diff_up(MOUSE_WHEEL_ROWS))
+                Ok(chat.app.scroll_diff_up(scroll_rows))
             }
-            _ => Ok(chat.app.scroll_transcript_up(MOUSE_WHEEL_ROWS)),
+            _ => Ok(chat.app.scroll_transcript_up(scroll_rows)),
         },
         MouseEventKind::ScrollDown => match hit_id.as_deref() {
             Some("composer") => Ok(chat.app.next_input_history()),
             Some("diff-files" | "diff-detail") if chat.app.diff_visible() => {
-                Ok(chat.app.scroll_diff_down(MOUSE_WHEEL_ROWS))
+                Ok(chat.app.scroll_diff_down(scroll_rows))
             }
-            _ => Ok(chat.app.scroll_transcript_down(MOUSE_WHEEL_ROWS)),
+            _ => Ok(chat.app.scroll_transcript_down(scroll_rows)),
         },
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
             permission_flow::handle_permission_mouse(client, chat, permission_dialog, mouse).await

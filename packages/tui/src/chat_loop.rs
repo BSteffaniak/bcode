@@ -34,6 +34,7 @@ pub async fn run_with_client<W: Write>(
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
+    mouse_scroll_rows: usize,
 ) -> Result<(), TuiError> {
     let mut modals = ModalState {
         palette: None,
@@ -96,7 +97,17 @@ pub async fn run_with_client<W: Write>(
         }
 
         if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
-            if handle_event(client, keymap, chat, &mut modals, terminal, event).await? {
+            if handle_event(
+                client,
+                keymap,
+                chat,
+                &mut modals,
+                terminal,
+                event,
+                mouse_scroll_rows,
+            )
+            .await?
+            {
                 needs_redraw = true;
             }
         } else if chat.app.tick() {
@@ -114,6 +125,7 @@ async fn handle_event<W: Write>(
     modals: &mut ModalState,
     terminal: &mut Terminal<&mut W>,
     event: Event,
+    mouse_scroll_rows: usize,
 ) -> Result<bool, TuiError> {
     match event {
         Event::Resize(size) => {
@@ -154,8 +166,15 @@ async fn handle_event<W: Write>(
                 ));
             }
             let hit_id = mouse_flow::mouse_hit_id(terminal.hits(), mouse);
-            mouse_flow::handle_mouse(hit_id, client, chat, &mut modals.permission_dialog, mouse)
-                .await
+            mouse_flow::handle_mouse(
+                hit_id,
+                client,
+                chat,
+                &mut modals.permission_dialog,
+                mouse,
+                mouse_scroll_rows,
+            )
+            .await
         }
         Event::User(_) => Ok(false),
     }

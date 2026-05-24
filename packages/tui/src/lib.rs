@@ -66,7 +66,6 @@ const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const OLDER_HISTORY_EVENT_LIMIT: usize = 500;
-const MOUSE_WHEEL_ROWS: usize = 1;
 
 /// Errors returned by the TUI.
 #[derive(Debug, thiserror::Error)]

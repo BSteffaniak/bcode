@@ -810,6 +810,9 @@ pub enum TuiThinkingMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiMouseConfig {
+    /// Terminal rows to scroll for each terminal mouse-wheel event.
+    #[serde(default = "default_tui_mouse_scroll_rows")]
+    pub scroll_rows: usize,
     /// Maximum milliseconds between clicks in the same sequence.
     #[serde(default = "default_mouse_multi_click_ms")]
     pub multi_click_ms: u64,
@@ -824,15 +827,32 @@ pub struct TuiMouseConfig {
     pub triple_click_select: TuiMouseClickSelection,
 }
 
+impl TuiMouseConfig {
+    /// Return the effective terminal rows to scroll for each wheel event.
+    #[must_use]
+    pub const fn effective_scroll_rows(self) -> usize {
+        if self.scroll_rows == 0 {
+            1
+        } else {
+            self.scroll_rows
+        }
+    }
+}
+
 impl Default for TuiMouseConfig {
     fn default() -> Self {
         Self {
+            scroll_rows: default_tui_mouse_scroll_rows(),
             multi_click_ms: default_mouse_multi_click_ms(),
             multi_click_max_distance: 0,
             double_click_select: TuiMouseClickSelection::Word,
             triple_click_select: default_triple_click_select(),
         }
     }
+}
+
+const fn default_tui_mouse_scroll_rows() -> usize {
+    3
 }
 
 const fn default_mouse_multi_click_ms() -> u64 {
@@ -2103,6 +2123,7 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         write_tui_keybinding_section(output, "permission", &tui.keybindings.permission);
         write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
     }
+    write_tui_mouse_toml(output, &tui.mouse);
     writeln!(output, "[tui.thinking]").expect("writing to string should not fail");
     writeln!(output, "show = {}", tui.thinking.show).expect("writing to string should not fail");
     writeln!(
@@ -2117,6 +2138,45 @@ const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
     match mode {
         TuiThinkingMode::Summary => "summary",
         TuiThinkingMode::Raw => "raw",
+    }
+}
+
+fn write_tui_mouse_toml(output: &mut String, mouse: &TuiMouseConfig) {
+    if mouse == &TuiMouseConfig::default() {
+        return;
+    }
+    writeln!(output, "[tui.mouse]").expect("writing to string should not fail");
+    writeln!(output, "scroll_rows = {}", mouse.scroll_rows)
+        .expect("writing to string should not fail");
+    writeln!(output, "multi_click_ms = {}", mouse.multi_click_ms)
+        .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "multi_click_max_distance = {}",
+        mouse.multi_click_max_distance
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "double_click_select = {}",
+        toml_string(tui_mouse_click_selection_name(mouse.double_click_select))
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "triple_click_select = {}",
+        toml_string(tui_mouse_click_selection_name(mouse.triple_click_select))
+    )
+    .expect("writing to string should not fail");
+    output.push('\n');
+}
+
+const fn tui_mouse_click_selection_name(selection: TuiMouseClickSelection) -> &'static str {
+    match selection {
+        TuiMouseClickSelection::Disabled => "disabled",
+        TuiMouseClickSelection::Word => "word",
+        TuiMouseClickSelection::Line => "line",
+        TuiMouseClickSelection::All => "all",
     }
 }
 
@@ -2744,7 +2804,7 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 mod tests {
     use super::{
         BcodeConfig, CompactionMode, ConfigLoadOverrides, DEFAULT_AGENT_PROFILE_PLUGIN_ID,
-        DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_SHELL_PLUGIN_ID, PluginSelection,
+        DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_SHELL_PLUGIN_ID, PluginSelection, TuiMouseConfig,
         default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_agent_configs,
         upsert_agent_permission_rule,
@@ -2761,6 +2821,7 @@ mod tests {
         let config: BcodeConfig = toml::from_str(
             r#"
 [tui.mouse]
+scroll_rows = 4
 multi_click_ms = 300
 multi_click_max_distance = 1
 double_click_select = "word"
@@ -2769,6 +2830,7 @@ triple_click_select = "all"
         )
         .expect("config should parse");
 
+        assert_eq!(config.tui.mouse.scroll_rows, 4);
         assert_eq!(config.tui.mouse.multi_click_ms, 300);
         assert_eq!(config.tui.mouse.multi_click_max_distance, 1);
         assert_eq!(
@@ -2778,6 +2840,20 @@ triple_click_select = "all"
         assert_eq!(
             config.tui.mouse.triple_click_select,
             super::TuiMouseClickSelection::All
+        );
+    }
+
+    #[test]
+    fn tui_mouse_scroll_rows_defaults_and_clamps_zero() {
+        assert_eq!(TuiMouseConfig::default().scroll_rows, 3);
+        assert_eq!(TuiMouseConfig::default().effective_scroll_rows(), 3);
+        assert_eq!(
+            TuiMouseConfig {
+                scroll_rows: 0,
+                ..TuiMouseConfig::default()
+            }
+            .effective_scroll_rows(),
+            1
         );
     }
 
