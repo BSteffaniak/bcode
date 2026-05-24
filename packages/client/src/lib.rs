@@ -37,6 +37,7 @@ pub enum ClientError {
 /// History returned when attaching to a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedSessionHistory {
+    pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
 }
@@ -946,8 +947,10 @@ impl ClientConnection {
             ResponsePayload::Attached {
                 history,
                 input_history,
+                session,
                 ..
             } => Ok(AttachedSessionHistory {
+                session,
                 history,
                 input_history,
             }),
@@ -987,8 +990,10 @@ impl ClientConnection {
             ResponsePayload::Attached {
                 history,
                 input_history,
+                session,
                 ..
             } => Ok(AttachedSessionHistory {
+                session,
                 history,
                 input_history,
             }),

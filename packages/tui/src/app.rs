@@ -124,6 +124,12 @@ impl BmuxApp {
         self.session_title.as_deref()
     }
 
+    /// Apply canonical session metadata from an attach/list response.
+    pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
+        self.session_id = Some(summary.id);
+        self.session_title.clone_from(&summary.name);
+    }
+
     /// Return the currently selected provider plugin id, if explicit.
     #[must_use]
     pub fn selected_provider_plugin_id(&self) -> Option<&str> {

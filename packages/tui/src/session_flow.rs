@@ -75,6 +75,7 @@ pub async fn switch_session(
         &attached.input_history,
         attached.history.len() >= super::INITIAL_HISTORY_EVENT_LIMIT,
     );
+    chat.app.apply_session_summary(&attached.session);
     hydrate_status(client, &mut chat.app).await;
     Ok(())
 }

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionSummary,
     SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
@@ -424,6 +424,58 @@ fn status_line_includes_scroll_offset_when_scrolled() {
     render::render(&mut app, &mut frame);
 
     assert!(rendered_text(&buffer).contains("1 rows from bottom"));
+}
+
+#[test]
+fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        42,
+        SessionEventKind::AssistantMessage {
+            text: "recent response".to_owned(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], true);
+    app.apply_session_summary(&SessionSummary {
+        id: session_id,
+        name: Some("Canonical title".to_owned()),
+        client_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        working_directory: "/tmp/bcode-tui-test".into(),
+    });
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+
+    assert!(buffer.row_symbols(0).unwrap().contains("Canonical title"));
+    assert!(!buffer.row_symbols(0).unwrap().contains("Untitled session"));
+}
+
+#[test]
+fn live_session_rename_overrides_attach_summary_title() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.apply_session_summary(&SessionSummary {
+        id: session_id,
+        name: Some("Old title".to_owned()),
+        client_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        working_directory: "/tmp/bcode-tui-test".into(),
+    });
+
+    app.absorb_session_event(&event(
+        session_id,
+        7,
+        SessionEventKind::SessionRenamed {
+            name: Some("New title".to_owned()),
+        },
+    ));
+
+    assert_eq!(app.session_title(), Some("New title"));
 }
 
 #[test]

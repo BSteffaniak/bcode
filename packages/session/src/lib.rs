@@ -993,6 +993,7 @@ pub(crate) struct SessionState {
 /// Active session attachment.
 #[derive(Debug)]
 pub struct SessionAttachment {
+    pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
     pub attached_event: SessionEvent,
@@ -1515,7 +1516,9 @@ impl SessionManager {
                 self.store.as_ref(),
                 activity_timestamp_ms,
             )?;
+            let session = state.summary();
             SessionAttachment {
+                session,
                 history,
                 input_history,
                 attached_event,
@@ -1570,7 +1573,9 @@ impl SessionManager {
                 self.store.as_ref(),
                 activity_timestamp_ms,
             )?;
+            let session = state.summary();
             SessionAttachment {
+                session,
                 history,
                 input_history,
                 attached_event,
@@ -3491,6 +3496,7 @@ mod tests {
             .expect("recent attach should succeed");
 
         assert_eq!(attachment.history.len(), 1);
+        assert_eq!(attachment.session.name.as_deref(), Some("recent"));
         assert!(matches!(
             &attachment.history[0].kind,
             SessionEventKind::UserMessage { text, .. } if text == "message 3"

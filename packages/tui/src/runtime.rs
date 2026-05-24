@@ -28,12 +28,13 @@ pub async fn run_event_loop<W: Write>(
     let (attached, event_task) =
         history_flow::attach_session_event_stream(&client, session_id, event_sender.clone())
             .await?;
-    let app = BmuxApp::new_with_history(
+    let mut app = BmuxApp::new_with_history(
         Some(session_id),
         &attached.history,
         &attached.input_history,
         attached.history.len() >= INITIAL_HISTORY_EVENT_LIMIT,
     );
+    app.apply_session_summary(&attached.session);
     let mut chat = session_flow::ActiveChat {
         app,
         session_id,

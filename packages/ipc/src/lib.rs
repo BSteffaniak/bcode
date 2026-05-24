@@ -28,7 +28,7 @@ pub const MAX_FRAME_PAYLOAD_SIZE: usize = 1_048_576;
 const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 
 /// Current Bcode IPC protocol version.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -326,6 +326,7 @@ pub enum ResponsePayload {
     },
     Attached {
         session_id: SessionId,
+        session: SessionSummary,
         history: Vec<SessionEvent>,
         #[serde(default)]
         input_history: Vec<SessionInputHistoryEntry>,
@@ -765,7 +766,9 @@ fn default_socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEventKind};
+    use bcode_session_models::{
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEventKind, SessionId, SessionSummary,
+    };
 
     #[test]
     fn ipc_v1_golden_fixtures_decode_to_expected_payloads() {
@@ -840,6 +843,77 @@ mod tests {
         for (path, encoded) in cases {
             assert_eq!(encoded, fixture_bytes(path), "fixture changed: {path}");
         }
+    }
+
+    #[test]
+    fn attached_response_carries_canonical_session_summary() {
+        let session_id: SessionId = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("session id should parse");
+        let summary = SessionSummary {
+            id: session_id,
+            name: Some("Canonical title".to_owned()),
+            client_count: 1,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            working_directory: "/tmp/bcode-ipc-test".into(),
+        };
+        let response = Response::Ok(ResponsePayload::Attached {
+            session_id,
+            session: summary.clone(),
+            history: Vec::new(),
+            input_history: Vec::new(),
+        });
+
+        let encoded = encode(&response).expect("response should encode");
+        let decoded: Response = decode(&encoded).expect("response should decode");
+
+        assert_eq!(decoded, response);
+        let Response::Ok(ResponsePayload::Attached { session, .. }) = decoded else {
+            panic!("decoded response should be attached");
+        };
+        assert_eq!(session, summary);
+    }
+
+    #[test]
+    fn response_envelope_uses_current_protocol_version() {
+        let envelope = response_envelope(7, &Response::Ok(ResponsePayload::MessageSent))
+            .expect("response envelope should encode");
+
+        assert_eq!(envelope.version, ProtocolVersion::current());
+        assert_eq!(ProtocolVersion::current().0, 2);
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_version_is_rejected() {
+        let envelope = Envelope {
+            version: ProtocolVersion(1),
+            request_id: 1,
+            kind: EnvelopeKind::Response,
+            payload: encode(&Response::Ok(ResponsePayload::MessageSent))
+                .expect("response should encode"),
+        };
+        let encoded = encode(&envelope).expect("envelope should encode");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            &u32::try_from(encoded.len())
+                .expect("encoded envelope should fit u32")
+                .to_le_bytes(),
+        );
+        frame.extend_from_slice(&encoded);
+        let mut cursor = std::io::Cursor::new(frame);
+
+        let error = read_envelope_frame(&mut cursor)
+            .await
+            .expect_err("old protocol version should fail");
+
+        assert!(matches!(
+            error,
+            CodecError::UnsupportedVersion {
+                actual: 1,
+                expected: 2
+            }
+        ));
     }
 
     fn fixture_bytes(path: &str) -> Vec<u8> {
