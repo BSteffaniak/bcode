@@ -7,7 +7,7 @@ use crate::migration::{
 use crate::{SessionEventStore, SessionStoreError, current_unix_millis, reader, write_event_frame};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
-    SessionEvent, SessionEventKind, SessionId,
+    SessionEvent, SessionEventKind, SessionId, ToolInvocationStreamEvent,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -28,6 +28,7 @@ const BUILTIN_SESSION_EVENT_MIGRATIONS: &[NoOpSessionEventMigration] = &[
     NoOpSessionEventMigration::new("sessions-events-v9-to-v10", 9, 10),
     NoOpSessionEventMigration::new("sessions-events-v10-to-v11", 10, 11),
     NoOpSessionEventMigration::new("sessions-events-v11-to-v12", 11, 12),
+    NoOpSessionEventMigration::new("sessions-events-v12-to-v13", 12, 13),
 ];
 
 trait SessionEventMigrationStep {
@@ -76,6 +77,9 @@ impl SessionEventMigrationStep for NoOpSessionEventMigration {
     ) -> Result<Vec<SessionEvent>, SessionEventLogMigrationError> {
         if self.from_schema == 10 && self.to_schema == 11 {
             return Ok(migrate_v10_event_to_v11(event));
+        }
+        if self.from_schema == 12 && self.to_schema == 13 {
+            return Ok(migrate_v12_event_to_v13(event));
         }
         Ok(vec![event])
     }
@@ -322,8 +326,10 @@ impl SessionEventStore {
         let mut tmp = fs::File::create(&tmp_path)?;
         let mut migrated_count = 0_usize;
         let mut used_steps = BTreeSet::new();
+        let mut sequence_map = BTreeMap::new();
         let mut next_sequence = 0_u64;
         for event in report.events {
+            let source_sequence = event.sequence;
             let events = migrate_event_to_schema(
                 event,
                 session_id,
@@ -332,11 +338,16 @@ impl SessionEventStore {
                 &mut used_steps,
             )?;
             for mut event in events {
+                remap_event_sequence_references(&mut event, &sequence_map);
                 event.sequence = next_sequence;
+                sequence_map.insert(source_sequence, next_sequence);
                 next_sequence = next_sequence.saturating_add(1);
                 write_event_frame(&mut tmp, &event)?;
                 migrated_count = migrated_count.saturating_add(1);
             }
+            sequence_map
+                .entry(source_sequence)
+                .or_insert_with(|| next_sequence.saturating_sub(1));
         }
         tmp.flush()?;
         drop(tmp);
@@ -400,6 +411,19 @@ fn validate_event_migration_steps<'a>(
         }
     }
     Ok(steps_by_from)
+}
+
+fn remap_event_sequence_references(event: &mut SessionEvent, sequence_map: &BTreeMap<u64, u64>) {
+    if let SessionEventKind::ContextCompacted {
+        compacted_through_sequence,
+        ..
+    } = &mut event.kind
+    {
+        *compacted_through_sequence = sequence_map
+            .range(..=*compacted_through_sequence)
+            .next_back()
+            .map_or(0, |(_, sequence)| *sequence);
+    }
 }
 
 fn migrate_event_to_schema(
@@ -490,6 +514,19 @@ fn migrate_v10_event_to_v11(event: SessionEvent) -> Vec<SessionEvent> {
             vec![event, finished]
         }
         _ => vec![event],
+    }
+}
+
+fn migrate_v12_event_to_v13(event: SessionEvent) -> Vec<SessionEvent> {
+    if matches!(
+        &event.kind,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta { .. }
+        }
+    ) {
+        Vec::new()
+    } else {
+        vec![event]
     }
 }
 

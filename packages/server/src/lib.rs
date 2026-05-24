@@ -4842,30 +4842,12 @@ async fn append_tool_stream_event(
     session_id: SessionId,
     event: ToolInvocationStreamEvent,
 ) {
-    if let ToolInvocationStreamEvent::OutputDelta {
-        tool_call_id,
-        stream,
-        sequence,
-        text,
-        byte_len,
-    } = event.clone()
-    {
-        append_trace_event(
-            state,
-            session_id,
-            None,
-            SessionTracePhase::ToolInvocationOutput,
-            SessionTracePayload::ToolInvocationStreamEvent(
-                ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id,
-                    stream,
-                    sequence,
-                    text: text.clone(),
-                    byte_len,
-                },
-            ),
-        )
-        .await;
+    if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
+        let _ = state
+            .sessions
+            .publish_transient_event(session_id, SessionEventKind::ToolInvocationStream { event })
+            .await;
+        return;
     }
 
     match state

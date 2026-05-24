@@ -1715,6 +1715,30 @@ impl SessionManager {
         .await
     }
 
+    /// Publish a transient event to currently attached session subscribers without
+    /// appending it to durable history.
+    ///
+    /// Returns `None` when the session is not loaded or has no active subscribers.
+    pub async fn publish_transient_event(
+        &self,
+        session_id: SessionId,
+        kind: SessionEventKind,
+    ) -> Option<SessionEvent> {
+        let inner = self.inner.lock().await;
+        let state = inner.sessions.get(&session_id)?;
+        if state.sender.receiver_count() == 0 {
+            return None;
+        }
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: state.next_sequence,
+            session_id,
+            kind,
+        };
+        let _ = state.sender.send(event.clone());
+        Some(event)
+    }
+
     /// Append a runtime-work started event to a session.
     ///
     /// # Errors
@@ -2424,6 +2448,160 @@ mod tests {
         store
             .ensure_fresh_index(session_id)
             .expect("migrated fixture should reindex");
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[test]
+    fn migration_to_v13_drops_persisted_tool_output_deltas() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp session dir should be created");
+        let store = super::SessionEventStore::new(&root);
+        let session_id = bcode_session_models::SessionId::new();
+        let path = store.event_path(session_id);
+        let events = vec![
+            SessionEvent {
+                schema_version: 12,
+                sequence: 0,
+                session_id,
+                kind: SessionEventKind::SessionCreated {
+                    name: None,
+                    working_directory: test_working_directory(),
+                },
+            },
+            SessionEvent {
+                schema_version: 12,
+                sequence: 1,
+                session_id,
+                kind: SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::Started {
+                        tool_call_id: "tool-1".to_string(),
+                        tool_name: "shell".to_string(),
+                        terminal: false,
+                        columns: None,
+                        rows: None,
+                    },
+                },
+            },
+            SessionEvent {
+                schema_version: 12,
+                sequence: 2,
+                session_id,
+                kind: SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "tool-1".to_string(),
+                        stream: ToolOutputStream::Stdout,
+                        sequence: 1,
+                        text: "large output chunk".to_string(),
+                        byte_len: 18,
+                    },
+                },
+            },
+            SessionEvent {
+                schema_version: 12,
+                sequence: 3,
+                session_id,
+                kind: SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::Finished {
+                        tool_call_id: "tool-1".to_string(),
+                        sequence: 2,
+                        is_error: false,
+                    },
+                },
+            },
+        ];
+        {
+            let mut file = std::fs::File::create(&path).expect("event log should be writable");
+            for event in &events {
+                super::write_event_frame(&mut file, event).expect("event frame should write");
+            }
+        }
+
+        store
+            .migrate_event_log_to_current(session_id)
+            .expect("migration should succeed");
+        let migrated = store
+            .read_session_events(session_id)
+            .expect("migrated events should read");
+
+        assert_eq!(migrated.len(), 3);
+        assert!(migrated.iter().all(|event| {
+            event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION
+                && !matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationStream {
+                        event: ToolInvocationStreamEvent::OutputDelta { .. }
+                    }
+                )
+        }));
+        assert!(matches!(
+            migrated[1].kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started { .. }
+            }
+        ));
+        assert!(matches!(
+            migrated[2].kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Finished { .. }
+            }
+        ));
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn transient_tool_output_delta_is_not_persisted() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should create");
+        let session = manager
+            .create_session(Some("test".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let mut attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let stream_event = ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id: "tool-1".to_string(),
+            stream: ToolOutputStream::Stdout,
+            sequence: 1,
+            text: "live only".to_string(),
+            byte_len: 9,
+        };
+        manager
+            .publish_transient_event(
+                session.id,
+                SessionEventKind::ToolInvocationStream {
+                    event: stream_event.clone(),
+                },
+            )
+            .await
+            .expect("transient event should publish");
+        let received = loop {
+            let event = attachment
+                .events
+                .recv()
+                .await
+                .expect("subscriber should receive transient event");
+            if matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }) {
+                break event;
+            }
+        };
+        assert_eq!(
+            received.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: stream_event
+            }
+        );
+        let persisted = manager
+            .session_history(session.id)
+            .await
+            .expect("history should read");
+        assert!(!persisted.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { .. }
+            }
+        )));
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
     }
 

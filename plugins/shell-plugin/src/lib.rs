@@ -427,12 +427,13 @@ where
             break;
         }
         sequence = sequence.saturating_add(1);
-        emit_tool_output_delta(events, tool_call_id, stream, sequence, &buffer[..read]);
         let remaining = MAX_OUTPUT_BYTES.saturating_sub(bytes.len());
         if remaining == 0 {
             continue;
         }
-        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        let retained = read.min(remaining);
+        emit_tool_output_delta(events, tool_call_id, stream, sequence, &buffer[..retained]);
+        bytes.extend_from_slice(&buffer[..retained]);
     }
     Ok(limit_output_bytes(&bytes, MAX_OUTPUT_BYTES))
 }
