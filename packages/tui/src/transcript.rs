@@ -188,10 +188,13 @@ impl TranscriptItem {
     }
 }
 
-/// Project session events into transcript items.
+/// Project session events into transcript items, optionally hiding reasoning items.
 #[must_use]
-pub fn transcript_items_from_events(events: &[SessionEvent]) -> Vec<TranscriptItem> {
-    let mut projector = TranscriptProjector::default();
+pub fn transcript_items_from_events_with_reasoning(
+    events: &[SessionEvent],
+    include_reasoning: bool,
+) -> Vec<TranscriptItem> {
+    let mut projector = TranscriptProjector::new(include_reasoning);
     for event in events {
         projector.push_event(event);
     }
@@ -206,19 +209,29 @@ struct StreamedToolReplayContext {
     saw_output: bool,
 }
 
-#[derive(Debug, Clone, Default)]
 struct TranscriptProjector {
     items: Vec<TranscriptItem>,
     tool_calls: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolReplayContext>,
+    include_reasoning: bool,
 }
 
 impl TranscriptProjector {
+    const fn new(include_reasoning: bool) -> Self {
+        Self {
+            items: Vec::new(),
+            tool_calls: BTreeMap::new(),
+            streamed_tool_results: BTreeMap::new(),
+            include_reasoning,
+        }
+    }
+
     fn push_event(&mut self, event: &SessionEvent) {
         push_transcript_item_from_event(
             &mut self.items,
             &mut self.tool_calls,
             &mut self.streamed_tool_results,
+            self.include_reasoning,
             event,
         );
     }
@@ -432,6 +445,7 @@ fn push_transcript_item_from_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    include_reasoning: bool,
     event: &SessionEvent,
 ) {
     match &event.kind {
@@ -441,12 +455,14 @@ fn push_transcript_item_from_event(
         SessionEventKind::AssistantMessage { text } => {
             finish_streaming_transcript_item(items, "Assistant", text);
         }
-        SessionEventKind::AssistantReasoningDelta { text } => {
+        SessionEventKind::AssistantReasoningDelta { text } if include_reasoning => {
             push_streaming_transcript_item(items, "Reasoning", text);
         }
-        SessionEventKind::AssistantReasoningMessage { text } => {
+        SessionEventKind::AssistantReasoningMessage { text } if include_reasoning => {
             finish_streaming_transcript_item(items, "Reasoning", text);
         }
+        SessionEventKind::AssistantReasoningDelta { .. }
+        | SessionEventKind::AssistantReasoningMessage { .. } => {}
         SessionEventKind::ToolCallFinished {
             tool_call_id,
             is_error,

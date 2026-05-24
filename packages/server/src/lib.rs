@@ -4269,7 +4269,8 @@ async fn build_model_turn_request(
         &messages,
     );
     let conversation_reuse = plan_conversation_reuse(state, &projection, messages.len()).await;
-    let metadata = projection.metadata();
+    let mut metadata = projection.metadata();
+    insert_reasoning_metadata(&mut metadata, &parameters);
     Ok(ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -4283,6 +4284,20 @@ async fn build_model_turn_request(
         conversation_reuse,
         metadata,
     })
+}
+
+fn insert_reasoning_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    parameters: &ModelParameters,
+) {
+    if let Some(effort) = &parameters.reasoning_effort_value {
+        metadata.insert("reasoning_effort".to_string(), effort.clone());
+    } else if let Some(effort) = parameters.reasoning_effort {
+        metadata.insert("reasoning_effort".to_string(), format!("{effort:?}"));
+    }
+    if let Some(summary) = &parameters.reasoning_summary {
+        metadata.insert("reasoning_summary".to_string(), summary.clone());
+    }
 }
 
 async fn append_model_request_trace(

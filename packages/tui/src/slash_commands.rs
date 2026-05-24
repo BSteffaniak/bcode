@@ -77,6 +77,16 @@ async fn thinking_command(
         Some("status") | None => Ok(SlashCommandOutcome::Handled(thinking_status(&status))),
         Some("effort") if parts.len() > 2 => {
             let effort = parts[2].to_owned();
+            if let Some(message) = unsupported_reasoning_value(
+                "effort",
+                &effort,
+                status
+                    .reasoning
+                    .as_ref()
+                    .map(|reasoning| reasoning.effort_values.as_slice()),
+            ) {
+                return Ok(SlashCommandOutcome::Handled(message));
+            }
             client
                 .set_session_reasoning(session_id, Some(effort.clone()), None)
                 .await?;
@@ -86,6 +96,16 @@ async fn thinking_command(
         }
         Some("summary") if parts.len() > 2 => {
             let summary = parts[2].to_owned();
+            if let Some(message) = unsupported_reasoning_value(
+                "summary",
+                &summary,
+                status
+                    .reasoning
+                    .as_ref()
+                    .map(|reasoning| reasoning.summary_values.as_slice()),
+            ) {
+                return Ok(SlashCommandOutcome::Handled(message));
+            }
             client
                 .set_session_reasoning(session_id, None, Some(summary.clone()))
                 .await?;
@@ -105,6 +125,21 @@ async fn thinking_command(
             )))
         }
     }
+}
+
+fn unsupported_reasoning_value(
+    kind: &str,
+    value: &str,
+    supported: Option<&[String]>,
+) -> Option<String> {
+    let supported = supported?;
+    if supported.is_empty() || supported.iter().any(|candidate| candidate == value) {
+        return None;
+    }
+    Some(format!(
+        "unsupported thinking {kind} '{value}' (supported: {})",
+        list_or_default(supported)
+    ))
 }
 
 fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {

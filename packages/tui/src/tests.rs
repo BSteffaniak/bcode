@@ -18,7 +18,7 @@ use super::{
     input,
     keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
     render, slash_palette, slash_palette_render,
-    transcript::{TranscriptItemKind, transcript_items_from_events},
+    transcript::{TranscriptItemKind, transcript_items_from_events_with_reasoning},
 };
 
 #[test]
@@ -1001,7 +1001,7 @@ fn streamed_terminal_history_suppresses_final_tool_result_tail() {
     let session_id = SessionId::new();
     let events = streamed_terminal_tool_events(session_id);
 
-    let transcript = transcript_items_from_events(&events);
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
     let terminal_items = transcript
         .iter()
         .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
@@ -1078,7 +1078,7 @@ fn streamed_tool_without_output_renders_final_result() {
         ),
     ];
 
-    let transcript = transcript_items_from_events(&events);
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
     assert!(transcript.iter().any(|item| item.text() == "final result"));
 }

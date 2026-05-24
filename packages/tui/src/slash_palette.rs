@@ -30,8 +30,8 @@ pub struct VisibleSlashItem<'a> {
 
 impl SlashPalette {
     /// Create slash completion state.
-    pub async fn new(client: &BcodeClient, _session_id: Option<SessionId>, query: &str) -> Self {
-        let items = slash_items(client, query).await;
+    pub async fn new(client: &BcodeClient, session_id: Option<SessionId>, query: &str) -> Self {
+        let items = slash_items(client, session_id, query).await;
         Self { items, selected: 0 }
     }
 
@@ -136,7 +136,11 @@ impl SlashItem {
     }
 }
 
-async fn slash_items(client: &BcodeClient, query: &str) -> Vec<SlashItem> {
+async fn slash_items(
+    client: &BcodeClient,
+    session_id: Option<SessionId>,
+    query: &str,
+) -> Vec<SlashItem> {
     let trimmed = query.trim_start_matches('/');
     let parts = trimmed.split_whitespace().collect::<Vec<_>>();
     let candidates = if parts.first() == Some(&"agent")
@@ -183,12 +187,38 @@ async fn slash_items(client: &BcodeClient, query: &str) -> Vec<SlashItem> {
                 )
             })
             .collect()
+    } else if matches!(parts.first(), Some(&"thinking"))
+        && matches!(parts.get(1), Some(&"effort" | &"summary"))
+        && let Some(session_id) = session_id
+        && let Ok(status) = client.session_model_status(session_id).await
+    {
+        thinking_items(parts[1], status.reasoning.as_ref())
     } else {
         static_items()
     };
     filter_items(candidates, trimmed)
         .into_iter()
         .take(MAX_SLASH_COMPLETIONS)
+        .collect()
+}
+
+fn thinking_items(
+    subcommand: &str,
+    reasoning: Option<&bcode_model::ModelReasoningInfo>,
+) -> Vec<SlashItem> {
+    let values = match subcommand {
+        "effort" => reasoning.map_or(&[][..], |reasoning| reasoning.effort_values.as_slice()),
+        "summary" => reasoning.map_or(&[][..], |reasoning| reasoning.summary_values.as_slice()),
+        _ => &[],
+    };
+    values
+        .iter()
+        .map(|value| {
+            item(
+                format!("/thinking {subcommand} {value}"),
+                "model-supported value",
+            )
+        })
         .collect()
 }
 

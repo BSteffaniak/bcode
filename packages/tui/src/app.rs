@@ -29,7 +29,7 @@ use super::transcript::{
     TranscriptItem, finish_streaming_transcript_item, merge_transcript_boundary, model_usage_item,
     permission_request_item, permission_result_item, push_streaming_transcript_item,
     streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
-    tool_result_item, transcript_items_from_events,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_layout::TranscriptLayoutCache;
 use super::transcript_viewport::TranscriptViewport;
@@ -612,7 +612,8 @@ impl BmuxApp {
         });
         self.input_history.prepend_committed(input_messages);
 
-        let mut older = transcript_items_from_events(events);
+        let mut older =
+            transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
         merge_transcript_boundary(&mut older, &mut self.transcript);
         older.append(&mut self.transcript);
         self.transcript = older;
@@ -717,10 +718,14 @@ impl BmuxApp {
             } => self.push_skill_error(skill_id, error),
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.add_streaming_delta(text);
-                self.push_streaming_item("Reasoning", text);
+                if self.reasoning_visible() {
+                    self.push_streaming_item("Reasoning", text);
+                }
             }
             SessionEventKind::AssistantReasoningMessage { text } => {
-                self.finish_streaming_item("Reasoning", text);
+                if self.reasoning_visible() {
+                    self.finish_streaming_item("Reasoning", text);
+                }
             }
             SessionEventKind::SessionCreated { name, .. } => self.session_title.clone_from(name),
             SessionEventKind::AgentChanged { agent_id } => {
