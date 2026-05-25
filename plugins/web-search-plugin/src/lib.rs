@@ -69,6 +69,7 @@ impl WebSearchPlugin {
             "web.search" => self.invoke_search(&context.config, &invocation),
             "web.fetch" => self.invoke_fetch(&context.config, &invocation),
             "web.status" => invoke_status(&context.config),
+            "web.inspect" => invoke_inspect(&invocation),
             _ => ToolInvocationResponse {
                 output: format!("unsupported web tool: {}", invocation.name),
                 is_error: true,
@@ -134,6 +135,17 @@ fn invoke_status(config: &bcode_plugin_sdk::PluginConfigContext) -> ToolInvocati
         Err(error) => return tool_error(error.to_string()),
     };
     json_tool_response(&status_response(&plugin_config))
+}
+
+fn invoke_inspect(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
+    let request = match serde_json::from_value::<InspectRequest>(invocation.arguments.clone()) {
+        Ok(request) => request,
+        Err(error) => return tool_error(error.to_string()),
+    };
+    match inspect_url(&request.url) {
+        Ok(response) => json_tool_response(&response),
+        Err(error) => tool_error(error.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -312,6 +324,15 @@ struct WebStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct InspectResponse {
+    url: String,
+    kind: String,
+    recommended_tool: Option<String>,
+    recommended_action: String,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SearchStatus {
     available: bool,
     provider: Option<String>,
@@ -327,6 +348,11 @@ struct FetchStatus {
     rendered_fetch: bool,
     max_bytes: usize,
 }
+#[derive(Debug, Clone, Deserialize)]
+struct InspectRequest {
+    url: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct BraveSearchResponse {
     #[serde(default)]
@@ -969,6 +995,7 @@ fn list_tools(
     }
     tools.push(fetch_tool_definition());
     tools.push(status_tool_definition());
+    tools.push(inspect_tool_definition());
     json_response(&ToolList { tools })
 }
 
@@ -1027,6 +1054,91 @@ fn status_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
     }
+}
+
+fn inspect_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "web.inspect".to_string(),
+        description: "Classify a URL and recommend the most agent-appropriate Bcode tool/action before fetching.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": { "type": "string" }
+            }
+        }),
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
+    }
+}
+
+fn inspect_url(url: &str) -> Result<InspectResponse, WebError> {
+    validate_url(url)?;
+    let lower = url.to_ascii_lowercase();
+    let (kind, recommended_tool, recommended_action, notes) = if is_github_repo_url(&lower) {
+        (
+            "github_repo",
+            Some("github.clone".to_string()),
+            "Use github.clone when available so the agent can inspect real repository files instead of rendered GitHub HTML.".to_string(),
+            vec!["GitHub repository pages are poor fetch targets for code understanding.".to_string()],
+        )
+    } else if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+    {
+        (
+            "pdf",
+            Some("document.extract".to_string()),
+            "Use document.extract when available; web.fetch can only return raw or fallback text for PDFs.".to_string(),
+            vec!["PDF extraction should preserve page text and metadata.".to_string()],
+        )
+    } else if is_youtube_url(&lower) {
+        (
+            "youtube_video",
+            Some("media.transcript".to_string()),
+            "Use media.transcript when available before attempting video analysis.".to_string(),
+            vec![
+                "Transcripts are cheaper and more agent-friendly than visual analysis.".to_string(),
+            ],
+        )
+    } else {
+        (
+            "web_page",
+            Some("web.fetch".to_string()),
+            "Use web.fetch for a bounded Markdown-oriented page read.".to_string(),
+            Vec::new(),
+        )
+    };
+    Ok(InspectResponse {
+        url: url.to_string(),
+        kind: kind.to_string(),
+        recommended_tool,
+        recommended_action,
+        notes,
+    })
+}
+
+fn is_github_repo_url(lower_url: &str) -> bool {
+    if !(lower_url.starts_with("https://github.com/")
+        || lower_url.starts_with("http://github.com/"))
+    {
+        return false;
+    }
+    let path = lower_url
+        .trim_start_matches("https://github.com/")
+        .trim_start_matches("http://github.com/");
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let Some(_owner) = segments.next() else {
+        return false;
+    };
+    let Some(repo) = segments.next() else {
+        return false;
+    };
+    !matches!(repo, "features" | "topics" | "trending" | "marketplace")
+}
+
+fn is_youtube_url(lower_url: &str) -> bool {
+    lower_url.contains("youtube.com/watch") || lower_url.contains("youtu.be/")
 }
 
 fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
@@ -1606,6 +1718,24 @@ mod tests {
         assert_eq!(
             jina_reader_url("https://example.com/docs"),
             "https://r.jina.ai/http://r.jina.ai/http://https://example.com/docs"
+        );
+    }
+
+    #[test]
+    fn inspect_recommends_specialized_tools_for_developer_resources() {
+        let github = inspect_url("https://github.com/bmorphism/bcode").expect("github url");
+        assert_eq!(github.kind, "github_repo");
+        assert_eq!(github.recommended_tool.as_deref(), Some("github.clone"));
+
+        let pdf = inspect_url("https://example.com/paper.pdf").expect("pdf url");
+        assert_eq!(pdf.kind, "pdf");
+        assert_eq!(pdf.recommended_tool.as_deref(), Some("document.extract"));
+
+        let youtube = inspect_url("https://youtu.be/example").expect("youtube url");
+        assert_eq!(youtube.kind, "youtube_video");
+        assert_eq!(
+            youtube.recommended_tool.as_deref(),
+            Some("media.transcript")
         );
     }
 }

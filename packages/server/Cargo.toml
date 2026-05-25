@@ -19,6 +19,7 @@ bcode_config = { workspace = true }
 bcode_default_agents_plugin = { workspace = true, optional = true }
 bcode_fake_provider_plugin = { workspace = true, optional = true }
 bcode_filesystem_plugin = { workspace = true, optional = true }
+bcode_github_plugin = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
 bcode_model = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
@@ -70,6 +71,11 @@ static-bundled-filesystem-plugin = [
     "dep:bcode_filesystem_plugin",
     "bcode_filesystem_plugin/static-bundled",
 ]
+static-bundled-github-plugin = [
+    "_static-bundled",
+    "dep:bcode_github_plugin",
+    "bcode_github_plugin/static-bundled",
+]
 static-bundled-openai-compatible-provider-plugin = [
     "_static-bundled",
     "dep:bcode_openai_compatible_provider_plugin",
@@ -81,6 +87,7 @@ static-bundled-plugins = [
     "static-bundled-default-agents-plugin",
     "static-bundled-fake-provider-plugin",
     "static-bundled-filesystem-plugin",
+    "static-bundled-github-plugin",
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-web-search-plugin",

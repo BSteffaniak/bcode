@@ -52,6 +52,9 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("filesystem.edit".to_string(), true),
                 ("web.search".to_string(), true),
                 ("web.fetch".to_string(), true),
+                ("web.status".to_string(), true),
+                ("web.inspect".to_string(), true),
+                ("github.clone".to_string(), true),
             ]),
             permission: PermissionConfig {
                 bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
@@ -75,6 +78,9 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("filesystem.edit".to_string(), false),
                 ("web.search".to_string(), true),
                 ("web.fetch".to_string(), true),
+                ("web.status".to_string(), true),
+                ("web.inspect".to_string(), true),
+                ("github.clone".to_string(), true),
             ]),
             permission: PermissionConfig {
                 bash: BTreeMap::from([
@@ -128,6 +134,8 @@ pub fn active_tools_for(config: &AgentConfig) -> Vec<String> {
         "filesystem.stat".to_string(),
         "web.search".to_string(),
         "web.fetch".to_string(),
+        "web.status".to_string(),
+        "web.inspect".to_string(),
     ]);
     for (tool, enabled) in &config.tools {
         if *enabled {
@@ -195,7 +203,9 @@ fn evaluate_after_path(
         }
         "filesystem.write" => evaluate_filesystem_path(config, request, &config.permission.write),
         "filesystem.edit" => evaluate_filesystem_path(config, request, &config.permission.edit),
-        "web.search" => evaluation(AgentDecision::Allow, String::new(), None, None),
+        "web.search" | "web.status" | "web.inspect" => {
+            evaluation(AgentDecision::Allow, String::new(), None, None)
+        }
         "web.fetch" => evaluate_web_url(config, request),
         _ => evaluate_side_effect_fallback(config, request),
     }

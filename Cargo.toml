@@ -2,6 +2,7 @@
 members = [
     "examples/hello-plugin",
     "plugins/filesystem-plugin",
+    "plugins/github-plugin",
     "plugins/bedrock-provider-plugin",
     "plugins/default-agents-plugin",
     "plugins/fake-provider-plugin",
@@ -56,6 +57,7 @@ bcode_config                            = { version = "0.0.1-alpha.0", default-f
 bcode_default_agents_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/default-agents-plugin" }
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
 bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }
+bcode_github_plugin                     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/github-plugin" }
 bcode_ipc                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
 bcode_model                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }
