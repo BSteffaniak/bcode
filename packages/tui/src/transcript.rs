@@ -53,6 +53,10 @@ pub enum TranscriptItemKind {
         columns: u16,
         /// Terminal rows used by the producer.
         rows: u16,
+        /// Process exit code once known.
+        exit_code: Option<i32>,
+        /// Whether execution timed out once known.
+        timed_out: Option<bool>,
         /// Whether the terminal command failed once finished.
         is_error: bool,
     },
@@ -162,6 +166,27 @@ impl TranscriptItem {
             }
             _ => {}
         }
+    }
+
+    /// Mark a terminal output item as finished with final process metadata.
+    pub const fn finish_terminal(
+        &mut self,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        is_error: bool,
+    ) {
+        if let TranscriptItemKind::TerminalOutput {
+            exit_code: terminal_exit_code,
+            timed_out: terminal_timed_out,
+            is_error: terminal_error,
+            ..
+        } = &mut self.kind
+        {
+            *terminal_exit_code = exit_code;
+            *terminal_timed_out = Some(timed_out);
+            *terminal_error = is_error;
+        }
+        self.streaming = false;
     }
 
     /// Mark a terminal output item as failed or successful.
@@ -312,6 +337,8 @@ pub fn streaming_terminal_output_item(
             output: text.to_owned(),
             columns,
             rows,
+            exit_code: None,
+            timed_out: None,
             is_error: false,
         },
     )
@@ -477,21 +504,27 @@ fn push_transcript_item_from_event(
         | SessionEventKind::AssistantReasoningMessage { .. } => {}
         SessionEventKind::ToolCallFinished {
             tool_call_id,
+            result,
             is_error,
             ..
         } => {
-            let should_render_final =
-                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id) {
-                    if let Some(index) = replay.index
-                        && let Some(item) = items.get_mut(index)
-                    {
+            let should_render_final = if let Some(replay) =
+                streamed_tool_results.get_mut(tool_call_id)
+            {
+                if let Some(index) = replay.index
+                    && let Some(item) = items.get_mut(index)
+                {
+                    if let Some((exit_code, timed_out)) = terminal_shell_result_metadata(result) {
+                        item.finish_terminal(exit_code, timed_out, *is_error);
+                    } else {
                         item.set_terminal_error(*is_error);
                         item.finish_streaming();
                     }
-                    !replay.saw_output
-                } else {
-                    true
-                };
+                }
+                !replay.saw_output
+            } else {
+                true
+            };
             if should_render_final
                 && let Some(item) = non_streaming_transcript_item_from_event(
                     event,
@@ -655,6 +688,19 @@ fn non_streaming_transcript_item_from_event(
     }
 }
 
+fn terminal_shell_result_metadata(result: &str) -> Option<(Option<i32>, bool)> {
+    let value = serde_json::from_str::<serde_json::Value>(result).ok()?;
+    if value.get("mode")?.as_str()? != "terminal" {
+        return None;
+    }
+    let exit_code = value
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok());
+    let timed_out = value.get("timed_out")?.as_bool()?;
+    Some((exit_code, timed_out))
+}
+
 fn apply_tool_invocation_stream_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
@@ -727,7 +773,6 @@ fn apply_tool_invocation_stream_event(
                 && let Some(item) = items.get_mut(index)
             {
                 item.set_terminal_error(*is_error);
-                item.finish_streaming();
             }
         }
         _ => {}

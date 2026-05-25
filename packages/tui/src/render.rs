@@ -583,6 +583,8 @@ fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptIte
         output,
         columns,
         rows: terminal_rows,
+        exit_code,
+        timed_out,
         is_error,
     } = item.kind()
     else {
@@ -596,6 +598,8 @@ fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptIte
             output,
             columns: *columns,
             rows: *terminal_rows,
+            exit_code: *exit_code,
+            timed_out: *timed_out,
             is_error: *is_error,
             streaming: item.streaming(),
         },
@@ -610,6 +614,8 @@ struct TerminalToolRenderContext<'a> {
     output: &'a str,
     columns: u16,
     rows: u16,
+    exit_code: Option<i32>,
+    timed_out: Option<bool>,
     is_error: bool,
     streaming: bool,
 }
@@ -647,8 +653,8 @@ fn push_terminal_tool_result_rows(
     push_terminal_output_rows(
         rows,
         &TerminalOutputTranscript {
-            exit_code: if context.is_error { Some(1) } else { Some(0) },
-            timed_out: false,
+            exit_code: context.exit_code,
+            timed_out: context.timed_out,
             output: context.output.to_owned(),
             output_truncated: false,
             output_bytes: None,
@@ -1523,7 +1529,7 @@ fn push_shell_result_rows(rows: &mut Vec<Line>, shell: &ShellResultPresentation,
             rows,
             &TerminalOutputTranscript {
                 exit_code: *exit_code,
-                timed_out: *timed_out,
+                timed_out: Some(*timed_out),
                 output: output.clone(),
                 output_truncated: *output_truncated,
                 output_bytes: *output_bytes,
@@ -1579,7 +1585,7 @@ fn push_shell_output_rows(rows: &mut Vec<Line>, output: &CaptureShellOutput, wid
 
 struct TerminalOutputTranscript {
     exit_code: Option<i32>,
-    timed_out: bool,
+    timed_out: Option<bool>,
     output: String,
     output_truncated: bool,
     output_bytes: Option<u64>,
@@ -1745,18 +1751,23 @@ const fn ansi_indexed_color(index: u8) -> Color {
 }
 
 fn terminal_status(output: &TerminalOutputTranscript) -> String {
+    let Some(timed_out) = output.timed_out else {
+        return "running · terminal".to_owned();
+    };
     let exit_code = output
         .exit_code
         .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-    format!(
-        "exit code {exit_code} · terminal · timed out {}",
-        output.timed_out
-    )
+    format!("exit code {exit_code} · terminal · timed out {timed_out}")
 }
 
 fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {
-    if output.timed_out || output.exit_code.is_some_and(|code| code != 0) {
+    if output
+        .timed_out
+        .is_some_and(|timed_out| timed_out || output.exit_code.is_some_and(|code| code != 0))
+    {
         Style::new().fg(Color::Red)
+    } else if output.timed_out.is_none() {
+        Style::new().fg(Color::Cyan)
     } else {
         Style::new().fg(Color::Green)
     }

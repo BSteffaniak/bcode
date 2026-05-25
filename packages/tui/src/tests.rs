@@ -1003,6 +1003,56 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
 }
 
 #[test]
+fn streamed_terminal_output_renders_running_until_final_result() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-running".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: "{}".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-running".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-running".to_owned(),
+                stream: ToolOutputStream::Pty,
+                sequence: 1,
+                text: "still running\n".to_owned(),
+                byte_len: "still running\n".len(),
+            },
+        },
+    ));
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("running · terminal"));
+    assert!(!output.contains("exit code 0 · terminal · timed out false"));
+}
+
+#[test]
 fn scroll_up_requests_older_history_only_after_top() {
     let session_id = SessionId::new();
     let history = (10..60)
@@ -1100,15 +1150,24 @@ fn streamed_terminal_history_suppresses_final_tool_result_tail() {
         .iter()
         .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
         .collect::<Vec<_>>();
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("final duplicate tail"))
-    );
+    assert!(!transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("final duplicate tail")
+    }));
 
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live output\n");
     assert!(!terminal_items[0].streaming());
+    let TranscriptItemKind::TerminalOutput {
+        exit_code,
+        timed_out,
+        ..
+    } = terminal_items[0].kind()
+    else {
+        panic!("expected terminal output");
+    };
+    assert_eq!(*exit_code, Some(7));
+    assert_eq!(*timed_out, Some(true));
 }
 
 #[test]
@@ -1124,15 +1183,24 @@ fn streamed_terminal_live_suppresses_final_tool_result_tail() {
         .iter()
         .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
         .collect::<Vec<_>>();
-    assert!(
-        !app.transcript()
-            .iter()
-            .any(|item| item.text().contains("final duplicate tail"))
-    );
+    assert!(!app.transcript().iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("final duplicate tail")
+    }));
 
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live output\n");
     assert!(!terminal_items[0].streaming());
+    let TranscriptItemKind::TerminalOutput {
+        exit_code,
+        timed_out,
+        ..
+    } = terminal_items[0].kind()
+    else {
+        panic!("expected terminal output");
+    };
+    assert_eq!(*exit_code, Some(7));
+    assert_eq!(*timed_out, Some(true));
 }
 
 #[test]
@@ -1231,7 +1299,16 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
             5,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-stream".to_owned(),
-                result: "final duplicate tail".to_owned(),
+                result: serde_json::json!({
+                    "mode": "terminal",
+                    "exit_code": 7,
+                    "timed_out": true,
+                    "output": "final duplicate tail",
+                    "output_truncated": false,
+                    "columns": 120,
+                    "rows": 40,
+                })
+                .to_string(),
                 is_error: false,
                 output: None,
             },

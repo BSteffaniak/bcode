@@ -26,6 +26,9 @@ use super::input_history::{InputHistory, InputHistoryOutcome};
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
+use super::tool_present::{
+    ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
+};
 use super::transcript::{
     TranscriptItem, TranscriptItemKind, finish_streaming_transcript_item,
     merge_transcript_boundary, model_usage_item, permission_request_item, permission_result_item,
@@ -951,15 +954,29 @@ impl BmuxApp {
         Some(status)
     }
 
-    fn finish_live_tool_output(&mut self, tool_call_id: &str, is_error: Option<bool>) -> bool {
+    fn finish_live_tool_output(
+        &mut self,
+        tool_call_id: &str,
+        is_error: Option<bool>,
+        result: Option<&str>,
+    ) -> bool {
         if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id) {
             if let Some(index) = context.index
                 && let Some(item) = self.transcript.get_mut(index)
             {
-                if let Some(is_error) = is_error {
-                    item.set_terminal_error(is_error);
+                if let Some(ShellResultPresentation::Terminal {
+                    exit_code,
+                    timed_out,
+                    ..
+                }) = result.and_then(terminal_shell_presentation)
+                {
+                    item.finish_terminal(exit_code, timed_out, is_error.unwrap_or(false));
+                } else {
+                    if let Some(is_error) = is_error {
+                        item.set_terminal_error(is_error);
+                    }
+                    item.finish_streaming();
                 }
-                item.finish_streaming();
             }
             return context.saw_output;
         }
@@ -967,7 +984,7 @@ impl BmuxApp {
     }
 
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
-        if self.finish_live_tool_output(tool_call_id, Some(is_error)) {
+        if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result)) {
             if is_error {
                 "failed".clone_into(&mut self.status);
             } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
@@ -1037,7 +1054,12 @@ impl BmuxApp {
                 is_error,
                 ..
             } => {
-                self.finish_live_tool_output(tool_call_id, Some(*is_error));
+                if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id)
+                    && let Some(index) = context.index
+                    && let Some(item) = self.transcript.get_mut(index)
+                {
+                    item.set_terminal_error(*is_error);
+                }
                 self.finish_tool_request_preview(tool_call_id);
                 if *is_error {
                     "failed".clone_into(&mut self.status);
@@ -1577,6 +1599,15 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     let numerator = u64::from(input_tokens).saturating_mul(100);
     let denominator = u64::from(context_window).max(1);
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
+}
+
+fn terminal_shell_presentation(result: &str) -> Option<ShellResultPresentation> {
+    match tool_result_presentation(Some("shell.run"), result)? {
+        ToolResultPresentation::Shell(shell @ ShellResultPresentation::Terminal { .. }) => {
+            Some(shell)
+        }
+        _ => None,
+    }
 }
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
