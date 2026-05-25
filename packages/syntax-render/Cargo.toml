@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "rendering", "text-processing"]
+description = "Syntax-highlighted terminal line rendering for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "syntax", "tui"]
+license     = { workspace = true }
+name        = "bcode_syntax_render"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_tui = { workspace = true }
+syntect  = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

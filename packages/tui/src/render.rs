@@ -8,8 +8,8 @@ use bmux_terminal_grid::{
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::diff::{
-    DiffFileList, DiffFileListState, DiffLine, DiffLineKind, DiffView, DiffViewMode, DiffViewState,
-    DiffViewStyles,
+    DiffFileList, DiffFileListState, DiffInlineSpan, DiffLine, DiffLineKind, DiffView,
+    DiffViewMode, DiffViewState, DiffViewStyles,
 };
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
@@ -1085,16 +1085,50 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
         .saturating_sub(2)
         .saturating_sub(5)
         .saturating_sub(3);
-    Line::from_spans(vec![
+    let mut spans = vec![
         Span::styled("  ", gutter_style),
         Span::styled(sign, sign_style.add_modifier(Modifier::BOLD)),
         Span::styled(format!("{line_number:>4}"), gutter_style),
         Span::styled(" │ ", gutter_style),
-        Span::styled(
+    ];
+    spans.extend(truncated_inline_diff_content_spans(
+        line, body_width, body_style,
+    ));
+    Line::from_spans(spans)
+}
+
+fn truncated_inline_diff_content_spans(
+    line: &DiffLine,
+    body_width: usize,
+    body_style: Style,
+) -> Vec<Span> {
+    if line.inline_spans.is_empty() {
+        return vec![Span::styled(
             truncate_to_display_width(&line.content, body_width),
             body_style,
-        ),
-    ])
+        )];
+    }
+
+    let mut remaining = body_width;
+    let mut spans = Vec::new();
+    for span in &line.inline_spans {
+        if remaining == 0 {
+            break;
+        }
+        let content = truncate_to_display_width(&span.content, remaining);
+        remaining = remaining.saturating_sub(text_display_width(&content));
+        spans.push(Span::styled(
+            content,
+            inline_diff_content_style(body_style, span),
+        ));
+    }
+    spans
+}
+
+const fn inline_diff_content_style(body_style: Style, span: &DiffInlineSpan) -> Style {
+    let mut style = span.style;
+    style.bg = body_style.bg;
+    style
 }
 
 const fn inline_diff_line_styles(kind: DiffLineKind) -> (&'static str, Style, Style) {
@@ -1152,8 +1186,8 @@ const fn diff_view_styles() -> DiffViewStyles {
         file_header: Style::new().fg(Color::BrightBlack),
         hunk_header: Style::new().fg(Color::BrightCyan),
         context: Style::new(),
-        added: Style::new().fg(Color::BrightGreen),
-        removed: Style::new().fg(Color::BrightRed),
+        added: Style::new().bg(Color::Indexed(22)),
+        removed: Style::new().bg(Color::Indexed(52)),
         gutter: Style::new().fg(Color::BrightBlack),
     }
 }

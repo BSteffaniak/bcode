@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_syntax_render          = { workspace = true }
 bmux_tui                     = { workspace = true }
 hyperchad_color              = { workspace = true }
 hyperchad_markdown           = { workspace = true, features = ["syntax-highlighting"] }

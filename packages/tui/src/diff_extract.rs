@@ -1,6 +1,7 @@
 //! Diff summary extraction for TUI transcript/tool state.
 
-use bmux_tui::diff::{DiffFileSummary, DiffLine, DiffLineKind};
+use bcode_syntax_render::SyntaxHighlighter;
+use bmux_tui::diff::{DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind};
 
 const DIFF_CONTEXT_LINES: usize = 3;
 const MAX_LCS_CELLS: usize = 40_000;
@@ -78,6 +79,7 @@ fn diff_lines_from_text(path: &str, old_text: &str, new_text: &str) -> Vec<DiffL
     let mut lines = file_headers(path);
     if old_lines == new_lines {
         push_unchanged_preview(&mut lines, &old_lines);
+        apply_syntax_highlighting(path, &mut lines);
         return lines;
     }
 
@@ -115,6 +117,7 @@ fn diff_lines_from_text(path: &str, old_text: &str, new_text: &str) -> Vec<DiffL
         old_context_end,
         new_context_end,
     );
+    apply_syntax_highlighting(path, &mut lines);
     lines
 }
 
@@ -140,6 +143,25 @@ fn push_unchanged_preview(lines: &mut Vec<DiffLine>, old_lines: &[&str]) {
             Some(line_number),
             (*line).to_owned(),
         ));
+    }
+}
+
+fn apply_syntax_highlighting(path: &str, lines: &mut [DiffLine]) {
+    let highlighter = SyntaxHighlighter::new();
+    if !highlighter.can_highlight(path) {
+        return;
+    }
+    for line in lines.iter_mut().filter(|line| {
+        matches!(
+            line.kind,
+            DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
+        )
+    }) {
+        line.inline_spans = highlighter
+            .highlight_line(path, &line.content)
+            .into_iter()
+            .map(|span| DiffInlineSpan::new(span.content, span.style))
+            .collect();
     }
 }
 
@@ -362,4 +384,61 @@ fn count_changed_diff_lines(lines: &[DiffLine]) -> (u32, u32) {
 
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{diff_from_tool_request, file_edit_from_tool_request};
+    use bmux_tui::diff::DiffLineKind;
+
+    #[test]
+    fn file_edit_diff_lines_include_syntax_spans_for_source_content() {
+        let edit = file_edit_from_tool_request(
+            "filesystem.edit",
+            &serde_json::json!({
+                "path": "src/lib.rs",
+                "old_text": "fn answer() -> i32 {\n    41\n}\n",
+                "new_text": "fn answer() -> i32 {\n    42\n}\n",
+            })
+            .to_string(),
+        )
+        .expect("edit should parse");
+
+        let lines = edit.diff_lines();
+
+        assert!(lines.iter().any(|line| {
+            matches!(line.kind, DiffLineKind::Added | DiffLineKind::Removed)
+                && !line.inline_spans.is_empty()
+        }));
+        assert!(
+            lines
+                .iter()
+                .filter(|line| matches!(
+                    line.kind,
+                    DiffLineKind::FileHeader | DiffLineKind::HunkHeader
+                ))
+                .all(|line| line.inline_spans.is_empty())
+        );
+    }
+
+    #[test]
+    fn diff_summary_keeps_change_counts_when_highlighted() {
+        let (summary, lines) = diff_from_tool_request(
+            "filesystem.write",
+            &serde_json::json!({
+                "path": "src/main.rs",
+                "contents": "fn main() {}\n",
+            })
+            .to_string(),
+        )
+        .expect("diff should parse");
+
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.removed, 0);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.kind == DiffLineKind::Added && !line.inline_spans.is_empty())
+        );
+    }
 }

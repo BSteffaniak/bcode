@@ -20,6 +20,7 @@ bcode_markdown_render = { workspace = true }
 bcode_model           = { workspace = true }
 bcode_session_models  = { workspace = true }
 bcode_skill_models    = { workspace = true }
+bcode_syntax_render   = { workspace = true }
 bmux_keyboard         = { workspace = true }
 bmux_terminal_grid    = { workspace = true }
 bmux_text_edit        = { workspace = true }

@@ -8,6 +8,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use hyperchad_color::Color as HyperChadColor;
 use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
@@ -147,7 +148,7 @@ fn hyperchad_markdown_options() -> MarkdownOptions {
         enable_smart_punctuation: true,
         emoji_enabled: false,
         xss_protection: true,
-        syntax_highlighting: true,
+        syntax_highlighting: false,
         link_resolver: None,
     }
 }
@@ -402,6 +403,9 @@ impl TerminalMarkdownRenderer {
         );
         nested.flush_line();
         let mut code_rows = nested.finish();
+        if let Some(language) = language {
+            apply_code_block_syntax_highlighting(language, &mut code_rows, self.theme);
+        }
         if code_rows.is_empty() {
             code_rows.push(Line::default());
         }
@@ -701,6 +705,29 @@ fn table_content_line(row: &[Vec<Span>], widths: &[usize], border_style: Style) 
     Line::from_spans(spans)
 }
 
+fn apply_code_block_syntax_highlighting(
+    language: &str,
+    code_rows: &mut [Line],
+    theme: MarkdownTheme,
+) {
+    let highlighter = SyntaxHighlighter::new();
+    if !highlighter.can_highlight(language) {
+        return;
+    }
+    for row in code_rows {
+        let text = row
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        row.spans = highlighter
+            .highlight_line(language, &text)
+            .into_iter()
+            .map(|span| Span::styled(span.content, theme.code_block_text.patch(span.style)))
+            .collect();
+    }
+}
+
 const fn is_block_container(container: &Container) -> bool {
     matches!(
         container.element,
@@ -849,6 +876,18 @@ mod tests {
         assert!(output.contains("╭─ rust"));
         assert!(output.contains("│ fn main() {}"));
         assert!(output.contains("╰─"));
+    }
+
+    #[test]
+    fn renders_code_block_with_generic_syntax_highlighting() {
+        let rows =
+            render_markdown_lines("```rust\nfn main() {}\n```", MarkdownRenderOptions::new(80));
+
+        assert!(
+            rows.iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| { !span.content.trim().is_empty() && span.style.fg.is_some() })
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ members = [
     "packages/model",
     "packages/model-provider-runtime",
     "packages/markdown-render",
+    "packages/syntax-render",
     "packages/plugin",
     "packages/plugin-sdk",
     "packages/provider-auth",
@@ -68,6 +69,7 @@ bcode_session_models                    = { version = "0.0.1-alpha.0", default-f
 bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin" }
 bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
 bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
+bcode_syntax_render                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/syntax-render" }
 bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
@@ -136,6 +138,12 @@ serde_json = { version = "1.0.149", default-features = false, features = [
 ] }
 sha2 = { version = "0.10.9", default-features = false }
 sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", rev = "87973bb7681c68cb9c787931b0ab402468adb517", default-features = false }
+syntect = { version = "5.3.0", default-features = false, features = [
+    "default-syntaxes",
+    "default-themes",
+    "parsing",
+    "regex-onig",
+] }
 test-log = { version = "0.2.20", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }

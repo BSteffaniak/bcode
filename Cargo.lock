@@ -874,6 +874,7 @@ dependencies = [
 name = "bcode_markdown_render"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_syntax_render",
  "bmux_tui",
  "hyperchad_color",
  "hyperchad_markdown",
@@ -1034,6 +1035,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_syntax_render"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_tui",
+ "syntect",
+]
+
+[[package]]
 name = "bcode_tool"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1063,6 +1072,7 @@ dependencies = [
  "bcode_model",
  "bcode_session_models",
  "bcode_skill_models",
+ "bcode_syntax_render",
  "bmux_keyboard",
  "bmux_terminal_grid",
  "bmux_text_edit",

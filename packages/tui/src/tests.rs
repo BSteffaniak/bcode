@@ -782,6 +782,14 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
             .map(|cell| cell.style.fg),
         Some(Some(bmux_tui::style::Color::BrightGreen))
     );
+    assert!(
+        buffer
+            .get(Point::new(
+                11,
+                output_line_y(&buffer, "+   2 │     42").unwrap()
+            ))
+            .is_some_and(|cell| cell.style.fg.is_some())
+    );
 }
 
 #[test]
