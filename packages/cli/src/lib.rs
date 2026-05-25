@@ -2792,8 +2792,12 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
         let status = tokio::time::timeout(Duration::from_millis(250), client.server_status()).await;
         match status {
             Ok(Ok(status)) if daemon_status_matches(&record, &status.daemon) => {
-                let stop_result =
-                    tokio::time::timeout(Duration::from_millis(250), client.server_stop()).await;
+                let stop_result = if stop_current {
+                    tokio::time::timeout(Duration::from_millis(250), client.server_stop()).await
+                } else {
+                    tokio::time::timeout(Duration::from_millis(250), client.server_stop_if_idle())
+                        .await
+                };
                 if matches!(stop_result, Ok(Ok(()))) {
                     summary.stopped = summary.stopped.saturating_add(1);
                     if verbose {
@@ -2804,9 +2808,10 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
                 } else {
                     summary.skipped = summary.skipped.saturating_add(1);
                     if verbose {
-                        summary
-                            .messages
-                            .push(format!("skipped {}: stop request failed", record.namespace));
+                        summary.messages.push(format!(
+                            "skipped {}: daemon busy or stop request failed",
+                            record.namespace
+                        ));
                     }
                 }
             }

@@ -8,8 +8,8 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
-    Response, ResponsePayload, SessionCatalogStatus, current_working_directory, decode,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    Response, ResponsePayload, ServerStopMode, SessionCatalogStatus, current_working_directory,
+    decode, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
@@ -267,8 +267,25 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn server_stop(&self) -> Result<(), ClientError> {
+        self.server_stop_with_mode(ServerStopMode::Force).await
+    }
+
+    /// Request graceful local server shutdown only if the daemon is idle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, rejects the request,
+    /// or is not idle.
+    pub async fn server_stop_if_idle(&self) -> Result<(), ClientError> {
+        self.server_stop_with_mode(ServerStopMode::IfIdle).await
+    }
+
+    async fn server_stop_with_mode(&self, mode: ServerStopMode) -> Result<(), ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::ServerStop).await? {
+        match connection
+            .send_request(Request::ServerStop { mode })
+            .await?
+        {
             ResponsePayload::ServerStopping => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }

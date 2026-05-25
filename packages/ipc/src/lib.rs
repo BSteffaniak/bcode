@@ -97,7 +97,10 @@ pub enum Request {
     },
     Ping,
     ServerStatus,
-    ServerStop,
+    ServerStop {
+        #[serde(default)]
+        mode: ServerStopMode,
+    },
     CreateSession {
         name: Option<String>,
         working_directory: PathBuf,
@@ -214,6 +217,17 @@ pub enum Request {
         session_id: SessionId,
         working_directory: PathBuf,
     },
+}
+
+/// Server stop request policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerStopMode {
+    /// Stop regardless of connected clients or active work.
+    #[default]
+    Force,
+    /// Stop only when the daemon is idle.
+    IfIdle,
 }
 
 /// Per-client model/provider/auth context supplied at connection time.

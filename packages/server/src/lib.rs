@@ -13,7 +13,8 @@ use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus,
-    SessionCatalogStatus, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    ServerStopMode, SessionCatalogStatus, decode, event_envelope, recv_envelope, response_envelope,
+    send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
@@ -543,6 +544,45 @@ impl ServerState {
             .contains(&client_id)
     }
 
+    async fn idle_shutdown_blocker(&self) -> Option<String> {
+        let connected_clients = self.clients.lock().await.len();
+        if connected_clients > 1 {
+            return Some(format!(
+                "daemon has {connected_clients} connected clients; refusing idle-only stop"
+            ));
+        }
+        let active_model_turns = self.active_turns.lock().await.len();
+        if active_model_turns > 0 {
+            return Some(format!(
+                "daemon has {active_model_turns} active model turns; refusing idle-only stop"
+            ));
+        }
+        let queued_session_commands = self
+            .session_runtimes
+            .lock()
+            .await
+            .values()
+            .map(|handle| handle.queued_commands.load(Ordering::Acquire))
+            .sum::<usize>();
+        if queued_session_commands > 0 {
+            return Some(format!(
+                "daemon has {queued_session_commands} queued session commands; refusing idle-only stop"
+            ));
+        }
+        let plugin_running = self
+            .plugins
+            .executor_statuses()
+            .into_iter()
+            .map(|status| status.running)
+            .sum::<usize>();
+        if plugin_running > 0 {
+            return Some(format!(
+                "daemon has {plugin_running} running plugin tasks; refusing idle-only stop"
+            ));
+        }
+        None
+    }
+
     async fn status(&self) -> ServerStatus {
         ServerStatus {
             connected_client_count: self.clients.lock().await.len(),
@@ -1007,7 +1047,7 @@ async fn handle_request(
         }
         Request::Ping => handle_ping(request_id, writer).await,
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
-        Request::ServerStop => handle_server_stop(request_id, state, writer).await,
+        Request::ServerStop { mode } => handle_server_stop(request_id, state, writer, mode).await,
         Request::CreateSession {
             name,
             working_directory,
@@ -1286,7 +1326,18 @@ async fn handle_server_stop(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
+    mode: ServerStopMode,
 ) -> Result<(), ServerError> {
+    if mode == ServerStopMode::IfIdle
+        && let Some(message) = state.idle_shutdown_blocker().await
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("daemon_busy", message)),
+        )
+        .await;
+    }
     send_response(
         writer,
         request_id,
