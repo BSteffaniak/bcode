@@ -313,6 +313,8 @@ enum ServerCommand {
         verbose: bool,
     },
     Stop,
+    Cleanup,
+    StopAll,
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -623,6 +625,8 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         ServerCommand::Run => run_server_foreground().await?,
         ServerCommand::Status { verbose } => server_status(verbose).await?,
         ServerCommand::Stop => server_stop().await?,
+        ServerCommand::Cleanup => server_cleanup(false).await?,
+        ServerCommand::StopAll => server_cleanup(true).await?,
     }
     Ok(())
 }
@@ -2529,6 +2533,7 @@ async fn run_server_foreground() -> Result<(), CliError> {
 
 async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
+    cleanup_old_daemons(false).await;
     if server_ping_ready(&client).await {
         if !quiet {
             println!("server already running");
@@ -2645,7 +2650,18 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let status = client.server_status().await?;
     println!("daemon: running");
-    println!("namespace: {}", bcode_ipc::daemon_namespace());
+    println!("namespace: {}", status.daemon.namespace);
+    if verbose {
+        println!(
+            "pid: {}",
+            status
+                .daemon
+                .pid
+                .map_or_else(|| "<unknown>".to_string(), |pid| pid.to_string())
+        );
+        println!("instance: {}", status.daemon.instance_id);
+        println!("build fingerprint: {}", status.daemon.build_fingerprint);
+    }
     println!("connected clients: {}", status.connected_client_count);
     println!(
         "model provider: {}",
@@ -2722,6 +2738,126 @@ fn print_runtime_summary(runtime: &[bcode_plugin::PluginExecutorStatus], verbose
                 plugin.failed
             );
         }
+    }
+}
+
+async fn server_cleanup(stop_current: bool) -> Result<(), CliError> {
+    let summary = cleanup_daemons(stop_current, true).await;
+    for line in summary.messages {
+        println!("{line}");
+    }
+    println!(
+        "daemon cleanup: {} stopped, {} stale records removed, {} skipped",
+        summary.stopped, summary.removed, summary.skipped
+    );
+    Ok(())
+}
+
+async fn cleanup_old_daemons(verbose: bool) {
+    let _ = tokio::time::timeout(
+        Duration::from_millis(1_000),
+        cleanup_daemons(false, verbose),
+    )
+    .await;
+}
+
+#[derive(Debug, Default)]
+struct DaemonCleanupSummary {
+    stopped: usize,
+    removed: usize,
+    skipped: usize,
+    messages: Vec<String>,
+}
+
+async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSummary {
+    let state_dir = bcode_config::default_state_dir();
+    let records = bcode_daemon_lifecycle::read_records(&state_dir);
+    let mut summary = DaemonCleanupSummary::default();
+    for (path, record) in records {
+        if !stop_current && record.is_current_namespace() {
+            summary.skipped = summary.skipped.saturating_add(1);
+            continue;
+        }
+        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
+            summary.skipped = summary.skipped.saturating_add(1);
+            if verbose {
+                summary.messages.push(format!(
+                    "skipped {}: unsupported endpoint",
+                    record.namespace
+                ));
+            }
+            continue;
+        };
+        let client = BcodeClient::new(endpoint);
+        let status = tokio::time::timeout(Duration::from_millis(250), client.server_status()).await;
+        match status {
+            Ok(Ok(status)) if daemon_status_matches(&record, &status.daemon) => {
+                let stop_result =
+                    tokio::time::timeout(Duration::from_millis(250), client.server_stop()).await;
+                if matches!(stop_result, Ok(Ok(()))) {
+                    summary.stopped = summary.stopped.saturating_add(1);
+                    if verbose {
+                        summary
+                            .messages
+                            .push(format!("stopped {}", record.namespace));
+                    }
+                } else {
+                    summary.skipped = summary.skipped.saturating_add(1);
+                    if verbose {
+                        summary
+                            .messages
+                            .push(format!("skipped {}: stop request failed", record.namespace));
+                    }
+                }
+            }
+            Ok(Ok(_)) => {
+                summary.skipped = summary.skipped.saturating_add(1);
+                if verbose {
+                    summary.messages.push(format!(
+                        "skipped {}: registry identity did not match running daemon",
+                        record.namespace
+                    ));
+                }
+            }
+            _ => {
+                if bcode_daemon_lifecycle::remove_record_path(&path).is_ok() {
+                    summary.removed = summary.removed.saturating_add(1);
+                    remove_stale_socket(&record);
+                    if verbose {
+                        summary
+                            .messages
+                            .push(format!("removed stale record {}", record.namespace));
+                    }
+                } else {
+                    summary.skipped = summary.skipped.saturating_add(1);
+                }
+            }
+        }
+    }
+    summary
+}
+
+fn daemon_status_matches(
+    record: &bcode_daemon_lifecycle::DaemonRecord,
+    status: &bcode_ipc::DaemonStatus,
+) -> bool {
+    status.namespace == record.namespace && status.instance_id == record.instance_id
+}
+
+fn remove_stale_socket(record: &bcode_daemon_lifecycle::DaemonRecord) {
+    #[cfg(unix)]
+    if let bcode_daemon_lifecycle::DaemonEndpointRecord::UnixSocket { path } = &record.endpoint
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("bcode-")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("sock"))
+            })
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 

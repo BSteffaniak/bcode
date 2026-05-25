@@ -254,6 +254,32 @@ pub struct ServerStatus {
     pub selected_model_id: Option<String>,
     #[serde(default)]
     pub plugin_runtime: Vec<bcode_plugin::PluginExecutorStatus>,
+    /// Server process identity and lifecycle metadata.
+    #[serde(default)]
+    pub daemon: DaemonStatus,
+}
+
+/// Server process identity and lifecycle metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DaemonStatus {
+    /// Daemon namespace.
+    #[serde(default)]
+    pub namespace: String,
+    /// IPC protocol version.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// Build fingerprint included in the namespace.
+    #[serde(default)]
+    pub build_fingerprint: String,
+    /// Process identifier, when available.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Random per-process identity token.
+    #[serde(default)]
+    pub instance_id: String,
+    /// Daemon start time in Unix milliseconds.
+    #[serde(default)]
+    pub started_at_unix_ms: u64,
 }
 
 /// Active model metadata for a session.

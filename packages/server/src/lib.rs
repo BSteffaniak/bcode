@@ -10,10 +10,10 @@ use bcode_agent_profile::{
     OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
 };
 use bcode_ipc::{
-    ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError, PluginServiceResponse,
-    PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus, SessionCatalogStatus,
-    decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
+    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
+    PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus,
+    SessionCatalogStatus, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
@@ -80,6 +80,9 @@ pub enum ServerError {
     Session(#[from] bcode_session::SessionError),
     #[error("session event store error: {0}")]
     SessionStore(#[from] bcode_session::SessionStoreError),
+    /// Registry I/O error: {0}
+    #[error("daemon lifecycle error: {0}")]
+    DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
     #[error("blocking task join error: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
 }
@@ -115,6 +118,8 @@ struct ServerState {
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
+    daemon_status: DaemonStatus,
+    daemon_record_path: Option<PathBuf>,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -378,6 +383,8 @@ struct ServerStateInit {
     auto_compaction: bcode_config::CompactionConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: usize,
+    daemon_status: DaemonStatus,
+    daemon_record_path: Option<PathBuf>,
 }
 
 impl ServerState {
@@ -417,6 +424,8 @@ impl ServerState {
             clients: Mutex::default(),
             client_runtime_contexts: Mutex::default(),
             message_accepted_clients: Mutex::default(),
+            daemon_status: init.daemon_status,
+            daemon_record_path: init.daemon_record_path,
             shutdown,
         }
     }
@@ -478,6 +487,7 @@ impl ServerState {
             selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
             selected_model_id: self.selected_model_id.clone(),
             plugin_runtime: self.plugins.executor_statuses(),
+            daemon: self.daemon_status.clone(),
         }
     }
 
@@ -497,6 +507,47 @@ fn catalog_status_to_ipc(status: CatalogLoadStatus) -> SessionCatalogStatus {
         CatalogLoadStatus::Loaded => SessionCatalogStatus::Loaded,
         CatalogLoadStatus::Failed(message) => SessionCatalogStatus::Failed(message),
     }
+}
+
+fn register_daemon(
+    endpoint: &IpcEndpoint,
+) -> Result<bcode_daemon_lifecycle::DaemonRecord, ServerError> {
+    let instance_id = daemon_instance_id()?;
+    let record = bcode_daemon_lifecycle::DaemonRecord::current(
+        endpoint,
+        daemon_log_path(),
+        std::env::current_exe().ok(),
+        instance_id,
+    )?;
+    bcode_daemon_lifecycle::write_record(&bcode_config::default_state_dir(), &record)?;
+    Ok(record)
+}
+
+fn daemon_instance_id() -> Result<String, ServerError> {
+    let started = bcode_daemon_lifecycle::unix_time_millis()?;
+    Ok(format!("{}-{started}", std::process::id()))
+}
+
+fn daemon_status_from_record(record: &bcode_daemon_lifecycle::DaemonRecord) -> DaemonStatus {
+    DaemonStatus {
+        namespace: record.namespace.clone(),
+        protocol_version: record.protocol_version,
+        build_fingerprint: record.build_fingerprint.clone(),
+        pid: record.pid,
+        instance_id: record.instance_id.clone(),
+        started_at_unix_ms: record.started_at_unix_ms,
+    }
+}
+
+fn daemon_log_path() -> PathBuf {
+    std::env::var_os("BCODE_DAEMON_LOG").map_or_else(
+        || {
+            bcode_config::default_state_dir()
+                .join("logs")
+                .join(format!("daemon-{}.log", bcode_ipc::daemon_namespace()))
+        },
+        PathBuf::from,
+    )
 }
 
 fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
@@ -718,6 +769,8 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
+    let daemon_record = register_daemon(&endpoint)?;
+    let daemon_status = daemon_status_from_record(&daemon_record);
     tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
     tracing::debug!(target: "bcode_server::startup", "initializing lazy session services");
     let sessions = SessionManager::persistent_lazy(default_session_store_dir());
@@ -760,6 +813,11 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             auto_compaction: config.model.compaction,
             skill_context_bytes: config.skills.max_context_bytes,
             skills,
+            daemon_status,
+            daemon_record_path: Some(bcode_daemon_lifecycle::record_path(
+                &bcode_config::default_state_dir(),
+                &daemon_record.namespace,
+            )),
         },
     ));
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
@@ -781,6 +839,9 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     }
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
     state.plugins.deactivate_all().await?;
+    if let Some(path) = &state.daemon_record_path {
+        bcode_daemon_lifecycle::remove_record_path(path)?;
+    }
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
     Ok(())
 }
@@ -7315,6 +7376,8 @@ mod tests {
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,
+                daemon_status: DaemonStatus::default(),
+                daemon_record_path: None,
             },
         );
         let delta = ToolInvocationStreamEvent::OutputDelta {
@@ -7391,6 +7454,8 @@ mod tests {
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,
+                daemon_status: DaemonStatus::default(),
+                daemon_record_path: None,
             },
         );
 

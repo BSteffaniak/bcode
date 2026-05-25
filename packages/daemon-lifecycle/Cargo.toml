@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Daemon lifecycle registry and cleanup models for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "daemon", "lifecycle"]
+license     = { workspace = true }
+name        = "bcode_daemon_lifecycle"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_ipc  = { workspace = true }
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
