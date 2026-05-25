@@ -56,6 +56,8 @@ pub enum ProviderCapability {
     JsonMode,
     PromptCaching,
     ConversationReuse,
+    NativeWebSearch,
+    CodeSearch,
 }
 
 /// Model listing response.
@@ -115,6 +117,8 @@ pub enum ModelCapability {
     Reasoning,
     ImageInput,
     PromptCaching,
+    NativeWebSearch,
+    CodeSearch,
 }
 
 /// User-facing thinking / reasoning effort level for models that support it.

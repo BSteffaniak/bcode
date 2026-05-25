@@ -89,6 +89,24 @@ pub enum ToolRequestPresentation {
         /// Whether rendered fetching was requested.
         render: bool,
     },
+    /// Git clone request.
+    GitClone {
+        /// Git remote or forge URL.
+        url: String,
+        /// Optional branch/tag/ref.
+        git_ref: Option<String>,
+        /// Explicit destination override.
+        destination: Option<String>,
+    },
+    /// Document extraction request.
+    DocumentExtract {
+        /// Source URL, if extracting from the network.
+        url: Option<String>,
+        /// Source path, if extracting from a local/artifact path.
+        path: Option<String>,
+        /// Optional maximum byte count.
+        max_bytes: Option<u64>,
+    },
 }
 
 /// Human-readable presentation for a known tool result.
@@ -284,6 +302,16 @@ pub fn tool_request_presentation(
             url: string_field(&value, "url")?,
             max_bytes: u64_field(&value, "max_bytes"),
             render: bool_field(&value, "render"),
+        }),
+        "git_clone" | "github_clone" => Some(ToolRequestPresentation::GitClone {
+            url: string_field(&value, "url")?,
+            git_ref: string_field(&value, "ref").or_else(|| string_field(&value, "branch")),
+            destination: string_field(&value, "destination"),
+        }),
+        "document_extract" => Some(ToolRequestPresentation::DocumentExtract {
+            url: string_field(&value, "url"),
+            path: string_field(&value, "path"),
+            max_bytes: u64_field(&value, "max_bytes"),
         }),
         _ => None,
     }

@@ -20,7 +20,7 @@ use bcode_plugin_sdk::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1949,6 +1949,7 @@ fn capabilities() -> ProviderCapabilities {
             ProviderCapability::Cancellation,
             ProviderCapability::Tools,
             ProviderCapability::PromptCaching,
+            ProviderCapability::NativeWebSearch,
         ]
         .into_iter()
         .collect(),
@@ -2024,17 +2025,32 @@ fn model_infos_from_items(
             display_name: model.id.clone(),
             context_window: None,
             max_output_tokens: None,
-            capabilities: [
-                ModelCapability::StreamingText,
-                ModelCapability::ToolCalls,
-                ModelCapability::PromptCaching,
-                ModelCapability::Reasoning,
-            ]
-            .into_iter()
-            .collect(),
+            capabilities: model_capabilities_for(&model),
             reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
         })
         .collect()
+}
+
+fn model_capabilities_for(model: &ModelResponseItem) -> BTreeSet<ModelCapability> {
+    let mut capabilities = BTreeSet::from([
+        ModelCapability::StreamingText,
+        ModelCapability::ToolCalls,
+        ModelCapability::PromptCaching,
+        ModelCapability::Reasoning,
+    ]);
+    if model_supports_native_web_search(model) {
+        capabilities.insert(ModelCapability::NativeWebSearch);
+    }
+    capabilities
+}
+
+fn model_supports_native_web_search(model: &ModelResponseItem) -> bool {
+    let lower = model.id.to_ascii_lowercase();
+    lower.contains("gpt-4.1")
+        || lower.contains("gpt-5")
+        || lower.contains("o3")
+        || lower.contains("o4")
+        || lower.contains("grok")
 }
 
 fn reasoning_info_for_model(

@@ -107,6 +107,64 @@ fn presentation_from_tool(
             max_bytes,
             render,
         } => web_fetch_permission(tool_name, url, *max_bytes, *render),
+        ToolRequestPresentation::GitClone {
+            url,
+            git_ref,
+            destination,
+        } => git_clone_permission(tool_name, url, git_ref.as_deref(), destination.as_deref()),
+        ToolRequestPresentation::DocumentExtract {
+            url,
+            path,
+            max_bytes,
+        } => document_extract_permission(tool_name, url.as_deref(), path.as_deref(), *max_bytes),
+    }
+}
+
+fn git_clone_permission(
+    tool_name: &str,
+    url: &str,
+    git_ref: Option<&str>,
+    destination: Option<&str>,
+) -> PermissionPresentation {
+    let mut details = vec![PermissionDetail::new("url", url.to_owned())];
+    if let Some(git_ref) = git_ref {
+        details.push(PermissionDetail::new("ref", git_ref.to_owned()));
+    }
+    details.push(PermissionDetail::new(
+        "destination",
+        destination
+            .unwrap_or("Bcode session artifact state")
+            .to_owned(),
+    ));
+    PermissionPresentation {
+        title: tool_name.to_owned(),
+        risk: "clone git repository into artifacts".to_owned(),
+        details,
+        raw_details: None,
+    }
+}
+
+fn document_extract_permission(
+    tool_name: &str,
+    url: Option<&str>,
+    path: Option<&str>,
+    max_bytes: Option<u64>,
+) -> PermissionPresentation {
+    let mut details = Vec::new();
+    if let Some(url) = url {
+        details.push(PermissionDetail::new("url", url.to_owned()));
+    }
+    if let Some(path) = path {
+        details.push(PermissionDetail::new("path", path.to_owned()));
+    }
+    if let Some(max_bytes) = max_bytes {
+        details.push(PermissionDetail::new("max bytes", max_bytes.to_string()));
+    }
+    PermissionPresentation {
+        title: tool_name.to_owned(),
+        risk: "extract document into artifacts".to_owned(),
+        details,
+        raw_details: None,
     }
 }
 

@@ -731,6 +731,7 @@ fn push_tool_result_rows(
     rows.push(Line::default());
 }
 
+#[allow(clippy::too_many_lines)]
 fn push_tool_request_presentation_rows(
     rows: &mut Vec<Line>,
     presentation: &ToolRequestPresentation,
@@ -834,6 +835,37 @@ fn push_tool_request_presentation_rows(
                 push_kv_row(rows, "limit", &format!("{max_bytes} bytes"), width);
             }
             push_kv_row(rows, "rendered", if *render { "yes" } else { "no" }, width);
+        }
+        ToolRequestPresentation::GitClone {
+            url,
+            git_ref,
+            destination,
+        } => {
+            push_kv_row(rows, "url", url, width);
+            if let Some(git_ref) = git_ref {
+                push_kv_row(rows, "ref", git_ref, width);
+            }
+            push_kv_row(
+                rows,
+                "destination",
+                destination.as_deref().unwrap_or("Bcode artifacts"),
+                width,
+            );
+        }
+        ToolRequestPresentation::DocumentExtract {
+            url,
+            path,
+            max_bytes,
+        } => {
+            if let Some(url) = url {
+                push_kv_row(rows, "url", url, width);
+            }
+            if let Some(path) = path {
+                push_kv_row(rows, "path", path, width);
+            }
+            if let Some(max_bytes) = max_bytes {
+                push_kv_row(rows, "limit", &format!("{max_bytes} bytes"), width);
+            }
         }
     }
 }
