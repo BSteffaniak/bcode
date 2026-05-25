@@ -23,13 +23,13 @@ use super::activity::ActivityState;
 use super::app::{BmuxApp, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
-use super::text_width::{display_width as text_display_width, truncate_to_display_width};
 use super::tool_present::{
     GrepMatchPresentation, ListEntryPresentation, ShellResultPresentation, ToolRequestPresentation,
     ToolResultPresentation, tool_request_presentation, tool_result_presentation,
 };
 use super::transcript::{TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
+use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
@@ -1651,7 +1651,7 @@ fn wrap_text_with_continuation(
     first_width: usize,
     continuation_width: usize,
 ) -> Vec<String> {
-    super::text_width::wrap_text_with_continuation(text, first_width, continuation_width)
+    bmux_tui::text_width::wrap_text_with_continuation(text, first_width, continuation_width)
 }
 
 fn spans_width(spans: &[Span]) -> usize {

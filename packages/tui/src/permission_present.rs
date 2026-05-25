@@ -2,9 +2,9 @@
 
 use serde_json::Value;
 
-use super::text_width::truncate_to_display_width;
 use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
 use super::transcript::pretty_jsonish;
+use bmux_tui::text_width::truncate_to_display_width;
 
 /// One labeled permission-detail row.
 #[derive(Debug, Clone, PartialEq, Eq)]

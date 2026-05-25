@@ -5,10 +5,12 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
+use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
+use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails, LabeledDetailsStyles};
 
 use super::permission_dialog::PermissionDialogState;
 use super::permission_present::{PermissionDetail, permission_presentation};
-use super::text_width::{display_width, wrap_text_with_continuation};
 
 const MIN_DIALOG_WIDTH: u16 = 48;
 const MAX_DIALOG_WIDTH: u16 = 100;
@@ -72,12 +74,24 @@ pub fn dialog_area(area: Rect) -> Rect {
 
 /// Return approve and deny button hit boxes for a dialog panel area.
 #[must_use]
-pub const fn action_areas(dialog: Rect) -> (Rect, Rect) {
+pub fn action_areas(dialog: Rect) -> (Rect, Rect) {
     let content = dialog.inset(Insets::new(2, 3, 2, 3));
     let y = content.bottom().saturating_sub(1);
-    let approve = Rect::new(content.x, y, 11, 1);
-    let deny = Rect::new(content.x.saturating_add(13), y, 8, 1);
-    (approve, deny)
+    let actions = action_buttons();
+    let areas =
+        ActionRow::new(&actions)
+            .spacing(2)
+            .action_areas(Rect::new(content.x, y, content.width, 1));
+    (
+        areas
+            .first()
+            .copied()
+            .unwrap_or_else(|| Rect::new(content.x, y, 0, 1)),
+        areas
+            .get(1)
+            .copied()
+            .unwrap_or_else(|| Rect::new(content.x, y, 0, 1)),
+    )
 }
 
 fn permission_rows(
@@ -100,9 +114,19 @@ fn permission_rows(
     push_metadata_row(&mut rows, "risk", risk, width);
     rows.push(Line::default());
 
-    for detail in details {
-        push_detail_rows(&mut rows, detail, width);
-    }
+    let detail_items = details
+        .iter()
+        .map(|detail| DetailItem::new(detail.label.clone(), detail.value.clone()))
+        .collect::<Vec<_>>();
+    rows.extend(
+        LabeledDetails::new(&detail_items)
+            .styles(LabeledDetailsStyles {
+                label: muted_style().add_modifier(Modifier::BOLD),
+                value: Style::new().fg(Color::BrightWhite),
+                continuation: muted_style(),
+            })
+            .lines(width),
+    );
 
     if let Some(raw_details) = raw_details.filter(|raw| !raw.trim().is_empty()) {
         rows.push(Line::default());
@@ -148,23 +172,6 @@ fn push_metadata_row(rows: &mut Vec<Line>, label: &str, value: &str, width: u16)
     );
 }
 
-fn push_detail_rows(rows: &mut Vec<Line>, detail: &PermissionDetail, width: u16) {
-    rows.push(Line::from_spans(vec![Span::styled(
-        detail.label.clone(),
-        muted_style().add_modifier(Modifier::BOLD),
-    )]));
-    for line in detail.value.lines() {
-        push_wrapped_rows(
-            rows,
-            &[Span::styled("  ", muted_style())],
-            line,
-            width,
-            Style::new().fg(Color::BrightWhite),
-        );
-    }
-    rows.push(Line::default());
-}
-
 fn push_wrapped_rows(rows: &mut Vec<Line>, prefix: &[Span], text: &str, width: u16, style: Style) {
     let max_width = usize::from(width.max(1));
     let prefix_width: usize = prefix.iter().map(|span| display_width(&span.content)).sum();
@@ -188,29 +195,38 @@ fn push_wrapped_rows(rows: &mut Vec<Line>, prefix: &[Span], text: &str, width: u
 }
 
 fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Frame<'_>) {
-    let (approve_area, deny_area) = action_areas(Rect::new(
+    let dialog = Rect::new(
         content.x.saturating_sub(3),
         content.y.saturating_sub(2),
         content.width.saturating_add(6),
         content.height.saturating_add(4),
-    ));
-    render_button("Approve", state.focused_approval(), approve_area, frame);
-    render_button("Deny", !state.focused_approval(), deny_area, frame);
+    );
+    let (approve_area, _) = action_areas(dialog);
+    ActionRow::new(&action_buttons())
+        .focused(usize::from(!state.focused_approval()))
+        .spacing(2)
+        .styles(action_styles())
+        .render(
+            Rect::new(approve_area.x, approve_area.y, content.width, 1),
+            frame,
+        );
 }
 
-fn render_button(label: &str, focused: bool, area: Rect, frame: &mut Frame<'_>) {
-    let style = if focused {
-        Style::new()
+fn action_buttons() -> [ActionButton; 2] {
+    [
+        ActionButton::new("approve", "Approve"),
+        ActionButton::new("deny", "Deny"),
+    ]
+}
+
+const fn action_styles() -> ActionRowStyles {
+    ActionRowStyles {
+        button: Style::new().fg(Color::BrightWhite),
+        focused_button: Style::new()
             .fg(Color::Black)
             .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(Color::BrightWhite)
-    };
-    frame.write_line(
-        area,
-        &Line::from_spans(vec![Span::styled(format!("[ {label} ]"), style)]),
-    );
+            .add_modifier(Modifier::BOLD),
+    }
 }
 
 fn format_label(label: &str) -> String {

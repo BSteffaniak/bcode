@@ -51,7 +51,6 @@ pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
 #[cfg(test)]
 pub(crate) mod tests;
-pub(crate) mod text_width;
 pub(crate) mod tool_present;
 pub(crate) mod transcript;
 pub(crate) mod transcript_layout;
