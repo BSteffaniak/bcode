@@ -5101,6 +5101,7 @@ async fn invoke_model_tool(
         name: call.name.clone(),
         arguments: call.arguments.clone(),
         cwd: Some(working_directory),
+        artifact_dir: Some(default_session_artifact_dir(session_id)),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let mut invocation = state
@@ -6414,6 +6415,13 @@ fn default_provider_state_path() -> PathBuf {
 
 fn default_trace_store_dir() -> PathBuf {
     bcode_config::default_state_dir().join("traces")
+}
+
+fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
+    bcode_config::default_state_dir()
+        .join("artifacts")
+        .join("sessions")
+        .join(session_id.to_string())
 }
 
 #[cfg(test)]

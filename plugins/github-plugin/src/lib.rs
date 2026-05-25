@@ -11,6 +11,7 @@ use bcode_tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
@@ -73,7 +74,7 @@ fn invoke_clone(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
-    match clone_repository(&request, invocation.cwd.as_deref()) {
+    match clone_repository(&request, invocation.artifact_dir.as_deref()) {
         Ok(response) => json_tool_response(&response),
         Err(error) => tool_error(error.to_string()),
     }
@@ -95,6 +96,8 @@ struct CloneResponse {
     owner: String,
     repo: String,
     branch: Option<String>,
+    artifact_kind: String,
+    artifact_scope: String,
     path: PathBuf,
     already_exists: bool,
 }
@@ -111,13 +114,13 @@ enum GithubError {
 
 fn clone_repository(
     request: &CloneRequest,
-    cwd: Option<&Path>,
+    artifact_dir: Option<&Path>,
 ) -> Result<CloneResponse, GithubError> {
     let repo = parse_github_repo(&request.url)?;
     let base = request
         .destination
         .clone()
-        .unwrap_or_else(|| default_destination(cwd, &repo.owner, &repo.repo));
+        .unwrap_or_else(|| default_destination(artifact_dir, &repo.owner, &repo.repo));
     if base.exists() {
         return Ok(CloneResponse {
             url: request.url.clone(),
@@ -125,6 +128,8 @@ fn clone_repository(
             owner: repo.owner,
             repo: repo.repo,
             branch: request.branch.clone(),
+            artifact_kind: "github_repo_clone".to_string(),
+            artifact_scope: artifact_scope(request.destination.as_ref()),
             path: base,
             already_exists: true,
         });
@@ -155,6 +160,8 @@ fn clone_repository(
         owner: repo.owner,
         repo: repo.repo,
         branch: request.branch.clone(),
+        artifact_kind: "github_repo_clone".to_string(),
+        artifact_scope: artifact_scope(request.destination.as_ref()),
         path: base,
         already_exists: false,
     })
@@ -205,18 +212,46 @@ fn parse_github_repo(url: &str) -> Result<GithubRepo, GithubError> {
     })
 }
 
-fn default_destination(cwd: Option<&Path>, owner: &str, repo: &str) -> PathBuf {
-    cwd.unwrap_or_else(|| Path::new("."))
-        .join(".bcode")
+fn default_destination(artifact_dir: Option<&Path>, owner: &str, repo: &str) -> PathBuf {
+    artifact_dir
+        .map_or_else(default_global_artifact_dir, Path::to_path_buf)
         .join("github")
         .join(owner)
         .join(repo)
 }
 
+fn default_global_artifact_dir() -> PathBuf {
+    default_state_dir().join("artifacts").join("github")
+}
+
+fn default_state_dir() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home).join("bcode");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("bcode");
+    }
+    env::temp_dir().join("bcode")
+}
+
+fn artifact_scope(explicit_destination: Option<&PathBuf>) -> String {
+    if explicit_destination.is_some() {
+        "explicit".to_string()
+    } else {
+        "session".to_string()
+    }
+}
+
 fn clone_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "github.clone".to_string(),
-        description: "Shallow-clone a GitHub repository into the session workspace so agents can inspect real files instead of rendered HTML.".to_string(),
+        description: "Shallow-clone a GitHub repository into Bcode-managed artifact state so agents can inspect real files instead of rendered HTML.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["url"],
@@ -290,8 +325,12 @@ mod tests {
     }
 
     #[test]
-    fn default_destination_is_workspace_scoped() {
-        let path = default_destination(Some(Path::new("/tmp/work")), "owner", "repo");
-        assert_eq!(path, PathBuf::from("/tmp/work/.bcode/github/owner/repo"));
+    fn default_destination_uses_artifact_dir_not_workspace() {
+        let path =
+            default_destination(Some(Path::new("/tmp/artifacts/session-1")), "owner", "repo");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/artifacts/session-1/github/owner/repo")
+        );
     }
 }

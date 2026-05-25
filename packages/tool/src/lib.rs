@@ -57,6 +57,9 @@ pub struct ToolInvocationRequest {
     /// Canonical session working directory for this invocation.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Host-managed artifact directory for this invocation/session.
+    #[serde(default)]
+    pub artifact_dir: Option<PathBuf>,
 }
 
 /// Incremental event emitted while a tool invocation is running.
