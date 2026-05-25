@@ -15,6 +15,8 @@ pub enum SlashCommandOutcome {
     PickModel,
     /// Open skill picker.
     PickSkill,
+    /// Open thinking settings dialog.
+    OpenThinkingSettings,
     /// Toggle diff panel.
     ToggleDiff,
     /// Toggle local thinking display.
@@ -74,7 +76,8 @@ async fn thinking_command(
     let status = client.session_model_status(session_id).await?;
     match parts.get(1).copied() {
         Some("capabilities") => Ok(SlashCommandOutcome::Handled(thinking_capabilities(&status))),
-        Some("status") | None => Ok(SlashCommandOutcome::Handled(thinking_status(&status))),
+        Some("status") => Ok(SlashCommandOutcome::Handled(thinking_status(&status))),
+        None => Ok(SlashCommandOutcome::OpenThinkingSettings),
         Some("effort") if parts.len() > 2 => {
             let effort = parts[2].to_owned();
             if let Some(message) = unsupported_reasoning_value(
@@ -143,10 +146,28 @@ fn unsupported_reasoning_value(
 }
 
 fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {
+    let effort = status
+        .reasoning_effort
+        .as_deref()
+        .or_else(|| {
+            status
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.default_effort.as_deref())
+        })
+        .unwrap_or("provider default");
+    let summary = status
+        .reasoning_summary
+        .as_deref()
+        .or_else(|| {
+            status
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.default_summary.as_deref())
+        })
+        .unwrap_or("provider default");
     format!(
-        "thinking: effort={}, summary={}{}",
-        status.reasoning_effort.as_deref().unwrap_or("default"),
-        status.reasoning_summary.as_deref().unwrap_or("default"),
+        "thinking: effort={effort}, summary={summary}{}",
         status
             .reasoning
             .as_ref()

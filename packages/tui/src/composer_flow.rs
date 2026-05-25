@@ -7,7 +7,7 @@ use bmux_tui::terminal::Terminal;
 
 use super::keymap::BmuxKeyMap;
 use super::session_flow::ActiveChat;
-use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands};
+use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands, thinking_dialog};
 
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
@@ -15,15 +15,15 @@ pub async fn submit_composer<W: Write>(
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
-) -> Result<(), TuiError> {
+) -> Result<Option<thinking_dialog::ThinkingDialogState>, TuiError> {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
-        return Ok(());
+        return Ok(None);
     };
     let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
         chat.app.clear_pending_submission(&message);
-        return Ok(());
+        return Ok(None);
     }
     if message.starts_with('/') {
         chat.app.clear_pending_submission(&message);
@@ -49,6 +49,16 @@ pub async fn submit_composer<W: Write>(
             slash_commands::SlashCommandOutcome::SystemNote(note) => {
                 chat.app.push_system_note(note);
                 chat.app.set_status("slash command handled".to_owned());
+            }
+            slash_commands::SlashCommandOutcome::OpenThinkingSettings => {
+                let status = client.session_model_status(session_id).await?;
+                chat.app.apply_model_status(status.clone());
+                chat.app
+                    .set_status("thinking settings: enter apply, esc cancel".to_owned());
+                return Ok(Some(thinking_dialog::ThinkingDialogState::new(
+                    chat.app.reasoning_visible(),
+                    &status,
+                )));
             }
             slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
                 session_flow::switch_session(client, chat, next_session_id).await?;
@@ -76,7 +86,7 @@ pub async fn submit_composer<W: Write>(
                     .set_status(format!("unknown slash command: {command}"));
             }
         }
-        return Ok(());
+        return Ok(None);
     }
     match client.send_user_message(session_id, message.clone()).await {
         Ok(acceptance) => {
@@ -94,12 +104,12 @@ pub async fn submit_composer<W: Write>(
                 chat.app.mark_pending_submission_sent();
                 chat.app.set_status("Message sent".to_owned());
             }
-            Ok(())
+            Ok(None)
         }
         Err(error) => {
             chat.app.restore_pending_submission(&message);
             chat.app.set_status(format!("send failed: {error}"));
-            Ok(())
+            Ok(None)
         }
     }
 }

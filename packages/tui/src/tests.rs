@@ -1271,3 +1271,60 @@ fn rendered_text(buffer: &Buffer) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[test]
+fn thinking_label_uses_effective_values() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.apply_model_status(bcode_ipc::SessionModelStatus {
+        provider_plugin_id: None,
+        model_id: None,
+        context_window: None,
+        max_output_tokens: None,
+        reasoning: Some(bcode_model::ModelReasoningInfo {
+            effort_values: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+            default_effort: Some("medium".to_owned()),
+            visible_summary_supported: true,
+            summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
+            default_summary: Some("auto".to_owned()),
+            raw_reasoning_supported: false,
+        }),
+        reasoning_effort: None,
+        reasoning_summary: Some("detailed".to_owned()),
+    });
+    app.set_reasoning_visible(true);
+
+    assert_eq!(
+        app.thinking_label(),
+        "shown · effort: medium · summary: detailed"
+    );
+}
+
+#[test]
+fn thinking_dialog_cycles_supported_values() {
+    let status = bcode_ipc::SessionModelStatus {
+        provider_plugin_id: None,
+        model_id: None,
+        context_window: None,
+        max_output_tokens: None,
+        reasoning: Some(bcode_model::ModelReasoningInfo {
+            effort_values: vec!["low".to_owned(), "medium".to_owned()],
+            default_effort: Some("low".to_owned()),
+            visible_summary_supported: true,
+            summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
+            default_summary: Some("auto".to_owned()),
+            raw_reasoning_supported: false,
+        }),
+        reasoning_effort: Some("low".to_owned()),
+        reasoning_summary: Some("auto".to_owned()),
+    };
+    let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
+
+    dialog.cycle_focused();
+    assert!(dialog.visible());
+    dialog.focus_next();
+    dialog.cycle_focused();
+    assert_eq!(dialog.effort(), Some("medium"));
+    dialog.focus_next();
+    dialog.cycle_focused();
+    assert_eq!(dialog.summary(), Some("detailed"));
+}

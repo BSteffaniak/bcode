@@ -19,13 +19,14 @@ use super::session_flow::ActiveChat;
 use super::{
     EVENT_POLL_TIMEOUT, TuiError, command_palette_render, composer_flow, history_flow, input,
     mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
-    slash_palette, slash_palette_render,
+    slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
 };
 
 struct ModalState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     permission_dialog: Option<PermissionDialogState>,
+    thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
 }
 
 /// Run the active chat UI loop.
@@ -40,6 +41,7 @@ pub async fn run_with_client<W: Write>(
         palette: None,
         slash_palette: None,
         permission_dialog: None,
+        thinking_dialog: None,
     };
     chat.app.set_key_hints(keymap.chat_hints());
     let mut needs_redraw = true;
@@ -91,6 +93,9 @@ pub async fn run_with_client<W: Write>(
                 }
                 if let Some(dialog) = &modals.permission_dialog {
                     permission_dialog_render::render_permission_dialog(dialog, frame);
+                }
+                if let Some(dialog) = &modals.thinking_dialog {
+                    thinking_dialog_render::render_thinking_dialog(dialog, frame);
                 }
             })?;
             needs_redraw = false;
@@ -188,6 +193,15 @@ async fn handle_chat_key<W: Write>(
     terminal: &mut Terminal<&mut W>,
     stroke: KeyStroke,
 ) -> Result<bool, TuiError> {
+    if modals.thinking_dialog.is_some() {
+        return thinking_flow::handle_thinking_key(
+            client,
+            chat,
+            &mut modals.thinking_dialog,
+            stroke,
+        )
+        .await;
+    }
     if modals.slash_palette.is_some() {
         return slash_flow::handle_slash_palette_key(
             client,
@@ -244,10 +258,14 @@ async fn handle_chat_key<W: Write>(
     if outcome.interrupted {
         request_turn_cancellation(client, chat).await;
     }
-    if outcome.submitted
-        && let Err(error) = composer_flow::submit_composer(client, keymap, chat, terminal).await
-    {
-        helpers::report_client_error(&mut chat.app, "send failed", &error);
+    if outcome.submitted {
+        match composer_flow::submit_composer(client, keymap, chat, terminal).await {
+            Ok(Some(dialog)) => {
+                modals.thinking_dialog = Some(dialog);
+            }
+            Ok(None) => {}
+            Err(error) => helpers::report_client_error(&mut chat.app, "send failed", &error),
+        }
     }
     Ok(outcome.redraw)
 }

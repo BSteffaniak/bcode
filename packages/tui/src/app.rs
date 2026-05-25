@@ -42,7 +42,12 @@ pub struct BmuxApp {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     current_agent_id: String,
+    reasoning_visible: bool,
     thinking_label: String,
+    reasoning_effort: Option<String>,
+    reasoning_summary: Option<String>,
+    reasoning_default_effort: Option<String>,
+    reasoning_default_summary: Option<String>,
     token_usage: TokenUsageMeter,
     composer: TextInputState,
     input_history: InputHistory,
@@ -90,7 +95,13 @@ impl BmuxApp {
             selected_provider_plugin_id: None,
             selected_model_id: None,
             current_agent_id: "build".to_owned(),
-            thinking_label: "default".to_owned(),
+            reasoning_visible: false,
+            thinking_label: "hidden · effort: provider default · summary: provider default"
+                .to_owned(),
+            reasoning_effort: None,
+            reasoning_summary: None,
+            reasoning_default_effort: None,
+            reasoning_default_summary: None,
             token_usage: TokenUsageMeter::default(),
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
@@ -360,6 +371,17 @@ impl BmuxApp {
         if status.model_id.is_some() {
             self.selected_model_id = status.model_id;
         }
+        self.reasoning_effort = status.reasoning_effort.clone();
+        self.reasoning_summary = status.reasoning_summary.clone();
+        self.reasoning_default_effort = status
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.default_effort.clone());
+        self.reasoning_default_summary = status
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.default_summary.clone());
+        self.refresh_thinking_label();
         let model = status
             .context_window
             .map(|context_window| bcode_model::ModelInfo {
@@ -462,13 +484,38 @@ impl BmuxApp {
 
     /// Return whether reasoning transcript items are visible.
     #[must_use]
-    pub fn reasoning_visible(&self) -> bool {
-        self.thinking_label != "hidden"
+    pub const fn reasoning_visible(&self) -> bool {
+        self.reasoning_visible
     }
 
     /// Set whether reasoning transcript items are visible.
     pub fn set_reasoning_visible(&mut self, visible: bool) {
-        if visible { "shown" } else { "hidden" }.clone_into(&mut self.thinking_label);
+        self.reasoning_visible = visible;
+        self.refresh_thinking_label();
+    }
+
+    /// Apply configured thinking display visibility.
+    pub fn apply_thinking_config(&mut self, config: bcode_config::TuiThinkingConfig) {
+        self.set_reasoning_visible(config.show);
+    }
+
+    fn refresh_thinking_label(&mut self) {
+        let display = if self.reasoning_visible {
+            "shown"
+        } else {
+            "hidden"
+        };
+        let effort = self
+            .reasoning_effort
+            .as_deref()
+            .or(self.reasoning_default_effort.as_deref())
+            .unwrap_or("provider default");
+        let summary = self
+            .reasoning_summary
+            .as_deref()
+            .or(self.reasoning_default_summary.as_deref())
+            .unwrap_or("provider default");
+        self.thinking_label = format!("{display} · effort: {effort} · summary: {summary}");
     }
 
     /// Mark the app as waiting for turn cancellation.
