@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use bcode_client::BcodeClient;
+use bcode_session_models::SessionId;
 use bmux_tui::terminal::Terminal;
 
 use super::keymap::BmuxKeyMap;
@@ -11,6 +12,116 @@ use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands, thin
 
 /// Result of submitting staged composer text.
 pub type SubmitComposerOutcome = Option<thinking_dialog::ThinkingDialogState>;
+
+fn is_slash_command_name(command: &str) -> bool {
+    matches!(
+        command,
+        "sessions"
+            | "new"
+            | "plan"
+            | "build"
+            | "agent"
+            | "compact"
+            | "model"
+            | "models"
+            | "set-model"
+            | "provider"
+            | "set-provider"
+            | "diff"
+            | "skills"
+            | "skill"
+            | "thinking"
+            | "runtime"
+            | "status"
+    )
+}
+
+fn has_known_slash_command(message: &str) -> bool {
+    message
+        .strip_prefix('/')
+        .and_then(|command| command.split_whitespace().next())
+        .is_some_and(is_slash_command_name)
+}
+
+async fn handle_slash_command<W: Write>(
+    client: &BcodeClient,
+    keymap: &BmuxKeyMap,
+    chat: &mut ActiveChat,
+    terminal: &mut Terminal<&mut W>,
+    session_id: SessionId,
+    message: &str,
+) -> Result<SubmitComposerOutcome, TuiError> {
+    match slash_commands::execute(client, session_id, message).await? {
+        slash_commands::SlashCommandOutcome::Unknown(_command) => {}
+        slash_commands::SlashCommandOutcome::Handled(status) => {
+            chat.app.clear_pending_submission(message);
+            chat.app.set_status(status);
+        }
+        slash_commands::SlashCommandOutcome::SetThinkingDisplay(show) => {
+            chat.app.clear_pending_submission(message);
+            chat.app.set_reasoning_visible(show);
+            chat.app.set_status(if show {
+                "thinking display shown".to_owned()
+            } else {
+                "thinking display hidden".to_owned()
+            });
+        }
+        slash_commands::SlashCommandOutcome::ToggleThinkingDisplay => {
+            chat.app.clear_pending_submission(message);
+            let show = !chat.app.reasoning_visible();
+            chat.app.set_reasoning_visible(show);
+            chat.app.set_status(if show {
+                "thinking display shown".to_owned()
+            } else {
+                "thinking display hidden".to_owned()
+            });
+        }
+        slash_commands::SlashCommandOutcome::SystemNote(note) => {
+            chat.app.clear_pending_submission(message);
+            chat.app.push_system_note(note);
+            chat.app.set_status("slash command handled".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {
+            chat.app.clear_pending_submission(message);
+            let status = client.session_model_status(session_id).await?;
+            chat.app.apply_model_status(status.clone());
+            chat.app
+                .set_status("thinking settings: enter apply, esc cancel".to_owned());
+            return Ok(Some(thinking_dialog::ThinkingDialogState::new_focused(
+                chat.app.reasoning_visible(),
+                &status,
+                focus,
+            )));
+        }
+        slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
+            chat.app.clear_pending_submission(message);
+            session_flow::switch_session(client, chat, next_session_id).await?;
+        }
+        slash_commands::SlashCommandOutcome::PickSession => {
+            chat.app.clear_pending_submission(message);
+            let next_session_id = session_flow::pick_session(terminal, client, keymap).await?;
+            session_flow::switch_session(client, chat, next_session_id).await?;
+        }
+        slash_commands::SlashCommandOutcome::PickModel => {
+            chat.app.clear_pending_submission(message);
+            model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;
+        }
+        slash_commands::SlashCommandOutcome::PickSkill => {
+            chat.app.clear_pending_submission(message);
+            skill_flow::pick_skill_for_session(terminal, client, chat, keymap).await?;
+        }
+        slash_commands::SlashCommandOutcome::ToggleDiff => {
+            chat.app.clear_pending_submission(message);
+            let _changed = chat.app.toggle_diff_visible();
+            chat.app.set_status(if chat.app.diff_visible() {
+                "diff panel shown".to_owned()
+            } else {
+                "diff panel hidden".to_owned()
+            });
+        }
+    }
+    Ok(None)
+}
 
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
@@ -28,69 +139,8 @@ pub async fn submit_composer<W: Write>(
         chat.app.clear_pending_submission(&message);
         return Ok(None);
     }
-    if message.starts_with('/') {
-        chat.app.clear_pending_submission(&message);
-        match slash_commands::execute(client, session_id, &message).await? {
-            slash_commands::SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
-            slash_commands::SlashCommandOutcome::SetThinkingDisplay(show) => {
-                chat.app.set_reasoning_visible(show);
-                chat.app.set_status(if show {
-                    "thinking display shown".to_owned()
-                } else {
-                    "thinking display hidden".to_owned()
-                });
-            }
-            slash_commands::SlashCommandOutcome::ToggleThinkingDisplay => {
-                let show = !chat.app.reasoning_visible();
-                chat.app.set_reasoning_visible(show);
-                chat.app.set_status(if show {
-                    "thinking display shown".to_owned()
-                } else {
-                    "thinking display hidden".to_owned()
-                });
-            }
-            slash_commands::SlashCommandOutcome::SystemNote(note) => {
-                chat.app.push_system_note(note);
-                chat.app.set_status("slash command handled".to_owned());
-            }
-            slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {
-                let status = client.session_model_status(session_id).await?;
-                chat.app.apply_model_status(status.clone());
-                chat.app
-                    .set_status("thinking settings: enter apply, esc cancel".to_owned());
-                return Ok(Some(thinking_dialog::ThinkingDialogState::new_focused(
-                    chat.app.reasoning_visible(),
-                    &status,
-                    focus,
-                )));
-            }
-            slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
-                session_flow::switch_session(client, chat, next_session_id).await?;
-            }
-            slash_commands::SlashCommandOutcome::PickSession => {
-                let next_session_id = session_flow::pick_session(terminal, client, keymap).await?;
-                session_flow::switch_session(client, chat, next_session_id).await?;
-            }
-            slash_commands::SlashCommandOutcome::PickModel => {
-                model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;
-            }
-            slash_commands::SlashCommandOutcome::PickSkill => {
-                skill_flow::pick_skill_for_session(terminal, client, chat, keymap).await?;
-            }
-            slash_commands::SlashCommandOutcome::ToggleDiff => {
-                let _changed = chat.app.toggle_diff_visible();
-                chat.app.set_status(if chat.app.diff_visible() {
-                    "diff panel shown".to_owned()
-                } else {
-                    "diff panel hidden".to_owned()
-                });
-            }
-            slash_commands::SlashCommandOutcome::Unknown(command) => {
-                chat.app
-                    .set_status(format!("unknown slash command: {command}"));
-            }
-        }
-        return Ok(None);
+    if has_known_slash_command(&message) {
+        return handle_slash_command(client, keymap, chat, terminal, session_id, &message).await;
     }
     match client.send_user_message(session_id, message.clone()).await {
         Ok(acceptance) => {
