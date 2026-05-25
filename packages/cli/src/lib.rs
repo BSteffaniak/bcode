@@ -2658,13 +2658,28 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
         "model: {}",
         status.selected_model_id.as_deref().unwrap_or("<default>")
     );
-    if status.session_catalog_loaded {
-        println!("sessions: {}", status.sessions.len());
-    } else {
-        println!(
-            "sessions: {} cached (catalog not loaded)",
-            status.sessions.len()
-        );
+    match &status.session_catalog_status {
+        bcode_ipc::SessionCatalogStatus::Loaded => {
+            println!("sessions: {}", status.sessions.len());
+        }
+        bcode_ipc::SessionCatalogStatus::Loading => {
+            println!(
+                "sessions: {} cached (catalog loading)",
+                status.sessions.len()
+            );
+        }
+        bcode_ipc::SessionCatalogStatus::NotStarted => {
+            println!(
+                "sessions: {} cached (catalog not started)",
+                status.sessions.len()
+            );
+        }
+        bcode_ipc::SessionCatalogStatus::Failed(message) => {
+            println!(
+                "sessions: {} cached (catalog failed: {message})",
+                status.sessions.len()
+            );
+        }
     }
     print_runtime_summary(&status.plugin_runtime, verbose);
     println!("log: {}", daemon_log_path().display());

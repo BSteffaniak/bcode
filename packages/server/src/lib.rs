@@ -12,8 +12,8 @@ use bcode_agent_profile::{
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError, PluginServiceResponse,
-    PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus, decode, event_envelope,
-    recv_envelope, response_envelope, send_envelope,
+    PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus, SessionCatalogStatus,
+    decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
@@ -22,7 +22,7 @@ use bcode_model::{
     OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
-use bcode_session::SessionManager;
+use bcode_session::{CatalogLoadStatus, SessionManager};
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
     RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionTokenUsage,
@@ -473,6 +473,7 @@ impl ServerState {
                 .cached_sessions(&bcode_ipc::current_working_directory())
                 .await,
             session_catalog_loaded: self.sessions.catalog_loaded(),
+            session_catalog_status: catalog_status_to_ipc(self.sessions.catalog_status()),
             selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
             selected_model_id: self.selected_model_id.clone(),
             plugin_runtime: self.plugins.executor_statuses(),
@@ -485,6 +486,15 @@ impl ServerState {
 
     fn request_shutdown(&self) {
         let _ = self.shutdown.send(());
+    }
+}
+
+fn catalog_status_to_ipc(status: CatalogLoadStatus) -> SessionCatalogStatus {
+    match status {
+        CatalogLoadStatus::NotStarted => SessionCatalogStatus::NotStarted,
+        CatalogLoadStatus::Loading => SessionCatalogStatus::Loading,
+        CatalogLoadStatus::Loaded => SessionCatalogStatus::Loaded,
+        CatalogLoadStatus::Failed(message) => SessionCatalogStatus::Failed(message),
     }
 }
 

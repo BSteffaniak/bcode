@@ -224,6 +224,17 @@ pub struct ClientRuntimeContext {
     pub env_keys: BTreeMap<String, bool>,
 }
 
+/// Persistent session catalog discovery status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCatalogStatus {
+    #[default]
+    NotStarted,
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
 /// Local server status summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -231,6 +242,8 @@ pub struct ServerStatus {
     pub sessions: Vec<SessionSummary>,
     #[serde(default)]
     pub session_catalog_loaded: bool,
+    #[serde(default)]
+    pub session_catalog_status: SessionCatalogStatus,
     #[serde(default)]
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
