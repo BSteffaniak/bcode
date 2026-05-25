@@ -846,7 +846,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bcode_github_plugin"
+name = "bcode_git_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
@@ -973,7 +973,7 @@ dependencies = [
  "bcode_default_agents_plugin",
  "bcode_fake_provider_plugin",
  "bcode_filesystem_plugin",
- "bcode_github_plugin",
+ "bcode_git_plugin",
  "bcode_ipc",
  "bcode_model",
  "bcode_openai_compatible_provider_plugin",

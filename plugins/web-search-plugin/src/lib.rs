@@ -1075,12 +1075,12 @@ fn inspect_tool_definition() -> ToolDefinition {
 fn inspect_url(url: &str) -> Result<InspectResponse, WebError> {
     validate_url(url)?;
     let lower = url.to_ascii_lowercase();
-    let (kind, recommended_tool, recommended_action, notes) = if is_github_repo_url(&lower) {
+    let (kind, recommended_tool, recommended_action, notes) = if is_git_repo_url(&lower) {
         (
-            "github_repo",
-            Some("github.clone".to_string()),
-            "Use github.clone when available so the agent can inspect real repository files instead of rendered GitHub HTML.".to_string(),
-            vec!["GitHub repository pages are poor fetch targets for code understanding.".to_string()],
+            "git_repository",
+            Some("git.clone".to_string()),
+            "Use git.clone when available so the agent can inspect real repository files instead of rendered forge HTML.".to_string(),
+            vec!["Git repository web pages are poor fetch targets for code understanding.".to_string()],
         )
     } else if std::path::Path::new(&lower)
         .extension()
@@ -1118,23 +1118,38 @@ fn inspect_url(url: &str) -> Result<InspectResponse, WebError> {
     })
 }
 
-fn is_github_repo_url(lower_url: &str) -> bool {
-    if !(lower_url.starts_with("https://github.com/")
-        || lower_url.starts_with("http://github.com/"))
-    {
+fn is_git_repo_url(lower_url: &str) -> bool {
+    for host in ["github.com", "gitlab.com", "codeberg.org", "bitbucket.org"] {
+        if forge_repo_url(lower_url, host) {
+            return true;
+        }
+    }
+    has_git_extension(lower_url)
+}
+
+fn has_git_extension(value: &str) -> bool {
+    std::path::Path::new(value)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
+}
+
+fn forge_repo_url(lower_url: &str, host: &str) -> bool {
+    let secure_prefix = format!("https://{host}/");
+    let plain_prefix = format!("http://{host}/");
+    if !(lower_url.starts_with(&secure_prefix) || lower_url.starts_with(&plain_prefix)) {
         return false;
     }
     let path = lower_url
-        .trim_start_matches("https://github.com/")
-        .trim_start_matches("http://github.com/");
+        .trim_start_matches(&secure_prefix)
+        .trim_start_matches(&plain_prefix);
     let mut segments = path.split('/').filter(|segment| !segment.is_empty());
-    let Some(_owner) = segments.next() else {
+    let Some(owner) = segments.next() else {
         return false;
     };
     let Some(repo) = segments.next() else {
         return false;
     };
-    !matches!(repo, "features" | "topics" | "trending" | "marketplace")
+    !matches!(owner, "features" | "topics" | "trending" | "marketplace") && !repo.is_empty()
 }
 
 fn is_youtube_url(lower_url: &str) -> bool {
@@ -1724,8 +1739,8 @@ mod tests {
     #[test]
     fn inspect_recommends_specialized_tools_for_developer_resources() {
         let github = inspect_url("https://github.com/bmorphism/bcode").expect("github url");
-        assert_eq!(github.kind, "github_repo");
-        assert_eq!(github.recommended_tool.as_deref(), Some("github.clone"));
+        assert_eq!(github.kind, "git_repository");
+        assert_eq!(github.recommended_tool.as_deref(), Some("git.clone"));
 
         let pdf = inspect_url("https://example.com/paper.pdf").expect("pdf url");
         assert_eq!(pdf.kind, "pdf");

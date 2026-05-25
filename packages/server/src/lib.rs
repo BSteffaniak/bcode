@@ -520,10 +520,10 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
             bcode_filesystem_plugin::static_plugin(),
         ),
-        #[cfg(feature = "static-bundled-github-plugin")]
+        #[cfg(feature = "static-bundled-git-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/github-plugin/bcode-plugin.toml"),
-            bcode_github_plugin::static_plugin(),
+            include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
+            bcode_git_plugin::static_plugin(),
         ),
         #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
         bcode_plugin::StaticBundledPlugin::new(

@@ -54,6 +54,7 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("web.fetch".to_string(), true),
                 ("web.status".to_string(), true),
                 ("web.inspect".to_string(), true),
+                ("git.clone".to_string(), true),
                 ("github.clone".to_string(), true),
             ]),
             permission: PermissionConfig {
@@ -80,6 +81,7 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("web.fetch".to_string(), true),
                 ("web.status".to_string(), true),
                 ("web.inspect".to_string(), true),
+                ("git.clone".to_string(), true),
                 ("github.clone".to_string(), true),
             ]),
             permission: PermissionConfig {

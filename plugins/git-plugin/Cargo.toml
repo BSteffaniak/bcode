@@ -1,11 +1,11 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled GitHub access tool plugin for bcode"
+description = "Bundled Git repository access tool plugin for bcode"
 edition     = { workspace = true }
-keywords    = ["bcode", "github", "git", "tool", "plugin"]
+keywords    = ["bcode", "git", "repository", "tool", "plugin"]
 license     = { workspace = true }
-name        = "bcode_github_plugin"
+name        = "bcode_git_plugin"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
