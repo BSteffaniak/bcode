@@ -134,6 +134,3 @@ For docs-only changes, no runtime validation is required.
 
 If a required command cannot be run, explain why in the final response.
 
-## Progress Tracking
-
-Keep `bcode-progress.md` updated with durable planning context, high-level requirements, feature decisions, and open questions that should outlive a single agent session.
