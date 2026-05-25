@@ -17,4 +17,14 @@ if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session
   violations=1
 fi
 
+if ! rg -q "mod actor;" packages/session/src/lib.rs; then
+  echo "Session module split violation: actor module must remain split from lib.rs." >&2
+  violations=1
+fi
+
+if ! rg -q "mod store_executor;" packages/session/src/lib.rs; then
+  echo "Session module split violation: store executor module must remain split from lib.rs." >&2
+  violations=1
+fi
+
 exit "$violations"
