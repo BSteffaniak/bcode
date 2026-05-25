@@ -2,9 +2,9 @@
 
 use std::io::Write;
 
-use bcode_client::BcodeClient;
-use bcode_ipc::Event as BcodeEvent;
-use bcode_session_models::{SessionId, SessionSummary};
+use bcode_client::{BcodeClient, SessionList};
+use bcode_ipc::{Event as BcodeEvent, SessionCatalogStatus};
+use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::crossterm::poll_event;
 use bmux_tui::event::{Event, FocusEvent};
@@ -98,14 +98,22 @@ enum PickerKeyOutcome {
     Canceled,
 }
 
-type SessionListTask = JoinHandle<Result<Vec<SessionSummary>, bcode_client::ClientError>>;
+type SessionListTask = JoinHandle<Result<SessionList, bcode_client::ClientError>>;
 
 fn spawn_session_list(client: &BcodeClient) -> SessionListTask {
     let client = client.clone();
-    tokio::spawn(async move { client.list_sessions().await })
+    tokio::spawn(async move { client.list_sessions_with_status().await })
+}
+
+const fn catalog_still_loading(status: &SessionCatalogStatus) -> bool {
+    matches!(
+        status,
+        SessionCatalogStatus::NotStarted | SessionCatalogStatus::Loading
+    )
 }
 
 async fn poll_session_list(
+    client: &BcodeClient,
     picker: &mut session_picker::SessionPickerApp,
     session_load: &mut Option<SessionListTask>,
 ) {
@@ -119,9 +127,15 @@ async fn poll_session_list(
         return;
     };
     match task.await {
-        Ok(Ok(sessions)) => {
-            picker.replace_sessions(sessions);
-            picker.set_status("Select a session or press Ctrl-N to create one".to_owned());
+        Ok(Ok(session_list)) => {
+            let is_loading = catalog_still_loading(&session_list.catalog_status);
+            picker.replace_sessions(session_list.sessions);
+            if is_loading {
+                picker.set_status("Loading sessions; press Ctrl-N to create one".to_owned());
+                *session_load = Some(spawn_session_list(client));
+            } else {
+                picker.set_status("Select a session or press Ctrl-N to create one".to_owned());
+            }
         }
         Ok(Err(error)) => picker.set_status(format!("Session load failed: {error}")),
         Err(error) => picker.set_status(format!("Session load task failed: {error}")),
@@ -144,7 +158,7 @@ pub async fn pick_session<W: Write>(
     picker.set_status("Loading sessions; press Ctrl-N to create one".to_owned());
     let mut session_load = Some(spawn_session_list(client));
     loop {
-        poll_session_list(&mut picker, &mut session_load).await;
+        poll_session_list(client, &mut picker, &mut session_load).await;
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
         let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
@@ -202,7 +216,7 @@ pub async fn pick_session_for_mutation<W: Write>(
     let mut session_load = Some(spawn_session_list(client));
     let mut pending_start_mode = Some(start_mode);
     loop {
-        poll_session_list(&mut picker, &mut session_load).await;
+        poll_session_list(client, &mut picker, &mut session_load).await;
         if session_load.is_none()
             && let Some(start_mode) = pending_start_mode.take()
         {

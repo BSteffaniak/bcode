@@ -323,6 +323,8 @@ pub enum ResponsePayload {
     },
     SessionList {
         sessions: Vec<SessionSummary>,
+        #[serde(default)]
+        catalog_status: SessionCatalogStatus,
     },
     SessionRenamed {
         session: SessionSummary,

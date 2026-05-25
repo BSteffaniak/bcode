@@ -1165,11 +1165,13 @@ async fn handle_list_sessions(
     working_directory: &Path,
 ) -> Result<(), ServerError> {
     let session_list = state.sessions.list_sessions(working_directory).await;
+    let catalog_status = catalog_status_to_ipc(state.sessions.catalog_status());
     send_response(
         writer,
         request_id,
         Response::Ok(ResponsePayload::SessionList {
             sessions: session_list,
+            catalog_status,
         }),
     )
     .await

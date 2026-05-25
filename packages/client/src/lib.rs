@@ -8,8 +8,8 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
-    Response, ResponsePayload, current_working_directory, decode, default_endpoint, recv_envelope,
-    request_envelope, send_envelope,
+    Response, ResponsePayload, SessionCatalogStatus, current_working_directory, decode,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
@@ -32,6 +32,13 @@ pub enum ClientError {
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
     UnexpectedEnvelope,
+}
+
+/// Session list response with persistent catalog status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionList {
+    pub sessions: Vec<SessionSummary>,
+    pub catalog_status: SessionCatalogStatus,
 }
 
 /// History returned when attaching to a session.
@@ -295,6 +302,15 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ClientError> {
+        Ok(self.list_sessions_with_status().await?.sessions)
+    }
+
+    /// List sessions and return the persistent catalog status observed by the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_sessions_with_status(&self) -> Result<SessionList, ClientError> {
         let mut connection = self.connect("bcode-cli").await?;
         match connection
             .send_request(Request::ListSessions {
@@ -302,7 +318,13 @@ impl BcodeClient {
             })
             .await?
         {
-            ResponsePayload::SessionList { sessions } => Ok(sessions),
+            ResponsePayload::SessionList {
+                sessions,
+                catalog_status,
+            } => Ok(SessionList {
+                sessions,
+                catalog_status,
+            }),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
