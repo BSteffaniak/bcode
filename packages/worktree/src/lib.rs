@@ -421,6 +421,28 @@ mod tests {
     }
 
     #[test]
+    fn create_worktree_applies_native_setup_config() {
+        let repo = TempRepo::init();
+        std::fs::write(repo.root.join(".env"), "TOKEN=test\n").expect("env should be written");
+        std::fs::write(
+            repo.root.join("worktree.config.toml"),
+            "copy = [\".env\"]\n",
+        )
+        .expect("setup config should be written");
+        let mut request = create_request("Setup Copy");
+        request.no_setup = false;
+
+        let response = create_worktree(&bcode_config::BcodeConfig::default(), &request, &repo.root)
+            .expect("worktree should be created with setup");
+
+        assert!(response.setup_applied);
+        assert_eq!(
+            std::fs::read_to_string(response.path.join(".env")).expect("env should be copied"),
+            "TOKEN=test\n"
+        );
+    }
+
+    #[test]
     fn remove_worktree_removes_registered_worktree() {
         let repo = TempRepo::init();
         let request = create_request("Remove Me");
