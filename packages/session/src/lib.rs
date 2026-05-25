@@ -404,32 +404,35 @@ impl SessionEventStore {
         Ok(events)
     }
 
-    fn write_state_index(&self, state: &SessionState) -> Result<(), SessionStoreError> {
-        let path = self.event_path(state.summary.id);
+    fn write_metadata_index(
+        &self,
+        metadata: &PersistedSessionMetadata,
+    ) -> Result<(), SessionStoreError> {
+        let path = self.event_path(metadata.summary.id);
         let file = index::fingerprint(&path)?;
         let index = index::SessionIndex {
             index_version: index::SESSION_INDEX_VERSION,
-            session_id: state.summary.id,
+            session_id: metadata.summary.id,
             last_good_offset: file.len,
             file,
             summary: SessionSummary {
                 client_count: 0,
-                ..state.summary.clone()
+                ..metadata.summary.clone()
             },
-            working_directory: state.working_directory.clone(),
-            next_sequence: state.next_sequence,
-            event_count: state.event_count,
-            created_at_ms: state.summary.created_at_ms,
-            updated_at_ms: state.summary.updated_at_ms,
-            has_user_message: state.has_user_message,
-            current_provider: state.current_provider.clone(),
-            current_model: state.current_model.clone(),
-            current_agent: state.current_agent.clone(),
-            latest_compaction_sequence: state.latest_compaction_sequence,
-            total_metered_tokens: state.total_metered_tokens,
+            working_directory: metadata.working_directory.clone(),
+            next_sequence: metadata.next_sequence,
+            event_count: metadata.event_count,
+            created_at_ms: metadata.summary.created_at_ms,
+            updated_at_ms: metadata.summary.updated_at_ms,
+            has_user_message: metadata.has_user_message,
+            current_provider: metadata.current_provider.clone(),
+            current_model: metadata.current_model.clone(),
+            current_agent: metadata.current_agent.clone(),
+            latest_compaction_sequence: metadata.latest_compaction_sequence,
+            total_metered_tokens: metadata.total_metered_tokens,
             min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            issues: state.index_issues.clone(),
+            issues: metadata.index_issues.clone(),
         };
         index::write_index(&self.root, &index)
     }
@@ -944,6 +947,38 @@ fn read_indexed_events(
         .collect()
 }
 
+struct PersistedSessionMetadata {
+    summary: SessionSummary,
+    working_directory: PathBuf,
+    next_sequence: u64,
+    event_count: usize,
+    has_user_message: bool,
+    current_provider: Option<String>,
+    current_model: Option<String>,
+    current_agent: Option<String>,
+    latest_compaction_sequence: Option<u64>,
+    total_metered_tokens: u64,
+    index_issues: Vec<index::SessionIndexIssue>,
+}
+
+impl PersistedSessionMetadata {
+    fn from_state(state: &SessionState) -> Self {
+        Self {
+            summary: state.summary.clone(),
+            working_directory: state.working_directory.clone(),
+            next_sequence: state.next_sequence,
+            event_count: state.event_count,
+            has_user_message: state.has_user_message,
+            current_provider: state.current_provider.clone(),
+            current_model: state.current_model.clone(),
+            current_agent: state.current_agent.clone(),
+            latest_compaction_sequence: state.latest_compaction_sequence,
+            total_metered_tokens: state.total_metered_tokens,
+            index_issues: state.index_issues.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SessionStoreExecutor {
     store: SessionEventStore,
@@ -952,10 +987,6 @@ struct SessionStoreExecutor {
 impl SessionStoreExecutor {
     const fn new(store: SessionEventStore) -> Self {
         Self { store }
-    }
-
-    const fn store(&self) -> &SessionEventStore {
-        &self.store
     }
 
     async fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
@@ -990,6 +1021,19 @@ impl SessionStoreExecutor {
     async fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let store = self.store.clone();
         spawn_blocking(move || store.delete(session_id)).await?
+    }
+
+    async fn append_event_frame(&self, event: SessionEvent) -> Result<(), SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.append(&event).map(|_| ())).await?
+    }
+
+    async fn write_metadata_index(
+        &self,
+        metadata: PersistedSessionMetadata,
+    ) -> Result<(), SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.write_metadata_index(&metadata)).await?
     }
 
     async fn read_session_events(
@@ -1061,6 +1105,7 @@ pub struct SessionMaintenanceStatus {
 #[derive(Debug, Clone)]
 struct SessionHandle {
     state: Arc<Mutex<SessionState>>,
+    operation: Arc<Mutex<()>>,
     snapshot: Arc<RwLock<SessionSnapshot>>,
 }
 
@@ -1070,6 +1115,7 @@ impl SessionHandle {
         let snapshot = SessionSnapshot::from_state(&state);
         Self {
             state: Arc::new(Mutex::new(state)),
+            operation: Arc::new(Mutex::new(())),
             snapshot: Arc::new(RwLock::new(snapshot)),
         }
     }
@@ -1086,6 +1132,44 @@ impl SessionHandle {
             .snapshot
             .write()
             .expect("session snapshot lock poisoned") = SessionSnapshot::from_state(state);
+    }
+
+    async fn append_event(
+        &self,
+        kind: SessionEventKind,
+        store: Option<&SessionStoreExecutor>,
+        activity_timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        let _operation = self.operation.lock().await;
+        let event = {
+            let state = self.state.lock().await;
+            state.build_next_event(kind)?
+        };
+        if let Some(store) = store {
+            store.append_event_frame(event.clone()).await?;
+            let metadata = {
+                let mut state = self.state.lock().await;
+                state.apply_persisted_event(event.clone(), activity_timestamp_ms);
+                state.index_status = SessionIndexStatusKind::Current;
+                PersistedSessionMetadata::from_state(&state)
+            };
+            if let Err(error) = store.write_metadata_index(metadata).await {
+                let mut state = self.state.lock().await;
+                state.index_status = SessionIndexStatusKind::Stale;
+                eprintln!(
+                    "failed to update session index for {}: {error}",
+                    state.summary.id
+                );
+            }
+        } else {
+            self.state
+                .lock()
+                .await
+                .apply_persisted_event(event.clone(), activity_timestamp_ms);
+        }
+        let state = self.state.lock().await;
+        self.refresh_snapshot(&state);
+        Ok(event)
     }
 }
 
@@ -1287,7 +1371,7 @@ impl SessionManager {
             updated_at_ms: now_ms,
             working_directory: working_directory.clone(),
         };
-        let mut state = SessionState {
+        let state = SessionState {
             summary: summary.clone(),
             working_directory: working_directory.clone(),
             clients: BTreeSet::new(),
@@ -1305,19 +1389,18 @@ impl SessionManager {
             access_status: SessionAccessStatus::ReadWrite,
             sender,
         };
-        state.push_event(
-            SessionEventKind::SessionCreated {
-                name,
-                working_directory,
-            },
-            self.store.as_ref().map(SessionStoreExecutor::store),
-            now_ms,
-        )?;
-        self.inner
-            .lock()
-            .await
-            .sessions
-            .insert(id, SessionHandle::new(state));
+        let handle = SessionHandle::new(state);
+        handle
+            .append_event(
+                SessionEventKind::SessionCreated {
+                    name,
+                    working_directory,
+                },
+                self.store.as_ref(),
+                now_ms,
+            )
+            .await?;
+        self.inner.lock().await.sessions.insert(id, handle);
         Ok(summary)
     }
 
@@ -1390,17 +1473,15 @@ impl SessionManager {
         let normalized_name = normalize_session_name(name);
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        let mut state = handle.state.lock().await;
-        state.ensure_writable()?;
-        state.summary.name.clone_from(&normalized_name);
-        let event = state.push_event(
-            SessionEventKind::SessionRenamed {
-                name: normalized_name,
-            },
-            self.store.as_ref().map(SessionStoreExecutor::store),
-            activity_timestamp_ms,
-        )?;
-        handle.refresh_snapshot(&state);
+        let event = handle
+            .append_event(
+                SessionEventKind::SessionRenamed {
+                    name: normalized_name,
+                },
+                self.store.as_ref(),
+                activity_timestamp_ms,
+            )
+            .await?;
         Ok(event)
     }
 
@@ -1631,8 +1712,7 @@ impl SessionManager {
             .await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        let mut state = handle.state.lock().await;
-        let history = if let Some(events) = &state.events {
+        let history = if let Some(events) = &handle.state.lock().await.events {
             events.clone()
         } else {
             let store = self
@@ -1642,17 +1722,20 @@ impl SessionManager {
             store.read_session_events(session_id).await?
         };
         let input_history = input_history_from_events(&history);
+        let mut state = handle.state.lock().await;
         state.ensure_writable()?;
         state.clients.insert(client_id);
         state.summary.client_count = state.clients.len();
         let events = state.sender.subscribe();
-        let attached_event = state.push_event(
-            SessionEventKind::ClientAttached { client_id },
-            self.store.as_ref().map(SessionStoreExecutor::store),
-            activity_timestamp_ms,
-        )?;
         let session = state.summary();
-        handle.refresh_snapshot(&state);
+        drop(state);
+        let attached_event = handle
+            .append_event(
+                SessionEventKind::ClientAttached { client_id },
+                self.store.as_ref(),
+                activity_timestamp_ms,
+            )
+            .await?;
         Ok(SessionAttachment {
             session,
             history,
@@ -1698,13 +1781,15 @@ impl SessionManager {
         state.clients.insert(client_id);
         state.summary.client_count = state.clients.len();
         let events = state.sender.subscribe();
-        let attached_event = state.push_event(
-            SessionEventKind::ClientAttached { client_id },
-            self.store.as_ref().map(SessionStoreExecutor::store),
-            activity_timestamp_ms,
-        )?;
         let session = state.summary();
-        handle.refresh_snapshot(&state);
+        drop(state);
+        let attached_event = handle
+            .append_event(
+                SessionEventKind::ClientAttached { client_id },
+                self.store.as_ref(),
+                activity_timestamp_ms,
+            )
+            .await?;
         Ok(SessionAttachment {
             session,
             history,
@@ -1732,12 +1817,14 @@ impl SessionManager {
         state.ensure_writable()?;
         if state.clients.remove(&client_id) {
             state.summary.client_count = state.clients.len();
-            let event = state.push_event(
-                SessionEventKind::ClientDetached { client_id },
-                self.store.as_ref().map(SessionStoreExecutor::store),
-                activity_timestamp_ms,
-            )?;
-            handle.refresh_snapshot(&state);
+            drop(state);
+            let event = handle
+                .append_event(
+                    SessionEventKind::ClientDetached { client_id },
+                    self.store.as_ref(),
+                    activity_timestamp_ms,
+                )
+                .await?;
             return Ok(Some(event));
         }
         Ok(None)
@@ -1761,24 +1848,33 @@ impl SessionManager {
             .await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        let mut state = handle.state.lock().await;
-        state.ensure_writable()?;
         let mut events = Vec::new();
-        if state.summary.name.is_none() && !state.has_user_message {
+        let should_rename = {
+            let state = handle.state.lock().await;
+            state.ensure_writable()?;
+            state.summary.name.is_none() && !state.has_user_message
+        };
+        if should_rename {
             let title = title_from_first_prompt(&text);
-            state.summary.name = Some(title.clone());
-            events.push(state.push_event(
-                SessionEventKind::SessionRenamed { name: Some(title) },
-                self.store.as_ref().map(SessionStoreExecutor::store),
-                activity_timestamp_ms,
-            )?);
+            events.push(
+                handle
+                    .append_event(
+                        SessionEventKind::SessionRenamed { name: Some(title) },
+                        self.store.as_ref(),
+                        activity_timestamp_ms,
+                    )
+                    .await?,
+            );
         }
-        events.push(state.push_event(
-            SessionEventKind::UserMessage { client_id, text },
-            self.store.as_ref().map(SessionStoreExecutor::store),
-            activity_timestamp_ms,
-        )?);
-        handle.refresh_snapshot(&state);
+        events.push(
+            handle
+                .append_event(
+                    SessionEventKind::UserMessage { client_id, text },
+                    self.store.as_ref(),
+                    activity_timestamp_ms,
+                )
+                .await?,
+        );
         Ok(events)
     }
 
@@ -2125,14 +2221,9 @@ impl SessionManager {
             .await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        let mut state = handle.state.lock().await;
-        state.ensure_writable()?;
-        let event = state.push_event(
-            kind,
-            self.store.as_ref().map(SessionStoreExecutor::store),
-            activity_timestamp_ms,
-        )?;
-        handle.refresh_snapshot(&state);
+        let event = handle
+            .append_event(kind, self.store.as_ref(), activity_timestamp_ms)
+            .await?;
         Ok(event)
     }
 
@@ -2237,25 +2328,24 @@ impl SessionState {
         }
     }
 
-    fn push_event(
-        &mut self,
-        kind: SessionEventKind,
-        store: Option<&SessionEventStore>,
-        activity_timestamp_ms: u64,
-    ) -> Result<SessionEvent, SessionStoreError> {
-        let event = SessionEvent {
+    fn build_next_event(&self, kind: SessionEventKind) -> Result<SessionEvent, SessionError> {
+        self.ensure_writable()?;
+        Ok(SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: self.next_sequence,
             session_id: self.summary.id,
             kind,
-        };
-        if let Some(store) = store {
-            store.append(&event)?;
-        }
+        })
+    }
+
+    fn apply_persisted_event(&mut self, event: SessionEvent, activity_timestamp_ms: u64) {
         self.summary.updated_at_ms = activity_timestamp_ms;
         self.next_sequence += 1;
         self.event_count = self.event_count.saturating_add(1);
         match &event.kind {
+            SessionEventKind::SessionRenamed { name } => {
+                self.summary.name.clone_from(name);
+            }
             SessionEventKind::UserMessage { .. } => self.has_user_message = true,
             SessionEventKind::ModelChanged { provider, model } => {
                 self.current_provider = Some(provider.clone());
@@ -2281,17 +2371,7 @@ impl SessionState {
         if let Some(events) = &mut self.events {
             events.push(event.clone());
         }
-        if let Some(store) = store {
-            match store.write_state_index(self) {
-                Ok(()) => self.index_status = SessionIndexStatusKind::Current,
-                Err(error) => eprintln!(
-                    "failed to update session index for {}: {error}",
-                    self.summary.id
-                ),
-            }
-        }
-        let _ = self.sender.send(event.clone());
-        Ok(event)
+        let _ = self.sender.send(event);
     }
 }
 
