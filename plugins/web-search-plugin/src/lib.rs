@@ -230,6 +230,10 @@ struct WebSearchProviderConfig {
     serper: ProviderConfig,
     #[serde(default)]
     serpapi: ProviderConfig,
+    #[serde(default)]
+    perplexity: ProviderConfig,
+    #[serde(default)]
+    gemini: ProviderConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -302,6 +306,10 @@ struct FetchRequest {
     timeout_ms: Option<u64>,
     #[serde(default)]
     render: bool,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -318,6 +326,8 @@ struct FetchResponse {
     fallback_used: String,
     content_format: String,
     extraction: String,
+    prompt: Option<String>,
+    prompt_response: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -462,6 +472,50 @@ struct SerpApiResult {
     source: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PerplexitySearchResponse {
+    #[serde(default)]
+    choices: Vec<PerplexityChoice>,
+    #[serde(default)]
+    citations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PerplexityChoice {
+    #[serde(default)]
+    message: PerplexityMessage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PerplexityMessage {
+    #[serde(default)]
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GeminiGenerateResponse {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GeminiCandidate {
+    #[serde(default)]
+    content: GeminiContent,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GeminiContent {
+    #[serde(default)]
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GeminiPart {
+    #[serde(default)]
+    text: String,
+}
+
 #[derive(Debug, Error)]
 enum WebError {
     #[error("{0}")]
@@ -488,6 +542,8 @@ async fn search_async(
         "brave" => search_brave(request, &config).await,
         "tavily" => search_tavily(request, &config).await,
         "exa" => search_exa(request, &config).await,
+        "perplexity" | "pplx" => search_perplexity(request, &config).await,
+        "gemini" | "google_gemini" => search_gemini(request, &config).await,
         "serper" => search_serper(request, &config).await,
         "serpapi" | "serp_api" => search_serpapi(request, &config).await,
         "model_native" => Ok(SearchResponse {
@@ -631,6 +687,120 @@ async fn search_exa(
         })
         .collect();
     Ok(search_response(request.query, "exa", results))
+}
+
+async fn search_perplexity(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(
+        &config.providers.perplexity,
+        &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
+    )?;
+    let max_results = max_results(&request, config);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
+    let body = json!({
+        "model": "sonar",
+        "messages": [
+            { "role": "system", "content": "Search the web and return concise cited results." },
+            { "role": "user", "content": scoped_query(&request) }
+        ],
+        "return_citations": true
+    });
+    let text = checked_text(
+        client
+            .post("https://api.perplexity.ai/chat/completions")
+            .header("Accept", "application/json")
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<PerplexitySearchResponse>(&text)?;
+    let content = decoded
+        .choices
+        .first()
+        .map(|choice| choice.message.content.clone())
+        .unwrap_or_default();
+    let mut results: Vec<SearchResult> = decoded
+        .citations
+        .into_iter()
+        .filter(|url| !url.is_empty())
+        .take(max_results)
+        .map(|url| SearchResult {
+            title: url.clone(),
+            url,
+            snippet: content.clone(),
+            published: None,
+            source: Some("perplexity".to_string()),
+        })
+        .collect();
+    if results.is_empty() && !content.trim().is_empty() {
+        results.push(SearchResult {
+            title: format!("Perplexity answer for {}", request.query),
+            url: String::new(),
+            snippet: content,
+            published: None,
+            source: Some("perplexity".to_string()),
+        });
+    }
+    Ok(search_response(request.query, "perplexity", results))
+}
+
+async fn search_gemini(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(
+        &config.providers.gemini,
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    )?;
+    let max_results = max_results(&request, config);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
+    let prompt = format!(
+        "Search the web for this query and return up to {max_results} concise results with URLs and snippets:\n{}",
+        scoped_query(&request)
+    );
+    let body = json!({
+        "contents": [{ "parts": [{ "text": prompt }] }],
+        "tools": [{ "google_search": {} }]
+    });
+    let text = checked_text(
+        client
+            .post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent")
+            .query(&[("key", api_key.as_str())])
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<GeminiGenerateResponse>(&text)?;
+    let content = gemini_text(&decoded);
+    let results = urls_from_text(&content)
+        .into_iter()
+        .take(max_results)
+        .map(|url| SearchResult {
+            title: url.clone(),
+            url,
+            snippet: content.clone(),
+            published: None,
+            source: Some("gemini".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let results = if results.is_empty() && !content.trim().is_empty() {
+        vec![SearchResult {
+            title: format!("Gemini answer for {}", request.query),
+            url: String::new(),
+            snippet: content,
+            published: None,
+            source: Some("gemini".to_string()),
+        }]
+    } else {
+        results
+    };
+    Ok(search_response(request.query, "gemini", results))
 }
 
 async fn search_serper(
@@ -815,7 +985,7 @@ async fn fetch_async(
 ) -> Result<FetchResponse, WebError> {
     validate_url(&request.url)?;
     if request.render {
-        return fetch_rendered(request, &config);
+        return fetch_rendered(&request, &config);
     }
     let fallbacks = fetch_fallbacks(&config);
     let plain_result = fetch_plain_async(&request, &config).await;
@@ -858,6 +1028,7 @@ async fn fetch_plain_async(
         let text = raw.into_owned();
         (plain_title(&text), text, None)
     };
+    let prompt_response = prompt_response(request, &text);
     Ok(FetchResponse {
         url: request.url.clone(),
         final_url,
@@ -871,6 +1042,8 @@ async fn fetch_plain_async(
         fallback_used: "plain".to_string(),
         content_format: "markdown".to_string(),
         extraction: "bcode_html".to_string(),
+        prompt: request.prompt.clone(),
+        prompt_response,
     })
 }
 
@@ -896,6 +1069,7 @@ async fn fetch_jina_reader_async(
     let body = response.bytes().await?;
     let truncated = body.len() > max_bytes;
     let text = String::from_utf8_lossy(&body[..body.len().min(max_bytes)]).to_string();
+    let prompt_response = prompt_response(request, &text);
     Ok(FetchResponse {
         url: request.url.clone(),
         final_url,
@@ -909,11 +1083,17 @@ async fn fetch_jina_reader_async(
         fallback_used: "jina_reader".to_string(),
         content_format: "markdown".to_string(),
         extraction: "jina_reader".to_string(),
+        prompt: request.prompt.clone(),
+        prompt_response,
     })
 }
 
 fn jina_reader_url(url: &str) -> String {
-    format!("https://r.jina.ai/http://r.jina.ai/http://{url}")
+    let trimmed = url.trim();
+    if trimmed.starts_with("https://r.jina.ai/http://") {
+        return trimmed.to_string();
+    }
+    format!("https://r.jina.ai/http://{trimmed}")
 }
 
 fn should_try_jina(
@@ -931,6 +1111,17 @@ fn should_try_jina(
     })
 }
 
+fn prompt_response(request: &FetchRequest, _text: &str) -> Option<String> {
+    let prompt = request.prompt.as_deref()?.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    let provider = request.provider.as_deref().unwrap_or("auto");
+    Some(format!(
+        "Prompted extraction requested via provider '{provider}': {prompt}\n\nNo configured provider-backed extraction is available in web.fetch yet; use the returned page text/markdown to answer the prompt."
+    ))
+}
+
 fn fetch_fallbacks(config: &WebSearchConfig) -> Vec<FetchFallback> {
     let configured = config
         .fetch
@@ -945,7 +1136,7 @@ fn fetch_fallbacks(config: &WebSearchConfig) -> Vec<FetchFallback> {
 }
 
 fn fetch_rendered(
-    request: FetchRequest,
+    request: &FetchRequest,
     config: &WebSearchConfig,
 ) -> Result<FetchResponse, WebError> {
     let command = config
@@ -977,9 +1168,10 @@ fn fetch_rendered(
     let truncated = output.stdout.len() > max_bytes;
     let raw = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(max_bytes)]);
     let (title, text, markdown) = html_document_text(&raw);
+    let prompt_response = prompt_response(request, &text);
     Ok(FetchResponse {
         url: request.url.clone(),
-        final_url: request.url,
+        final_url: request.url.clone(),
         status: 200,
         title,
         content_type: Some("text/html; rendered=command".to_string()),
@@ -990,6 +1182,8 @@ fn fetch_rendered(
         fallback_used: "rendered_command".to_string(),
         content_format: "markdown".to_string(),
         extraction: "rendered_command".to_string(),
+        prompt: request.prompt.clone(),
+        prompt_response,
     })
 }
 fn list_tools(
@@ -1021,7 +1215,7 @@ fn search_tool_definition() -> ToolDefinition {
             "required": ["query"],
             "properties": {
                 "query": { "type": "string" },
-                "provider": { "type": "string", "description": "Optional provider override: auto, model_native, brave, tavily, exa, serper, serpapi, or duckduckgo_html" },
+                "provider": { "type": "string", "description": "Optional provider override: auto, model_native, brave, tavily, exa, perplexity, gemini, serper, serpapi, or duckduckgo_html" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
                 "site": { "type": "string", "description": "Optional domain to restrict results with a site: query" },
                 "freshness": { "type": "string", "description": "Provider-specific freshness filter such as day, week, month, or year" },
@@ -1048,7 +1242,9 @@ fn fetch_tool_definition() -> ToolDefinition {
                 "url": { "type": "string" },
                 "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_FETCH_BYTES },
                 "timeout_ms": { "type": "integer", "minimum": 1 },
-                "render": { "type": "boolean", "description": "Use the explicit rendered-fetch command adapter configured by BCODE_WEB_RENDER_COMMAND" }
+                "render": { "type": "boolean", "description": "Use the explicit rendered-fetch command adapter configured by BCODE_WEB_RENDER_COMMAND" },
+                "prompt": { "type": "string", "description": "Optional question or extraction prompt to carry alongside fetched content" },
+                "provider": { "type": "string", "description": "Reserved provider override for prompted extraction; plain fetch currently returns content plus prompt metadata" }
             }
         }),
         side_effect: ToolSideEffect::ReadOnly,
@@ -1179,7 +1375,7 @@ fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
     let mut recommended = Vec::new();
     if matches!(provider.as_deref(), Some("duckduckgo_html") | None) {
         recommended.push(
-            "Configure Brave, Tavily, Exa, Serper, SerpAPI, or model-native search for more stable results."
+            "Configure Brave, Tavily, Exa, Perplexity, Gemini, Serper, SerpAPI, or model-native search for more stable results."
                 .to_string(),
         );
     }
@@ -1251,6 +1447,28 @@ fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
         || env_value(&["EXA_API_KEY"]).is_some()
     {
         providers.push("exa".to_string());
+    }
+    if config
+        .providers
+        .perplexity
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["PERPLEXITY_API_KEY", "PPLX_API_KEY"]).is_some()
+    {
+        providers.push("perplexity".to_string());
+    }
+    if config
+        .providers
+        .gemini
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).is_some()
+    {
+        providers.push("gemini".to_string());
     }
     if config
         .providers
@@ -1370,6 +1588,28 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
     }
     if config
         .providers
+        .perplexity
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["PERPLEXITY_API_KEY", "PPLX_API_KEY"]).is_some()
+    {
+        return Ok("perplexity".to_string());
+    }
+    if config
+        .providers
+        .gemini
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).is_some()
+    {
+        return Ok("gemini".to_string());
+    }
+    if config
+        .providers
         .serper
         .api_key
         .as_ref()
@@ -1397,6 +1637,32 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         return Ok("duckduckgo_html".to_string());
     }
     Err(WebError::MissingProvider)
+}
+
+fn gemini_text(response: &GeminiGenerateResponse) -> String {
+    response
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.content.parts.iter())
+        .map(|part| part.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn urls_from_text(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '(' | ')' | '[' | ']' | ',' | '.' | ';' | '"' | '\''
+                )
+            });
+            (token.starts_with("http://") || token.starts_with("https://"))
+                .then(|| token.to_string())
+        })
+        .collect()
 }
 
 fn provider_key(config: &ProviderConfig, names: &[&str]) -> Result<String, WebError> {
@@ -1802,6 +2068,24 @@ mod tests {
     }
 
     #[test]
+    fn auto_provider_prefers_perplexity_when_keyed() {
+        let config = WebSearchConfig {
+            allow_best_effort_no_key: true,
+            providers: WebSearchProviderConfig {
+                perplexity: ProviderConfig {
+                    api_key: Some(SecretRef::Value {
+                        value: "pplx-test".to_string(),
+                    }),
+                },
+                ..WebSearchProviderConfig::default()
+            },
+            ..WebSearchConfig::default()
+        };
+        let provider = search_provider(None, &config).expect("perplexity provider");
+        assert_eq!(provider, "perplexity");
+    }
+
+    #[test]
     fn duckduckgo_html_parser_extracts_results() {
         let html = r#"
             <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs&amp;rut=x">Example &amp; Docs</a>
@@ -1827,7 +2111,7 @@ mod tests {
     fn jina_reader_url_wraps_original_url() {
         assert_eq!(
             jina_reader_url("https://example.com/docs"),
-            "https://r.jina.ai/http://r.jina.ai/http://https://example.com/docs"
+            "https://r.jina.ai/http://https://example.com/docs"
         );
     }
 
