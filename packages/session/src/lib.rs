@@ -1073,7 +1073,7 @@ impl SessionStoreExecutor {
 /// In-memory session manager with optional append-only persistence.
 #[derive(Debug, Default)]
 pub struct SessionManager {
-    inner: Mutex<SessionManagerInner>,
+    inner: Arc<Mutex<SessionManagerInner>>,
     store: Option<SessionStoreExecutor>,
     activity_clock_ms: AtomicU64,
 }
@@ -1096,6 +1096,7 @@ enum SessionIndexStatusKind {
 /// Background session maintenance status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SessionMaintenanceStatus {
+    pub catalog_loading: bool,
     pub stale_indexes: usize,
     pub running_rebuilds: usize,
     pub completed_rebuilds: usize,
@@ -1690,7 +1691,7 @@ impl SessionManager {
     ) -> Self {
         let executor = SessionStoreExecutor::new(store);
         Self {
-            inner: Mutex::new(SessionManagerInner {
+            inner: Arc::new(Mutex::new(SessionManagerInner {
                 sessions: sessions
                     .into_iter()
                     .map(|(session_id, state)| {
@@ -1704,7 +1705,7 @@ impl SessionManager {
                 running_catalog_load: false,
                 completed_rebuilds: 0,
                 failed_rebuilds: 0,
-            }),
+            })),
             store: Some(executor),
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
         }
@@ -1753,31 +1754,28 @@ impl SessionManager {
             return;
         }
         inner.running_catalog_load = true;
+        let registry = Arc::clone(&self.inner);
         drop(inner);
 
-        let sessions = match store.load_catalog().await {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                self.inner.lock().await.running_catalog_load = false;
-                eprintln!("failed to load session catalog: {error}");
-                return;
+        tokio::spawn(async move {
+            let sessions = match store.load_catalog().await {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    registry.lock().await.running_catalog_load = false;
+                    eprintln!("failed to load session catalog: {error}");
+                    return;
+                }
+            };
+            let mut inner = registry.lock().await;
+            for (session_id, state) in sessions {
+                inner
+                    .sessions
+                    .entry(session_id)
+                    .or_insert_with(|| SessionHandle::new(state, Some(store.clone())));
             }
-        };
-        let mut inner = self.inner.lock().await;
-        for (session_id, state) in sessions {
-            let store = self.store.clone();
-            inner
-                .sessions
-                .entry(session_id)
-                .or_insert_with(|| SessionHandle::new(state, store));
-        }
-        inner.catalog_loaded = true;
-        inner.running_catalog_load = false;
-    }
-
-    async fn ensure_catalog_loaded(&self) -> Result<(), SessionStoreError> {
-        self.start_catalog_load().await;
-        Ok(())
+            inner.catalog_loaded = true;
+            inner.running_catalog_load = false;
+        });
     }
 
     async fn migrate_session_to_current_if_required(
@@ -1868,9 +1866,7 @@ impl SessionManager {
 
     /// List known sessions from the session catalog.
     pub async fn list_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
-        if let Err(error) = self.ensure_catalog_loaded().await {
-            eprintln!("failed to load session catalog: {error}");
-        }
+        self.start_catalog_load().await;
         self.cached_sessions(working_directory).await
     }
 
@@ -1891,15 +1887,21 @@ impl SessionManager {
 
     /// Return background maintenance status.
     pub async fn maintenance_status(&self) -> SessionMaintenanceStatus {
-        let (handles, completed_rebuilds, failed_rebuilds) = {
+        let (handles, catalog_loading, completed_rebuilds, failed_rebuilds) = {
             let inner = self.inner.lock().await;
             let handles = inner.sessions.values().cloned().collect::<Vec<_>>();
-            (handles, inner.completed_rebuilds, inner.failed_rebuilds)
+            (
+                handles,
+                inner.running_catalog_load,
+                inner.completed_rebuilds,
+                inner.failed_rebuilds,
+            )
         };
         let stale_indexes = stale_index_count(handles);
         SessionMaintenanceStatus {
+            catalog_loading,
             stale_indexes,
-            running_rebuilds: usize::from(self.inner.lock().await.running_catalog_load),
+            running_rebuilds: 0,
             completed_rebuilds,
             failed_rebuilds,
         }
@@ -4223,6 +4225,14 @@ mod tests {
         assert!(!restored.catalog_loaded().await);
 
         let sessions = restored.list_sessions(&test_working_directory()).await;
+        assert!(sessions.len() <= 1);
+        for _ in 0..1000 {
+            if restored.catalog_loaded().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let sessions = restored.cached_sessions(&test_working_directory()).await;
         assert_eq!(sessions.len(), 1);
         assert!(restored.catalog_loaded().await);
 
