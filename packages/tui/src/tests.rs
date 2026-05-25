@@ -794,7 +794,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert_eq!(
         buffer
             .get(Point::new(
-                45,
+                47,
                 output_line_y(&buffer, "+   2 │     42").unwrap()
             ))
             .map(|cell| cell.style.bg),
@@ -803,7 +803,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert_eq!(
         buffer
             .get(Point::new(
-                46,
+                48,
                 output_line_y(&buffer, "+   2 │     42").unwrap()
             ))
             .map(|cell| cell.style.bg),

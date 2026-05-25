@@ -1145,8 +1145,8 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
         .saturating_sub(5)
         .saturating_sub(3)
         .saturating_sub(2);
-    let mut spans = vec![
-        Span::styled("  ", muted_style()),
+    let mut spans = vec![Span::styled("  ", muted_style())];
+    let mut card_spans = vec![
         Span::styled("│ ", muted_style()),
         Span::styled("  ", gutter_style),
         Span::styled(
@@ -1156,14 +1156,19 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
         Span::styled(format!("{line_number:>4}"), gutter_style),
         Span::styled(" │ ", gutter_style),
     ];
-    spans.extend(truncated_inline_diff_content_spans(
+    card_spans.extend(truncated_inline_diff_content_spans(
         line,
         body_width,
         row_style.patch(body_style),
         emphasis_style,
     ));
-    pad_inline_diff_spans(&mut spans, usize::from(width).saturating_sub(2), row_style);
-    spans.push(Span::styled(" │", muted_style()));
+    pad_inline_diff_spans(
+        &mut card_spans,
+        usize::from(width).saturating_sub(2),
+        row_style,
+    );
+    card_spans.push(Span::styled(" │", muted_style()));
+    spans.extend(card_spans);
     Line::from_spans(spans)
 }
 
