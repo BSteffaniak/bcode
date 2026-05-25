@@ -1147,7 +1147,7 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
         .saturating_sub(2);
     let mut spans = vec![
         Span::styled("  ", muted_style()),
-        Span::styled("│ ", row_style.patch(muted_style())),
+        Span::styled("│ ", muted_style()),
         Span::styled("  ", gutter_style),
         Span::styled(
             sign,
@@ -1162,8 +1162,8 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
         row_style.patch(body_style),
         emphasis_style,
     ));
-    pad_inline_diff_spans(&mut spans, usize::from(width), row_style);
-    spans.push(Span::styled(" │", row_style.patch(muted_style())));
+    pad_inline_diff_spans(&mut spans, usize::from(width).saturating_sub(2), row_style);
+    spans.push(Span::styled(" │", muted_style()));
     Line::from_spans(spans)
 }
 

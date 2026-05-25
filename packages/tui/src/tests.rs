@@ -794,11 +794,20 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert_eq!(
         buffer
             .get(Point::new(
-                49,
+                45,
                 output_line_y(&buffer, "+   2 │     42").unwrap()
             ))
             .map(|cell| cell.style.bg),
         Some(Some(bmux_tui::style::Color::Indexed(22)))
+    );
+    assert_eq!(
+        buffer
+            .get(Point::new(
+                46,
+                output_line_y(&buffer, "+   2 │     42").unwrap()
+            ))
+            .map(|cell| cell.style.bg),
+        Some(None)
     );
     assert_eq!(
         buffer
