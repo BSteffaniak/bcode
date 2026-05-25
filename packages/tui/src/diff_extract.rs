@@ -1,10 +1,13 @@
 //! Diff summary extraction for TUI transcript/tool state.
 
 use bcode_syntax_render::SyntaxHighlighter;
-use bmux_tui::diff::{DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind};
+use bmux_tui::diff::{DiffChangedRange, DiffFileSummary, DiffInlineSpan, DiffLine, DiffLineKind};
+use unicode_segmentation::UnicodeSegmentation;
 
 const DIFF_CONTEXT_LINES: usize = 3;
 const MAX_LCS_CELLS: usize = 40_000;
+const MAX_INTRALINE_PAIR_CELLS: usize = 10_000;
+const MAX_INTRALINE_LINE_GRAPHEMES: usize = 2_000;
 
 /// Semantic file-edit content extracted from a filesystem tool request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +120,7 @@ fn diff_lines_from_text(path: &str, old_text: &str, new_text: &str) -> Vec<DiffL
         old_context_end,
         new_context_end,
     );
+    apply_intraline_changed_ranges(&mut lines);
     apply_syntax_highlighting(path, &mut lines);
     lines
 }
@@ -144,6 +148,110 @@ fn push_unchanged_preview(lines: &mut Vec<DiffLine>, old_lines: &[&str]) {
             (*line).to_owned(),
         ));
     }
+}
+
+fn apply_intraline_changed_ranges(lines: &mut [DiffLine]) {
+    let mut index = 0usize;
+    while index < lines.len() {
+        if !matches!(
+            lines[index].kind,
+            DiffLineKind::Added | DiffLineKind::Removed
+        ) {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let start = index;
+        while index < lines.len()
+            && matches!(
+                lines[index].kind,
+                DiffLineKind::Added | DiffLineKind::Removed
+            )
+        {
+            index = index.saturating_add(1);
+        }
+        apply_changed_ranges_to_block(&mut lines[start..index]);
+    }
+}
+
+fn apply_changed_ranges_to_block(block: &mut [DiffLine]) {
+    let removed = block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.kind == DiffLineKind::Removed).then_some(index))
+        .collect::<Vec<_>>();
+    let added = block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.kind == DiffLineKind::Added).then_some(index))
+        .collect::<Vec<_>>();
+    if removed.is_empty()
+        || added.is_empty()
+        || removed.len().saturating_mul(added.len()) > MAX_INTRALINE_PAIR_CELLS
+    {
+        return;
+    }
+    for (removed_index, added_index) in removed.into_iter().zip(added) {
+        let Some((removed_range, added_range)) =
+            changed_ranges_for_pair(&block[removed_index].content, &block[added_index].content)
+        else {
+            continue;
+        };
+        if !removed_range.is_empty() {
+            block[removed_index].changed_ranges.push(removed_range);
+        }
+        if !added_range.is_empty() {
+            block[added_index].changed_ranges.push(added_range);
+        }
+    }
+}
+
+fn changed_ranges_for_pair(
+    old_content: &str,
+    new_content: &str,
+) -> Option<(DiffChangedRange, DiffChangedRange)> {
+    let old_boundaries = grapheme_boundaries(old_content);
+    let new_boundaries = grapheme_boundaries(new_content);
+    if old_boundaries.len().saturating_sub(1) > MAX_INTRALINE_LINE_GRAPHEMES
+        || new_boundaries.len().saturating_sub(1) > MAX_INTRALINE_LINE_GRAPHEMES
+    {
+        return None;
+    }
+
+    let old_graphemes = old_content.graphemes(true).collect::<Vec<_>>();
+    let new_graphemes = new_content.graphemes(true).collect::<Vec<_>>();
+    let prefix = old_graphemes
+        .iter()
+        .zip(new_graphemes.iter())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let old_remaining = old_graphemes.len().saturating_sub(prefix);
+    let new_remaining = new_graphemes.len().saturating_sub(prefix);
+    let suffix = old_graphemes
+        .iter()
+        .skip(prefix)
+        .rev()
+        .zip(new_graphemes.iter().skip(prefix).rev())
+        .take_while(|(old, new)| old == new)
+        .count()
+        .min(old_remaining)
+        .min(new_remaining);
+
+    let old_start = old_boundaries[prefix];
+    let old_end = old_boundaries[old_graphemes.len().saturating_sub(suffix)];
+    let new_start = new_boundaries[prefix];
+    let new_end = new_boundaries[new_graphemes.len().saturating_sub(suffix)];
+    Some((
+        DiffChangedRange::new(old_start, old_end),
+        DiffChangedRange::new(new_start, new_end),
+    ))
+}
+
+fn grapheme_boundaries(content: &str) -> Vec<usize> {
+    content
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .chain(std::iter::once(content.len()))
+        .collect()
 }
 
 fn apply_syntax_highlighting(path: &str, lines: &mut [DiffLine]) {
@@ -389,7 +497,7 @@ fn usize_to_u32(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{diff_from_tool_request, file_edit_from_tool_request};
-    use bmux_tui::diff::DiffLineKind;
+    use bmux_tui::diff::{DiffChangedRange, DiffLineKind};
 
     #[test]
     fn file_edit_diff_lines_include_syntax_spans_for_source_content() {
@@ -419,6 +527,57 @@ mod tests {
                 ))
                 .all(|line| line.inline_spans.is_empty())
         );
+    }
+
+    #[test]
+    fn file_edit_diff_lines_include_changed_ranges_for_replacements() {
+        let edit = file_edit_from_tool_request(
+            "filesystem.edit",
+            &serde_json::json!({
+                "path": "src/lib.rs",
+                "old_text": "let value = old_name;\n",
+                "new_text": "let value = new_name;\n",
+            })
+            .to_string(),
+        )
+        .expect("edit should parse");
+
+        let lines = edit.diff_lines();
+        let removed = lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Removed)
+            .expect("removed line should exist");
+        let added = lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Added)
+            .expect("added line should exist");
+
+        assert_eq!(removed.changed_ranges, vec![DiffChangedRange::new(12, 15)]);
+        assert_eq!(added.changed_ranges, vec![DiffChangedRange::new(12, 15)]);
+    }
+
+    #[test]
+    fn file_edit_changed_ranges_are_unicode_boundary_safe() {
+        let edit = file_edit_from_tool_request(
+            "filesystem.edit",
+            &serde_json::json!({
+                "path": "src/lib.rs",
+                "old_text": "let face = \"😀\";\n",
+                "new_text": "let face = \"😃\";\n",
+            })
+            .to_string(),
+        )
+        .expect("edit should parse");
+
+        let lines = edit.diff_lines();
+        let added = lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Added)
+            .expect("added line should exist");
+
+        assert!(added.changed_ranges.iter().all(|range| {
+            added.content.is_char_boundary(range.start) && added.content.is_char_boundary(range.end)
+        }));
     }
 
     #[test]

@@ -782,6 +782,24 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
             .map(|cell| cell.style.fg),
         Some(Some(bmux_tui::style::Color::BrightGreen))
     );
+    assert_eq!(
+        buffer
+            .get(Point::new(
+                2,
+                output_line_y(&buffer, "-   2 │     41").unwrap()
+            ))
+            .map(|cell| cell.style.bg),
+        Some(Some(bmux_tui::style::Color::Indexed(52)))
+    );
+    assert_eq!(
+        buffer
+            .get(Point::new(
+                60,
+                output_line_y(&buffer, "+   2 │     42").unwrap()
+            ))
+            .map(|cell| cell.style.bg),
+        Some(Some(bmux_tui::style::Color::Indexed(22)))
+    );
     assert!(
         buffer
             .get(Point::new(

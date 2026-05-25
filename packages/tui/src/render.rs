@@ -8,8 +8,8 @@ use bmux_terminal_grid::{
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::diff::{
-    DiffFileList, DiffFileListState, DiffInlineSpan, DiffLine, DiffLineKind, DiffView,
-    DiffViewMode, DiffViewState, DiffViewStyles,
+    DiffChangedRange, DiffFileList, DiffFileListState, DiffInlineSpan, DiffLine, DiffLineKind,
+    DiffView, DiffViewMode, DiffViewState, DiffViewStyles,
 };
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
@@ -1079,21 +1079,30 @@ fn inline_diff_preview(lines: &[DiffLine], max_rows: usize) -> Vec<InlineDiffPre
 
 fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
     let (sign, sign_style, body_style) = inline_diff_line_styles(line.kind);
+    let row_style = inline_diff_row_style(line.kind);
+    let emphasis_style = inline_diff_emphasis_style(line.kind);
     let line_number = inline_diff_line_number(line);
-    let gutter_style = muted_style();
+    let gutter_style = row_style.patch(muted_style());
     let body_width = usize::from(width)
         .saturating_sub(2)
         .saturating_sub(5)
         .saturating_sub(3);
     let mut spans = vec![
         Span::styled("  ", gutter_style),
-        Span::styled(sign, sign_style.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            sign,
+            row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
+        ),
         Span::styled(format!("{line_number:>4}"), gutter_style),
         Span::styled(" │ ", gutter_style),
     ];
     spans.extend(truncated_inline_diff_content_spans(
-        line, body_width, body_style,
+        line,
+        body_width,
+        row_style.patch(body_style),
+        emphasis_style,
     ));
+    pad_inline_diff_spans(&mut spans, usize::from(width), row_style);
     Line::from_spans(spans)
 }
 
@@ -1101,6 +1110,7 @@ fn truncated_inline_diff_content_spans(
     line: &DiffLine,
     body_width: usize,
     body_style: Style,
+    emphasis_style: Style,
 ) -> Vec<Span> {
     if line.inline_spans.is_empty() {
         return vec![Span::styled(
@@ -1109,26 +1119,133 @@ fn truncated_inline_diff_content_spans(
         )];
     }
 
+    let source_spans = if line.inline_spans.is_empty() {
+        vec![DiffInlineSpan::new(line.content.clone(), Style::new())]
+    } else {
+        line.inline_spans.clone()
+    };
     let mut remaining = body_width;
     let mut spans = Vec::new();
-    for span in &line.inline_spans {
+    let mut offset = 0usize;
+    for span in source_spans {
         if remaining == 0 {
             break;
         }
-        let content = truncate_to_display_width(&span.content, remaining);
-        remaining = remaining.saturating_sub(text_display_width(&content));
-        spans.push(Span::styled(
-            content,
-            inline_diff_content_style(body_style, span),
-        ));
+        let span_start = offset;
+        let span_end = span_start.saturating_add(span.content.len());
+        for segment in inline_diff_span_segments(&span, span_start, span_end, &line.changed_ranges)
+        {
+            if remaining == 0 {
+                break;
+            }
+            let content = truncate_to_display_width(segment.content, remaining);
+            remaining = remaining.saturating_sub(text_display_width(&content));
+            spans.push(Span::styled(
+                content,
+                inline_diff_content_style(
+                    body_style,
+                    segment.style,
+                    if segment.emphasized {
+                        emphasis_style
+                    } else {
+                        Style::new()
+                    },
+                ),
+            ));
+        }
+        offset = span_end;
     }
     spans
 }
 
-const fn inline_diff_content_style(body_style: Style, span: &DiffInlineSpan) -> Style {
-    let mut style = span.style;
-    style.bg = body_style.bg;
-    style
+#[derive(Debug, Clone, Copy)]
+struct InlineDiffSpanSegment<'content> {
+    content: &'content str,
+    style: Style,
+    emphasized: bool,
+}
+
+fn inline_diff_span_segments<'span>(
+    span: &'span DiffInlineSpan,
+    span_start: usize,
+    span_end: usize,
+    changed_ranges: &[DiffChangedRange],
+) -> Vec<InlineDiffSpanSegment<'span>> {
+    let mut segments = Vec::new();
+    let mut local_start = 0usize;
+    for range in changed_ranges
+        .iter()
+        .copied()
+        .filter(|range| range.start < span_end && range.end > span_start)
+    {
+        let overlap_start = range.start.max(span_start).saturating_sub(span_start);
+        let overlap_end = range.end.min(span_end).saturating_sub(span_start);
+        if overlap_start > span.content.len()
+            || overlap_end > span.content.len()
+            || !span.content.is_char_boundary(overlap_start)
+            || !span.content.is_char_boundary(overlap_end)
+        {
+            continue;
+        }
+        if local_start < overlap_start {
+            segments.push(InlineDiffSpanSegment {
+                content: &span.content[local_start..overlap_start],
+                style: span.style,
+                emphasized: false,
+            });
+        }
+        segments.push(InlineDiffSpanSegment {
+            content: &span.content[overlap_start..overlap_end],
+            style: span.style,
+            emphasized: true,
+        });
+        local_start = overlap_end;
+    }
+    if local_start < span.content.len() {
+        segments.push(InlineDiffSpanSegment {
+            content: &span.content[local_start..],
+            style: span.style,
+            emphasized: false,
+        });
+    }
+    segments
+}
+
+const fn inline_diff_content_style(
+    body_style: Style,
+    span_style: Style,
+    emphasis_style: Style,
+) -> Style {
+    body_style.patch(span_style).patch(emphasis_style)
+}
+
+fn pad_inline_diff_spans(spans: &mut Vec<Span>, width: usize, style: Style) {
+    let current_width = spans
+        .iter()
+        .map(|span| text_display_width(&span.content))
+        .sum::<usize>();
+    if current_width < width {
+        spans.push(Span::styled(
+            " ".repeat(width.saturating_sub(current_width)),
+            style,
+        ));
+    }
+}
+
+const fn inline_diff_row_style(kind: DiffLineKind) -> Style {
+    match kind {
+        DiffLineKind::Added => Style::new().bg(Color::Indexed(22)),
+        DiffLineKind::Removed => Style::new().bg(Color::Indexed(52)),
+        DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => Style::new(),
+    }
+}
+
+const fn inline_diff_emphasis_style(kind: DiffLineKind) -> Style {
+    match kind {
+        DiffLineKind::Added => Style::new().bg(Color::Indexed(28)),
+        DiffLineKind::Removed => Style::new().bg(Color::Indexed(88)),
+        DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => Style::new(),
+    }
 }
 
 const fn inline_diff_line_styles(kind: DiffLineKind) -> (&'static str, Style, Style) {
@@ -1186,8 +1303,12 @@ const fn diff_view_styles() -> DiffViewStyles {
         file_header: Style::new().fg(Color::BrightBlack),
         hunk_header: Style::new().fg(Color::BrightCyan),
         context: Style::new(),
-        added: Style::new().bg(Color::Indexed(22)),
-        removed: Style::new().bg(Color::Indexed(52)),
+        added: Style::new().fg(Color::BrightGreen),
+        removed: Style::new().fg(Color::BrightRed),
+        added_row: Style::new().bg(Color::Indexed(22)),
+        removed_row: Style::new().bg(Color::Indexed(52)),
+        added_emphasis: Style::new().bg(Color::Indexed(28)),
+        removed_emphasis: Style::new().bg(Color::Indexed(88)),
         gutter: Style::new().fg(Color::BrightBlack),
     }
 }
