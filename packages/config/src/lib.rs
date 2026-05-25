@@ -390,10 +390,17 @@ impl ConfigLoadOverrides {
             && self.cli_config_toml.is_none()
     }
 
-    /// Fluent setter for the base config path.
+    /// Set base config path.
     #[must_use]
     pub fn with_base_config_path(mut self, path: Option<PathBuf>) -> Self {
         self.base_config_path = path;
+        self
+    }
+
+    /// Fluent setter for the CLI raw TOML override.
+    #[must_use]
+    pub fn with_cli_config_toml(mut self, toml: Option<String>) -> Self {
+        self.cli_config_toml = merge_config_toml_overrides(self.cli_config_toml, toml);
         self
     }
 }
@@ -402,6 +409,17 @@ impl ConfigLoadOverrides {
 #[must_use]
 pub fn model_profile_override_toml(profile: &str) -> String {
     format!("[model]\nprofile = {}\n", toml_string(profile))
+}
+
+/// Build a TOML override for worktree base ref.
+#[must_use]
+pub fn worktree_base_ref_override_toml(base_ref: WorktreeBaseRefConfig) -> String {
+    let value = match base_ref {
+        WorktreeBaseRefConfig::Auto => "auto",
+        WorktreeBaseRefConfig::DefaultBranch => "default_branch",
+        WorktreeBaseRefConfig::Head => "head",
+    };
+    format!("[worktree]\nbase_ref = {}\n", toml_string(value))
 }
 
 fn merge_config_toml_overrides(left: Option<String>, right: Option<String>) -> Option<String> {

@@ -106,7 +106,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         if cli.command.is_some() {
             return Err(CliError::NewSessionWithCommand);
         }
-        run_new_session_tui().await?;
+        run_new_session_tui(cli.worktree).await?;
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
@@ -239,6 +239,9 @@ struct Cli {
     /// Create a new session and open it in the terminal UI.
     #[arg(short = 'n', long = "new")]
     new: bool,
+    /// Create a new session in a new worktree and open it in the terminal UI.
+    #[arg(long, value_name = "NAME", requires = "new")]
+    worktree: Option<String>,
     /// Select a model profile from configuration for this client connection.
     #[arg(long, value_name = "MODEL_PROFILE")]
     profile: Option<String>,
@@ -396,6 +399,16 @@ enum WorktreeBaseRefArg {
     Auto,
     DefaultBranch,
     Head,
+}
+
+impl WorktreeBaseRefArg {
+    const fn into_config(self) -> bcode_config::WorktreeBaseRefConfig {
+        match self {
+            Self::Auto => bcode_config::WorktreeBaseRefConfig::Auto,
+            Self::DefaultBranch => bcode_config::WorktreeBaseRefConfig::DefaultBranch,
+            Self::Head => bcode_config::WorktreeBaseRefConfig::Head,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2972,6 +2985,16 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
             no_setup,
             json,
         } => {
+            let _config_override = base.map(|base| {
+                bcode_config::push_process_config_overrides(
+                    bcode_config::ConfigLoadOverrides::from_env_with_cli(
+                        None,
+                        Some(bcode_config::worktree_base_ref_override_toml(
+                            base.into_config(),
+                        )),
+                    ),
+                )
+            });
             worktree_create(WorktreeCreateCliArgs {
                 name,
                 repo,
@@ -3055,10 +3078,12 @@ async fn worktree_create(args: WorktreeCreateCliArgs) -> Result<(), CliError> {
             path: args.path,
             branch: args.branch,
             new_branch: args.new_branch,
-            base_ref: args.base.map(|base| match base {
-                WorktreeBaseRefArg::Auto => WorktreeBaseRef::Auto,
-                WorktreeBaseRefArg::DefaultBranch => WorktreeBaseRef::DefaultBranch,
-                WorktreeBaseRefArg::Head => WorktreeBaseRef::Head,
+            base_ref: args.base.map(|base| match base.into_config() {
+                bcode_config::WorktreeBaseRefConfig::Auto => WorktreeBaseRef::Auto,
+                bcode_config::WorktreeBaseRefConfig::DefaultBranch => {
+                    WorktreeBaseRef::DefaultBranch
+                }
+                bcode_config::WorktreeBaseRefConfig::Head => WorktreeBaseRef::Head,
             }),
             detach: args.detach,
             force: args.force,
@@ -3103,10 +3128,32 @@ async fn worktree_remove(
     Ok(())
 }
 
-async fn run_new_session_tui() -> Result<(), CliError> {
+async fn run_new_session_tui(worktree: Option<String>) -> Result<(), CliError> {
     ensure_server_running().await?;
     let client = BcodeClient::default_endpoint();
-    let session = client.create_session(None).await?;
+    let session = if let Some(name) = worktree {
+        client
+            .create_worktree(WorktreeCreateRequest {
+                name,
+                cwd: None,
+                path: None,
+                branch: None,
+                new_branch: None,
+                base_ref: None,
+                detach: false,
+                force: false,
+                attach_session_id: None,
+                new_session: true,
+                no_setup: false,
+            })
+            .await?
+            .session
+            .ok_or_else(|| {
+                CliError::LoginProfile("worktree creation did not return a session".to_string())
+            })?
+    } else {
+        client.create_session(None).await?
+    };
     bcode_tui::run(Some(session.id)).await?;
     Ok(())
 }

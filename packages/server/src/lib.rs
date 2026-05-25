@@ -1080,7 +1080,7 @@ async fn handle_request(
             handle_create_worktree(request_id, state, writer, request).await
         }
         Request::RemoveWorktree(request) => {
-            handle_remove_worktree(request_id, writer, request).await
+            handle_remove_worktree(request_id, state, writer, request).await
         }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
@@ -1550,10 +1550,30 @@ async fn handle_create_worktree(
 
 async fn handle_remove_worktree(
     request_id: u64,
+    state: &ServerState,
     writer: &SharedWriter,
     request: WorktreeRemoveRequest,
 ) -> Result<(), ServerError> {
-    let cwd = request.cwd.unwrap_or_else(current_request_cwd);
+    let cwd = request.cwd.clone().unwrap_or_else(current_request_cwd);
+    let sessions = state.sessions.cached_sessions(&cwd).await;
+    if let Some(session) = sessions
+        .iter()
+        .find(|session| path_is_inside(&session.working_directory, &request.path))
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "worktree_remove_failed",
+                format!(
+                    "session {} is rooted inside worktree {}; move or delete it before removal",
+                    session.id,
+                    request.path.display()
+                ),
+            )),
+        )
+        .await;
+    }
     match bcode_worktree::remove_worktree(&cwd, &request.path, request.force) {
         Ok(response) => {
             send_response(
@@ -1579,6 +1599,12 @@ async fn handle_remove_worktree(
 
 fn current_request_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    let normalized_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let normalized_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    normalized_path == normalized_root || normalized_path.starts_with(normalized_root)
 }
 
 async fn handle_rename_session(
