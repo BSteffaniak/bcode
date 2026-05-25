@@ -3,8 +3,6 @@
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 
-const MAX_SLASH_COMPLETIONS: usize = 8;
-
 /// Slash completion picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashPalette {
@@ -197,9 +195,6 @@ async fn slash_items(
         static_items()
     };
     filter_items(candidates, trimmed)
-        .into_iter()
-        .take(MAX_SLASH_COMPLETIONS)
-        .collect()
 }
 
 fn thinking_items(
@@ -222,18 +217,65 @@ fn thinking_items(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchRank {
+    Exact,
+    Prefix,
+    Fuzzy,
+}
+
 fn filter_items(items: Vec<SlashItem>, query: &str) -> Vec<SlashItem> {
     let normalized_query = normalize(query);
     if normalized_query.is_empty() {
         return items;
     }
-    items
+    let mut matches = items
         .into_iter()
-        .filter(|item| {
-            normalize(&item.command).contains(&normalized_query)
-                || normalize(&item.description).contains(&normalized_query)
+        .enumerate()
+        .filter_map(|(index, item)| {
+            match_rank(&item, &normalized_query).map(|rank| (rank, index, item))
         })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(rank, index, _item)| (*rank, *index));
+    matches
+        .into_iter()
+        .map(|(_rank, _index, item)| item)
         .collect()
+}
+
+fn match_rank(item: &SlashItem, normalized_query: &str) -> Option<MatchRank> {
+    let command = normalize(&item.command);
+    let description = normalize(&item.description);
+    if command == normalized_query || description == normalized_query {
+        Some(MatchRank::Exact)
+    } else if command.starts_with(normalized_query) || description.starts_with(normalized_query) {
+        Some(MatchRank::Prefix)
+    } else if fuzzy_matches(&command, normalized_query)
+        || command.contains(normalized_query)
+        || fuzzy_matches(&description, normalized_query)
+        || description.contains(normalized_query)
+    {
+        Some(MatchRank::Fuzzy)
+    } else {
+        None
+    }
+}
+
+fn fuzzy_matches(value: &str, query: &str) -> bool {
+    let mut query_chars = query.chars();
+    let Some(mut next_query_char) = query_chars.next() else {
+        return true;
+    };
+    for value_char in value.chars() {
+        if value_char == next_query_char {
+            if let Some(query_char) = query_chars.next() {
+                next_query_char = query_char;
+            } else {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn normalize(value: &str) -> String {
@@ -291,14 +333,40 @@ mod tests {
     use super::{filter_items, static_items};
 
     #[test]
-    fn filters_static_slash_items_by_typed_prefix() {
-        let items = filter_items(static_items(), "pl");
-
-        assert_eq!(items[0].command(), "/plan");
-        assert!(
-            items
-                .iter()
-                .all(|item| item.command().contains("pl") || item.description().contains("pl"))
+    fn ranks_exact_matches_before_prefix_and_fuzzy_matches() {
+        let items = filter_items(
+            vec![
+                super::item("/agent", "a thin agent"),
+                super::item("/plan", "Switch to plan agent"),
+                super::item("/thinking", "Open thinking settings"),
+                super::item("/thin", "Short thinking alias"),
+            ],
+            "thin",
         );
+
+        assert_eq!(items[0].command(), "/thin");
+        assert_eq!(items[1].command(), "/thinking");
+        assert_eq!(items[2].command(), "/agent");
+    }
+
+    #[test]
+    fn ranks_prefix_matches_before_fuzzy_matches() {
+        let items = filter_items(
+            vec![
+                super::item("/agent", "Set session agent by id"),
+                super::item("/thinking", "Open thinking settings"),
+            ],
+            "t",
+        );
+
+        assert_eq!(items[0].command(), "/thinking");
+        assert_eq!(items[1].command(), "/agent");
+    }
+
+    #[test]
+    fn fuzzy_matches_non_contiguous_characters() {
+        let items = filter_items(static_items(), "tm");
+
+        assert!(items.iter().any(|item| item.command() == "/set-model "));
     }
 }
