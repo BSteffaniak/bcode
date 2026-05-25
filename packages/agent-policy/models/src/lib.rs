@@ -41,6 +41,7 @@ pub struct AgentConfig {
 ///   `filesystem.stat`, `filesystem.exists`).
 /// * `write` — patterns matched against the `path` argument of `filesystem.write`.
 /// * `edit` — patterns matched against the `path` argument of `filesystem.edit`.
+/// * `web` — patterns matched against URL arguments for web/network tools.
 /// * `external_directory` — single action governing any tool argument resolving outside
 ///   the session working directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +58,9 @@ pub struct PermissionConfig {
     /// `filesystem.edit` rules keyed by path glob.
     #[serde(default)]
     pub edit: BTreeMap<String, Action>,
+    /// Web/network tool rules keyed by URL glob.
+    #[serde(default)]
+    pub web: BTreeMap<String, Action>,
     /// Action governing any path resolving outside the session working directory.
     #[serde(default = "default_external_directory_action")]
     pub external_directory: Action,
@@ -69,6 +73,7 @@ impl Default for PermissionConfig {
             read: BTreeMap::new(),
             write: BTreeMap::new(),
             edit: BTreeMap::new(),
+            web: BTreeMap::new(),
             external_directory: default_external_directory_action(),
         }
     }

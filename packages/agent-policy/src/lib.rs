@@ -56,6 +56,7 @@ pub fn default_config() -> AgentPermissionConfig {
             permission: PermissionConfig {
                 bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
                 external_directory: Action::Allow,
+                web: BTreeMap::from([("*".to_string(), Action::Ask)]),
                 ..PermissionConfig::default()
             },
         },
@@ -91,6 +92,7 @@ pub fn default_config() -> AgentPermissionConfig {
                     ("rg *".to_string(), Action::Allow),
                 ]),
                 external_directory: Action::Allow,
+                web: BTreeMap::from([("*".to_string(), Action::Ask)]),
                 ..PermissionConfig::default()
             },
         },
@@ -194,12 +196,39 @@ fn evaluate_after_path(
         "filesystem.write" => evaluate_filesystem_path(config, request, &config.permission.write),
         "filesystem.edit" => evaluate_filesystem_path(config, request, &config.permission.edit),
         "web.search" => evaluation(AgentDecision::Allow, String::new(), None, None),
-        "web.fetch" => evaluate_web_fetch(config, request),
+        "web.fetch" => evaluate_web_url(config, request),
         _ => evaluate_side_effect_fallback(config, request),
     }
 }
 
-fn evaluate_web_fetch(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
+fn evaluate_web_url(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
+    let url = string_argument(&request.arguments, "url").unwrap_or("*");
+    let rules = compile_path_rules(&config.permission.web);
+    if let Some(rule) = matching_path_rule(&rules, url) {
+        return match rule.action {
+            Action::Allow => evaluation(
+                AgentDecision::Allow,
+                String::new(),
+                Some(rule.pattern.clone()),
+                None,
+            ),
+            Action::Ask => evaluation(
+                AgentDecision::Ask,
+                format!("{} agent asks before web URL: {}", request.agent_id, url),
+                Some(rule.pattern.clone()),
+                None,
+            ),
+            Action::Deny => evaluation(
+                AgentDecision::Deny,
+                format!(
+                    "{} agent denied web URL '{}' by rule '{}'",
+                    request.agent_id, url, rule.pattern
+                ),
+                Some(rule.pattern.clone()),
+                None,
+            ),
+        };
+    }
     if tool_enabled(config, request) == Some(true) {
         evaluation(
             AgentDecision::Ask,

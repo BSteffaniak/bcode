@@ -71,6 +71,24 @@ pub enum ToolRequestPresentation {
         /// Path to inspect.
         path: String,
     },
+    /// Web search request.
+    WebSearch {
+        /// Search query.
+        query: String,
+        /// Optional provider override.
+        provider: Option<String>,
+        /// Optional maximum result count.
+        max_results: Option<u64>,
+    },
+    /// Web fetch request.
+    WebFetch {
+        /// URL to fetch.
+        url: String,
+        /// Optional maximum byte count.
+        max_bytes: Option<u64>,
+        /// Whether rendered fetching was requested.
+        render: bool,
+    },
 }
 
 /// Human-readable presentation for a known tool result.
@@ -251,6 +269,16 @@ pub fn tool_request_presentation(
         }),
         "filesystem_stat" | "stat" => Some(ToolRequestPresentation::Stat {
             path: path_field(&value, "path")?,
+        }),
+        "web_search" => Some(ToolRequestPresentation::WebSearch {
+            query: string_field(&value, "query")?,
+            provider: string_field(&value, "provider"),
+            max_results: u64_field(&value, "max_results"),
+        }),
+        "web_fetch" => Some(ToolRequestPresentation::WebFetch {
+            url: string_field(&value, "url")?,
+            max_bytes: u64_field(&value, "max_bytes"),
+            render: bool_field(&value, "render"),
         }),
         _ => None,
     }

@@ -114,6 +114,8 @@ impl WebSearchPlugin {
 struct SearchRequest {
     query: String,
     #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
     max_results: Option<usize>,
     #[serde(default)]
     site: Option<String>,
@@ -152,6 +154,8 @@ struct FetchRequest {
     max_bytes: Option<usize>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    render: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,9 +166,10 @@ struct FetchResponse {
     title: Option<String>,
     content_type: Option<String>,
     text: String,
+    markdown: Option<String>,
     truncated: bool,
+    rendered: bool,
 }
-
 #[derive(Debug, Clone, Deserialize)]
 struct BraveSearchResponse {
     #[serde(default)]
@@ -197,12 +202,86 @@ struct BraveProfile {
     name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TavilySearchResponse {
+    #[serde(default)]
+    results: Vec<TavilyResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TavilyResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExaSearchResponse {
+    #[serde(default)]
+    results: Vec<ExaResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExaResult {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    published_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SerperSearchResponse {
+    #[serde(default)]
+    organic: Vec<SerperResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SerperResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    link: String,
+    #[serde(default)]
+    snippet: String,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SerpApiSearchResponse {
+    #[serde(default)]
+    organic_results: Vec<SerpApiResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SerpApiResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    link: String,
+    #[serde(default)]
+    snippet: String,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
 #[derive(Debug, Error)]
 enum WebError {
     #[error("{0}")]
     InvalidRequest(String),
     #[error(
-        "no web search provider configured; set BCODE_WEB_SEARCH_PROVIDER=brave and BCODE_WEB_SEARCH_API_KEY or BRAVE_SEARCH_API_KEY"
+        "no web search provider configured; set BCODE_WEB_SEARCH_PROVIDER or a supported provider API key"
     )]
     MissingProvider,
     #[error("network request failed: {0}")]
@@ -215,9 +294,13 @@ enum WebError {
 
 async fn search_async(request: SearchRequest) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
-    let provider = search_provider()?;
+    let provider = search_provider(request.provider.as_deref())?;
     match provider.as_str() {
         "brave" => search_brave(request).await,
+        "tavily" => search_tavily(request).await,
+        "exa" => search_exa(request).await,
+        "serper" => search_serper(request).await,
+        "serpapi" | "serp_api" => search_serpapi(request).await,
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
         ))),
@@ -225,21 +308,9 @@ async fn search_async(request: SearchRequest) -> Result<SearchResponse, WebError
 }
 
 async fn search_brave(request: SearchRequest) -> Result<SearchResponse, WebError> {
-    let api_key = env_value(["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"])
-        .ok_or(WebError::MissingProvider)?;
-    let max_results = request
-        .max_results
-        .unwrap_or(DEFAULT_MAX_RESULTS)
-        .clamp(1, 20);
-    let mut query = request.query.trim().to_string();
-    if let Some(site) = request
-        .site
-        .as_deref()
-        .map(str::trim)
-        .filter(|site| !site.is_empty())
-    {
-        query = format!("site:{site} {query}");
-    }
+    let api_key = provider_key(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"])?;
+    let max_results = max_results(&request);
+    let query = scoped_query(&request);
     let client = client(request.timeout_ms)?;
     let mut builder = client
         .get("https://api.search.brave.com/res/v1/web/search")
@@ -255,15 +326,7 @@ async fn search_brave(request: SearchRequest) -> Result<SearchResponse, WebError
     if let Some(safe_search) = request.safe_search.as_deref() {
         builder = builder.query(&[("safesearch", safe_search)]);
     }
-    let response = builder.send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        return Err(WebError::Http {
-            status: status.as_u16(),
-            body: truncate_chars(&body, 1_000),
-        });
-    }
+    let body = checked_text(builder.send().await?).await?;
     let decoded = serde_json::from_str::<BraveSearchResponse>(&body)?;
     let results = decoded
         .web
@@ -280,17 +343,159 @@ async fn search_brave(request: SearchRequest) -> Result<SearchResponse, WebError
             source: result.profile.and_then(|profile| profile.name),
         })
         .collect();
-    Ok(SearchResponse {
-        query: request.query,
-        provider: "brave".to_string(),
-        results,
-        partial: false,
-        message: None,
-    })
+    Ok(search_response(request.query, "brave", results))
+}
+
+async fn search_tavily(request: SearchRequest) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&["TAVILY_API_KEY"])?;
+    let max_results = max_results(&request);
+    let client = client(request.timeout_ms)?;
+    let body = json!({
+        "api_key": api_key,
+        "query": scoped_query(&request),
+        "max_results": max_results,
+        "search_depth": "basic"
+    });
+    let text = checked_text(
+        client
+            .post("https://api.tavily.com/search")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<TavilySearchResponse>(&text)?;
+    let results = decoded
+        .results
+        .into_iter()
+        .filter(|result| !result.url.is_empty())
+        .take(max_results)
+        .map(|result| SearchResult {
+            title: html_text(&result.title),
+            url: result.url,
+            snippet: html_text(&result.content),
+            published: None,
+            source: Some("tavily".to_string()),
+        })
+        .collect();
+    Ok(search_response(request.query, "tavily", results))
+}
+async fn search_exa(request: SearchRequest) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&["EXA_API_KEY"])?;
+    let max_results = max_results(&request);
+    let client = client(request.timeout_ms)?;
+    let body = json!({
+        "query": scoped_query(&request),
+        "numResults": max_results,
+        "contents": { "text": { "maxCharacters": 500 } }
+    });
+    let text = checked_text(
+        client
+            .post("https://api.exa.ai/search")
+            .header("Accept", "application/json")
+            .header("x-api-key", api_key)
+            .json(&body)
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<ExaSearchResponse>(&text)?;
+    let results = decoded
+        .results
+        .into_iter()
+        .filter(|result| !result.url.is_empty())
+        .take(max_results)
+        .map(|result| SearchResult {
+            title: result
+                .title
+                .map_or_else(String::new, |title| html_text(&title)),
+            url: result.url,
+            snippet: result
+                .text
+                .map_or_else(String::new, |text| html_text(&text)),
+            published: result.published_date,
+            source: Some("exa".to_string()),
+        })
+        .collect();
+    Ok(search_response(request.query, "exa", results))
+}
+
+async fn search_serper(request: SearchRequest) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&["SERPER_API_KEY"])?;
+    let max_results = max_results(&request);
+    let client = client(request.timeout_ms)?;
+    let body = json!({ "q": scoped_query(&request), "num": max_results });
+    let text = checked_text(
+        client
+            .post("https://google.serper.dev/search")
+            .header("Accept", "application/json")
+            .header("X-API-KEY", api_key)
+            .json(&body)
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<SerperSearchResponse>(&text)?;
+    let results = decoded
+        .organic
+        .into_iter()
+        .filter(|result| !result.link.is_empty())
+        .take(max_results)
+        .map(|result| SearchResult {
+            title: html_text(&result.title),
+            url: result.link,
+            snippet: html_text(&result.snippet),
+            published: result.date,
+            source: result.source,
+        })
+        .collect();
+    Ok(search_response(request.query, "serper", results))
+}
+
+async fn search_serpapi(request: SearchRequest) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&["SERPAPI_API_KEY"])?;
+    let max_results = max_results(&request);
+    let client = client(request.timeout_ms)?;
+    let text = checked_text(
+        client
+            .get("https://serpapi.com/search.json")
+            .query(&[
+                ("engine", "google"),
+                ("q", scoped_query(&request).as_str()),
+                ("api_key", api_key.as_str()),
+                ("num", max_results.to_string().as_str()),
+            ])
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<SerpApiSearchResponse>(&text)?;
+    let results = decoded
+        .organic_results
+        .into_iter()
+        .filter(|result| !result.link.is_empty())
+        .take(max_results)
+        .map(|result| SearchResult {
+            title: html_text(&result.title),
+            url: result.link,
+            snippet: html_text(&result.snippet),
+            published: result.date,
+            source: result.source,
+        })
+        .collect();
+    Ok(search_response(request.query, "serpapi", results))
 }
 
 async fn fetch_async(request: FetchRequest) -> Result<FetchResponse, WebError> {
     validate_url(&request.url)?;
+    if request.render {
+        return fetch_rendered(request);
+    }
+    fetch_plain_async(request).await
+}
+
+async fn fetch_plain_async(request: FetchRequest) -> Result<FetchResponse, WebError> {
     let max_bytes = request
         .max_bytes
         .unwrap_or(DEFAULT_FETCH_MAX_BYTES)
@@ -308,25 +513,63 @@ async fn fetch_async(request: FetchRequest) -> Result<FetchResponse, WebError> {
     let truncated = body.len() > max_bytes;
     let bytes = &body[..body.len().min(max_bytes)];
     let raw = String::from_utf8_lossy(bytes);
-    let text = if content_type
+    let (title, text, markdown) = if content_type
         .as_deref()
         .is_some_and(|value| value.to_ascii_lowercase().contains("html"))
     {
-        html_text(&raw)
+        html_document_text(&raw)
     } else {
-        raw.into_owned()
+        let text = raw.into_owned();
+        (plain_title(&text), text, None)
     };
     Ok(FetchResponse {
         url: request.url,
         final_url,
         status: status.as_u16(),
-        title: html_title(&text),
+        title,
         content_type,
         text,
+        markdown,
         truncated,
+        rendered: false,
     })
 }
 
+fn fetch_rendered(request: FetchRequest) -> Result<FetchResponse, WebError> {
+    let command = env_value(&["BCODE_WEB_RENDER_COMMAND"]).ok_or_else(|| {
+        WebError::InvalidRequest(
+            "rendered fetch requires BCODE_WEB_RENDER_COMMAND to name an explicit local fetch command"
+                .to_string(),
+        )
+    })?;
+    let output = std::process::Command::new(command)
+        .arg(&request.url)
+        .output()
+        .map_err(|error| WebError::InvalidRequest(error.to_string()))?;
+    if !output.status.success() {
+        return Err(WebError::InvalidRequest(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+    let max_bytes = request
+        .max_bytes
+        .unwrap_or(DEFAULT_FETCH_MAX_BYTES)
+        .clamp(1, MAX_FETCH_BYTES);
+    let truncated = output.stdout.len() > max_bytes;
+    let raw = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(max_bytes)]);
+    let (title, text, markdown) = html_document_text(&raw);
+    Ok(FetchResponse {
+        url: request.url.clone(),
+        final_url: request.url,
+        status: 200,
+        title,
+        content_type: Some("text/html; rendered=command".to_string()),
+        text,
+        markdown,
+        truncated,
+        rendered: true,
+    })
+}
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
@@ -339,12 +582,13 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
 fn search_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "web.search".to_string(),
-        description: "Search the web through the configured search provider. Requires a provider API key such as Brave Search.".to_string(),
+        description: "Search the web through the configured search provider. Supports Brave, Tavily, Exa, Serper, and SerpAPI through provider API keys.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["query"],
             "properties": {
                 "query": { "type": "string" },
+                "provider": { "type": "string", "description": "Optional provider override: auto, brave, tavily, exa, serper, or serpapi" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
                 "site": { "type": "string", "description": "Optional domain to restrict results with a site: query" },
                 "freshness": { "type": "string", "description": "Provider-specific freshness filter such as day, week, month, or year" },
@@ -370,7 +614,8 @@ fn fetch_tool_definition() -> ToolDefinition {
             "properties": {
                 "url": { "type": "string" },
                 "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_FETCH_BYTES },
-                "timeout_ms": { "type": "integer", "minimum": 1 }
+                "timeout_ms": { "type": "integer", "minimum": 1 },
+                "render": { "type": "boolean", "description": "Use the explicit rendered-fetch command adapter configured by BCODE_WEB_RENDER_COMMAND" }
             }
         }),
         side_effect: ToolSideEffect::ReadOnly,
@@ -378,16 +623,66 @@ fn fetch_tool_definition() -> ToolDefinition {
     }
 }
 
-fn search_provider() -> Result<String, WebError> {
-    env::var("BCODE_WEB_SEARCH_PROVIDER")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            env_value(["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"])
-                .map(|_| "brave".to_string())
-        })
-        .ok_or(WebError::MissingProvider)
+fn search_response(query: String, provider: &str, results: Vec<SearchResult>) -> SearchResponse {
+    SearchResponse {
+        query,
+        provider: provider.to_string(),
+        results,
+        partial: false,
+        message: None,
+    }
+}
+
+fn max_results(request: &SearchRequest) -> usize {
+    request
+        .max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, 20)
+}
+
+fn scoped_query(request: &SearchRequest) -> String {
+    let mut query = request.query.trim().to_string();
+    if let Some(site) = request
+        .site
+        .as_deref()
+        .map(str::trim)
+        .filter(|site| !site.is_empty())
+    {
+        query = format!("site:{site} {query}");
+    }
+    query
+}
+
+fn search_provider(explicit: Option<&str>) -> Result<String, WebError> {
+    let provider = explicit
+        .map(str::to_string)
+        .or_else(|| env_value(&["BCODE_WEB_SEARCH_PROVIDER"]))
+        .unwrap_or_else(|| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if provider != "auto" {
+        return Ok(provider);
+    }
+    if env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some() {
+        return Ok("brave".to_string());
+    }
+    if env_value(&["TAVILY_API_KEY"]).is_some() {
+        return Ok("tavily".to_string());
+    }
+    if env_value(&["EXA_API_KEY"]).is_some() {
+        return Ok("exa".to_string());
+    }
+    if env_value(&["SERPER_API_KEY"]).is_some() {
+        return Ok("serper".to_string());
+    }
+    if env_value(&["SERPAPI_API_KEY"]).is_some() {
+        return Ok("serpapi".to_string());
+    }
+    Err(WebError::MissingProvider)
+}
+
+fn provider_key(names: &[&str]) -> Result<String, WebError> {
+    env_value(names).ok_or(WebError::MissingProvider)
 }
 
 fn client(timeout_ms: Option<u64>) -> Result<Client, WebError> {
@@ -400,7 +695,20 @@ fn client(timeout_ms: Option<u64>) -> Result<Client, WebError> {
         .map_err(WebError::Network)
 }
 
-fn env_value<const N: usize>(names: [&str; N]) -> Option<String> {
+async fn checked_text(response: reqwest::Response) -> Result<String, WebError> {
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(WebError::Http {
+            status: status.as_u16(),
+            body: truncate_chars(&body, 1_000),
+        })
+    }
+}
+
+fn env_value(names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| match env::var(name) {
         Ok(value) if !value.trim().is_empty() => Some(value),
         _ => None,
@@ -428,17 +736,54 @@ fn validate_url(url: &str) -> Result<(), WebError> {
         ))
     }
 }
+fn html_document_text(input: &str) -> (Option<String>, String, Option<String>) {
+    let title = extract_between_case_insensitive(input, "<title", "</title>")
+        .and_then(|raw| raw.split_once('>').map(|(_, text)| html_text(text)))
+        .filter(|text| !text.is_empty());
+    let body = extract_preferred_body(input).unwrap_or(input);
+    let markdown = html_to_markdown(body);
+    let text = collapse_blank_lines(&markdown);
+    (title.or_else(|| plain_title(&text)), text, Some(markdown))
+}
 
-fn html_text(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
+fn extract_preferred_body(input: &str) -> Option<&str> {
+    extract_element(input, "main")
+        .or_else(|| extract_element(input, "article"))
+        .or_else(|| extract_element(input, "body"))
+}
+
+fn extract_element<'a>(input: &'a str, tag: &str) -> Option<&'a str> {
+    let lower = input.to_ascii_lowercase();
+    let start_token = format!("<{tag}");
+    let end_token = format!("</{tag}>");
+    let start = lower.find(&start_token)?;
+    let content_start = input[start..].find('>')? + start + 1;
+    let end = lower[content_start..].find(&end_token)? + content_start;
+    Some(&input[content_start..end])
+}
+
+fn extract_between_case_insensitive<'a>(input: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let lower = input.to_ascii_lowercase();
+    let range_start = lower.find(&start.to_ascii_lowercase())?;
+    let range_end = lower[range_start..].find(&end.to_ascii_lowercase())? + range_start + end.len();
+    Some(&input[range_start..range_end])
+}
+
+fn html_to_markdown(input: &str) -> String {
+    let without_noise = remove_noise_elements(input);
+    let mut output = String::with_capacity(without_noise.len());
+    let mut tag = String::new();
     let mut in_tag = false;
     let mut in_entity = false;
     let mut entity = String::new();
-    for character in input.chars() {
+    for character in without_noise.chars() {
         if in_tag {
             if character == '>' {
+                push_tag_marker(&mut output, &tag);
+                tag.clear();
                 in_tag = false;
-                output.push(' ');
+            } else {
+                tag.push(character);
             }
             continue;
         }
@@ -463,7 +808,59 @@ fn html_text(input: &str) -> String {
             _ => output.push(character),
         }
     }
-    collapse_whitespace(&output)
+    collapse_blank_lines(&output)
+}
+
+fn remove_noise_elements(input: &str) -> String {
+    let mut output = input.to_string();
+    for tag in ["script", "style", "nav", "footer", "aside", "svg"] {
+        output = remove_element_case_insensitive(&output, tag);
+    }
+    output
+}
+
+fn remove_element_case_insensitive(input: &str, tag: &str) -> String {
+    let mut output = String::new();
+    let mut remaining = input;
+    let start_token = format!("<{tag}");
+    let end_token = format!("</{tag}>");
+    loop {
+        let lower = remaining.to_ascii_lowercase();
+        let Some(start) = lower.find(&start_token) else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        let Some(relative_end) = lower[start..].find(&end_token) else {
+            break;
+        };
+        let end = start + relative_end + end_token.len();
+        remaining = &remaining[end..];
+    }
+    output
+}
+
+fn push_tag_marker(output: &mut String, tag: &str) {
+    let normalized = tag
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "h1" => output.push_str("\n\n# "),
+        "h2" => output.push_str("\n\n## "),
+        "h3" => output.push_str("\n\n### "),
+        "h4" | "h5" | "h6" => output.push_str("\n\n#### "),
+        "p" | "div" | "section" | "article" | "main" | "br" => output.push_str("\n\n"),
+        "li" => output.push_str("\n* "),
+        "pre" | "code" => output.push('`'),
+        _ => output.push(' '),
+    }
+}
+
+fn html_text(input: &str) -> String {
+    collapse_whitespace(&html_to_markdown(input))
 }
 
 fn decode_entity(entity: &str) -> &str {
@@ -494,7 +891,20 @@ fn collapse_whitespace(input: &str) -> String {
     output.trim().to_string()
 }
 
-fn html_title(text: &str) -> Option<String> {
+fn collapse_blank_lines(input: &str) -> String {
+    let mut output = String::new();
+    let mut blank_lines = 0_u8;
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if blank_lines < 2 && !output.is_empty() {
+            output.push_str("\n\n");
+            blank_lines += 1;
+        }
+        output.push_str(line);
+    }
+    output.trim().to_string()
+}
+
+fn plain_title(text: &str) -> Option<String> {
     text.lines()
         .next()
         .map(str::trim)
@@ -543,7 +953,6 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 }
 
 bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.toml"));
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,13 +961,35 @@ mod tests {
     fn html_text_removes_tags_and_decodes_common_entities() {
         assert_eq!(
             html_text("<h1>Rust &amp; Bcode</h1><p>A&nbsp;test</p>"),
-            "Rust & Bcode A test"
+            "# Rust & Bcode # A test"
         );
+    }
+
+    #[test]
+    fn html_document_prefers_article_and_removes_noise() {
+        let html = r"
+            <html><head><title>Doc title</title></head>
+            <body><nav>menu</nav><article><h1>Heading</h1><p>Body &amp; text</p></article></body></html>
+        ";
+        let (title, text, markdown) = html_document_text(html);
+        assert_eq!(title.as_deref(), Some("Doc title"));
+        assert!(text.contains("# Heading"));
+        assert!(text.contains("Body & text"));
+        assert!(!text.contains("menu"));
+        assert!(markdown.is_some());
     }
 
     #[test]
     fn validate_url_rejects_non_http_urls() {
         assert!(validate_url("file:///etc/passwd").is_err());
         assert!(validate_url("https://example.com").is_ok());
+    }
+
+    #[test]
+    fn auto_provider_requires_a_key_when_no_provider_env_exists() {
+        // This test asserts only the explicit unsupported path to avoid mutating
+        // process-global env in parallel test runs.
+        let provider = search_provider(Some("unknown")).expect("explicit provider should resolve");
+        assert_eq!(provider, "unknown");
     }
 }

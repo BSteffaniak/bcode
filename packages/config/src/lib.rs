@@ -1414,7 +1414,7 @@ pub enum ConfigError {
 /// at load time, state-file rules win over same-pattern rules declared in
 /// `bcode.toml`.
 ///
-/// `category` must be one of `bash`, `read`, `write`, or `edit`.
+/// `category` must be one of `bash`, `read`, `write`, `edit`, or `web`.
 /// `action` must be one of `allow`, `ask`, or `deny`.
 ///
 /// # Errors
@@ -1792,6 +1792,9 @@ pub fn merge_agent_configs(
         for (pattern, action) in overlay_agent.permission.edit {
             entry.permission.edit.insert(pattern, action);
         }
+        for (pattern, action) in overlay_agent.permission.web {
+            entry.permission.web.insert(pattern, action);
+        }
     }
 }
 
@@ -1847,6 +1850,7 @@ fn insert_agent_permission_rule(
         "read" => &mut permission.read,
         "write" => &mut permission.write,
         "edit" => &mut permission.edit,
+        "web" => &mut permission.web,
         _ => return Err(ConfigError::UnknownPermissionCategory(category.to_string())),
     };
     map.insert(pattern, action);
@@ -2243,6 +2247,7 @@ fn write_agents_toml(
             || !permission.read.is_empty()
             || !permission.write.is_empty()
             || !permission.edit.is_empty()
+            || !permission.web.is_empty()
             || permission.external_directory
                 != bcode_agent_policy_models::default_external_directory_action();
         if !has_permission {
@@ -2265,6 +2270,7 @@ fn write_agents_toml(
         write_action_map(output, "read", &permission.read);
         write_action_map(output, "write", &permission.write);
         write_action_map(output, "edit", &permission.edit);
+        write_action_map(output, "web", &permission.web);
         output.push('\n');
     }
 }

@@ -97,6 +97,66 @@ fn presentation_from_tool(
             *ignore_case,
             *max_matches,
         ),
+        ToolRequestPresentation::WebSearch {
+            query,
+            provider,
+            max_results,
+        } => web_search_permission(tool_name, query, provider.as_deref(), *max_results),
+        ToolRequestPresentation::WebFetch {
+            url,
+            max_bytes,
+            render,
+        } => web_fetch_permission(tool_name, url, *max_bytes, *render),
+    }
+}
+
+fn web_search_permission(
+    tool_name: &str,
+    query: &str,
+    provider: Option<&str>,
+    max_results: Option<u64>,
+) -> PermissionPresentation {
+    let mut details = vec![PermissionDetail::new("query", query.to_owned())];
+    if let Some(provider) = provider {
+        details.push(PermissionDetail::new("provider", provider.to_owned()));
+    }
+    if let Some(max_results) = max_results {
+        details.push(PermissionDetail::new(
+            "max results",
+            max_results.to_string(),
+        ));
+    }
+    PermissionPresentation {
+        title: tool_name.to_owned(),
+        risk: "web search".to_owned(),
+        details,
+        raw_details: None,
+    }
+}
+
+fn web_fetch_permission(
+    tool_name: &str,
+    url: &str,
+    max_bytes: Option<u64>,
+    render: bool,
+) -> PermissionPresentation {
+    let mut details = vec![PermissionDetail::new("url", url.to_owned())];
+    if let Some(max_bytes) = max_bytes {
+        details.push(PermissionDetail::new("max bytes", max_bytes.to_string()));
+    }
+    details.push(PermissionDetail::new(
+        "rendered",
+        if render { "yes" } else { "no" },
+    ));
+    PermissionPresentation {
+        title: tool_name.to_owned(),
+        risk: if render {
+            "rendered web fetch".to_owned()
+        } else {
+            "web fetch".to_owned()
+        },
+        details,
+        raw_details: None,
     }
 }
 

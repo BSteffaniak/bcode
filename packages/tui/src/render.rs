@@ -779,6 +779,30 @@ fn push_tool_request_presentation_rows(
                 push_kv_row(rows, "limit", &format!("{max_matches} matches"), width);
             }
         }
+        ToolRequestPresentation::WebSearch {
+            query,
+            provider,
+            max_results,
+        } => {
+            push_kv_row(rows, "query", query, width);
+            if let Some(provider) = provider {
+                push_kv_row(rows, "provider", provider, width);
+            }
+            if let Some(max_results) = max_results {
+                push_kv_row(rows, "limit", &format!("{max_results} results"), width);
+            }
+        }
+        ToolRequestPresentation::WebFetch {
+            url,
+            max_bytes,
+            render,
+        } => {
+            push_kv_row(rows, "url", url, width);
+            if let Some(max_bytes) = max_bytes {
+                push_kv_row(rows, "limit", &format!("{max_bytes} bytes"), width);
+            }
+            push_kv_row(rows, "rendered", if *render { "yes" } else { "no" }, width);
+        }
     }
 }
 
