@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
@@ -947,7 +948,7 @@ pub struct SessionManager {
 
 #[derive(Debug, Default)]
 struct SessionManagerInner {
-    sessions: BTreeMap<SessionId, SessionState>,
+    sessions: BTreeMap<SessionId, SessionHandle>,
     catalog_loaded: bool,
     activity_clock_ms: u64,
     index_rebuilds: BTreeMap<SessionId, JoinHandle<()>>,
@@ -968,6 +969,20 @@ pub struct SessionMaintenanceStatus {
     pub running_rebuilds: usize,
     pub completed_rebuilds: usize,
     pub failed_rebuilds: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SessionHandle {
+    state: Arc<Mutex<SessionState>>,
+}
+
+impl SessionHandle {
+    #[must_use]
+    fn new(state: SessionState) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1027,7 +1042,10 @@ impl SessionManager {
     ) -> Self {
         Self {
             inner: Mutex::new(SessionManagerInner {
-                sessions,
+                sessions: sessions
+                    .into_iter()
+                    .map(|(session_id, state)| (session_id, SessionHandle::new(state)))
+                    .collect(),
                 catalog_loaded,
                 activity_clock_ms: current_unix_millis(),
                 index_rebuilds: BTreeMap::new(),
@@ -1036,6 +1054,17 @@ impl SessionManager {
             }),
             store: Some(store),
         }
+    }
+
+    async fn session_handle(&self, session_id: SessionId) -> Result<SessionHandle, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        self.inner
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(SessionError::NotFound(session_id))
     }
 
     async fn ensure_session_loaded(&self, session_id: SessionId) -> Result<(), SessionError> {
@@ -1049,7 +1078,10 @@ impl SessionManager {
             return Err(SessionError::NotFound(session_id));
         };
         let mut inner = self.inner.lock().await;
-        inner.sessions.entry(session_id).or_insert(state);
+        inner
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| SessionHandle::new(state));
         Ok(())
     }
 
@@ -1064,7 +1096,10 @@ impl SessionManager {
         let sessions = store.load_catalog()?;
         let mut inner = self.inner.lock().await;
         for (session_id, state) in sessions {
-            inner.sessions.entry(session_id).or_insert(state);
+            inner
+                .sessions
+                .entry(session_id)
+                .or_insert_with(|| SessionHandle::new(state));
         }
         inner.catalog_loaded = true;
         Ok(())
@@ -1076,11 +1111,8 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         self.ensure_session_loaded(session_id).await?;
         let should_migrate = {
-            let inner = self.inner.lock().await;
-            let state = inner
-                .sessions
-                .get(&session_id)
-                .ok_or(SessionError::NotFound(session_id))?;
+            let handle = self.session_handle(session_id).await?;
+            let state = handle.state.lock().await;
             match state.access_status {
                 SessionAccessStatus::ReadWrite => false,
                 SessionAccessStatus::ReadOnlyMigrationRequired => true,
@@ -1097,17 +1129,15 @@ impl SessionManager {
         };
         store.migrate_event_log_to_current(session_id)?;
         let index = store.ensure_fresh_index(session_id)?;
-        let mut inner = self.inner.lock().await;
-        let clients = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?
-            .clients
-            .clone();
+        let handle = self.session_handle(session_id).await?;
+        let clients = {
+            let state = handle.state.lock().await;
+            state.clients.clone()
+        };
         let mut state = SessionState::from_index(index);
         state.clients = clients;
         state.summary.client_count = state.clients.len();
-        inner.sessions.insert(session_id, state);
+        *handle.state.lock().await = state;
         Ok(())
     }
 
@@ -1122,10 +1152,9 @@ impl SessionManager {
         working_directory: PathBuf,
     ) -> Result<SessionSummary, SessionError> {
         let working_directory = normalize_working_directory(&working_directory);
-        let mut inner = self.inner.lock().await;
         let id = SessionId::new();
         let (sender, _) = broadcast::channel(512);
-        let now_ms = inner.next_activity_timestamp_ms();
+        let now_ms = self.next_activity_timestamp_ms().await;
         let summary = SessionSummary {
             id,
             name: name.clone(),
@@ -1160,7 +1189,11 @@ impl SessionManager {
             self.store.as_ref(),
             now_ms,
         )?;
-        inner.sessions.insert(id, state);
+        self.inner
+            .lock()
+            .await
+            .sessions
+            .insert(id, SessionHandle::new(state));
         Ok(summary)
     }
 
@@ -1175,8 +1208,11 @@ impl SessionManager {
     /// List already-loaded sessions without touching persistent storage.
     pub async fn cached_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
         let working_directory = normalize_working_directory(working_directory);
-        let inner = self.inner.lock().await;
-        sorted_session_summaries(&inner.sessions, &working_directory)
+        let handles = {
+            let inner = self.inner.lock().await;
+            inner.sessions.values().cloned().collect::<Vec<_>>()
+        };
+        sorted_session_summaries(handles, &working_directory).await
     }
 
     /// Return true once the persistent session catalog has been discovered.
@@ -1186,9 +1222,28 @@ impl SessionManager {
 
     /// Return background maintenance status.
     pub async fn maintenance_status(&self) -> SessionMaintenanceStatus {
-        let mut inner = self.inner.lock().await;
-        inner.collect_finished_rebuilds();
-        inner.maintenance_status()
+        let (handles, running_rebuilds, completed_rebuilds, failed_rebuilds, completed_handles) = {
+            let mut inner = self.inner.lock().await;
+            let completed_handles = inner.collect_finished_rebuilds();
+            let handles = inner.sessions.values().cloned().collect::<Vec<_>>();
+            (
+                handles,
+                inner.index_rebuilds.len(),
+                inner.completed_rebuilds,
+                inner.failed_rebuilds,
+                completed_handles,
+            )
+        };
+        for handle in completed_handles {
+            handle.state.lock().await.index_status = SessionIndexStatusKind::Current;
+        }
+        let stale_indexes = stale_index_count(handles).await;
+        SessionMaintenanceStatus {
+            stale_indexes,
+            running_rebuilds,
+            completed_rebuilds,
+            failed_rebuilds,
+        }
     }
 
     /// Rename a session.
@@ -1207,23 +1262,18 @@ impl SessionManager {
         self.migrate_session_to_current_if_required(session_id)
             .await?;
         let normalized_name = normalize_session_name(name);
-        let event = {
-            let mut inner = self.inner.lock().await;
-            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
-            let state = inner
-                .sessions
-                .get_mut(&session_id)
-                .ok_or(SessionError::NotFound(session_id))?;
-            state.ensure_writable()?;
-            state.summary.name.clone_from(&normalized_name);
-            state.push_event(
-                SessionEventKind::SessionRenamed {
-                    name: normalized_name,
-                },
-                self.store.as_ref(),
-                activity_timestamp_ms,
-            )?
-        };
+        let handle = self.session_handle(session_id).await?;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let mut state = handle.state.lock().await;
+        state.ensure_writable()?;
+        state.summary.name.clone_from(&normalized_name);
+        let event = state.push_event(
+            SessionEventKind::SessionRenamed {
+                name: normalized_name,
+            },
+            self.store.as_ref(),
+            activity_timestamp_ms,
+        )?;
         Ok(event)
     }
 
@@ -1240,23 +1290,24 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let mut inner = self.inner.lock().await;
-        let state = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
-        if !state.clients.is_empty() {
-            return Err(SessionError::ConnectedClients(session_id));
+        let handle = self.session_handle(session_id).await?;
+        {
+            let state = handle.state.lock().await;
+            if !state.clients.is_empty() {
+                return Err(SessionError::ConnectedClients(session_id));
+            }
         }
         if let Some(store) = &self.store {
             store.delete(session_id)?;
         }
-        let removed = inner
+        let removed = self
+            .inner
+            .lock()
+            .await
             .sessions
             .remove(&session_id)
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(removed.summary)
+        Ok(removed.state.lock().await.summary.clone())
     }
 
     /// Ensure the session's canonical event log has been migrated to the current schema.
@@ -1279,13 +1330,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        inner
-            .sessions
-            .get(&session_id)
-            .map(SessionState::summary)
-            .ok_or(SessionError::NotFound(session_id))
+        let handle = self.session_handle(session_id).await?;
+        Ok(handle.state.lock().await.summary())
     }
 
     /// Return the durable working directory associated with a session.
@@ -1300,13 +1346,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<PathBuf, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        inner
-            .sessions
-            .get(&session_id)
-            .map(|state| state.working_directory.clone())
-            .ok_or(SessionError::NotFound(session_id))
+        let handle = self.session_handle(session_id).await?;
+        Ok(handle.state.lock().await.working_directory.clone())
     }
 
     /// Return canonical access status for one session.
@@ -1318,13 +1359,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionAccessStatus, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        inner
-            .sessions
-            .get(&session_id)
-            .map(|state| state.access_status)
-            .ok_or(SessionError::NotFound(session_id))
+        let handle = self.session_handle(session_id).await?;
+        Ok(handle.state.lock().await.access_status)
     }
 
     /// Return replayable history for a session.
@@ -1336,12 +1372,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        let state = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
+        let handle = self.session_handle(session_id).await?;
+        let state = handle.state.lock().await;
         if let Some(events) = &state.events {
             return Ok(events.clone());
         }
@@ -1362,13 +1394,9 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
         let should_mark_current = {
-            let inner = self.inner.lock().await;
-            let state = inner
-                .sessions
-                .get(&session_id)
-                .ok_or(SessionError::NotFound(session_id))?;
+            let handle = self.session_handle(session_id).await?;
+            let state = handle.state.lock().await;
             if let Some(events) = &state.events {
                 return Ok(history_page_from_events(session_id, events.clone(), query));
             }
@@ -1380,7 +1408,7 @@ impl SessionManager {
             .ok_or(SessionError::NotFound(session_id))?;
         let page = store.read_session_history_page(session_id, query)?;
         if should_mark_current {
-            self.inner.lock().await.mark_index_current(session_id);
+            self.mark_index_current(session_id).await;
         }
         Ok(page)
     }
@@ -1394,12 +1422,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        let state = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
+        let handle = self.session_handle(session_id).await?;
+        let state = handle.state.lock().await;
         if let Some(events) = &state.events {
             return Ok(input_history_from_events(events));
         }
@@ -1419,12 +1443,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        let state = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
+        let handle = self.session_handle(session_id).await?;
+        let state = handle.state.lock().await;
         if let Some(events) = &state.events {
             return Ok(model_context_events_from_history(events));
         }
@@ -1444,12 +1464,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Option<(String, String)>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        let state = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
+        let handle = self.session_handle(session_id).await?;
+        let state = handle.state.lock().await;
         Ok(state
             .current_provider
             .clone()
@@ -1465,12 +1481,8 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Option<String>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let inner = self.inner.lock().await;
-        let state = inner
-            .sessions
-            .get(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
+        let handle = self.session_handle(session_id).await?;
+        let state = handle.state.lock().await;
         Ok(state.current_agent.clone())
     }
 
@@ -1490,42 +1502,36 @@ impl SessionManager {
     ) -> Result<SessionAttachment, SessionError> {
         self.migrate_session_to_current_if_required(session_id)
             .await?;
-        let attachment = {
-            let mut inner = self.inner.lock().await;
-            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
-            let state = inner
-                .sessions
-                .get_mut(&session_id)
+        let handle = self.session_handle(session_id).await?;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let mut state = handle.state.lock().await;
+        let history = if let Some(events) = &state.events {
+            events.clone()
+        } else {
+            let store = self
+                .store
+                .as_ref()
                 .ok_or(SessionError::NotFound(session_id))?;
-            let history = if let Some(events) = &state.events {
-                events.clone()
-            } else {
-                let store = self
-                    .store
-                    .as_ref()
-                    .ok_or(SessionError::NotFound(session_id))?;
-                store.read_session_events(session_id)?
-            };
-            let input_history = input_history_from_events(&history);
-            state.ensure_writable()?;
-            state.clients.insert(client_id);
-            state.summary.client_count = state.clients.len();
-            let events = state.sender.subscribe();
-            let attached_event = state.push_event(
-                SessionEventKind::ClientAttached { client_id },
-                self.store.as_ref(),
-                activity_timestamp_ms,
-            )?;
-            let session = state.summary();
-            SessionAttachment {
-                session,
-                history,
-                input_history,
-                attached_event,
-                events,
-            }
+            store.read_session_events(session_id)?
         };
-        Ok(attachment)
+        let input_history = input_history_from_events(&history);
+        state.ensure_writable()?;
+        state.clients.insert(client_id);
+        state.summary.client_count = state.clients.len();
+        let events = state.sender.subscribe();
+        let attached_event = state.push_event(
+            SessionEventKind::ClientAttached { client_id },
+            self.store.as_ref(),
+            activity_timestamp_ms,
+        )?;
+        let session = state.summary();
+        Ok(SessionAttachment {
+            session,
+            history,
+            input_history,
+            attached_event,
+            events,
+        })
     }
 
     /// Attach a client and return only the most recent replayable history events.
@@ -1557,32 +1563,26 @@ impl SessionManager {
             .await?
             .events;
         let input_history = self.session_input_history(session_id).await?;
-        let attachment = {
-            let mut inner = self.inner.lock().await;
-            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
-            let state = inner
-                .sessions
-                .get_mut(&session_id)
-                .ok_or(SessionError::NotFound(session_id))?;
-            state.ensure_writable()?;
-            state.clients.insert(client_id);
-            state.summary.client_count = state.clients.len();
-            let events = state.sender.subscribe();
-            let attached_event = state.push_event(
-                SessionEventKind::ClientAttached { client_id },
-                self.store.as_ref(),
-                activity_timestamp_ms,
-            )?;
-            let session = state.summary();
-            SessionAttachment {
-                session,
-                history,
-                input_history,
-                attached_event,
-                events,
-            }
-        };
-        Ok(attachment)
+        let handle = self.session_handle(session_id).await?;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let mut state = handle.state.lock().await;
+        state.ensure_writable()?;
+        state.clients.insert(client_id);
+        state.summary.client_count = state.clients.len();
+        let events = state.sender.subscribe();
+        let attached_event = state.push_event(
+            SessionEventKind::ClientAttached { client_id },
+            self.store.as_ref(),
+            activity_timestamp_ms,
+        )?;
+        let session = state.summary();
+        Ok(SessionAttachment {
+            session,
+            history,
+            input_history,
+            attached_event,
+            events,
+        })
     }
 
     /// Detach a client from a session if it is currently attached.
@@ -1595,12 +1595,11 @@ impl SessionManager {
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<Option<SessionEvent>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let mut inner = self.inner.lock().await;
-        let activity_timestamp_ms = inner.next_activity_timestamp_ms();
-        let Some(state) = inner.sessions.get_mut(&session_id) else {
+        let Ok(handle) = self.session_handle(session_id).await else {
             return Ok(None);
         };
+        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let mut state = handle.state.lock().await;
         state.ensure_writable()?;
         if state.clients.remove(&client_id) {
             state.summary.client_count = state.clients.len();
@@ -1629,31 +1628,25 @@ impl SessionManager {
     ) -> Result<Vec<SessionEvent>, SessionError> {
         self.migrate_session_to_current_if_required(session_id)
             .await?;
-        let events = {
-            let mut inner = self.inner.lock().await;
-            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
-            let state = inner
-                .sessions
-                .get_mut(&session_id)
-                .ok_or(SessionError::NotFound(session_id))?;
-            state.ensure_writable()?;
-            let mut events = Vec::new();
-            if state.summary.name.is_none() && !state.has_user_message {
-                let title = title_from_first_prompt(&text);
-                state.summary.name = Some(title.clone());
-                events.push(state.push_event(
-                    SessionEventKind::SessionRenamed { name: Some(title) },
-                    self.store.as_ref(),
-                    activity_timestamp_ms,
-                )?);
-            }
+        let handle = self.session_handle(session_id).await?;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let mut state = handle.state.lock().await;
+        state.ensure_writable()?;
+        let mut events = Vec::new();
+        if state.summary.name.is_none() && !state.has_user_message {
+            let title = title_from_first_prompt(&text);
+            state.summary.name = Some(title.clone());
             events.push(state.push_event(
-                SessionEventKind::UserMessage { client_id, text },
+                SessionEventKind::SessionRenamed { name: Some(title) },
                 self.store.as_ref(),
                 activity_timestamp_ms,
             )?);
-            events
-        };
+        }
+        events.push(state.push_event(
+            SessionEventKind::UserMessage { client_id, text },
+            self.store.as_ref(),
+            activity_timestamp_ms,
+        )?);
         Ok(events)
     }
 
@@ -1743,8 +1736,11 @@ impl SessionManager {
         session_id: SessionId,
         kind: SessionEventKind,
     ) -> Option<SessionEvent> {
-        let inner = self.inner.lock().await;
-        let state = inner.sessions.get(&session_id)?;
+        let handle = {
+            let inner = self.inner.lock().await;
+            inner.sessions.get(&session_id).cloned()?
+        };
+        let state = handle.state.lock().await;
         if state.sender.receiver_count() == 0 {
             return None;
         }
@@ -1995,56 +1991,49 @@ impl SessionManager {
     ) -> Result<SessionEvent, SessionError> {
         self.migrate_session_to_current_if_required(session_id)
             .await?;
-        let event = {
-            let mut inner = self.inner.lock().await;
-            let activity_timestamp_ms = inner.next_activity_timestamp_ms();
-            let state = inner
-                .sessions
-                .get_mut(&session_id)
-                .ok_or(SessionError::NotFound(session_id))?;
-            state.ensure_writable()?;
-            state.push_event(kind, self.store.as_ref(), activity_timestamp_ms)?
-        };
+        let handle = self.session_handle(session_id).await?;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let mut state = handle.state.lock().await;
+        state.ensure_writable()?;
+        let event = state.push_event(kind, self.store.as_ref(), activity_timestamp_ms)?;
         Ok(event)
+    }
+    async fn mark_index_current(&self, session_id: SessionId) {
+        if let Ok(handle) = self.session_handle(session_id).await {
+            handle.state.lock().await.index_status = SessionIndexStatusKind::Current;
+        }
+        let completed_rebuilds = {
+            let mut inner = self.inner.lock().await;
+            inner.collect_finished_rebuilds()
+        };
+        for handle in completed_rebuilds {
+            handle.state.lock().await.index_status = SessionIndexStatusKind::Current;
+        }
+    }
+
+    async fn next_activity_timestamp_ms(&self) -> u64 {
+        self.inner.lock().await.next_activity_timestamp_ms()
     }
 }
 
 impl SessionManagerInner {
-    fn mark_index_current(&mut self, session_id: SessionId) {
-        if let Some(state) = self.sessions.get_mut(&session_id) {
-            state.index_status = SessionIndexStatusKind::Current;
-        }
-        self.collect_finished_rebuilds();
-    }
-
-    fn collect_finished_rebuilds(&mut self) {
+    fn collect_finished_rebuilds(&mut self) -> Vec<SessionHandle> {
         let finished = self
             .index_rebuilds
             .iter()
             .filter_map(|(session_id, handle)| handle.is_finished().then_some(*session_id))
             .collect::<Vec<_>>();
+        let mut completed = Vec::new();
         for session_id in finished {
             if let Some(handle) = self.index_rebuilds.remove(&session_id) {
                 drop(handle);
                 self.completed_rebuilds = self.completed_rebuilds.saturating_add(1);
-                if let Some(state) = self.sessions.get_mut(&session_id) {
-                    state.index_status = SessionIndexStatusKind::Current;
+                if let Some(state) = self.sessions.get(&session_id) {
+                    completed.push(state.clone());
                 }
             }
         }
-    }
-
-    fn maintenance_status(&self) -> SessionMaintenanceStatus {
-        SessionMaintenanceStatus {
-            stale_indexes: self
-                .sessions
-                .values()
-                .filter(|state| state.index_status == SessionIndexStatusKind::Stale)
-                .count(),
-            running_rebuilds: self.index_rebuilds.len(),
-            completed_rebuilds: self.completed_rebuilds,
-            failed_rebuilds: self.failed_rebuilds,
-        }
+        completed
     }
 
     fn next_activity_timestamp_ms(&mut self) -> u64 {
@@ -2160,15 +2149,27 @@ impl SessionState {
     }
 }
 
-fn sorted_session_summaries(
-    sessions: &BTreeMap<SessionId, SessionState>,
+async fn stale_index_count(handles: Vec<SessionHandle>) -> usize {
+    let mut count = 0;
+    for handle in handles {
+        if handle.state.lock().await.index_status == SessionIndexStatusKind::Stale {
+            count += 1;
+        }
+    }
+    count
+}
+
+async fn sorted_session_summaries(
+    handles: Vec<SessionHandle>,
     working_directory: &Path,
 ) -> Vec<SessionSummary> {
-    let mut sessions = sessions
-        .values()
-        .filter(|state| normalize_working_directory(&state.working_directory) == working_directory)
-        .map(SessionState::summary)
-        .collect::<Vec<_>>();
+    let mut sessions = Vec::new();
+    for handle in handles {
+        let state = handle.state.lock().await;
+        if normalize_working_directory(&state.working_directory) == working_directory {
+            sessions.push(state.summary());
+        }
+    }
     sessions.sort_by(|left, right| {
         right
             .updated_at_ms
