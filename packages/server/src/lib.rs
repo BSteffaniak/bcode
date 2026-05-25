@@ -569,13 +569,74 @@ fn resolved_plugin_config_value(
     manifest: &bcode_plugin::PluginManifest,
 ) -> serde_json::Value {
     let mut value = serde_json::Value::Object(serde_json::Map::new());
-    if manifest.id == "bcode.web-search" {
+    if let Some(section) = manifest
+        .config
+        .as_ref()
+        .and_then(|config| config.section.as_deref())
+        && section == "web_search"
+    {
         merge_json_values(&mut value, toml_value_to_json(&config.web_search));
     }
     if let Some(plugin_value) = config.plugins.config.get(&manifest.id) {
         merge_json_values(&mut value, toml_value_to_json(plugin_value));
     }
-    value
+    resolve_plugin_config_secrets(value)
+}
+
+fn resolve_plugin_config_secrets(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(resolved) = resolve_secret_ref(&map) {
+                return serde_json::Value::String(resolved);
+            }
+            serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, resolve_plugin_config_secrets(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(resolve_plugin_config_secrets)
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn resolve_secret_ref(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let backend = map.get("backend")?.as_str()?;
+    match backend {
+        "env" => map
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|value| !value.trim().is_empty()),
+        "sshenv" => resolve_sshenv_secret_ref(map),
+        _ => None,
+    }
+}
+
+fn resolve_sshenv_secret_ref(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let profile = map.get("profile")?.as_str()?;
+    let key = map
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(profile);
+    let vault = map
+        .get("vault")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            bcode_config::default_auth_vault_path,
+            std::path::PathBuf::from,
+        );
+    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    store
+        .get_profile(profile)
+        .ok()
+        .flatten()
+        .and_then(|profile_env| profile_env.get(key).map(|value| value.as_str().to_string()))
 }
 
 fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {

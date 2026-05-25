@@ -179,6 +179,7 @@ struct ProviderConfig {
 #[serde(tag = "backend", rename_all = "snake_case")]
 enum SecretRef {
     Env { name: String },
+    Sshenv,
     Value { value: String },
 }
 
@@ -186,6 +187,7 @@ impl SecretRef {
     fn resolve(&self) -> Option<String> {
         match self {
             Self::Env { name } => env_value(&[name.as_str()]),
+            Self::Sshenv => None,
             Self::Value { value } => Some(value.clone()),
         }
     }
