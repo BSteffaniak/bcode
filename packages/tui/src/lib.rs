@@ -32,6 +32,7 @@ pub(crate) mod pending_submissions;
 pub(crate) mod permission_dialog;
 pub(crate) mod permission_dialog_render;
 pub(crate) mod permission_flow;
+pub(crate) mod permission_present;
 pub(crate) mod picker_mouse;
 pub(crate) mod picker_render;
 pub(crate) mod provider_picker;
@@ -50,6 +51,7 @@ pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod text_width;
 pub(crate) mod tool_present;
 pub(crate) mod transcript;
 pub(crate) mod transcript_layout;

@@ -89,7 +89,7 @@ pub async fn run_with_client<W: Write>(
                 if let Some(palette) = &mut modals.palette {
                     command_palette_render::render_palette(palette, frame);
                 }
-                if let Some(dialog) = &mut modals.permission_dialog {
+                if let Some(dialog) = &modals.permission_dialog {
                     permission_dialog_render::render_permission_dialog(dialog, frame);
                 }
             })?;

@@ -1,13 +1,12 @@
 //! TUI permission modal state.
 
 use bcode_ipc::PermissionSummary;
-use bmux_tui::dialog::DialogState;
 
 /// Pending permission dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionDialogState {
     permission: PermissionSummary,
-    dialog: DialogState,
+    focused_action: usize,
 }
 
 impl PermissionDialogState {
@@ -16,7 +15,7 @@ impl PermissionDialogState {
     pub const fn new(permission: PermissionSummary) -> Self {
         Self {
             permission,
-            dialog: DialogState { focused_action: 0 },
+            focused_action: 0,
         }
     }
 
@@ -26,15 +25,10 @@ impl PermissionDialogState {
         &self.permission
     }
 
-    /// Return dialog state mutably.
-    pub const fn dialog_mut(&mut self) -> &mut DialogState {
-        &mut self.dialog
-    }
-
     /// Return the currently focused action approval value.
     #[must_use]
     pub const fn focused_approval(&self) -> bool {
-        self.dialog.focused_action == 0
+        self.focused_action == 0
     }
 
     /// Return the currently focused action label.
@@ -49,11 +43,15 @@ impl PermissionDialogState {
 
     /// Focus next action.
     pub const fn focus_next(&mut self) {
-        self.dialog.focus_next(2);
+        self.focused_action = self.focused_action.saturating_add(1) % 2;
     }
 
     /// Focus previous action.
     pub const fn focus_previous(&mut self) {
-        self.dialog.focus_previous(2);
+        if self.focused_action == 0 {
+            self.focused_action = 1;
+        } else {
+            self.focused_action = self.focused_action.saturating_sub(1);
+        }
     }
 }

@@ -23,6 +23,7 @@ use super::activity::ActivityState;
 use super::app::{BmuxApp, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
+use super::text_width::{display_width as text_display_width, truncate_to_display_width};
 use super::tool_present::{
     GrepMatchPresentation, ListEntryPresentation, ShellResultPresentation, ToolRequestPresentation,
     ToolResultPresentation, tool_request_presentation, tool_result_presentation,
@@ -1299,7 +1300,7 @@ fn terminal_output_lines(output: &TerminalOutputTranscript) -> Vec<Line> {
     };
     stream.process(output.output.as_bytes());
     let grid = stream.grid();
-    let rows = grid.main_content_rows();
+    let rows = grid.main_content_tail_rows(MAX_INLINE_TOOL_TEXT_ROWS);
     let lines = rows
         .iter()
         .map(|row| terminal_grid_row_to_line(grid, row))
@@ -1650,23 +1651,7 @@ fn wrap_text_with_continuation(
     first_width: usize,
     continuation_width: usize,
 ) -> Vec<String> {
-    let mut rows = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-    let mut max_width = first_width;
-    for ch in text.chars() {
-        let width = char_display_width(ch);
-        if current_width > 0 && current_width.saturating_add(width) > max_width {
-            rows.push(current);
-            current = String::new();
-            current_width = 0;
-            max_width = continuation_width;
-        }
-        current.push(ch);
-        current_width = current_width.saturating_add(width);
-    }
-    rows.push(current);
-    rows
+    super::text_width::wrap_text_with_continuation(text, first_width, continuation_width)
 }
 
 fn spans_width(spans: &[Span]) -> usize {
@@ -1674,37 +1659,6 @@ fn spans_width(spans: &[Span]) -> usize {
         .iter()
         .map(|span| text_display_width(&span.content))
         .sum()
-}
-
-fn text_display_width(text: &str) -> usize {
-    text.chars().map(char_display_width).sum()
-}
-
-fn truncate_to_display_width(text: &str, width: usize) -> String {
-    let mut output = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let char_width = char_display_width(ch);
-        if used.saturating_add(char_width) > width {
-            output.push('…');
-            return output;
-        }
-        output.push(ch);
-        used = used.saturating_add(char_width);
-    }
-    output
-}
-
-fn char_display_width(ch: char) -> usize {
-    if ch == '\t' {
-        4
-    } else if ch.is_control() {
-        0
-    } else if ch.len_utf8() > 1 {
-        2
-    } else {
-        1
-    }
 }
 
 fn pending_label(state: PendingSubmissionState) -> String {

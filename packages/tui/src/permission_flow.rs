@@ -7,6 +7,7 @@ use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
+use super::permission_dialog_render;
 use super::{TuiError, session_flow::ActiveChat};
 
 /// Handle one permission-dialog key.
@@ -132,25 +133,11 @@ fn permission_click_approval(mouse: MouseEvent) -> Option<bool> {
         return None;
     };
     let area = helpers::terminal_area().ok()?;
-    let dialog_width = area.width.saturating_sub(4).min(76);
-    let dialog_height = area.height.saturating_sub(4).min(14);
-    let dialog_x = area
-        .x
-        .saturating_add(area.width.saturating_sub(dialog_width) / 2);
-    let dialog_y = area
-        .y
-        .saturating_add(area.height.saturating_sub(dialog_height) / 3);
-    let button_y = dialog_y.saturating_add(dialog_height).saturating_sub(3);
-    if mouse.position.y != button_y {
-        return None;
-    }
-    let approve_start = dialog_x.saturating_add(2);
-    let approve_end = approve_start.saturating_add(12);
-    let deny_start = approve_end.saturating_add(2);
-    let deny_end = deny_start.saturating_add(9);
-    if (approve_start..approve_end).contains(&mouse.position.x) {
+    let dialog = permission_dialog_render::dialog_area(area);
+    let (approve_area, deny_area) = permission_dialog_render::action_areas(dialog);
+    if approve_area.contains(mouse.position) {
         Some(true)
-    } else if (deny_start..deny_end).contains(&mouse.position.x) {
+    } else if deny_area.contains(mouse.position) {
         Some(false)
     } else {
         None

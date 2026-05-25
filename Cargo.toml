@@ -152,6 +152,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "std",
 ] }
 unicode-segmentation = { version = "1.13.0", default-features = false }
+unicode-width = { version = "0.2.2", default-features = false }
 uuid = { version = "1.21.0", default-features = false }
 zeroize = { version = "1.8.2", default-features = false, features = ["std"] }
 
@@ -194,12 +195,12 @@ opt-level = 0
 # switchy_time                 = { path = "../MoosicBox/packages/switchy/time" }
 
 # BMUX local development patches
-# [patch."https://github.com/BSteffaniak/bmux.git"]
-# bmux_attach_image_protocol = { path = "../wt-bmux/text-inputs/packages/attach-image-protocol" }
-# bmux_codec                 = { path = "../wt-bmux/text-inputs/packages/codec" }
-# bmux_ipc                   = { path = "../wt-bmux/text-inputs/packages/ipc" }
-# bmux_keyboard              = { path = "../wt-bmux/text-inputs/packages/keyboard" }
-# bmux_terminal_grid         = { path = "../wt-bmux/text-inputs/packages/terminal-grid" }
-# bmux_text_edit             = { path = "../wt-bmux/text-inputs/packages/text-edit" }
-# bmux_tui                   = { path = "../wt-bmux/text-inputs/packages/tui" }
-# bmux_tui_components        = { path = "../wt-bmux/text-inputs/packages/tui-components" }
+[patch."https://github.com/BSteffaniak/bmux.git"]
+bmux_attach_image_protocol = { path = "../wt-bmux/text-inputs/packages/attach-image-protocol" }
+bmux_codec                 = { path = "../wt-bmux/text-inputs/packages/codec" }
+bmux_ipc                   = { path = "../wt-bmux/text-inputs/packages/ipc" }
+bmux_keyboard              = { path = "../wt-bmux/text-inputs/packages/keyboard" }
+bmux_terminal_grid         = { path = "../wt-bmux/text-inputs/packages/terminal-grid" }
+bmux_text_edit             = { path = "../wt-bmux/text-inputs/packages/text-edit" }
+bmux_tui                   = { path = "../wt-bmux/text-inputs/packages/tui" }
+bmux_tui_components        = { path = "../wt-bmux/text-inputs/packages/tui-components" }
