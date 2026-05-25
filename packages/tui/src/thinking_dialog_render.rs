@@ -1,10 +1,10 @@
 //! TUI thinking settings dialog rendering.
 
-use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
-use bmux_tui::prelude::{Line, Span, Style, Widget};
+use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 
 use super::thinking_dialog::ThinkingDialogState;
 
@@ -15,14 +15,10 @@ const MAX_DIALOG_HEIGHT: u16 = 22;
 
 /// Render a thinking settings dialog.
 pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>) {
-    let area = dialog_area(frame.area());
-    Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::Cyan)))
-        .title(" Thinking settings ")
-        .padding(Insets::new(1, 2, 1, 2))
-        .render(area, frame);
+    let modal = modal_frame();
+    modal.render(frame.area(), frame);
 
-    let content = area.inset(Insets::new(2, 3, 2, 3));
+    let content = modal.content_area(frame.area());
     let rows = rows(state);
     for (row_index, line) in rows.iter().take(usize::from(content.height)).enumerate() {
         let Ok(row_offset) = u16::try_from(row_index) else {
@@ -40,18 +36,18 @@ pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>
     }
 }
 
-/// Return the thinking dialog panel area for a terminal area.
-#[must_use]
-pub fn dialog_area(area: Rect) -> Rect {
-    let available_width = area.width.saturating_sub(4);
-    let available_height = area.height.saturating_sub(4);
-    let width = available_width.clamp(MIN_DIALOG_WIDTH.min(available_width), MAX_DIALOG_WIDTH);
-    let height = available_height.clamp(MIN_DIALOG_HEIGHT.min(available_height), MAX_DIALOG_HEIGHT);
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 3);
-    Rect::new(x, y, width, height)
+fn modal_frame() -> ModalFrame {
+    ModalFrame::new(
+        ModalSizing::new(
+            Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
+            Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
+            Insets::all(4),
+        ),
+        ModalTheme::dark(Color::Cyan),
+    )
+    .title(" Thinking settings ")
+    .padding(Insets::new(1, 2, 1, 2))
+    .placement(ModalPlacement::UpperThird)
 }
 
 fn rows(state: &ThinkingDialogState) -> Vec<Line> {

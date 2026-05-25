@@ -1,13 +1,13 @@
 //! TUI permission dialog rendering.
 
-use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
-use bmux_tui::prelude::{Line, Span, Style, Widget};
+use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
 use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails, LabeledDetailsStyles};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 
 use super::permission_dialog::PermissionDialogState;
 use super::permission_present::{PermissionDetail, permission_presentation};
@@ -19,7 +19,8 @@ const MAX_DIALOG_HEIGHT: u16 = 24;
 
 /// Render a permission approval dialog.
 pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame<'_>) {
-    let area = dialog_area(frame.area());
+    let modal = modal_frame();
+    let area = modal.panel_area(frame.area());
     let permission = state.permission();
     let presentation = permission_presentation(&permission.tool_name, &permission.arguments_json);
     let rows = permission_rows(
@@ -32,13 +33,9 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
         area.width.saturating_sub(4),
     );
 
-    Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::Yellow)))
-        .title(" Permission requested ")
-        .padding(Insets::new(1, 2, 1, 2))
-        .render(area, frame);
+    modal.render(frame.area(), frame);
 
-    let content = area.inset(Insets::new(2, 3, 2, 3));
+    let content = modal.content_area(frame.area());
     let visible_body_rows = content.height.saturating_sub(2);
     for (row_index, line) in rows.iter().take(usize::from(visible_body_rows)).enumerate() {
         let Ok(row_offset) = u16::try_from(row_index) else {
@@ -61,15 +58,21 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
 /// Return the permission dialog panel area for a terminal area.
 #[must_use]
 pub fn dialog_area(area: Rect) -> Rect {
-    let available_width = area.width.saturating_sub(4);
-    let available_height = area.height.saturating_sub(4);
-    let width = available_width.clamp(MIN_DIALOG_WIDTH.min(available_width), MAX_DIALOG_WIDTH);
-    let height = available_height.clamp(MIN_DIALOG_HEIGHT.min(available_height), MAX_DIALOG_HEIGHT);
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 3);
-    Rect::new(x, y, width, height)
+    modal_frame().panel_area(area)
+}
+
+fn modal_frame() -> ModalFrame {
+    ModalFrame::new(
+        ModalSizing::new(
+            Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
+            Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
+            Insets::all(4),
+        ),
+        ModalTheme::dark(Color::Yellow),
+    )
+    .title(" Permission requested ")
+    .padding(Insets::new(1, 2, 1, 2))
+    .placement(ModalPlacement::UpperThird)
 }
 
 /// Return approve and deny button hit boxes for a dialog panel area.
