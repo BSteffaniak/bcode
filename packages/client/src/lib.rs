@@ -8,8 +8,10 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
-    Response, ResponsePayload, ServerStopMode, SessionCatalogStatus, current_working_directory,
-    decode, default_endpoint, recv_envelope, request_envelope, send_envelope,
+    Response, ResponsePayload, ServerStopMode, SessionCatalogStatus, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
+    WorktreeRemoveResponse, current_working_directory, decode, default_endpoint, recv_envelope,
+    request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
@@ -365,6 +367,63 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionWorkingDirectoryChanged { session, .. } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List Git worktrees for the current repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_worktrees(
+        &self,
+        request: WorktreeListRequest,
+    ) -> Result<WorktreeListResponse, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::ListWorktrees(request))
+            .await?
+        {
+            ResponsePayload::WorktreeList(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Create a Git worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn create_worktree(
+        &self,
+        request: WorktreeCreateRequest,
+    ) -> Result<WorktreeCreateResponse, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::CreateWorktree(request))
+            .await?
+        {
+            ResponsePayload::WorktreeCreated(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Remove a Git worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn remove_worktree(
+        &self,
+        request: WorktreeRemoveRequest,
+    ) -> Result<WorktreeRemoveResponse, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::RemoveWorktree(request))
+            .await?
+        {
+            ResponsePayload::WorktreeRemoved(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

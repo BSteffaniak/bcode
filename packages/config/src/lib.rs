@@ -131,6 +131,8 @@ pub struct BcodeConfig {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub tui: TuiConfig,
+    #[serde(default)]
+    pub worktree: WorktreeConfig,
     #[serde(default = "empty_toml_table")]
     pub web_search: toml::Value,
 }
@@ -146,6 +148,7 @@ impl Default for BcodeConfig {
             observability: ObservabilityConfig::default(),
             skills: SkillsConfig::default(),
             tui: TuiConfig::default(),
+            worktree: WorktreeConfig::default(),
             web_search: empty_toml_table(),
         }
     }
@@ -788,6 +791,79 @@ pub enum ObservabilityLevel {
 
 const fn default_max_trace_blob_bytes() -> usize {
     10 * 1024 * 1024
+}
+
+/// Worktree configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    /// Root directory for Bcode-created worktrees. Relative paths resolve from the repo root.
+    #[serde(default = "default_worktree_root")]
+    pub root: PathBuf,
+    /// Prefix used when deriving new branch names.
+    #[serde(default = "default_worktree_branch_prefix")]
+    pub branch_prefix: String,
+    /// Default base ref strategy for new worktrees.
+    #[serde(default)]
+    pub base_ref: WorktreeBaseRefConfig,
+    /// Automatic worktree setup configuration.
+    #[serde(default)]
+    pub setup: WorktreeSetupConfig,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            root: default_worktree_root(),
+            branch_prefix: default_worktree_branch_prefix(),
+            base_ref: WorktreeBaseRefConfig::default(),
+            setup: WorktreeSetupConfig::default(),
+        }
+    }
+}
+
+/// Configured strategy for choosing the base ref for newly-created worktrees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeBaseRefConfig {
+    /// Use context-sensitive defaults.
+    #[default]
+    Auto,
+    /// Use the repository default branch when possible.
+    DefaultBranch,
+    /// Use the current checkout's `HEAD`.
+    Head,
+}
+
+/// Automatic worktree setup configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeSetupConfig {
+    /// Whether setup should run automatically after creating a worktree.
+    #[serde(default = "default_worktree_setup_enabled")]
+    pub enabled: bool,
+    /// Setup profile name for future profile-aware setup flows.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+impl Default for WorktreeSetupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_worktree_setup_enabled(),
+            profile: None,
+        }
+    }
+}
+
+fn default_worktree_root() -> PathBuf {
+    PathBuf::from(".bcode").join("worktrees")
+}
+
+fn default_worktree_branch_prefix() -> String {
+    "bcode/".to_string()
+}
+
+const fn default_worktree_setup_enabled() -> bool {
+    true
 }
 
 /// Terminal UI configuration.
@@ -2737,6 +2813,12 @@ fn toml_string(value: &str) -> String {
 /// Return default config paths in merge order.
 #[must_use]
 pub fn default_config_paths() -> Vec<PathBuf> {
+    default_config_paths_from(&env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Return default config paths in merge order for a starting directory.
+#[must_use]
+pub fn default_config_paths_from(start: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
         paths.push(
@@ -2752,10 +2834,26 @@ pub fn default_config_paths() -> Vec<PathBuf> {
                 .join(DEFAULT_CONFIG_FILE_NAME),
         );
     }
-    if let Ok(current_dir) = env::current_dir() {
-        paths.push(current_dir.join(".bcode").join(DEFAULT_CONFIG_FILE_NAME));
-    }
+    let root = discover_config_root(start).unwrap_or_else(|| start.to_path_buf());
+    paths.push(root.join(DEFAULT_CONFIG_FILE_NAME));
+    paths.push(root.join(".bcode").join(DEFAULT_CONFIG_FILE_NAME));
     paths
+}
+
+fn discover_config_root(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
 }
 
 /// Load configuration from default paths.
@@ -2917,7 +3015,7 @@ mod tests {
         BcodeConfig, CompactionMode, ConfigLoadOverrides, DEFAULT_AGENT_PROFILE_PLUGIN_ID,
         DEFAULT_DOCUMENT_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID,
         DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig,
-        default_permissions_state_path, load_config_from_paths,
+        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_agent_configs,
         upsert_agent_permission_rule,
     };
@@ -3897,6 +3995,19 @@ extends = ["a"]
         .expect("config should load");
 
         assert_eq!(config.model.max_tool_rounds, Some(6));
+    }
+
+    #[test]
+    fn default_config_paths_include_repo_local_layers() {
+        let root = unique_temp_dir();
+        let nested = root.join("src").join("bin");
+        std::fs::create_dir_all(root.join(".git")).expect("git dir should be created");
+        std::fs::create_dir_all(&nested).expect("nested dir should be created");
+
+        let paths = default_config_paths_from(&nested);
+
+        assert!(paths.contains(&root.join("bcode.toml")));
+        assert!(paths.contains(&root.join(".bcode").join("bcode.toml")));
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

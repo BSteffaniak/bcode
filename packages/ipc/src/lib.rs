@@ -10,6 +10,10 @@ use bcode_session_models::{
     SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
+pub use bcode_worktree_models::{
+    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
+    WorktreeRemoveRequest, WorktreeRemoveResponse,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::env;
@@ -217,6 +221,9 @@ pub enum Request {
         session_id: SessionId,
         working_directory: PathBuf,
     },
+    ListWorktrees(WorktreeListRequest),
+    CreateWorktree(WorktreeCreateRequest),
+    RemoveWorktree(WorktreeRemoveRequest),
 }
 
 /// Server stop request policy.
@@ -451,6 +458,9 @@ pub enum ResponsePayload {
         session: SessionSummary,
         changed: bool,
     },
+    WorktreeList(WorktreeListResponse),
+    WorktreeCreated(WorktreeCreateResponse),
+    WorktreeRemoved(WorktreeRemoveResponse),
 }
 
 /// Structured error response.

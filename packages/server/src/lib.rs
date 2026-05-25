@@ -13,8 +13,8 @@ use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogStatus, decode, event_envelope, recv_envelope, response_envelope,
-    send_envelope,
+    ServerStopMode, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
+    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
@@ -1068,6 +1068,15 @@ async fn handle_request(
             )
             .await
         }
+        Request::ListWorktrees(request) => {
+            handle_list_worktrees(request_id, state, writer, request).await
+        }
+        Request::CreateWorktree(request) => {
+            handle_create_worktree(request_id, state, writer, request).await
+        }
+        Request::RemoveWorktree(request) => {
+            handle_remove_worktree(request_id, writer, request).await
+        }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
         }
@@ -1246,6 +1255,9 @@ async fn handle_agent_permission_plugin_request(
         }
         Request::PublishPluginEvent { topic, payload } => {
             handle_publish_plugin_event(request_id, state, writer, &topic, &payload).await
+        }
+        Request::ListWorktrees(_) | Request::CreateWorktree(_) | Request::RemoveWorktree(_) => {
+            unreachable!("worktree request routed to primary handler")
         }
         _ => unreachable!("primary request routed to agent/permission/plugin handler"),
     }
@@ -1439,6 +1451,129 @@ async fn handle_change_session_working_directory(
             .await
         }
     }
+}
+
+async fn handle_list_worktrees(
+    request_id: u64,
+    _state: &ServerState,
+    writer: &SharedWriter,
+    request: WorktreeListRequest,
+) -> Result<(), ServerError> {
+    let cwd = request.cwd.unwrap_or_else(current_request_cwd);
+    match bcode_worktree::list_worktrees(&cwd) {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorktreeList(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "worktree_list_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_create_worktree(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: WorktreeCreateRequest,
+) -> Result<(), ServerError> {
+    if let Some(session_id) = request.attach_session_id
+        && state.active_turns.lock().await.contains_key(&session_id)
+    {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_busy",
+                format!("session has an active model turn: {session_id}"),
+            )),
+        )
+        .await;
+    }
+    let cwd = request.cwd.clone().unwrap_or_else(current_request_cwd);
+    let config = bcode_config::load_config()?;
+    match bcode_worktree::create_worktree(&config, &request, &cwd) {
+        Ok(mut response) => {
+            if let Some(session_id) = request.attach_session_id {
+                if let Some(event) = state
+                    .sessions
+                    .change_session_working_directory(session_id, response.path.clone())
+                    .await?
+                {
+                    publish_session_event(state, &event).await;
+                }
+                response.session = Some(state.sessions.session_summary(session_id).await?);
+            } else if request.new_session {
+                let session = state
+                    .sessions
+                    .create_session(Some(request.name), response.path.clone())
+                    .await?;
+                response.session = Some(session);
+            }
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorktreeCreated(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "worktree_create_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_remove_worktree(
+    request_id: u64,
+    writer: &SharedWriter,
+    request: WorktreeRemoveRequest,
+) -> Result<(), ServerError> {
+    let cwd = request.cwd.unwrap_or_else(current_request_cwd);
+    match bcode_worktree::remove_worktree(&cwd, &request.path, request.force) {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorktreeRemoved(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "worktree_remove_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+fn current_request_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 async fn handle_rename_session(

@@ -23,6 +23,7 @@ bcode_server           = { workspace = true }
 bcode_session          = { workspace = true }
 bcode_session_models   = { workspace = true }
 bcode_tui              = { workspace = true }
+bcode_worktree_models  = { workspace = true }
 clap                   = { workspace = true, features = ["derive", "help", "std", "usage"] }
 rand                   = { workspace = true }
 reqwest                = { workspace = true }

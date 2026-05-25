@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared worktree models for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "worktree", "git"]
+license     = { workspace = true }
+name        = "bcode_worktree_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

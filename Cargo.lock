@@ -763,6 +763,7 @@ dependencies = [
  "bcode_session",
  "bcode_session_models",
  "bcode_tui",
+ "bcode_worktree_models",
  "clap",
  "rand 0.9.4",
  "reqwest",
@@ -907,6 +908,7 @@ dependencies = [
  "bcode_plugin",
  "bcode_session_models",
  "bcode_skill_models",
+ "bcode_worktree_models",
  "bmux_codec",
  "bmux_ipc",
  "serde",
@@ -1021,6 +1023,8 @@ dependencies = [
  "bcode_skill_models",
  "bcode_tool",
  "bcode_web_search_plugin",
+ "bcode_worktree",
+ "bcode_worktree_models",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1151,6 +1155,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bcode_worktree"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_config",
+ "bcode_worktree_models",
+ "serde",
+ "thiserror 2.0.18",
+ "worktree_setup_git",
+]
+
+[[package]]
+name = "bcode_worktree_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "serde",
 ]
 
 [[package]]
@@ -2272,6 +2295,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "git2"
+version = "0.20.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
+dependencies = [
+ "bitflags 2.11.1",
+ "libc",
+ "libgit2-sys",
+ "log",
+ "url",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2963,6 +2999,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libgit2-sys"
+version = "0.18.4+1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b26f66f35e1871b22efcf7191564123d2a446ca0538cde63c23adfefa9b15b7"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "pkg-config",
+]
+
+[[package]]
 name = "libloading"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2985,6 +3033,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e02f3bb43d335493c96bf3fd3a321600bf6bd07ed34bc64118e9293bdffea46c"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "libz-sys"
+version = "1.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc3a226e576f50782b3305c5ccf458698f92798987f551c6a02efe8276721e22"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -5330,6 +5390,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5827,6 +5893,17 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "worktree_setup_git"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e070482002f7deee3ce63e919449b8734682f1ecd15cbaaeeebbca172abcfb72"
+dependencies = [
+ "git2",
+ "log",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

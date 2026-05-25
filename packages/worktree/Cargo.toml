@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Git worktree orchestration for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "worktree", "git"]
+license     = { workspace = true }
+name        = "bcode_worktree"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_config          = { workspace = true }
+bcode_worktree_models = { workspace = true }
+serde                 = { workspace = true, features = ["derive", "std"] }
+thiserror             = { workspace = true }
+worktree_setup_git    = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
