@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
@@ -939,11 +939,26 @@ fn read_indexed_events(
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct SessionStoreExecutor {
+    store: SessionEventStore,
+}
+
+impl SessionStoreExecutor {
+    const fn new(store: SessionEventStore) -> Self {
+        Self { store }
+    }
+
+    const fn store(&self) -> &SessionEventStore {
+        &self.store
+    }
+}
+
 /// In-memory session manager with optional append-only persistence.
 #[derive(Debug, Default)]
 pub struct SessionManager {
     inner: Mutex<SessionManagerInner>,
-    store: Option<SessionEventStore>,
+    store: Option<SessionStoreExecutor>,
 }
 
 #[derive(Debug, Default)]
@@ -974,13 +989,49 @@ pub struct SessionMaintenanceStatus {
 #[derive(Debug, Clone)]
 struct SessionHandle {
     state: Arc<Mutex<SessionState>>,
+    snapshot: Arc<RwLock<SessionSnapshot>>,
 }
 
 impl SessionHandle {
     #[must_use]
     fn new(state: SessionState) -> Self {
+        let snapshot = SessionSnapshot::from_state(&state);
         Self {
             state: Arc::new(Mutex::new(state)),
+            snapshot: Arc::new(RwLock::new(snapshot)),
+        }
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        self.snapshot
+            .read()
+            .expect("session snapshot lock poisoned")
+            .clone()
+    }
+
+    fn refresh_snapshot(&self, state: &SessionState) {
+        *self
+            .snapshot
+            .write()
+            .expect("session snapshot lock poisoned") = SessionSnapshot::from_state(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSnapshot {
+    summary: SessionSummary,
+    working_directory: PathBuf,
+    access_status: SessionAccessStatus,
+    index_status: SessionIndexStatusKind,
+}
+
+impl SessionSnapshot {
+    fn from_state(state: &SessionState) -> Self {
+        Self {
+            summary: state.summary(),
+            working_directory: state.working_directory.clone(),
+            access_status: state.access_status,
+            index_status: state.index_status,
         }
     }
 }
@@ -1052,7 +1103,7 @@ impl SessionManager {
                 completed_rebuilds: 0,
                 failed_rebuilds: 0,
             }),
-            store: Some(store),
+            store: Some(SessionStoreExecutor::new(store)),
         }
     }
 
@@ -1074,7 +1125,7 @@ impl SessionManager {
         let Some(store) = &self.store else {
             return Err(SessionError::NotFound(session_id));
         };
-        let Some(state) = store.load_session(session_id)? else {
+        let Some(state) = store.store().load_session(session_id)? else {
             return Err(SessionError::NotFound(session_id));
         };
         let mut inner = self.inner.lock().await;
@@ -1093,7 +1144,7 @@ impl SessionManager {
             self.inner.lock().await.catalog_loaded = true;
             return Ok(());
         };
-        let sessions = store.load_catalog()?;
+        let sessions = store.store().load_catalog()?;
         let mut inner = self.inner.lock().await;
         for (session_id, state) in sessions {
             inner
@@ -1127,8 +1178,8 @@ impl SessionManager {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        store.migrate_event_log_to_current(session_id)?;
-        let index = store.ensure_fresh_index(session_id)?;
+        store.store().migrate_event_log_to_current(session_id)?;
+        let index = store.store().ensure_fresh_index(session_id)?;
         let handle = self.session_handle(session_id).await?;
         let clients = {
             let state = handle.state.lock().await;
@@ -1137,6 +1188,7 @@ impl SessionManager {
         let mut state = SessionState::from_index(index);
         state.clients = clients;
         state.summary.client_count = state.clients.len();
+        handle.refresh_snapshot(&state);
         *handle.state.lock().await = state;
         Ok(())
     }
@@ -1186,7 +1238,7 @@ impl SessionManager {
                 name,
                 working_directory,
             },
-            self.store.as_ref(),
+            self.store.as_ref().map(SessionStoreExecutor::store),
             now_ms,
         )?;
         self.inner
@@ -1212,7 +1264,7 @@ impl SessionManager {
             let inner = self.inner.lock().await;
             inner.sessions.values().cloned().collect::<Vec<_>>()
         };
-        sorted_session_summaries(handles, &working_directory).await
+        sorted_session_summaries(handles, &working_directory)
     }
 
     /// Return true once the persistent session catalog has been discovered.
@@ -1235,9 +1287,11 @@ impl SessionManager {
             )
         };
         for handle in completed_handles {
-            handle.state.lock().await.index_status = SessionIndexStatusKind::Current;
+            let mut state = handle.state.lock().await;
+            state.index_status = SessionIndexStatusKind::Current;
+            handle.refresh_snapshot(&state);
         }
-        let stale_indexes = stale_index_count(handles).await;
+        let stale_indexes = stale_index_count(handles);
         SessionMaintenanceStatus {
             stale_indexes,
             running_rebuilds,
@@ -1271,9 +1325,10 @@ impl SessionManager {
             SessionEventKind::SessionRenamed {
                 name: normalized_name,
             },
-            self.store.as_ref(),
+            self.store.as_ref().map(SessionStoreExecutor::store),
             activity_timestamp_ms,
         )?;
+        handle.refresh_snapshot(&state);
         Ok(event)
     }
 
@@ -1298,7 +1353,7 @@ impl SessionManager {
             }
         }
         if let Some(store) = &self.store {
-            store.delete(session_id)?;
+            store.store().delete(session_id)?;
         }
         let removed = self
             .inner
@@ -1381,7 +1436,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(store.read_session_events(session_id)?)
+        Ok(store.store().read_session_events(session_id)?)
     }
 
     /// Return a bounded page of replayable history for a session.
@@ -1406,7 +1461,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        let page = store.read_session_history_page(session_id, query)?;
+        let page = store.store().read_session_history_page(session_id, query)?;
         if should_mark_current {
             self.mark_index_current(session_id).await;
         }
@@ -1431,7 +1486,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(store.read_session_input_history(session_id)?)
+        Ok(store.store().read_session_input_history(session_id)?)
     }
 
     /// Return the model-visible session events, starting at the latest compaction when possible.
@@ -1452,7 +1507,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(store.read_model_context_events(session_id)?)
+        Ok(store.store().read_model_context_events(session_id)?)
     }
 
     /// Return the latest session-specific model selection if one has been set.
@@ -1512,7 +1567,7 @@ impl SessionManager {
                 .store
                 .as_ref()
                 .ok_or(SessionError::NotFound(session_id))?;
-            store.read_session_events(session_id)?
+            store.store().read_session_events(session_id)?
         };
         let input_history = input_history_from_events(&history);
         state.ensure_writable()?;
@@ -1521,10 +1576,11 @@ impl SessionManager {
         let events = state.sender.subscribe();
         let attached_event = state.push_event(
             SessionEventKind::ClientAttached { client_id },
-            self.store.as_ref(),
+            self.store.as_ref().map(SessionStoreExecutor::store),
             activity_timestamp_ms,
         )?;
         let session = state.summary();
+        handle.refresh_snapshot(&state);
         Ok(SessionAttachment {
             session,
             history,
@@ -1572,10 +1628,11 @@ impl SessionManager {
         let events = state.sender.subscribe();
         let attached_event = state.push_event(
             SessionEventKind::ClientAttached { client_id },
-            self.store.as_ref(),
+            self.store.as_ref().map(SessionStoreExecutor::store),
             activity_timestamp_ms,
         )?;
         let session = state.summary();
+        handle.refresh_snapshot(&state);
         Ok(SessionAttachment {
             session,
             history,
@@ -1603,11 +1660,13 @@ impl SessionManager {
         state.ensure_writable()?;
         if state.clients.remove(&client_id) {
             state.summary.client_count = state.clients.len();
-            return Ok(Some(state.push_event(
+            let event = state.push_event(
                 SessionEventKind::ClientDetached { client_id },
-                self.store.as_ref(),
+                self.store.as_ref().map(SessionStoreExecutor::store),
                 activity_timestamp_ms,
-            )?));
+            )?;
+            handle.refresh_snapshot(&state);
+            return Ok(Some(event));
         }
         Ok(None)
     }
@@ -1638,15 +1697,16 @@ impl SessionManager {
             state.summary.name = Some(title.clone());
             events.push(state.push_event(
                 SessionEventKind::SessionRenamed { name: Some(title) },
-                self.store.as_ref(),
+                self.store.as_ref().map(SessionStoreExecutor::store),
                 activity_timestamp_ms,
             )?);
         }
         events.push(state.push_event(
             SessionEventKind::UserMessage { client_id, text },
-            self.store.as_ref(),
+            self.store.as_ref().map(SessionStoreExecutor::store),
             activity_timestamp_ms,
         )?);
+        handle.refresh_snapshot(&state);
         Ok(events)
     }
 
@@ -1995,19 +2055,29 @@ impl SessionManager {
         let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
         let mut state = handle.state.lock().await;
         state.ensure_writable()?;
-        let event = state.push_event(kind, self.store.as_ref(), activity_timestamp_ms)?;
+        let event = state.push_event(
+            kind,
+            self.store.as_ref().map(SessionStoreExecutor::store),
+            activity_timestamp_ms,
+        )?;
+        handle.refresh_snapshot(&state);
         Ok(event)
     }
+
     async fn mark_index_current(&self, session_id: SessionId) {
         if let Ok(handle) = self.session_handle(session_id).await {
-            handle.state.lock().await.index_status = SessionIndexStatusKind::Current;
+            let mut state = handle.state.lock().await;
+            state.index_status = SessionIndexStatusKind::Current;
+            handle.refresh_snapshot(&state);
         }
         let completed_rebuilds = {
             let mut inner = self.inner.lock().await;
             inner.collect_finished_rebuilds()
         };
         for handle in completed_rebuilds {
-            handle.state.lock().await.index_status = SessionIndexStatusKind::Current;
+            let mut state = handle.state.lock().await;
+            state.index_status = SessionIndexStatusKind::Current;
+            handle.refresh_snapshot(&state);
         }
     }
 
@@ -2149,27 +2219,25 @@ impl SessionState {
     }
 }
 
-async fn stale_index_count(handles: Vec<SessionHandle>) -> usize {
-    let mut count = 0;
-    for handle in handles {
-        if handle.state.lock().await.index_status == SessionIndexStatusKind::Stale {
-            count += 1;
-        }
-    }
-    count
+fn stale_index_count(handles: Vec<SessionHandle>) -> usize {
+    handles
+        .into_iter()
+        .filter(|handle| handle.snapshot().index_status == SessionIndexStatusKind::Stale)
+        .count()
 }
 
-async fn sorted_session_summaries(
+fn sorted_session_summaries(
     handles: Vec<SessionHandle>,
     working_directory: &Path,
 ) -> Vec<SessionSummary> {
-    let mut sessions = Vec::new();
-    for handle in handles {
-        let state = handle.state.lock().await;
-        if normalize_working_directory(&state.working_directory) == working_directory {
-            sessions.push(state.summary());
-        }
-    }
+    let mut sessions = handles
+        .into_iter()
+        .map(|handle| handle.snapshot())
+        .filter(|snapshot| {
+            normalize_working_directory(&snapshot.working_directory) == working_directory
+        })
+        .map(|snapshot| snapshot.summary)
+        .collect::<Vec<_>>();
     sessions.sort_by(|left, right| {
         right
             .updated_at_ms
