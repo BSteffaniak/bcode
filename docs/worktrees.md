@@ -57,7 +57,7 @@ bcode worktree remove <path>
 ```
 
 If `worktree.config.toml` exists, Bcode applies worktree setup automatically after creation.
-The setup engine is internal; user-facing output remains Bcode worktree output.
+The setup engine is integrated into Bcode; user-facing output remains Bcode worktree output.
 
 ## Agent tools
 

@@ -11,11 +11,13 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_config          = { workspace = true }
-bcode_worktree_models = { workspace = true }
-serde                 = { workspace = true, features = ["derive", "std"] }
-thiserror             = { workspace = true }
-worktree_setup_git    = { workspace = true }
+bcode_config              = { workspace = true }
+bcode_worktree_models     = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+thiserror                 = { workspace = true }
+worktree_setup_config     = { workspace = true }
+worktree_setup_git        = { workspace = true }
+worktree_setup_operations = { workspace = true }
 
 [features]
 default          = []

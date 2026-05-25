@@ -12,6 +12,7 @@ use bcode_worktree_models::{
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
+use worktree_setup_config::{discover_configs, load_config, resolve_profiles};
 use worktree_setup_git::{
     WorktreeCreateOptions, create_worktree as setup_create_worktree, discover_repo, get_repo_root,
     get_workdir, get_worktrees, remove_worktree as setup_remove_worktree,
@@ -27,8 +28,8 @@ pub enum WorktreeError {
     #[error("invalid worktree request: {0}")]
     InvalidRequest(String),
     /// Worktree setup failed.
-    #[error("worktree setup failed with status {status}: {stderr}")]
-    SetupFailed { status: String, stderr: String },
+    #[error("worktree setup failed: {0}")]
+    Setup(String),
     /// I/O failed.
     #[error("worktree I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -95,7 +96,7 @@ pub fn create_worktree(
         },
     )?;
     let setup_applied = if config.worktree.setup.enabled && !request.no_setup {
-        apply_setup(&repo_root, &path)?;
+        apply_setup(config, &repo_root, &path)?;
         true
     } else {
         false
@@ -233,25 +234,66 @@ fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn apply_setup(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
-    if !repo_root.join("worktree.config.toml").exists()
-        && !path.join("worktree.config.toml").exists()
-    {
+fn apply_setup(config: &BcodeConfig, repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
+    let config_paths =
+        discover_configs(repo_root).map_err(|error| WorktreeError::Setup(error.to_string()))?;
+    if config_paths.is_empty() {
         return Ok(());
     }
-    let output = Command::new("worktree-setup")
-        .arg("setup")
-        .arg(path)
-        .arg("--non-interactive")
-        .current_dir(repo_root)
-        .output()?;
+    let loaded = config_paths
+        .iter()
+        .filter_map(|config_path| load_config(config_path, repo_root).ok())
+        .collect::<Vec<_>>();
+    if loaded.is_empty() {
+        return Ok(());
+    }
+    let selected = if let Some(profile) = config.worktree.setup.profile.as_deref() {
+        let profile_names = vec![profile.to_string()];
+        let resolved = resolve_profiles(&profile_names, &loaded, repo_root)
+            .map_err(|error| WorktreeError::Setup(error.to_string()))?;
+        resolved
+            .config_indices
+            .into_iter()
+            .filter_map(|index| loaded.get(index))
+            .collect::<Vec<_>>()
+    } else {
+        loaded.iter().collect::<Vec<_>>()
+    };
+    for loaded_config in selected {
+        let options = worktree_setup_operations::ApplyConfigOptions {
+            copy_unstaged: None,
+            overwrite_existing: false,
+            allow_path_escape: loaded_config.config.allow_path_escape.unwrap_or(false),
+        };
+        worktree_setup_operations::apply_config(loaded_config, repo_root, path, &options)
+            .map_err(|error| WorktreeError::Setup(error.to_string()))?;
+        for command in &loaded_config.config.post_setup {
+            run_setup_command(path, command)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_setup_command(cwd: &Path, command: &str) -> Result<(), WorktreeError> {
+    let output = if cfg!(windows) {
+        Command::new("cmd")
+            .args(["/C", command])
+            .current_dir(cwd)
+            .output()?
+    } else {
+        Command::new("sh")
+            .args(["-c", command])
+            .current_dir(cwd)
+            .output()?
+    };
     if output.status.success() {
         return Ok(());
     }
-    Err(WorktreeError::SetupFailed {
-        status: output.status.to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-    })
+    Err(WorktreeError::Setup(format!(
+        "setup command failed with status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 const fn base_ref_from_config(config: WorktreeBaseRefConfig) -> WorktreeBaseRef {
