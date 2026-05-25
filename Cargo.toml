@@ -36,6 +36,7 @@ members = [
     "packages/tui",
     "packages/worktree",
     "packages/worktree/models",
+    "plugins/worktree-plugin",
     "packages/session/models",
 ]
 resolver = "2"
@@ -85,6 +86,7 @@ bcode_tui                               = { version = "0.0.1-alpha.0", default-f
 bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }
 bcode_worktree                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree" }
 bcode_worktree_models                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree/models" }
+bcode_worktree_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/worktree-plugin" }
 
 # BMUX reuse
 bmux_codec          = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }

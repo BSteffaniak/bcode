@@ -1,0 +1,20 @@
+id      = "bcode.worktree"
+name    = "Bcode Worktree Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "tool_execution"
+description  = "Model-callable Git worktree tools"
+interface_id = "bcode.tool/v1"
+name         = "Worktree Tools"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_worktree_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

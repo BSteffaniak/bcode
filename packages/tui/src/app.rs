@@ -143,6 +143,12 @@ impl BmuxApp {
         self.session_title.as_deref()
     }
 
+    /// Return the current working directory, if known.
+    #[must_use]
+    pub fn working_directory(&self) -> Option<&std::path::Path> {
+        self.working_directory.as_deref()
+    }
+
     /// Apply canonical session metadata from an attach/list response.
     pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
         self.session_id = Some(summary.id);

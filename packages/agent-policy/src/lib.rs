@@ -56,6 +56,9 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("web.inspect".to_string(), true),
                 ("git.clone".to_string(), true),
                 ("github.clone".to_string(), true),
+                ("worktree.list".to_string(), true),
+                ("worktree.create".to_string(), true),
+                ("worktree.remove".to_string(), true),
                 ("document.extract".to_string(), true),
             ]),
             permission: PermissionConfig {
@@ -84,6 +87,9 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("web.inspect".to_string(), true),
                 ("git.clone".to_string(), true),
                 ("github.clone".to_string(), true),
+                ("worktree.list".to_string(), true),
+                ("worktree.create".to_string(), true),
+                ("worktree.remove".to_string(), true),
                 ("document.extract".to_string(), true),
             ]),
             permission: PermissionConfig {
@@ -211,6 +217,7 @@ fn evaluate_after_path(
             evaluation(AgentDecision::Allow, String::new(), None, None)
         }
         "web.fetch" => evaluate_web_url(config, request),
+        "worktree.list" => evaluation(AgentDecision::Allow, String::new(), None, None),
         _ => evaluate_side_effect_fallback(config, request),
     }
 }
@@ -557,6 +564,9 @@ fn tool_aliases(tool_name: &str) -> Vec<String> {
         "filesystem.grep" => aliases.push("grep".to_string()),
         "filesystem.find" => aliases.push("find".to_string()),
         "filesystem.list" => aliases.push("ls".to_string()),
+        "worktree.list" => aliases.push("worktree.read".to_string()),
+        "worktree.create" => aliases.push("worktree.create".to_string()),
+        "worktree.remove" => aliases.push("worktree.remove".to_string()),
         _ => {}
     }
     aliases
@@ -578,6 +588,7 @@ pub fn normalize_tool_names(tool: &str) -> Vec<String> {
         "stat" => vec!["filesystem.stat".to_string()],
         "write" => vec!["filesystem.write".to_string()],
         "edit" => vec!["filesystem.edit".to_string()],
+        "worktree.read" => vec!["worktree.list".to_string()],
         other => vec![other.to_string()],
     }
 }

@@ -705,6 +705,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
             bcode_web_search_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-worktree-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/worktree-plugin/bcode-plugin.toml"),
+            bcode_worktree_plugin::static_plugin(),
+        ),
     ]
 }
 

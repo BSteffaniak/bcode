@@ -32,12 +32,14 @@ const DEFAULT_SHELL_PLUGIN_ID: &str = "bcode.shell";
 const DEFAULT_WEB_SEARCH_PLUGIN_ID: &str = "bcode.web-search";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_ID: &str = "bcode.openai-compatible";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_IDS: &[&str] = &["bcode.openai-compatible", "bcode.bedrock"];
+const DEFAULT_WORKTREE_PLUGIN_ID: &str = "bcode.worktree";
 const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
     DEFAULT_DOCUMENT_PLUGIN_ID,
     DEFAULT_FILESYSTEM_PLUGIN_ID,
     DEFAULT_GIT_PLUGIN_ID,
     DEFAULT_SHELL_PLUGIN_ID,
     DEFAULT_WEB_SEARCH_PLUGIN_ID,
+    DEFAULT_WORKTREE_PLUGIN_ID,
     DEFAULT_AGENT_PROFILE_PLUGIN_ID,
 ];
 

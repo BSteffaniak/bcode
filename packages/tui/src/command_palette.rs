@@ -11,6 +11,10 @@ pub enum PaletteCommand {
     NewSession,
     /// Open the session picker.
     SwitchSession,
+    /// List Git worktrees.
+    ListWorktrees,
+    /// Create a worktree for the current session.
+    CreateSessionWorktree,
     /// Show active model status.
     ShowModelStatus,
     /// Show server default model/provider.
@@ -42,6 +46,8 @@ impl PaletteCommand {
         match self {
             Self::NewSession => "session.new",
             Self::SwitchSession => "session.switch",
+            Self::ListWorktrees => "worktree.list",
+            Self::CreateSessionWorktree => "worktree.createSession",
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
             Self::ShowRuntimeStatus => "runtime.status",
@@ -61,6 +67,8 @@ impl PaletteCommand {
         match id {
             "session.new" => Some(Self::NewSession),
             "session.switch" => Some(Self::SwitchSession),
+            "worktree.list" => Some(Self::ListWorktrees),
+            "worktree.createSession" => Some(Self::CreateSessionWorktree),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
             "runtime.status" => Some(Self::ShowRuntimeStatus),
@@ -128,6 +136,18 @@ fn palette_items() -> Vec<PaletteItem> {
             "Switch Session",
             "Open the session picker",
             "switch session picker open",
+        ),
+        item(
+            PaletteCommand::ListWorktrees,
+            "Worktree: List",
+            "Show repository worktrees",
+            "worktree list git branch repository",
+        ),
+        item(
+            PaletteCommand::CreateSessionWorktree,
+            "Worktree: Create for Current Session",
+            "Create and move this session into a worktree",
+            "worktree create current session branch",
         ),
         item(
             PaletteCommand::ShowModelStatus,
