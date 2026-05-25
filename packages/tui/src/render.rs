@@ -565,7 +565,7 @@ fn push_tool_request_rows(
 }
 
 fn file_tool_action(tool_name: &str, streaming: bool) -> &'static str {
-    let normalized = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
+    let normalized = normalized_tool_name_for_render(tool_name);
     match (normalized.as_str(), streaming) {
         ("filesystem_write" | "write", true) => "Writing …",
         ("filesystem_write" | "write", false) => "Write preview",
@@ -625,16 +625,12 @@ fn push_terminal_tool_result_rows(
     context: TerminalToolRenderContext<'_>,
     width: u16,
 ) {
-    let status = if context.streaming {
-        "running"
-    } else if context.is_error {
-        "failed"
-    } else {
-        "ok"
-    };
-    let title = context.tool_name.map_or_else(
-        || format!("Terminal · {status}"),
-        |name| format!("Terminal · {name} · {status}"),
+    let title = terminal_title(
+        context.tool_name,
+        context.exit_code,
+        context.timed_out,
+        context.is_error,
+        context.streaming,
     );
     push_wrapped_styled_text(
         rows,
@@ -677,6 +673,31 @@ fn push_terminal_tool_result_rows(
     rows.push(Line::default());
 }
 
+fn terminal_title(
+    tool_name: Option<&str>,
+    exit_code: Option<i32>,
+    timed_out: Option<bool>,
+    is_error: bool,
+    streaming: bool,
+) -> String {
+    let status = if streaming || timed_out.is_none() {
+        "running".to_owned()
+    } else if let Some(code) = exit_code {
+        let outcome = if is_error { "failed" } else { "ok" };
+        format!("{outcome} · exit {code}")
+    } else {
+        let outcome = if is_error { "failed" } else { "ok" };
+        format!("{outcome} · signal")
+    };
+    let timeout = timed_out
+        .map(|value| format!(" · timed out {value}"))
+        .unwrap_or_default();
+    tool_name.map_or_else(
+        || format!("Terminal · {status}{timeout}"),
+        |name| format!("Terminal · {name} · {status}{timeout}"),
+    )
+}
+
 struct ToolResultRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: Option<&'a str>,
@@ -690,11 +711,25 @@ fn push_tool_result_rows(
     context: &ToolResultRenderContext<'_>,
     width: u16,
 ) {
+    let presentation = tool_result_presentation(context.tool_name, context.result);
     let status = if context.is_error { "failed" } else { "ok" };
-    let title = context.tool_name.map_or_else(
-        || format!("Tool result · {status}"),
-        |name| format!("Tool result · {name} · {status}"),
-    );
+    let title = match &presentation {
+        Some(ToolResultPresentation::Shell(ShellResultPresentation::Terminal {
+            exit_code,
+            timed_out,
+            ..
+        })) => terminal_title(
+            context.tool_name,
+            *exit_code,
+            Some(*timed_out),
+            context.is_error,
+            false,
+        ),
+        _ => context.tool_name.map_or_else(
+            || format!("Tool result · {status}"),
+            |name| format!("Tool result · {name} · {status}"),
+        ),
+    };
     push_wrapped_styled_text(
         rows,
         Vec::new(),
@@ -707,7 +742,7 @@ fn push_tool_result_rows(
         },
         muted_style(),
     );
-    if let Some(presentation) = tool_result_presentation(context.tool_name, context.result) {
+    if let Some(presentation) = presentation {
         push_tool_result_presentation_rows(rows, &presentation, width);
     } else {
         push_labeled_text_preview(
@@ -2115,8 +2150,8 @@ fn activity_label(activity: &ActivityState) -> String {
 }
 
 fn tool_activity_label(tool_name: &str) -> String {
-    match tool_name.replace(['-', '.'], "_").as_str() {
-        "shell_run" | "shell" => "shell".to_owned(),
+    match normalized_tool_name_for_render(tool_name).as_str() {
+        "shell_run" | "shell" | "filesystem_shell_run" | "bash" => "shell".to_owned(),
         "filesystem_read" | "read" => "reading".to_owned(),
         "filesystem_write" | "write" => "writing".to_owned(),
         "filesystem_edit" | "edit" => "editing".to_owned(),
@@ -2127,6 +2162,10 @@ fn tool_activity_label(tool_name: &str) -> String {
         "filesystem_stat" | "stat" => "stat".to_owned(),
         other => format!("tool {other}"),
     }
+}
+
+fn normalized_tool_name_for_render(tool_name: &str) -> String {
+    tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
 }
 
 fn spinner_frame() -> &'static str {

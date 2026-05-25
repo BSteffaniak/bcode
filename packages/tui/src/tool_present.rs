@@ -250,13 +250,15 @@ pub fn tool_request_presentation(
     arguments_json: &str,
 ) -> Option<ToolRequestPresentation> {
     let value = serde_json::from_str::<Value>(arguments_json).ok()?;
-    let normalized = normalized_tool_name(tool_name);
-    match normalized.as_str() {
-        "shell_run" | "shell" => Some(ToolRequestPresentation::ShellRun {
+    if is_shell_tool_name(tool_name) {
+        return Some(ToolRequestPresentation::ShellRun {
             command: string_field(&value, "command")?,
             cwd: string_field(&value, "cwd"),
             timeout_ms: u64_field(&value, "timeout_ms"),
-        }),
+        });
+    }
+    let normalized = normalized_tool_name(tool_name);
+    match normalized.as_str() {
         "filesystem_read" | "read" => Some(ToolRequestPresentation::Read {
             path: path_field(&value, "path")?,
         }),
@@ -324,9 +326,7 @@ pub fn tool_result_presentation(
     result: &str,
 ) -> Option<ToolResultPresentation> {
     let normalized = tool_name.map(normalized_tool_name);
-    if matches!(normalized.as_deref(), Some("shell_run" | "shell"))
-        || looks_like_shell_result(result)
-    {
+    if normalized.as_deref().is_some_and(is_shell_tool_name) || looks_like_shell_result(result) {
         return shell_result(result).map(ToolResultPresentation::Shell);
     }
     match normalized?.as_str() {
@@ -506,6 +506,13 @@ fn filesystem_stat_result(result: &str) -> Option<ToolResultPresentation> {
 
 fn normalized_tool_name(tool_name: &str) -> String {
     tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
+}
+
+fn is_shell_tool_name(tool_name: &str) -> bool {
+    matches!(
+        normalized_tool_name(tool_name).as_str(),
+        "shell" | "shell_run" | "filesystem_shell_run" | "bash"
+    )
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {

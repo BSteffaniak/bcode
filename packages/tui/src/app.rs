@@ -1491,14 +1491,23 @@ fn normalized_tool_name(tool_name: &str) -> String {
     tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
 }
 
+fn is_shell_tool_name(tool_name: &str) -> bool {
+    matches!(
+        normalized_tool_name(tool_name).as_str(),
+        "shell" | "shell_run" | "filesystem_shell_run" | "bash"
+    )
+}
+
 fn tool_request_status(tool_name: &str, arguments_json: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
     let normalized = normalized_tool_name(tool_name);
-    match normalized.as_str() {
-        "shell_run" | "shell" => value
+    if is_shell_tool_name(tool_name) {
+        return value
             .get("cwd")
             .and_then(serde_json::Value::as_str)
-            .map(|cwd| format!("cwd {cwd}")),
+            .map(|cwd| format!("cwd {cwd}"));
+    }
+    match normalized.as_str() {
         "filesystem_read" | "read" | "filesystem_exists" | "exists" | "filesystem_stat"
         | "stat" => value
             .get("path")

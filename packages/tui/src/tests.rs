@@ -923,7 +923,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Tool result · shell.run · ok"));
+    assert!(output.contains("Terminal · shell.run · ok · exit 0 · timed out false"));
     assert!(output.contains("terminal: 80x10"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 12"));
@@ -1048,8 +1048,132 @@ fn streamed_terminal_output_renders_running_until_final_result() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
+    assert!(output.contains("Terminal · shell.run · running"));
     assert!(output.contains("running · terminal"));
     assert!(!output.contains("exit code 0 · terminal · timed out false"));
+}
+
+#[test]
+fn streamed_terminal_output_preserves_ansi_color() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-color".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: "{}".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-color".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-color".to_owned(),
+                stream: ToolOutputStream::Pty,
+                sequence: 1,
+                text: "\u{1b}[32mgreen\u{1b}[0m\n".to_owned(),
+                byte_len: "\u{1b}[32mgreen\u{1b}[0m\n".len(),
+            },
+        },
+    ));
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(
+        buffer
+            .get(Point::new(4, output_line_y(&buffer, "green").unwrap()))
+            .map(|cell| cell.style.fg),
+        Some(Some(bmux_tui::style::Color::Green))
+    );
+}
+
+#[test]
+fn streamed_terminal_output_updates_header_after_final_result() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-final".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: "{}".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-final".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-final".to_owned(),
+                stream: ToolOutputStream::Pty,
+                sequence: 1,
+                text: "done\n".to_owned(),
+                byte_len: "done\n".len(),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        4,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-final".to_owned(),
+            result: serde_json::json!({
+                "mode": "terminal",
+                "exit_code": 2,
+                "timed_out": false,
+                "output": "done\n",
+                "output_truncated": false,
+                "columns": 80,
+                "rows": 24,
+            })
+            .to_string(),
+            is_error: true,
+            output: None,
+        },
+    ));
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("Terminal · shell.run · failed · exit 2 · timed out false"));
+    assert!(output.contains("exit code 2 · terminal · timed out false"));
+    assert!(!output.contains("Terminal · shell.run · running"));
 }
 
 #[test]
