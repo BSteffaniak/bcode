@@ -8,8 +8,8 @@ use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
     DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_OK, NativeEventContext,
-    NativeServiceContext, PluginEvent, SERVICE_STATUS_OK, ServiceEventCallback, ServiceRequest,
-    StaticPluginVtable,
+    NativeServiceContext, PluginConfigContext, PluginEvent, SERVICE_STATUS_OK,
+    ServiceEventCallback, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 use libloading::Library;
@@ -69,6 +69,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
     #[serde(default)]
+    pub config: Option<PluginManifestConfig>,
+    #[serde(default)]
     pub concurrency: PluginConcurrencyConfig,
     pub runtime: PluginRuntime,
 }
@@ -85,6 +87,17 @@ pub struct PluginService {
     pub concurrency: Option<PluginConcurrencyConfig>,
     #[serde(default)]
     pub class: Option<PluginInvocationClass>,
+}
+
+/// Plugin config declaration from a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginManifestConfig {
+    #[serde(default)]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub schema_version: Option<u16>,
+    #[serde(default)]
+    pub schema_file: Option<PathBuf>,
 }
 
 /// Event subscription declared by a plugin manifest.
@@ -158,6 +171,24 @@ pub struct RegisteredPlugin {
     pub manifest: PluginManifest,
 }
 
+/// Resolved per-plugin host configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedPluginConfig {
+    pub config: serde_json::Value,
+    pub redacted_config: serde_json::Value,
+}
+
+impl ResolvedPluginConfig {
+    /// Create a resolved plugin config from raw and redacted JSON values.
+    #[must_use]
+    pub const fn new(config: serde_json::Value, redacted_config: serde_json::Value) -> Self {
+        Self {
+            config,
+            redacted_config,
+        }
+    }
+}
+
 /// Statically bundled plugin registration.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticBundledPlugin {
@@ -196,6 +227,7 @@ enum LoadedPluginBackend {
 pub struct LoadedPlugin {
     manifest: PluginManifest,
     backend: LoadedPluginBackend,
+    config: ResolvedPluginConfig,
 }
 
 impl LoadedPlugin {
@@ -203,6 +235,17 @@ impl LoadedPlugin {
     #[must_use]
     pub const fn manifest(&self) -> &PluginManifest {
         &self.manifest
+    }
+
+    /// Return the resolved plugin config.
+    #[must_use]
+    pub const fn config(&self) -> &ResolvedPluginConfig {
+        &self.config
+    }
+
+    /// Set the resolved host config for this loaded plugin.
+    pub fn set_config(&mut self, config: ResolvedPluginConfig) {
+        self.config = config;
     }
 
     /// Activate the plugin.
@@ -279,6 +322,11 @@ impl LoadedPlugin {
                 interface_id: interface_id.into(),
                 operation: operation.into(),
                 payload,
+            },
+            config: PluginConfigContext {
+                config: self.config.config.clone(),
+                redacted_config: self.config.redacted_config.clone(),
+                secrets: BTreeMap::new(),
             },
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
         };
@@ -1196,6 +1244,7 @@ pub struct ServiceRuntimePolicy {
 pub struct PluginRuntimeHost {
     registry: Arc<PluginRegistry>,
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
+    configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
 }
 
 impl PluginRuntimeHost {
@@ -1220,6 +1269,20 @@ impl PluginRuntimeHost {
         PluginHost::load_defaults_with_static_bundled(selection, static_plugins).map(Self::from)
     }
 
+    /// Discover, load, activate, and start plugin executors from default roots plus static bundled registrations and config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery, loading, activation, or executor startup fails.
+    pub fn load_defaults_with_static_bundled_and_config(
+        selection: &PluginSelection,
+        static_plugins: &[StaticBundledPlugin],
+        configs: BTreeMap<String, ResolvedPluginConfig>,
+    ) -> Result<Self, PluginLoadError> {
+        PluginHost::load_defaults_with_static_bundled_and_config(selection, static_plugins, configs)
+            .map(Self::from)
+    }
+
     /// Return the immutable plugin registry.
     #[must_use]
     pub fn registry(&self) -> &PluginRegistry {
@@ -1230,6 +1293,12 @@ impl PluginRuntimeHost {
     #[must_use]
     pub fn executors(&self) -> &BTreeMap<String, Arc<PluginExecutorHandle>> {
         &self.executors
+    }
+
+    /// Return resolved plugin configs keyed by plugin ID.
+    #[must_use]
+    pub fn configs(&self) -> &BTreeMap<String, ResolvedPluginConfig> {
+        &self.configs
     }
 
     /// Return plugin executor status snapshots.
@@ -1445,6 +1514,7 @@ impl PluginRuntimeHost {
 impl From<PluginHost> for PluginRuntimeHost {
     fn from(mut host: PluginHost) -> Self {
         let loaded = std::mem::take(&mut host.loaded);
+        let configs = std::mem::take(&mut host.configs);
         let mut manifests = BTreeMap::new();
         let mut executors = BTreeMap::new();
         for plugin in loaded {
@@ -1480,6 +1550,7 @@ impl From<PluginHost> for PluginRuntimeHost {
         Self {
             registry: Arc::new(PluginRegistry::from_manifests(manifests)),
             executors: Arc::new(executors),
+            configs: Arc::new(configs),
         }
     }
 }
@@ -1691,6 +1762,7 @@ fn manifest_subscribes_to(manifest: &PluginManifest, topic: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct PluginHost {
     loaded: Vec<LoadedPlugin>,
+    configs: BTreeMap<String, ResolvedPluginConfig>,
 }
 
 impl PluginHost {
@@ -1711,6 +1783,23 @@ impl PluginHost {
     pub fn load_defaults_with_static_bundled(
         selection: &PluginSelection,
         static_plugins: &[StaticBundledPlugin],
+    ) -> Result<Self, PluginLoadError> {
+        Self::load_defaults_with_static_bundled_and_config(
+            selection,
+            static_plugins,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Discover, load, and activate plugins from default roots plus static bundled registrations and config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery, loading, or activation fails.
+    pub fn load_defaults_with_static_bundled_and_config(
+        selection: &PluginSelection,
+        static_plugins: &[StaticBundledPlugin],
+        configs: BTreeMap<String, ResolvedPluginConfig>,
     ) -> Result<Self, PluginLoadError> {
         tracing::debug!(target: "bcode_plugin::startup", "discovering plugins");
         let static_plugins = filter_selected_static_plugins(static_plugins, selection)?;
@@ -1734,7 +1823,11 @@ impl PluginHost {
                 .collect::<Vec<_>>(),
             "plugins selected"
         );
-        let mut host = Self::load_static_plugins(&static_plugins)?;
+        let mut host = Self {
+            loaded: Vec::new(),
+            configs,
+        };
+        host.load_static_plugins_into(&static_plugins)?;
         host.load_registered_plugins_into(&plugins)?;
         Ok(host)
     }
@@ -1759,15 +1852,26 @@ impl PluginHost {
         plugins: &[(PluginManifest, StaticPluginVtable)],
     ) -> Result<Self, PluginLoadError> {
         let mut host = Self::default();
+        host.load_static_plugins_into(plugins)?;
+        Ok(host)
+    }
+
+    fn load_static_plugins_into(
+        &mut self,
+        plugins: &[(PluginManifest, StaticPluginVtable)],
+    ) -> Result<(), PluginLoadError> {
         for (manifest, vtable) in plugins {
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %manifest.id, "loading static plugin");
-            let loaded = load_static_plugin(manifest.clone(), *vtable)?;
+            let mut loaded = load_static_plugin(manifest.clone(), *vtable)?;
+            if let Some(config) = self.configs.get(&manifest.id).cloned() {
+                loaded.set_config(config);
+            }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             loaded.activate()?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
-            host.loaded.push(loaded);
+            self.loaded.push(loaded);
         }
-        Ok(host)
+        Ok(())
     }
 
     fn load_registered_plugins_into(
@@ -1776,7 +1880,10 @@ impl PluginHost {
     ) -> Result<(), PluginLoadError> {
         for plugin in plugins {
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "loading plugin");
-            let loaded = load_registered_plugin(plugin)?;
+            let mut loaded = load_registered_plugin(plugin)?;
+            if let Some(config) = self.configs.get(&plugin.manifest.id).cloned() {
+                loaded.set_config(config);
+            }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             loaded.activate()?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
@@ -1986,6 +2093,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
             invoke_service_streaming,
             handle_event,
         },
+        config: ResolvedPluginConfig::default(),
     })
 }
 
@@ -2019,6 +2127,7 @@ pub fn load_static_plugin(
     Ok(LoadedPlugin {
         manifest,
         backend: LoadedPluginBackend::Static { vtable },
+        config: ResolvedPluginConfig::default(),
     })
 }
 
@@ -2259,6 +2368,7 @@ library = "libexample_plugin.dylib"
     #[test]
     fn static_service_event_callback_delivers_stream_events() {
         let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
             manifest: test_manifest("events"),
             backend: LoadedPluginBackend::Static {
                 vtable: test_streaming_vtable(),
@@ -2279,7 +2389,9 @@ library = "libexample_plugin.dylib"
         let mut manifest = test_manifest("events");
         manifest.concurrency = PluginConcurrencyConfig::Limited { max: 1 };
         let runtime = PluginRuntimeHost::from(PluginHost {
+            configs: BTreeMap::new(),
             loaded: vec![LoadedPlugin {
+                config: ResolvedPluginConfig::default(),
                 manifest,
                 backend: LoadedPluginBackend::Static {
                     vtable: test_streaming_vtable(),
@@ -2318,6 +2430,7 @@ library = "libexample_plugin.dylib"
     fn oversized_service_response_is_not_retried() {
         LARGE_CALLS.store(0, Ordering::SeqCst);
         let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
             manifest: test_manifest("large"),
             backend: LoadedPluginBackend::Static {
                 vtable: test_large_vtable(),
@@ -2446,6 +2559,7 @@ library = "libexample_plugin.dylib"
 
         fn manifest(id: &str) -> PluginManifest {
             PluginManifest {
+                config: None,
                 id: id.to_string(),
                 name: id.to_string(),
                 version: Version::new(0, 0, 1),
@@ -2477,8 +2591,10 @@ library = "libexample_plugin.dylib"
             .expect("runtime builds");
         tokio.block_on(async {
             let runtime = PluginRuntimeHost::from(PluginHost {
+                configs: BTreeMap::new(),
                 loaded: vec![
                     LoadedPlugin {
+                        config: ResolvedPluginConfig::default(),
                         manifest: manifest("slow"),
                         backend: LoadedPluginBackend::Static {
                             vtable: StaticPluginVtable {
@@ -2512,6 +2628,7 @@ library = "libexample_plugin.dylib"
                         },
                     },
                     LoadedPlugin {
+                        config: ResolvedPluginConfig::default(),
                         manifest: manifest("fast"),
                         backend: LoadedPluginBackend::Static {
                             vtable: StaticPluginVtable {
@@ -2667,6 +2784,7 @@ library = "libexample_plugin.dylib"
 
     fn test_manifest(id: &str) -> PluginManifest {
         PluginManifest {
+            config: None,
             id: id.to_string(),
             name: id.to_string(),
             version: Version::new(0, 0, 1),

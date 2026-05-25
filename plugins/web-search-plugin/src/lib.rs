@@ -39,7 +39,7 @@ impl Default for WebSearchPlugin {
 impl RustPlugin for WebSearchPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
-            TOOL_SERVICE_INTERFACE_ID => self.invoke_tool_service(&context.request),
+            TOOL_SERVICE_INTERFACE_ID => self.invoke_tool_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported web search plugin service interface",
@@ -49,10 +49,10 @@ impl RustPlugin for WebSearchPlugin {
 }
 
 impl WebSearchPlugin {
-    fn invoke_tool_service(&self, request: &ServiceRequest) -> ServiceResponse {
-        match request.operation.as_str() {
-            OP_LIST_TOOLS => list_tools(request),
-            OP_INVOKE_TOOL => self.invoke_tool(request),
+    fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        match context.request.operation.as_str() {
+            OP_LIST_TOOLS => list_tools(&context.request),
+            OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported tool service operation",
@@ -60,14 +60,14 @@ impl WebSearchPlugin {
         }
     }
 
-    fn invoke_tool(&self, request: &ServiceRequest) -> ServiceResponse {
-        let invocation = match request.payload_json::<ToolInvocationRequest>() {
+    fn invoke_tool(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let invocation = match context.request.payload_json::<ToolInvocationRequest>() {
             Ok(invocation) => invocation,
             Err(error) => return invalid_request(&error),
         };
         let response = match invocation.name.as_str() {
-            "web.search" => self.invoke_search(&invocation),
-            "web.fetch" => self.invoke_fetch(&invocation),
+            "web.search" => self.invoke_search(&context.config, &invocation),
+            "web.fetch" => self.invoke_fetch(&context.config, &invocation),
             _ => ToolInvocationResponse {
                 output: format!("unsupported web tool: {}", invocation.name),
                 is_error: true,
@@ -78,35 +78,115 @@ impl WebSearchPlugin {
         json_response(&response)
     }
 
-    fn invoke_search(&self, invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
+    fn invoke_search(
+        &self,
+        config: &bcode_plugin_sdk::PluginConfigContext,
+        invocation: &ToolInvocationRequest,
+    ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<SearchRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
+            Err(error) => return tool_error(error.to_string()),
+        };
+        let plugin_config = match config.typed_or_default::<WebSearchConfig>() {
+            Ok(config) => config,
             Err(error) => return tool_error(error.to_string()),
         };
         let runtime = match &self.runtime {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
-        match runtime.block_on(search_async(request)) {
+        match runtime.block_on(search_async(request, plugin_config)) {
             Ok(Ok(response)) => json_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
     }
 
-    fn invoke_fetch(&self, invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
+    fn invoke_fetch(
+        &self,
+        config: &bcode_plugin_sdk::PluginConfigContext,
+        invocation: &ToolInvocationRequest,
+    ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<FetchRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
+            Err(error) => return tool_error(error.to_string()),
+        };
+        let plugin_config = match config.typed_or_default::<WebSearchConfig>() {
+            Ok(config) => config,
             Err(error) => return tool_error(error.to_string()),
         };
         let runtime = match &self.runtime {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
-        match runtime.block_on(fetch_async(request)) {
+        match runtime.block_on(fetch_async(request, plugin_config)) {
             Ok(Ok(response)) => json_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WebSearchConfig {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    max_results: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    fetch: Option<WebFetchConfig>,
+    #[serde(default)]
+    providers: WebSearchProviderConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WebFetchConfig {
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    rendered: Option<RenderedFetchConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RenderedFetchConfig {
+    #[serde(default)]
+    command: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WebSearchProviderConfig {
+    #[serde(default)]
+    brave: ProviderConfig,
+    #[serde(default)]
+    tavily: ProviderConfig,
+    #[serde(default)]
+    exa: ProviderConfig,
+    #[serde(default)]
+    serper: ProviderConfig,
+    #[serde(default)]
+    serpapi: ProviderConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ProviderConfig {
+    #[serde(default)]
+    api_key: Option<SecretRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+enum SecretRef {
+    Env { name: String },
+    Value { value: String },
+}
+
+impl SecretRef {
+    fn resolve(&self) -> Option<String> {
+        match self {
+            Self::Env { name } => env_value(&[name.as_str()]),
+            Self::Value { value } => Some(value.clone()),
         }
     }
 }
@@ -293,26 +373,35 @@ enum WebError {
     Decode(#[from] serde_json::Error),
 }
 
-async fn search_async(request: SearchRequest) -> Result<SearchResponse, WebError> {
+async fn search_async(
+    request: SearchRequest,
+    config: WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
-    let provider = search_provider(request.provider.as_deref())?;
+    let provider = search_provider(request.provider.as_deref(), &config)?;
     match provider.as_str() {
-        "brave" => search_brave(request).await,
-        "tavily" => search_tavily(request).await,
-        "exa" => search_exa(request).await,
-        "serper" => search_serper(request).await,
-        "serpapi" | "serp_api" => search_serpapi(request).await,
+        "brave" => search_brave(request, &config).await,
+        "tavily" => search_tavily(request, &config).await,
+        "exa" => search_exa(request, &config).await,
+        "serper" => search_serper(request, &config).await,
+        "serpapi" | "serp_api" => search_serpapi(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
         ))),
     }
 }
 
-async fn search_brave(request: SearchRequest) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"])?;
-    let max_results = max_results(&request);
+async fn search_brave(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(
+        &config.providers.brave,
+        &["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"],
+    )?;
+    let max_results = max_results(&request, config);
     let query = scoped_query(&request);
-    let client = client(request.timeout_ms)?;
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let mut builder = client
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("Accept", "application/json")
@@ -347,10 +436,13 @@ async fn search_brave(request: SearchRequest) -> Result<SearchResponse, WebError
     Ok(search_response(request.query, "brave", results))
 }
 
-async fn search_tavily(request: SearchRequest) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&["TAVILY_API_KEY"])?;
-    let max_results = max_results(&request);
-    let client = client(request.timeout_ms)?;
+async fn search_tavily(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&config.providers.tavily, &["TAVILY_API_KEY"])?;
+    let max_results = max_results(&request, config);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let body = json!({
         "api_key": api_key,
         "query": scoped_query(&request),
@@ -382,10 +474,13 @@ async fn search_tavily(request: SearchRequest) -> Result<SearchResponse, WebErro
         .collect();
     Ok(search_response(request.query, "tavily", results))
 }
-async fn search_exa(request: SearchRequest) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&["EXA_API_KEY"])?;
-    let max_results = max_results(&request);
-    let client = client(request.timeout_ms)?;
+async fn search_exa(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&config.providers.exa, &["EXA_API_KEY"])?;
+    let max_results = max_results(&request, config);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let body = json!({
         "query": scoped_query(&request),
         "numResults": max_results,
@@ -422,10 +517,13 @@ async fn search_exa(request: SearchRequest) -> Result<SearchResponse, WebError> 
     Ok(search_response(request.query, "exa", results))
 }
 
-async fn search_serper(request: SearchRequest) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&["SERPER_API_KEY"])?;
-    let max_results = max_results(&request);
-    let client = client(request.timeout_ms)?;
+async fn search_serper(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&config.providers.serper, &["SERPER_API_KEY"])?;
+    let max_results = max_results(&request, config);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let body = json!({ "q": scoped_query(&request), "num": max_results });
     let text = checked_text(
         client
@@ -454,10 +552,13 @@ async fn search_serper(request: SearchRequest) -> Result<SearchResponse, WebErro
     Ok(search_response(request.query, "serper", results))
 }
 
-async fn search_serpapi(request: SearchRequest) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&["SERPAPI_API_KEY"])?;
-    let max_results = max_results(&request);
-    let client = client(request.timeout_ms)?;
+async fn search_serpapi(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let api_key = provider_key(&config.providers.serpapi, &["SERPAPI_API_KEY"])?;
+    let max_results = max_results(&request, config);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let text = checked_text(
         client
             .get("https://serpapi.com/search.json")
@@ -488,20 +589,27 @@ async fn search_serpapi(request: SearchRequest) -> Result<SearchResponse, WebErr
     Ok(search_response(request.query, "serpapi", results))
 }
 
-async fn fetch_async(request: FetchRequest) -> Result<FetchResponse, WebError> {
+async fn fetch_async(
+    request: FetchRequest,
+    config: WebSearchConfig,
+) -> Result<FetchResponse, WebError> {
     validate_url(&request.url)?;
     if request.render {
-        return fetch_rendered(request);
+        return fetch_rendered(request, &config);
     }
-    fetch_plain_async(request).await
+    fetch_plain_async(request, &config).await
 }
 
-async fn fetch_plain_async(request: FetchRequest) -> Result<FetchResponse, WebError> {
+async fn fetch_plain_async(
+    request: FetchRequest,
+    config: &WebSearchConfig,
+) -> Result<FetchResponse, WebError> {
     let max_bytes = request
         .max_bytes
+        .or_else(|| config.fetch.as_ref().and_then(|fetch| fetch.max_bytes))
         .unwrap_or(DEFAULT_FETCH_MAX_BYTES)
         .clamp(1, MAX_FETCH_BYTES);
-    let client = client(request.timeout_ms)?;
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let response = client.get(&request.url).send().await?;
     let status = response.status();
     let final_url = response.url().to_string();
@@ -536,13 +644,22 @@ async fn fetch_plain_async(request: FetchRequest) -> Result<FetchResponse, WebEr
     })
 }
 
-fn fetch_rendered(request: FetchRequest) -> Result<FetchResponse, WebError> {
-    let command = env_value(&["BCODE_WEB_RENDER_COMMAND"]).ok_or_else(|| {
-        WebError::InvalidRequest(
-            "rendered fetch requires BCODE_WEB_RENDER_COMMAND to name an explicit local fetch command"
-                .to_string(),
-        )
-    })?;
+fn fetch_rendered(
+    request: FetchRequest,
+    config: &WebSearchConfig,
+) -> Result<FetchResponse, WebError> {
+    let command = config
+        .fetch
+        .as_ref()
+        .and_then(|fetch| fetch.rendered.as_ref())
+        .and_then(|rendered| rendered.command.clone())
+        .or_else(|| env_value(&["BCODE_WEB_RENDER_COMMAND"]))
+        .ok_or_else(|| {
+            WebError::InvalidRequest(
+                "rendered fetch requires BCODE_WEB_RENDER_COMMAND or web_search.fetch.rendered.command"
+                    .to_string(),
+            )
+        })?;
     let output = std::process::Command::new(command)
         .arg(&request.url)
         .output()
@@ -554,6 +671,7 @@ fn fetch_rendered(request: FetchRequest) -> Result<FetchResponse, WebError> {
     }
     let max_bytes = request
         .max_bytes
+        .or_else(|| config.fetch.as_ref().and_then(|fetch| fetch.max_bytes))
         .unwrap_or(DEFAULT_FETCH_MAX_BYTES)
         .clamp(1, MAX_FETCH_BYTES);
     let truncated = output.stdout.len() > max_bytes;
@@ -634,9 +752,10 @@ fn search_response(query: String, provider: &str, results: Vec<SearchResult>) ->
     }
 }
 
-fn max_results(request: &SearchRequest) -> usize {
+fn max_results(request: &SearchRequest, config: &WebSearchConfig) -> usize {
     request
         .max_results
+        .or(config.max_results)
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, 20)
 }
@@ -654,9 +773,10 @@ fn scoped_query(request: &SearchRequest) -> String {
     query
 }
 
-fn search_provider(explicit: Option<&str>) -> Result<String, WebError> {
+fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<String, WebError> {
     let provider = explicit
         .map(str::to_string)
+        .or_else(|| config.provider.clone())
         .or_else(|| env_value(&["BCODE_WEB_SEARCH_PROVIDER"]))
         .unwrap_or_else(|| "auto".to_string())
         .trim()
@@ -664,26 +784,71 @@ fn search_provider(explicit: Option<&str>) -> Result<String, WebError> {
     if provider != "auto" {
         return Ok(provider);
     }
-    if env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some() {
+    if config
+        .providers
+        .brave
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some()
+    {
         return Ok("brave".to_string());
     }
-    if env_value(&["TAVILY_API_KEY"]).is_some() {
+    if config
+        .providers
+        .tavily
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["TAVILY_API_KEY"]).is_some()
+    {
         return Ok("tavily".to_string());
     }
-    if env_value(&["EXA_API_KEY"]).is_some() {
+    if config
+        .providers
+        .exa
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["EXA_API_KEY"]).is_some()
+    {
         return Ok("exa".to_string());
     }
-    if env_value(&["SERPER_API_KEY"]).is_some() {
+    if config
+        .providers
+        .serper
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["SERPER_API_KEY"]).is_some()
+    {
         return Ok("serper".to_string());
     }
-    if env_value(&["SERPAPI_API_KEY"]).is_some() {
+    if config
+        .providers
+        .serpapi
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["SERPAPI_API_KEY"]).is_some()
+    {
         return Ok("serpapi".to_string());
     }
     Err(WebError::MissingProvider)
 }
 
-fn provider_key(names: &[&str]) -> Result<String, WebError> {
-    env_value(names).ok_or(WebError::MissingProvider)
+fn provider_key(config: &ProviderConfig, names: &[&str]) -> Result<String, WebError> {
+    config
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .or_else(|| env_value(names))
+        .ok_or(WebError::MissingProvider)
 }
 
 fn client(timeout_ms: Option<u64>) -> Result<Client, WebError> {
@@ -992,7 +1157,8 @@ mod tests {
     fn auto_provider_requires_a_key_when_no_provider_env_exists() {
         // This test asserts only the explicit unsupported path to avoid mutating
         // process-global env in parallel test runs.
-        let provider = search_provider(Some("unknown")).expect("explicit provider should resolve");
+        let provider = search_provider(Some("unknown"), &WebSearchConfig::default())
+            .expect("explicit provider should resolve");
         assert_eq!(provider, "unknown");
     }
 }

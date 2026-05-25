@@ -105,7 +105,7 @@ const PROVIDER_ENVIRONMENT_SPECS: &[ProviderEnvironmentSpec] = &[
 ];
 
 /// Top-level Bcode configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BcodeConfig {
     #[serde(default, skip_serializing)]
     pub composition: CompositionConfig,
@@ -127,6 +127,28 @@ pub struct BcodeConfig {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub tui: TuiConfig,
+    #[serde(default = "empty_toml_table")]
+    pub web_search: toml::Value,
+}
+
+impl Default for BcodeConfig {
+    fn default() -> Self {
+        Self {
+            composition: CompositionConfig::default(),
+            plugins: PluginConfig::default(),
+            model: ModelConfig::default(),
+            agent: BTreeMap::new(),
+            auth: AuthConfig::default(),
+            observability: ObservabilityConfig::default(),
+            skills: SkillsConfig::default(),
+            tui: TuiConfig::default(),
+            web_search: empty_toml_table(),
+        }
+    }
+}
+
+fn empty_toml_table() -> toml::Value {
+    toml::Value::Table(toml::Table::new())
 }
 
 impl BcodeConfig {
@@ -1299,12 +1321,14 @@ pub struct ResolvedModelSelection {
 }
 
 /// Plugin configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PluginConfig {
     #[serde(default)]
     pub enabled: BTreeSet<String>,
     #[serde(default)]
     pub disabled: BTreeSet<String>,
+    #[serde(default)]
+    pub config: BTreeMap<String, toml::Value>,
 }
 
 fn merge_reasoning_config(base: &ReasoningConfig, overlay: &ReasoningConfig) -> ReasoningConfig {
@@ -1894,7 +1918,22 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_observability_toml(&mut output, &config.observability);
     write_skills_toml(&mut output, &config.skills);
     write_tui_toml(&mut output, &config.tui);
+    write_domain_toml(&mut output, "web_search", &config.web_search);
     output
+}
+
+fn write_domain_toml(output: &mut String, section: &str, value: &toml::Value) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    if table.is_empty() {
+        return;
+    }
+    writeln!(output, "[{}]", toml_table_key(section)).expect("writing to string should not fail");
+    for (key, value) in table {
+        write_toml_value(output, key, value);
+    }
+    output.push('\n');
 }
 
 fn write_model_compaction_toml(output: &mut String, compaction: &CompactionConfig) {
@@ -2516,6 +2555,41 @@ fn write_plugins_toml(output: &mut String, plugins: &PluginConfig) {
     write_string_set(output, "enabled", &plugins.enabled);
     write_string_set(output, "disabled", &plugins.disabled);
     output.push('\n');
+    for (plugin_id, value) in &plugins.config {
+        if let Some(table) = value.as_table() {
+            writeln!(output, "[plugins.config.{}]", toml_table_key(plugin_id))
+                .expect("writing to string should not fail");
+            for (key, value) in table {
+                write_toml_value(output, key, value);
+            }
+            output.push('\n');
+        }
+    }
+}
+
+fn write_toml_value(output: &mut String, key: &str, value: &toml::Value) {
+    let encoded = toml_value_literal(value);
+    writeln!(output, "{} = {}", toml_key(key), encoded.trim())
+        .expect("writing to string should not fail");
+}
+
+fn toml_value_literal(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(value) => toml_string(value),
+        toml::Value::Integer(value) => value.to_string(),
+        toml::Value::Float(value) => value.to_string(),
+        toml::Value::Boolean(value) => value.to_string(),
+        toml::Value::Datetime(value) => value.to_string(),
+        toml::Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(toml_value_literal)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{values}]")
+        }
+        toml::Value::Table(_) => "{}".to_string(),
+    }
 }
 
 fn write_string_set(output: &mut String, key: &str, values: &BTreeSet<String>) {

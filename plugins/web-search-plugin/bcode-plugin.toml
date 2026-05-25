@@ -8,6 +8,9 @@ description  = "Model-callable web search and web page reading tools"
 interface_id = "bcode.tool/v1"
 name         = "Web Search Tools"
 
+[config]
+section = "web_search"
+
 [concurrency]
 max  = 4
 type = "limited"

@@ -5,6 +5,7 @@
 //! Plugin author SDK for Bcode native plugins.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
@@ -182,8 +183,73 @@ impl From<&str> for PluginError {
 pub struct NativeServiceContext {
     pub plugin_id: String,
     pub request: ServiceRequest,
+    #[serde(default)]
+    pub config: PluginConfigContext,
     #[serde(skip)]
     pub events: ServiceEventEmitter,
+}
+
+/// Resolved plugin configuration delivered by the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginConfigContext {
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default)]
+    pub redacted_config: serde_json::Value,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
+}
+
+impl PluginConfigContext {
+    /// Decode the resolved plugin config into a typed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config cannot deserialize into `T`.
+    pub fn typed<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_value(self.config.clone())
+    }
+
+    /// Decode the resolved plugin config into a typed value, falling back to
+    /// `T::default()` when the host did not provide config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when non-empty config cannot deserialize into `T`.
+    pub fn typed_or_default<T>(&self) -> Result<T, serde_json::Error>
+    where
+        T: Default + DeserializeOwned,
+    {
+        if self.config.is_null() {
+            Ok(T::default())
+        } else {
+            self.typed()
+        }
+    }
+}
+
+impl NativeServiceContext {
+    /// Decode the resolved plugin config into a typed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config cannot deserialize into `T`.
+    pub fn config<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        self.config.typed()
+    }
+
+    /// Decode the resolved plugin config into a typed value, falling back to
+    /// `T::default()` when the host did not provide config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when non-empty config cannot deserialize into `T`.
+    pub fn config_or_default<T>(&self) -> Result<T, serde_json::Error>
+    where
+        T: Default + DeserializeOwned,
+    {
+        self.config.typed_or_default()
+    }
 }
 
 /// Host event delivered to a native plugin.

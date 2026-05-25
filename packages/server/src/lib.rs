@@ -538,6 +538,87 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     ]
 }
 
+fn resolve_plugin_configs(
+    config: &bcode_config::BcodeConfig,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig> {
+    let mut manifests = std::collections::BTreeMap::new();
+    for plugin in static_plugins {
+        if let Ok(manifest) = toml::from_str::<bcode_plugin::PluginManifest>(plugin.manifest_toml) {
+            manifests.insert(manifest.id.clone(), manifest);
+        }
+    }
+    manifests
+        .values()
+        .filter_map(|manifest| {
+            let raw = resolved_plugin_config_value(config, manifest);
+            if raw.is_null() {
+                return None;
+            }
+            let redacted = redact_plugin_config_value(&raw);
+            Some((
+                manifest.id.clone(),
+                bcode_plugin::ResolvedPluginConfig::new(raw, redacted),
+            ))
+        })
+        .collect()
+}
+
+fn resolved_plugin_config_value(
+    config: &bcode_config::BcodeConfig,
+    manifest: &bcode_plugin::PluginManifest,
+) -> serde_json::Value {
+    let mut value = serde_json::Value::Object(serde_json::Map::new());
+    if manifest.id == "bcode.web-search" {
+        merge_json_values(&mut value, toml_value_to_json(&config.web_search));
+    }
+    if let Some(plugin_value) = config.plugins.config.get(&manifest.id) {
+        merge_json_values(&mut value, toml_value_to_json(plugin_value));
+    }
+    value
+}
+
+fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
+fn merge_json_values(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                merge_json_values(base.entry(key).or_insert(serde_json::Value::Null), value);
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn redact_plugin_config_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    if key.to_ascii_lowercase().contains("key")
+                        || key.to_ascii_lowercase().contains("secret")
+                        || key.to_ascii_lowercase().contains("token")
+                    {
+                        (
+                            key.clone(),
+                            serde_json::Value::String("<redacted>".to_string()),
+                        )
+                    } else {
+                        (key.clone(), redact_plugin_config_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(redact_plugin_config_value).collect())
+        }
+        value => value.clone(),
+    }
+}
+
 /// Run the local Bcode server until interrupted.
 ///
 /// # Errors
@@ -556,9 +637,11 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     );
     tracing::debug!(target: "bcode_server::startup", "loading plugins");
     let static_plugins = static_bundled_plugins();
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugin_configs = resolve_plugin_configs(&config, &static_plugins);
+    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
         &plugin_selection,
         &static_plugins,
+        plugin_configs,
     )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
