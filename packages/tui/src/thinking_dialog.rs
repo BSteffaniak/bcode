@@ -2,6 +2,27 @@
 
 use bcode_ipc::SessionModelStatus;
 
+/// Initially focused thinking setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDialogFocus {
+    /// Focus the local display toggle.
+    Display,
+    /// Focus the requested reasoning effort.
+    Effort,
+    /// Focus the requested reasoning summary mode.
+    Summary,
+}
+
+impl ThinkingDialogFocus {
+    const fn row(self) -> usize {
+        match self {
+            Self::Display => 0,
+            Self::Effort => 1,
+            Self::Summary => 2,
+        }
+    }
+}
+
 /// Pending thinking settings dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingDialogState {
@@ -30,8 +51,20 @@ impl ThinkingDialogState {
                 .map_or_else(Vec::new, |reasoning| reasoning.summary_values.clone()),
             default_effort: reasoning.and_then(|reasoning| reasoning.default_effort.clone()),
             default_summary: reasoning.and_then(|reasoning| reasoning.default_summary.clone()),
-            focused_row: 0,
+            focused_row: ThinkingDialogFocus::Display.row(),
         }
+    }
+
+    /// Create state with a specific initial focus.
+    #[must_use]
+    pub fn new_focused(
+        visible: bool,
+        status: &SessionModelStatus,
+        focus: ThinkingDialogFocus,
+    ) -> Self {
+        let mut state = Self::new(visible, status);
+        state.focused_row = focus.row();
+        state
     }
 
     /// Return whether reasoning display is enabled.

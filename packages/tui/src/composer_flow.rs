@@ -9,13 +9,16 @@ use super::keymap::BmuxKeyMap;
 use super::session_flow::ActiveChat;
 use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands, thinking_dialog};
 
+/// Result of submitting staged composer text.
+pub type SubmitComposerOutcome = Option<thinking_dialog::ThinkingDialogState>;
+
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
-) -> Result<Option<thinking_dialog::ThinkingDialogState>, TuiError> {
+) -> Result<SubmitComposerOutcome, TuiError> {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
         return Ok(None);
@@ -50,14 +53,15 @@ pub async fn submit_composer<W: Write>(
                 chat.app.push_system_note(note);
                 chat.app.set_status("slash command handled".to_owned());
             }
-            slash_commands::SlashCommandOutcome::OpenThinkingSettings => {
+            slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {
                 let status = client.session_model_status(session_id).await?;
                 chat.app.apply_model_status(status.clone());
                 chat.app
                     .set_status("thinking settings: enter apply, esc cancel".to_owned());
-                return Ok(Some(thinking_dialog::ThinkingDialogState::new(
+                return Ok(Some(thinking_dialog::ThinkingDialogState::new_focused(
                     chat.app.reasoning_visible(),
                     &status,
+                    focus,
                 )));
             }
             slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {

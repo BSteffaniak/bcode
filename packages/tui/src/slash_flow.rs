@@ -46,40 +46,41 @@ pub async fn handle_slash_palette_key<W: Write>(
     slash_palette: &mut Option<slash_palette::SlashPalette>,
     terminal: &mut Terminal<&mut W>,
     stroke: KeyStroke,
-) -> Result<bool, TuiError> {
+) -> Result<Option<composer_flow::SubmitComposerOutcome>, TuiError> {
     let Some(active_palette) = slash_palette else {
-        return Ok(false);
+        return Ok(Some(None));
     };
     match stroke.key {
         KeyCode::Up if stroke.modifiers.is_empty() => {
             active_palette.move_previous();
-            Ok(true)
+            Ok(Some(None))
         }
         KeyCode::Down if stroke.modifiers.is_empty() => {
             active_palette.move_next();
-            Ok(true)
+            Ok(Some(None))
         }
         KeyCode::Tab if stroke.modifiers.is_empty() => {
             accept_slash_completion(chat, slash_palette);
-            Ok(true)
+            Ok(Some(None))
         }
         KeyCode::Enter if stroke.modifiers.is_empty() => {
             if active_palette.selected_matches(chat.app.composer().text()) {
                 *slash_palette = None;
-                if let Err(error) =
-                    composer_flow::submit_composer(client, keymap, chat, terminal).await
-                {
-                    helpers::report_client_error(&mut chat.app, "send failed", &error);
+                match composer_flow::submit_composer(client, keymap, chat, terminal).await {
+                    Ok(outcome) => return Ok(Some(outcome)),
+                    Err(error) => {
+                        helpers::report_client_error(&mut chat.app, "send failed", &error);
+                    }
                 }
             } else {
                 accept_slash_completion(chat, slash_palette);
             }
-            Ok(true)
+            Ok(Some(None))
         }
         KeyCode::Escape if stroke.modifiers.is_empty() => {
             *slash_palette = None;
             chat.app.set_status("slash completions hidden".to_owned());
-            Ok(true)
+            Ok(Some(None))
         }
         _ => {
             let outcome = input::handle_key(&mut chat.app, keymap, stroke);
@@ -87,13 +88,15 @@ pub async fn handle_slash_palette_key<W: Write>(
             if outcome.interrupted {
                 request_turn_cancellation(client, chat).await;
             }
-            if outcome.submitted
-                && let Err(error) =
-                    composer_flow::submit_composer(client, keymap, chat, terminal).await
-            {
-                helpers::report_client_error(&mut chat.app, "send failed", &error);
+            if outcome.submitted {
+                match composer_flow::submit_composer(client, keymap, chat, terminal).await {
+                    Ok(outcome) => return Ok(Some(outcome)),
+                    Err(error) => {
+                        helpers::report_client_error(&mut chat.app, "send failed", &error);
+                    }
+                }
             }
-            Ok(outcome.redraw || slash_palette.is_some())
+            Ok(Some(None))
         }
     }
 }

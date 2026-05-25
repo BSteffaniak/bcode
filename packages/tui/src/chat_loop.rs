@@ -203,7 +203,7 @@ async fn handle_chat_key<W: Write>(
         .await;
     }
     if modals.slash_palette.is_some() {
-        return slash_flow::handle_slash_palette_key(
+        if let Some(dialog) = slash_flow::handle_slash_palette_key(
             client,
             keymap,
             chat,
@@ -211,7 +211,12 @@ async fn handle_chat_key<W: Write>(
             terminal,
             stroke,
         )
-        .await;
+        .await?
+        .flatten()
+        {
+            modals.thinking_dialog = Some(dialog);
+        }
+        return Ok(true);
     }
     let changed = match stroke.key {
         KeyCode::Char(']') if stroke.modifiers.is_empty() => chat.app.select_next_diff_file(),

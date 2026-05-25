@@ -1328,3 +1328,37 @@ fn thinking_dialog_cycles_supported_values() {
     dialog.cycle_focused();
     assert_eq!(dialog.summary(), Some("detailed"));
 }
+
+#[test]
+fn thinking_dialog_can_start_focused_on_effort_or_summary() {
+    let status = bcode_ipc::SessionModelStatus {
+        provider_plugin_id: None,
+        model_id: None,
+        context_window: None,
+        max_output_tokens: None,
+        reasoning: Some(bcode_model::ModelReasoningInfo {
+            effort_values: vec!["low".to_owned(), "medium".to_owned()],
+            default_effort: Some("low".to_owned()),
+            visible_summary_supported: true,
+            summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
+            default_summary: Some("auto".to_owned()),
+            raw_reasoning_supported: false,
+        }),
+        reasoning_effort: Some("low".to_owned()),
+        reasoning_summary: Some("auto".to_owned()),
+    };
+
+    let effort = super::thinking_dialog::ThinkingDialogState::new_focused(
+        false,
+        &status,
+        super::thinking_dialog::ThinkingDialogFocus::Effort,
+    );
+    let summary = super::thinking_dialog::ThinkingDialogState::new_focused(
+        false,
+        &status,
+        super::thinking_dialog::ThinkingDialogFocus::Summary,
+    );
+
+    assert_eq!(effort.focused_row(), 1);
+    assert_eq!(summary.focused_row(), 2);
+}

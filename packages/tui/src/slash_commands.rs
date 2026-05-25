@@ -16,7 +16,7 @@ pub enum SlashCommandOutcome {
     /// Open skill picker.
     PickSkill,
     /// Open thinking settings dialog.
-    OpenThinkingSettings,
+    OpenThinkingSettings(super::thinking_dialog::ThinkingDialogFocus),
     /// Toggle diff panel.
     ToggleDiff,
     /// Toggle local thinking display.
@@ -77,7 +77,15 @@ async fn thinking_command(
     match parts.get(1).copied() {
         Some("capabilities") => Ok(SlashCommandOutcome::Handled(thinking_capabilities(&status))),
         Some("status") => Ok(SlashCommandOutcome::Handled(thinking_status(&status))),
-        None => Ok(SlashCommandOutcome::OpenThinkingSettings),
+        None => Ok(SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Display,
+        )),
+        Some("effort") if parts.len() == 2 => Ok(SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Effort,
+        )),
+        Some("summary") if parts.len() == 2 => Ok(SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Summary,
+        )),
         Some("effort") if parts.len() > 2 => {
             let effort = parts[2].to_owned();
             if let Some(message) = unsupported_reasoning_value(
@@ -120,6 +128,16 @@ async fn thinking_command(
         Some("hide") => Ok(SlashCommandOutcome::SetThinkingDisplay(false)),
         Some("toggle") => Ok(SlashCommandOutcome::ToggleThinkingDisplay),
         Some(value) => {
+            if let Some(message) = unsupported_reasoning_value(
+                "effort",
+                value,
+                status
+                    .reasoning
+                    .as_ref()
+                    .map(|reasoning| reasoning.effort_values.as_slice()),
+            ) {
+                return Ok(SlashCommandOutcome::Handled(message));
+            }
             client
                 .set_session_reasoning(session_id, Some(value.to_owned()), None)
                 .await?;
