@@ -7,6 +7,7 @@ members = [
     "plugins/fake-provider-plugin",
     "plugins/openai-compatible-provider-plugin",
     "plugins/shell-plugin",
+    "plugins/web-search-plugin",
     "packages/agent-policy",
     "packages/agent-policy/models",
     "packages/agent-profile",
@@ -73,6 +74,7 @@ bcode_syntax_render                     = { version = "0.0.1-alpha.0", default-f
 bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
+bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }
 
 # BMUX reuse
 bmux_codec          = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }

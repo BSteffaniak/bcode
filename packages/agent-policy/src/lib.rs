@@ -50,6 +50,8 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("filesystem.read".to_string(), true),
                 ("filesystem.write".to_string(), true),
                 ("filesystem.edit".to_string(), true),
+                ("web.search".to_string(), true),
+                ("web.fetch".to_string(), true),
             ]),
             permission: PermissionConfig {
                 bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
@@ -70,6 +72,8 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("filesystem.read".to_string(), true),
                 ("filesystem.write".to_string(), false),
                 ("filesystem.edit".to_string(), false),
+                ("web.search".to_string(), true),
+                ("web.fetch".to_string(), true),
             ]),
             permission: PermissionConfig {
                 bash: BTreeMap::from([
@@ -120,6 +124,8 @@ pub fn active_tools_for(config: &AgentConfig) -> Vec<String> {
         "filesystem.find".to_string(),
         "filesystem.grep".to_string(),
         "filesystem.stat".to_string(),
+        "web.search".to_string(),
+        "web.fetch".to_string(),
     ]);
     for (tool, enabled) in &config.tools {
         if *enabled {
@@ -187,7 +193,30 @@ fn evaluate_after_path(
         }
         "filesystem.write" => evaluate_filesystem_path(config, request, &config.permission.write),
         "filesystem.edit" => evaluate_filesystem_path(config, request, &config.permission.edit),
+        "web.search" => evaluation(AgentDecision::Allow, String::new(), None, None),
+        "web.fetch" => evaluate_web_fetch(config, request),
         _ => evaluate_side_effect_fallback(config, request),
+    }
+}
+
+fn evaluate_web_fetch(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
+    if tool_enabled(config, request) == Some(true) {
+        evaluation(
+            AgentDecision::Ask,
+            format!("{} agent asks before web.fetch", request.agent_id),
+            None,
+            None,
+        )
+    } else {
+        evaluation(
+            AgentDecision::Deny,
+            format!(
+                "{} agent denied web.fetch; enable the tool if web page reads are allowed",
+                request.agent_id
+            ),
+            None,
+            None,
+        )
     }
 }
 

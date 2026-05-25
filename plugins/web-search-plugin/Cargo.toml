@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled web search and fetch tool plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "web", "search", "tool", "plugin"]
+license     = { workspace = true }
+name        = "bcode_web_search_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_model_provider_runtime = { workspace = true }
+bcode_plugin_sdk             = { workspace = true }
+bcode_tool                   = { workspace = true }
+reqwest                      = { workspace = true }
+serde                        = { workspace = true, features = ["derive", "std"] }
+serde_json                   = { workspace = true }
+thiserror                    = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

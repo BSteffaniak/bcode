@@ -972,6 +972,7 @@ dependencies = [
  "bcode_skill",
  "bcode_skill_models",
  "bcode_tool",
+ "bcode_web_search_plugin",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1087,6 +1088,19 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "uuid",
+]
+
+[[package]]
+name = "bcode_web_search_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model_provider_runtime",
+ "bcode_plugin_sdk",
+ "bcode_tool",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

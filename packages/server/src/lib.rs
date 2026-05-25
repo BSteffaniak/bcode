@@ -530,6 +530,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
             bcode_shell_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-web-search-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
+            bcode_web_search_plugin::static_plugin(),
+        ),
     ]
 }
 

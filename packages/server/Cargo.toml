@@ -29,6 +29,7 @@ bcode_shell_plugin = { workspace = true, optional = true }
 bcode_skill = { workspace = true }
 bcode_skill_models = { workspace = true }
 bcode_tool = { workspace = true }
+bcode_web_search_plugin = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -80,9 +81,15 @@ static-bundled-plugins = [
     "static-bundled-filesystem-plugin",
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-shell-plugin",
+    "static-bundled-web-search-plugin",
 ]
 static-bundled-shell-plugin = [
     "_static-bundled",
     "dep:bcode_shell_plugin",
     "bcode_shell_plugin/static-bundled",
+]
+static-bundled-web-search-plugin = [
+    "_static-bundled",
+    "dep:bcode_web_search_plugin",
+    "bcode_web_search_plugin/static-bundled",
 ]
