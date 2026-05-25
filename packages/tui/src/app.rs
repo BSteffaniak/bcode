@@ -30,7 +30,7 @@ use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
 use super::transcript::{
-    TranscriptItem, TranscriptItemKind, finish_streaming_transcript_item,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, finish_streaming_transcript_item,
     merge_transcript_boundary, model_usage_item, permission_request_item, permission_result_item,
     push_streaming_transcript_item, streaming_terminal_output_item, streaming_tool_output_item,
     tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
@@ -951,6 +951,7 @@ impl BmuxApp {
             .push(tool_request_item(tool_call_id, tool_name, arguments_json));
         if let Some(status) = edit_summary {
             self.set_file_activity(tool_name);
+            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Pending);
             self.status = status;
         } else {
             self.set_activity(ActivityState::RunningTool {
@@ -1006,9 +1007,12 @@ impl BmuxApp {
         if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result)) {
             if is_error {
                 "failed".clone_into(&mut self.status);
+                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
             } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
                 self.status = format!("applied · {status}");
             } else {
+                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
                 "finished".clone_into(&mut self.status);
             }
             self.finish_tool_request_preview(tool_call_id);
@@ -1024,9 +1028,12 @@ impl BmuxApp {
         ));
         if is_error {
             "failed".clone_into(&mut self.status);
+            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
         } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
             self.status = format!("applied · {status}");
         } else {
+            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
             "finished".clone_into(&mut self.status);
         }
         self.finish_tool_request_preview(tool_call_id);
@@ -1062,6 +1069,7 @@ impl BmuxApp {
                     );
                 }
                 self.set_activity_for_tool_call(tool_call_id, tool_name);
+                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applying);
                 if let Some(status) = self.tool_call_file_status(tool_call_id) {
                     self.status = status;
                 } else {
@@ -1082,9 +1090,12 @@ impl BmuxApp {
                 self.finish_tool_request_preview(tool_call_id);
                 if *is_error {
                     "failed".clone_into(&mut self.status);
+                    self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
                 } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                    self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
                     self.status = format!("applied · {status}");
                 } else {
+                    self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
                     "finished".clone_into(&mut self.status);
                 }
             }
@@ -1179,6 +1190,7 @@ impl BmuxApp {
         self.set_activity(ActivityState::WaitingPermission {
             name: tool_name.to_owned(),
         });
+        self.set_tool_request_file_phase(tool_call_id, FileEditPhase::WaitingPermission);
         self.status = self.tool_call_file_status(tool_call_id).map_or_else(
             || {
                 tool_request_status(tool_name, arguments_json)
@@ -1194,6 +1206,10 @@ impl BmuxApp {
         } else {
             "permission denied"
         };
+        if !approved && let Some(tool_call_id) = self.permission_tool_call_id(permission_id) {
+            self.set_tool_request_file_phase(&tool_call_id, FileEditPhase::Failed);
+            self.finish_tool_request_preview(&tool_call_id);
+        }
         status.clone_into(&mut self.status);
         self.transcript
             .push(permission_result_item(permission_id, approved));
@@ -1230,6 +1246,39 @@ impl BmuxApp {
             summary.added,
             summary.removed
         ))
+    }
+
+    fn set_tool_request_file_phase(&mut self, tool_call_id: &str, phase: FileEditPhase) {
+        for item in self.transcript.iter_mut().rev() {
+            let TranscriptItemKind::ToolRequest {
+                tool_call_id: item_tool_call_id,
+                file_edit_phase,
+                ..
+            } = item.kind_mut()
+            else {
+                continue;
+            };
+            if item_tool_call_id == tool_call_id {
+                if file_edit_phase.is_some() {
+                    *file_edit_phase = Some(phase);
+                }
+                break;
+            }
+        }
+    }
+
+    fn permission_tool_call_id(&self, permission_id: &str) -> Option<String> {
+        self.transcript.iter().rev().find_map(|item| {
+            let TranscriptItemKind::PermissionRequest {
+                permission_id: item_permission_id,
+                tool_call_id,
+                ..
+            } = item.kind()
+            else {
+                return None;
+            };
+            (item_permission_id == permission_id).then(|| tool_call_id.clone())
+        })
     }
 
     fn finish_tool_request_preview(&mut self, tool_call_id: &str) {

@@ -735,6 +735,156 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
 }
 
 #[test]
+fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_write".to_owned(),
+            tool_name: "filesystem_write".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "/Users/braden/projects/bcode/packages/tui/src/render.rs",
+                "contents": "fn main() {}\n",
+            })
+            .to_string(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 72, 16));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("writing"));
+    assert!(output.contains("packages/tui/src/render.rs"), "{output}");
+    assert!(output.contains("Ready to apply · Writing file"));
+    assert!(!output.contains("running tool filesystem_write"));
+    assert!(!output.contains("tool filesystem_write · running tool filesystem_write"));
+}
+
+#[test]
+fn live_file_edit_card_shows_permission_and_applied_phases() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let args = serde_json::json!({
+        "path": "src/lib.rs",
+        "old_text": "old\n",
+        "new_text": "new\n",
+    })
+    .to_string();
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_edit".to_owned(),
+            tool_name: "filesystem_edit".to_owned(),
+            arguments_json: args.clone(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::PermissionRequested {
+            permission_id: "perm_edit".to_owned(),
+            tool_call_id: "call_edit".to_owned(),
+            tool_name: "filesystem_edit".to_owned(),
+            arguments_json: args,
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(
+        output.contains("Waiting for permission") && output.contains("Editing file"),
+        "{output}"
+    );
+
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call_edit".to_owned(),
+                tool_name: "filesystem_edit".to_owned(),
+                terminal: false,
+                columns: None,
+                rows: None,
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        4,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call_edit".to_owned(),
+            result: "edited src/lib.rs".to_owned(),
+            is_error: false,
+            output: None,
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(
+        output.contains("Applied") && output.contains("Editing file"),
+        "{output}"
+    );
+    assert!(output.contains("confirmation: edited src/lib.rs"));
+}
+
+#[test]
+fn denied_file_permission_marks_preview_failed() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let args = serde_json::json!({
+        "path": "src/lib.rs",
+        "old_text": "old\n",
+        "new_text": "new\n",
+    })
+    .to_string();
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_edit".to_owned(),
+            tool_name: "filesystem_edit".to_owned(),
+            arguments_json: args.clone(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::PermissionRequested {
+            permission_id: "perm_edit".to_owned(),
+            tool_call_id: "call_edit".to_owned(),
+            tool_name: "filesystem_edit".to_owned(),
+            arguments_json: args,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::PermissionResolved {
+            permission_id: "perm_edit".to_owned(),
+            approved: false,
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("Edit preview · filesystem_edit"));
+    assert!(output.contains("failed"));
+    assert!(output.contains("Failed") && output.contains("Editing file"));
+}
+
+#[test]
 fn transcript_renders_filesystem_edit_inline_diff_preview() {
     let session_id = SessionId::new();
     let history = [event(
@@ -758,7 +908,8 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Editing … · filesystem.edit"));
+    assert!(output.contains("Editing file"), "{output}");
+    assert!(output.contains("Ready to apply · Editing file"));
     assert!(output.contains("src/lib.rs  +1 -1"));
     assert!(output.contains("replaced 1 line with 1 line"));
     assert!(output.contains("live preview"));

@@ -18,6 +18,12 @@ pub struct FileEditTranscript {
 }
 
 impl FileEditTranscript {
+    /// Return whether the preview has no known previous contents.
+    #[must_use]
+    pub const fn old_text_is_empty(&self) -> bool {
+        self.old_text.is_empty()
+    }
+
     /// Return a summary for this file edit.
     #[must_use]
     pub fn summary(&self) -> DiffFileSummary {
@@ -52,6 +58,7 @@ pub fn file_edit_from_tool_request(
         .as_str()?;
     let old_text = value
         .get("old_text")
+        .or_else(|| value.get("old_string"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let new_text = value

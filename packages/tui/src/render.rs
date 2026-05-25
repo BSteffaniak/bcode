@@ -28,7 +28,7 @@ use super::tool_present::{
     GrepMatchPresentation, ListEntryPresentation, ShellResultPresentation, ToolRequestPresentation,
     ToolResultPresentation, tool_request_presentation, tool_result_presentation,
 };
-use super::transcript::{TranscriptItem, TranscriptItemKind};
+use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
@@ -210,7 +210,7 @@ fn sync_transcript_layout(app: &mut BmuxApp, width: u16) {
             transcript_item_signature(&transcript[index], width, inline_diff_config)
         },
         transcript_rows: |index| {
-            transcript_item_rows(&transcript[index], width, inline_diff_config)
+            transcript_item_rows(&transcript, index, width, inline_diff_config)
         },
         pending_signature: |index| pending_submission_signature(&pending_submissions[index], width),
         pending_rows: |index| pending_submission_rows(&pending_submissions[index], width),
@@ -274,12 +274,13 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn transcript_item_rows(
-    item: &TranscriptItem,
+    transcript: &[TranscriptItem],
+    index: usize,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
 ) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, item, width, inline_diff_config);
+    push_transcript_item_rows(&mut rows, transcript, index, width, inline_diff_config);
     rows
 }
 
@@ -336,12 +337,32 @@ fn pending_submission_signature(
     ))
 }
 
+fn has_file_preview_before(
+    transcript: &[TranscriptItem],
+    index: usize,
+    tool_call_id: &str,
+) -> bool {
+    transcript[..index].iter().rev().any(|item| {
+        let TranscriptItemKind::ToolRequest {
+            tool_call_id: item_tool_call_id,
+            file_edit,
+            ..
+        } = item.kind()
+        else {
+            return false;
+        };
+        item_tool_call_id == tool_call_id && file_edit.is_some()
+    })
+}
+
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
-    item: &TranscriptItem,
+    transcript: &[TranscriptItem],
+    index: usize,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
 ) {
+    let item = &transcript[index];
     match item.kind() {
         TranscriptItemKind::UserMessage => {
             push_message_block(rows, "You", item.text(), Color::Blue, width);
@@ -357,12 +378,14 @@ fn push_transcript_item_rows(
             tool_name,
             arguments_json,
             file_edit,
+            file_edit_phase,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
                 tool_name,
                 arguments_json,
                 file_edit: file_edit.as_ref(),
+                file_edit_phase: *file_edit_phase,
                 inline_diff_config,
             };
             push_tool_request_rows(rows, item, &context, width);
@@ -374,6 +397,7 @@ fn push_transcript_item_rows(
             result,
             is_error,
         } => {
+            let has_file_preview = has_file_preview_before(transcript, index, tool_call_id);
             push_tool_result_rows(
                 rows,
                 item,
@@ -382,6 +406,7 @@ fn push_transcript_item_rows(
                     tool_name: tool_name.as_deref(),
                     result,
                     is_error: *is_error,
+                    has_file_preview,
                 },
                 width,
             );
@@ -513,6 +538,7 @@ struct ToolRequestRenderContext<'a> {
     tool_name: &'a str,
     arguments_json: &'a str,
     file_edit: Option<&'a FileEditTranscript>,
+    file_edit_phase: Option<FileEditPhase>,
     inline_diff_config: TuiInlineDiffConfig,
 }
 
@@ -522,7 +548,7 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
-    let title = if context.file_edit.is_some() {
+    let mut title = if context.file_edit.is_some() {
         format!(
             "{} · {}",
             file_tool_action(context.tool_name, item.streaming()),
@@ -531,7 +557,12 @@ fn push_tool_request_rows(
     } else {
         format!("Tool · {}", context.tool_name)
     };
-    let title_color = if item.streaming() {
+    if context.file_edit_phase == Some(FileEditPhase::Failed) {
+        title.push_str(" · failed");
+    }
+    let title_color = if context.file_edit_phase == Some(FileEditPhase::Failed) {
+        Color::Red
+    } else if item.streaming() {
         Color::Cyan
     } else {
         Color::Yellow
@@ -553,7 +584,14 @@ fn push_tool_request_rows(
         muted_style(),
     );
     if let Some(edit) = context.file_edit {
-        push_file_edit_preview_rows(rows, edit, width, context.inline_diff_config);
+        push_file_edit_preview_rows(
+            rows,
+            edit,
+            width,
+            context.inline_diff_config,
+            context.file_edit_phase,
+            context.tool_name,
+        );
     } else if let Some(presentation) =
         tool_request_presentation(context.tool_name, context.arguments_json)
     {
@@ -703,6 +741,7 @@ struct ToolResultRenderContext<'a> {
     tool_name: Option<&'a str>,
     result: &'a str,
     is_error: bool,
+    has_file_preview: bool,
 }
 
 fn push_tool_result_rows(
@@ -743,7 +782,16 @@ fn push_tool_result_rows(
         muted_style(),
     );
     if let Some(presentation) = presentation {
-        push_tool_result_presentation_rows(rows, &presentation, width);
+        if context.has_file_preview
+            && matches!(
+                presentation,
+                ToolResultPresentation::Write { .. } | ToolResultPresentation::Edit { .. }
+            )
+        {
+            push_muted_confirmation_rows(rows, &presentation, width);
+        } else {
+            push_tool_result_presentation_rows(rows, &presentation, width);
+        }
     } else {
         push_labeled_text_preview(
             rows,
@@ -764,6 +812,29 @@ fn push_tool_result_rows(
         );
     }
     rows.push(Line::default());
+}
+
+fn push_muted_confirmation_rows(
+    rows: &mut Vec<Line>,
+    presentation: &ToolResultPresentation,
+    width: u16,
+) {
+    let (ToolResultPresentation::Write { summary } | ToolResultPresentation::Edit { summary }) =
+        presentation
+    else {
+        return;
+    };
+    if summary.is_empty() {
+        return;
+    }
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!("confirmation: {summary}"),
+        width,
+        muted_style(),
+        muted_style(),
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1146,8 +1217,24 @@ fn push_file_edit_preview_rows(
     edit: &FileEditTranscript,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
+    phase: Option<FileEditPhase>,
+    tool_name: &str,
 ) {
     let summary = edit.summary();
+    let phase = phase.unwrap_or(FileEditPhase::Applied);
+    let phase_style = file_edit_phase_style(phase);
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!(
+            "{} · {}",
+            phase.label(),
+            file_write_mode_label(tool_name, edit.old_text_is_empty())
+        ),
+        width,
+        phase_style,
+        muted_style(),
+    );
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
@@ -1209,6 +1296,28 @@ fn push_file_edit_preview_rows(
         }
     }
     rows.push(inline_diff_card_border('╰', '─', '╯', card_width));
+}
+
+const fn file_edit_phase_style(phase: FileEditPhase) -> Style {
+    match phase {
+        FileEditPhase::Pending | FileEditPhase::Applying => Style::new().fg(Color::Cyan),
+        FileEditPhase::WaitingPermission => Style::new().fg(Color::Yellow),
+        FileEditPhase::Applied => Style::new().fg(Color::Green),
+        FileEditPhase::Failed => Style::new().fg(Color::Red),
+    }
+}
+
+fn file_write_mode_label(tool_name: &str, old_text_is_empty: bool) -> &'static str {
+    let normalized = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
+    if matches!(normalized.as_str(), "filesystem_write" | "write") {
+        if old_text_is_empty {
+            "Writing file"
+        } else {
+            "Replacing file"
+        }
+    } else {
+        "Editing file"
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2100,10 +2209,11 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         activity_label(app.activity()),
         Style::new().fg(Color::Cyan),
     )];
-    if !app.status().is_empty() {
+    let status_text = statusline_status_text(app);
+    if !status_text.is_empty() {
         spans.extend([
             Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
-            Span::styled(app.status().to_owned(), Style::new().fg(Color::BrightBlack)),
+            Span::styled(status_text, Style::new().fg(Color::BrightBlack)),
         ]);
     }
     if app.scroll_offset() > 0 {
@@ -2122,6 +2232,33 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         ),
     ]);
     frame.write_line(area, &Line::from_spans(spans));
+}
+
+fn statusline_status_text(app: &BmuxApp) -> String {
+    let max_width = 48;
+    let status = app.status();
+    status
+        .split(" · ")
+        .map(|part| truncate_status_part(part, max_width))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn truncate_status_part(part: &str, max_width: usize) -> String {
+    if text_display_width(part) <= max_width {
+        return part.to_owned();
+    }
+    let mut suffix = String::new();
+    let mut width: usize = 1;
+    for grapheme in part.graphemes(true).rev() {
+        let grapheme_width = text_display_width(grapheme);
+        if width.saturating_add(grapheme_width) > max_width {
+            break;
+        }
+        suffix.insert_str(0, grapheme);
+        width = width.saturating_add(grapheme_width);
+    }
+    format!("…{suffix}")
 }
 
 fn activity_label(activity: &ActivityState) -> String {
