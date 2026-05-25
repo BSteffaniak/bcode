@@ -472,7 +472,7 @@ impl ServerState {
                 .sessions
                 .cached_sessions(&bcode_ipc::current_working_directory())
                 .await,
-            session_catalog_loaded: self.sessions.catalog_loaded().await,
+            session_catalog_loaded: self.sessions.catalog_loaded(),
             selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
             selected_model_id: self.selected_model_id.clone(),
             plugin_runtime: self.plugins.executor_statuses(),

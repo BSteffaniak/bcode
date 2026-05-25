@@ -41,7 +41,7 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::spawn_blocking;
 
 const FRAME_V2_MAGIC: &[u8; 4] = b"BSE2";
@@ -94,6 +94,8 @@ pub enum SessionStoreError {
     Decode(#[source] bmux_codec::Error),
     #[error("blocking session store task failed: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
+    #[error("session catalog load failed: {0}")]
+    CatalogLoad(String),
     #[error("session index error: {0}")]
     Index(#[source] serde_json::Error),
     #[error("session event frame is too large: {0} bytes")]
@@ -1071,18 +1073,18 @@ impl SessionStoreExecutor {
 }
 
 /// In-memory session manager with optional append-only persistence.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionManager {
     inner: Arc<Mutex<SessionManagerInner>>,
     store: Option<SessionStoreExecutor>,
     activity_clock_ms: AtomicU64,
+    catalog_status_tx: watch::Sender<CatalogLoadStatus>,
+    catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
 }
 
 #[derive(Debug, Default)]
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
-    catalog_loaded: bool,
-    running_catalog_load: bool,
     completed_rebuilds: usize,
     failed_rebuilds: usize,
 }
@@ -1093,10 +1095,19 @@ enum SessionIndexStatusKind {
     Stale,
 }
 
+/// Current asynchronous catalog discovery status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum CatalogLoadStatus {
+    NotStarted,
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
 /// Background session maintenance status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionMaintenanceStatus {
-    pub catalog_loading: bool,
+    pub catalog_status: CatalogLoadStatus,
     pub stale_indexes: usize,
     pub running_rebuilds: usize,
     pub completed_rebuilds: usize,
@@ -1664,6 +1675,19 @@ pub struct SessionAttachment {
     pub events: broadcast::Receiver<SessionEvent>,
 }
 
+impl Default for SessionManager {
+    fn default() -> Self {
+        let (catalog_status_tx, catalog_status_rx) = watch::channel(CatalogLoadStatus::Loaded);
+        Self {
+            inner: Arc::new(Mutex::new(SessionManagerInner::default())),
+            store: None,
+            activity_clock_ms: AtomicU64::new(current_unix_millis()),
+            catalog_status_tx,
+            catalog_status_rx,
+        }
+    }
+}
+
 impl SessionManager {
     /// Create a session manager backed by an append-only event store.
     ///
@@ -1690,6 +1714,12 @@ impl SessionManager {
         catalog_loaded: bool,
     ) -> Self {
         let executor = SessionStoreExecutor::new(store);
+        let catalog_status = if catalog_loaded {
+            CatalogLoadStatus::Loaded
+        } else {
+            CatalogLoadStatus::NotStarted
+        };
+        let (catalog_status_tx, catalog_status_rx) = watch::channel(catalog_status);
         Self {
             inner: Arc::new(Mutex::new(SessionManagerInner {
                 sessions: sessions
@@ -1701,13 +1731,13 @@ impl SessionManager {
                         )
                     })
                     .collect(),
-                catalog_loaded,
-                running_catalog_load: false,
                 completed_rebuilds: 0,
                 failed_rebuilds: 0,
             })),
             store: Some(executor),
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
+            catalog_status_tx,
+            catalog_status_rx,
         }
     }
 
@@ -1740,28 +1770,35 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Return the current persistent catalog discovery status.
+    #[must_use]
+    pub fn catalog_status(&self) -> CatalogLoadStatus {
+        self.catalog_status_rx.borrow().clone()
+    }
+
+    /// Subscribe to persistent catalog status changes.
+    pub fn subscribe_catalog_status(&self) -> watch::Receiver<CatalogLoadStatus> {
+        self.catalog_status_rx.clone()
+    }
+
     /// Start loading the persistent catalog in the background if it has not loaded yet.
-    pub async fn start_catalog_load(&self) {
-        if self.inner.lock().await.catalog_loaded {
-            return;
-        }
+    pub fn start_catalog_load(&self) {
         let Some(store) = self.store.clone() else {
-            self.inner.lock().await.catalog_loaded = true;
+            let _ = self.catalog_status_tx.send(CatalogLoadStatus::Loaded);
             return;
         };
-        let mut inner = self.inner.lock().await;
-        if inner.catalog_loaded || inner.running_catalog_load {
-            return;
+        match self.catalog_status() {
+            CatalogLoadStatus::Loaded | CatalogLoadStatus::Loading => return,
+            CatalogLoadStatus::NotStarted | CatalogLoadStatus::Failed(_) => {}
         }
-        inner.running_catalog_load = true;
+        let _ = self.catalog_status_tx.send(CatalogLoadStatus::Loading);
         let registry = Arc::clone(&self.inner);
-        drop(inner);
-
+        let status = self.catalog_status_tx.clone();
         tokio::spawn(async move {
             let sessions = match store.load_catalog().await {
                 Ok(sessions) => sessions,
                 Err(error) => {
-                    registry.lock().await.running_catalog_load = false;
+                    let _ = status.send(CatalogLoadStatus::Failed(error.to_string()));
                     eprintln!("failed to load session catalog: {error}");
                     return;
                 }
@@ -1773,9 +1810,32 @@ impl SessionManager {
                     .entry(session_id)
                     .or_insert_with(|| SessionHandle::new(state, Some(store.clone())));
             }
-            inner.catalog_loaded = true;
-            inner.running_catalog_load = false;
+            drop(inner);
+            let _ = status.send(CatalogLoadStatus::Loaded);
         });
+    }
+
+    /// Wait until background catalog loading completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if catalog loading fails or the catalog status channel closes.
+    pub async fn wait_catalog_loaded(&self) -> Result<(), SessionStoreError> {
+        self.start_catalog_load();
+        let mut status = self.catalog_status_rx.clone();
+        loop {
+            let value = status.borrow().clone();
+            match value {
+                CatalogLoadStatus::Loaded => return Ok(()),
+                CatalogLoadStatus::Failed(message) => {
+                    return Err(SessionStoreError::CatalogLoad(message));
+                }
+                CatalogLoadStatus::NotStarted | CatalogLoadStatus::Loading => {}
+            }
+            status.changed().await.map_err(|_| {
+                SessionStoreError::CatalogLoad("session catalog status channel closed".to_string())
+            })?;
+        }
     }
 
     async fn migrate_session_to_current_if_required(
@@ -1866,7 +1926,7 @@ impl SessionManager {
 
     /// List known sessions from the session catalog.
     pub async fn list_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
-        self.start_catalog_load().await;
+        self.start_catalog_load();
         self.cached_sessions(working_directory).await
     }
 
@@ -1881,25 +1941,20 @@ impl SessionManager {
     }
 
     /// Return true once the persistent session catalog has been discovered.
-    pub async fn catalog_loaded(&self) -> bool {
-        self.inner.lock().await.catalog_loaded
+    pub fn catalog_loaded(&self) -> bool {
+        matches!(self.catalog_status(), CatalogLoadStatus::Loaded)
     }
 
     /// Return background maintenance status.
     pub async fn maintenance_status(&self) -> SessionMaintenanceStatus {
-        let (handles, catalog_loading, completed_rebuilds, failed_rebuilds) = {
+        let (handles, completed_rebuilds, failed_rebuilds) = {
             let inner = self.inner.lock().await;
             let handles = inner.sessions.values().cloned().collect::<Vec<_>>();
-            (
-                handles,
-                inner.running_catalog_load,
-                inner.completed_rebuilds,
-                inner.failed_rebuilds,
-            )
+            (handles, inner.completed_rebuilds, inner.failed_rebuilds)
         };
         let stale_indexes = stale_index_count(handles);
         SessionMaintenanceStatus {
-            catalog_loading,
+            catalog_status: self.catalog_status(),
             stale_indexes,
             running_rebuilds: 0,
             completed_rebuilds,
@@ -4209,7 +4264,7 @@ mod tests {
             .expect("session should create");
 
         let restored = SessionManager::persistent_lazy(&root);
-        assert!(!restored.catalog_loaded().await);
+        assert!(!restored.catalog_loaded());
         assert!(
             restored
                 .cached_sessions(&test_working_directory())
@@ -4222,19 +4277,17 @@ mod tests {
             .await
             .expect("targeted session load should work");
         assert_eq!(summary.name.as_deref(), Some("lazy catalog"));
-        assert!(!restored.catalog_loaded().await);
+        assert!(!restored.catalog_loaded());
 
         let sessions = restored.list_sessions(&test_working_directory()).await;
         assert!(sessions.len() <= 1);
-        for _ in 0..1000 {
-            if restored.catalog_loaded().await {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        restored
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog load should complete");
         let sessions = restored.cached_sessions(&test_working_directory()).await;
         assert_eq!(sessions.len(), 1);
-        assert!(restored.catalog_loaded().await);
+        assert!(restored.catalog_loaded());
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
