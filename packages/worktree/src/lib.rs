@@ -27,6 +27,9 @@ pub enum WorktreeError {
     /// Worktree request was invalid.
     #[error("invalid worktree request: {0}")]
     InvalidRequest(String),
+    /// Worktree removal was refused.
+    #[error("worktree removal refused: {0}")]
+    RemoveRefused(String),
     /// Worktree setup failed.
     #[error("worktree setup failed: {0}")]
     Setup(String),
@@ -122,6 +125,31 @@ pub fn remove_worktree(
     force: bool,
 ) -> Result<WorktreeRemoveResponse, WorktreeError> {
     let repo = discover_repo(cwd)?;
+    let list = list_worktrees(cwd)?;
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Some(worktree) = list.worktrees.iter().find(|worktree| {
+        worktree
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.path.clone())
+            == target
+    }) else {
+        return Err(WorktreeError::RemoveRefused(format!(
+            "{} is not a registered worktree",
+            path.display()
+        )));
+    };
+    if worktree.is_main {
+        return Err(WorktreeError::RemoveRefused(
+            "refusing to remove the main worktree".to_string(),
+        ));
+    }
+    if !force && worktree_is_dirty(path) {
+        return Err(WorktreeError::RemoveRefused(format!(
+            "{} has uncommitted changes; use force to remove it",
+            path.display()
+        )));
+    }
     setup_remove_worktree(&repo, path, force)?;
     Ok(WorktreeRemoveResponse {
         path: path.to_path_buf(),
@@ -220,6 +248,10 @@ fn default_branch_ref(repo_root: &Path) -> Result<String, WorktreeError> {
 fn current_head_ref(cwd: &Path) -> Option<String> {
     run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
         .and_then(|value| if value == "HEAD" { None } else { Some(value) })
+}
+
+fn worktree_is_dirty(cwd: &Path) -> bool {
+    run_git(cwd, &["status", "--porcelain"]).is_some_and(|status| !status.trim().is_empty())
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -454,5 +486,32 @@ mod tests {
 
         assert_eq!(removed.path, response.path);
         assert!(!removed.path.exists());
+    }
+
+    #[test]
+    fn remove_worktree_refuses_dirty_worktree_without_force() {
+        let repo = TempRepo::init();
+        let request = create_request("Dirty Remove");
+        let response = create_worktree(&bcode_config::BcodeConfig::default(), &request, &repo.root)
+            .expect("worktree should be created");
+        std::fs::write(response.path.join("dirty.txt"), "dirty\n")
+            .expect("dirty file should be written");
+
+        let error = remove_worktree(&repo.root, &response.path, false)
+            .expect_err("dirty worktree removal should be refused");
+
+        assert!(error.to_string().contains("uncommitted changes"));
+        remove_worktree(&repo.root, &response.path, true)
+            .expect("forced dirty worktree removal should succeed");
+    }
+
+    #[test]
+    fn remove_worktree_refuses_main_worktree() {
+        let repo = TempRepo::init();
+
+        let error = remove_worktree(&repo.root, &repo.root, true)
+            .expect_err("main worktree removal should be refused");
+
+        assert!(error.to_string().contains("main worktree"));
     }
 }
