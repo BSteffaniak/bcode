@@ -68,6 +68,7 @@ impl WebSearchPlugin {
         let response = match invocation.name.as_str() {
             "web.search" => self.invoke_search(&context.config, &invocation),
             "web.fetch" => self.invoke_fetch(&context.config, &invocation),
+            "web.status" => invoke_status(&context.config),
             _ => ToolInvocationResponse {
                 output: format!("unsupported web tool: {}", invocation.name),
                 is_error: true,
@@ -127,6 +128,14 @@ impl WebSearchPlugin {
     }
 }
 
+fn invoke_status(config: &bcode_plugin_sdk::PluginConfigContext) -> ToolInvocationResponse {
+    let plugin_config = match config.typed_or_default::<WebSearchConfig>() {
+        Ok(config) => config,
+        Err(error) => return tool_error(error.to_string()),
+    };
+    json_tool_response(&status_response(&plugin_config))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct WebSearchConfig {
     #[serde(default)]
@@ -165,7 +174,27 @@ struct WebFetchConfig {
     #[serde(default)]
     max_bytes: Option<usize>,
     #[serde(default)]
+    fallbacks: Vec<FetchFallback>,
+    #[serde(default)]
     rendered: Option<RenderedFetchConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FetchFallback {
+    Plain,
+    JinaReader,
+    RenderedCommand,
+}
+
+impl FetchFallback {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::JinaReader => "jina_reader",
+            Self::RenderedCommand => "rendered_command",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -271,6 +300,32 @@ struct FetchResponse {
     markdown: Option<String>,
     truncated: bool,
     rendered: bool,
+    fallback_used: String,
+    content_format: String,
+    extraction: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebStatusResponse {
+    search: SearchStatus,
+    fetch: FetchStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SearchStatus {
+    available: bool,
+    provider: Option<String>,
+    quality: String,
+    configured_providers: Vec<String>,
+    recommended: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FetchStatus {
+    available: bool,
+    fallbacks: Vec<String>,
+    rendered_fetch: bool,
+    max_bytes: usize,
 }
 #[derive(Debug, Clone, Deserialize)]
 struct BraveSearchResponse {
@@ -723,11 +778,18 @@ async fn fetch_async(
     if request.render {
         return fetch_rendered(request, &config);
     }
-    fetch_plain_async(request, &config).await
+    let fallbacks = fetch_fallbacks(&config);
+    let plain_result = fetch_plain_async(&request, &config).await;
+    if should_try_jina(&fallbacks, &plain_result)
+        && let Ok(response) = fetch_jina_reader_async(&request, &config).await
+    {
+        return Ok(response);
+    }
+    plain_result
 }
 
 async fn fetch_plain_async(
-    request: FetchRequest,
+    request: &FetchRequest,
     config: &WebSearchConfig,
 ) -> Result<FetchResponse, WebError> {
     let max_bytes = request
@@ -758,7 +820,7 @@ async fn fetch_plain_async(
         (plain_title(&text), text, None)
     };
     Ok(FetchResponse {
-        url: request.url,
+        url: request.url.clone(),
         final_url,
         status: status.as_u16(),
         title,
@@ -767,7 +829,80 @@ async fn fetch_plain_async(
         markdown,
         truncated,
         rendered: false,
+        fallback_used: "plain".to_string(),
+        content_format: "markdown".to_string(),
+        extraction: "bcode_html".to_string(),
     })
+}
+
+async fn fetch_jina_reader_async(
+    request: &FetchRequest,
+    config: &WebSearchConfig,
+) -> Result<FetchResponse, WebError> {
+    let max_bytes = request
+        .max_bytes
+        .or_else(|| config.fetch.as_ref().and_then(|fetch| fetch.max_bytes))
+        .unwrap_or(DEFAULT_FETCH_MAX_BYTES)
+        .clamp(1, MAX_FETCH_BYTES);
+    let jina_url = jina_reader_url(&request.url);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
+    let response = client.get(&jina_url).send().await?;
+    let status = response.status();
+    let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let body = response.bytes().await?;
+    let truncated = body.len() > max_bytes;
+    let text = String::from_utf8_lossy(&body[..body.len().min(max_bytes)]).to_string();
+    Ok(FetchResponse {
+        url: request.url.clone(),
+        final_url,
+        status: status.as_u16(),
+        title: plain_title(&text),
+        content_type,
+        markdown: Some(text.clone()),
+        text,
+        truncated,
+        rendered: false,
+        fallback_used: "jina_reader".to_string(),
+        content_format: "markdown".to_string(),
+        extraction: "jina_reader".to_string(),
+    })
+}
+
+fn jina_reader_url(url: &str) -> String {
+    format!("https://r.jina.ai/http://r.jina.ai/http://{url}")
+}
+
+fn should_try_jina(
+    fallbacks: &[FetchFallback],
+    plain_result: &Result<FetchResponse, WebError>,
+) -> bool {
+    if !fallbacks.contains(&FetchFallback::JinaReader) {
+        return false;
+    }
+    plain_result.as_ref().map_or(true, |response| {
+        response.status == 401
+            || response.status == 403
+            || response.status == 429
+            || response.text.len() < 200
+    })
+}
+
+fn fetch_fallbacks(config: &WebSearchConfig) -> Vec<FetchFallback> {
+    let configured = config
+        .fetch
+        .as_ref()
+        .map(|fetch| fetch.fallbacks.clone())
+        .unwrap_or_default();
+    if configured.is_empty() {
+        vec![FetchFallback::Plain, FetchFallback::JinaReader]
+    } else {
+        configured
+    }
 }
 
 fn fetch_rendered(
@@ -813,6 +948,9 @@ fn fetch_rendered(
         markdown,
         truncated,
         rendered: true,
+        fallback_used: "rendered_command".to_string(),
+        content_format: "markdown".to_string(),
+        extraction: "rendered_command".to_string(),
     })
 }
 fn list_tools(
@@ -830,6 +968,7 @@ fn list_tools(
         tools.push(search_tool_definition());
     }
     tools.push(fetch_tool_definition());
+    tools.push(status_tool_definition());
     json_response(&ToolList { tools })
 }
 
@@ -875,6 +1014,139 @@ fn fetch_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: true,
     }
+}
+
+fn status_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "web.status".to_string(),
+        description: "Report configured and fallback web search/fetch capabilities.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {}
+        }),
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
+    }
+}
+
+fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
+    let provider = search_provider(None, config).ok();
+    let configured = configured_search_providers(config);
+    let quality = provider
+        .as_deref()
+        .map_or("unavailable", provider_quality)
+        .to_string();
+    let mut recommended = Vec::new();
+    if matches!(provider.as_deref(), Some("duckduckgo_html") | None) {
+        recommended.push(
+            "Configure Brave, Tavily, Exa, Serper, SerpAPI, or future model-native search for more stable results."
+                .to_string(),
+        );
+    }
+    let fallbacks = fetch_fallbacks(config);
+    WebStatusResponse {
+        search: SearchStatus {
+            available: provider.is_some(),
+            provider,
+            quality,
+            configured_providers: configured,
+            recommended,
+        },
+        fetch: FetchStatus {
+            available: true,
+            rendered_fetch: rendered_fetch_available(config),
+            max_bytes: config
+                .fetch
+                .as_ref()
+                .and_then(|fetch| fetch.max_bytes)
+                .unwrap_or(DEFAULT_FETCH_MAX_BYTES),
+            fallbacks: fallbacks
+                .into_iter()
+                .map(FetchFallback::as_str)
+                .map(ToString::to_string)
+                .collect(),
+        },
+    }
+}
+
+fn provider_quality(provider: &str) -> &'static str {
+    match provider {
+        "duckduckgo_html" => "best_effort",
+        _ => "configured_api",
+    }
+}
+
+fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
+    let mut providers = Vec::new();
+    if config
+        .providers
+        .brave
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some()
+    {
+        providers.push("brave".to_string());
+    }
+    if config
+        .providers
+        .tavily
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["TAVILY_API_KEY"]).is_some()
+    {
+        providers.push("tavily".to_string());
+    }
+    if config
+        .providers
+        .exa
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["EXA_API_KEY"]).is_some()
+    {
+        providers.push("exa".to_string());
+    }
+    if config
+        .providers
+        .serper
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["SERPER_API_KEY"]).is_some()
+    {
+        providers.push("serper".to_string());
+    }
+    if config
+        .providers
+        .serpapi
+        .api_key
+        .as_ref()
+        .and_then(SecretRef::resolve)
+        .is_some()
+        || env_value(&["SERPAPI_API_KEY"]).is_some()
+    {
+        providers.push("serpapi".to_string());
+    }
+    if config.allow_best_effort_no_key {
+        providers.push("duckduckgo_html".to_string());
+    }
+    providers
+}
+
+fn rendered_fetch_available(config: &WebSearchConfig) -> bool {
+    config
+        .fetch
+        .as_ref()
+        .and_then(|fetch| fetch.rendered.as_ref())
+        .and_then(|rendered| rendered.command.as_ref())
+        .is_some()
+        || env_value(&["BCODE_WEB_RENDER_COMMAND"]).is_some()
 }
 
 fn search_response(query: String, provider: &str, results: Vec<SearchResult>) -> SearchResponse {
@@ -1318,5 +1590,22 @@ mod tests {
         assert_eq!(results[0].url, "https://example.com/docs");
         assert_eq!(results[0].title, "Example & Docs");
         assert_eq!(results[0].snippet, "Useful snippet");
+    }
+
+    #[test]
+    fn status_reports_default_search_and_fetch_capabilities() {
+        let status = status_response(&WebSearchConfig::default());
+        assert!(status.search.available);
+        assert_eq!(status.search.provider.as_deref(), Some("duckduckgo_html"));
+        assert_eq!(status.search.quality, "best_effort");
+        assert!(status.fetch.fallbacks.contains(&"jina_reader".to_string()));
+    }
+
+    #[test]
+    fn jina_reader_url_wraps_original_url() {
+        assert_eq!(
+            jina_reader_url("https://example.com/docs"),
+            "https://r.jina.ai/http://r.jina.ai/http://https://example.com/docs"
+        );
     }
 }
