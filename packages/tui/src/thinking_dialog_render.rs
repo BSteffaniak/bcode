@@ -8,6 +8,8 @@ use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, 
 
 use super::thinking_dialog::ThinkingDialogState;
 
+const MODAL_BG: Color = Color::Black;
+
 const MIN_DIALOG_WIDTH: u16 = 56;
 const MAX_DIALOG_WIDTH: u16 = 96;
 const MIN_DIALOG_HEIGHT: u16 = 15;
@@ -54,9 +56,9 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
         "Control what reasoning is requested and whether provider-visible reasoning is shown.",
-        Style::new().fg(Color::BrightWhite),
+        Style::new().fg(Color::BrightWhite).bg(MODAL_BG),
     )]));
-    rows.push(Line::default());
+    rows.push(modal_blank_line());
     rows.push(setting_row(
         state.focused_row() == 0,
         "Display reasoning",
@@ -67,67 +69,97 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
         state.focused_row() == 1,
         "Reasoning effort",
         state.effective_effort_label(),
-        Some(&values_help(state.effort_values())),
+        Some(&values_help(
+            state.effort_values(),
+            state.effort_values_are_provider_declared(),
+        )),
     ));
     rows.push(setting_row(
         state.focused_row() == 2,
         "Reasoning summary",
         state.effective_summary_label(),
-        Some(&values_help(state.summary_values())),
+        Some(&values_help(
+            state.summary_values(),
+            state.summary_values_are_provider_declared(),
+        )),
     ));
-    rows.push(Line::default());
+    rows.push(modal_blank_line());
     rows.push(Line::from_spans(vec![
         Span::styled(
             "Enter",
-            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::Green)
+                .bg(MODAL_BG)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" apply   "),
+        Span::styled(" apply   ", Style::new().bg(MODAL_BG)),
         Span::styled(
             "Esc",
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::Yellow)
+                .bg(MODAL_BG)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" cancel   "),
+        Span::styled(" cancel   ", Style::new().bg(MODAL_BG)),
         Span::styled(
             "↑/↓",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::Cyan)
+                .bg(MODAL_BG)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" move   "),
+        Span::styled(" move   ", Style::new().bg(MODAL_BG)),
         Span::styled(
             "Space",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::Cyan)
+                .bg(MODAL_BG)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" change"),
+        Span::styled(" change", Style::new().bg(MODAL_BG)),
     ]));
     rows
+}
+
+fn modal_blank_line() -> Line {
+    Line::from_spans(vec![Span::styled("", Style::new().bg(MODAL_BG))])
 }
 
 fn setting_row(focused: bool, label: &str, value: &str, help: Option<&str>) -> Line {
     let marker = if focused { "›" } else { " " };
     let marker_style = if focused {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(Color::Cyan)
+            .bg(MODAL_BG)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(Color::BrightBlack)
+        Style::new().fg(Color::BrightBlack).bg(MODAL_BG)
     };
     let mut spans = vec![
         Span::styled(marker, marker_style),
-        Span::raw(" "),
-        Span::styled(format!("{label}: "), Style::new().fg(Color::BrightBlack)),
-        Span::styled(value.to_owned(), Style::new().fg(Color::Cyan)),
+        Span::styled(" ", Style::new().bg(MODAL_BG)),
+        Span::styled(
+            format!("{label}: "),
+            Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
+        ),
+        Span::styled(value.to_owned(), Style::new().fg(Color::Cyan).bg(MODAL_BG)),
     ];
     if let Some(help) = help {
-        spans.push(Span::raw("  "));
+        spans.push(Span::styled("  ", Style::new().bg(MODAL_BG)));
         spans.push(Span::styled(
             help.to_owned(),
-            Style::new().fg(Color::BrightBlack),
+            Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
         ));
     }
     Line::from_spans(spans)
 }
 
-fn values_help(values: &[String]) -> String {
+fn values_help(values: &[String], provider_declared: bool) -> String {
     if values.is_empty() {
         "provider values unknown".to_owned()
-    } else {
+    } else if provider_declared {
         format!("available: {}", values.join(", "))
+    } else {
+        format!("fallback: {}", values.join(", "))
     }
 }

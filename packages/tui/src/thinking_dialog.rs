@@ -23,6 +23,9 @@ impl ThinkingDialogFocus {
     }
 }
 
+const FALLBACK_EFFORT_VALUES: &[&str] = &["minimal", "low", "medium", "high"];
+const FALLBACK_SUMMARY_VALUES: &[&str] = &["auto", "concise", "detailed"];
+
 /// Pending thinking settings dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingDialogState {
@@ -33,6 +36,8 @@ pub struct ThinkingDialogState {
     summary_values: Vec<String>,
     default_effort: Option<String>,
     default_summary: Option<String>,
+    provider_declared_effort_values: bool,
+    provider_declared_summary_values: bool,
     focused_row: usize,
 }
 
@@ -41,16 +46,26 @@ impl ThinkingDialogState {
     #[must_use]
     pub fn new(visible: bool, status: &SessionModelStatus) -> Self {
         let reasoning = status.reasoning.as_ref();
+        let provider_declared_effort_values =
+            reasoning.is_some_and(|reasoning| !reasoning.effort_values.is_empty());
+        let provider_declared_summary_values =
+            reasoning.is_some_and(|reasoning| !reasoning.summary_values.is_empty());
         Self {
             visible,
             effort: status.reasoning_effort.clone(),
             summary: status.reasoning_summary.clone(),
-            effort_values: reasoning
-                .map_or_else(Vec::new, |reasoning| reasoning.effort_values.clone()),
-            summary_values: reasoning
-                .map_or_else(Vec::new, |reasoning| reasoning.summary_values.clone()),
+            effort_values: reasoning_values_with_fallback(
+                reasoning.map(|reasoning| reasoning.effort_values.as_slice()),
+                FALLBACK_EFFORT_VALUES,
+            ),
+            summary_values: reasoning_values_with_fallback(
+                reasoning.map(|reasoning| reasoning.summary_values.as_slice()),
+                FALLBACK_SUMMARY_VALUES,
+            ),
             default_effort: reasoning.and_then(|reasoning| reasoning.default_effort.clone()),
             default_summary: reasoning.and_then(|reasoning| reasoning.default_summary.clone()),
+            provider_declared_effort_values,
+            provider_declared_summary_values,
             focused_row: ThinkingDialogFocus::Display.row(),
         }
     }
@@ -91,10 +106,22 @@ impl ThinkingDialogState {
         &self.effort_values
     }
 
+    /// Return whether effort values are provider-declared.
+    #[must_use]
+    pub const fn effort_values_are_provider_declared(&self) -> bool {
+        self.provider_declared_effort_values
+    }
+
     /// Return supported summary values.
     #[must_use]
     pub fn summary_values(&self) -> &[String] {
         &self.summary_values
+    }
+
+    /// Return whether summary values are provider-declared.
+    #[must_use]
+    pub const fn summary_values_are_provider_declared(&self) -> bool {
+        self.provider_declared_summary_values
     }
 
     /// Return effective effort label.
@@ -158,4 +185,13 @@ fn next_value(current: Option<&str>, values: &[String]) -> Option<String> {
         .and_then(|current| values.iter().position(|value| value == current))
         .map_or(0, |index| index.saturating_add(1) % values.len());
     values.get(next_index).cloned()
+}
+
+fn reasoning_values_with_fallback(values: Option<&[String]>, fallback: &[&str]) -> Vec<String> {
+    let values = values.unwrap_or_default();
+    if values.is_empty() {
+        fallback.iter().map(|value| (*value).to_owned()).collect()
+    } else {
+        values.to_vec()
+    }
 }

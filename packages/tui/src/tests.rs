@@ -1362,3 +1362,26 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
     assert_eq!(effort.focused_row(), 1);
     assert_eq!(summary.focused_row(), 2);
 }
+
+#[test]
+fn thinking_dialog_cycles_fallback_values_when_provider_values_are_unknown() {
+    let status = bcode_ipc::SessionModelStatus {
+        provider_plugin_id: None,
+        model_id: None,
+        context_window: None,
+        max_output_tokens: None,
+        reasoning: None,
+        reasoning_effort: None,
+        reasoning_summary: None,
+    };
+    let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
+
+    dialog.focus_next();
+    dialog.cycle_focused();
+    assert_eq!(dialog.effort(), Some("minimal"));
+    assert!(!dialog.effort_values_are_provider_declared());
+    dialog.focus_next();
+    dialog.cycle_focused();
+    assert_eq!(dialog.summary(), Some("auto"));
+    assert!(!dialog.summary_values_are_provider_declared());
+}
