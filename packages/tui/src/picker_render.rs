@@ -7,7 +7,18 @@ use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::input::TextInput;
 use bmux_tui::list::{List, ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
-use bmux_tui::style::Color;
+use bmux_tui::style::{Color, Modifier};
+
+const PICKER_BG: Color = Color::Black;
+
+const fn picker_style() -> Style {
+    Style::new().bg(PICKER_BG)
+}
+
+/// Return the standard picker opaque base style.
+pub const fn picker_base_style() -> Style {
+    picker_style()
+}
 
 /// Render standard picker panel chrome and return `(inner_area, list_start_y)`.
 pub fn render_picker_chrome(
@@ -23,10 +34,16 @@ pub fn render_picker_chrome(
     }
 
     let inner = render_picker_panel(title, area, frame);
-    frame.write_line(Rect::new(inner.x, inner.y, inner.width, 1), header);
+    frame.write_line_with_fallback_style(
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        header,
+        picker_style(),
+    );
     let input_area = Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1);
     TextInput::new(input)
+        .style(picker_style())
         .placeholder(placeholder)
+        .placeholder_style(Style::new().fg(Color::BrightBlack).bg(PICKER_BG))
         .render(input_area, frame);
     Some((inner, input_area.y.saturating_add(2)))
 }
@@ -34,9 +51,10 @@ pub fn render_picker_chrome(
 /// Render a standard picker status line and return its row.
 pub fn render_picker_status(inner: Rect, text: &str, style: Style, frame: &mut Frame<'_>) -> u16 {
     let y = inner.bottom().saturating_sub(1);
-    frame.write_line(
+    frame.write_line_with_fallback_style(
         Rect::new(inner.x, y, inner.width, u16::from(inner.height > 0)),
         &Line::from_spans(vec![Span::styled(text.to_owned(), style)]),
+        picker_style(),
     );
     y
 }
@@ -49,9 +67,10 @@ pub fn picker_list_area(inner: Rect, list_y: u16, bottom_y: u16) -> Option<Rect>
 /// Render a standard picker panel and return its inner area.
 pub fn render_picker_panel(title: &'static str, area: Rect, frame: &mut Frame<'_>) -> Rect {
     let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::Cyan)))
+        .border(Border::single().style(Style::new().fg(Color::Cyan).bg(PICKER_BG)))
         .title(title)
-        .padding(Insets::new(1, 1, 1, 1));
+        .padding(Insets::new(1, 1, 1, 1))
+        .background(picker_style());
     panel.render(area, frame);
     panel.inner_area(area)
 }
@@ -66,6 +85,13 @@ pub fn render_picker_list(
     let mut render_state = *state;
     render_state.ensure_selected_visible(area.height, items.len());
     List::new(items)
+        .style(picker_style())
+        .selected_style(
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Rgb(38, 52, 64))
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ")
         .render(area, frame, &mut render_state);
     *state = render_state;

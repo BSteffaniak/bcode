@@ -41,7 +41,7 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
         let Ok(row_offset) = u16::try_from(row_index) else {
             return;
         };
-        frame.write_line(
+        modal.render_line(
             Rect::new(
                 content.x,
                 content.y.saturating_add(row_offset),
@@ -49,6 +49,7 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
                 1,
             ),
             line,
+            frame,
         );
     }
 
@@ -209,9 +210,10 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
         .focused(usize::from(!state.focused_approval()))
         .spacing(2)
         .styles(action_styles())
-        .render(
+        .render_with_fallback_style(
             Rect::new(approve_area.x, approve_area.y, content.width, 1),
             frame,
+            ModalTheme::dark(Color::Yellow).text,
         );
 }
 

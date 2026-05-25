@@ -6,7 +6,9 @@ use bmux_tui::input::TextInput;
 use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 
-use super::picker_render::{picker_list_area, render_picker_chrome, render_picker_list};
+use super::picker_render::{
+    picker_base_style, picker_list_area, render_picker_chrome, render_picker_list,
+};
 use super::skill_picker::{SkillPickerApp, SkillPickerMode};
 
 /// Render the skill picker.
@@ -39,26 +41,30 @@ fn render_bottom(app: &SkillPickerApp, inner: Rect, frame: &mut Frame<'_>) -> u1
     };
     let bottom_y = inner.bottom().saturating_sub(bottom_height);
     if matches!(app.mode(), SkillPickerMode::Argument) {
-        frame.write_line(
+        frame.write_line_with_fallback_style(
             Rect::new(inner.x, bottom_y, inner.width, 1),
             &Line::from_spans(vec![Span::styled(
                 "Invocation arguments/display text:",
                 Style::new().fg(Color::BrightBlack),
             )]),
+            picker_base_style(),
         );
         TextInput::new(app.argument())
+            .style(picker_base_style())
             .placeholder("Optional arguments")
+            .placeholder_style(Style::new().fg(Color::BrightBlack).bg(Color::Black))
             .render(
                 Rect::new(inner.x, bottom_y.saturating_add(1), inner.width, 1),
                 frame,
             );
     } else {
-        frame.write_line(
+        frame.write_line_with_fallback_style(
             Rect::new(inner.x, bottom_y, inner.width, 1),
             &Line::from_spans(vec![Span::styled(
                 "Use / palette to reopen. Activation persists for this session.",
                 Style::new().fg(Color::BrightBlack),
             )]),
+            picker_base_style(),
         );
     }
     bottom_y

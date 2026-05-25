@@ -26,7 +26,7 @@ pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>
         let Ok(row_offset) = u16::try_from(row_index) else {
             return;
         };
-        frame.write_line(
+        modal.render_line(
             Rect::new(
                 content.x,
                 content.y.saturating_add(row_offset),
@@ -34,6 +34,7 @@ pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>
                 1,
             ),
             line,
+            frame,
         );
     }
 }
