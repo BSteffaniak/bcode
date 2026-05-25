@@ -3227,6 +3227,17 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::SystemMessage { text } => {
             println!("#{} system: {text}", event.sequence);
         }
+        SessionEventKind::WorkingDirectoryChanged {
+            old_working_directory,
+            new_working_directory,
+        } => {
+            println!(
+                "#{} working directory changed: {} -> {}",
+                event.sequence,
+                old_working_directory.display(),
+                new_working_directory.display()
+            );
+        }
         SessionEventKind::ContextCompacted {
             compacted_through_sequence,
             ..

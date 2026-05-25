@@ -220,6 +220,26 @@ fn list_or_default(values: &[String]) -> String {
     }
 }
 
+async fn cwd_command(
+    client: &BcodeClient,
+    session_id: SessionId,
+    parts: &[&str],
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    if parts.len() <= 1 {
+        return Ok(SlashCommandOutcome::Handled(
+            "usage: /cwd <path>".to_owned(),
+        ));
+    }
+    let working_directory = parts.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+    let session = client
+        .change_session_working_directory(session_id, working_directory)
+        .await?;
+    Ok(SlashCommandOutcome::Handled(format!(
+        "working directory set to {}",
+        session.working_directory.display()
+    )))
+}
+
 /// Execute a slash command.
 ///
 /// # Errors
@@ -293,6 +313,7 @@ pub async fn execute(
             )))
         }
         "diff" => Ok(SlashCommandOutcome::ToggleDiff),
+        "cwd" => cwd_command(client, session_id, &parts).await,
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" if parts.get(1) == Some(&"describe") && parts.len() > 2 => {
             describe_skill(client, parts[2]).await

@@ -602,6 +602,13 @@ fn non_streaming_transcript_item_from_event(
         SessionEventKind::SystemMessage { text } => {
             Some(TranscriptItem::new("System", text.clone()))
         }
+        SessionEventKind::WorkingDirectoryChanged {
+            old_working_directory,
+            new_working_directory,
+        } => Some(TranscriptItem::new(
+            "System",
+            working_directory_changed_message(old_working_directory, new_working_directory),
+        )),
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
@@ -686,6 +693,17 @@ fn non_streaming_transcript_item_from_event(
         )),
         _ => None,
     }
+}
+
+fn working_directory_changed_message(
+    old_working_directory: &std::path::Path,
+    new_working_directory: &std::path::Path,
+) -> String {
+    format!(
+        "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
+        old_working_directory.display(),
+        new_working_directory.display()
+    )
 }
 
 fn terminal_shell_result_metadata(result: &str) -> Option<(Option<i32>, bool)> {

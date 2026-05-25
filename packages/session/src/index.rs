@@ -151,6 +151,12 @@ impl SessionIndex {
                     name.clone_from(event_name);
                     working_directory = Some(event_working_directory.clone());
                 }
+                SessionEventKind::WorkingDirectoryChanged {
+                    new_working_directory,
+                    ..
+                } => {
+                    working_directory = Some(new_working_directory.clone());
+                }
                 SessionEventKind::SessionRenamed { name: event_name } => {
                     name.clone_from(event_name);
                 }
@@ -459,6 +465,7 @@ pub fn rebuild_index_metadata(
 const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
     match kind {
         SessionEventKind::SessionCreated { .. } => "session_created",
+        SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
         SessionEventKind::UserMessage { .. } => "user_message",

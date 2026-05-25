@@ -43,6 +43,7 @@ use super::transcript_viewport::TranscriptViewport;
 pub struct BmuxApp {
     session_id: Option<SessionId>,
     session_title: Option<String>,
+    working_directory: Option<std::path::PathBuf>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     current_agent_id: String,
@@ -97,6 +98,7 @@ impl BmuxApp {
         let mut app = Self {
             session_id,
             session_title: None,
+            working_directory: None,
             selected_provider_plugin_id: None,
             selected_model_id: None,
             current_agent_id: "build".to_owned(),
@@ -145,6 +147,7 @@ impl BmuxApp {
     pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
         self.session_id = Some(summary.id);
         self.session_title.clone_from(&summary.name);
+        self.working_directory = Some(summary.working_directory.clone());
     }
 
     /// Apply terminal UI configuration.
@@ -763,6 +766,10 @@ impl BmuxApp {
                 self.push_model_usage(turn_id, usage);
             }
             SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
+            SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory,
+                new_working_directory,
+            } => self.apply_working_directory_changed(old_working_directory, new_working_directory),
             SessionEventKind::SessionRenamed { name } => self.rename_session(name.as_deref()),
             SessionEventKind::SkillInvoked {
                 skill_id,
@@ -909,6 +916,18 @@ impl BmuxApp {
     fn push_system_message(&mut self, text: &str) {
         self.transcript
             .push(TranscriptItem::new("System", text.to_owned()));
+    }
+
+    fn apply_working_directory_changed(
+        &mut self,
+        old_working_directory: &std::path::Path,
+        new_working_directory: &std::path::Path,
+    ) {
+        self.working_directory = Some(new_working_directory.to_path_buf());
+        let message =
+            working_directory_changed_message(old_working_directory, new_working_directory);
+        self.transcript.push(TranscriptItem::new("System", message));
+        self.status = format!("working directory: {}", new_working_directory.display());
     }
 
     fn push_streaming_item(&mut self, role: &'static str, text: &str) {
@@ -1610,6 +1629,17 @@ fn terminal_shell_presentation(result: &str) -> Option<ShellResultPresentation> 
     }
 }
 
+fn working_directory_changed_message(
+    old_working_directory: &std::path::Path,
+    new_working_directory: &std::path::Path,
+) -> String {
+    format!(
+        "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
+        old_working_directory.display(),
+        new_working_directory.display()
+    )
+}
+
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
     match &event.kind {
         SessionEventKind::UserMessage { .. }
@@ -1622,6 +1652,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::ModelUsage { .. }
         | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SkillInvoked { .. }
         | SessionEventKind::SkillInvocationFailed { .. }
         | SessionEventKind::RuntimeWorkStarted { .. }

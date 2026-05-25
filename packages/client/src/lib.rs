@@ -329,6 +329,29 @@ impl BcodeClient {
         }
     }
 
+    /// Change a session's canonical working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn change_session_working_directory(
+        &self,
+        session_id: SessionId,
+        working_directory: impl Into<std::path::PathBuf>,
+    ) -> Result<SessionSummary, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::ChangeSessionWorkingDirectory {
+                session_id,
+                working_directory: working_directory.into(),
+            })
+            .await?
+        {
+            ResponsePayload::SessionWorkingDirectoryChanged { session, .. } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Rename a session.
     ///
     /// # Errors

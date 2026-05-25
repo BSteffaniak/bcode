@@ -208,6 +208,10 @@ pub enum Request {
         #[serde(default)]
         runtime_context: Option<ClientRuntimeContext>,
     },
+    ChangeSessionWorkingDirectory {
+        session_id: SessionId,
+        working_directory: PathBuf,
+    },
 }
 
 /// Per-client model/provider/auth context supplied at connection time.
@@ -401,6 +405,10 @@ pub enum ResponsePayload {
         models: bcode_model::ModelList,
     },
     ClientRuntimeContextUpdated,
+    SessionWorkingDirectoryChanged {
+        session: SessionSummary,
+        changed: bool,
+    },
 }
 
 /// Structured error response.

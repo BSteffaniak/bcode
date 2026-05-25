@@ -881,6 +881,19 @@ async fn handle_request(
         Request::ListSessions { working_directory } => {
             handle_list_sessions(request_id, state, writer, &working_directory).await
         }
+        Request::ChangeSessionWorkingDirectory {
+            session_id,
+            working_directory,
+        } => {
+            handle_change_session_working_directory(
+                request_id,
+                state,
+                writer,
+                session_id,
+                working_directory,
+            )
+            .await
+        }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
         }
@@ -1186,6 +1199,56 @@ async fn handle_list_sessions(
         }),
     )
     .await
+}
+
+async fn handle_change_session_working_directory(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    working_directory: PathBuf,
+) -> Result<(), ServerError> {
+    if state.active_turns.lock().await.contains_key(&session_id) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "session_busy",
+                format!("session has an active model turn: {session_id}"),
+            )),
+        )
+        .await;
+    }
+    match state
+        .sessions
+        .change_session_working_directory(session_id, working_directory)
+        .await
+    {
+        Ok(event) => {
+            let changed = event.is_some();
+            if let Some(event) = event {
+                publish_session_event(state, &event).await;
+            }
+            let session = state.sessions.session_summary(session_id).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionWorkingDirectoryChanged { session, changed }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_cwd_change_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_rename_session(
@@ -5661,6 +5724,18 @@ fn session_event_to_model_message_with_limit(
             role: MessageRole::System,
             content: vec![ContentBlock::Text { text: text.clone() }],
         }),
+        SessionEventKind::WorkingDirectoryChanged {
+            old_working_directory,
+            new_working_directory,
+        } => Some(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: working_directory_changed_message(
+                    old_working_directory,
+                    new_working_directory,
+                ),
+            }],
+        }),
         SessionEventKind::ContextCompacted { summary, .. } => Some(ModelMessage {
             role: MessageRole::System,
             content: vec![ContentBlock::Text {
@@ -5669,6 +5744,17 @@ fn session_event_to_model_message_with_limit(
         }),
         _ => None,
     }
+}
+
+fn working_directory_changed_message(
+    old_working_directory: &Path,
+    new_working_directory: &Path,
+) -> String {
+    format!(
+        "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
+        old_working_directory.display(),
+        new_working_directory.display()
+    )
 }
 
 fn tool_result_content_from_output(output: &str) -> Vec<bcode_model::ToolResultContent> {

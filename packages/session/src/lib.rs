@@ -1343,6 +1343,37 @@ impl SessionManager {
         Ok(event)
     }
 
+    /// Change a session's canonical working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn change_session_working_directory(
+        &self,
+        session_id: SessionId,
+        new_working_directory: PathBuf,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
+        let handle = self.session_handle(session_id).await?;
+        let old_working_directory = handle.working_directory().await?;
+        let new_working_directory = normalize_working_directory(&new_working_directory);
+        if old_working_directory == new_working_directory {
+            return Ok(None);
+        }
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
+        let event = handle
+            .append_event(
+                SessionEventKind::WorkingDirectoryChanged {
+                    old_working_directory,
+                    new_working_directory,
+                },
+                activity_timestamp_ms,
+            )
+            .await?;
+        Ok(Some(event))
+    }
+
     /// Delete a session.
     ///
     /// # Errors
@@ -2017,6 +2048,15 @@ impl SessionState {
                 self.summary.name.clone_from(name);
             }
             SessionEventKind::UserMessage { .. } => self.has_user_message = true,
+            SessionEventKind::WorkingDirectoryChanged {
+                new_working_directory,
+                ..
+            } => {
+                self.working_directory = normalize_working_directory(new_working_directory);
+                self.summary
+                    .working_directory
+                    .clone_from(&self.working_directory);
+            }
             SessionEventKind::ModelChanged { provider, model } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
@@ -4140,6 +4180,14 @@ mod tests {
                         text: "output".to_string(),
                         byte_len: 6,
                     },
+                },
+            ),
+            (
+                31,
+                "WorkingDirectoryChanged",
+                SessionEventKind::WorkingDirectoryChanged {
+                    old_working_directory: test_working_directory(),
+                    new_working_directory: test_working_directory().join("worktree"),
                 },
             ),
         ]

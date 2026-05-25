@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 14;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 15;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -655,5 +655,10 @@ pub enum SessionEventKind {
     /// Incremental tool invocation event emitted while a tool is running.
     ToolInvocationStream {
         event: ToolInvocationStreamEvent,
+    },
+    /// Durable marker that moves the session's canonical working directory.
+    WorkingDirectoryChanged {
+        old_working_directory: PathBuf,
+        new_working_directory: PathBuf,
     },
 }
