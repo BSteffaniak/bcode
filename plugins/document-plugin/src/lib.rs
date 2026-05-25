@@ -68,6 +68,7 @@ impl DocumentPlugin {
         };
         let response = match invocation.name.as_str() {
             "document.extract" => self.invoke_extract(&invocation),
+            "document.status" => invoke_status(),
             _ => ToolInvocationResponse {
                 output: format!("unsupported document tool: {}", invocation.name),
                 is_error: true,
@@ -119,6 +120,26 @@ struct ExtractResponse {
     text: String,
     truncated: bool,
     extractor: String,
+    fallback_used: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DocumentStatusResponse {
+    extract: ExtractStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExtractStatus {
+    available: bool,
+    extractors: Vec<ExtractorStatus>,
+    configured_order: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExtractorStatus {
+    name: String,
+    available: bool,
+    quality: String,
 }
 
 #[derive(Debug, Error)]
@@ -133,6 +154,8 @@ enum DocumentError {
     Network(#[from] reqwest::Error),
     #[error("I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("native PDF extraction failed: {0}")]
+    NativeExtract(String),
     #[error("pdftotext failed with status {status}: {stderr}")]
     PdfToTextFailed { status: String, stderr: String },
 }
@@ -161,8 +184,8 @@ async fn extract_async(
         return Err(DocumentError::UnsupportedDocument);
     }
     let text_path = document_path.with_extension("txt");
-    extract_pdf_to_text(&document_path, &text_path)?;
-    let bytes = std::fs::read(&text_path)?;
+    let extraction = extract_pdf_text(&document_path, &text_path)?;
+    let bytes = extraction.text.as_bytes();
     let truncated = bytes.len() > max_bytes;
     let text = String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]).to_string();
     Ok(ExtractResponse {
@@ -179,8 +202,59 @@ async fn extract_async(
         text_path,
         text,
         truncated,
-        extractor: "pdftotext".to_string(),
+        extractor: extraction.extractor,
+        fallback_used: extraction.fallback_used,
     })
+}
+
+struct PdfExtraction {
+    text: String,
+    extractor: String,
+    fallback_used: Option<String>,
+}
+
+fn extract_pdf_text(
+    document_path: &Path,
+    text_path: &Path,
+) -> Result<PdfExtraction, DocumentError> {
+    match extract_pdf_text_native(document_path, text_path) {
+        Ok(text) if meaningful_text(&text) => Ok(PdfExtraction {
+            text,
+            extractor: "native".to_string(),
+            fallback_used: None,
+        }),
+        Ok(_) | Err(_) if pdftotext_available() => {
+            let text = extract_pdf_text_pdftotext(document_path, text_path)?;
+            Ok(PdfExtraction {
+                text,
+                extractor: "pdftotext".to_string(),
+                fallback_used: Some("native_unavailable_or_low_text".to_string()),
+            })
+        }
+        Ok(text) => Ok(PdfExtraction {
+            text,
+            extractor: "native".to_string(),
+            fallback_used: Some("native_low_text".to_string()),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn extract_pdf_text_native(
+    document_path: &Path,
+    text_path: &Path,
+) -> Result<String, DocumentError> {
+    let text = pdf_extract::extract_text(document_path)
+        .map_err(|error| DocumentError::NativeExtract(error.to_string()))?;
+    std::fs::write(text_path, &text)?;
+    Ok(text)
+}
+
+fn meaningful_text(text: &str) -> bool {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+        >= 20
 }
 
 #[derive(Debug, Clone)]
@@ -237,20 +311,30 @@ async fn download_document(
     Ok(path)
 }
 
-fn extract_pdf_to_text(document_path: &Path, text_path: &Path) -> Result<(), DocumentError> {
+fn extract_pdf_text_pdftotext(
+    document_path: &Path,
+    text_path: &Path,
+) -> Result<String, DocumentError> {
     let output = Command::new("pdftotext")
         .arg("-layout")
         .arg(document_path)
         .arg(text_path)
         .output()?;
     if output.status.success() {
-        Ok(())
+        std::fs::read_to_string(text_path).map_err(DocumentError::Io)
     } else {
         Err(DocumentError::PdfToTextFailed {
             status: output.status.to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
     }
+}
+
+fn pdftotext_available() -> bool {
+    Command::new("pdftotext")
+        .arg("-v")
+        .output()
+        .is_ok_and(|output| output.status.success() || !output.stderr.is_empty())
 }
 
 fn is_pdf_path(path: &Path) -> bool {
@@ -294,15 +378,14 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
         return invalid_request(&error);
     }
     json_response(&ToolList {
-        tools: vec![extract_tool_definition()],
+        tools: vec![extract_tool_definition(), status_tool_definition()],
     })
 }
 
 fn extract_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "document.extract".to_string(),
-        description: "Extract text from PDF documents using session artifact state and pdftotext."
-            .to_string(),
+        description: "Extract text from PDF documents using native Rust extraction with optional pdftotext fallback.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -314,6 +397,45 @@ fn extract_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
+    }
+}
+
+fn status_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "document.status".to_string(),
+        description: "Report available document extraction backends.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {}
+        }),
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
+    }
+}
+
+fn invoke_status() -> ToolInvocationResponse {
+    json_tool_response(&status_response())
+}
+
+fn status_response() -> DocumentStatusResponse {
+    let extractors = vec![
+        ExtractorStatus {
+            name: "native".to_string(),
+            available: true,
+            quality: "built_in".to_string(),
+        },
+        ExtractorStatus {
+            name: "pdftotext".to_string(),
+            available: pdftotext_available(),
+            quality: "external_optional".to_string(),
+        },
+    ];
+    DocumentStatusResponse {
+        extract: ExtractStatus {
+            available: true,
+            configured_order: vec!["native".to_string(), "pdftotext".to_string()],
+            extractors,
+        },
     }
 }
 
@@ -400,6 +522,19 @@ mod tests {
         assert_eq!(
             stable_name("https://example.com/a file.pdf"),
             "https___example.com_a_file.pdf"
+        );
+    }
+
+    #[test]
+    fn native_extractor_is_available_by_default() {
+        let status = status_response();
+        assert!(status.extract.available);
+        assert!(
+            status
+                .extract
+                .extractors
+                .iter()
+                .any(|extractor| extractor.name == "native" && extractor.available)
         );
     }
 }
