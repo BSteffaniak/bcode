@@ -97,8 +97,8 @@ impl BmuxApp {
             selected_provider_plugin_id: None,
             selected_model_id: None,
             current_agent_id: "build".to_owned(),
-            reasoning_visible: false,
-            thinking_label: "hidden · effort: provider default · summary: provider default"
+            reasoning_visible: true,
+            thinking_label: "shown · effort: provider default · summary: provider default"
                 .to_owned(),
             reasoning_effort: None,
             reasoning_summary: None,

@@ -830,7 +830,7 @@ pub struct TuiThinkingConfig {
 impl Default for TuiThinkingConfig {
     fn default() -> Self {
         Self {
-            show: false,
+            show: true,
             mode: TuiThinkingMode::Summary,
         }
     }
