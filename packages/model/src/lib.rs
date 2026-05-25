@@ -29,6 +29,9 @@ pub const OP_POLL_TURN_EVENTS: &str = "poll_turn_events";
 /// Operation for cancelling a model turn.
 pub const OP_CANCEL_TURN: &str = "cancel_turn";
 
+/// Operation for provider-native web search.
+pub const OP_NATIVE_WEB_SEARCH: &str = "native_web_search";
+
 /// Operation for provider turn cleanup.
 pub const OP_FINISH_TURN: &str = "finish_turn";
 
@@ -268,6 +271,51 @@ pub struct ValidateConfigResponse {
     pub message: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider-native web search request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWebSearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    #[serde(default)]
+    pub site: Option<String>,
+    #[serde(default)]
+    pub freshness: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub safe_search: Option<String>,
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider-native web search response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWebSearchResponse {
+    pub provider: String,
+    #[serde(default)]
+    pub results: Vec<NativeWebSearchResult>,
+    #[serde(default)]
+    pub partial: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Provider-native web search result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWebSearchResult {
+    pub title: String,
+    pub url: String,
+    #[serde(default)]
+    pub snippet: String,
+    #[serde(default)]
+    pub published: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Start a provider model turn.

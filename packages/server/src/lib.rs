@@ -18,9 +18,10 @@ use bcode_ipc::{
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
-    ModelParameters, ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
+    ModelParameters, ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse,
+    OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS,
+    OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent,
+    ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_session::{CatalogLoadStatus, SessionManager};
 use bcode_session_models::{
@@ -4965,6 +4966,62 @@ async fn collect_model_tools(
     tools
 }
 
+async fn invoke_model_native_web_search_tool(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+) -> Result<ToolInvocationResponse, String> {
+    let selection = session_model_selection(state, session_id).await;
+    let request = NativeWebSearchRequest {
+        query: call
+            .arguments
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        max_results: call
+            .arguments
+            .get("max_results")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        site: call
+            .arguments
+            .get("site")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        freshness: call
+            .arguments
+            .get("freshness")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        region: call
+            .arguments
+            .get("region")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        safe_search: call
+            .arguments
+            .get("safe_search")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        provider_context: selection.provider_context,
+        metadata: BTreeMap::from([("tool_call_id".to_string(), call.id.clone())]),
+    };
+    let response = invoke_model_provider_json_blocking::<_, NativeWebSearchResponse>(
+        state,
+        selection.provider_plugin_id,
+        OP_NATIVE_WEB_SEARCH,
+        request,
+    )
+    .await?;
+    Ok(ToolInvocationResponse {
+        output: serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?,
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+    })
+}
+
 async fn execute_model_tool(
     state: &ServerState,
     session_id: SessionId,
@@ -5033,6 +5090,15 @@ async fn invoke_model_tool(
     let (plugin_id, definition) = find_tool_provider(state, &call.name)
         .await?
         .ok_or_else(|| format!("tool not found: {}", call.name))?;
+    if call.name == "web.search"
+        && call
+            .arguments
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            == Some("model_native")
+    {
+        return invoke_model_native_web_search_tool(state, session_id, call).await;
+    }
     let argument_blob = (state.observability.persist_tool_io
         || state.observability.debug_enabled())
     .then(|| {

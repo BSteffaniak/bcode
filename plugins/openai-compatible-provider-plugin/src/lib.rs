@@ -10,10 +10,12 @@ use bcode_config::AuthMode;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
-    OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
-    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestContext,
-    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    NativeWebSearchRequest, NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN,
+    OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS,
+    OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
+    ProviderRequestContext, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
+    ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -99,6 +101,7 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
             OP_CAPABILITIES => json_response(&capabilities()),
             OP_MODELS => json_response(&self.models()),
             OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
+            OP_NATIVE_WEB_SEARCH => native_web_search(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
@@ -109,6 +112,29 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
             ),
         }
     }
+}
+
+fn native_web_search(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<NativeWebSearchRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    let response = NativeWebSearchResponse {
+        provider: PROVIDER_ID.to_string(),
+        results: vec![NativeWebSearchResult {
+            title: format!("Model-native search requested: {}", request.query),
+            url: String::new(),
+            snippet: "This provider declares native web search capability, but direct provider-native search routing is not implemented for this OpenAI-compatible backend yet.".to_string(),
+            published: None,
+            source: Some("model_native_unimplemented".to_string()),
+        }],
+        partial: true,
+        message: Some(
+            "model-native search capability is declared but not implemented by this provider backend"
+                .to_string(),
+        ),
+    };
+    json_response(&response)
 }
 
 impl OpenAiCompatibleProviderPlugin {

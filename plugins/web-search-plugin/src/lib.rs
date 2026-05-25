@@ -490,10 +490,16 @@ async fn search_async(
         "exa" => search_exa(request, &config).await,
         "serper" => search_serper(request, &config).await,
         "serpapi" | "serp_api" => search_serpapi(request, &config).await,
-        "model_native" => Err(WebError::InvalidRequest(
-            "model-native search is recognized but not yet routable through the active model provider"
-                .to_string(),
-        )),
+        "model_native" => Ok(SearchResponse {
+            query: request.query,
+            provider: "model_native".to_string(),
+            results: Vec::new(),
+            partial: true,
+            message: Some(
+                "model-native search is routed by the Bcode host when requested by the agent"
+                    .to_string(),
+            ),
+        }),
         "duckduckgo_html" | "duckduckgo" | "ddg" => search_duckduckgo_html(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
