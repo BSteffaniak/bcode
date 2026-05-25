@@ -52,8 +52,25 @@ bcode worktree list
 bcode worktree create my-task
 bcode worktree create my-task --session <session-id>
 bcode worktree create my-task --new-session
+bcode -n --worktree my-task
 bcode worktree attach <session-id> <path>
 bcode worktree remove <path>
+```
+
+## TUI
+
+The command palette includes:
+
+* `Worktree: List`
+* `Worktree: Create for Current Session`
+
+Slash commands are also available:
+
+```text
+/worktree
+/worktree list
+/worktree create my-task
+/worktree attach ../path
 ```
 
 If `worktree.config.toml` exists, Bcode applies worktree setup automatically after creation.
