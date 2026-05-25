@@ -120,11 +120,13 @@ If code changes are made, run relevant checks before finishing and report exactl
 
 Minimum expected validation once Rust crates exist:
 
-- `cargo fmt --check`
+- `cargo fmt`
 - `cargo check --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - relevant `cargo test` commands for changed packages
 - relevant plugin rebuild/check commands when plugin crates exist
+
+Prefer `cargo fmt` over `cargo fmt --check` during normal implementation work. Agents should apply formatting directly and leave changed Rust files formatted. Use `cargo fmt --check` only for read-only/plan-only sessions, CI-style verification, or when explicitly asked not to modify files.
 
 Treat clippy warnings as blocking. Fix root causes rather than adding broad suppressions.
 
