@@ -789,7 +789,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
                 output_line_y(&buffer, "-   2 │     41").unwrap()
             ))
             .map(|cell| cell.style.bg),
-        Some(Some(bmux_tui::style::Color::Indexed(52)))
+        Some(Some(bmux_tui::style::Color::Rgb(32, 10, 10)))
     );
     assert_eq!(
         buffer
@@ -798,7 +798,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
                 output_line_y(&buffer, "+   2 │     42").unwrap()
             ))
             .map(|cell| cell.style.bg),
-        Some(Some(bmux_tui::style::Color::Indexed(22)))
+        Some(Some(bmux_tui::style::Color::Rgb(0, 24, 16)))
     );
     assert_eq!(
         buffer

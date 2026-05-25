@@ -30,6 +30,7 @@ use super::tool_present::{
 use super::transcript::{TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
+use unicode_segmentation::UnicodeSegmentation;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
@@ -1038,7 +1039,7 @@ fn push_file_edit_preview_rows(rows: &mut Vec<Line>, edit: &FileEditTranscript, 
     for row in preview {
         match row {
             InlineDiffPreviewRow::Line(line) => {
-                rows.push(render_inline_diff_line(line, card_width));
+                rows.extend(render_inline_diff_line(line, card_width));
             }
             InlineDiffPreviewRow::Hidden(count) => {
                 rows.push(render_inline_diff_hidden_row(count, card_width));
@@ -1133,81 +1134,93 @@ fn inline_diff_hidden_text(count: usize) -> String {
     format!("… {count} diff rows hidden …")
 }
 
-fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
+fn render_inline_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
     let (sign, sign_style, body_style) = inline_diff_line_styles(line.kind);
     let row_style = inline_diff_row_style(line.kind);
     let emphasis_style = inline_diff_emphasis_style(line.kind);
     let line_number = inline_diff_line_number(line);
     let gutter_style = row_style.patch(muted_style());
-    let body_width = usize::from(width)
+    let body_width = inline_diff_body_width(width);
+    let content_rows = wrap_inline_diff_content_spans(
+        inline_diff_content_spans(line, row_style.patch(body_style), emphasis_style),
+        body_width,
+    );
+    let content_rows = if content_rows.is_empty() {
+        vec![Vec::new()]
+    } else {
+        content_rows
+    };
+
+    content_rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, content_spans)| {
+            let mut spans = vec![Span::styled("  ", muted_style())];
+            let mut card_spans = if index == 0 {
+                vec![
+                    Span::styled("│ ", muted_style()),
+                    Span::styled("  ", gutter_style),
+                    Span::styled(
+                        sign,
+                        row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
+                    ),
+                    Span::styled(format!("{line_number:>4}"), gutter_style),
+                    Span::styled(" │ ", gutter_style),
+                ]
+            } else {
+                inline_diff_continuation_prefix(gutter_style)
+            };
+            card_spans.extend(content_spans);
+            pad_inline_diff_spans(
+                &mut card_spans,
+                usize::from(width).saturating_sub(2),
+                row_style,
+            );
+            card_spans.push(Span::styled(" │", muted_style()));
+            spans.extend(card_spans);
+            Line::from_spans(spans)
+        })
+        .collect()
+}
+
+fn inline_diff_continuation_prefix(gutter_style: Style) -> Vec<Span> {
+    vec![
+        Span::styled("│ ", muted_style()),
+        Span::styled("  ", gutter_style),
+        Span::styled(" ", gutter_style),
+        Span::styled("    ", gutter_style),
+        Span::styled(" │ ", gutter_style),
+    ]
+}
+
+const fn inline_diff_body_width(width: u16) -> usize {
+    (width as usize)
         .saturating_sub(2)
         .saturating_sub(2)
         .saturating_sub(5)
         .saturating_sub(3)
-        .saturating_sub(2);
-    let mut spans = vec![Span::styled("  ", muted_style())];
-    let mut card_spans = vec![
-        Span::styled("│ ", muted_style()),
-        Span::styled("  ", gutter_style),
-        Span::styled(
-            sign,
-            row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
-        ),
-        Span::styled(format!("{line_number:>4}"), gutter_style),
-        Span::styled(" │ ", gutter_style),
-    ];
-    card_spans.extend(truncated_inline_diff_content_spans(
-        line,
-        body_width,
-        row_style.patch(body_style),
-        emphasis_style,
-    ));
-    pad_inline_diff_spans(
-        &mut card_spans,
-        usize::from(width).saturating_sub(2),
-        row_style,
-    );
-    card_spans.push(Span::styled(" │", muted_style()));
-    spans.extend(card_spans);
-    Line::from_spans(spans)
+        .saturating_sub(2)
 }
 
-fn truncated_inline_diff_content_spans(
+fn inline_diff_content_spans(
     line: &DiffLine,
-    body_width: usize,
     body_style: Style,
     emphasis_style: Style,
 ) -> Vec<Span> {
-    if line.inline_spans.is_empty() {
-        return vec![Span::styled(
-            truncate_to_display_width(&line.content, body_width),
-            body_style,
-        )];
-    }
-
     let source_spans = if line.inline_spans.is_empty() {
         vec![DiffInlineSpan::new(line.content.clone(), Style::new())]
     } else {
         line.inline_spans.clone()
     };
-    let mut remaining = body_width;
     let mut spans = Vec::new();
     let mut offset = 0usize;
     for span in source_spans {
-        if remaining == 0 {
-            break;
-        }
         let span_start = offset;
         let span_end = span_start.saturating_add(span.content.len());
         for segment in inline_diff_span_segments(&span, span_start, span_end, &line.changed_ranges)
         {
-            if remaining == 0 {
-                break;
-            }
-            let content = truncate_to_display_width(segment.content, remaining);
-            remaining = remaining.saturating_sub(text_display_width(&content));
             spans.push(Span::styled(
-                content,
+                segment.content.to_owned(),
                 inline_diff_content_style(
                     body_style,
                     segment.style,
@@ -1222,6 +1235,27 @@ fn truncated_inline_diff_content_spans(
         offset = span_end;
     }
     spans
+}
+
+fn wrap_inline_diff_content_spans(spans: Vec<Span>, width: usize) -> Vec<Vec<Span>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span>> = Vec::new();
+    let mut current = Vec::new();
+    let mut current_width = 0usize;
+    for span in spans {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = text_display_width(grapheme);
+            if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
+                rows.push(current);
+                current = Vec::new();
+                current_width = 0;
+            }
+            current.push(Span::styled(grapheme.to_owned(), span.style));
+            current_width = current_width.saturating_add(grapheme_width);
+        }
+    }
+    rows.push(current);
+    rows
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1300,16 +1334,16 @@ fn pad_inline_diff_spans(spans: &mut Vec<Span>, width: usize, style: Style) {
 
 const fn inline_diff_row_style(kind: DiffLineKind) -> Style {
     match kind {
-        DiffLineKind::Added => Style::new().bg(Color::Indexed(22)),
-        DiffLineKind::Removed => Style::new().bg(Color::Indexed(52)),
+        DiffLineKind::Added => Style::new().bg(Color::Rgb(0, 24, 16)),
+        DiffLineKind::Removed => Style::new().bg(Color::Rgb(32, 10, 10)),
         DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => Style::new(),
     }
 }
 
 const fn inline_diff_emphasis_style(kind: DiffLineKind) -> Style {
     match kind {
-        DiffLineKind::Added => Style::new().bg(Color::Indexed(28)),
-        DiffLineKind::Removed => Style::new().bg(Color::Indexed(88)),
+        DiffLineKind::Added => Style::new().bg(Color::Rgb(0, 42, 26)),
+        DiffLineKind::Removed => Style::new().bg(Color::Rgb(50, 14, 14)),
         DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => Style::new(),
     }
 }
