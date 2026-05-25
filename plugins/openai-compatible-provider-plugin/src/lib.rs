@@ -101,7 +101,7 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
             OP_CAPABILITIES => json_response(&capabilities()),
             OP_MODELS => json_response(&self.models()),
             OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
-            OP_NATIVE_WEB_SEARCH => native_web_search(&context.request),
+            OP_NATIVE_WEB_SEARCH => self.native_web_search(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
@@ -114,30 +114,22 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
     }
 }
 
-fn native_web_search(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<NativeWebSearchRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let response = NativeWebSearchResponse {
-        provider: PROVIDER_ID.to_string(),
-        results: vec![NativeWebSearchResult {
-            title: format!("Model-native search requested: {}", request.query),
-            url: String::new(),
-            snippet: "This provider declares native web search capability, but direct provider-native search routing is not implemented for this OpenAI-compatible backend yet.".to_string(),
-            published: None,
-            source: Some("model_native_unimplemented".to_string()),
-        }],
-        partial: true,
-        message: Some(
-            "model-native search capability is declared but not implemented by this provider backend"
-                .to_string(),
-        ),
-    };
-    json_response(&response)
-}
-
 impl OpenAiCompatibleProviderPlugin {
+    fn native_web_search(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<NativeWebSearchRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        match &self.runtime {
+            Ok(runtime) => match runtime.block_on(native_web_search_inner(request)) {
+                Ok(Ok(response)) => json_response(&response),
+                Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
+                Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+            },
+            Err(error) => ServiceResponse::error("runtime_error", error),
+        }
+    }
+
     fn start_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
@@ -412,6 +404,36 @@ struct ResponsesTool {
     strict: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ResponsesNativeSearchBody {
+    #[serde(default)]
+    output: Vec<ResponsesNativeSearchOutputItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesNativeSearchOutputItem {
+    #[serde(default)]
+    content: Vec<ResponsesNativeSearchContentItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesNativeSearchContentItem {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    annotations: Vec<ResponsesNativeSearchAnnotation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesNativeSearchAnnotation {
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatTool {
     r#type: &'static str,
@@ -605,6 +627,186 @@ fn push_runtime_error(turn: &TurnState, error: &str) {
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::Error,
     });
+}
+
+async fn native_web_search_inner(
+    request: NativeWebSearchRequest,
+) -> Result<NativeWebSearchResponse, ProviderError> {
+    let mut settings = settings_for_context(&request.provider_context);
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    let AuthSettings::ApiKey(api_key) = &settings.auth else {
+        return Ok(native_search_unavailable(
+            "OpenAI Responses API native web search currently requires API-key auth",
+        ));
+    };
+    if !matches!(settings.dialect, OpenAiCompatibleDialect::ResponsesApi) {
+        return Ok(native_search_unavailable(
+            "OpenAI native web search requires the responses_api dialect",
+        ));
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| {
+            provider_error(
+                "client_build_failed",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?;
+    let model_id = native_search_model_id(&settings);
+    let body = build_native_web_search_body(&request, &model_id);
+    let response = client
+        .post(responses_endpoint(&settings))
+        .bearer_auth(api_key)
+        .header("originator", "bcode")
+        .header("User-Agent", "bcode/0.0.1")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            provider_error(
+                "request_failed",
+                if error.is_timeout() {
+                    ProviderErrorCategory::Timeout
+                } else {
+                    ProviderErrorCategory::Network
+                },
+                error.to_string(),
+            )
+        })?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(error_from_status(status.as_u16(), &text));
+    }
+    Ok(native_web_search_response(&request.query, &text))
+}
+
+fn native_search_unavailable(message: &str) -> NativeWebSearchResponse {
+    NativeWebSearchResponse {
+        provider: PROVIDER_ID.to_string(),
+        results: Vec::new(),
+        partial: true,
+        message: Some(message.to_string()),
+    }
+}
+
+fn native_search_model_id(settings: &Settings) -> String {
+    settings
+        .default_model
+        .clone()
+        .unwrap_or_else(|| settings.fallback_model.clone())
+}
+
+fn build_native_web_search_body(
+    request: &NativeWebSearchRequest,
+    model_id: &str,
+) -> serde_json::Value {
+    let mut query = request.query.clone();
+    if let Some(site) = request
+        .site
+        .as_deref()
+        .filter(|site| !site.trim().is_empty())
+    {
+        query = format!("site:{} {}", site.trim(), query);
+    }
+    let mut prompt = format!(
+        "Search the web for this query and return concise results with titles, URLs, and snippets.\n\nQuery: {query}"
+    );
+    if let Some(freshness) = request.freshness.as_deref() {
+        prompt.push_str("\nFreshness: ");
+        prompt.push_str(freshness);
+    }
+    if let Some(region) = request.region.as_deref() {
+        prompt.push_str("\nRegion: ");
+        prompt.push_str(region);
+    }
+    if let Some(safe_search) = request.safe_search.as_deref() {
+        prompt.push_str("\nSafe search: ");
+        prompt.push_str(safe_search);
+    }
+    if let Some(max_results) = request.max_results {
+        prompt.push_str("\nMaximum results: ");
+        prompt.push_str(&max_results.to_string());
+    }
+    serde_json::json!({
+        "model": model_id,
+        "input": prompt,
+        "stream": false,
+        "store": false,
+        "tools": [{ "type": "web_search_preview" }]
+    })
+}
+
+fn native_web_search_response(query: &str, body: &str) -> NativeWebSearchResponse {
+    let Ok(decoded) = serde_json::from_str::<ResponsesNativeSearchBody>(body) else {
+        return NativeWebSearchResponse {
+            provider: PROVIDER_ID.to_string(),
+            results: vec![NativeWebSearchResult {
+                title: format!("Search response for {query}"),
+                url: String::new(),
+                snippet: body.to_string(),
+                published: None,
+                source: Some("openai_responses_api".to_string()),
+            }],
+            partial: true,
+            message: Some(
+                "provider response did not match expected Responses API shape".to_string(),
+            ),
+        };
+    };
+    let mut results = Vec::new();
+    let mut fallback_text = String::new();
+    for output in decoded.output {
+        for content in output.content {
+            if let Some(text) = content.text {
+                append_text_with_space(&mut fallback_text, &text);
+            }
+            for annotation in content.annotations {
+                if annotation.r#type == "url_citation"
+                    && let Some(url) = annotation.url
+                    && !url.is_empty()
+                {
+                    results.push(NativeWebSearchResult {
+                        title: annotation.title.unwrap_or_else(|| url.clone()),
+                        url,
+                        snippet: String::new(),
+                        published: None,
+                        source: Some("openai_responses_api".to_string()),
+                    });
+                }
+            }
+        }
+    }
+    if results.is_empty() && !fallback_text.trim().is_empty() {
+        results.push(NativeWebSearchResult {
+            title: format!("Search response for {query}"),
+            url: String::new(),
+            snippet: fallback_text.trim().to_string(),
+            published: None,
+            source: Some("openai_responses_api".to_string()),
+        });
+    } else if !fallback_text.trim().is_empty() {
+        for result in &mut results {
+            result.snippet = fallback_text.trim().to_string();
+        }
+    }
+    NativeWebSearchResponse {
+        provider: PROVIDER_ID.to_string(),
+        partial: results.is_empty(),
+        message: results
+            .is_empty()
+            .then(|| "provider returned no web search results".to_string()),
+        results,
+    }
+}
+
+fn append_text_with_space(buffer: &mut String, text: &str) {
+    if !buffer.is_empty() {
+        buffer.push(' ');
+    }
+    buffer.push_str(text.trim());
 }
 
 async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
