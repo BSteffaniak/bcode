@@ -35,7 +35,7 @@ pub async fn run_event_loop<W: Write>(
         attached.history.len() >= INITIAL_HISTORY_EVENT_LIMIT,
     );
     app.apply_session_summary(&attached.session);
-    app.apply_thinking_config(config.tui.thinking);
+    app.apply_tui_config(config.tui);
     let mut chat = session_flow::ActiveChat {
         app,
         session_id,

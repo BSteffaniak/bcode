@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
 use bcode_session_models::{
     ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
     SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
@@ -62,6 +63,7 @@ pub struct BmuxApp {
     activity: ActivityState,
     status: String,
     key_hints: String,
+    tui_config: TuiConfig,
     exit: ExitState,
     cursor: CursorBlink,
 }
@@ -116,6 +118,7 @@ impl BmuxApp {
             activity: ActivityState::Idle,
             status: String::from("TUI connected. Enter submits; Esc/Ctrl-C exits."),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
+            tui_config: TuiConfig::default(),
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
         };
@@ -139,6 +142,18 @@ impl BmuxApp {
     pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
         self.session_id = Some(summary.id);
         self.session_title.clone_from(&summary.name);
+    }
+
+    /// Apply terminal UI configuration.
+    pub fn apply_tui_config(&mut self, config: TuiConfig) {
+        self.apply_thinking_config(config.thinking);
+        self.tui_config = config;
+    }
+
+    /// Return inline diff preview rendering configuration.
+    #[must_use]
+    pub const fn inline_diff_config(&self) -> TuiInlineDiffConfig {
+        self.tui_config.inline_diff
     }
 
     /// Return the currently selected provider plugin id, if explicit.
@@ -495,7 +510,7 @@ impl BmuxApp {
     }
 
     /// Apply configured thinking display visibility.
-    pub fn apply_thinking_config(&mut self, config: bcode_config::TuiThinkingConfig) {
+    pub fn apply_thinking_config(&mut self, config: TuiThinkingConfig) {
         self.set_reasoning_visible(config.show);
     }
 

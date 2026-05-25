@@ -1,5 +1,6 @@
 //! TUI rendering.
 
+use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
@@ -36,7 +37,8 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const MAX_COMPOSER_ROWS: u16 = 6;
 const MAX_INLINE_DIFF_ROWS: usize = 28;
 const INLINE_DIFF_CARD_MIN_WIDTH: usize = 48;
-const INLINE_DIFF_CARD_MAX_WIDTH: usize = 100;
+const INLINE_DIFF_CARD_CHROME_WIDTH: usize = 14;
+const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
@@ -199,12 +201,17 @@ fn sync_transcript_layout(app: &mut BmuxApp, width: u16) {
     let pending_submissions = app.pending_submissions().to_vec();
     let has_older_history = app.has_older_history();
     let loading_older_history = app.loading_older_history();
+    let inline_diff_config = app.inline_diff_config();
     app.transcript_layout_mut().sync(TranscriptLayoutSpec {
         width,
         transcript_len: transcript.len(),
         pending_len: pending_submissions.len(),
-        transcript_signature: |index| transcript_item_signature(&transcript[index], width),
-        transcript_rows: |index| transcript_item_rows(&transcript[index], width),
+        transcript_signature: |index| {
+            transcript_item_signature(&transcript[index], width, inline_diff_config)
+        },
+        transcript_rows: |index| {
+            transcript_item_rows(&transcript[index], width, inline_diff_config)
+        },
         pending_signature: |index| pending_submission_signature(&pending_submissions[index], width),
         pending_rows: |index| pending_submission_rows(&pending_submissions[index], width),
         history_banner_signature: || {
@@ -266,9 +273,13 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         .render(detail_area, frame, &mut diff_state);
 }
 
-fn transcript_item_rows(item: &TranscriptItem, width: u16) -> Vec<Line> {
+fn transcript_item_rows(
+    item: &TranscriptItem,
+    width: u16,
+    inline_diff_config: TuiInlineDiffConfig,
+) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, item, width);
+    push_transcript_item_rows(&mut rows, item, width, inline_diff_config);
     rows
 }
 
@@ -300,9 +311,13 @@ const fn history_banner_text(
     }
 }
 
-fn transcript_item_signature(item: &TranscriptItem, width: u16) -> TranscriptLayoutSignature {
+fn transcript_item_signature(
+    item: &TranscriptItem,
+    width: u16,
+    inline_diff_config: TuiInlineDiffConfig,
+) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{width}:{}:{}:{:?}:{}",
+        "item:{width}:{inline_diff_config:?}:{}:{}:{:?}:{}",
         item.role(),
         item.streaming(),
         item.kind(),
@@ -321,7 +336,12 @@ fn pending_submission_signature(
     ))
 }
 
-fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
+fn push_transcript_item_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    width: u16,
+    inline_diff_config: TuiInlineDiffConfig,
+) {
     match item.kind() {
         TranscriptItemKind::UserMessage => {
             push_message_block(rows, "You", item.text(), Color::Blue, width);
@@ -338,15 +358,14 @@ fn push_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width:
             arguments_json,
             file_edit,
         } => {
-            push_tool_request_rows(
-                rows,
-                item,
+            let context = ToolRequestRenderContext {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-                file_edit.as_ref(),
-                width,
-            );
+                file_edit: file_edit.as_ref(),
+                inline_diff_config,
+            };
+            push_tool_request_rows(rows, item, &context, width);
         }
         TranscriptItemKind::ToolResult {
             tool_call_id,
@@ -488,19 +507,25 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     );
 }
 
+#[derive(Clone, Copy)]
+struct ToolRequestRenderContext<'a> {
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    arguments_json: &'a str,
+    file_edit: Option<&'a FileEditTranscript>,
+    inline_diff_config: TuiInlineDiffConfig,
+}
+
 fn push_tool_request_rows(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
-    tool_call_id: &str,
-    tool_name: &str,
-    arguments_json: &str,
-    file_edit: Option<&FileEditTranscript>,
+    context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
     push_wrapped_styled_text(
         rows,
         Vec::new(),
-        &format!("Tool · {tool_name}"),
+        &format!("Tool · {}", context.tool_name),
         width,
         Style::new().fg(Color::Yellow),
         Style::new().fg(Color::Yellow),
@@ -508,14 +533,16 @@ fn push_tool_request_rows(
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
-        &format!("call {tool_call_id}"),
+        &format!("call {}", context.tool_call_id),
         width,
         muted_style(),
         muted_style(),
     );
-    if let Some(edit) = file_edit {
-        push_file_edit_preview_rows(rows, edit, width);
-    } else if let Some(presentation) = tool_request_presentation(tool_name, arguments_json) {
+    if let Some(edit) = context.file_edit {
+        push_file_edit_preview_rows(rows, edit, width, context.inline_diff_config);
+    } else if let Some(presentation) =
+        tool_request_presentation(context.tool_name, context.arguments_json)
+    {
         push_tool_request_presentation_rows(rows, &presentation, width);
     } else if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
@@ -991,7 +1018,12 @@ fn push_hidden_count(rows: &mut Vec<Line>, total: usize, shown: usize, noun: &st
     }
 }
 
-fn push_file_edit_preview_rows(rows: &mut Vec<Line>, edit: &FileEditTranscript, width: u16) {
+fn push_file_edit_preview_rows(
+    rows: &mut Vec<Line>,
+    edit: &FileEditTranscript,
+    width: u16,
+    inline_diff_config: TuiInlineDiffConfig,
+) {
     let summary = edit.summary();
     push_wrapped_styled_text(
         rows,
@@ -1034,7 +1066,7 @@ fn push_file_edit_preview_rows(rows: &mut Vec<Line>, edit: &FileEditTranscript, 
     );
 
     let preview = inline_diff_preview(&diff_lines, MAX_INLINE_DIFF_ROWS);
-    let card_width = inline_diff_card_width(&preview, width.saturating_sub(2));
+    let card_width = inline_diff_card_width(&preview, width.saturating_sub(2), inline_diff_config);
     rows.push(inline_diff_card_border('╭', '─', '╮', card_width));
     for row in preview {
         match row {
@@ -1076,7 +1108,11 @@ fn inline_diff_preview(lines: &[DiffLine], max_rows: usize) -> Vec<InlineDiffPre
         .collect()
 }
 
-fn inline_diff_card_width(preview: &[InlineDiffPreviewRow<'_>], available_width: u16) -> u16 {
+fn inline_diff_card_width(
+    preview: &[InlineDiffPreviewRow<'_>],
+    available_width: u16,
+    config: TuiInlineDiffConfig,
+) -> u16 {
     let available = usize::from(available_width.max(1));
     let content_width = preview
         .iter()
@@ -1086,19 +1122,18 @@ fn inline_diff_card_width(preview: &[InlineDiffPreviewRow<'_>], available_width:
         })
         .max()
         .unwrap_or(0);
-    let max_width = INLINE_DIFF_CARD_MAX_WIDTH.min(available);
+    let max_width = config
+        .max_width
+        .filter(|width| *width > 0)
+        .map_or(available, |max_width| max_width.min(available));
     let width = content_width
-        .saturating_add(2)
+        .saturating_add(INLINE_DIFF_CARD_CHROME_WIDTH)
         .clamp(INLINE_DIFF_CARD_MIN_WIDTH.min(max_width), max_width);
     u16::try_from(width).unwrap_or(u16::MAX)
 }
 
 fn inline_diff_line_display_width(line: &DiffLine) -> usize {
-    2usize
-        .saturating_add(1)
-        .saturating_add(4)
-        .saturating_add(3)
-        .saturating_add(text_display_width(&line.content))
+    text_display_width(&line.content)
 }
 
 fn inline_diff_card_border(left: char, fill: char, right: char, width: u16) -> Line {
@@ -1194,12 +1229,7 @@ fn inline_diff_continuation_prefix(gutter_style: Style) -> Vec<Span> {
 }
 
 const fn inline_diff_body_width(width: u16) -> usize {
-    (width as usize)
-        .saturating_sub(2)
-        .saturating_sub(2)
-        .saturating_sub(5)
-        .saturating_sub(3)
-        .saturating_sub(2)
+    (width as usize).saturating_sub(INLINE_DIFF_BODY_CHROME_WIDTH)
 }
 
 fn inline_diff_content_spans(
