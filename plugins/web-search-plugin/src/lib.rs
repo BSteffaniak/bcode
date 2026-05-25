@@ -161,6 +161,8 @@ struct WebSearchConfig {
     #[serde(default)]
     fetch: Option<WebFetchConfig>,
     #[serde(default)]
+    model_native_available: bool,
+    #[serde(default)]
     providers: WebSearchProviderConfig,
 }
 
@@ -176,6 +178,7 @@ impl Default for WebSearchConfig {
             timeout_ms: None,
             allow_best_effort_no_key: default_allow_best_effort_no_key(),
             fetch: None,
+            model_native_available: false,
             providers: WebSearchProviderConfig::default(),
         }
     }
@@ -487,6 +490,10 @@ async fn search_async(
         "exa" => search_exa(request, &config).await,
         "serper" => search_serper(request, &config).await,
         "serpapi" | "serp_api" => search_serpapi(request, &config).await,
+        "model_native" => Err(WebError::InvalidRequest(
+            "model-native search is recognized but not yet routable through the active model provider"
+                .to_string(),
+        )),
         "duckduckgo_html" | "duckduckgo" | "ddg" => search_duckduckgo_html(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
@@ -1002,13 +1009,13 @@ fn list_tools(
 fn search_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "web.search".to_string(),
-        description: "Search the web through the configured search provider. Supports Brave, Tavily, Exa, Serper, SerpAPI, and best-effort DuckDuckGo HTML fallback.".to_string(),
+        description: "Search the web through the configured search provider. Supports Brave, Tavily, Exa, Serper, SerpAPI, model-native capability detection, and best-effort DuckDuckGo HTML fallback.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["query"],
             "properties": {
                 "query": { "type": "string" },
-                "provider": { "type": "string", "description": "Optional provider override: auto, brave, tavily, exa, serper, serpapi, or duckduckgo_html" },
+                "provider": { "type": "string", "description": "Optional provider override: auto, model_native, brave, tavily, exa, serper, serpapi, or duckduckgo_html" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
                 "site": { "type": "string", "description": "Optional domain to restrict results with a site: query" },
                 "freshness": { "type": "string", "description": "Provider-specific freshness filter such as day, week, month, or year" },
@@ -1166,7 +1173,7 @@ fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
     let mut recommended = Vec::new();
     if matches!(provider.as_deref(), Some("duckduckgo_html") | None) {
         recommended.push(
-            "Configure Brave, Tavily, Exa, Serper, SerpAPI, or future model-native search for more stable results."
+            "Configure Brave, Tavily, Exa, Serper, SerpAPI, or model-native search for more stable results."
                 .to_string(),
         );
     }
@@ -1199,6 +1206,7 @@ fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
 fn provider_quality(provider: &str) -> &'static str {
     match provider {
         "duckduckgo_html" => "best_effort",
+        "model_native" => "model_provider_native",
         _ => "configured_api",
     }
 }
@@ -1259,6 +1267,9 @@ fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
         || env_value(&["SERPAPI_API_KEY"]).is_some()
     {
         providers.push("serpapi".to_string());
+    }
+    if config.model_native_available {
+        providers.push("model_native".to_string());
     }
     if config.allow_best_effort_no_key {
         providers.push("duckduckgo_html".to_string());
@@ -1373,6 +1384,9 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
     {
         return Ok("serpapi".to_string());
     }
+    if config.model_native_available {
+        return Ok("model_native".to_string());
+    }
     if config.allow_best_effort_no_key {
         return Ok("duckduckgo_html".to_string());
     }
@@ -1450,19 +1464,43 @@ fn html_document_text(input: &str) -> (Option<String>, String, Option<String>) {
 }
 
 fn extract_preferred_body(input: &str) -> Option<&str> {
-    extract_element(input, "main")
-        .or_else(|| extract_element(input, "article"))
-        .or_else(|| extract_element(input, "body"))
+    select_longest_element(input, &["main", "article"])
+        .or_else(|| select_longest_element(input, &["body"]))
 }
 
-fn extract_element<'a>(input: &'a str, tag: &str) -> Option<&'a str> {
+fn select_longest_element<'a>(input: &'a str, tags: &[&str]) -> Option<&'a str> {
+    tags.iter()
+        .flat_map(|tag| extract_elements(input, tag))
+        .max_by_key(|candidate| readable_score(candidate))
+}
+
+fn extract_elements<'a>(input: &'a str, tag: &str) -> Vec<&'a str> {
+    let mut elements = Vec::new();
     let lower = input.to_ascii_lowercase();
     let start_token = format!("<{tag}");
     let end_token = format!("</{tag}>");
-    let start = lower.find(&start_token)?;
-    let content_start = input[start..].find('>')? + start + 1;
-    let end = lower[content_start..].find(&end_token)? + content_start;
-    Some(&input[content_start..end])
+    let mut search_from = 0;
+    while let Some(relative_start) = lower[search_from..].find(&start_token) {
+        let start = search_from + relative_start;
+        let Some(relative_content_start) = input[start..].find('>') else {
+            break;
+        };
+        let content_start = start + relative_content_start + 1;
+        let Some(relative_end) = lower[content_start..].find(&end_token) else {
+            break;
+        };
+        let end = content_start + relative_end;
+        elements.push(&input[content_start..end]);
+        search_from = end + end_token.len();
+    }
+    elements
+}
+
+fn readable_score(input: &str) -> usize {
+    let text = html_text(input);
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
 }
 
 fn extract_between_case_insensitive<'a>(input: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -1555,10 +1593,38 @@ fn push_tag_marker(output: &mut String, tag: &str) {
         "h2" => output.push_str("\n\n## "),
         "h3" => output.push_str("\n\n### "),
         "h4" | "h5" | "h6" => output.push_str("\n\n#### "),
-        "p" | "div" | "section" | "article" | "main" | "br" => output.push_str("\n\n"),
+        "p" | "div" | "section" | "article" | "main" | "br" | "tr" => output.push_str("\n\n"),
         "li" => output.push_str("\n* "),
-        "pre" | "code" => output.push('`'),
+        "td" | "th" => output.push_str(" | "),
+        "pre" => output.push_str("\n\n```\n"),
+        "code" => output.push('`'),
+        _ if normalized == "a" => {
+            if let Some(href) = tag_attribute(tag, "href") {
+                output.push_str(" [");
+                output.push_str(&href);
+                output.push_str("] ");
+            } else {
+                output.push(' ');
+            }
+        }
         _ => output.push(' '),
+    }
+}
+
+fn tag_attribute(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let key = format!("{name}=");
+    let start = lower.find(&key)? + key.len();
+    let quote = tag[start..].chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let value_start = start + quote.len_utf8();
+        let end = tag[value_start..].find(quote)? + value_start;
+        Some(html_text(&tag[value_start..end]))
+    } else {
+        let end = tag[start..]
+            .find(char::is_whitespace)
+            .map_or(tag.len(), |end| start + end);
+        Some(html_text(&tag[start..end]))
     }
 }
 
@@ -1682,6 +1748,29 @@ mod tests {
         assert!(text.contains("Body & text"));
         assert!(!text.contains("menu"));
         assert!(markdown.is_some());
+    }
+
+    #[test]
+    fn html_document_chooses_longer_article_content() {
+        let html = r"
+            <body>
+                <article><p>short</p></article>
+                <article><h2>Useful</h2><p>This is the detailed content agents need.</p></article>
+            </body>
+        ";
+        let (_title, text, _markdown) = html_document_text(html);
+        assert!(text.contains("Useful"));
+        assert!(text.contains("detailed content"));
+    }
+
+    #[test]
+    fn html_markdown_preserves_links_and_table_cells() {
+        let markdown = html_to_markdown(
+            "<p>See <a href='https://example.com'>docs</a></p><table><tr><td>A</td><td>B</td></tr></table>",
+        );
+        assert!(markdown.contains("https://example.com"));
+        assert!(markdown.contains('A'));
+        assert!(markdown.contains('B'));
     }
 
     #[test]
