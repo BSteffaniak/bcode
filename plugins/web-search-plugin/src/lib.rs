@@ -985,16 +985,163 @@ async fn fetch_async(
 ) -> Result<FetchResponse, WebError> {
     validate_url(&request.url)?;
     if request.render {
-        return fetch_rendered(&request, &config);
+        let mut response = fetch_rendered(&request, &config)?;
+        apply_prompt_extraction(&mut response, &request, &config).await?;
+        return Ok(response);
     }
     let fallbacks = fetch_fallbacks(&config);
     let plain_result = fetch_plain_async(&request, &config).await;
-    if should_try_jina(&fallbacks, &plain_result)
-        && let Ok(response) = fetch_jina_reader_async(&request, &config).await
-    {
-        return Ok(response);
+    let mut response = if should_try_jina(&fallbacks, &plain_result) {
+        match fetch_jina_reader_async(&request, &config).await {
+            Ok(response) => response,
+            Err(_) => plain_result?,
+        }
+    } else {
+        plain_result?
+    };
+    apply_prompt_extraction(&mut response, &request, &config).await?;
+    Ok(response)
+}
+
+async fn apply_prompt_extraction(
+    response: &mut FetchResponse,
+    request: &FetchRequest,
+    config: &WebSearchConfig,
+) -> Result<(), WebError> {
+    let Some(prompt) = request
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let provider = fetch_extraction_provider(request, config);
+    let extracted = match provider.as_str() {
+        "perplexity" | "pplx" => extract_with_perplexity(prompt, response, request, config).await?,
+        "gemini" | "google_gemini" => {
+            extract_with_gemini(prompt, response, request, config).await?
+        }
+        "none" | "content" => prompt_response(request, &response.text).unwrap_or_default(),
+        _ => {
+            return Err(WebError::InvalidRequest(format!(
+                "unsupported prompted fetch provider: {provider}"
+            )));
+        }
+    };
+    response.prompt_response = Some(extracted);
+    response.extraction = format!("{}+prompt_{provider}", response.extraction);
+    Ok(())
+}
+
+fn fetch_extraction_provider(request: &FetchRequest, config: &WebSearchConfig) -> String {
+    let provider = request
+        .provider
+        .clone()
+        .or_else(|| env_value(&["BCODE_WEB_FETCH_PROVIDER"]))
+        .unwrap_or_else(|| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if provider != "auto" {
+        return provider;
     }
-    plain_result
+    if provider_key(
+        &config.providers.gemini,
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    )
+    .is_ok()
+    {
+        return "gemini".to_string();
+    }
+    if provider_key(
+        &config.providers.perplexity,
+        &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
+    )
+    .is_ok()
+    {
+        return "perplexity".to_string();
+    }
+    "content".to_string()
+}
+
+async fn extract_with_perplexity(
+    prompt: &str,
+    response: &FetchResponse,
+    request: &FetchRequest,
+    config: &WebSearchConfig,
+) -> Result<String, WebError> {
+    let api_key = provider_key(
+        &config.providers.perplexity,
+        &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
+    )?;
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
+    let content = bounded_prompt_content(&response.text);
+    let body = json!({
+        "model": "sonar",
+        "messages": [
+            { "role": "system", "content": "Answer the user's extraction prompt using only the provided fetched web content. Cite the source URL when useful." },
+            { "role": "user", "content": format!("URL: {}\nTitle: {}\n\nPrompt: {}\n\nFetched content:\n{}", response.final_url, response.title.as_deref().unwrap_or(""), prompt, content) }
+        ]
+    });
+    let text = checked_text(
+        client
+            .post("https://api.perplexity.ai/chat/completions")
+            .header("Accept", "application/json")
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<PerplexitySearchResponse>(&text)?;
+    Ok(decoded
+        .choices
+        .first()
+        .map(|choice| choice.message.content.clone())
+        .unwrap_or_default())
+}
+
+async fn extract_with_gemini(
+    prompt: &str,
+    response: &FetchResponse,
+    request: &FetchRequest,
+    config: &WebSearchConfig,
+) -> Result<String, WebError> {
+    let api_key = provider_key(
+        &config.providers.gemini,
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    )?;
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
+    let content = bounded_prompt_content(&response.text);
+    let body = json!({
+        "contents": [{
+            "parts": [{
+                "text": format!("Use only the fetched content below to answer the extraction prompt.\n\nURL: {}\nTitle: {}\nPrompt: {}\n\nFetched content:\n{}", response.final_url, response.title.as_deref().unwrap_or(""), prompt, content)
+            }]
+        }]
+    });
+    let text = checked_text(
+        client
+            .post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent")
+            .query(&[("key", api_key.as_str())])
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await?,
+    )
+    .await?;
+    let decoded = serde_json::from_str::<GeminiGenerateResponse>(&text)?;
+    Ok(gemini_text(&decoded))
+}
+
+fn bounded_prompt_content(text: &str) -> String {
+    const MAX_PROMPT_CONTENT_CHARS: usize = 40_000;
+    if text.chars().count() <= MAX_PROMPT_CONTENT_CHARS {
+        return text.to_string();
+    }
+    let mut output = truncate_chars(text, MAX_PROMPT_CONTENT_CHARS);
+    output.push_str("\n\n[truncated]");
+    output
 }
 
 async fn fetch_plain_async(
