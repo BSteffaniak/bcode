@@ -56,6 +56,7 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("web.inspect".to_string(), true),
                 ("git.clone".to_string(), true),
                 ("github.clone".to_string(), true),
+                ("document.extract".to_string(), true),
             ]),
             permission: PermissionConfig {
                 bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
@@ -83,6 +84,7 @@ pub fn default_config() -> AgentPermissionConfig {
                 ("web.inspect".to_string(), true),
                 ("git.clone".to_string(), true),
                 ("github.clone".to_string(), true),
+                ("document.extract".to_string(), true),
             ]),
             permission: PermissionConfig {
                 bash: BTreeMap::from([

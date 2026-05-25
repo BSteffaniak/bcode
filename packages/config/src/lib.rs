@@ -25,6 +25,7 @@ pub const BCODE_MODEL_PROFILE_ENV: &str = "BCODE_MODEL_PROFILE";
 pub const BCODE_AUTH_PROFILE_ENV: &str = "BCODE_AUTH_PROFILE";
 
 const DEFAULT_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
+const DEFAULT_DOCUMENT_PLUGIN_ID: &str = "bcode.document";
 const DEFAULT_FILESYSTEM_PLUGIN_ID: &str = "bcode.filesystem";
 const DEFAULT_GIT_PLUGIN_ID: &str = "bcode.git";
 const DEFAULT_SHELL_PLUGIN_ID: &str = "bcode.shell";
@@ -32,6 +33,7 @@ const DEFAULT_WEB_SEARCH_PLUGIN_ID: &str = "bcode.web-search";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_ID: &str = "bcode.openai-compatible";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_IDS: &[&str] = &["bcode.openai-compatible", "bcode.bedrock"];
 const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
+    DEFAULT_DOCUMENT_PLUGIN_ID,
     DEFAULT_FILESYSTEM_PLUGIN_ID,
     DEFAULT_GIT_PLUGIN_ID,
     DEFAULT_SHELL_PLUGIN_ID,
@@ -2913,8 +2915,8 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 mod tests {
     use super::{
         BcodeConfig, CompactionMode, ConfigLoadOverrides, DEFAULT_AGENT_PROFILE_PLUGIN_ID,
-        DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID, DEFAULT_SHELL_PLUGIN_ID,
-        DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig,
+        DEFAULT_DOCUMENT_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID,
+        DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig,
         default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_agent_configs,
         upsert_agent_permission_rule,
@@ -2968,6 +2970,11 @@ triple_click_select = "all"
     }
 
     fn assert_default_core_plugins_enabled(plugin_selection: &PluginSelection) {
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_DOCUMENT_PLUGIN_ID)
+        );
         assert!(
             plugin_selection
                 .enabled

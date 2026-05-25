@@ -823,6 +823,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_document_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model_provider_runtime",
+ "bcode_plugin_sdk",
+ "bcode_tool",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bcode_fake_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -971,6 +984,7 @@ dependencies = [
  "bcode_command",
  "bcode_config",
  "bcode_default_agents_plugin",
+ "bcode_document_plugin",
  "bcode_fake_provider_plugin",
  "bcode_filesystem_plugin",
  "bcode_git_plugin",

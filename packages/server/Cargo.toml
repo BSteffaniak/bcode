@@ -17,6 +17,7 @@ bcode_bedrock_provider_plugin = { workspace = true, optional = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_default_agents_plugin = { workspace = true, optional = true }
+bcode_document_plugin = { workspace = true, optional = true }
 bcode_fake_provider_plugin = { workspace = true, optional = true }
 bcode_filesystem_plugin = { workspace = true, optional = true }
 bcode_git_plugin = { workspace = true, optional = true }
@@ -61,6 +62,11 @@ static-bundled-default-agents-plugin = [
     "dep:bcode_default_agents_plugin",
     "bcode_default_agents_plugin/static-bundled",
 ]
+static-bundled-document-plugin = [
+    "_static-bundled",
+    "dep:bcode_document_plugin",
+    "bcode_document_plugin/static-bundled",
+]
 static-bundled-fake-provider-plugin = [
     "_static-bundled",
     "dep:bcode_fake_provider_plugin",
@@ -85,6 +91,7 @@ static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
     "static-bundled-default-agents-plugin",
+    "static-bundled-document-plugin",
     "static-bundled-fake-provider-plugin",
     "static-bundled-filesystem-plugin",
     "static-bundled-git-plugin",

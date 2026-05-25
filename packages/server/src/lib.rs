@@ -510,6 +510,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
             bcode_default_agents_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-document-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/document-plugin/bcode-plugin.toml"),
+            bcode_document_plugin::static_plugin(),
+        ),
         #[cfg(feature = "static-bundled-fake-provider-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),

@@ -1,0 +1,405 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! Bundled document extraction tool plugin for Bcode.
+
+use bcode_model_provider_runtime::ProviderRuntime;
+use bcode_plugin_sdk::prelude::*;
+use bcode_tool::{
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
+    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+use thiserror::Error;
+
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_BYTES: usize = 20 * 1024 * 1024;
+const MAX_BYTES: usize = 100 * 1024 * 1024;
+const USER_AGENT: &str = concat!("Bcode/", env!("CARGO_PKG_VERSION"));
+
+/// Bundled document extraction plugin.
+pub struct DocumentPlugin {
+    runtime: Result<ProviderRuntime, String>,
+}
+
+impl Default for DocumentPlugin {
+    fn default() -> Self {
+        Self {
+            runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
+        }
+    }
+}
+
+impl RustPlugin for DocumentPlugin {
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        match context.request.interface_id.as_str() {
+            TOOL_SERVICE_INTERFACE_ID => self.invoke_tool_service(&context.request),
+            _ => ServiceResponse::error(
+                "unsupported_interface",
+                "unsupported document plugin service interface",
+            ),
+        }
+    }
+}
+
+impl DocumentPlugin {
+    fn invoke_tool_service(&self, request: &ServiceRequest) -> ServiceResponse {
+        match request.operation.as_str() {
+            OP_LIST_TOOLS => list_tools(request),
+            OP_INVOKE_TOOL => self.invoke_tool(request),
+            _ => ServiceResponse::error(
+                "unsupported_operation",
+                "unsupported document tool service operation",
+            ),
+        }
+    }
+
+    fn invoke_tool(&self, request: &ServiceRequest) -> ServiceResponse {
+        let invocation = match request.payload_json::<ToolInvocationRequest>() {
+            Ok(invocation) => invocation,
+            Err(error) => return invalid_request(&error),
+        };
+        let response = match invocation.name.as_str() {
+            "document.extract" => self.invoke_extract(&invocation),
+            _ => ToolInvocationResponse {
+                output: format!("unsupported document tool: {}", invocation.name),
+                is_error: true,
+                content: Vec::new(),
+                full_output: None,
+            },
+        };
+        json_response(&response)
+    }
+
+    fn invoke_extract(&self, invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
+        let request = match serde_json::from_value::<ExtractRequest>(invocation.arguments.clone()) {
+            Ok(request) => request,
+            Err(error) => return tool_error(error.to_string()),
+        };
+        let runtime = match &self.runtime {
+            Ok(runtime) => runtime,
+            Err(error) => return tool_error(format!("document runtime unavailable: {error}")),
+        };
+        let artifact_dir = invocation.artifact_dir.clone();
+        match runtime.block_on(extract_async(request, artifact_dir)) {
+            Ok(Ok(response)) => json_tool_response(&response),
+            Ok(Err(error)) => tool_error(error.to_string()),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExtractRequest {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExtractResponse {
+    source: String,
+    content_type: String,
+    artifact_kind: String,
+    artifact_scope: String,
+    document_path: PathBuf,
+    text_path: PathBuf,
+    text: String,
+    truncated: bool,
+    extractor: String,
+}
+
+#[derive(Debug, Error)]
+enum DocumentError {
+    #[error("provide exactly one of url or path")]
+    InvalidSource,
+    #[error("url must start with http:// or https://")]
+    InvalidUrl,
+    #[error("document source must be a PDF for this extractor")]
+    UnsupportedDocument,
+    #[error("network request failed: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("pdftotext failed with status {status}: {stderr}")]
+    PdfToTextFailed { status: String, stderr: String },
+}
+
+async fn extract_async(
+    request: ExtractRequest,
+    artifact_dir: Option<PathBuf>,
+) -> Result<ExtractResponse, DocumentError> {
+    let source = source(&request)?;
+    let artifact_root = artifact_dir
+        .as_deref()
+        .map_or_else(default_global_document_artifact_dir, Path::to_path_buf)
+        .join("documents");
+    std::fs::create_dir_all(&artifact_root)?;
+    let max_bytes = request
+        .max_bytes
+        .unwrap_or(DEFAULT_MAX_BYTES)
+        .clamp(1, MAX_BYTES);
+    let document_path = match &source {
+        DocumentSource::Url(url) => {
+            download_document(url, &artifact_root, max_bytes, request.timeout_ms).await?
+        }
+        DocumentSource::Path(path) => path.clone(),
+    };
+    if !is_pdf_path(&document_path) {
+        return Err(DocumentError::UnsupportedDocument);
+    }
+    let text_path = document_path.with_extension("txt");
+    extract_pdf_to_text(&document_path, &text_path)?;
+    let bytes = std::fs::read(&text_path)?;
+    let truncated = bytes.len() > max_bytes;
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]).to_string();
+    Ok(ExtractResponse {
+        source: source.as_string(),
+        content_type: "application/pdf".to_string(),
+        artifact_kind: "document_extraction".to_string(),
+        artifact_scope: if artifact_dir.is_some() {
+            "session"
+        } else {
+            "global"
+        }
+        .to_string(),
+        document_path,
+        text_path,
+        text,
+        truncated,
+        extractor: "pdftotext".to_string(),
+    })
+}
+
+#[derive(Debug, Clone)]
+enum DocumentSource {
+    Url(String),
+    Path(PathBuf),
+}
+
+impl DocumentSource {
+    fn as_string(&self) -> String {
+        match self {
+            Self::Url(url) => url.clone(),
+            Self::Path(path) => path.display().to_string(),
+        }
+    }
+}
+
+fn source(request: &ExtractRequest) -> Result<DocumentSource, DocumentError> {
+    match (&request.url, &request.path) {
+        (Some(url), None) => {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                Ok(DocumentSource::Url(url.clone()))
+            } else {
+                Err(DocumentError::InvalidUrl)
+            }
+        }
+        (None, Some(path)) => Ok(DocumentSource::Path(path.clone())),
+        _ => Err(DocumentError::InvalidSource),
+    }
+}
+
+async fn download_document(
+    url: &str,
+    artifact_root: &Path,
+    max_bytes: usize,
+    timeout_ms: Option<u64>,
+) -> Result<PathBuf, DocumentError> {
+    let client = Client::builder()
+        .timeout(Duration::from_millis(
+            timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).max(1),
+        ))
+        .user_agent(USER_AGENT)
+        .build()?;
+    let response = client.get(url).send().await?;
+    let final_url = response.url().to_string();
+    let bytes = response.bytes().await?;
+    let extension = if final_url.to_ascii_lowercase().contains(".pdf") {
+        "pdf"
+    } else {
+        "bin"
+    };
+    let path = artifact_root.join(format!("{}.{extension}", stable_name(&final_url)));
+    std::fs::write(&path, &bytes[..bytes.len().min(max_bytes)])?;
+    Ok(path)
+}
+
+fn extract_pdf_to_text(document_path: &Path, text_path: &Path) -> Result<(), DocumentError> {
+    let output = Command::new("pdftotext")
+        .arg("-layout")
+        .arg(document_path)
+        .arg(text_path)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(DocumentError::PdfToTextFailed {
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+}
+
+fn is_pdf_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+fn stable_name(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars().take(120) {
+        output.push(match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => character,
+            _ => '_',
+        });
+    }
+    output.trim_matches('_').to_string()
+}
+
+fn default_global_document_artifact_dir() -> PathBuf {
+    default_state_dir().join("artifacts")
+}
+
+fn default_state_dir() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home).join("bcode");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("bcode");
+    }
+    env::temp_dir().join("bcode")
+}
+
+fn list_tools(request: &ServiceRequest) -> ServiceResponse {
+    if let Err(error) = request.payload_json::<ListToolsRequest>() {
+        return invalid_request(&error);
+    }
+    json_response(&ToolList {
+        tools: vec![extract_tool_definition()],
+    })
+}
+
+fn extract_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "document.extract".to_string(),
+        description: "Extract text from PDF documents using session artifact state and pdftotext."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string" },
+                "path": { "type": "string" },
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_BYTES },
+                "timeout_ms": { "type": "integer", "minimum": 1 }
+            }
+        }),
+        side_effect: ToolSideEffect::WriteFiles,
+        requires_permission: true,
+    }
+}
+
+fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
+    match ServiceResponse::json(value) {
+        Ok(response) => response,
+        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+    }
+}
+
+fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
+    ServiceResponse::error("invalid_request", error.to_string())
+}
+
+fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value) {
+        Ok(output) => ToolInvocationResponse {
+            output,
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+        },
+        Err(error) => tool_error(error.to_string()),
+    }
+}
+
+const fn tool_error(output: String) -> ToolInvocationResponse {
+    ToolInvocationResponse {
+        output,
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+    }
+}
+
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    bcode_plugin_sdk::static_plugin_vtable!(DocumentPlugin, include_str!("../bcode-plugin.toml"))
+}
+
+bcode_plugin_sdk::export_plugin!(DocumentPlugin, include_str!("../bcode-plugin.toml"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_requires_exactly_one_input() {
+        assert!(
+            source(&ExtractRequest {
+                url: None,
+                path: None,
+                max_bytes: None,
+                timeout_ms: None
+            })
+            .is_err()
+        );
+        assert!(
+            source(&ExtractRequest {
+                url: Some("https://example.com/a.pdf".to_string()),
+                path: Some(PathBuf::from("a.pdf")),
+                max_bytes: None,
+                timeout_ms: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn source_accepts_http_pdf_url() {
+        let result = source(&ExtractRequest {
+            url: Some("https://example.com/a.pdf".to_string()),
+            path: None,
+            max_bytes: None,
+            timeout_ms: None,
+        })
+        .expect("url source");
+        assert_eq!(result.as_string(), "https://example.com/a.pdf");
+    }
+
+    #[test]
+    fn stable_names_are_path_safe() {
+        assert_eq!(
+            stable_name("https://example.com/a file.pdf"),
+            "https___example.com_a_file.pdf"
+        );
+    }
+}
