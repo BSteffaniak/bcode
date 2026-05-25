@@ -24,6 +24,10 @@ pub enum ActivityState {
         /// User-facing progress detail.
         detail: String,
     },
+    /// Writing a file through a filesystem tool.
+    WritingFile,
+    /// Editing a file through a filesystem tool.
+    EditingFile,
     /// Running a tool.
     RunningTool {
         /// Tool name.

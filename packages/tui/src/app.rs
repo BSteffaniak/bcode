@@ -27,10 +27,10 @@ use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::transcript::{
-    TranscriptItem, finish_streaming_transcript_item, merge_transcript_boundary, model_usage_item,
-    permission_request_item, permission_result_item, push_streaming_transcript_item,
-    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
-    tool_result_item, transcript_items_from_events_with_reasoning,
+    TranscriptItem, TranscriptItemKind, finish_streaming_transcript_item,
+    merge_transcript_boundary, model_usage_item, permission_request_item, permission_result_item,
+    push_streaming_transcript_item, streaming_terminal_output_item, streaming_tool_output_item,
+    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_layout::TranscriptLayoutCache;
 use super::transcript_viewport::TranscriptViewport;
@@ -917,7 +917,7 @@ impl BmuxApp {
     }
 
     fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
-        self.record_diff_summary(tool_name, arguments_json);
+        let edit_summary = self.record_diff_summary(tool_name, arguments_json);
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
@@ -927,17 +927,28 @@ impl BmuxApp {
         );
         self.transcript
             .push(tool_request_item(tool_call_id, tool_name, arguments_json));
-        self.set_activity(ActivityState::RunningTool {
-            name: tool_name.to_owned(),
-        });
-        self.status = format!("running tool {tool_name}");
+        if let Some(status) = edit_summary {
+            self.set_file_activity(tool_name);
+            self.status = status;
+        } else {
+            self.set_activity(ActivityState::RunningTool {
+                name: tool_name.to_owned(),
+            });
+            self.status = tool_request_status(tool_name, arguments_json)
+                .unwrap_or_else(|| "started".to_owned());
+        }
     }
 
-    fn record_diff_summary(&mut self, tool_name: &str, arguments_json: &str) {
-        let Some((summary, lines)) = diff_from_tool_request(tool_name, arguments_json) else {
-            return;
-        };
+    fn record_diff_summary(&mut self, tool_name: &str, arguments_json: &str) -> Option<String> {
+        let (summary, lines) = diff_from_tool_request(tool_name, arguments_json)?;
+        let status = format!(
+            "{} · +{} -{}",
+            summary.display_path(),
+            summary.added,
+            summary.removed
+        );
         self.diff_panel.record(summary, lines);
+        Some(status)
     }
 
     fn finish_live_tool_output(&mut self, tool_call_id: &str, is_error: Option<bool>) -> bool {
@@ -958,10 +969,13 @@ impl BmuxApp {
     fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
         if self.finish_live_tool_output(tool_call_id, Some(is_error)) {
             if is_error {
-                "tool failed".clone_into(&mut self.status);
+                "failed".clone_into(&mut self.status);
+            } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                self.status = format!("applied · {status}");
             } else {
-                "tool finished".clone_into(&mut self.status);
+                "finished".clone_into(&mut self.status);
             }
+            self.finish_tool_request_preview(tool_call_id);
             return;
         }
         let context = self.tool_call_contexts.get(tool_call_id);
@@ -973,10 +987,13 @@ impl BmuxApp {
             is_error,
         ));
         if is_error {
-            "tool failed".clone_into(&mut self.status);
+            "failed".clone_into(&mut self.status);
+        } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+            self.status = format!("applied · {status}");
         } else {
-            "tool finished".clone_into(&mut self.status);
+            "finished".clone_into(&mut self.status);
         }
+        self.finish_tool_request_preview(tool_call_id);
     }
 
     fn apply_tool_stream_event(&mut self, event: &ToolInvocationStreamEvent) {
@@ -1008,7 +1025,12 @@ impl BmuxApp {
                         },
                     );
                 }
-                self.status = format!("running tool {tool_name}");
+                self.set_activity_for_tool_call(tool_call_id, tool_name);
+                if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                    self.status = status;
+                } else {
+                    tool_name.clone_into(&mut self.status);
+                }
             }
             ToolInvocationStreamEvent::Finished {
                 tool_call_id,
@@ -1016,6 +1038,14 @@ impl BmuxApp {
                 ..
             } => {
                 self.finish_live_tool_output(tool_call_id, Some(*is_error));
+                self.finish_tool_request_preview(tool_call_id);
+                if *is_error {
+                    "failed".clone_into(&mut self.status);
+                } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                    self.status = format!("applied · {status}");
+                } else {
+                    "finished".clone_into(&mut self.status);
+                }
             }
         }
     }
@@ -1108,7 +1138,13 @@ impl BmuxApp {
         self.set_activity(ActivityState::WaitingPermission {
             name: tool_name.to_owned(),
         });
-        self.status = format!("waiting for permission: {tool_name}");
+        self.status = self.tool_call_file_status(tool_call_id).map_or_else(
+            || {
+                tool_request_status(tool_name, arguments_json)
+                    .unwrap_or_else(|| tool_name.to_owned())
+            },
+            |status| format!("waiting permission · {status}"),
+        );
     }
 
     fn set_permission_status(&mut self, permission_id: &str, approved: bool) {
@@ -1120,6 +1156,55 @@ impl BmuxApp {
         status.clone_into(&mut self.status);
         self.transcript
             .push(permission_result_item(permission_id, approved));
+    }
+
+    fn set_file_activity(&mut self, tool_name: &str) {
+        let normalized = normalized_tool_name(tool_name);
+        if matches!(normalized.as_str(), "filesystem_write" | "write") {
+            self.set_activity(ActivityState::WritingFile);
+        } else if matches!(normalized.as_str(), "filesystem_edit" | "edit") {
+            self.set_activity(ActivityState::EditingFile);
+        } else {
+            self.set_activity(ActivityState::RunningTool {
+                name: tool_name.to_owned(),
+            });
+        }
+    }
+
+    fn set_activity_for_tool_call(&mut self, tool_call_id: &str, fallback_tool_name: &str) {
+        if let Some(context) = self.tool_call_contexts.get(tool_call_id) {
+            let tool_name = context.tool_name.clone();
+            self.set_file_activity(&tool_name);
+        } else {
+            self.set_file_activity(fallback_tool_name);
+        }
+    }
+
+    fn tool_call_file_status(&self, tool_call_id: &str) -> Option<String> {
+        let context = self.tool_call_contexts.get(tool_call_id)?;
+        let (summary, _) = diff_from_tool_request(&context.tool_name, &context.arguments_json)?;
+        Some(format!(
+            "{} · +{} -{}",
+            summary.display_path(),
+            summary.added,
+            summary.removed
+        ))
+    }
+
+    fn finish_tool_request_preview(&mut self, tool_call_id: &str) {
+        for item in self.transcript.iter_mut().rev() {
+            let TranscriptItemKind::ToolRequest {
+                tool_call_id: item_tool_call_id,
+                ..
+            } = item.kind_mut()
+            else {
+                continue;
+            };
+            if item_tool_call_id == tool_call_id {
+                item.finish_streaming();
+                break;
+            }
+        }
     }
 
     fn push_model_usage(&mut self, turn_id: &str, usage: &bcode_session_models::SessionTokenUsage) {
@@ -1359,6 +1444,33 @@ impl BmuxApp {
 
 pub const fn composer_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
+}
+
+fn normalized_tool_name(tool_name: &str) -> String {
+    tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
+}
+
+fn tool_request_status(tool_name: &str, arguments_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
+    let normalized = normalized_tool_name(tool_name);
+    match normalized.as_str() {
+        "shell_run" | "shell" => value
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(|cwd| format!("cwd {cwd}")),
+        "filesystem_read" | "read" | "filesystem_exists" | "exists" | "filesystem_stat"
+        | "stat" => value
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        "filesystem_list" | "list" | "filesystem_find" | "find" | "filesystem_grep" | "grep" => {
+            value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

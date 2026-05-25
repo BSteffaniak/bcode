@@ -242,6 +242,11 @@ pub fn tool_request_presentation(
         "filesystem_read" | "read" => Some(ToolRequestPresentation::Read {
             path: path_field(&value, "path")?,
         }),
+        "filesystem_edit" | "edit" => Some(ToolRequestPresentation::Write {
+            path: path_field(&value, "path")?,
+            bytes: string_field(&value, "new_text").map_or(0, |contents| contents.len()),
+            lines: string_field(&value, "new_text").map_or(0, |contents| contents.lines().count()),
+        }),
         "filesystem_write" | "write" => Some(ToolRequestPresentation::Write {
             path: path_field(&value, "path")?,
             bytes: string_field(&value, "contents").map_or(0, |contents| contents.len()),

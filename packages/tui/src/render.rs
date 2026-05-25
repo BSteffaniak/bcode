@@ -522,13 +522,27 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
+    let title = if context.file_edit.is_some() {
+        format!(
+            "{} · {}",
+            file_tool_action(context.tool_name, item.streaming()),
+            context.tool_name
+        )
+    } else {
+        format!("Tool · {}", context.tool_name)
+    };
+    let title_color = if item.streaming() {
+        Color::Cyan
+    } else {
+        Color::Yellow
+    };
     push_wrapped_styled_text(
         rows,
         Vec::new(),
-        &format!("Tool · {}", context.tool_name),
+        &title,
         width,
-        Style::new().fg(Color::Yellow),
-        Style::new().fg(Color::Yellow),
+        Style::new().fg(title_color),
+        Style::new().fg(title_color),
     );
     push_wrapped_styled_text(
         rows,
@@ -548,6 +562,18 @@ fn push_tool_request_rows(
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
     }
     rows.push(Line::default());
+}
+
+fn file_tool_action(tool_name: &str, streaming: bool) -> &'static str {
+    let normalized = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
+    match (normalized.as_str(), streaming) {
+        ("filesystem_write" | "write", true) => "Writing …",
+        ("filesystem_write" | "write", false) => "Write preview",
+        ("filesystem_edit" | "edit", true) => "Editing …",
+        ("filesystem_edit" | "edit", false) => "Edit preview",
+        (_, true) => "File change …",
+        (_, false) => "File change preview",
+    }
 }
 
 fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
@@ -1080,10 +1106,17 @@ fn push_file_edit_preview_rows(
         .collect::<Vec<_>>();
     let total_rows = diff_lines.len();
     let shown_rows = total_rows.min(MAX_INLINE_DIFF_ROWS);
+    let progress = if total_rows > shown_rows {
+        format!(
+            "live preview · showing {shown_rows} of {total_rows} diff rows · /diff for full view"
+        )
+    } else {
+        "live preview · /diff for full view".to_owned()
+    };
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
-        &format!("showing {shown_rows} of {total_rows} diff rows · /diff for full view"),
+        &progress,
         width,
         muted_style(),
         muted_style(),
@@ -1985,11 +2018,16 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let mut spans = vec![
-        Span::styled(activity_label(app.activity()), Style::new().fg(Color::Cyan)),
-        Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
-        Span::styled(app.status().to_owned(), Style::new().fg(Color::BrightBlack)),
-    ];
+    let mut spans = vec![Span::styled(
+        activity_label(app.activity()),
+        Style::new().fg(Color::Cyan),
+    )];
+    if !app.status().is_empty() {
+        spans.extend([
+            Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
+            Span::styled(app.status().to_owned(), Style::new().fg(Color::BrightBlack)),
+        ]);
+    }
     if app.scroll_offset() > 0 {
         spans.push(Span::styled(
             format!(" · {} rows from bottom", app.scroll_offset()),
@@ -2021,9 +2059,30 @@ fn activity_label(activity: &ActivityState) -> String {
         ActivityState::ProviderStream { detail } => {
             format!("{} provider stream · {detail}", spinner_frame())
         }
-        ActivityState::RunningTool { name } => format!("{} tool {name}", spinner_frame()),
-        ActivityState::WaitingPermission { name } => format!("permission {name}"),
+        ActivityState::WritingFile => format!("{} writing", spinner_frame()),
+        ActivityState::EditingFile => format!("{} editing", spinner_frame()),
+        ActivityState::RunningTool { name } => {
+            format!("{} {}", spinner_frame(), tool_activity_label(name))
+        }
+        ActivityState::WaitingPermission { name } => {
+            format!("permission {}", tool_activity_label(name))
+        }
         ActivityState::Cancelling => format!("{} cancelling", spinner_frame()),
+    }
+}
+
+fn tool_activity_label(tool_name: &str) -> String {
+    match tool_name.replace(['-', '.'], "_").as_str() {
+        "shell_run" | "shell" => "shell".to_owned(),
+        "filesystem_read" | "read" => "reading".to_owned(),
+        "filesystem_write" | "write" => "writing".to_owned(),
+        "filesystem_edit" | "edit" => "editing".to_owned(),
+        "filesystem_exists" | "exists" => "checking path".to_owned(),
+        "filesystem_list" | "list" => "listing".to_owned(),
+        "filesystem_find" | "find" => "finding".to_owned(),
+        "filesystem_grep" | "grep" => "searching".to_owned(),
+        "filesystem_stat" | "stat" => "stat".to_owned(),
+        other => format!("tool {other}"),
     }
 }
 

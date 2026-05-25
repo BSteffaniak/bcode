@@ -135,6 +135,11 @@ impl TranscriptItem {
         }
     }
 
+    const fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
     /// Return display role.
     #[must_use]
     pub const fn role(&self) -> &'static str {
@@ -173,6 +178,11 @@ impl TranscriptItem {
     /// Mark this transcript item as no longer streaming.
     pub const fn finish_streaming(&mut self) {
         self.streaming = false;
+    }
+
+    /// Return mutable semantic item kind.
+    pub const fn kind_mut(&mut self) -> &mut TranscriptItemKind {
+        &mut self.kind
     }
 
     /// Return semantic item kind.
@@ -268,6 +278,7 @@ pub fn tool_request_item(
     arguments_json: &str,
 ) -> TranscriptItem {
     let file_edit = file_edit_from_tool_request(tool_name, arguments_json);
+    let streaming = file_edit.is_some();
     TranscriptItem::with_kind(
         "Tool",
         pretty_jsonish(arguments_json),
@@ -279,6 +290,7 @@ pub fn tool_request_item(
             file_edit,
         },
     )
+    .with_streaming(streaming)
 }
 
 /// Build a streaming transcript item for live terminal output.

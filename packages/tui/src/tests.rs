@@ -758,10 +758,10 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Tool · filesystem.edit"));
+    assert!(output.contains("Editing … · filesystem.edit"));
     assert!(output.contains("src/lib.rs  +1 -1"));
     assert!(output.contains("replaced 1 line with 1 line"));
-    assert!(output.contains("showing"));
+    assert!(output.contains("live preview"));
     assert!(output.contains("-   2 │     41"));
     assert!(output.contains("+   2 │     42"));
     assert!(!output.contains("\"old_text\""));
