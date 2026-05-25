@@ -35,11 +35,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, spawn_blocking};
 
 const FRAME_V2_MAGIC: &[u8; 4] = b"BSE2";
 const FRAME_V2_VERSION: u16 = 2;
@@ -89,6 +92,8 @@ pub enum SessionStoreError {
     Encode(#[source] bmux_codec::Error),
     #[error("failed to decode session event: {0}")]
     Decode(#[source] bmux_codec::Error),
+    #[error("blocking session store task failed: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
     #[error("session index error: {0}")]
     Index(#[source] serde_json::Error),
     #[error("session event frame is too large: {0} bytes")]
@@ -952,6 +957,73 @@ impl SessionStoreExecutor {
     const fn store(&self) -> &SessionEventStore {
         &self.store
     }
+
+    async fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.load_catalog()).await?
+    }
+
+    async fn load_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionState>, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.load_session(session_id)).await?
+    }
+
+    async fn migrate_event_log_to_current(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionMigrationReport, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.migrate_event_log_to_current(session_id)).await?
+    }
+
+    async fn ensure_fresh_index(
+        &self,
+        session_id: SessionId,
+    ) -> Result<index::SessionIndex, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.ensure_fresh_index(session_id)).await?
+    }
+
+    async fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.delete(session_id)).await?
+    }
+
+    async fn read_session_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.read_session_events(session_id)).await?
+    }
+
+    async fn read_session_history_page(
+        &self,
+        session_id: SessionId,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.read_session_history_page(session_id, query)).await?
+    }
+
+    async fn read_session_input_history(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.read_session_input_history(session_id)).await?
+    }
+
+    async fn read_model_context_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.read_model_context_events(session_id)).await?
+    }
 }
 
 /// In-memory session manager with optional append-only persistence.
@@ -959,13 +1031,13 @@ impl SessionStoreExecutor {
 pub struct SessionManager {
     inner: Mutex<SessionManagerInner>,
     store: Option<SessionStoreExecutor>,
+    activity_clock_ms: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
     catalog_loaded: bool,
-    activity_clock_ms: u64,
     index_rebuilds: BTreeMap<SessionId, JoinHandle<()>>,
     completed_rebuilds: usize,
     failed_rebuilds: usize,
@@ -1098,12 +1170,12 @@ impl SessionManager {
                     .map(|(session_id, state)| (session_id, SessionHandle::new(state)))
                     .collect(),
                 catalog_loaded,
-                activity_clock_ms: current_unix_millis(),
                 index_rebuilds: BTreeMap::new(),
                 completed_rebuilds: 0,
                 failed_rebuilds: 0,
             }),
             store: Some(SessionStoreExecutor::new(store)),
+            activity_clock_ms: AtomicU64::new(current_unix_millis()),
         }
     }
 
@@ -1125,7 +1197,7 @@ impl SessionManager {
         let Some(store) = &self.store else {
             return Err(SessionError::NotFound(session_id));
         };
-        let Some(state) = store.store().load_session(session_id)? else {
+        let Some(state) = store.load_session(session_id).await? else {
             return Err(SessionError::NotFound(session_id));
         };
         let mut inner = self.inner.lock().await;
@@ -1144,7 +1216,7 @@ impl SessionManager {
             self.inner.lock().await.catalog_loaded = true;
             return Ok(());
         };
-        let sessions = store.store().load_catalog()?;
+        let sessions = store.load_catalog().await?;
         let mut inner = self.inner.lock().await;
         for (session_id, state) in sessions {
             inner
@@ -1178,8 +1250,8 @@ impl SessionManager {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        store.store().migrate_event_log_to_current(session_id)?;
-        let index = store.store().ensure_fresh_index(session_id)?;
+        store.migrate_event_log_to_current(session_id).await?;
+        let index = store.ensure_fresh_index(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let clients = {
             let state = handle.state.lock().await;
@@ -1206,7 +1278,7 @@ impl SessionManager {
         let working_directory = normalize_working_directory(&working_directory);
         let id = SessionId::new();
         let (sender, _) = broadcast::channel(512);
-        let now_ms = self.next_activity_timestamp_ms().await;
+        let now_ms = self.next_activity_timestamp_ms();
         let summary = SessionSummary {
             id,
             name: name.clone(),
@@ -1317,7 +1389,7 @@ impl SessionManager {
             .await?;
         let normalized_name = normalize_session_name(name);
         let handle = self.session_handle(session_id).await?;
-        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let mut state = handle.state.lock().await;
         state.ensure_writable()?;
         state.summary.name.clone_from(&normalized_name);
@@ -1353,7 +1425,7 @@ impl SessionManager {
             }
         }
         if let Some(store) = &self.store {
-            store.store().delete(session_id)?;
+            store.delete(session_id).await?;
         }
         let removed = self
             .inner
@@ -1436,7 +1508,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(store.store().read_session_events(session_id)?)
+        Ok(store.read_session_events(session_id).await?)
     }
 
     /// Return a bounded page of replayable history for a session.
@@ -1461,7 +1533,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        let page = store.store().read_session_history_page(session_id, query)?;
+        let page = store.read_session_history_page(session_id, query).await?;
         if should_mark_current {
             self.mark_index_current(session_id).await;
         }
@@ -1486,7 +1558,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(store.store().read_session_input_history(session_id)?)
+        Ok(store.read_session_input_history(session_id).await?)
     }
 
     /// Return the model-visible session events, starting at the latest compaction when possible.
@@ -1507,7 +1579,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(store.store().read_model_context_events(session_id)?)
+        Ok(store.read_model_context_events(session_id).await?)
     }
 
     /// Return the latest session-specific model selection if one has been set.
@@ -1558,7 +1630,7 @@ impl SessionManager {
         self.migrate_session_to_current_if_required(session_id)
             .await?;
         let handle = self.session_handle(session_id).await?;
-        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let mut state = handle.state.lock().await;
         let history = if let Some(events) = &state.events {
             events.clone()
@@ -1567,7 +1639,7 @@ impl SessionManager {
                 .store
                 .as_ref()
                 .ok_or(SessionError::NotFound(session_id))?;
-            store.store().read_session_events(session_id)?
+            store.read_session_events(session_id).await?
         };
         let input_history = input_history_from_events(&history);
         state.ensure_writable()?;
@@ -1620,7 +1692,7 @@ impl SessionManager {
             .events;
         let input_history = self.session_input_history(session_id).await?;
         let handle = self.session_handle(session_id).await?;
-        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let mut state = handle.state.lock().await;
         state.ensure_writable()?;
         state.clients.insert(client_id);
@@ -1655,7 +1727,7 @@ impl SessionManager {
         let Ok(handle) = self.session_handle(session_id).await else {
             return Ok(None);
         };
-        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let mut state = handle.state.lock().await;
         state.ensure_writable()?;
         if state.clients.remove(&client_id) {
@@ -1688,7 +1760,7 @@ impl SessionManager {
         self.migrate_session_to_current_if_required(session_id)
             .await?;
         let handle = self.session_handle(session_id).await?;
-        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let mut state = handle.state.lock().await;
         state.ensure_writable()?;
         let mut events = Vec::new();
@@ -2052,7 +2124,7 @@ impl SessionManager {
         self.migrate_session_to_current_if_required(session_id)
             .await?;
         let handle = self.session_handle(session_id).await?;
-        let activity_timestamp_ms = self.next_activity_timestamp_ms().await;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let mut state = handle.state.lock().await;
         state.ensure_writable()?;
         let event = state.push_event(
@@ -2081,8 +2153,18 @@ impl SessionManager {
         }
     }
 
-    async fn next_activity_timestamp_ms(&self) -> u64 {
-        self.inner.lock().await.next_activity_timestamp_ms()
+    fn next_activity_timestamp_ms(&self) -> u64 {
+        loop {
+            let previous = self.activity_clock_ms.load(Ordering::Acquire);
+            let next = previous.max(current_unix_millis()).saturating_add(1);
+            if self
+                .activity_clock_ms
+                .compare_exchange(previous, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return next;
+            }
+        }
     }
 }
 
@@ -2104,12 +2186,6 @@ impl SessionManagerInner {
             }
         }
         completed
-    }
-
-    fn next_activity_timestamp_ms(&mut self) -> u64 {
-        let now_ms = current_unix_millis();
-        self.activity_clock_ms = self.activity_clock_ms.max(now_ms).saturating_add(1);
-        self.activity_clock_ms
     }
 }
 
