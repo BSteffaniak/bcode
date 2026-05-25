@@ -767,7 +767,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert_eq!(
         buffer
             .get(Point::new(
-                2,
+                6,
                 output_line_y(&buffer, "-   2 │     41").unwrap()
             ))
             .map(|cell| cell.style.fg),
@@ -776,7 +776,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert_eq!(
         buffer
             .get(Point::new(
-                2,
+                6,
                 output_line_y(&buffer, "+   2 │     42").unwrap()
             ))
             .map(|cell| cell.style.fg),
@@ -785,7 +785,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert_eq!(
         buffer
             .get(Point::new(
-                2,
+                4,
                 output_line_y(&buffer, "-   2 │     41").unwrap()
             ))
             .map(|cell| cell.style.bg),
@@ -794,19 +794,20 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     assert_eq!(
         buffer
             .get(Point::new(
-                60,
+                49,
                 output_line_y(&buffer, "+   2 │     42").unwrap()
             ))
             .map(|cell| cell.style.bg),
         Some(Some(bmux_tui::style::Color::Indexed(22)))
     );
-    assert!(
+    assert_eq!(
         buffer
             .get(Point::new(
-                11,
+                99,
                 output_line_y(&buffer, "+   2 │     42").unwrap()
             ))
-            .is_some_and(|cell| cell.style.fg.is_some())
+            .map(|cell| cell.style.bg),
+        Some(None)
     );
 }
 

@@ -34,6 +34,8 @@ use bmux_tui::text_width::{display_width as text_display_width, truncate_to_disp
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
 const MAX_INLINE_DIFF_ROWS: usize = 28;
+const INLINE_DIFF_CARD_MIN_WIDTH: usize = 48;
+const INLINE_DIFF_CARD_MAX_WIDTH: usize = 100;
 const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
@@ -1031,23 +1033,19 @@ fn push_file_edit_preview_rows(rows: &mut Vec<Line>, edit: &FileEditTranscript, 
     );
 
     let preview = inline_diff_preview(&diff_lines, MAX_INLINE_DIFF_ROWS);
+    let card_width = inline_diff_card_width(&preview, width.saturating_sub(2));
+    rows.push(inline_diff_card_border('╭', '─', '╮', card_width));
     for row in preview {
         match row {
             InlineDiffPreviewRow::Line(line) => {
-                rows.push(render_inline_diff_line(line, width.saturating_sub(2)));
+                rows.push(render_inline_diff_line(line, card_width));
             }
             InlineDiffPreviewRow::Hidden(count) => {
-                push_wrapped_styled_text(
-                    rows,
-                    vec![Span::styled("  ", muted_style())],
-                    &format!("… {count} diff rows hidden …"),
-                    width,
-                    muted_style(),
-                    muted_style(),
-                );
+                rows.push(render_inline_diff_hidden_row(count, card_width));
             }
         }
     }
+    rows.push(inline_diff_card_border('╰', '─', '╯', card_width));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1077,6 +1075,64 @@ fn inline_diff_preview(lines: &[DiffLine], max_rows: usize) -> Vec<InlineDiffPre
         .collect()
 }
 
+fn inline_diff_card_width(preview: &[InlineDiffPreviewRow<'_>], available_width: u16) -> u16 {
+    let available = usize::from(available_width.max(1));
+    let content_width = preview
+        .iter()
+        .map(|row| match row {
+            InlineDiffPreviewRow::Line(line) => inline_diff_line_display_width(line),
+            InlineDiffPreviewRow::Hidden(count) => inline_diff_hidden_text(*count).len(),
+        })
+        .max()
+        .unwrap_or(0);
+    let max_width = INLINE_DIFF_CARD_MAX_WIDTH.min(available);
+    let width = content_width
+        .saturating_add(2)
+        .clamp(INLINE_DIFF_CARD_MIN_WIDTH.min(max_width), max_width);
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+fn inline_diff_line_display_width(line: &DiffLine) -> usize {
+    2usize
+        .saturating_add(1)
+        .saturating_add(4)
+        .saturating_add(3)
+        .saturating_add(text_display_width(&line.content))
+}
+
+fn inline_diff_card_border(left: char, fill: char, right: char, width: u16) -> Line {
+    let inner_width = usize::from(width.saturating_sub(2));
+    Line::from_spans(vec![
+        Span::styled("  ", muted_style()),
+        Span::styled(
+            format!("{left}{}{right}", fill.to_string().repeat(inner_width)),
+            muted_style(),
+        ),
+    ])
+}
+
+fn render_inline_diff_hidden_row(count: usize, width: u16) -> Line {
+    let text = inline_diff_hidden_text(count);
+    let inner_width = usize::from(width.saturating_sub(4));
+    let clipped = truncate_to_display_width(&text, inner_width);
+    let clipped_width = text_display_width(&clipped);
+    let mut spans = vec![
+        Span::styled("  ", muted_style()),
+        Span::styled("│ ", muted_style()),
+        Span::styled(clipped, muted_style()),
+    ];
+    let padding = inner_width.saturating_sub(clipped_width);
+    if padding > 0 {
+        spans.push(Span::styled(" ".repeat(padding), muted_style()));
+    }
+    spans.push(Span::styled(" │", muted_style()));
+    Line::from_spans(spans)
+}
+
+fn inline_diff_hidden_text(count: usize) -> String {
+    format!("… {count} diff rows hidden …")
+}
+
 fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
     let (sign, sign_style, body_style) = inline_diff_line_styles(line.kind);
     let row_style = inline_diff_row_style(line.kind);
@@ -1085,9 +1141,13 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
     let gutter_style = row_style.patch(muted_style());
     let body_width = usize::from(width)
         .saturating_sub(2)
+        .saturating_sub(2)
         .saturating_sub(5)
-        .saturating_sub(3);
+        .saturating_sub(3)
+        .saturating_sub(2);
     let mut spans = vec![
+        Span::styled("  ", muted_style()),
+        Span::styled("│ ", row_style.patch(muted_style())),
         Span::styled("  ", gutter_style),
         Span::styled(
             sign,
@@ -1103,6 +1163,7 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Line {
         emphasis_style,
     ));
     pad_inline_diff_spans(&mut spans, usize::from(width), row_style);
+    spans.push(Span::styled(" │", row_style.patch(muted_style())));
     Line::from_spans(spans)
 }
 
