@@ -56,6 +56,8 @@ pub enum SessionError {
     Store(#[from] SessionStoreError),
     #[error("session has connected clients: {0}")]
     ConnectedClients(SessionId),
+    #[error("session is being deleted: {0}")]
+    Deleting(SessionId),
     #[error("session is not writable: {session_id} ({status:?})")]
     NotWritable {
         session_id: SessionId,
@@ -1269,8 +1271,12 @@ impl SessionHandle {
             .await
     }
 
-    async fn can_delete(&self) -> Result<SessionSummary, SessionError> {
-        self.send(SessionCommand::CanDelete).await?
+    fn client_count(&self) -> usize {
+        self.snapshot().summary.client_count
+    }
+
+    async fn shutdown(&self) -> Result<(), SessionError> {
+        self.send(SessionCommand::Shutdown).await
     }
 }
 
@@ -1324,7 +1330,7 @@ enum SessionCommand {
         state: SessionState,
         reply: oneshot::Sender<()>,
     },
-    CanDelete(oneshot::Sender<Result<SessionSummary, SessionError>>),
+    Shutdown(oneshot::Sender<()>),
 }
 
 struct SessionActor {
@@ -1414,8 +1420,9 @@ impl SessionActor {
                     self.refresh_snapshot();
                     let _ = reply.send(());
                 }
-                SessionCommand::CanDelete(reply) => {
-                    let _ = reply.send(self.can_delete());
+                SessionCommand::Shutdown(reply) => {
+                    let _ = reply.send(());
+                    break;
                 }
             }
         }
@@ -1615,14 +1622,6 @@ impl SessionActor {
         };
         let _ = self.state.sender.send(event.clone());
         Some(event)
-    }
-
-    fn can_delete(&self) -> Result<SessionSummary, SessionError> {
-        if self.state.clients.is_empty() {
-            Ok(self.state.summary())
-        } else {
-            Err(SessionError::ConnectedClients(self.state.summary.id))
-        }
     }
 }
 
@@ -2005,9 +2004,9 @@ impl SessionManager {
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionError> {
         let handle = self.session_handle(session_id).await?;
-        let session = handle.can_delete().await?;
-        if let Some(store) = &self.store {
-            store.delete(session_id).await?;
+        let session = handle.summary().await?;
+        if handle.client_count() != 0 {
+            return Err(SessionError::ConnectedClients(session_id));
         }
         self.inner
             .lock()
@@ -2015,6 +2014,10 @@ impl SessionManager {
             .sessions
             .remove(&session_id)
             .ok_or(SessionError::NotFound(session_id))?;
+        if let Some(store) = &self.store {
+            store.delete(session_id).await?;
+        }
+        handle.shutdown().await?;
         Ok(session)
     }
 
@@ -4045,6 +4048,73 @@ mod tests {
                 .map(|entry| entry.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["message 0", "message 1", "message 2", "message 3"]
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_session_appends_have_contiguous_sequences() {
+        let root = unique_temp_dir();
+        let manager = std::sync::Arc::new(
+            SessionManager::persistent(&root).expect("manager should initialize"),
+        );
+        let session = manager
+            .create_session(Some("concurrent".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let manager = std::sync::Arc::clone(&manager);
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .append_event(
+                        session.id,
+                        SessionEventKind::SystemMessage {
+                            text: format!("message {index}"),
+                        },
+                    )
+                    .await
+                    .expect("event should append")
+            }));
+        }
+
+        let mut sequences = Vec::new();
+        for task in tasks {
+            sequences.push(task.await.expect("task should join").sequence);
+        }
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=16).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn catalog_status_subscription_reports_loaded() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        manager
+            .create_session(Some("catalog".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+
+        let restored = SessionManager::persistent_lazy(&root);
+        let mut status = restored.subscribe_catalog_status();
+        assert_eq!(*status.borrow(), super::CatalogLoadStatus::NotStarted);
+        restored.start_catalog_load();
+        loop {
+            if matches!(*status.borrow(), super::CatalogLoadStatus::Loaded) {
+                break;
+            }
+            status.changed().await.expect("status should change");
+        }
+        assert_eq!(
+            restored
+                .cached_sessions(&test_working_directory())
+                .await
+                .len(),
+            1
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
