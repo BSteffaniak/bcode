@@ -160,6 +160,7 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "parsing",
     "regex-onig",
 ] }
+tempfile = { version = "3.27.0", default-features = false }
 test-log = { version = "0.2.20", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }

@@ -320,11 +320,117 @@ fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{create_worktree, list_worktrees, remove_worktree, slugify};
+    use bcode_worktree_models::WorktreeCreateRequest;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    struct TempRepo {
+        _temp: TempDir,
+        root: std::path::PathBuf,
+    }
+
+    impl TempRepo {
+        fn init() -> Self {
+            let temp = tempfile::tempdir().expect("temp dir should be created");
+            run(temp.path(), &["init", "--initial-branch", "main"]);
+            run(temp.path(), &["config", "user.email", "bcode@example.test"]);
+            run(temp.path(), &["config", "user.name", "Bcode Test"]);
+            std::fs::write(temp.path().join("README.md"), "test\n")
+                .expect("readme should be written");
+            run(temp.path(), &["add", "README.md"]);
+            run(temp.path(), &["commit", "-m", "initial"]);
+            Self {
+                root: temp.path().to_path_buf(),
+                _temp: temp,
+            }
+        }
+    }
+
+    fn run(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn create_request(name: &str) -> WorktreeCreateRequest {
+        WorktreeCreateRequest {
+            name: name.to_string(),
+            cwd: None,
+            path: None,
+            branch: None,
+            new_branch: None,
+            base_ref: None,
+            detach: false,
+            force: false,
+            attach_session_id: None,
+            new_session: false,
+            no_setup: true,
+        }
+    }
 
     #[test]
     fn slugify_normalizes_task_names() {
         assert_eq!(slugify("Feature Auth"), "feature-auth");
         assert_eq!(slugify(" fix:issue!! "), "fix-issue");
+    }
+
+    #[test]
+    fn list_worktrees_includes_main_worktree() {
+        let repo = TempRepo::init();
+
+        let response = list_worktrees(&repo.root).expect("worktrees should list");
+
+        assert_eq!(
+            response
+                .repo_root
+                .canonicalize()
+                .expect("repo root canonical"),
+            repo.root.canonicalize().expect("temp root canonical")
+        );
+        assert!(response.worktrees.iter().any(|worktree| worktree.is_main));
+    }
+
+    #[test]
+    fn create_worktree_uses_default_path_and_branch() {
+        let repo = TempRepo::init();
+        let request = create_request("Feature Auth");
+
+        let response = create_worktree(&bcode_config::BcodeConfig::default(), &request, &repo.root)
+            .expect("worktree should be created");
+
+        assert_eq!(response.branch.as_deref(), Some("bcode/feature-auth"));
+        assert!(response.path.ends_with(".bcode/worktrees/feature-auth"));
+        assert!(response.path.join("README.md").exists());
+        let listed = list_worktrees(&repo.root).expect("worktrees should list");
+        assert!(
+            listed
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == response.path)
+        );
+    }
+
+    #[test]
+    fn remove_worktree_removes_registered_worktree() {
+        let repo = TempRepo::init();
+        let request = create_request("Remove Me");
+        let response = create_worktree(&bcode_config::BcodeConfig::default(), &request, &repo.root)
+            .expect("worktree should be created");
+
+        let removed =
+            remove_worktree(&repo.root, &response.path, false).expect("worktree should be removed");
+
+        assert_eq!(removed.path, response.path);
+        assert!(!removed.path.exists());
     }
 }

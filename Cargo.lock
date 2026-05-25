@@ -1201,6 +1201,7 @@ dependencies = [
  "bcode_config",
  "bcode_worktree_models",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "worktree_setup_config",
  "worktree_setup_git",

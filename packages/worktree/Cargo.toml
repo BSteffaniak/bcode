@@ -19,6 +19,9 @@ worktree_setup_config     = { workspace = true }
 worktree_setup_git        = { workspace = true }
 worktree_setup_operations = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []
