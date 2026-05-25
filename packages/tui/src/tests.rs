@@ -1675,6 +1675,7 @@ fn thinking_label_uses_effective_values() {
             summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
             default_summary: Some("auto".to_owned()),
             raw_reasoning_supported: false,
+            source: bcode_model::ModelReasoningCapabilitySource::KnownModelTable,
         }),
         reasoning_effort: None,
         reasoning_summary: Some("detailed".to_owned()),
@@ -1701,6 +1702,7 @@ fn thinking_dialog_cycles_supported_values() {
             summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
             default_summary: Some("auto".to_owned()),
             raw_reasoning_supported: false,
+            source: bcode_model::ModelReasoningCapabilitySource::KnownModelTable,
         }),
         reasoning_effort: Some("low".to_owned()),
         reasoning_summary: Some("auto".to_owned()),
@@ -1731,6 +1733,7 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
             summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
             default_summary: Some("auto".to_owned()),
             raw_reasoning_supported: false,
+            source: bcode_model::ModelReasoningCapabilitySource::KnownModelTable,
         }),
         reasoning_effort: Some("low".to_owned()),
         reasoning_summary: Some("auto".to_owned()),
@@ -1766,10 +1769,16 @@ fn thinking_dialog_cycles_fallback_values_when_provider_values_are_unknown() {
 
     dialog.focus_next();
     dialog.cycle_focused();
-    assert_eq!(dialog.effort(), Some("minimal"));
-    assert!(!dialog.effort_values_are_provider_declared());
+    assert_eq!(dialog.effort(), Some("none"));
+    assert_eq!(
+        dialog.effort_values_source(),
+        bcode_model::ModelReasoningCapabilitySource::GenericFallback
+    );
     dialog.focus_next();
     dialog.cycle_focused();
     assert_eq!(dialog.summary(), Some("auto"));
-    assert!(!dialog.summary_values_are_provider_declared());
+    assert_eq!(
+        dialog.summary_values_source(),
+        bcode_model::ModelReasoningCapabilitySource::GenericFallback
+    );
 }

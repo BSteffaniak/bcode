@@ -72,7 +72,7 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
         state.effective_effort_label(),
         Some(&values_help(
             state.effort_values(),
-            state.effort_values_are_provider_declared(),
+            state.effort_values_source(),
         )),
     ));
     rows.push(setting_row(
@@ -81,7 +81,7 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
         state.effective_summary_label(),
         Some(&values_help(
             state.summary_values(),
-            state.summary_values_are_provider_declared(),
+            state.summary_values_source(),
         )),
     ));
     rows.push(modal_blank_line());
@@ -155,12 +155,24 @@ fn setting_row(focused: bool, label: &str, value: &str, help: Option<&str>) -> L
     Line::from_spans(spans)
 }
 
-fn values_help(values: &[String], provider_declared: bool) -> String {
+fn values_help(values: &[String], source: bcode_model::ModelReasoningCapabilitySource) -> String {
     if values.is_empty() {
-        "provider values unknown".to_owned()
-    } else if provider_declared {
-        format!("available: {}", values.join(", "))
-    } else {
-        format!("fallback: {}", values.join(", "))
+        return "not supported or unknown".to_owned();
+    }
+    let values = values.join(", ");
+    match source {
+        bcode_model::ModelReasoningCapabilitySource::ConfigOverride => {
+            format!("config: {values}")
+        }
+        bcode_model::ModelReasoningCapabilitySource::ProviderMetadata => {
+            format!("provider: {values}")
+        }
+        bcode_model::ModelReasoningCapabilitySource::KnownModelTable => {
+            format!("known model: {values}")
+        }
+        bcode_model::ModelReasoningCapabilitySource::GenericFallback
+        | bcode_model::ModelReasoningCapabilitySource::Unknown => {
+            format!("common values; provider may reject: {values}")
+        }
     }
 }

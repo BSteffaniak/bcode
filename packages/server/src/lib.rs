@@ -2224,6 +2224,7 @@ fn reasoning_capabilities_from_config(
         summary_values: reasoning.summary_values.clone(),
         default_summary: reasoning.default_summary.clone(),
         raw_reasoning_supported: reasoning.raw_reasoning_supported.unwrap_or_default(),
+        source: bcode_model::ModelReasoningCapabilitySource::ConfigOverride,
     })
 }
 

@@ -86,6 +86,23 @@ pub struct ModelInfo {
     pub reasoning: Option<ModelReasoningInfo>,
 }
 
+/// Source of model reasoning capability metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelReasoningCapabilitySource {
+    /// No source was provided.
+    #[default]
+    Unknown,
+    /// User or administrator configuration override.
+    ConfigOverride,
+    /// Provider model metadata explicitly declared the values.
+    ProviderMetadata,
+    /// Bcode inferred values from a maintained provider/model compatibility table.
+    KnownModelTable,
+    /// Generic compatibility fallback; the provider may reject unsupported values.
+    GenericFallback,
+}
+
 /// Per-model reasoning/thinking controls exposed by a provider.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelReasoningInfo {
@@ -107,6 +124,9 @@ pub struct ModelReasoningInfo {
     /// Whether raw provider reasoning text can be requested.
     #[serde(default)]
     pub raw_reasoning_supported: bool,
+    /// Source of this capability metadata.
+    #[serde(default)]
+    pub source: ModelReasoningCapabilitySource,
 }
 
 /// Per-model capability.

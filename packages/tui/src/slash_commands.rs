@@ -191,7 +191,8 @@ fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {
             .reasoning
             .as_ref()
             .map_or_else(String::new, |reasoning| format!(
-                "\navailable effort: {}\navailable summary: {}",
+                "\nsource: {}\navailable effort: {}\navailable summary: {}",
+                reasoning_source_label(reasoning.source),
                 list_or_default(&reasoning.effort_values),
                 list_or_default(&reasoning.summary_values)
             ))
@@ -203,7 +204,8 @@ fn thinking_capabilities(status: &bcode_ipc::SessionModelStatus) -> String {
         return "thinking: no provider-declared reasoning capabilities for this model".to_owned();
     };
     format!(
-        "thinking capabilities\neffort: {}\ndefault effort: {}\nvisible summary: {}\nsummary values: {}\ndefault summary: {}\nraw reasoning: {}",
+        "thinking capabilities\nsource: {}\neffort: {}\ndefault effort: {}\nvisible summary: {}\nsummary values: {}\ndefault summary: {}\nraw reasoning: {}",
+        reasoning_source_label(reasoning.source),
         list_or_default(&reasoning.effort_values),
         reasoning.default_effort.as_deref().unwrap_or("unknown"),
         reasoning.visible_summary_supported,
@@ -211,6 +213,20 @@ fn thinking_capabilities(status: &bcode_ipc::SessionModelStatus) -> String {
         reasoning.default_summary.as_deref().unwrap_or("unknown"),
         reasoning.raw_reasoning_supported,
     )
+}
+
+const fn reasoning_source_label(
+    source: bcode_model::ModelReasoningCapabilitySource,
+) -> &'static str {
+    match source {
+        bcode_model::ModelReasoningCapabilitySource::ConfigOverride => "config override",
+        bcode_model::ModelReasoningCapabilitySource::ProviderMetadata => "provider metadata",
+        bcode_model::ModelReasoningCapabilitySource::KnownModelTable => "known model table",
+        bcode_model::ModelReasoningCapabilitySource::GenericFallback => {
+            "common fallback; provider may reject"
+        }
+        bcode_model::ModelReasoningCapabilitySource::Unknown => "unknown",
+    }
 }
 
 fn list_or_default(values: &[String]) -> String {

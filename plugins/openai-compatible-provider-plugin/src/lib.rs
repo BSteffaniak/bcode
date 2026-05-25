@@ -9,13 +9,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_config::AuthMode;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
-    NativeWebSearchRequest, NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN,
-    OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS,
-    OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
-    ProviderRequestContext, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
-    ValidateConfigResponse,
+    MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage,
+    ModelReasoningCapabilitySource, ModelTurnRequest, NativeWebSearchRequest,
+    NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
+    OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
+    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestContext,
+    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -234,6 +234,7 @@ struct ReasoningRequestShape {
     include_summary: &'static [&'static str],
     fallback_effort_values: &'static [&'static str],
     fallback_summary_values: &'static [&'static str],
+    source: ModelReasoningCapabilitySource,
 }
 
 impl OpenAiCompatibleDialect {
@@ -245,20 +246,23 @@ impl OpenAiCompatibleDialect {
                 include_summary: &[],
                 fallback_effort_values: &["low", "medium", "high"],
                 fallback_summary_values: &[],
+                source: ModelReasoningCapabilitySource::GenericFallback,
             },
             Self::ResponsesApi => ReasoningRequestShape {
                 supports_reasoning_object: true,
                 include_state: &[],
                 include_summary: &["reasoning.summary"],
-                fallback_effort_values: &["minimal", "low", "medium", "high"],
+                fallback_effort_values: &["none", "minimal", "low", "medium", "high", "xhigh"],
                 fallback_summary_values: &["auto", "concise", "detailed"],
+                source: ModelReasoningCapabilitySource::KnownModelTable,
             },
             Self::ChatGptCodex => ReasoningRequestShape {
                 supports_reasoning_object: true,
                 include_state: &["reasoning.encrypted_content"],
                 include_summary: &["reasoning.summary"],
-                fallback_effort_values: &["minimal", "low", "medium", "high"],
+                fallback_effort_values: &["none", "minimal", "low", "medium", "high", "xhigh"],
                 fallback_summary_values: &["auto", "concise", "detailed"],
+                source: ModelReasoningCapabilitySource::KnownModelTable,
             },
         }
     }
@@ -2290,32 +2294,129 @@ fn reasoning_info_for_model(
         return metadata_reasoning;
     }
     let lower = model.id.to_ascii_lowercase();
+    let known = known_reasoning_info(&lower, shape);
+    if known.is_some() {
+        return known;
+    }
     if lower.contains("gpt-5") || lower.contains("o3") || lower.contains("o4") {
-        Some(bcode_model::ModelReasoningInfo {
-            effort_values: shape
-                .fallback_effort_values
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-            default_effort: shape
-                .fallback_effort_values
-                .contains(&"medium")
-                .then(|| "medium".to_string()),
-            visible_summary_supported: !shape.include_summary.is_empty(),
-            summary_values: shape
-                .fallback_summary_values
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-            default_summary: shape
-                .fallback_summary_values
-                .contains(&"auto")
-                .then(|| "auto".to_string()),
-            raw_reasoning_supported: false,
-        })
+        Some(reasoning_info(
+            shape.fallback_effort_values,
+            default_value(shape.fallback_effort_values, "medium"),
+            !shape.include_summary.is_empty(),
+            shape.fallback_summary_values,
+            default_value(shape.fallback_summary_values, "auto"),
+            false,
+            shape.source,
+        ))
     } else {
         None
     }
+}
+
+fn known_reasoning_info(
+    model_id: &str,
+    shape: ReasoningRequestShape,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    if model_id.contains("grok-4") {
+        return None;
+    }
+    if model_id.contains("grok") || model_id.contains("x-ai/") || model_id.contains("xai/") {
+        return Some(reasoning_info(
+            &["low", "high"],
+            None,
+            false,
+            &[],
+            None,
+            false,
+            ModelReasoningCapabilitySource::KnownModelTable,
+        ));
+    }
+    if model_id.contains("qwen3") || model_id.contains("qwen-3") {
+        return Some(reasoning_info(
+            &["none", "default"],
+            Some("default"),
+            false,
+            &[],
+            None,
+            true,
+            ModelReasoningCapabilitySource::KnownModelTable,
+        ));
+    }
+    if model_id.contains("gpt-oss") {
+        return Some(reasoning_info(
+            &["low", "medium", "high"],
+            Some("medium"),
+            false,
+            &[],
+            None,
+            true,
+            ModelReasoningCapabilitySource::KnownModelTable,
+        ));
+    }
+    if model_id.contains("gpt-5-pro") || model_id.contains("gpt-5.5-pro") {
+        return Some(reasoning_info(
+            &["high"],
+            Some("high"),
+            !shape.include_summary.is_empty(),
+            shape.fallback_summary_values,
+            default_value(shape.fallback_summary_values, "auto"),
+            false,
+            ModelReasoningCapabilitySource::KnownModelTable,
+        ));
+    }
+    if model_id.contains("gpt-5.5") {
+        return Some(reasoning_info(
+            &["none", "minimal", "low", "medium", "high", "xhigh"],
+            Some("medium"),
+            !shape.include_summary.is_empty(),
+            shape.fallback_summary_values,
+            default_value(shape.fallback_summary_values, "auto"),
+            false,
+            ModelReasoningCapabilitySource::KnownModelTable,
+        ));
+    }
+    if model_id.contains("gpt-5.1") {
+        return Some(reasoning_info(
+            &["none", "low", "medium", "high"],
+            Some("none"),
+            !shape.include_summary.is_empty(),
+            shape.fallback_summary_values,
+            default_value(shape.fallback_summary_values, "auto"),
+            false,
+            ModelReasoningCapabilitySource::KnownModelTable,
+        ));
+    }
+    None
+}
+
+fn reasoning_info(
+    effort_values: &[&str],
+    default_effort: Option<&str>,
+    visible_summary_supported: bool,
+    summary_values: &[&str],
+    default_summary: Option<&str>,
+    raw_reasoning_supported: bool,
+    source: ModelReasoningCapabilitySource,
+) -> bcode_model::ModelReasoningInfo {
+    bcode_model::ModelReasoningInfo {
+        effort_values: effort_values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        default_effort: default_effort.map(str::to_string),
+        visible_summary_supported,
+        summary_values: summary_values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        default_summary: default_summary.map(str::to_string),
+        raw_reasoning_supported,
+        source,
+    }
+}
+
+fn default_value<'a>(values: &'a [&str], value: &'a str) -> Option<&'a str> {
+    values.contains(&value).then_some(value)
 }
 
 fn reasoning_info_from_metadata(
@@ -2329,6 +2430,7 @@ fn reasoning_info_from_metadata(
         summary_values: string_array_field(reasoning, "summary_values"),
         default_summary: string_field(reasoning, "default_summary"),
         raw_reasoning_supported: bool_field(reasoning, "raw_reasoning_supported"),
+        source: ModelReasoningCapabilitySource::ProviderMetadata,
     })
 }
 

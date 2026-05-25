@@ -23,7 +23,7 @@ impl ThinkingDialogFocus {
     }
 }
 
-const FALLBACK_EFFORT_VALUES: &[&str] = &["minimal", "low", "medium", "high"];
+const FALLBACK_EFFORT_VALUES: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 const FALLBACK_SUMMARY_VALUES: &[&str] = &["auto", "concise", "detailed"];
 
 /// Pending thinking settings dialog state.
@@ -36,8 +36,7 @@ pub struct ThinkingDialogState {
     summary_values: Vec<String>,
     default_effort: Option<String>,
     default_summary: Option<String>,
-    provider_declared_effort_values: bool,
-    provider_declared_summary_values: bool,
+    source: bcode_model::ModelReasoningCapabilitySource,
     focused_row: usize,
 }
 
@@ -46,10 +45,10 @@ impl ThinkingDialogState {
     #[must_use]
     pub fn new(visible: bool, status: &SessionModelStatus) -> Self {
         let reasoning = status.reasoning.as_ref();
-        let provider_declared_effort_values =
-            reasoning.is_some_and(|reasoning| !reasoning.effort_values.is_empty());
-        let provider_declared_summary_values =
-            reasoning.is_some_and(|reasoning| !reasoning.summary_values.is_empty());
+        let source = reasoning.map_or(
+            bcode_model::ModelReasoningCapabilitySource::GenericFallback,
+            |reasoning| reasoning.source,
+        );
         Self {
             visible,
             effort: status.reasoning_effort.clone(),
@@ -64,8 +63,7 @@ impl ThinkingDialogState {
             ),
             default_effort: reasoning.and_then(|reasoning| reasoning.default_effort.clone()),
             default_summary: reasoning.and_then(|reasoning| reasoning.default_summary.clone()),
-            provider_declared_effort_values,
-            provider_declared_summary_values,
+            source,
             focused_row: ThinkingDialogFocus::Display.row(),
         }
     }
@@ -106,10 +104,10 @@ impl ThinkingDialogState {
         &self.effort_values
     }
 
-    /// Return whether effort values are provider-declared.
+    /// Return the source of the effort values.
     #[must_use]
-    pub const fn effort_values_are_provider_declared(&self) -> bool {
-        self.provider_declared_effort_values
+    pub const fn effort_values_source(&self) -> bcode_model::ModelReasoningCapabilitySource {
+        self.source
     }
 
     /// Return supported summary values.
@@ -118,10 +116,10 @@ impl ThinkingDialogState {
         &self.summary_values
     }
 
-    /// Return whether summary values are provider-declared.
+    /// Return the source of the summary values.
     #[must_use]
-    pub const fn summary_values_are_provider_declared(&self) -> bool {
-        self.provider_declared_summary_values
+    pub const fn summary_values_source(&self) -> bcode_model::ModelReasoningCapabilitySource {
+        self.source
     }
 
     /// Return effective effort label.
