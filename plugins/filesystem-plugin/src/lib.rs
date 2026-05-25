@@ -391,6 +391,7 @@ fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
             output: format!("unknown filesystem tool: {}", request.name),
             is_error: true,
             content: Vec::new(),
+            full_output: None,
         },
     };
     json_response(&response)
@@ -424,6 +425,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
             ),
             is_error: true,
             content: Vec::new(),
+            full_output: None,
         };
     };
     let lines = contents.lines().collect::<Vec<_>>();
@@ -460,6 +462,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
         output,
         is_error: false,
         content: Vec::new(),
+        full_output: None,
     }
 }
 
@@ -489,6 +492,7 @@ fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationR
                 },
             },
         }],
+        full_output: None,
     }
 }
 
@@ -540,6 +544,7 @@ fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocatio
                     output: format!("wrote {bytes_written} bytes"),
                     is_error: false,
                     content: Vec::new(),
+                    full_output: None,
                 },
             )
         }
@@ -556,11 +561,13 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                     output: error,
                     is_error: true,
                     content: Vec::new(),
+                    full_output: None,
                 },
                 |replacements| ToolInvocationResponse {
                     output: format!("applied {replacements} replacement"),
                     is_error: false,
                     content: Vec::new(),
+                    full_output: None,
                 },
             )
         }
@@ -576,6 +583,7 @@ fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocati
                 .to_string(),
             is_error: false,
             content: Vec::new(),
+            full_output: None,
         },
         Err(error) => tool_json_error(&error),
     }
@@ -1394,6 +1402,7 @@ fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
         output: error.to_string(),
         is_error: true,
         content: Vec::new(),
+        full_output: None,
     }
 }
 
@@ -1402,6 +1411,7 @@ fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
         output: error.to_string(),
         is_error: true,
         content: Vec::new(),
+        full_output: None,
     }
 }
 
@@ -1414,11 +1424,13 @@ where
             output,
             is_error: false,
             content: Vec::new(),
+            full_output: None,
         },
         Err(error) => ToolInvocationResponse {
             output: error.to_string(),
             is_error: true,
             content: Vec::new(),
+            full_output: None,
         },
     }
 }

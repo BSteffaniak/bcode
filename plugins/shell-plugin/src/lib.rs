@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_FINAL_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
+const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
 
 /// Bundled shell plugin.
 #[derive(Default)]
@@ -125,6 +125,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             output: format!("unknown shell tool: {}", request.name),
             is_error: true,
             content: Vec::new(),
+            full_output: None,
         },
     };
     json_response(&response)
@@ -144,6 +145,7 @@ fn run_shell_tool(
                 output: error.to_string(),
                 is_error: true,
                 content: Vec::new(),
+                full_output: None,
             };
         }
     };
@@ -152,6 +154,7 @@ fn run_shell_tool(
             output: "command must not be empty".to_string(),
             is_error: true,
             content: Vec::new(),
+            full_output: None,
         };
     }
     emit_tool_stream_event(
@@ -173,6 +176,7 @@ fn run_shell_tool(
                 output: error,
                 is_error: true,
                 content: Vec::new(),
+                full_output: None,
             },
         }
     };
@@ -220,6 +224,7 @@ fn run_terminal_shell_command(
             output: error,
             is_error: true,
             content: Vec::new(),
+            full_output: None,
         },
     }
 }
@@ -281,29 +286,43 @@ fn run_terminal_shell_command_inner(
     };
     drop(pair.master);
     let output = join_reader(reader_thread)?;
-    let terminal_output = limit_terminal_final_output(&output);
+    let inline_output = limit_terminal_inline_output(&output);
     let terminal_output = TerminalCommandOutput {
         mode: "terminal",
         exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
         timed_out,
-        output: terminal_output.text,
-        output_truncated: terminal_output.truncated,
-        output_bytes: u64::try_from(terminal_output.original_bytes).unwrap_or(u64::MAX),
-        retained_output_bytes: u64::try_from(terminal_output.retained_bytes).unwrap_or(u64::MAX),
+        output: inline_output.text,
+        output_truncated: inline_output.truncated,
+        output_bytes: u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX),
+        retained_output_bytes: u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
+        columns,
+        rows,
+    };
+    let full_terminal_output = TerminalCommandOutput {
+        mode: "terminal",
+        exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
+        timed_out,
+        output: output.text,
+        output_truncated: output.truncated,
+        output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
+        retained_output_bytes: u64::try_from(output.retained_bytes).unwrap_or(u64::MAX),
         columns,
         rows,
     };
     let encoded = serde_json::to_string(&terminal_output).map_err(|error| error.to_string())?;
+    let full_encoded =
+        serde_json::to_string(&full_terminal_output).map_err(|error| error.to_string())?;
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: timed_out || !status.success(),
         content: Vec::new(),
+        full_output: Some(full_encoded),
     })
 }
 
-fn limit_terminal_final_output(output: &LimitedOutput) -> LimitedOutput {
+fn limit_terminal_inline_output(output: &LimitedOutput) -> LimitedOutput {
     let bytes = output.text.as_bytes();
-    let limit = MAX_FINAL_TERMINAL_OUTPUT_BYTES.min(bytes.len());
+    let limit = MAX_INLINE_TERMINAL_OUTPUT_BYTES.min(bytes.len());
     let start = bytes.len().saturating_sub(limit);
     let start = utf8_boundary_at_or_after(&output.text, start);
     let text = output.text[start..].to_owned();
@@ -384,6 +403,7 @@ fn run_shell_command(
         output,
         is_error: result.timed_out || result.exit_code.is_none_or(|code| code != 0),
         content: Vec::new(),
+        full_output: None,
     })
 }
 
@@ -561,33 +581,33 @@ mod tests {
     #[test]
     fn terminal_result_tail_marks_truncation_and_byte_counts() {
         let output = LimitedOutput {
-            text: format!("{}tail", "x".repeat(MAX_FINAL_TERMINAL_OUTPUT_BYTES + 128)),
-            original_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
-            retained_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
+            text: format!("{}tail", "x".repeat(MAX_INLINE_TERMINAL_OUTPUT_BYTES + 128)),
+            original_bytes: MAX_INLINE_TERMINAL_OUTPUT_BYTES + 132,
+            retained_bytes: MAX_INLINE_TERMINAL_OUTPUT_BYTES + 132,
             truncated: false,
         };
 
-        let limited = limit_terminal_final_output(&output);
+        let limited = limit_terminal_inline_output(&output);
 
         assert!(limited.truncated);
         assert_eq!(limited.original_bytes, output.original_bytes);
-        assert!(limited.retained_bytes <= MAX_FINAL_TERMINAL_OUTPUT_BYTES);
+        assert!(limited.retained_bytes <= MAX_INLINE_TERMINAL_OUTPUT_BYTES);
         assert!(limited.text.ends_with("tail"));
     }
 
     #[test]
     fn terminal_final_output_is_smaller_tail() {
         let output = LimitedOutput {
-            text: format!("{}tail", "x".repeat(MAX_FINAL_TERMINAL_OUTPUT_BYTES + 128)),
-            original_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
-            retained_bytes: MAX_FINAL_TERMINAL_OUTPUT_BYTES + 132,
+            text: format!("{}tail", "x".repeat(MAX_INLINE_TERMINAL_OUTPUT_BYTES + 128)),
+            original_bytes: MAX_INLINE_TERMINAL_OUTPUT_BYTES + 132,
+            retained_bytes: MAX_INLINE_TERMINAL_OUTPUT_BYTES + 132,
             truncated: false,
         };
 
-        let limited = limit_terminal_final_output(&output);
+        let limited = limit_terminal_inline_output(&output);
 
         assert!(limited.truncated);
-        assert!(limited.retained_bytes <= MAX_FINAL_TERMINAL_OUTPUT_BYTES);
+        assert!(limited.retained_bytes <= MAX_INLINE_TERMINAL_OUTPUT_BYTES);
         assert!(limited.text.ends_with("tail"));
     }
 

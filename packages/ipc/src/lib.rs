@@ -1027,6 +1027,7 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 result: "z".repeat(MAX_FRAME_PAYLOAD_SIZE + 100_000),
                 is_error: false,
+                output: None,
             },
         });
         let envelope = event_envelope(&event).expect("event should encode");

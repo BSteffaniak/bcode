@@ -3010,12 +3010,13 @@ fn session_event_compaction_line(
             tool_call_id,
             result,
             is_error,
+            output,
         } => Some(format!(
             "#{} tool result {tool_call_id} (error={is_error}):\n{}",
             event.sequence,
             project_tool_result_for_model_context(
                 result,
-                None,
+                output.as_ref().map(trace_blob_read_path),
                 tool_output_context_chars.min(COMPACTION_TOOL_RESULT_CHARS),
             )
         )),
@@ -4736,6 +4737,15 @@ fn project_tool_result_for_model_context(
     output
 }
 
+fn trace_blob_read_path(blob: &TraceBlobRef) -> PathBuf {
+    let path = PathBuf::from(&blob.path);
+    if path.is_absolute() {
+        path
+    } else {
+        default_trace_store_dir().join(path)
+    }
+}
+
 fn format_block_or_placeholder(value: &str, placeholder: &str) -> String {
     if value.is_empty() {
         format!("  {placeholder}")
@@ -4819,13 +4829,15 @@ async fn execute_model_tool(
             output: error,
             is_error: true,
             content: Vec::new(),
+            full_output: None,
         });
+    let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
             state.trace_store.write_text_blob(
                 session_id,
                 &format!("tool-output-{}", call.id),
-                &result.output,
+                artifact_output,
                 0,
             )
         })
@@ -4839,7 +4851,7 @@ async fn execute_model_tool(
             tool_call_id: call.id.clone(),
             duration_ms: elapsed_ms(tool_start),
             is_error: result.is_error,
-            output_bytes: result.output.len(),
+            output_bytes: artifact_output.len(),
             output: output_blob.clone(),
         },
     )
@@ -4851,6 +4863,7 @@ async fn execute_model_tool(
         result.output,
         result.is_error,
         result.content,
+        output_blob,
     )
     .await;
 }
@@ -4912,6 +4925,7 @@ async fn invoke_model_tool(
                     .unwrap_or_else(|| "tool denied by active agent policy".to_string()),
                 is_error: true,
                 content: Vec::new(),
+                full_output: None,
             });
         }
         AgentDecision::Ask => {
@@ -4920,6 +4934,7 @@ async fn invoke_model_tool(
                     output: "permission denied".to_string(),
                     is_error: true,
                     content: Vec::new(),
+                    full_output: None,
                 });
             }
         }
@@ -5403,6 +5418,7 @@ fn session_event_to_model_message_with_limit(
             tool_call_id,
             result,
             is_error,
+            output,
         } => Some(ModelMessage {
             role: MessageRole::Tool,
             content: vec![ContentBlock::ToolResult {
@@ -5410,7 +5426,7 @@ fn session_event_to_model_message_with_limit(
                     call_id: tool_call_id.clone(),
                     output: project_tool_result_for_model_context(
                         result,
-                        None,
+                        output.as_ref().map(trace_blob_read_path),
                         tool_output_context_chars,
                     ),
                     is_error: *is_error,
@@ -5615,10 +5631,18 @@ async fn append_tool_finished_event(
     result: String,
     is_error: bool,
     content: Vec<ToolResultContent>,
+    output: Option<TraceBlobRef>,
 ) {
-    if let Err(error) =
-        append_tool_finished_event_inner(state, session_id, tool_call_id, result, is_error, content)
-            .await
+    if let Err(error) = append_tool_finished_event_inner(
+        state,
+        session_id,
+        tool_call_id,
+        result,
+        is_error,
+        content,
+        output,
+    )
+    .await
     {
         eprintln!("failed to append tool result: {error}");
     }
@@ -5631,6 +5655,7 @@ async fn append_tool_finished_event_inner(
     result: String,
     is_error: bool,
     content: Vec<ToolResultContent>,
+    output: Option<TraceBlobRef>,
 ) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
@@ -5642,6 +5667,7 @@ async fn append_tool_finished_event_inner(
             tool_call_id,
             format!("{result}{content_note}"),
             is_error,
+            output,
         )
         .await?;
     publish_session_event(state, &event).await;
@@ -6541,6 +6567,7 @@ mod tests {
                     tool_call_id: "call-1".to_string(),
                     result: "ok".to_string(),
                     is_error: false,
+                    output: None,
                 },
             ),
         ];
@@ -6584,6 +6611,7 @@ mod tests {
                     tool_call_id: "call-1".to_string(),
                     result: format!("{}tail", "x".repeat(4_000)),
                     is_error: false,
+                    output: None,
                 },
             )],
             1_000,
@@ -7057,6 +7085,7 @@ mod tests {
             canonical_result.clone(),
             false,
             Vec::new(),
+            None,
         )
         .await
         .expect("tool result event should append");
@@ -7080,6 +7109,7 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 result: output,
                 is_error: false,
+                output: None,
             },
         };
 

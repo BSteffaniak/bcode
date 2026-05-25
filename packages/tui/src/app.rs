@@ -718,6 +718,7 @@ impl BmuxApp {
                 tool_call_id,
                 result,
                 is_error,
+                ..
             } => {
                 self.set_activity(ActivityState::Thinking);
                 self.push_tool_result(tool_call_id, result, *is_error);

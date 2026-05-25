@@ -3182,10 +3182,14 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             tool_call_id,
             result,
             is_error,
+            output,
         } => {
             let status = if *is_error { "error" } else { "ok" };
+            let artifact = output
+                .as_ref()
+                .map_or_else(String::new, |output| format!(" artifact={}", output.path));
             println!(
-                "#{} tool call finished ({status}): {tool_call_id}: {result}",
+                "#{} tool call finished ({status}): {tool_call_id}: {result}{artifact}",
                 event.sequence
             );
         }

@@ -294,6 +294,7 @@ impl From<BadReasoningOrderSessionEventKind> for SessionEventKind {
                 tool_call_id,
                 result,
                 is_error,
+                output: None,
             },
             BadReasoningOrderSessionEventKind::PermissionRequested {
                 permission_id,

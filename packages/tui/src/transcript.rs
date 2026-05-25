@@ -575,6 +575,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             result,
             is_error,
+            ..
         } => {
             if streamed_tool_results
                 .get(tool_call_id)

@@ -32,6 +32,7 @@ const BUILTIN_SESSION_EVENT_MIGRATIONS: &[NoOpSessionEventMigration] = &[
     NoOpSessionEventMigration::new("sessions-events-v10-to-v11", 10, 11),
     NoOpSessionEventMigration::new("sessions-events-v11-to-v12", 11, 12),
     NoOpSessionEventMigration::new("sessions-events-v12-to-v13", 12, 13),
+    NoOpSessionEventMigration::new("sessions-events-v13-to-v14", 13, 14),
 ];
 
 trait SessionEventMigrationStep {
@@ -507,6 +508,7 @@ fn migrate_v10_event_to_v11(event: SessionEvent) -> Vec<SessionEvent> {
             tool_call_id,
             result,
             is_error,
+            ..
         } => {
             let mut finished = event.clone();
             finished.kind = SessionEventKind::RuntimeWorkFinished {

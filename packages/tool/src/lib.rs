@@ -114,6 +114,8 @@ pub struct ToolInvocationResponse {
     pub is_error: bool,
     #[serde(default)]
     pub content: Vec<ToolResultContent>,
+    #[serde(default)]
+    pub full_output: Option<String>,
 }
 
 /// Structured model-visible tool result content.

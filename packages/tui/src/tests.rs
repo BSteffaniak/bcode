@@ -714,6 +714,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
                 tool_call_id: full_call_id.to_owned(),
                 result: "ok".to_owned(),
                 is_error: false,
+                output: None,
             },
         ),
     ];
@@ -850,6 +851,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                     "exit_code: 0\ntimed_out: false\nstdout:\n{stdout}\nstderr:\n\u{1b}[31mwarning\u{1b}[0m"
                 ),
                 is_error: false,
+                output: None,
             },
         ),
     ];
@@ -910,6 +912,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
                 })
                 .to_string(),
                 is_error: false,
+                output: None,
             },
         ),
     ];
@@ -946,6 +949,7 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
             })
             .to_string(),
             is_error: false,
+            output: None,
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -981,6 +985,7 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
             })
             .to_string(),
             is_error: false,
+            output: None,
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -1071,6 +1076,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
             tool_call_id: "call-1".to_owned(),
             result: "first\n".to_owned(),
             is_error: false,
+            output: None,
         },
     ));
 
@@ -1162,6 +1168,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 tool_call_id: "call-empty".to_owned(),
                 result: "final result".to_owned(),
                 is_error: false,
+                output: None,
             },
         ),
     ];
@@ -1226,6 +1233,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 tool_call_id: "call-stream".to_owned(),
                 result: "final duplicate tail".to_owned(),
                 is_error: false,
+                output: None,
             },
         ),
     ]

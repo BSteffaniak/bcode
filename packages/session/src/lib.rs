@@ -30,7 +30,7 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
     SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
     SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary, SessionTokenUsage,
-    SessionTraceEvent,
+    SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1659,6 +1659,7 @@ impl SessionManager {
         tool_call_id: String,
         result: String,
         is_error: bool,
+        output: Option<TraceBlobRef>,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
@@ -1666,6 +1667,7 @@ impl SessionManager {
                 tool_call_id,
                 result,
                 is_error,
+                output,
             },
         )
         .await
@@ -2834,7 +2836,13 @@ mod tests {
             .await
             .expect("tool request should append");
         manager
-            .append_tool_call_finished(session.id, "tool-1".to_string(), "ok".to_string(), false)
+            .append_tool_call_finished(
+                session.id,
+                "tool-1".to_string(),
+                "ok".to_string(),
+                false,
+                None,
+            )
             .await
             .expect("tool result should append");
         manager
@@ -2909,7 +2917,7 @@ mod tests {
         )));
         assert!(history.iter().any(|event| matches!(
             &event.kind,
-            SessionEventKind::ToolCallFinished { tool_call_id, result, is_error }
+            SessionEventKind::ToolCallFinished { tool_call_id, result, is_error, .. }
                 if tool_call_id == "tool-1" && result == "ok" && !is_error
         )));
         assert!(history.iter().any(|event| matches!(
@@ -3913,6 +3921,7 @@ mod tests {
                     tool_call_id: "call".to_string(),
                     result: "ok".to_string(),
                     is_error: false,
+                    output: None,
                 },
             ),
             (

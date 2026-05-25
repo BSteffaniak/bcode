@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 13;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 14;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -528,6 +528,8 @@ pub enum SessionEventKind {
         result: String,
         #[serde(default)]
         is_error: bool,
+        #[serde(default)]
+        output: Option<TraceBlobRef>,
     },
     PermissionRequested {
         permission_id: String,
