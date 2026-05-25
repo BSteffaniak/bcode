@@ -908,6 +908,7 @@ impl BcodeClient {
             .send_request(Request::Hello {
                 client_name: format!("{client_name};cap=message_accepted"),
                 runtime_context: self.runtime_context.clone(),
+                daemon_namespace: bcode_ipc::daemon_namespace(),
             })
             .await?
         {

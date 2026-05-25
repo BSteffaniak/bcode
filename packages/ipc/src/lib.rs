@@ -92,6 +92,8 @@ pub enum Request {
         client_name: String,
         #[serde(default)]
         runtime_context: Option<ClientRuntimeContext>,
+        #[serde(default)]
+        daemon_namespace: String,
     },
     Ping,
     ServerStatus,
@@ -991,6 +993,7 @@ mod tests {
     fn runtime_context_with_semantic_auth_round_trips() {
         let request = Request::Hello {
             client_name: "test".to_string(),
+            daemon_namespace: daemon_namespace(),
             runtime_context: Some(ClientRuntimeContext {
                 selected_provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 selected_model_id: Some("model".to_string()),

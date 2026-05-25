@@ -117,6 +117,8 @@ struct ServerState {
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
+    client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
+    active_session_namespaces: Mutex<BTreeMap<SessionId, String>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
@@ -423,6 +425,8 @@ impl ServerState {
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
             client_runtime_contexts: Mutex::default(),
+            client_session_namespaces: Mutex::default(),
+            active_session_namespaces: Mutex::default(),
             message_accepted_clients: Mutex::default(),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
@@ -437,6 +441,10 @@ impl ServerState {
     async fn unregister_client(&self, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
         self.client_runtime_contexts.lock().await.remove(&client_id);
+        self.client_session_namespaces
+            .lock()
+            .await
+            .remove(&client_id);
         self.message_accepted_clients
             .lock()
             .await
@@ -465,6 +473,66 @@ impl ServerState {
             .lock()
             .await
             .get(&client_id)
+            .cloned()
+    }
+
+    async fn set_client_session_namespace(&self, client_id: ClientId, namespace: String) {
+        self.client_session_namespaces
+            .lock()
+            .await
+            .insert(client_id, namespace);
+    }
+
+    async fn client_session_namespace(&self, client_id: ClientId) -> String {
+        self.client_session_namespaces
+            .lock()
+            .await
+            .get(&client_id)
+            .cloned()
+            .unwrap_or_else(bcode_ipc::daemon_namespace)
+    }
+
+    async fn try_activate_session_namespace(
+        &self,
+        session_id: SessionId,
+        namespace: String,
+    ) -> Result<(), String> {
+        let mut active_namespaces = self.active_session_namespaces.lock().await;
+        match active_namespaces.get(&session_id) {
+            Some(active_namespace) if active_namespace != &namespace => {
+                Err(active_namespace.clone())
+            }
+            Some(_) => Ok(()),
+            None => {
+                active_namespaces.insert(session_id, namespace);
+                drop(active_namespaces);
+                Ok(())
+            }
+        }
+    }
+
+    async fn deactivate_session_namespace_if_inactive(&self, session_id: SessionId) {
+        if let Ok(summary) = self.sessions.session_summary(session_id).await
+            && summary.client_count == 0
+        {
+            self.active_session_namespaces
+                .lock()
+                .await
+                .remove(&session_id);
+        }
+    }
+
+    async fn active_session_namespace_mismatch(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Option<String> {
+        let client_namespace = self.client_session_namespace(client_id).await;
+        self.active_session_namespaces
+            .lock()
+            .await
+            .get(&session_id)
+            .filter(|active_namespace| *active_namespace != &client_namespace)
             .cloned()
     }
 
@@ -893,6 +961,9 @@ async fn handle_registered_client(
         && let Some(event) = state.sessions.detach_session(session_id, client_id).await?
     {
         publish_session_event(state, &event).await;
+        state
+            .deactivate_session_namespace_if_inactive(session_id)
+            .await;
     }
 
     Ok(())
@@ -911,6 +982,7 @@ async fn handle_request(
         Request::Hello {
             client_name,
             runtime_context,
+            daemon_namespace,
         } => {
             handle_hello(
                 request_id,
@@ -919,6 +991,7 @@ async fn handle_request(
                 writer,
                 &client_name,
                 runtime_context,
+                daemon_namespace,
             )
             .await
         }
@@ -962,10 +1035,11 @@ async fn handle_request(
             handle_delete_session(request_id, state, writer, session_id).await
         }
         Request::SessionHistory { session_id } => {
-            handle_session_history(request_id, state, writer, session_id).await
+            handle_session_history(request_id, client_id, state, writer, session_id).await
         }
         Request::SessionHistoryPage { session_id, query } => {
-            handle_session_history_page(request_id, state, writer, session_id, query).await
+            handle_session_history_page(request_id, client_id, state, writer, session_id, query)
+                .await
         }
         Request::AttachSession { session_id } => {
             handle_attach_session(
@@ -1172,12 +1246,16 @@ async fn handle_hello(
     writer: &SharedWriter,
     client_name: &str,
     runtime_context: Option<ClientRuntimeContext>,
+    daemon_namespace: String,
 ) -> Result<(), ServerError> {
     if client_name_supports_message_accepted(client_name) {
         state.register_message_accepted_client(client_id).await;
     }
     state
         .set_client_runtime_context(client_id, runtime_context)
+        .await;
+    state
+        .set_client_session_namespace(client_id, daemon_namespace)
         .await;
     send_response(
         writer,
@@ -1396,10 +1474,18 @@ async fn handle_delete_session(
 
 async fn handle_session_history(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
     match state.sessions.session_history(session_id).await {
         Ok(history) => {
             send_response(
@@ -1425,11 +1511,19 @@ async fn handle_session_history(
 
 async fn handle_session_history_page(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
     query: bcode_session_models::SessionHistoryQuery,
 ) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
     match state.sessions.session_history_page(session_id, query).await {
         Ok(page) => {
             send_response(
@@ -1450,6 +1544,24 @@ async fn handle_session_history_page(
     }
 }
 
+async fn send_incompatible_active_session_response(
+    writer: &SharedWriter,
+    request_id: u64,
+    active_namespace: &str,
+) -> Result<(), ServerError> {
+    send_response(
+        writer,
+        request_id,
+        Response::Err(ErrorResponse::new(
+            "session_incompatible_active_client",
+            format!(
+                "session is active for daemon compatibility namespace {active_namespace}; reconnect with a matching client or wait until the session is inactive"
+            ),
+        )),
+    )
+    .await
+}
+
 async fn handle_attach_session(
     request_id: u64,
     client_id: ClientId,
@@ -1458,6 +1570,14 @@ async fn handle_attach_session(
     attached_session: &mut Option<SessionId>,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
+    let client_namespace = state.client_session_namespace(client_id).await;
+    if let Err(active_namespace) = state
+        .try_activate_session_namespace(session_id, client_namespace)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
     match state.sessions.attach_session(session_id, client_id).await {
         Ok(attachment) => {
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
@@ -1483,7 +1603,11 @@ async fn handle_attach_session(
                 request_id,
                 Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
             )
-            .await
+            .await?;
+            state
+                .deactivate_session_namespace_if_inactive(session_id)
+                .await;
+            Ok(())
         }
     }
 }
@@ -1497,6 +1621,14 @@ async fn handle_attach_session_recent(
     session_id: SessionId,
     limit: usize,
 ) -> Result<(), ServerError> {
+    let client_namespace = state.client_session_namespace(client_id).await;
+    if let Err(active_namespace) = state
+        .try_activate_session_namespace(session_id, client_namespace)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
     match state
         .sessions
         .attach_session_recent(session_id, client_id, limit)
@@ -1526,7 +1658,11 @@ async fn handle_attach_session_recent(
                 request_id,
                 Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
             )
-            .await
+            .await?;
+            state
+                .deactivate_session_namespace_if_inactive(session_id)
+                .await;
+            Ok(())
         }
     }
 }
@@ -1768,6 +1904,13 @@ async fn handle_invoke_skill(
     arguments: String,
     display_text: String,
 ) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
     let Some(registry) = &state.skills else {
         return send_response(
             writer,
@@ -1818,6 +1961,13 @@ async fn handle_user_message(
     session_id: SessionId,
     text: String,
 ) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
     match enqueue_session_command(
         state,
         session_id,
@@ -2352,6 +2502,13 @@ async fn handle_compact_session(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
     let selection = session_model_selection_with_runtime_context(
         state,
         session_id,
