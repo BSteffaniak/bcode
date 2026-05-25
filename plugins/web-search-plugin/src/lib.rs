@@ -51,7 +51,7 @@ impl RustPlugin for WebSearchPlugin {
 impl WebSearchPlugin {
     fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         match context.request.operation.as_str() {
-            OP_LIST_TOOLS => list_tools(&context.request),
+            OP_LIST_TOOLS => list_tools(&context.request, &context.config),
             OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
@@ -127,7 +127,7 @@ impl WebSearchPlugin {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WebSearchConfig {
     #[serde(default)]
     provider: Option<String>,
@@ -135,10 +135,29 @@ struct WebSearchConfig {
     max_results: Option<usize>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default = "default_allow_best_effort_no_key")]
+    allow_best_effort_no_key: bool,
     #[serde(default)]
     fetch: Option<WebFetchConfig>,
     #[serde(default)]
     providers: WebSearchProviderConfig,
+}
+
+const fn default_allow_best_effort_no_key() -> bool {
+    true
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            max_results: None,
+            timeout_ms: None,
+            allow_best_effort_no_key: default_allow_best_effort_no_key(),
+            fetch: None,
+            providers: WebSearchProviderConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -387,6 +406,7 @@ async fn search_async(
         "exa" => search_exa(request, &config).await,
         "serper" => search_serper(request, &config).await,
         "serpapi" | "serp_api" => search_serpapi(request, &config).await,
+        "duckduckgo_html" | "duckduckgo" | "ddg" => search_duckduckgo_html(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
         ))),
@@ -591,6 +611,110 @@ async fn search_serpapi(
     Ok(search_response(request.query, "serpapi", results))
 }
 
+async fn search_duckduckgo_html(
+    request: SearchRequest,
+    config: &WebSearchConfig,
+) -> Result<SearchResponse, WebError> {
+    let max_results = max_results(&request, config);
+    let client = client(request.timeout_ms.or(config.timeout_ms))?;
+    let body = checked_text(
+        client
+            .get("https://html.duckduckgo.com/html/")
+            .query(&[("q", scoped_query(&request).as_str())])
+            .send()
+            .await?,
+    )
+    .await?;
+    let results = parse_duckduckgo_html_results(&body)
+        .into_iter()
+        .take(max_results)
+        .collect();
+    let mut response = search_response(request.query, "duckduckgo_html", results);
+    response.message = Some(
+        "No configured API search provider was found; using best-effort DuckDuckGo HTML search."
+            .to_string(),
+    );
+    Ok(response)
+}
+
+fn parse_duckduckgo_html_results(body: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let mut remaining = body;
+    while let Some(anchor_start) = remaining.find("result__a") {
+        remaining = &remaining[anchor_start..];
+        let Some(href_key) = remaining.find("href=\"") else {
+            break;
+        };
+        let href_start = href_key + "href=\"".len();
+        let Some(href_end) = remaining[href_start..].find('"') else {
+            break;
+        };
+        let url = html_text(&remaining[href_start..href_start + href_end]);
+        let Some(title_start) = remaining[href_start + href_end..].find('>') else {
+            break;
+        };
+        let title_start = href_start + href_end + title_start + 1;
+        let Some(title_end) = remaining[title_start..].find("</a>") else {
+            break;
+        };
+        let title = html_text(&remaining[title_start..title_start + title_end]);
+        let snippet = extract_duckduckgo_snippet(remaining).unwrap_or_default();
+        if !url.is_empty() && !title.is_empty() {
+            results.push(SearchResult {
+                title,
+                url: decode_duckduckgo_redirect(&url),
+                snippet,
+                published: None,
+                source: Some("DuckDuckGo HTML".to_string()),
+            });
+        }
+        remaining = &remaining[title_start + title_end..];
+    }
+    results
+}
+
+fn extract_duckduckgo_snippet(block: &str) -> Option<String> {
+    let start = block.find("result__snippet")?;
+    let block = &block[start..];
+    let text_start = block.find('>')? + 1;
+    let text_end = block[text_start..]
+        .find("</a>")
+        .or_else(|| block[text_start..].find("</div>"))?;
+    Some(html_text(&block[text_start..text_start + text_end]))
+}
+
+fn decode_duckduckgo_redirect(url: &str) -> String {
+    let Some(query_start) = url.find("uddg=") else {
+        return url.to_string();
+    };
+    let encoded = &url[query_start + "uddg=".len()..];
+    let encoded = encoded.split('&').next().unwrap_or(encoded);
+    percent_decode(encoded)
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            output.push(byte);
+            index += 3;
+        } else if bytes[index] == b'+' {
+            output.push(b' ');
+            index += 1;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).to_string()
+}
+
 async fn fetch_async(
     request: FetchRequest,
     config: WebSearchConfig,
@@ -691,25 +815,34 @@ fn fetch_rendered(
         rendered: true,
     })
 }
-fn list_tools(request: &ServiceRequest) -> ServiceResponse {
+fn list_tools(
+    request: &ServiceRequest,
+    config: &bcode_plugin_sdk::PluginConfigContext,
+) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
-    json_response(&ToolList {
-        tools: vec![search_tool_definition(), fetch_tool_definition()],
-    })
+    let plugin_config = config
+        .typed_or_default::<WebSearchConfig>()
+        .unwrap_or_else(|_| WebSearchConfig::default());
+    let mut tools = Vec::new();
+    if search_provider(None, &plugin_config).is_ok() {
+        tools.push(search_tool_definition());
+    }
+    tools.push(fetch_tool_definition());
+    json_response(&ToolList { tools })
 }
 
 fn search_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "web.search".to_string(),
-        description: "Search the web through the configured search provider. Supports Brave, Tavily, Exa, Serper, and SerpAPI through provider API keys.".to_string(),
+        description: "Search the web through the configured search provider. Supports Brave, Tavily, Exa, Serper, SerpAPI, and best-effort DuckDuckGo HTML fallback.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["query"],
             "properties": {
                 "query": { "type": "string" },
-                "provider": { "type": "string", "description": "Optional provider override: auto, brave, tavily, exa, serper, or serpapi" },
+                "provider": { "type": "string", "description": "Optional provider override: auto, brave, tavily, exa, serper, serpapi, or duckduckgo_html" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
                 "site": { "type": "string", "description": "Optional domain to restrict results with a site: query" },
                 "freshness": { "type": "string", "description": "Provider-specific freshness filter such as day, week, month, or year" },
@@ -840,6 +973,9 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         || env_value(&["SERPAPI_API_KEY"]).is_some()
     {
         return Ok("serpapi".to_string());
+    }
+    if config.allow_best_effort_no_key {
+        return Ok("duckduckgo_html".to_string());
     }
     Err(WebError::MissingProvider)
 }
@@ -1156,11 +1292,31 @@ mod tests {
     }
 
     #[test]
-    fn auto_provider_requires_a_key_when_no_provider_env_exists() {
-        // This test asserts only the explicit unsupported path to avoid mutating
-        // process-global env in parallel test runs.
-        let provider = search_provider(Some("unknown"), &WebSearchConfig::default())
-            .expect("explicit provider should resolve");
-        assert_eq!(provider, "unknown");
+    fn auto_provider_uses_best_effort_fallback_by_default() {
+        let provider = search_provider(None, &WebSearchConfig::default())
+            .expect("best-effort fallback should resolve");
+        assert_eq!(provider, "duckduckgo_html");
+    }
+
+    #[test]
+    fn auto_provider_can_disable_best_effort_fallback() {
+        let config = WebSearchConfig {
+            allow_best_effort_no_key: false,
+            ..WebSearchConfig::default()
+        };
+        assert!(search_provider(None, &config).is_err());
+    }
+
+    #[test]
+    fn duckduckgo_html_parser_extracts_results() {
+        let html = r#"
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs&amp;rut=x">Example &amp; Docs</a>
+            <a class="result__snippet">Useful <b>snippet</b></a>
+        "#;
+        let results = parse_duckduckgo_html_results(html);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/docs");
+        assert_eq!(results[0].title, "Example & Docs");
+        assert_eq!(results[0].snippet, "Useful snippet");
     }
 }
