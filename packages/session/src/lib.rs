@@ -42,7 +42,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::spawn_blocking;
 
 const FRAME_V2_MAGIC: &[u8; 4] = b"BSE2";
 const FRAME_V2_VERSION: u16 = 2;
@@ -1082,7 +1082,7 @@ pub struct SessionManager {
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
     catalog_loaded: bool,
-    index_rebuilds: BTreeMap<SessionId, JoinHandle<()>>,
+    running_catalog_load: bool,
     completed_rebuilds: usize,
     failed_rebuilds: usize,
 }
@@ -1257,10 +1257,6 @@ impl SessionHandle {
             .await
     }
 
-    async fn mark_index_current(&self) -> Result<(), SessionError> {
-        self.send(SessionCommand::MarkIndexCurrent).await
-    }
-
     async fn can_delete(&self) -> Result<SessionSummary, SessionError> {
         self.send(SessionCommand::CanDelete).await?
     }
@@ -1316,7 +1312,6 @@ enum SessionCommand {
         state: SessionState,
         reply: oneshot::Sender<()>,
     },
-    MarkIndexCurrent(oneshot::Sender<()>),
     CanDelete(oneshot::Sender<Result<SessionSummary, SessionError>>),
 }
 
@@ -1404,11 +1399,6 @@ impl SessionActor {
                 }
                 SessionCommand::ReplaceState { state, reply } => {
                     self.state = state;
-                    self.refresh_snapshot();
-                    let _ = reply.send(());
-                }
-                SessionCommand::MarkIndexCurrent(reply) => {
-                    self.state.index_status = SessionIndexStatusKind::Current;
                     self.refresh_snapshot();
                     let _ = reply.send(());
                 }
@@ -1711,7 +1701,7 @@ impl SessionManager {
                     })
                     .collect(),
                 catalog_loaded,
-                index_rebuilds: BTreeMap::new(),
+                running_catalog_load: false,
                 completed_rebuilds: 0,
                 failed_rebuilds: 0,
             }),
@@ -1749,23 +1739,44 @@ impl SessionManager {
         Ok(())
     }
 
-    async fn ensure_catalog_loaded(&self) -> Result<(), SessionStoreError> {
+    /// Start loading the persistent catalog in the background if it has not loaded yet.
+    pub async fn start_catalog_load(&self) {
         if self.inner.lock().await.catalog_loaded {
-            return Ok(());
+            return;
         }
-        let Some(store) = &self.store else {
+        let Some(store) = self.store.clone() else {
             self.inner.lock().await.catalog_loaded = true;
-            return Ok(());
+            return;
         };
-        let sessions = store.load_catalog().await?;
+        let mut inner = self.inner.lock().await;
+        if inner.catalog_loaded || inner.running_catalog_load {
+            return;
+        }
+        inner.running_catalog_load = true;
+        drop(inner);
+
+        let sessions = match store.load_catalog().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.inner.lock().await.running_catalog_load = false;
+                eprintln!("failed to load session catalog: {error}");
+                return;
+            }
+        };
         let mut inner = self.inner.lock().await;
         for (session_id, state) in sessions {
+            let store = self.store.clone();
             inner
                 .sessions
                 .entry(session_id)
-                .or_insert_with(|| SessionHandle::new(state, self.store.clone()));
+                .or_insert_with(|| SessionHandle::new(state, store));
         }
         inner.catalog_loaded = true;
+        inner.running_catalog_load = false;
+    }
+
+    async fn ensure_catalog_loaded(&self) -> Result<(), SessionStoreError> {
+        self.start_catalog_load().await;
         Ok(())
     }
 
@@ -1880,25 +1891,15 @@ impl SessionManager {
 
     /// Return background maintenance status.
     pub async fn maintenance_status(&self) -> SessionMaintenanceStatus {
-        let (handles, running_rebuilds, completed_rebuilds, failed_rebuilds, completed_handles) = {
-            let mut inner = self.inner.lock().await;
-            let completed_handles = inner.collect_finished_rebuilds();
+        let (handles, completed_rebuilds, failed_rebuilds) = {
+            let inner = self.inner.lock().await;
             let handles = inner.sessions.values().cloned().collect::<Vec<_>>();
-            (
-                handles,
-                inner.index_rebuilds.len(),
-                inner.completed_rebuilds,
-                inner.failed_rebuilds,
-                completed_handles,
-            )
+            (handles, inner.completed_rebuilds, inner.failed_rebuilds)
         };
-        for handle in completed_handles {
-            let _ = handle.mark_index_current().await;
-        }
         let stale_indexes = stale_index_count(handles);
         SessionMaintenanceStatus {
             stale_indexes,
-            running_rebuilds,
+            running_rebuilds: usize::from(self.inner.lock().await.running_catalog_load),
             completed_rebuilds,
             failed_rebuilds,
         }
@@ -2531,27 +2532,6 @@ impl SessionManager {
                 return next;
             }
         }
-    }
-}
-
-impl SessionManagerInner {
-    fn collect_finished_rebuilds(&mut self) -> Vec<SessionHandle> {
-        let finished = self
-            .index_rebuilds
-            .iter()
-            .filter_map(|(session_id, handle)| handle.is_finished().then_some(*session_id))
-            .collect::<Vec<_>>();
-        let mut completed = Vec::new();
-        for session_id in finished {
-            if let Some(handle) = self.index_rebuilds.remove(&session_id) {
-                drop(handle);
-                self.completed_rebuilds = self.completed_rebuilds.saturating_add(1);
-                if let Some(state) = self.sessions.get(&session_id) {
-                    completed.push(state.clone());
-                }
-            }
-        }
-        completed
     }
 }
 
