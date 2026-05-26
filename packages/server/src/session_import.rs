@@ -12,7 +12,7 @@ use bcode_session_models::{
     ClientId, SessionEventKind, SessionEventProvenance, SessionId, SessionImportSummary,
 };
 use sha2::{Digest as _, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::WriteHalf;
@@ -21,84 +21,6 @@ use uuid::Uuid;
 
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
-
-/// Discover external sessions and project them into picker-compatible summaries.
-pub async fn discover_importable_session_summaries(
-    state: &ServerState,
-    working_directory: &Path,
-) -> Vec<bcode_session_models::SessionSummary> {
-    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
-        return Vec::new();
-    }
-    let Some(providers) = state
-        .plugins
-        .registry()
-        .service_registry()
-        .providers_for(SESSION_IMPORT_INTERFACE_ID)
-        .cloned()
-    else {
-        return Vec::new();
-    };
-    let existing = state.sessions.cached_sessions(working_directory).await;
-    let mut external = Vec::new();
-    for plugin_id in providers {
-        let request = DiscoverImportableSessionsRequest {
-            working_directory: Some(working_directory.to_path_buf()),
-            include_diagnostics: false,
-        };
-        let Ok(response) = state
-            .plugins
-            .invoke_service_json::<_, DiscoverImportableSessionsResponse>(
-                &plugin_id,
-                SESSION_IMPORT_INTERFACE_ID,
-                OP_DISCOVER_IMPORTABLE_SESSIONS,
-                &request,
-            )
-            .await
-        else {
-            continue;
-        };
-        for summary in response.sessions {
-            if summary.status != bcode_session_import::ImportableSessionStatus::Available {
-                continue;
-            }
-            if existing.iter().any(|session| {
-                session.import.as_ref().is_some_and(|import| {
-                    import.source_id == summary.source_id
-                        && import.external_session_id == summary.external_session_id
-                })
-            }) {
-                continue;
-            }
-            let id = external_session_id(&summary.source_id, &summary.external_session_id);
-            let name = Some(
-                summary
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty())
-                    .unwrap_or_else(|| summary.external_session_id.clone()),
-            );
-            external.push(bcode_session_models::SessionSummary {
-                id,
-                name,
-                client_count: 0,
-                created_at_ms: summary.created_at_ms.unwrap_or(0),
-                updated_at_ms: summary.updated_at_ms.or(summary.created_at_ms).unwrap_or(0),
-                working_directory: summary
-                    .working_directory
-                    .clone()
-                    .unwrap_or_else(|| working_directory.to_path_buf()),
-                import: Some(SessionImportSummary {
-                    source_id: summary.source_id,
-                    source_display_name: summary.source_display_name,
-                    external_session_id: summary.external_session_id,
-                    imported_at_ms: 0,
-                }),
-            });
-        }
-    }
-    external
-}
 
 async fn all_cached_sessions(state: &ServerState) -> Vec<bcode_session_models::SessionSummary> {
     state.sessions.all_session_summaries().await
@@ -311,13 +233,14 @@ fn import_event_provenance(
 /// summary cannot be loaded.
 pub async fn handle_import_external_session(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     source_id: &str,
     external_session_id: &str,
 ) -> Result<(), ServerError> {
     match import_external_session(state, source_id, external_session_id).await {
         Ok((session_id, warnings)) => {
+            state.session_catalog.refresh_native_now(state).await;
             let session = state.sessions.session_summary(session_id).await?;
             send_response(
                 writer,
@@ -349,7 +272,10 @@ fn import_warning_to_ipc(warning: bcode_session_import::ImportWarning) -> Sessio
 }
 
 /// Resolve a synthetic external session ID into an imported native Bcode session ID.
-pub async fn resolve_attach_session_id(state: &ServerState, session_id: SessionId) -> SessionId {
+pub async fn resolve_attach_session_id(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> SessionId {
     if state.sessions.session_summary(session_id).await.is_ok() {
         return session_id;
     }
@@ -360,6 +286,7 @@ pub async fn resolve_attach_session_id(state: &ServerState, session_id: SessionI
     };
     match import_external_session(state, &source_id, &external_session_id).await {
         Ok((imported_session_id, warnings)) => {
+            state.session_catalog.refresh_native_now(state).await;
             if !warnings.is_empty() {
                 eprintln!(
                     "imported [{source_id}] session with {} warnings",

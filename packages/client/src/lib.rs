@@ -8,10 +8,10 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
-    Response, ResponsePayload, ServerStopMode, SessionCatalogStatus, SessionImportWarning,
-    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
-    WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory, decode,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    Response, ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
+    SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
+    WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
+    decode, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
@@ -41,6 +41,8 @@ pub enum ClientError {
 pub struct SessionList {
     pub sessions: Vec<SessionSummary>,
     pub catalog_status: SessionCatalogStatus,
+    pub catalog_sources: Vec<SessionCatalogSourceStatus>,
+    pub catalog_revision: u64,
 }
 
 /// History returned when attaching to a session.
@@ -341,9 +343,13 @@ impl BcodeClient {
             ResponsePayload::SessionList {
                 sessions,
                 catalog_status,
+                catalog_sources,
+                catalog_revision,
             } => Ok(SessionList {
                 sessions,
                 catalog_status,
+                catalog_sources,
+                catalog_revision,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }

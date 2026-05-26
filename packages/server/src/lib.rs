@@ -4,7 +4,8 @@
 
 //! Local Bcode daemon runtime.
 
-pub mod session_import;
+pub mod session_catalog;
+mod session_import;
 
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
@@ -15,8 +16,9 @@ use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
-    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
+    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
+    response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
@@ -93,6 +95,7 @@ pub enum ServerError {
 #[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
+    pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
@@ -401,6 +404,7 @@ impl ServerState {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions,
+            session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
             selected_provider_plugin_id: init.selected_provider_plugin_id,
             selected_model_id: init.selected_model_id,
@@ -586,14 +590,23 @@ impl ServerState {
     }
 
     async fn status(&self) -> ServerStatus {
+        let sessions = self
+            .sessions
+            .cached_sessions(&bcode_ipc::current_working_directory())
+            .await;
+        let status = catalog_status_to_ipc(self.sessions.catalog_status());
         ServerStatus {
             connected_client_count: self.clients.lock().await.len(),
-            sessions: self
-                .sessions
-                .cached_sessions(&bcode_ipc::current_working_directory())
-                .await,
-            session_catalog_loaded: self.sessions.catalog_loaded(),
-            session_catalog_status: catalog_status_to_ipc(self.sessions.catalog_status()),
+            sessions,
+            session_catalog_loaded: matches!(status, SessionCatalogStatus::Loaded),
+            session_catalog_status: status.clone(),
+            session_catalog_sources: vec![SessionCatalogSourceStatus {
+                source_id: "native".to_owned(),
+                display_name: "Native Bcode sessions".to_owned(),
+                status,
+                updated_at_ms: 0,
+            }],
+            session_catalog_revision: 0,
             selected_provider_plugin_id: self.selected_provider_plugin_id.clone(),
             selected_model_id: self.selected_model_id.clone(),
             plugin_runtime: self.plugins.executor_statuses(),
@@ -1418,21 +1431,22 @@ async fn handle_create_session(
 
 async fn handle_list_sessions(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     working_directory: &Path,
 ) -> Result<(), ServerError> {
-    let mut session_list = state.sessions.list_sessions(working_directory).await;
-    session_list.extend(
-        session_import::discover_importable_session_summaries(state, working_directory).await,
-    );
-    let catalog_status = catalog_status_to_ipc(state.sessions.catalog_status());
+    let snapshot = state
+        .session_catalog
+        .snapshot(state, working_directory)
+        .await;
     send_response(
         writer,
         request_id,
         Response::Ok(ResponsePayload::SessionList {
-            sessions: session_list,
-            catalog_status,
+            sessions: snapshot.sessions,
+            catalog_status: snapshot.status,
+            catalog_sources: snapshot.sources,
+            catalog_revision: snapshot.revision,
         }),
     )
     .await

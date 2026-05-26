@@ -266,6 +266,16 @@ pub enum SessionCatalogStatus {
     Failed(String),
 }
 
+/// Per-source session catalog discovery status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogSourceStatus {
+    pub source_id: String,
+    pub display_name: String,
+    pub status: SessionCatalogStatus,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
 /// Local server status summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -275,6 +285,10 @@ pub struct ServerStatus {
     pub session_catalog_loaded: bool,
     #[serde(default)]
     pub session_catalog_status: SessionCatalogStatus,
+    #[serde(default)]
+    pub session_catalog_sources: Vec<SessionCatalogSourceStatus>,
+    #[serde(default)]
+    pub session_catalog_revision: u64,
     #[serde(default)]
     pub selected_provider_plugin_id: Option<String>,
     #[serde(default)]
@@ -391,6 +405,10 @@ pub enum ResponsePayload {
         sessions: Vec<SessionSummary>,
         #[serde(default)]
         catalog_status: SessionCatalogStatus,
+        #[serde(default)]
+        catalog_sources: Vec<SessionCatalogSourceStatus>,
+        #[serde(default)]
+        catalog_revision: u64,
     },
     SessionRenamed {
         session: SessionSummary,

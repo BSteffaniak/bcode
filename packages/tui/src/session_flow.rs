@@ -131,7 +131,21 @@ async fn poll_session_list(
             let is_loading = catalog_still_loading(&session_list.catalog_status);
             picker.replace_sessions(session_list.sessions);
             if is_loading {
-                picker.set_status("Loading sessions; press Ctrl-N to create one".to_owned());
+                let loading_sources = session_list
+                    .catalog_sources
+                    .iter()
+                    .filter(|source| catalog_still_loading(&source.status))
+                    .map(|source| source.source_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let suffix = if loading_sources.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({loading_sources})")
+                };
+                picker.set_status(format!(
+                    "Loading sessions{suffix}; press Ctrl-N to create one"
+                ));
                 *session_load = Some(spawn_session_list(client));
             } else {
                 picker.set_status("Select a session or press Ctrl-N to create one".to_owned());
