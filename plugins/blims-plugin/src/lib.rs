@@ -85,6 +85,9 @@ pub const OP_PROPOSAL_REJECT: &str = "proposal.reject";
 /// Work proposal defer operation.
 pub const OP_PROPOSAL_DEFER: &str = "proposal.defer";
 
+/// Work proposal patch recording operation.
+pub const OP_PROPOSAL_RECORD_PATCH: &str = "proposal.record_patch";
+
 /// Agent talk prompt operation.
 pub const OP_AGENT_TALK_PROMPT: &str = "agent.talk_prompt";
 
@@ -136,6 +139,7 @@ impl RustPlugin for BlimsPlugin {
             OP_PROPOSAL_APPROVE => service_proposal_status(&context.request, "approved"),
             OP_PROPOSAL_REJECT => service_proposal_status(&context.request, "rejected"),
             OP_PROPOSAL_DEFER => service_proposal_status(&context.request, "deferred"),
+            OP_PROPOSAL_RECORD_PATCH => service_proposal_record_patch(&context.request),
             OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
@@ -247,6 +251,17 @@ pub struct ProposalRequest {
     pub working_directory: PathBuf,
     /// Proposal id.
     pub proposal_id: String,
+}
+
+/// Request to record a proposal patch artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalRecordPatchRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Proposal id.
+    pub proposal_id: String,
+    /// Patch text.
+    pub patch: String,
 }
 
 /// Work proposal summary.
@@ -833,6 +848,17 @@ fn service_proposal_status(request: &ServiceRequest, status: &str) -> ServiceRes
     match set_proposal_status(&request, status) {
         Ok(proposal) => json_response(&proposal),
         Err(error) => ServiceResponse::error("proposal_status_failed", error.to_string()),
+    }
+}
+
+fn service_proposal_record_patch(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ProposalRecordPatchRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match record_proposal_patch(&request) {
+        Ok(artifact) => json_response(&artifact),
+        Err(error) => ServiceResponse::error("proposal_record_patch_failed", error.to_string()),
     }
 }
 
@@ -1771,6 +1797,43 @@ fn set_proposal_status(
                 .execute(database)
                 .await?;
             Ok(WorkProposalSummary { status, ..proposal })
+        })
+    })
+}
+
+fn record_proposal_patch(
+    request: &ProposalRecordPatchRequest,
+) -> Result<ArtifactDetail, BlimsStateError> {
+    let request = request.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let proposal = load_proposal(database, &request.proposal_id).await?;
+            let id = format!("patch-{}", proposal.id);
+            let payload = serde_json::json!({
+                "proposal_id": proposal.id,
+                "task_id": proposal.task_id,
+                "session_id": proposal.session_id,
+                "worktree_path": proposal.worktree_path,
+                "branch": proposal.branch,
+                "patch": request.patch,
+            });
+            let payload_json = serde_json::to_string_pretty(&payload)?;
+            database
+                .insert("artifacts")
+                .value("id", id.clone())
+                .value("initiative_id", proposal.initiative_id.clone())
+                .value("kind", "proposal_patch")
+                .value("title", format!("Patch for {}", proposal.id))
+                .value("payload_json", payload_json.clone())
+                .execute(database)
+                .await?;
+            Ok(ArtifactDetail {
+                id,
+                initiative_id: proposal.initiative_id,
+                kind: "proposal_patch".to_string(),
+                title: format!("Patch for {}", proposal.id),
+                payload_json,
+            })
         })
     })
 }

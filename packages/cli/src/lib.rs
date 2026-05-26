@@ -572,6 +572,11 @@ enum BlimsProposalCommand {
         #[arg(long)]
         json: bool,
     },
+    Patch {
+        proposal_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl WorktreeBaseRefArg {
@@ -1206,6 +1211,9 @@ async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
             update_office_proposal_status("proposal.defer", "proposal deferred", proposal_id)
                 .await?;
         }
+        ["patch", proposal_id] | ["patch", "proposal", proposal_id] => {
+            create_blims_proposal_patch((*proposal_id).to_string(), false).await?;
+        }
         ["work", "task", task_id] | ["work", task_id] => {
             start_blims_task_work((*task_id).to_string()).await?;
         }
@@ -1503,7 +1511,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
     );
 }
 
@@ -1716,6 +1724,9 @@ async fn handle_blims_proposal_command(command: BlimsProposalCommand) -> Result<
             print_proposal_status_update("proposal.defer", "proposal deferred", proposal_id, json)
                 .await?;
         }
+        BlimsProposalCommand::Patch { proposal_id, json } => {
+            create_blims_proposal_patch(proposal_id, json).await?;
+        }
     }
     Ok(())
 }
@@ -1734,6 +1745,42 @@ async fn print_proposal_status_update(
         print_proposal_detail(&proposal);
     }
     Ok(())
+}
+
+async fn create_blims_proposal_patch(proposal_id: String, json: bool) -> Result<(), CliError> {
+    let proposal = load_blims_proposal("proposal.inspect", proposal_id).await?;
+    let patch = git_diff_for_proposal(&proposal)?;
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "proposal_id": proposal.id,
+        "patch": patch,
+    });
+    let response =
+        call_blims_service("proposal.record_patch", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let artifact = decode_blims_response::<BlimsArtifactDetail>(response)?;
+        println!("patch artifact created: {}", artifact.id);
+        println!("initiative: {}", artifact.initiative_id);
+    }
+    Ok(())
+}
+
+fn git_diff_for_proposal(proposal: &BlimsWorkProposalSummary) -> Result<String, CliError> {
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("HEAD")
+        .current_dir(&proposal.worktree_path)
+        .output()?;
+    if !output.status.success() {
+        return Err(CliError::Blims(format!(
+            "failed to create git diff for proposal {}: {}",
+            proposal.id,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 async fn load_blims_proposal(
