@@ -115,6 +115,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     };
     let response = match request.name.as_str() {
         "shell.run" => run_shell_tool(
+            context,
             context.events,
             &request.tool_call_id,
             request.name.as_str(),
@@ -133,6 +134,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
 }
 
 fn run_shell_tool(
+    context: &NativeServiceContext,
     events: ServiceEventEmitter,
     tool_call_id: &str,
     tool_name: &str,
@@ -172,6 +174,7 @@ fn run_shell_tool(
     let response = if arguments.terminal {
         run_terminal_shell_command(
             events,
+            &context.cancellation,
             tool_call_id,
             &arguments,
             session_cwd,
@@ -180,6 +183,7 @@ fn run_shell_tool(
     } else {
         match run_shell_command(
             events,
+            &context.cancellation,
             tool_call_id,
             &arguments,
             session_cwd,
@@ -229,6 +233,7 @@ struct LimitedOutput {
 
 fn run_terminal_shell_command(
     events: ServiceEventEmitter,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
@@ -236,6 +241,7 @@ fn run_terminal_shell_command(
 ) -> ToolInvocationResponse {
     match run_terminal_shell_command_inner(
         events,
+        cancellation,
         tool_call_id,
         arguments,
         session_cwd,
@@ -253,6 +259,7 @@ fn run_terminal_shell_command(
 
 fn run_terminal_shell_command_inner(
     events: ServiceEventEmitter,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
@@ -301,7 +308,7 @@ fn run_terminal_shell_command_inner(
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
         }
-        if cancellation_path.is_some_and(Path::exists) {
+        if cancellation.is_cancelled() || cancellation_path.is_some_and(Path::exists) {
             cancelled = true;
             child.kill().map_err(|error| error.to_string())?;
             break child.wait().map_err(|error| error.to_string())?;
@@ -374,6 +381,7 @@ const fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
 
 fn run_shell_command(
     events: ServiceEventEmitter,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&std::path::Path>,
@@ -391,19 +399,32 @@ fn run_shell_command(
         .map_err(|error| error.to_string())?;
     let tool_call_id = tool_call_id.to_owned();
     let cancellation_path = cancellation_path.map(Path::to_path_buf);
+    let cancellation = cancellation.clone();
     let result = runtime
         .block_on(async {
             let runtime = ToolExecutionRuntime::new(1);
             let cancel_handle = runtime.cancellation_handle();
             let cancel_task = cancellation_path.map(|path| {
                 let cancel_handle = cancel_handle.clone();
+                let cancellation = cancellation.clone();
                 tokio::spawn(async move {
-                    while !path.exists() {
+                    while !cancellation.is_cancelled() && !path.exists() {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     cancel_handle.cancel();
                 })
             });
+            let context_cancel_task = if cancel_task.is_none() {
+                let cancel_handle = cancel_handle.clone();
+                Some(tokio::spawn(async move {
+                    while !cancellation.is_cancelled() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    cancel_handle.cancel();
+                }))
+            } else {
+                None
+            };
             let result = runtime
                 .run_process_streaming(
                     ProcessExecutionRequest {
@@ -434,6 +455,9 @@ fn run_shell_command(
                 .await;
             if let Some(cancel_task) = cancel_task {
                 cancel_task.abort();
+            }
+            if let Some(context_cancel_task) = context_cancel_task {
+                context_cancel_task.abort();
             }
             result
         })
@@ -604,6 +628,7 @@ mod tests {
         let started = Instant::now();
         let response = run_shell_command(
             ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
             "test",
             &ShellRunArguments {
                 command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),

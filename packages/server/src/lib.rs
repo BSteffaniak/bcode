@@ -6015,6 +6015,7 @@ async fn invoke_model_tool(
     let response = loop {
         tokio::select! {
             () = cancel_state.cancelled() => {
+                invocation.cancel.cancel();
                 let _ = std::fs::write(&cancellation_path, b"cancelled\n");
                 append_runtime_work_cancel_requested_event(
                     state,

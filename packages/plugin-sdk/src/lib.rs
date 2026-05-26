@@ -7,6 +7,10 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::sync::{Mutex, OnceLock};
 
 /// ABI-safe callback used by plugins to emit incremental service events.
@@ -22,6 +26,30 @@ pub type StreamingServiceFn = fn(
     Option<ServiceEventCallback>,
     *mut c_void,
 ) -> i32;
+
+/// Cloneable cancellation state scoped to one service invocation.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceCancellation {
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl ServiceCancellation {
+    /// Create cancellation state from a shared flag.
+    #[must_use]
+    pub const fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled: Some(cancelled),
+        }
+    }
+
+    /// Return whether host cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
+    }
+}
 
 /// Cloneable event emitter scoped to one service invocation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -187,6 +215,8 @@ pub struct NativeServiceContext {
     pub config: PluginConfigContext,
     #[serde(skip)]
     pub events: ServiceEventEmitter,
+    #[serde(skip)]
+    pub cancellation: ServiceCancellation,
 }
 
 /// Resolved plugin configuration delivered by the host.

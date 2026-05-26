@@ -22,7 +22,7 @@ use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 use thiserror::Error;
@@ -314,7 +314,24 @@ impl LoadedPlugin {
         interface_id: impl Into<String>,
         operation: impl Into<String>,
         payload: Vec<u8>,
+        on_event: impl FnMut(Vec<u8>),
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        self.invoke_service_with_events_and_cancellation(
+            interface_id,
+            operation,
+            payload,
+            on_event,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        )
+    }
+
+    fn invoke_service_with_events_and_cancellation(
+        &self,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
         mut on_event: impl FnMut(Vec<u8>),
+        cancellation: bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let context = NativeServiceContext {
             plugin_id: self.manifest.id.clone(),
@@ -329,6 +346,7 @@ impl LoadedPlugin {
                 secrets: BTreeMap::new(),
             },
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
+            cancellation,
         };
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let output_capacity = 1024 * 1024;
@@ -547,6 +565,8 @@ pub enum PluginLoadError {
     EventEncode(#[source] serde_json::Error),
     #[error("plugin '{plugin_id}' event handler failed with code {code}")]
     EventHandlerFailed { plugin_id: String, code: i32 },
+    #[error("plugin invocation {invocation_id:?} was cancelled before it started")]
+    InvocationCancelled { invocation_id: PluginInvocationId },
     #[error("plugin '{plugin_id}' {hook} hook failed with code {code}")]
     LifecycleFailed {
         plugin_id: String,
@@ -805,6 +825,31 @@ impl PluginInvocationId {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginInvocationCancelHandle {
+    id: PluginInvocationId,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PluginInvocationCancelHandle {
+    /// Return the plugin invocation identifier.
+    #[must_use]
+    pub const fn id(&self) -> PluginInvocationId {
+        self.id
+    }
+
+    /// Request cancellation for this invocation.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Return whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
 /// Plugin executor status snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginExecutorStatus {
@@ -890,6 +935,7 @@ struct PluginInvocation {
     interface_id: String,
     operation: String,
     payload: Vec<u8>,
+    cancellation: PluginInvocationCancelHandle,
     response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
     event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
@@ -916,6 +962,7 @@ enum PluginExecutorMessage {
 pub struct StreamingServiceInvocation {
     pub response: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
     pub events: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub cancel: PluginInvocationCancelHandle,
 }
 
 /// Handle to a plugin-local executor.
@@ -977,15 +1024,21 @@ impl PluginExecutorHandle {
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
         let (response, response_receiver) = oneshot::channel();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let invocation_id = next_plugin_invocation_id();
+        let cancel = PluginInvocationCancelHandle {
+            id: invocation_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
                 let invocation = PluginInvocation {
-                    id: next_plugin_invocation_id(),
+                    id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
                     interface_id,
                     operation,
                     payload,
+                    cancellation: cancel.clone(),
                     response,
                     event_sender: Some(event_sender),
                 };
@@ -1009,12 +1062,13 @@ impl PluginExecutorHandle {
                 };
                 let (unused_response, _) = oneshot::channel();
                 let invocation = PluginInvocation {
-                    id: next_plugin_invocation_id(),
+                    id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
                     interface_id,
                     operation,
                     payload,
+                    cancellation: cancel.clone(),
                     response: unused_response,
                     event_sender: Some(event_sender),
                 };
@@ -1034,6 +1088,7 @@ impl PluginExecutorHandle {
         Ok(StreamingServiceInvocation {
             response: response_receiver,
             events: event_receiver,
+            cancel,
         })
     }
     async fn invoke_service_inner(
@@ -1044,13 +1099,18 @@ impl PluginExecutorHandle {
         class: PluginInvocationClass,
         event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        let invocation_id = next_plugin_invocation_id();
         let invocation = PluginInvocation {
-            id: next_plugin_invocation_id(),
+            id: invocation_id,
             class,
             enqueued_at: Instant::now(),
             interface_id,
             operation,
             payload,
+            cancellation: PluginInvocationCancelHandle {
+                id: invocation_id,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
             response: oneshot::channel().0,
             event_sender,
         };
@@ -1560,6 +1620,12 @@ fn execute_plugin_service_invocation(
     invocation: PluginInvocation,
     metrics: &PluginExecutorMetrics,
 ) -> Result<ServiceResponse, PluginLoadError> {
+    if invocation.cancellation.is_cancelled() {
+        metrics.failed.fetch_add(1, Ordering::Relaxed);
+        return Err(PluginLoadError::InvocationCancelled {
+            invocation_id: invocation.id,
+        });
+    }
     metrics.running.fetch_add(1, Ordering::Relaxed);
     let started_at = Instant::now();
     tracing::debug!(
@@ -1572,7 +1638,7 @@ fn execute_plugin_service_invocation(
         operation = %invocation.operation,
         "plugin service invocation started"
     );
-    let response = plugin.invoke_service_with_events(
+    let response = plugin.invoke_service_with_events_and_cancellation(
         invocation.interface_id,
         invocation.operation,
         invocation.payload,
@@ -1581,6 +1647,7 @@ fn execute_plugin_service_invocation(
                 let _ = sender.send(event);
             }
         },
+        bcode_plugin_sdk::ServiceCancellation::new(Arc::clone(&invocation.cancellation.cancelled)),
     );
     metrics.running.fetch_sub(1, Ordering::Relaxed);
     if response.is_ok() {
