@@ -432,7 +432,47 @@ enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    Initiative {
+        #[command(subcommand)]
+        command: BlimsInitiativeCommand,
+    },
+    Guidance {
+        #[command(subcommand)]
+        command: BlimsGuidanceCommand,
+    },
     Report {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlimsInitiativeCommand {
+    Create {
+        title: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        priority: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlimsGuidanceCommand {
+    Set {
+        guidance: String,
+        #[arg(long, default_value = "strong")]
+        strength: String,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
         #[arg(long)]
         json: bool,
     },
@@ -753,6 +793,21 @@ struct BlimsWorkspaceRequest {
     working_directory: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BlimsInitiativeCreateRequest {
+    working_directory: PathBuf,
+    title: String,
+    description: Option<String>,
+    priority: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BlimsGuidanceSetRequest {
+    working_directory: PathBuf,
+    guidance: String,
+    strength: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsCompanyStatus {
     state: String,
@@ -784,6 +839,23 @@ struct BlimsWorldSnapshot {
     player_name: String,
     rooms: Vec<BlimsRoomSnapshot>,
     agents: Vec<BlimsAgentSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsInitiativeSummary {
+    id: String,
+    title: String,
+    description: String,
+    status: String,
+    priority: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsGuidanceSummary {
+    id: String,
+    guidance: String,
+    strength: String,
+    active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -854,6 +926,8 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
                 }
             }
         }
+        BlimsCommand::Initiative { command } => handle_blims_initiative_command(command).await?,
+        BlimsCommand::Guidance { command } => handle_blims_guidance_command(command).await?,
         BlimsCommand::Report { json } => {
             let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
             if json {
@@ -863,6 +937,97 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
                 println!("{}", report.title);
                 for bullet in report.bullets {
                     println!("* {bullet}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Result<(), CliError> {
+    match command {
+        BlimsInitiativeCommand::Create {
+            title,
+            description,
+            priority,
+            json,
+        } => {
+            let request = BlimsInitiativeCreateRequest {
+                working_directory: std::env::current_dir()?,
+                title,
+                description,
+                priority,
+            };
+            let response =
+                call_blims_service("initiative.create", serde_json::to_vec(&request)?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let initiative = decode_blims_response::<BlimsInitiativeSummary>(response)?;
+                println!(
+                    "initiative created: {} ({})",
+                    initiative.title, initiative.id
+                );
+            }
+        }
+        BlimsInitiativeCommand::List { json } => {
+            let response =
+                call_blims_service("initiative.list", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let initiatives = decode_blims_response::<Vec<BlimsInitiativeSummary>>(response)?;
+                for initiative in initiatives {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        initiative.id,
+                        initiative.priority,
+                        initiative.status,
+                        initiative.title,
+                        initiative.description
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_blims_guidance_command(command: BlimsGuidanceCommand) -> Result<(), CliError> {
+    match command {
+        BlimsGuidanceCommand::Set {
+            guidance,
+            strength,
+            json,
+        } => {
+            let request = BlimsGuidanceSetRequest {
+                working_directory: std::env::current_dir()?,
+                guidance,
+                strength,
+            };
+            let response =
+                call_blims_service("guidance.set", serde_json::to_vec(&request)?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let guidance = decode_blims_response::<BlimsGuidanceSummary>(response)?;
+                println!(
+                    "guidance set: {} ({})",
+                    guidance.guidance, guidance.strength
+                );
+            }
+        }
+        BlimsGuidanceCommand::List { json } => {
+            let response = call_blims_service("guidance.list", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let guidance = decode_blims_response::<Vec<BlimsGuidanceSummary>>(response)?;
+                for item in guidance {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        item.id, item.strength, item.active, item.guidance
+                    );
                 }
             }
         }

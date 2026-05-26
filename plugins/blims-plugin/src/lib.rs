@@ -6,9 +6,12 @@
 
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::env;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use switchy_database::query::SortDirection;
+use std::pin::Pin;
+use switchy_database::query::{FilterableQuery as _, SortDirection, where_eq};
 use switchy_database::schema::{Column, DataType, create_table};
 use switchy_database::{Database, DatabaseValue, Row};
 use thiserror::Error;
@@ -24,6 +27,18 @@ pub const OP_COMPANY_CREATE: &str = "company.create";
 
 /// Agent list operation.
 pub const OP_AGENT_LIST: &str = "agent.list";
+
+/// Initiative create operation.
+pub const OP_INITIATIVE_CREATE: &str = "initiative.create";
+
+/// Initiative list operation.
+pub const OP_INITIATIVE_LIST: &str = "initiative.list";
+
+/// Guidance set operation.
+pub const OP_GUIDANCE_SET: &str = "guidance.set";
+
+/// Guidance list operation.
+pub const OP_GUIDANCE_LIST: &str = "guidance.list";
 
 /// World snapshot operation.
 pub const OP_WORLD_SNAPSHOT: &str = "world.snapshot";
@@ -54,6 +69,10 @@ impl RustPlugin for BlimsPlugin {
             OP_COMPANY_STATUS => service_company_status(&context.request),
             OP_COMPANY_CREATE => service_company_create(&context.request),
             OP_AGENT_LIST => service_agent_list(&context.request),
+            OP_INITIATIVE_CREATE => service_initiative_create(&context.request),
+            OP_INITIATIVE_LIST => service_initiative_list(&context.request),
+            OP_GUIDANCE_SET => service_guidance_set(&context.request),
+            OP_GUIDANCE_LIST => service_guidance_list(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
             _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
@@ -66,6 +85,33 @@ impl RustPlugin for BlimsPlugin {
 pub struct WorkspaceRequest {
     /// Workspace or repository directory.
     pub working_directory: PathBuf,
+}
+
+/// Request to create a company initiative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativeCreateRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Initiative title.
+    pub title: String,
+    /// Optional initiative description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional initiative priority. Lower numbers sort first.
+    #[serde(default)]
+    pub priority: Option<i64>,
+}
+
+/// Request to add CEO guidance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidanceSetRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Guidance text.
+    pub guidance: String,
+    /// Guidance strength label.
+    #[serde(default = "default_guidance_strength")]
+    pub strength: String,
 }
 
 /// Current Blims company lifecycle state.
@@ -178,6 +224,38 @@ struct RoomRecord {
     purpose: String,
 }
 
+/// Persisted initiative summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativeSummary {
+    /// Initiative id.
+    pub id: String,
+    /// Initiative title.
+    pub title: String,
+    /// Initiative description.
+    pub description: String,
+    /// Initiative status.
+    pub status: String,
+    /// Initiative priority. Lower numbers sort first.
+    pub priority: i64,
+}
+
+/// Persisted CEO guidance summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidanceSummary {
+    /// Guidance id.
+    pub id: String,
+    /// Guidance text.
+    pub guidance: String,
+    /// Guidance strength label.
+    pub strength: String,
+    /// Whether this guidance is active.
+    pub active: bool,
+}
+
+fn default_guidance_strength() -> String {
+    "strong".to_string()
+}
+
 /// Errors returned by Blims state initialization.
 #[derive(Debug, Error)]
 pub enum BlimsStateError {
@@ -201,14 +279,17 @@ pub enum BlimsStateError {
     #[error("failed to initialize Blims database schema: {0}")]
     Schema(#[from] switchy_database::DatabaseError),
     /// State initialization worker panicked.
-    #[error("Blims state initialization worker panicked")]
-    WorkerPanicked,
+    #[error("Blims state initialization worker panicked: {0}")]
+    WorkerPanicked(String),
     /// Required state was missing.
     #[error("Blims company state has not been created at {0}")]
     StateMissing(PathBuf),
     /// Persisted state row was missing an expected column.
     #[error("Blims state row is missing column {0}")]
     MissingColumn(&'static str),
+    /// A request field was invalid.
+    #[error("invalid Blims request: {0}")]
+    InvalidRequest(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +308,19 @@ fn state_paths(working_directory: &Path) -> StatePaths {
         state_root,
         database_path,
     }
+}
+
+fn panic_to_blims_error(payload: Box<dyn Any + Send>) -> BlimsStateError {
+    let message = payload.downcast::<String>().map_or_else(
+        |payload| {
+            payload.downcast::<&str>().map_or_else(
+                |_| "unknown panic payload".to_string(),
+                |message| (*message).to_string(),
+            )
+        },
+        |message| *message,
+    );
+    BlimsStateError::WorkerPanicked(message)
 }
 
 fn service_company_status(request: &ServiceRequest) -> ServiceResponse {
@@ -264,6 +358,50 @@ fn service_agent_list(request: &ServiceRequest) -> ServiceResponse {
                 .collect::<Vec<_>>(),
         ),
         Err(error) => ServiceResponse::error("state_read_failed", error.to_string()),
+    }
+}
+
+fn service_initiative_create(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<InitiativeCreateRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match create_initiative(&request) {
+        Ok(initiative) => json_response(&initiative),
+        Err(error) => ServiceResponse::error("initiative_create_failed", error.to_string()),
+    }
+}
+
+fn service_initiative_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_initiatives(&request.working_directory) {
+        Ok(initiatives) => json_response(&initiatives),
+        Err(error) => ServiceResponse::error("initiative_list_failed", error.to_string()),
+    }
+}
+
+fn service_guidance_set(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<GuidanceSetRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match set_guidance(&request) {
+        Ok(guidance) => json_response(&guidance),
+        Err(error) => ServiceResponse::error("guidance_set_failed", error.to_string()),
+    }
+}
+
+fn service_guidance_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_guidance(&request.working_directory) {
+        Ok(guidance) => json_response(&guidance),
+        Err(error) => ServiceResponse::error("guidance_list_failed", error.to_string()),
     }
 }
 
@@ -365,7 +503,7 @@ fn create_company_state(working_directory: &Path) -> Result<CompanyStatus, Blims
         })
     })
     .join()
-    .map_err(|_| BlimsStateError::WorkerPanicked)??;
+    .map_err(panic_to_blims_error)??;
 
     Ok(company_status(working_directory))
 }
@@ -376,6 +514,15 @@ async fn initialize_schema(database: &dyn Database) -> Result<(), switchy_databa
 }
 
 async fn create_core_tables(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    create_base_tables(database).await?;
+    create_org_tables(database).await?;
+    create_world_tables(database).await?;
+    create_work_tables(database).await
+}
+
+async fn create_base_tables(
     database: &dyn Database,
 ) -> Result<(), switchy_database::DatabaseError> {
     create_table("blims_schema_version")
@@ -404,7 +551,10 @@ async fn create_core_tables(
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
-        .await?;
+        .await
+}
+
+async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
     create_table("departments")
         .if_not_exists(true)
         .column(text_column("id"))
@@ -443,7 +593,12 @@ async fn create_core_tables(
         .column(text_column("escalation"))
         .primary_key("agent_id")
         .execute(database)
-        .await?;
+        .await
+}
+
+async fn create_world_tables(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
     create_table("worlds")
         .if_not_exists(true)
         .column(text_column("id"))
@@ -459,6 +614,46 @@ async fn create_core_tables(
         .column(text_column("world_id"))
         .column(text_column("name"))
         .column(text_column("purpose"))
+        .primary_key("id")
+        .execute(database)
+        .await
+}
+
+async fn create_work_tables(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    create_table("executive_guidance")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("company_id"))
+        .column(text_column("guidance"))
+        .column(text_column("strength"))
+        .column(bool_column("active"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("initiatives")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("company_id"))
+        .column(text_column("title"))
+        .column(text_column("description"))
+        .column(text_column("status"))
+        .column(int_column("priority"))
+        .column(text_column("created_by"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("tasks")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("initiative_id"))
+        .column(text_column("title"))
+        .column(text_column("status"))
+        .column(text_column("assigned_agent_id"))
+        .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
         .await
@@ -481,6 +676,16 @@ fn int_column(name: &str) -> Column {
         auto_increment: false,
         data_type: DataType::BigInt,
         default: None,
+    }
+}
+
+fn bool_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        nullable: false,
+        auto_increment: false,
+        data_type: DataType::Bool,
+        default: Some(DatabaseValue::Bool(true)),
     }
 }
 
@@ -736,9 +941,22 @@ struct CompanyData {
     world_theme: String,
     rooms: Vec<RoomRecord>,
     agents: Vec<AgentRecord>,
+    initiatives: Vec<InitiativeSummary>,
+    guidance: Vec<GuidanceSummary>,
 }
 
-fn load_company_data(working_directory: &Path) -> Result<CompanyData, BlimsStateError> {
+fn with_database<T>(
+    working_directory: &Path,
+    operation: impl for<'a> FnOnce(
+        &'a dyn Database,
+    )
+        -> Pin<Box<dyn Future<Output = Result<T, BlimsStateError>> + 'a>>
+    + Send
+    + 'static,
+) -> Result<T, BlimsStateError>
+where
+    T: Send + 'static,
+{
     let paths = state_paths(working_directory);
     if !paths.database_path.exists() {
         return Err(BlimsStateError::StateMissing(paths.database_path));
@@ -757,11 +975,136 @@ fn load_company_data(working_directory: &Path) -> Result<CompanyData, BlimsState
                     source,
                 })?;
             initialize_schema(database.as_ref()).await?;
-            load_company_data_from_database(database.as_ref()).await
+            operation(database.as_ref()).await
         })
     })
     .join()
-    .map_err(|_| BlimsStateError::WorkerPanicked)?
+    .map_err(panic_to_blims_error)?
+}
+
+fn load_company_data(working_directory: &Path) -> Result<CompanyData, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(load_company_data_from_database(database))
+    })
+}
+
+fn create_initiative(
+    request: &InitiativeCreateRequest,
+) -> Result<InitiativeSummary, BlimsStateError> {
+    let title = request.title.trim().to_string();
+    if title.is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "initiative title cannot be empty".to_string(),
+        ));
+    }
+    let id = stable_slug(&title);
+    let description = request.description.clone().unwrap_or_default();
+    let priority = request.priority.unwrap_or(100);
+    let initiative = InitiativeSummary {
+        id: id.clone(),
+        title: title.clone(),
+        description: description.clone(),
+        status: "active".to_string(),
+        priority,
+    };
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .insert("initiatives")
+                .value("id", id)
+                .value("company_id", "default")
+                .value("title", title.clone())
+                .value("description", description)
+                .value("status", "active")
+                .value("priority", priority)
+                .value("created_by", "ceo")
+                .execute(database)
+                .await?;
+            Ok::<_, BlimsStateError>(initiative)
+        })
+    })
+}
+
+fn list_initiatives(working_directory: &Path) -> Result<Vec<InitiativeSummary>, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(async move {
+            database
+                .select("initiatives")
+                .columns(&["id", "title", "description", "status", "priority"])
+                .sort("priority", SortDirection::Asc)
+                .execute(database)
+                .await?
+                .iter()
+                .map(initiative_summary)
+                .collect()
+        })
+    })
+}
+
+fn set_guidance(request: &GuidanceSetRequest) -> Result<GuidanceSummary, BlimsStateError> {
+    let guidance = request.guidance.trim().to_string();
+    if guidance.is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "guidance cannot be empty".to_string(),
+        ));
+    }
+    let id = stable_slug(&guidance);
+    let strength = request.strength.clone();
+    let summary = GuidanceSummary {
+        id: id.clone(),
+        guidance: guidance.clone(),
+        strength: strength.clone(),
+        active: true,
+    };
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .insert("executive_guidance")
+                .value("id", id)
+                .value("company_id", "default")
+                .value("guidance", guidance.clone())
+                .value("strength", strength)
+                .value("active", true)
+                .execute(database)
+                .await?;
+            Ok::<_, BlimsStateError>(summary)
+        })
+    })
+}
+
+fn list_guidance(working_directory: &Path) -> Result<Vec<GuidanceSummary>, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(async move {
+            database
+                .select("executive_guidance")
+                .columns(&["id", "guidance", "strength", "active"])
+                .sort("created_at", SortDirection::Desc)
+                .execute(database)
+                .await?
+                .iter()
+                .map(guidance_summary)
+                .collect()
+        })
+    })
+}
+
+fn stable_slug(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if character.is_whitespace() || matches!(character, '-' | '_') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 async fn load_company_data_from_database(
@@ -801,6 +1144,25 @@ async fn load_company_data_from_database(
         .sort("id", SortDirection::Asc)
         .execute(database)
         .await?;
+    let initiatives = database
+        .select("initiatives")
+        .columns(&["id", "title", "description", "status", "priority"])
+        .sort("priority", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(initiative_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    let guidance = database
+        .select("executive_guidance")
+        .columns(&["id", "guidance", "strength", "active"])
+        .filter(Box::new(where_eq("active", true)))
+        .sort("created_at", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(guidance_summary)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CompanyData {
         company: CompanyRecord {
@@ -817,6 +1179,8 @@ async fn load_company_data_from_database(
             .iter()
             .map(agent_record)
             .collect::<Result<Vec<_>, _>>()?,
+        initiatives,
+        guidance,
     })
 }
 
@@ -840,25 +1204,79 @@ fn agent_record(row: &Row) -> Result<AgentRecord, BlimsStateError> {
     })
 }
 
+fn initiative_summary(row: &Row) -> Result<InitiativeSummary, BlimsStateError> {
+    Ok(InitiativeSummary {
+        id: required_text(row, "id")?,
+        title: required_text(row, "title")?,
+        description: required_text(row, "description")?,
+        status: required_text(row, "status")?,
+        priority: required_i64(row, "priority")?,
+    })
+}
+
+fn guidance_summary(row: &Row) -> Result<GuidanceSummary, BlimsStateError> {
+    Ok(GuidanceSummary {
+        id: required_text(row, "id")?,
+        guidance: required_text(row, "guidance")?,
+        strength: required_text(row, "strength")?,
+        active: required_bool(row, "active")?,
+    })
+}
+
 fn required_text(row: &Row, column: &'static str) -> Result<String, BlimsStateError> {
     row.get(column)
         .and_then(|value| value.as_str().map(ToString::to_string))
         .ok_or(BlimsStateError::MissingColumn(column))
 }
 
+fn required_i64(row: &Row, column: &'static str) -> Result<i64, BlimsStateError> {
+    row.get(column)
+        .and_then(|value| value.as_i64())
+        .ok_or(BlimsStateError::MissingColumn(column))
+}
+
+fn required_bool(row: &Row, column: &'static str) -> Result<bool, BlimsStateError> {
+    row.get(column)
+        .and_then(|value| {
+            value
+                .as_bool()
+                .or_else(|| value.as_i64().map(|value| value != 0))
+        })
+        .ok_or(BlimsStateError::MissingColumn(column))
+}
+
 fn morning_report(data: &CompanyData) -> MorningReport {
+    let mut bullets = vec![
+        format!("Mission: {}", data.company.mission),
+        format!("Culture: {}", data.company.culture),
+        format!(
+            "{} starter agents are active across {} rooms.",
+            data.agents.len(),
+            data.rooms.len()
+        ),
+    ];
+    if data.guidance.is_empty() {
+        bullets.push("No active CEO guidance yet.".to_string());
+    } else {
+        bullets.push(format!("Active CEO guidance: {}", data.guidance.len()));
+        if let Some(guidance) = data.guidance.first() {
+            bullets.push(format!("Top guidance: {}", guidance.guidance));
+        }
+    }
+    if data.initiatives.is_empty() {
+        bullets.push(
+            "No active initiatives yet. Add CEO guidance to wake the company loop.".to_string(),
+        );
+    } else {
+        bullets.push(format!("Active initiatives: {}", data.initiatives.len()));
+        if let Some(initiative) = data.initiatives.first() {
+            bullets.push(format!("Top initiative: {}", initiative.title));
+        }
+    }
+
     MorningReport {
         title: format!("{} morning report", data.company.name),
-        bullets: vec![
-            format!("Mission: {}", data.company.mission),
-            format!("Culture: {}", data.company.culture),
-            format!(
-                "{} starter agents are active across {} rooms.",
-                data.agents.len(),
-                data.rooms.len()
-            ),
-            "No active initiatives yet. Add CEO guidance to wake the company loop.".to_string(),
-        ],
+        bullets,
     }
 }
 
