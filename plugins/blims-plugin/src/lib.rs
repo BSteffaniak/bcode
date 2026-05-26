@@ -76,6 +76,15 @@ pub const OP_PROPOSAL_INSPECT: &str = "proposal.inspect";
 /// Work proposal mark-ready operation.
 pub const OP_PROPOSAL_MARK_READY: &str = "proposal.mark_ready";
 
+/// Work proposal approve operation.
+pub const OP_PROPOSAL_APPROVE: &str = "proposal.approve";
+
+/// Work proposal reject operation.
+pub const OP_PROPOSAL_REJECT: &str = "proposal.reject";
+
+/// Work proposal defer operation.
+pub const OP_PROPOSAL_DEFER: &str = "proposal.defer";
+
 /// Agent talk prompt operation.
 pub const OP_AGENT_TALK_PROMPT: &str = "agent.talk_prompt";
 
@@ -124,6 +133,9 @@ impl RustPlugin for BlimsPlugin {
             OP_PROPOSAL_LIST => service_proposal_list(&context.request),
             OP_PROPOSAL_INSPECT => service_proposal_inspect(&context.request),
             OP_PROPOSAL_MARK_READY => service_proposal_mark_ready(&context.request),
+            OP_PROPOSAL_APPROVE => service_proposal_status(&context.request, "approved"),
+            OP_PROPOSAL_REJECT => service_proposal_status(&context.request, "rejected"),
+            OP_PROPOSAL_DEFER => service_proposal_status(&context.request, "deferred"),
             OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
@@ -810,13 +822,17 @@ fn service_proposal_inspect(request: &ServiceRequest) -> ServiceResponse {
 }
 
 fn service_proposal_mark_ready(request: &ServiceRequest) -> ServiceResponse {
+    service_proposal_status(request, "ready_for_review")
+}
+
+fn service_proposal_status(request: &ServiceRequest, status: &str) -> ServiceResponse {
     let request = match request.payload_json::<ProposalRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match mark_proposal_ready(&request) {
+    match set_proposal_status(&request, status) {
         Ok(proposal) => json_response(&proposal),
-        Err(error) => ServiceResponse::error("proposal_mark_ready_failed", error.to_string()),
+        Err(error) => ServiceResponse::error("proposal_status_failed", error.to_string()),
     }
 }
 
@@ -1400,6 +1416,7 @@ struct CompanyData {
     agents: Vec<AgentRecord>,
     initiatives: Vec<InitiativeSummary>,
     guidance: Vec<GuidanceSummary>,
+    proposals: Vec<WorkProposalSummary>,
 }
 
 fn with_database<T>(
@@ -1738,21 +1755,22 @@ fn inspect_proposal(request: &ProposalRequest) -> Result<WorkProposalSummary, Bl
     })
 }
 
-fn mark_proposal_ready(request: &ProposalRequest) -> Result<WorkProposalSummary, BlimsStateError> {
+fn set_proposal_status(
+    request: &ProposalRequest,
+    status: &str,
+) -> Result<WorkProposalSummary, BlimsStateError> {
     let proposal_id = request.proposal_id.clone();
+    let status = status.to_string();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let proposal = load_proposal(database, &proposal_id).await?;
             database
                 .update("work_proposals")
-                .value("status", "ready_for_review")
-                .filter(Box::new(where_eq("id", proposal_id.clone())))
+                .value("status", status.clone())
+                .filter(Box::new(where_eq("id", proposal_id)))
                 .execute(database)
                 .await?;
-            Ok(WorkProposalSummary {
-                status: "ready_for_review".to_string(),
-                ..proposal
-            })
+            Ok(WorkProposalSummary { status, ..proposal })
         })
     })
 }
@@ -2103,6 +2121,15 @@ async fn load_company_data_from_database(
         .iter()
         .map(guidance_summary)
         .collect::<Result<Vec<_>, _>>()?;
+    let proposals = database
+        .select("work_proposals")
+        .columns(&proposal_columns())
+        .sort("updated_at", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(proposal_summary)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CompanyData {
         company: CompanyRecord {
@@ -2121,6 +2148,7 @@ async fn load_company_data_from_database(
             .collect::<Result<Vec<_>, _>>()?,
         initiatives,
         guidance,
+        proposals,
     })
 }
 
@@ -2258,6 +2286,27 @@ fn morning_report(data: &CompanyData) -> MorningReport {
         bullets.push(format!("Active initiatives: {}", data.initiatives.len()));
         if let Some(initiative) = data.initiatives.first() {
             bullets.push(format!("Top initiative: {}", initiative.title));
+        }
+    }
+    if data.proposals.is_empty() {
+        bullets.push("No work proposals are open yet.".to_string());
+    } else {
+        let drafts = data
+            .proposals
+            .iter()
+            .filter(|proposal| proposal.status == "draft")
+            .count();
+        let ready = data
+            .proposals
+            .iter()
+            .filter(|proposal| proposal.status == "ready_for_review")
+            .count();
+        bullets.push(format!("Open work proposals: {}", data.proposals.len()));
+        if drafts > 0 {
+            bullets.push(format!("Draft proposals in progress: {drafts}"));
+        }
+        if ready > 0 {
+            bullets.push(format!("Ready for CEO review: {ready}"));
         }
     }
 

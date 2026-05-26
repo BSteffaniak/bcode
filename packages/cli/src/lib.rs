@@ -557,6 +557,21 @@ enum BlimsProposalCommand {
         #[arg(long)]
         json: bool,
     },
+    Approve {
+        proposal_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Reject {
+        proposal_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Defer {
+        proposal_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl WorktreeBaseRefArg {
@@ -1172,7 +1187,24 @@ async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
             print_office_proposal(proposal_id).await?;
         }
         ["ready", proposal_id] | ["ready", "proposal", proposal_id] => {
-            mark_office_proposal_ready(proposal_id).await?;
+            update_office_proposal_status(
+                "proposal.mark_ready",
+                "proposal ready for review",
+                proposal_id,
+            )
+            .await?;
+        }
+        ["approve", proposal_id] | ["approve", "proposal", proposal_id] => {
+            update_office_proposal_status("proposal.approve", "proposal approved", proposal_id)
+                .await?;
+        }
+        ["reject", proposal_id] | ["reject", "proposal", proposal_id] => {
+            update_office_proposal_status("proposal.reject", "proposal rejected", proposal_id)
+                .await?;
+        }
+        ["defer", proposal_id] | ["defer", "proposal", proposal_id] => {
+            update_office_proposal_status("proposal.defer", "proposal deferred", proposal_id)
+                .await?;
         }
         ["work", "task", task_id] | ["work", task_id] => {
             start_blims_task_work((*task_id).to_string()).await?;
@@ -1309,9 +1341,13 @@ async fn print_office_proposal(proposal_id: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn mark_office_proposal_ready(proposal_id: &str) -> Result<(), CliError> {
-    let proposal = load_blims_proposal("proposal.mark_ready", proposal_id.to_string()).await?;
-    println!("proposal ready for review: {}", proposal.id);
+async fn update_office_proposal_status(
+    operation: &str,
+    message: &str,
+    proposal_id: &str,
+) -> Result<(), CliError> {
+    let proposal = load_blims_proposal(operation, proposal_id.to_string()).await?;
+    println!("{message}: {}", proposal.id);
     print_proposal_detail(&proposal);
     Ok(())
 }
@@ -1467,7 +1503,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready <proposal-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
     );
 }
 
@@ -1655,14 +1691,47 @@ async fn handle_blims_proposal_command(command: BlimsProposalCommand) -> Result<
             }
         }
         BlimsProposalCommand::MarkReady { proposal_id, json } => {
-            let proposal = load_blims_proposal("proposal.mark_ready", proposal_id).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&proposal)?);
-            } else {
-                println!("proposal ready for review: {}", proposal.id);
-                print_proposal_detail(&proposal);
-            }
+            print_proposal_status_update(
+                "proposal.mark_ready",
+                "proposal ready for review",
+                proposal_id,
+                json,
+            )
+            .await?;
         }
+        BlimsProposalCommand::Approve { proposal_id, json } => {
+            print_proposal_status_update(
+                "proposal.approve",
+                "proposal approved",
+                proposal_id,
+                json,
+            )
+            .await?;
+        }
+        BlimsProposalCommand::Reject { proposal_id, json } => {
+            print_proposal_status_update("proposal.reject", "proposal rejected", proposal_id, json)
+                .await?;
+        }
+        BlimsProposalCommand::Defer { proposal_id, json } => {
+            print_proposal_status_update("proposal.defer", "proposal deferred", proposal_id, json)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn print_proposal_status_update(
+    operation: &str,
+    message: &str,
+    proposal_id: String,
+    json: bool,
+) -> Result<(), CliError> {
+    let proposal = load_blims_proposal(operation, proposal_id).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&proposal)?);
+    } else {
+        println!("{message}: {}", proposal.id);
+        print_proposal_detail(&proposal);
     }
     Ok(())
 }
