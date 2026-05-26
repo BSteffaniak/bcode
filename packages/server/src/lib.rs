@@ -697,6 +697,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
             bcode_openai_compatible_provider_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-opencode-session-import-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml"),
+            bcode_opencode_session_import_plugin::static_plugin(),
+        ),
         #[cfg(feature = "static-bundled-pi-session-import-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),

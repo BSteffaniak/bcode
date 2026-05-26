@@ -34,6 +34,7 @@ const DEFAULT_MODEL_PROVIDER_PLUGIN_ID: &str = "bcode.openai-compatible";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_IDS: &[&str] = &["bcode.openai-compatible", "bcode.bedrock"];
 const DEFAULT_WORKTREE_PLUGIN_ID: &str = "bcode.worktree";
 const DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.pi-session-import";
+const DEFAULT_OPENCODE_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.opencode-session-import";
 const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
     DEFAULT_DOCUMENT_PLUGIN_ID,
     DEFAULT_FILESYSTEM_PLUGIN_ID,
@@ -43,6 +44,7 @@ const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
     DEFAULT_WORKTREE_PLUGIN_ID,
     DEFAULT_AGENT_PROFILE_PLUGIN_ID,
     DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID,
+    DEFAULT_OPENCODE_SESSION_IMPORT_PLUGIN_ID,
 ];
 
 struct ProviderEnvironmentSpec {
@@ -829,6 +831,8 @@ pub struct SessionImportConfig {
     pub hide_already_imported: bool,
     #[serde(default)]
     pub pi: PiSessionImportConfig,
+    #[serde(default)]
+    pub opencode: OpenCodeSessionImportConfig,
 }
 
 impl Default for SessionImportConfig {
@@ -838,6 +842,7 @@ impl Default for SessionImportConfig {
             auto_discover_on_startup: true,
             hide_already_imported: true,
             pi: PiSessionImportConfig::default(),
+            opencode: OpenCodeSessionImportConfig::default(),
         }
     }
 }
@@ -854,6 +859,27 @@ pub struct PiSessionImportConfig {
 }
 
 impl Default for PiSessionImportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paths: Vec::new(),
+            path_mode: SessionImportPathMode::DefaultsAndCustom,
+        }
+    }
+}
+
+/// `OpenCode` session import configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenCodeSessionImportConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub path_mode: SessionImportPathMode,
+}
+
+impl Default for OpenCodeSessionImportConfig {
     fn default() -> Self {
         Self {
             enabled: true,

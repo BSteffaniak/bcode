@@ -25,6 +25,7 @@ bcode_git_plugin = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
 bcode_model = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
+bcode_opencode_session_import_plugin = { workspace = true, optional = true }
 bcode_pi_session_import_plugin = { workspace = true, optional = true }
 bcode_plugin = { workspace = true }
 bcode_session = { workspace = true }
@@ -94,6 +95,11 @@ static-bundled-openai-compatible-provider-plugin = [
     "dep:bcode_openai_compatible_provider_plugin",
     "bcode_openai_compatible_provider_plugin/static-bundled",
 ]
+static-bundled-opencode-session-import-plugin = [
+    "_static-bundled",
+    "dep:bcode_opencode_session_import_plugin",
+    "bcode_opencode_session_import_plugin/static-bundled",
+]
 static-bundled-pi-session-import-plugin = [
     "_static-bundled",
     "dep:bcode_pi_session_import_plugin",
@@ -108,6 +114,7 @@ static-bundled-plugins = [
     "static-bundled-filesystem-plugin",
     "static-bundled-git-plugin",
     "static-bundled-openai-compatible-provider-plugin",
+    "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-web-search-plugin",

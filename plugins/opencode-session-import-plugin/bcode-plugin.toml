@@ -1,0 +1,19 @@
+id      = "bcode.opencode-session-import"
+name    = "Bcode OpenCode Session Import Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "query"
+description  = "Discover and load OpenCode sessions for one-time import into Bcode"
+interface_id = "bcode.session_import/v1"
+name         = "OpenCode Session Import"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version    = 1
+library        = "libbcode_opencode_session_import_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"
