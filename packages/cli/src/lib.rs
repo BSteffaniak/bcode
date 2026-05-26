@@ -508,11 +508,21 @@ enum BlimsTaskCommand {
         #[arg(long)]
         json: bool,
     },
+    Inspect {
+        task_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum BlimsArtifactCommand {
     List {
+        #[arg(long)]
+        json: bool,
+    },
+    Inspect {
+        artifact_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -932,6 +942,15 @@ struct BlimsArtifactSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsArtifactDetail {
+    id: String,
+    initiative_id: String,
+    kind: String,
+    title: String,
+    payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsAgentTalkPrompt {
     agent_id: String,
     prompt: String,
@@ -1095,7 +1114,8 @@ async fn start_agent_talk_session(prompt: BlimsAgentTalkPrompt) -> Result<(), Cl
         .send_user_message(session.id, prompt.prompt)
         .await?;
     println!("AI chat session with {}: {}", prompt.agent_id, session.id);
-    println!("Open it with: bcode attach {}", session.id);
+    println!("Attaching now. Press Ctrl-C to return to the Blims office.");
+    attach_session(session.id).await?;
     Ok(())
 }
 
@@ -1258,6 +1278,19 @@ async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliE
                 }
             }
         }
+        BlimsTaskCommand::Inspect { task_id, json } => {
+            let request = serde_json::json!({
+                "working_directory": std::env::current_dir()?,
+                "task_id": task_id,
+            });
+            let response =
+                call_blims_service("task.inspect", serde_json::to_vec(&request)?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                print_task_detail(&decode_blims_response::<BlimsTaskSummary>(response)?);
+            }
+        }
     }
     Ok(())
 }
@@ -1278,8 +1311,41 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
                 }
             }
         }
+        BlimsArtifactCommand::Inspect { artifact_id, json } => {
+            let request = serde_json::json!({
+                "working_directory": std::env::current_dir()?,
+                "artifact_id": artifact_id,
+            });
+            let response =
+                call_blims_service("artifact.inspect", serde_json::to_vec(&request)?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                print_artifact_detail(&decode_blims_response::<BlimsArtifactDetail>(response)?);
+            }
+        }
     }
     Ok(())
+}
+
+fn print_task_detail(task: &BlimsTaskSummary) {
+    println!("{}", task.title);
+    println!("id: {}", task.id);
+    println!("initiative: {}", task.initiative_id);
+    println!("status: {}", task.status);
+    println!("priority: {}", task.priority);
+    println!("assigned agent: {}", task.assigned_agent_id);
+    println!("description: {}", task.description);
+    println!("rationale: {}", task.rationale);
+}
+
+fn print_artifact_detail(artifact: &BlimsArtifactDetail) {
+    println!("{}", artifact.title);
+    println!("id: {}", artifact.id);
+    println!("initiative: {}", artifact.initiative_id);
+    println!("kind: {}", artifact.kind);
+    println!("payload:");
+    println!("{}", artifact.payload_json);
 }
 
 async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Result<(), CliError> {

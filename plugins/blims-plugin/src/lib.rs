@@ -49,8 +49,14 @@ pub const OP_INITIATIVE_IMPORT_PLAN: &str = "initiative.import_plan";
 /// Task list operation.
 pub const OP_TASK_LIST: &str = "task.list";
 
+/// Task inspect operation.
+pub const OP_TASK_INSPECT: &str = "task.inspect";
+
 /// Artifact list operation.
 pub const OP_ARTIFACT_LIST: &str = "artifact.list";
+
+/// Artifact inspect operation.
+pub const OP_ARTIFACT_INSPECT: &str = "artifact.inspect";
 
 /// Agent talk prompt operation.
 pub const OP_AGENT_TALK_PROMPT: &str = "agent.talk_prompt";
@@ -91,7 +97,9 @@ impl RustPlugin for BlimsPlugin {
             OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(&context.request),
             OP_INITIATIVE_IMPORT_PLAN => service_initiative_import_plan(&context.request),
             OP_TASK_LIST => service_task_list(&context.request),
+            OP_TASK_INSPECT => service_task_inspect(&context.request),
             OP_ARTIFACT_LIST => service_artifact_list(&context.request),
+            OP_ARTIFACT_INSPECT => service_artifact_inspect(&context.request),
             OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
@@ -150,6 +158,24 @@ pub struct AgentTalkPromptRequest {
     pub working_directory: PathBuf,
     /// Blims agent id.
     pub agent_id: String,
+}
+
+/// Request to inspect a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskInspectRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Task id.
+    pub task_id: String,
+}
+
+/// Request to inspect an artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactInspectRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Artifact id.
+    pub artifact_id: String,
 }
 
 /// Request to import an AI-generated plan for an initiative.
@@ -254,6 +280,21 @@ pub struct ArtifactSummary {
     pub kind: String,
     /// Artifact title.
     pub title: String,
+}
+
+/// Persisted artifact detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactDetail {
+    /// Artifact id.
+    pub id: String,
+    /// Parent initiative id.
+    pub initiative_id: String,
+    /// Artifact kind.
+    pub kind: String,
+    /// Artifact title.
+    pub title: String,
+    /// Artifact payload JSON.
+    pub payload_json: String,
 }
 
 /// Current Blims company lifecycle state.
@@ -587,6 +628,17 @@ fn service_task_list(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn service_task_inspect(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<TaskInspectRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match inspect_task(&request) {
+        Ok(task) => json_response(&task),
+        Err(error) => ServiceResponse::error("task_inspect_failed", error.to_string()),
+    }
+}
+
 fn service_artifact_list(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<WorkspaceRequest>() {
         Ok(request) => request,
@@ -595,6 +647,17 @@ fn service_artifact_list(request: &ServiceRequest) -> ServiceResponse {
     match list_artifacts(&request.working_directory) {
         Ok(artifacts) => json_response(&artifacts),
         Err(error) => ServiceResponse::error("artifact_list_failed", error.to_string()),
+    }
+}
+
+fn service_artifact_inspect(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ArtifactInspectRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match inspect_artifact(&request) {
+        Ok(artifact) => json_response(&artifact),
+        Err(error) => ServiceResponse::error("artifact_inspect_failed", error.to_string()),
     }
 }
 
@@ -1331,6 +1394,34 @@ fn list_tasks(working_directory: &Path) -> Result<Vec<TaskSummary>, BlimsStateEr
     })
 }
 
+fn inspect_task(request: &TaskInspectRequest) -> Result<TaskSummary, BlimsStateError> {
+    let task_id = request.task_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .select("tasks")
+                .columns(&[
+                    "id",
+                    "initiative_id",
+                    "title",
+                    "description",
+                    "status",
+                    "assigned_agent_id",
+                    "rationale",
+                    "priority",
+                ])
+                .filter(Box::new(where_eq("id", task_id)))
+                .limit(1)
+                .execute_first(database)
+                .await?
+                .as_ref()
+                .map(task_summary)
+                .transpose()?
+                .ok_or(BlimsStateError::MissingColumn("task"))
+        })
+    })
+}
+
 fn list_artifacts(working_directory: &Path) -> Result<Vec<ArtifactSummary>, BlimsStateError> {
     with_database(working_directory, |database| {
         Box::pin(async move {
@@ -1343,6 +1434,25 @@ fn list_artifacts(working_directory: &Path) -> Result<Vec<ArtifactSummary>, Blim
                 .iter()
                 .map(artifact_summary)
                 .collect()
+        })
+    })
+}
+
+fn inspect_artifact(request: &ArtifactInspectRequest) -> Result<ArtifactDetail, BlimsStateError> {
+    let artifact_id = request.artifact_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .select("artifacts")
+                .columns(&["id", "initiative_id", "kind", "title", "payload_json"])
+                .filter(Box::new(where_eq("id", artifact_id)))
+                .limit(1)
+                .execute_first(database)
+                .await?
+                .as_ref()
+                .map(artifact_detail)
+                .transpose()?
+                .ok_or(BlimsStateError::MissingColumn("artifact"))
         })
     })
 }
@@ -1672,6 +1782,16 @@ fn artifact_summary(row: &Row) -> Result<ArtifactSummary, BlimsStateError> {
         initiative_id: required_text(row, "initiative_id")?,
         kind: required_text(row, "kind")?,
         title: required_text(row, "title")?,
+    })
+}
+
+fn artifact_detail(row: &Row) -> Result<ArtifactDetail, BlimsStateError> {
+    Ok(ArtifactDetail {
+        id: required_text(row, "id")?,
+        initiative_id: required_text(row, "initiative_id")?,
+        kind: required_text(row, "kind")?,
+        title: required_text(row, "title")?,
+        payload_json: required_text(row, "payload_json")?,
     })
 }
 
