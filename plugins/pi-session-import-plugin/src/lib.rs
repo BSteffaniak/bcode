@@ -218,14 +218,17 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
                 };
                 match message.get("role").and_then(Value::as_str) {
                     Some("user") => {
-                        let (text, images) = content_text_and_images(message.get("content"));
-                        skipped_images = skipped_images.saturating_add(images);
+                        let (text, image_notes) =
+                            content_text_and_image_notes(message.get("content"));
+                        skipped_images = skipped_images
+                            .saturating_add(u64::try_from(image_notes.len()).unwrap_or(u64::MAX));
                         if !text.trim().is_empty() {
                             events.push(import_event(
                                 &value,
                                 ImportableSessionEventKind::UserMessage { text },
                             ));
                         }
+                        append_image_notes(&mut events, &value, "user message", image_notes);
                     }
                     Some("assistant") => {
                         if let Some(blocks) = message.get("content").and_then(Value::as_array) {
@@ -281,6 +284,13 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
                                         ));
                                     }
                                     Some("image") => {
+                                        let note = image_note("assistant message", block);
+                                        events.push(import_event(
+                                            &value,
+                                            ImportableSessionEventKind::SystemMessage {
+                                                text: note,
+                                            },
+                                        ));
                                         skipped_images = skipped_images.saturating_add(1);
                                     }
                                     Some(other) => warnings.push(ImportWarning::new(
@@ -299,8 +309,10 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
                         }
                     }
                     Some("toolResult") => {
-                        let (result, images) = content_text_and_images(message.get("content"));
-                        skipped_images = skipped_images.saturating_add(images);
+                        let (result, image_notes) =
+                            content_text_and_image_notes(message.get("content"));
+                        skipped_images = skipped_images
+                            .saturating_add(u64::try_from(image_notes.len()).unwrap_or(u64::MAX));
                         let tool_call_id =
                             string_field(message, "toolCallId").unwrap_or_else(|| {
                                 string_field(&value, "id").unwrap_or_else(|| "unknown".to_string())
@@ -317,6 +329,7 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
                                 is_error,
                             },
                         ));
+                        append_image_notes(&mut events, &value, "tool result", image_notes);
                     }
                     Some(other) => warnings.push(ImportWarning::new(
                         "unknown_message_role",
@@ -338,8 +351,8 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
     }
     if skipped_images > 0 {
         warnings.push(ImportWarning::counted(
-            "skipped_images",
-            "skipped Pi image blocks",
+            "preserved_image_references",
+            "preserved Pi image references as inert system notes",
             skipped_images,
         ));
     }
@@ -396,7 +409,7 @@ fn read_summary(path: &Path) -> Result<ImportableSessionSummary, std::io::Error>
                     continue;
                 };
                 if message.get("role").and_then(Value::as_str) == Some("user") {
-                    let (text, _) = content_text_and_images(message.get("content"));
+                    let (text, _) = content_text_and_image_notes(message.get("content"));
                     let text = text.trim();
                     if !text.is_empty() && !text.starts_with('<') {
                         first_user = Some(truncate_title(text));
@@ -448,12 +461,12 @@ fn diagnostic_summary(root: &Path, code: &str, message: String) -> ImportableSes
     }
 }
 
-fn content_text_and_images(content: Option<&Value>) -> (String, u64) {
+fn content_text_and_image_notes(content: Option<&Value>) -> (String, Vec<String>) {
     match content {
-        Some(Value::String(text)) => (text.clone(), 0),
+        Some(Value::String(text)) => (text.clone(), Vec::new()),
         Some(Value::Array(blocks)) => {
             let mut text = String::new();
-            let mut images = 0_u64;
+            let mut image_notes = Vec::new();
             for block in blocks {
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => append_text(
@@ -463,14 +476,38 @@ fn content_text_and_images(content: Option<&Value>) -> (String, u64) {
                             .and_then(Value::as_str)
                             .unwrap_or_default(),
                     ),
-                    Some("image") => images = images.saturating_add(1),
+                    Some("image") => image_notes.push(image_note("content block", block)),
                     _ => {}
                 }
             }
-            (text, images)
+            (text, image_notes)
         }
-        _ => (String::new(), 0),
+        _ => (String::new(), Vec::new()),
     }
+}
+
+fn append_image_notes(
+    events: &mut Vec<ImportableSessionEvent>,
+    source: &Value,
+    context: &str,
+    notes: Vec<String>,
+) {
+    events.extend(notes.into_iter().map(|text| {
+        import_event(
+            source,
+            ImportableSessionEventKind::SystemMessage {
+                text: format!("Imported Pi image in {context}: {text}"),
+            },
+        )
+    }));
+}
+
+fn image_note(context: &str, block: &Value) -> String {
+    let path = string_field(block, "path")
+        .or_else(|| string_field(block, "filePath"))
+        .or_else(|| string_field(block, "url"))
+        .unwrap_or_else(|| "<inline image>".to_owned());
+    format!("{context} image reference {path}")
 }
 
 fn maybe_usage_event(source: &Value) -> Option<ImportableSessionEvent> {
@@ -677,6 +714,11 @@ mod tests {
             event.kind,
             ImportableSessionEventKind::ToolCallFinished { .. }
         )));
+        assert!(session.events.iter().any(|event| matches!(
+            &event.kind,
+            ImportableSessionEventKind::SystemMessage { text }
+                if text.contains("image reference")
+        )));
         assert!(
             session
                 .events
@@ -693,7 +735,7 @@ mod tests {
             session
                 .warnings
                 .iter()
-                .any(|warning| warning.code == "skipped_images")
+                .any(|warning| warning.code == "preserved_image_references")
         );
         assert!(
             session
