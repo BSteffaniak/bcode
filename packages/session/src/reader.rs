@@ -119,6 +119,7 @@ impl From<BadReasoningOrderSessionEvent> for SessionEvent {
             schema_version: value.schema_version,
             sequence: value.sequence,
             session_id: value.session_id,
+            provenance: None,
             kind: value.kind.into(),
         }
     }

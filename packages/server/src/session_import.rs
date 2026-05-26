@@ -4,11 +4,13 @@ use crate::{ErrorResponse, ServerError, ServerState, send_response};
 use bcode_ipc::LocalIpcStream;
 use bcode_ipc::{Response, ResponsePayload, SessionImportWarning};
 use bcode_session_import::{
-    DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse,
+    DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportableSessionEvent,
     ImportableSessionEventKind, LoadImportableSessionRequest, OP_DISCOVER_IMPORTABLE_SESSIONS,
     OP_LOAD_IMPORTABLE_SESSION, SESSION_IMPORT_INTERFACE_ID,
 };
-use bcode_session_models::{ClientId, SessionEventKind, SessionId, SessionImportSummary};
+use bcode_session_models::{
+    ClientId, SessionEventKind, SessionEventProvenance, SessionId, SessionImportSummary,
+};
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -197,7 +199,8 @@ pub async fn import_external_session(
             .events
             .into_iter()
             .scan(0_u64, |compacted_through_sequence, event| {
-                Some(match event.kind {
+                let provenance = import_event_provenance(&event, &importable.summary.locator);
+                let kind = match event.kind {
                     ImportableSessionEventKind::UserMessage { text } => {
                         SessionEventKind::UserMessage {
                             client_id: ClientId::new(),
@@ -263,7 +266,8 @@ pub async fn import_external_session(
                     ImportableSessionEventKind::SystemMessage { text } => {
                         SessionEventKind::SystemMessage { text }
                     }
-                })
+                };
+                Some((kind, provenance))
             })
             .collect();
         let session = state
@@ -284,6 +288,19 @@ pub async fn import_external_session(
         return Ok((session.id, importable.warnings));
     }
     Err("external session not found".to_string())
+}
+
+fn import_event_provenance(
+    event: &ImportableSessionEvent,
+    locator: &str,
+) -> Option<SessionEventProvenance> {
+    (event.external_event_id.is_some() || event.timestamp_ms.is_some() || !locator.is_empty()).then(
+        || SessionEventProvenance {
+            source_event_id: event.external_event_id.clone(),
+            source_timestamp_ms: event.timestamp_ms,
+            source_locator: (!locator.is_empty()).then(|| locator.to_owned()),
+        },
+    )
 }
 
 /// Send IPC response for an explicit external import request.

@@ -54,6 +54,22 @@ impl SessionHandle {
     ) -> Result<SessionEvent, SessionError> {
         self.send(|reply| SessionCommand::AppendEvent {
             kind,
+            provenance: None,
+            activity_timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn append_event_with_provenance(
+        &self,
+        kind: SessionEventKind,
+        provenance: Option<SessionEventProvenance>,
+        activity_timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.send(|reply| SessionCommand::AppendEvent {
+            kind,
+            provenance,
             activity_timestamp_ms,
             reply,
         })
@@ -181,6 +197,7 @@ pub enum AttachMode {
 enum SessionCommand {
     AppendEvent {
         kind: SessionEventKind,
+        provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
@@ -238,10 +255,14 @@ impl SessionActor {
             match command {
                 SessionCommand::AppendEvent {
                     kind,
+                    provenance,
                     activity_timestamp_ms,
                     reply,
                 } => {
-                    let _ = reply.send(self.append_event(kind, activity_timestamp_ms).await);
+                    let _ = reply.send(
+                        self.append_event(kind, provenance, activity_timestamp_ms)
+                            .await,
+                    );
                 }
                 SessionCommand::AppendUserMessage {
                     client_id,
@@ -330,9 +351,11 @@ impl SessionActor {
     async fn append_event(
         &mut self,
         kind: SessionEventKind,
+        provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
-        let event = self.state.build_next_event(kind)?;
+        let mut event = self.state.build_next_event(kind)?;
+        event.provenance = provenance;
         if let Some(store) = &self.store {
             store.append_event_frame(event.clone()).await?;
         }
@@ -366,6 +389,7 @@ impl SessionActor {
             events.push(
                 self.append_event(
                     SessionEventKind::SessionRenamed { name: Some(title) },
+                    None,
                     activity_timestamp_ms,
                 )
                 .await?,
@@ -374,6 +398,7 @@ impl SessionActor {
         events.push(
             self.append_event(
                 SessionEventKind::UserMessage { client_id, text },
+                None,
                 activity_timestamp_ms,
             )
             .await?,
@@ -407,6 +432,7 @@ impl SessionActor {
         let attached_event = self
             .append_event(
                 SessionEventKind::ClientAttached { client_id },
+                None,
                 activity_timestamp_ms,
             )
             .await?;
@@ -431,6 +457,7 @@ impl SessionActor {
             return Ok(Some(
                 self.append_event(
                     SessionEventKind::ClientDetached { client_id },
+                    None,
                     activity_timestamp_ms,
                 )
                 .await?,
@@ -510,6 +537,7 @@ impl SessionActor {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: self.state.next_sequence,
             session_id: self.state.summary.id,
+            provenance: None,
             kind,
         };
         let _ = self.state.sender.send(event.clone());

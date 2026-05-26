@@ -35,6 +35,7 @@ const BUILTIN_SESSION_EVENT_MIGRATIONS: &[NoOpSessionEventMigration] = &[
     NoOpSessionEventMigration::new("sessions-events-v13-to-v14", 13, 14),
     NoOpSessionEventMigration::new("sessions-events-v14-to-v15", 14, 15),
     NoOpSessionEventMigration::new("sessions-events-v15-to-v16", 15, 16),
+    NoOpSessionEventMigration::new("sessions-events-v16-to-v17", 16, 17),
 ];
 
 trait SessionEventMigrationStep {
@@ -86,6 +87,11 @@ impl SessionEventMigrationStep for NoOpSessionEventMigration {
         }
         if self.from_schema == 12 && self.to_schema == 13 {
             return Ok(migrate_v12_event_to_v13(event));
+        }
+        if self.from_schema == 16 && self.to_schema == 17 {
+            let mut event = event;
+            event.provenance = None;
+            return Ok(vec![event]);
         }
         Ok(vec![event])
     }

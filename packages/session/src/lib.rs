@@ -28,9 +28,9 @@ pub use migration::{
 use actor::{AttachMode, SessionHandle};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
-    SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionSummary,
-    SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
+    SessionEventKind, SessionEventProvenance, SessionHistoryCursor, SessionHistoryDirection,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
+    SessionInputHistoryEntry, SessionSummary, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1397,7 +1397,7 @@ impl SessionManager {
         name: Option<String>,
         working_directory: PathBuf,
         import: SessionImportSummary,
-        events: Vec<SessionEventKind>,
+        events: Vec<(SessionEventKind, Option<SessionEventProvenance>)>,
     ) -> Result<SessionSummary, SessionError> {
         let session = self.create_session(name, working_directory).await?;
         self.append_event(
@@ -1410,8 +1410,9 @@ impl SessionManager {
             },
         )
         .await?;
-        for event in events {
-            self.append_event(session.id, event).await?;
+        for (event, provenance) in events {
+            self.append_event_with_provenance(session.id, event, provenance)
+                .await?;
         }
         self.session_summary(session.id).await
     }
@@ -2008,6 +2009,30 @@ impl SessionManager {
         Ok(event)
     }
 
+    /// Append an event with optional source provenance to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the session does not exist
+    /// * the event cannot be persisted
+    pub async fn append_event_with_provenance(
+        &self,
+        session_id: SessionId,
+        kind: SessionEventKind,
+        provenance: Option<SessionEventProvenance>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
+        let handle = self.session_handle(session_id).await?;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
+        let event = handle
+            .append_event_with_provenance(kind, provenance, activity_timestamp_ms)
+            .await?;
+        Ok(event)
+    }
+
     fn next_activity_timestamp_ms(&self) -> u64 {
         loop {
             let previous = self.activity_clock_ms.load(Ordering::Acquire);
@@ -2073,12 +2098,14 @@ impl SessionState {
 
     fn build_next_event(&self, kind: SessionEventKind) -> Result<SessionEvent, SessionError> {
         self.ensure_writable()?;
-        Ok(SessionEvent {
+        let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: self.next_sequence,
             session_id: self.summary.id,
+            provenance: None,
             kind,
-        })
+        };
+        Ok(event)
     }
 
     fn apply_persisted_event(&mut self, event: SessionEvent, activity_timestamp_ms: u64) {
@@ -2402,7 +2429,7 @@ mod tests {
     use super::{SessionAccessStatus, SessionManager, access_status_from_report, reader};
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
-        RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+        RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
         SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent, SessionTracePayload,
         SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
     };
@@ -2472,6 +2499,7 @@ mod tests {
                 schema_version: 12,
                 sequence: 0,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::SessionCreated {
                     name: None,
                     working_directory: test_working_directory(),
@@ -2481,6 +2509,7 @@ mod tests {
                 schema_version: 12,
                 sequence: 1,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::ToolInvocationStream {
                     event: ToolInvocationStreamEvent::Started {
                         tool_call_id: "tool-1".to_string(),
@@ -2495,6 +2524,7 @@ mod tests {
                 schema_version: 12,
                 sequence: 2,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::ToolInvocationStream {
                     event: ToolInvocationStreamEvent::OutputDelta {
                         tool_call_id: "tool-1".to_string(),
@@ -2509,6 +2539,7 @@ mod tests {
                 schema_version: 12,
                 sequence: 3,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::ToolInvocationStream {
                     event: ToolInvocationStreamEvent::Finished {
                         tool_call_id: "tool-1".to_string(),
@@ -2624,6 +2655,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 0,
             session_id,
+            provenance: None,
             kind: SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::OutputDelta {
                     tool_call_id: "call".to_string(),
@@ -2669,6 +2701,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 0,
             session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
             kind: SessionEventKind::TraceEvent {
                 trace: Box::new(SessionTraceEvent {
                     timestamp_ms: 1,
@@ -3147,6 +3180,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
             sequence: 0,
             session_id,
+            provenance: None,
             kind: SessionEventKind::SessionCreated {
                 name: Some("old".to_string()),
                 working_directory: test_working_directory(),
@@ -3205,6 +3239,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 2,
                 sequence: 0,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::SessionCreated {
                     name: Some("mixed old".to_string()),
                     working_directory: test_working_directory(),
@@ -3217,6 +3252,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
                 sequence: 1,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "hello".to_string(),
@@ -3229,6 +3265,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 2,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::SystemMessage {
                     text: "current".to_string(),
                 },
@@ -3280,6 +3317,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
                 sequence: 0,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::SessionCreated {
                     name: Some("auto".to_string()),
                     working_directory: test_working_directory(),
@@ -3325,6 +3363,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION.saturating_add(1),
             sequence: 0,
             session_id,
+            provenance: None,
             kind: SessionEventKind::SessionCreated {
                 name: Some("future".to_string()),
                 working_directory: test_working_directory(),
@@ -3359,6 +3398,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 0,
             session_id,
+            provenance: None,
             kind: SessionEventKind::SessionCreated {
                 name: Some("mixed".to_string()),
                 working_directory: test_working_directory(),
@@ -3425,6 +3465,44 @@ mod tests {
             SessionEventKind::UserMessage { text, .. } if text == "hello"
         )));
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn append_event_with_provenance_persists_source_metadata() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("imported".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let provenance = SessionEventProvenance {
+            source_event_id: Some("pi-event-1".to_string()),
+            source_timestamp_ms: Some(1_779_483_416_000),
+            source_locator: Some("/tmp/pi-session.jsonl".to_string()),
+        };
+        manager
+            .append_event_with_provenance(
+                session.id,
+                SessionEventKind::AssistantMessage {
+                    text: "imported response".to_string(),
+                },
+                Some(provenance.clone()),
+            )
+            .await
+            .expect("event should append");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let history = restored
+            .session_history(session.id)
+            .await
+            .expect("history should load");
+        let imported = history
+            .iter()
+            .find(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+            .expect("imported event should exist");
+
+        assert_eq!(imported.provenance.as_ref(), Some(&provenance));
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
@@ -4469,6 +4547,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 0,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::SessionCreated {
                     name: Some("stable-order".to_string()),
                     working_directory: test_working_directory(),
@@ -4478,6 +4557,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 1,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::AssistantDelta {
                     text: "partial".to_string(),
                 },
@@ -4486,6 +4566,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 2,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::ToolCallRequested {
                     tool_call_id: "call".to_string(),
                     tool_name: "read".to_string(),
@@ -4496,6 +4577,7 @@ mod tests {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 3,
                 session_id,
+                provenance: None,
                 kind: SessionEventKind::SkillInvocationFailed {
                     skill_id: SkillId::new("fixture"),
                     error: "failed".to_string(),

@@ -1108,6 +1108,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 7,
             session_id,
+            provenance: None,
             kind: SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-1".to_string(),
                 result: "z".repeat(MAX_FRAME_PAYLOAD_SIZE + 100_000),

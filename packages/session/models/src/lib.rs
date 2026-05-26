@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 16;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 17;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -191,12 +191,28 @@ pub enum RuntimeWorkStatus {
     Cancelled,
 }
 
+/// Source provenance for an event imported from another agent/tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventProvenance {
+    /// External source event identifier, when available.
+    #[serde(default)]
+    pub source_event_id: Option<String>,
+    /// External source event timestamp in Unix milliseconds, when available.
+    #[serde(default)]
+    pub source_timestamp_ms: Option<u64>,
+    /// External source locator such as a file path, when available.
+    #[serde(default)]
+    pub source_locator: Option<String>,
+}
+
 /// Replayable event emitted by a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEvent {
     pub schema_version: u16,
     pub sequence: u64,
     pub session_id: SessionId,
+    #[serde(default)]
+    pub provenance: Option<SessionEventProvenance>,
     pub kind: SessionEventKind,
 }
 

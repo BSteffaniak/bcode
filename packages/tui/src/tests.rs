@@ -1598,6 +1598,7 @@ fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> Sessio
         schema_version: 1,
         sequence,
         session_id,
+        provenance: None,
         kind,
     }
 }

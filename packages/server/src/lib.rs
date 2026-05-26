@@ -7054,6 +7054,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence,
             session_id,
+            provenance: None,
             kind,
         }
     }
@@ -7888,6 +7889,7 @@ mod tests {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 1,
             session_id,
+            provenance: None,
             kind: SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-1".to_string(),
                 result: output,
