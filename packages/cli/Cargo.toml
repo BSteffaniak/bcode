@@ -21,6 +21,7 @@ bcode_plugin           = { workspace = true }
 bcode_provider_auth    = { workspace = true }
 bcode_server           = { workspace = true }
 bcode_session          = { workspace = true }
+bcode_session_import   = { workspace = true }
 bcode_session_models   = { workspace = true }
 bcode_tui              = { workspace = true }
 bcode_worktree_models  = { workspace = true }

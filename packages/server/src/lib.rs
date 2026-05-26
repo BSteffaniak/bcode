@@ -4,6 +4,8 @@
 
 //! Local Bcode daemon runtime.
 
+pub mod session_import;
+
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,
     AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
@@ -13,9 +15,8 @@ use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
-    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
-    response_envelope, send_envelope,
+    ServerStopMode, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
+    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
@@ -26,17 +27,11 @@ use bcode_model::{
     ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_session::{CatalogLoadStatus, SessionManager};
-use bcode_session_import::{
-    DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse,
-    ImportableSessionEventKind, LoadImportableSessionRequest, OP_DISCOVER_IMPORTABLE_SESSIONS,
-    OP_LOAD_IMPORTABLE_SESSION, SESSION_IMPORT_INTERFACE_ID,
-};
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
-    RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionImportSummary,
-    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
-    TraceRedaction,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
+    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -49,7 +44,6 @@ use bcode_tool::{
     ToolResultContent,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -65,7 +59,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
-use uuid::Uuid;
 
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
@@ -98,9 +91,9 @@ pub enum ServerError {
 }
 
 #[derive(Debug)]
-struct ServerState {
-    sessions: SessionManager,
-    plugins: bcode_plugin::PluginRuntimeHost,
+pub struct ServerState {
+    pub sessions: SessionManager,
+    pub plugins: bcode_plugin::PluginRuntimeHost,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
@@ -1110,7 +1103,7 @@ async fn handle_request(
                 .await
         }
         Request::AttachSession { session_id } => {
-            let session_id = resolve_attach_session_id(state, session_id).await;
+            let session_id = session_import::resolve_attach_session_id(state, session_id).await;
             handle_attach_session(
                 request_id,
                 client_id,
@@ -1122,7 +1115,7 @@ async fn handle_request(
             .await
         }
         Request::AttachSessionRecent { session_id, limit } => {
-            let session_id = resolve_attach_session_id(state, session_id).await;
+            let session_id = session_import::resolve_attach_session_id(state, session_id).await;
             handle_attach_session_recent(
                 request_id,
                 client_id,
@@ -1138,7 +1131,7 @@ async fn handle_request(
             source_id,
             external_session_id,
         } => {
-            handle_import_external_session(
+            session_import::handle_import_external_session(
                 request_id,
                 state,
                 writer,
@@ -1425,7 +1418,9 @@ async fn handle_list_sessions(
     working_directory: &Path,
 ) -> Result<(), ServerError> {
     let mut session_list = state.sessions.list_sessions(working_directory).await;
-    session_list.extend(discover_importable_session_summaries(state, working_directory).await);
+    session_list.extend(
+        session_import::discover_importable_session_summaries(state, working_directory).await,
+    );
     let catalog_status = catalog_status_to_ipc(state.sessions.catalog_status());
     send_response(
         writer,
@@ -1436,232 +1431,6 @@ async fn handle_list_sessions(
         }),
     )
     .await
-}
-
-async fn discover_importable_session_summaries(
-    state: &ServerState,
-    working_directory: &Path,
-) -> Vec<bcode_session_models::SessionSummary> {
-    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
-        return Vec::new();
-    }
-    let Some(providers) = state
-        .plugins
-        .registry()
-        .service_registry()
-        .providers_for(SESSION_IMPORT_INTERFACE_ID)
-        .cloned()
-    else {
-        return Vec::new();
-    };
-    let existing = state.sessions.cached_sessions(working_directory).await;
-    let mut external = Vec::new();
-    for plugin_id in providers {
-        let request = DiscoverImportableSessionsRequest {
-            working_directory: Some(working_directory.to_path_buf()),
-        };
-        let Ok(response) = state
-            .plugins
-            .invoke_service_json::<_, DiscoverImportableSessionsResponse>(
-                &plugin_id,
-                SESSION_IMPORT_INTERFACE_ID,
-                OP_DISCOVER_IMPORTABLE_SESSIONS,
-                &request,
-            )
-            .await
-        else {
-            continue;
-        };
-        for summary in response.sessions {
-            if existing.iter().any(|session| {
-                session.import.as_ref().is_some_and(|import| {
-                    import.source_id == summary.source_id
-                        && import.external_session_id == summary.external_session_id
-                })
-            }) {
-                continue;
-            }
-            let id = external_session_id(&summary.source_id, &summary.external_session_id);
-            let name = Some(
-                summary
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty())
-                    .unwrap_or_else(|| summary.external_session_id.clone()),
-            );
-            external.push(bcode_session_models::SessionSummary {
-                id,
-                name,
-                client_count: 0,
-                created_at_ms: summary.created_at_ms.unwrap_or(0),
-                updated_at_ms: summary.updated_at_ms.or(summary.created_at_ms).unwrap_or(0),
-                working_directory: summary
-                    .working_directory
-                    .clone()
-                    .unwrap_or_else(|| working_directory.to_path_buf()),
-                import: Some(SessionImportSummary {
-                    source_id: summary.source_id,
-                    source_display_name: summary.source_display_name,
-                    external_session_id: summary.external_session_id,
-                    imported_at_ms: 0,
-                }),
-            });
-        }
-    }
-    external
-}
-
-async fn all_cached_sessions(state: &ServerState) -> Vec<bcode_session_models::SessionSummary> {
-    state.sessions.all_session_summaries().await
-}
-
-fn external_session_id(source_id: &str, external_session_id: &str) -> SessionId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"bcode external session");
-    hasher.update(source_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(external_session_id.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x80;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    SessionId(Uuid::from_bytes(bytes))
-}
-
-#[allow(clippy::too_many_lines)]
-async fn import_external_session(
-    state: &ServerState,
-    source_id: &str,
-    external_session_id: &str,
-) -> Result<(SessionId, Vec<bcode_session_import::ImportWarning>), String> {
-    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
-        return Err("session import is disabled".to_string());
-    }
-    if let Some(existing) = all_cached_sessions(state)
-        .await
-        .into_iter()
-        .find(|session| {
-            session.import.as_ref().is_some_and(|import| {
-                import.source_id == source_id && import.external_session_id == external_session_id
-            })
-        })
-    {
-        return Ok((existing.id, Vec::new()));
-    }
-    let providers = state
-        .plugins
-        .registry()
-        .service_registry()
-        .providers_for(SESSION_IMPORT_INTERFACE_ID)
-        .cloned()
-        .ok_or_else(|| "no session import providers are loaded".to_string())?;
-    for plugin_id in providers {
-        let discovery = state
-            .plugins
-            .invoke_service_json::<_, DiscoverImportableSessionsResponse>(
-                &plugin_id,
-                SESSION_IMPORT_INTERFACE_ID,
-                OP_DISCOVER_IMPORTABLE_SESSIONS,
-                &DiscoverImportableSessionsRequest::default(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(summary) = discovery.sessions.into_iter().find(|summary| {
-            summary.source_id == source_id && summary.external_session_id == external_session_id
-        }) else {
-            continue;
-        };
-        let importable = state
-            .plugins
-            .invoke_service_json::<_, bcode_session_import::ImportableSession>(
-                &plugin_id,
-                SESSION_IMPORT_INTERFACE_ID,
-                OP_LOAD_IMPORTABLE_SESSION,
-                &LoadImportableSessionRequest {
-                    source_id: summary.source_id.clone(),
-                    external_session_id: summary.external_session_id.clone(),
-                    locator: summary.locator.clone(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let name = importable
-            .summary
-            .title
-            .clone()
-            .or_else(|| Some(importable.summary.external_session_id.clone()));
-        let working_directory = importable
-            .summary
-            .working_directory
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let mut events = Vec::new();
-        let mut compacted_through_sequence = 0_u64;
-        for event in importable.events {
-            events.push(match event.kind {
-                ImportableSessionEventKind::UserMessage { text } => SessionEventKind::UserMessage {
-                    client_id: ClientId::new(),
-                    text,
-                },
-                ImportableSessionEventKind::AssistantMessage { text } => {
-                    SessionEventKind::AssistantMessage { text }
-                }
-                ImportableSessionEventKind::ToolCallRequested {
-                    tool_call_id,
-                    tool_name,
-                    arguments_json,
-                } => SessionEventKind::ToolCallRequested {
-                    tool_call_id,
-                    tool_name,
-                    arguments_json,
-                },
-                ImportableSessionEventKind::ToolCallFinished {
-                    tool_call_id,
-                    result,
-                    is_error,
-                } => SessionEventKind::ToolCallFinished {
-                    tool_call_id,
-                    result,
-                    is_error,
-                    output: None,
-                },
-                ImportableSessionEventKind::ModelChanged { provider, model } => {
-                    SessionEventKind::ModelChanged { provider, model }
-                }
-                ImportableSessionEventKind::AgentChanged { agent_id } => {
-                    SessionEventKind::AgentChanged { agent_id }
-                }
-                ImportableSessionEventKind::ContextCompacted { summary } => {
-                    compacted_through_sequence = compacted_through_sequence.saturating_add(1);
-                    SessionEventKind::ContextCompacted {
-                        summary,
-                        compacted_through_sequence,
-                    }
-                }
-                ImportableSessionEventKind::SystemMessage { text } => {
-                    SessionEventKind::SystemMessage { text }
-                }
-            });
-        }
-        let session = state
-            .sessions
-            .import_session(
-                name,
-                working_directory,
-                SessionImportSummary {
-                    source_id: importable.summary.source_id,
-                    source_display_name: importable.summary.source_display_name,
-                    external_session_id: importable.summary.external_session_id,
-                    imported_at_ms: current_unix_millis(),
-                },
-                events,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok((session.id, importable.warnings));
-    }
-    Err("external session not found".to_string())
 }
 
 async fn handle_change_session_working_directory(
@@ -2033,106 +1802,6 @@ async fn send_incompatible_active_session_response(
         )),
     )
     .await
-}
-
-async fn handle_import_external_session(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    source_id: &str,
-    external_session_id: &str,
-) -> Result<(), ServerError> {
-    match import_external_session(state, source_id, external_session_id).await {
-        Ok((session_id, warnings)) => {
-            let session = state.sessions.session_summary(session_id).await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::ExternalSessionImported {
-                    session,
-                    warnings: warnings.into_iter().map(import_warning_to_ipc).collect(),
-                }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new("import_failed", error)),
-            )
-            .await
-        }
-    }
-}
-
-fn import_warning_to_ipc(warning: bcode_session_import::ImportWarning) -> SessionImportWarning {
-    SessionImportWarning {
-        code: warning.code,
-        message: warning.message,
-        count: warning.count,
-    }
-}
-
-async fn resolve_attach_session_id(state: &ServerState, session_id: SessionId) -> SessionId {
-    if state.sessions.session_summary(session_id).await.is_ok() {
-        return session_id;
-    }
-    let Some((source_id, external_session_id)) =
-        external_parts_from_session_id(state, session_id).await
-    else {
-        return session_id;
-    };
-    match import_external_session(state, &source_id, &external_session_id).await {
-        Ok((imported_session_id, warnings)) => {
-            if !warnings.is_empty() {
-                eprintln!(
-                    "imported [{source_id}] session with {} warnings",
-                    warnings.len()
-                );
-                for warning in warnings {
-                    eprintln!("import warning: {}: {}", warning.code, warning.message);
-                }
-            }
-            imported_session_id
-        }
-        Err(error) => {
-            eprintln!(
-                "failed to import external session {source_id}/{external_session_id}: {error}"
-            );
-            session_id
-        }
-    }
-}
-
-async fn external_parts_from_session_id(
-    state: &ServerState,
-    session_id: SessionId,
-) -> Option<(String, String)> {
-    let providers = state
-        .plugins
-        .registry()
-        .service_registry()
-        .providers_for(SESSION_IMPORT_INTERFACE_ID)?
-        .clone();
-    for plugin_id in providers {
-        let response = state
-            .plugins
-            .invoke_service_json::<_, DiscoverImportableSessionsResponse>(
-                &plugin_id,
-                SESSION_IMPORT_INTERFACE_ID,
-                OP_DISCOVER_IMPORTABLE_SESSIONS,
-                &DiscoverImportableSessionsRequest::default(),
-            )
-            .await
-            .ok()?;
-        for summary in response.sessions {
-            if external_session_id(&summary.source_id, &summary.external_session_id) == session_id {
-                return Some((summary.source_id, summary.external_session_id));
-            }
-        }
-    }
-    None
 }
 
 async fn handle_attach_session(
@@ -7084,7 +6753,7 @@ fn compact_attach_history(
     compacted
 }
 
-async fn send_response(
+pub(crate) async fn send_response(
     writer: &SharedWriter,
     request_id: u64,
     response: Response,

@@ -9,6 +9,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_config::AuthMode;
 use bcode_ipc::{Event, PermissionSummary, default_endpoint};
+use bcode_session_import::{
+    DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse,
+    ListImportSourcesResponse, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
+    SESSION_IMPORT_INTERFACE_ID,
+};
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
     SessionHistoryQuery, SessionId,
@@ -127,6 +132,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
                 json,
             } => session_doctor(session_id, fix, json)?,
             SessionCommand::Migrate { command } => handle_session_migrate_command(command)?,
+            SessionCommand::Import { command } => handle_session_import_command(command).await?,
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
             SessionCommand::Repair { session_id } => session_repair(session_id)?,
         },
@@ -446,11 +452,31 @@ enum SessionCommand {
         #[command(subcommand)]
         command: SessionMigrateCommand,
     },
+    Import {
+        #[command(subcommand)]
+        command: SessionImportCommand,
+    },
     Reindex {
         session_id: Option<SessionId>,
     },
     Repair {
         session_id: SessionId,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SessionImportCommand {
+    Sources,
+    Discover {
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Open {
+        #[arg(long, default_value = "pi")]
+        source: String,
+        external_session_id: String,
     },
 }
 
@@ -3307,6 +3333,73 @@ fn handle_migrate_command(command: MigrateCommand) -> Result<(), CliError> {
         }
         MigrateCommand::Apply { dry_run, backup } => session_migration_apply(dry_run, backup),
     }
+}
+
+async fn handle_session_import_command(command: SessionImportCommand) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let client = BcodeClient::default_endpoint();
+    match command {
+        SessionImportCommand::Sources => {
+            let response = client
+                .call_plugin_service(
+                    SESSION_IMPORT_INTERFACE_ID.to_string(),
+                    OP_LIST_IMPORT_SOURCES.to_string(),
+                    Vec::new(),
+                )
+                .await?;
+            let sources: ListImportSourcesResponse = serde_json::from_slice(&response.payload)?;
+            for source in sources.sources {
+                println!("{}\t{}", source.source_id, source.display_name);
+            }
+        }
+        SessionImportCommand::Discover { source, json } => {
+            let request = serde_json::to_vec(&DiscoverImportableSessionsRequest::default())?;
+            let response = client
+                .call_plugin_service(
+                    SESSION_IMPORT_INTERFACE_ID.to_string(),
+                    OP_DISCOVER_IMPORTABLE_SESSIONS.to_string(),
+                    request,
+                )
+                .await?;
+            let mut sessions: DiscoverImportableSessionsResponse =
+                serde_json::from_slice(&response.payload)?;
+            if let Some(source) = source {
+                sessions
+                    .sessions
+                    .retain(|session| session.source_id == source);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else if sessions.sessions.is_empty() {
+                println!("no importable sessions");
+            } else {
+                for session in sessions.sessions {
+                    println!(
+                        "[{}]\t{}\t{}",
+                        session.source_id,
+                        session.external_session_id,
+                        session.title.as_deref().unwrap_or("<untitled>")
+                    );
+                }
+            }
+        }
+        SessionImportCommand::Open {
+            source,
+            external_session_id,
+        } => {
+            let (session, warnings) = client
+                .import_external_session(source.clone(), external_session_id)
+                .await?;
+            println!("{}", session.id);
+            if !warnings.is_empty() {
+                eprintln!("imported [{source}] with {} warnings", warnings.len());
+                for warning in warnings {
+                    eprintln!("{}: {}", warning.code, warning.message);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_session_migrate_command(command: SessionMigrateCommand) -> Result<(), CliError> {

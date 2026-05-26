@@ -796,6 +796,7 @@ dependencies = [
  "bcode_provider_auth",
  "bcode_server",
  "bcode_session",
+ "bcode_session_import",
  "bcode_session_models",
  "bcode_tui",
  "bcode_worktree_models",
