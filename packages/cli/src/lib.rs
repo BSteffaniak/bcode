@@ -473,6 +473,11 @@ enum BlimsInitiativeCommand {
         #[arg(long)]
         json: bool,
     },
+    Inspect {
+        initiative_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     PlanPrompt {
         initiative_id: String,
     },
@@ -1041,8 +1046,8 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
 }
 
 async fn enter_blims_office() -> Result<(), CliError> {
-    let world = load_blims_world().await?;
-    let report = load_blims_report().await?;
+    let mut world = load_blims_world().await?;
+    let mut report = load_blims_report().await?;
     let mut player_room_id = "ceo-nook".to_string();
     loop {
         print_blims_office(&world, &report, &player_room_id);
@@ -1060,13 +1065,50 @@ async fn enter_blims_office() -> Result<(), CliError> {
                 player_room_id = next_room_id(&world, &player_room_id);
             }
             "r" | "report" => print_blims_report(&report),
+            "refresh" | "reload" => refresh_blims_office(&mut world, &mut report).await?,
+            "tasks" | "task" => print_office_tasks().await?,
+            "artifacts" | "artifact" => print_office_artifacts().await?,
+            "initiatives" | "initiative" => print_office_initiatives().await?,
             "t" | "talk" | "look" => print_room_interaction(&world, &report, &player_room_id),
-            "ai" => start_room_agent_talk(&world, &player_room_id).await?,
+            "ai" => {
+                start_room_agent_talk(&world, &player_room_id).await?;
+                refresh_blims_office(&mut world, &mut report).await?;
+            }
             "w" | "world" => print_blims_world(&world),
             "help" | "?" => print_blims_help(),
             "" => {}
-            _ => println!("unknown command: {command} (try `help`)"),
+            _ => handle_blims_office_command(command).await?,
         }
+    }
+    Ok(())
+}
+
+async fn refresh_blims_office(
+    world: &mut BlimsWorldSnapshot,
+    report: &mut BlimsMorningReport,
+) -> Result<(), CliError> {
+    *world = load_blims_world().await?;
+    *report = load_blims_report().await?;
+    println!("office refreshed");
+    Ok(())
+}
+
+async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["inspect", "initiative", initiative_id] | ["initiative", initiative_id] => {
+            print_office_initiative(initiative_id).await?;
+        }
+        ["inspect", "task", task_id] | ["task", task_id] => {
+            print_office_task(task_id).await?;
+        }
+        ["inspect", "artifact", artifact_id] | ["artifact", artifact_id] => {
+            print_office_artifact(artifact_id).await?;
+        }
+        ["talk" | "ai", agent_id] => {
+            start_blims_agent_talk((*agent_id).to_string()).await?;
+        }
+        _ => println!("unknown command: {command} (try `help`)"),
     }
     Ok(())
 }
@@ -1079,6 +1121,81 @@ async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
 async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
     let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
     decode_blims_response::<BlimsMorningReport>(response)
+}
+
+async fn print_office_initiatives() -> Result<(), CliError> {
+    let response = call_blims_service("initiative.list", blims_workspace_payload()?).await?;
+    print_initiative_list(&decode_blims_response::<Vec<BlimsInitiativeSummary>>(
+        response,
+    )?);
+    Ok(())
+}
+
+async fn print_office_initiative(initiative_id: &str) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "initiative_id": initiative_id,
+    });
+    let response = call_blims_service("initiative.inspect", serde_json::to_vec(&request)?).await?;
+    print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(response)?);
+    Ok(())
+}
+
+async fn print_office_tasks() -> Result<(), CliError> {
+    let response = call_blims_service("task.list", blims_workspace_payload()?).await?;
+    let tasks = decode_blims_response::<Vec<BlimsTaskSummary>>(response)?;
+    if tasks.is_empty() {
+        println!("no tasks yet");
+    } else {
+        for task in tasks {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                task.id,
+                task.initiative_id,
+                task.priority,
+                task.status,
+                task.assigned_agent_id,
+                task.title
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn print_office_task(task_id: &str) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "task_id": task_id,
+    });
+    let response = call_blims_service("task.inspect", serde_json::to_vec(&request)?).await?;
+    print_task_detail(&decode_blims_response::<BlimsTaskSummary>(response)?);
+    Ok(())
+}
+
+async fn print_office_artifacts() -> Result<(), CliError> {
+    let response = call_blims_service("artifact.list", blims_workspace_payload()?).await?;
+    let artifacts = decode_blims_response::<Vec<BlimsArtifactSummary>>(response)?;
+    if artifacts.is_empty() {
+        println!("no artifacts yet");
+    } else {
+        for artifact in artifacts {
+            println!(
+                "{}\t{}\t{}\t{}",
+                artifact.id, artifact.initiative_id, artifact.kind, artifact.title
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn print_office_artifact(artifact_id: &str) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "artifact_id": artifact_id,
+    });
+    let response = call_blims_service("artifact.inspect", serde_json::to_vec(&request)?).await?;
+    print_artifact_detail(&decode_blims_response::<BlimsArtifactDetail>(response)?);
+    Ok(())
 }
 
 async fn start_blims_agent_talk(agent_id: String) -> Result<(), CliError> {
@@ -1164,7 +1281,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look, ai start AI chat, r report, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, inspect <initiative|task|artifact> <id>, refresh, w world, q quit"
     );
 }
 
@@ -1348,6 +1465,31 @@ fn print_artifact_detail(artifact: &BlimsArtifactDetail) {
     println!("{}", artifact.payload_json);
 }
 
+fn print_initiative_list(initiatives: &[BlimsInitiativeSummary]) {
+    if initiatives.is_empty() {
+        println!("no initiatives yet");
+        return;
+    }
+    for initiative in initiatives {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            initiative.id,
+            initiative.priority,
+            initiative.status,
+            initiative.title,
+            initiative.description
+        );
+    }
+}
+
+fn print_initiative_detail(initiative: &BlimsInitiativeSummary) {
+    println!("{}", initiative.title);
+    println!("id: {}", initiative.id);
+    println!("status: {}", initiative.status);
+    println!("priority: {}", initiative.priority);
+    println!("description: {}", initiative.description);
+}
+
 async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Result<(), CliError> {
     match command {
         BlimsInitiativeCommand::Create {
@@ -1381,16 +1523,25 @@ async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Res
                 print_blims_service_response(response);
             } else {
                 let initiatives = decode_blims_response::<Vec<BlimsInitiativeSummary>>(response)?;
-                for initiative in initiatives {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}",
-                        initiative.id,
-                        initiative.priority,
-                        initiative.status,
-                        initiative.title,
-                        initiative.description
-                    );
-                }
+                print_initiative_list(&initiatives);
+            }
+        }
+        BlimsInitiativeCommand::Inspect {
+            initiative_id,
+            json,
+        } => {
+            let request = serde_json::json!({
+                "working_directory": std::env::current_dir()?,
+                "initiative_id": initiative_id,
+            });
+            let response =
+                call_blims_service("initiative.inspect", serde_json::to_vec(&request)?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(
+                    response,
+                )?);
             }
         }
         BlimsInitiativeCommand::PlanPrompt { initiative_id } => {

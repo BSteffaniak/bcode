@@ -34,6 +34,9 @@ pub const OP_INITIATIVE_CREATE: &str = "initiative.create";
 /// Initiative list operation.
 pub const OP_INITIATIVE_LIST: &str = "initiative.list";
 
+/// Initiative inspect operation.
+pub const OP_INITIATIVE_INSPECT: &str = "initiative.inspect";
+
 /// Guidance set operation.
 pub const OP_GUIDANCE_SET: &str = "guidance.set";
 
@@ -92,6 +95,7 @@ impl RustPlugin for BlimsPlugin {
             OP_AGENT_LIST => service_agent_list(&context.request),
             OP_INITIATIVE_CREATE => service_initiative_create(&context.request),
             OP_INITIATIVE_LIST => service_initiative_list(&context.request),
+            OP_INITIATIVE_INSPECT => service_initiative_inspect(&context.request),
             OP_GUIDANCE_SET => service_guidance_set(&context.request),
             OP_GUIDANCE_LIST => service_guidance_list(&context.request),
             OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(&context.request),
@@ -176,6 +180,15 @@ pub struct ArtifactInspectRequest {
     pub working_directory: PathBuf,
     /// Artifact id.
     pub artifact_id: String,
+}
+
+/// Request to inspect an initiative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativeInspectRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Initiative id.
+    pub initiative_id: String,
 }
 
 /// Request to import an AI-generated plan for an initiative.
@@ -570,6 +583,17 @@ fn service_initiative_list(request: &ServiceRequest) -> ServiceResponse {
     match list_initiatives(&request.working_directory) {
         Ok(initiatives) => json_response(&initiatives),
         Err(error) => ServiceResponse::error("initiative_list_failed", error.to_string()),
+    }
+}
+
+fn service_initiative_inspect(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<InitiativeInspectRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match inspect_initiative(&request) {
+        Ok(initiative) => json_response(&initiative),
+        Err(error) => ServiceResponse::error("initiative_inspect_failed", error.to_string()),
     }
 }
 
@@ -1319,6 +1343,15 @@ fn list_initiatives(working_directory: &Path) -> Result<Vec<InitiativeSummary>, 
                 .map(initiative_summary)
                 .collect()
         })
+    })
+}
+
+fn inspect_initiative(
+    request: &InitiativeInspectRequest,
+) -> Result<InitiativeSummary, BlimsStateError> {
+    let initiative_id = request.initiative_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move { load_initiative(database, &initiative_id).await })
     })
 }
 
