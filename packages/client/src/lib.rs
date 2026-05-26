@@ -8,10 +8,10 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
-    Response, ResponsePayload, ServerStopMode, SessionCatalogStatus, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
-    WorktreeRemoveResponse, current_working_directory, decode, default_endpoint, recv_envelope,
-    request_envelope, send_envelope,
+    Response, ResponsePayload, ServerStopMode, SessionCatalogStatus, SessionImportWarning,
+    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
+    WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory, decode,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
@@ -49,6 +49,7 @@ pub struct AttachedSessionHistory {
     pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
+    pub import_warnings: Vec<SessionImportWarning>,
 }
 
 const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
@@ -344,6 +345,31 @@ impl BcodeClient {
                 sessions,
                 catalog_status,
             }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Import an external session and return the native Bcode session plus one-time warnings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the import request.
+    pub async fn import_external_session(
+        &self,
+        source_id: impl Into<String>,
+        external_session_id: impl Into<String>,
+    ) -> Result<(SessionSummary, Vec<SessionImportWarning>), ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::ImportExternalSession {
+                source_id: source_id.into(),
+                external_session_id: external_session_id.into(),
+            })
+            .await?
+        {
+            ResponsePayload::ExternalSessionImported { session, warnings } => {
+                Ok((session, warnings))
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -1069,12 +1095,14 @@ impl ClientConnection {
             ResponsePayload::Attached {
                 history,
                 input_history,
+                import_warnings,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
                 session,
                 history,
                 input_history,
+                import_warnings,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1112,12 +1140,14 @@ impl ClientConnection {
             ResponsePayload::Attached {
                 history,
                 input_history,
+                import_warnings,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
                 session,
                 history,
                 input_history,
+                import_warnings,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }

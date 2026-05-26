@@ -13,8 +13,9 @@ use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
     PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
-    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    ServerStopMode, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
+    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
+    response_envelope, send_envelope,
 };
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
@@ -1133,6 +1134,19 @@ async fn handle_request(
             )
             .await
         }
+        Request::ImportExternalSession {
+            source_id,
+            external_session_id,
+        } => {
+            handle_import_external_session(
+                request_id,
+                state,
+                writer,
+                &source_id,
+                &external_session_id,
+            )
+            .await
+        }
         Request::SendUserMessage { session_id, text } => {
             handle_user_message(request_id, client_id, state, writer, session_id, text).await
         }
@@ -1495,10 +1509,7 @@ async fn discover_importable_session_summaries(
 }
 
 async fn all_cached_sessions(state: &ServerState) -> Vec<bcode_session_models::SessionSummary> {
-    state
-        .sessions
-        .cached_sessions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .await
+    state.sessions.all_session_summaries().await
 }
 
 fn external_session_id(source_id: &str, external_session_id: &str) -> SessionId {
@@ -2018,6 +2029,45 @@ async fn send_incompatible_active_session_response(
     .await
 }
 
+async fn handle_import_external_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    source_id: &str,
+    external_session_id: &str,
+) -> Result<(), ServerError> {
+    match import_external_session(state, source_id, external_session_id).await {
+        Ok((session_id, warnings)) => {
+            let session = state.sessions.session_summary(session_id).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::ExternalSessionImported {
+                    session,
+                    warnings: warnings.into_iter().map(import_warning_to_ipc).collect(),
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("import_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+fn import_warning_to_ipc(warning: bcode_session_import::ImportWarning) -> SessionImportWarning {
+    SessionImportWarning {
+        code: warning.code,
+        message: warning.message,
+        count: warning.count,
+    }
+}
+
 async fn resolve_attach_session_id(state: &ServerState, session_id: SessionId) -> SessionId {
     if state.sessions.session_summary(session_id).await.is_ok() {
         return session_id;
@@ -2108,6 +2158,7 @@ async fn handle_attach_session(
                     session: attachment.session,
                     history: compact_attach_history(attachment.history),
                     input_history: attachment.input_history,
+                    import_warnings: Vec::new(),
                 }),
             )
             .await?;
@@ -2163,6 +2214,7 @@ async fn handle_attach_session_recent(
                     session: attachment.session,
                     history: compact_attach_history(attachment.history),
                     input_history: attachment.input_history,
+                    import_warnings: Vec::new(),
                 }),
             )
             .await?;

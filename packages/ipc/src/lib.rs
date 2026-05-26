@@ -224,6 +224,10 @@ pub enum Request {
     ListWorktrees(WorktreeListRequest),
     CreateWorktree(WorktreeCreateRequest),
     RemoveWorktree(WorktreeRemoveRequest),
+    ImportExternalSession {
+        source_id: String,
+        external_session_id: String,
+    },
 }
 
 /// Server stop request policy.
@@ -358,6 +362,15 @@ pub struct PluginServiceError {
     pub message: String,
 }
 
+/// Warning reported after importing an external session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionImportWarning {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub count: Option<u64>,
+}
+
 /// Successful response payload variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -398,6 +411,8 @@ pub enum ResponsePayload {
         history: Vec<SessionEvent>,
         #[serde(default)]
         input_history: Vec<SessionInputHistoryEntry>,
+        #[serde(default)]
+        import_warnings: Vec<SessionImportWarning>,
     },
     MessageSent,
     TurnCancellationRequested {
@@ -461,6 +476,10 @@ pub enum ResponsePayload {
     WorktreeList(WorktreeListResponse),
     WorktreeCreated(WorktreeCreateResponse),
     WorktreeRemoved(WorktreeRemoveResponse),
+    ExternalSessionImported {
+        session: SessionSummary,
+        warnings: Vec<SessionImportWarning>,
+    },
 }
 
 /// Structured error response.
@@ -482,6 +501,7 @@ impl ErrorResponse {
 }
 
 /// Top-level response message.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
@@ -939,6 +959,7 @@ mod tests {
             session: summary.clone(),
             history: Vec::new(),
             input_history: Vec::new(),
+            import_warnings: Vec::new(),
         });
 
         let encoded = encode(&response).expect("response should encode");

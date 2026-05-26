@@ -134,6 +134,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub tui: TuiConfig,
     #[serde(default)]
+    pub session_import: SessionImportConfig,
+    #[serde(default)]
     pub worktree: WorktreeConfig,
     #[serde(default = "empty_toml_table")]
     pub web_search: toml::Value,
@@ -150,6 +152,7 @@ impl Default for BcodeConfig {
             observability: ObservabilityConfig::default(),
             skills: SkillsConfig::default(),
             tui: TuiConfig::default(),
+            session_import: SessionImportConfig::default(),
             worktree: WorktreeConfig::default(),
             web_search: empty_toml_table(),
         }
@@ -811,6 +814,61 @@ pub enum ObservabilityLevel {
 
 const fn default_max_trace_blob_bytes() -> usize {
     10 * 1024 * 1024
+}
+
+/// Session import configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionImportConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_discover_on_startup: bool,
+    #[serde(default = "default_true")]
+    pub hide_already_imported: bool,
+    #[serde(default)]
+    pub pi: PiSessionImportConfig,
+}
+
+impl Default for SessionImportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_discover_on_startup: true,
+            hide_already_imported: true,
+            pi: PiSessionImportConfig::default(),
+        }
+    }
+}
+
+/// Pi session import configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiSessionImportConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub path_mode: SessionImportPathMode,
+}
+
+impl Default for PiSessionImportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paths: Vec::new(),
+            path_mode: SessionImportPathMode::DefaultsAndCustom,
+        }
+    }
+}
+
+/// Path selection mode for a session import source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionImportPathMode {
+    DefaultsOnly,
+    CustomOnly,
+    #[default]
+    DefaultsAndCustom,
 }
 
 /// Worktree configuration.

@@ -1293,6 +1293,18 @@ impl SessionManager {
         sorted_session_summaries(handles, &working_directory)
     }
 
+    pub async fn all_session_summaries(&self) -> Vec<SessionSummary> {
+        self.start_catalog_load();
+        let handles = {
+            let inner = self.inner.lock().await;
+            inner.sessions.values().cloned().collect::<Vec<_>>()
+        };
+        handles
+            .into_iter()
+            .map(|handle| handle.snapshot().summary)
+            .collect()
+    }
+
     /// Return true once the persistent session catalog has been discovered.
     pub fn catalog_loaded(&self) -> bool {
         matches!(self.catalog_status(), CatalogLoadStatus::Loaded)

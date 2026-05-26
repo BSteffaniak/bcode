@@ -118,6 +118,13 @@ impl SessionPickerApp {
         Some(self.sessions[index].id)
     }
 
+    /// Return selected import metadata.
+    #[must_use]
+    pub fn selected_import(&self) -> Option<&bcode_session_models::SessionImportSummary> {
+        let index = self.list.selected_source_index()?;
+        self.sessions[index].import.as_ref()
+    }
+
     /// Return selected session name.
     #[must_use]
     pub fn selected_session_name(&self) -> Option<&str> {
