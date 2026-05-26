@@ -138,6 +138,7 @@ pub struct ServerState {
 struct SessionRuntimeHandle {
     commands: mpsc::Sender<SessionCommand>,
     queued_commands: Arc<AtomicUsize>,
+    receiver: Arc<Mutex<Option<mpsc::Receiver<SessionCommand>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1267,8 +1268,26 @@ async fn handle_request(
             )
             .await
         }
-        Request::CancelSessionTurn { session_id } => {
-            handle_cancel_session_turn(request_id, state, writer, session_id, client_id).await
+        Request::CancelSessionTurn {
+            session_id,
+            clear_queue,
+        } => {
+            handle_cancel_session_turn(
+                request_id,
+                state,
+                writer,
+                session_id,
+                client_id,
+                clear_queue,
+            )
+            .await
+        }
+        Request::CancelRuntimeWork {
+            session_id,
+            work_id,
+        } => {
+            handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
+                .await
         }
         Request::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
@@ -2094,9 +2113,11 @@ async fn session_runtime_handle(
 
     let (commands, receiver) = mpsc::channel(128);
     let queued_commands = Arc::new(AtomicUsize::new(0));
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
     let handle = SessionRuntimeHandle {
         commands,
         queued_commands: Arc::clone(&queued_commands),
+        receiver: Arc::clone(&receiver),
     };
     runtimes.insert(session_id, handle.clone());
     drop(runtimes);
@@ -2110,10 +2131,15 @@ async fn session_runtime_handle(
 async fn run_session_runtime(
     state: Arc<ServerState>,
     session_id: SessionId,
-    mut commands: mpsc::Receiver<SessionCommand>,
+    commands: Arc<Mutex<Option<mpsc::Receiver<SessionCommand>>>>,
     queued_commands: Arc<AtomicUsize>,
 ) {
     let mut permit = SessionTurnPermit::new(session_id);
+    let mut commands = commands
+        .lock()
+        .await
+        .take()
+        .expect("session runtime receiver should be present");
     while let Some(command) = commands.recv().await {
         queued_commands.fetch_sub(1, Ordering::AcqRel);
         match command {
@@ -2841,6 +2867,7 @@ async fn handle_cancel_session_turn(
     writer: &SharedWriter,
     session_id: SessionId,
     client_id: ClientId,
+    clear_queue: bool,
 ) -> Result<(), ServerError> {
     let Some(active_session_turn) = state
         .active_session_turns
@@ -2858,10 +2885,20 @@ async fn handle_cancel_session_turn(
     };
 
     active_session_turn.cancel_state.cancel();
+    if clear_queue {
+        clear_session_command_queue(state, session_id).await;
+    }
     append_model_turn_cancel_requested_event(
         state,
         session_id,
         active_session_turn.turn_id.clone(),
+        Some(client_id),
+    )
+    .await;
+    append_runtime_work_cancel_requested_event(
+        state,
+        session_id,
+        RuntimeWorkId::new(format!("model_{}", active_session_turn.turn_id)),
         Some(client_id),
     )
     .await;
@@ -2909,6 +2946,60 @@ async fn handle_cancel_session_turn(
             .await
         }
     }
+}
+
+async fn clear_session_command_queue(state: &ServerState, session_id: SessionId) {
+    let Some(handle) = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    else {
+        return;
+    };
+    let mut cleared = 0_usize;
+    if let Some(receiver) = handle.receiver.lock().await.as_mut() {
+        while receiver.try_recv().is_ok() {
+            cleared = cleared.saturating_add(1);
+        }
+    }
+    if cleared > 0 {
+        handle.queued_commands.fetch_sub(cleared, Ordering::AcqRel);
+    }
+}
+
+async fn handle_cancel_runtime_work(
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+) -> Result<(), ServerError> {
+    let cancelled = if let Some(active_turn) =
+        state.active_session_turns.lock().await.get(&session_id)
+    {
+        let is_model_turn = work_id == RuntimeWorkId::new(format!("model_{}", active_turn.turn_id));
+        let is_active_tool = state.active_turns.lock().await.contains_key(&session_id)
+            && work_id.0.starts_with("tool_");
+        if is_model_turn || is_active_tool {
+            active_turn.cancel_state.cancel();
+            append_runtime_work_cancel_requested_event(state, session_id, work_id, Some(client_id))
+                .await;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+    )
+    .await
 }
 
 async fn handle_compact_session(
@@ -3871,6 +3962,14 @@ async fn run_model_turn(
 ) {
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+    let model_work_id = RuntimeWorkId::new(format!("model_{turn_id}"));
+    append_model_runtime_work_started_event(
+        state,
+        session_id,
+        model_work_id.clone(),
+        turn_id.clone(),
+    )
+    .await;
     let cancel_state = Arc::new(TurnCancelState::default());
     state.active_session_turns.lock().await.insert(
         session_id,
@@ -3895,6 +3994,14 @@ async fn run_model_turn(
         session_id,
         turn_id,
         completion.outcome,
+        completion.message.clone(),
+    )
+    .await;
+    append_runtime_work_finished_event(
+        state,
+        session_id,
+        model_work_id,
+        runtime_work_status_from_model_outcome(completion.outcome),
         completion.message,
     )
     .await;
@@ -6879,6 +6986,35 @@ async fn append_system_event(state: &ServerState, session_id: SessionId, text: S
     }
 }
 
+async fn append_model_runtime_work_started_event(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+    turn_id: String,
+) {
+    match state
+        .sessions
+        .append_runtime_work_started(
+            session_id,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind: RuntimeWorkKind::ModelTurn,
+                label: format!("model turn {turn_id}"),
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                started_at_ms: Some(current_unix_millis()),
+                cancellable: true,
+            },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append model runtime work start: {error}"),
+    }
+}
+
 async fn append_model_turn_started_event(
     state: &ServerState,
     session_id: SessionId,
@@ -6891,6 +7027,40 @@ async fn append_model_turn_started_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append model turn start: {error}"),
+    }
+}
+
+async fn append_runtime_work_finished_event(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+    status: RuntimeWorkStatus,
+    message: Option<String>,
+) {
+    match state
+        .sessions
+        .append_runtime_work_finished(
+            session_id,
+            work_id,
+            status,
+            Some(current_unix_millis()),
+            message,
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append runtime work finish: {error}"),
+    }
+}
+
+const fn runtime_work_status_from_model_outcome(outcome: ModelTurnOutcome) -> RuntimeWorkStatus {
+    match outcome {
+        ModelTurnOutcome::Completed => RuntimeWorkStatus::Completed,
+        ModelTurnOutcome::Cancelled => RuntimeWorkStatus::Cancelled,
+        ModelTurnOutcome::IdleTimeout => RuntimeWorkStatus::TimedOut,
+        ModelTurnOutcome::Error
+        | ModelTurnOutcome::ToolRoundLimitReached
+        | ModelTurnOutcome::ProviderUnavailable => RuntimeWorkStatus::Failed,
     }
 }
 

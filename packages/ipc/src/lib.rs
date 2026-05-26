@@ -6,7 +6,7 @@
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    ClientId, RuntimeWorkId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
     SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
@@ -145,6 +145,12 @@ pub enum Request {
     },
     CancelSessionTurn {
         session_id: SessionId,
+        #[serde(default)]
+        clear_queue: bool,
+    },
+    CancelRuntimeWork {
+        session_id: SessionId,
+        work_id: RuntimeWorkId,
     },
     CompactSession {
         session_id: SessionId,
