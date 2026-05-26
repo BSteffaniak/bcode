@@ -19,7 +19,8 @@ use bcode_session_models::{
     SessionHistoryQuery, SessionId,
 };
 use bcode_worktree_models::{
-    WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
+    WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
+    WorktreeRemoveRequest,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
@@ -1295,9 +1296,10 @@ async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
     });
     let response = call_blims_service("task.work_prompt", serde_json::to_vec(&request)?).await?;
     let prompt = decode_blims_response::<BlimsTaskWorkPrompt>(response)?;
-    let session = BcodeClient::default_endpoint()
-        .create_session(Some(format!("Blims task: {}", prompt.task_id)))
-        .await?;
+    let worktree = create_blims_task_worktree(&prompt).await?;
+    let session = worktree.session.ok_or_else(|| {
+        CliError::Blims("task worktree creation did not return a session".to_string())
+    })?;
     BcodeClient::default_endpoint()
         .send_user_message(session.id, prompt.prompt)
         .await?;
@@ -1305,9 +1307,34 @@ async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
         "task work session for {} as {}: {}",
         prompt.task_id, prompt.agent_id, session.id
     );
+    println!("sandbox	{}", worktree.path.display());
+    if let Some(branch) = worktree.branch {
+        println!("branch	{branch}");
+    }
     println!("Attaching now. Press Ctrl-C to return.");
     attach_session(session.id).await?;
     Ok(())
+}
+
+async fn create_blims_task_worktree(
+    prompt: &BlimsTaskWorkPrompt,
+) -> Result<WorktreeCreateResponse, CliError> {
+    BcodeClient::default_endpoint()
+        .create_worktree(WorktreeCreateRequest {
+            name: format!("blims-{}", prompt.task_id),
+            cwd: None,
+            path: None,
+            branch: None,
+            new_branch: Some(format!("blims/{}", prompt.task_id)),
+            base_ref: Some(WorktreeBaseRef::Head),
+            detach: false,
+            force: false,
+            attach_session_id: None,
+            new_session: true,
+            no_setup: false,
+        })
+        .await
+        .map_err(Into::into)
 }
 
 fn print_blims_office(
