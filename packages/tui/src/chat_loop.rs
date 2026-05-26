@@ -274,15 +274,15 @@ async fn handle_chat_key<W: Write>(
         request_turn_cancellation(context.client, chat).await;
     }
     if outcome.submitted {
-        match composer_flow::submit_composer(
-            context.client,
-            context.keymap,
-            chat,
-            context.terminal,
-            context.terminal_events,
-        )
-        .await
-        {
+        let mut io = super::runtime_context::TuiIo {
+            terminal: context.terminal,
+            input: context.terminal_events,
+        };
+        let services = super::runtime_context::TuiServices {
+            client: context.client,
+            keymap: context.keymap,
+        };
+        match composer_flow::submit_composer(&mut io, &services, chat).await {
             Ok(Some(dialog)) => {
                 modals.thinking_dialog = Some(dialog);
             }

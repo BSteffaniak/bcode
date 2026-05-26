@@ -2,29 +2,26 @@
 
 use std::io::Write;
 
+use super::runtime_context::{TuiIo, TuiServices};
 use bcode_client::BcodeClient;
 use bcode_skill_models::SkillId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
-use bmux_tui::terminal::Terminal;
 
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
-use super::terminal_events::TuiInput;
 use super::{TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render};
 
 /// Pick and perform a skill action for the active session.
 pub async fn pick_skill_for_session<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    keymap: &BmuxKeyMap,
 ) -> Result<(), TuiError> {
-    let skills = client.list_skills().await?;
+    let skills = services.client.list_skills().await?;
     if skills.skills.is_empty() {
         chat.app.set_status("no skills available".to_owned());
         chat.app
@@ -33,13 +30,14 @@ pub async fn pick_skill_for_session<W: Write>(
     }
     let mut picker = skill_picker::SkillPickerApp::new(skills.skills);
     loop {
-        terminal.resize(helpers::terminal_area()?);
-        terminal.draw(|frame| skill_picker_render::render_skill_picker(&mut picker, frame))?;
-        let Some(event) = terminal_events.recv().await? else {
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| skill_picker_render::render_skill_picker(&mut picker, frame))?;
+        let Some(event) = io.input.recv().await? else {
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => match picker.mode() {
                 skill_picker::SkillPickerMode::Filter => {
                     picker.filter_mut().insert_str(&text);
@@ -47,49 +45,58 @@ pub async fn pick_skill_for_session<W: Write>(
                 }
                 skill_picker::SkillPickerMode::Argument => picker.argument_mut().insert_str(&text),
             },
-            Event::Key(stroke) => match handle_skill_picker_key(&mut picker, keymap, stroke) {
-                skill_picker::SkillPickerAction::Continue => {}
-                skill_picker::SkillPickerAction::Cancel => return Ok(()),
-                skill_picker::SkillPickerAction::Help(skill_id) => {
-                    if let Err(error) = describe_skill(client, chat, skill_id).await {
-                        helpers::report_client_error(&mut chat.app, "skill help failed", &error);
+            Event::Key(stroke) => {
+                match handle_skill_picker_key(&mut picker, services.keymap, stroke) {
+                    skill_picker::SkillPickerAction::Continue => {}
+                    skill_picker::SkillPickerAction::Cancel => return Ok(()),
+                    skill_picker::SkillPickerAction::Help(skill_id) => {
+                        if let Err(error) = describe_skill(services.client, chat, skill_id).await {
+                            helpers::report_client_error(
+                                &mut chat.app,
+                                "skill help failed",
+                                &error,
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                skill_picker::SkillPickerAction::Activate(skill_id) => {
-                    if let Err(error) = activate_skill(client, chat, skill_id).await {
-                        helpers::report_client_error(
-                            &mut chat.app,
-                            "skill activation failed",
-                            &error,
-                        );
+                    skill_picker::SkillPickerAction::Activate(skill_id) => {
+                        if let Err(error) = activate_skill(services.client, chat, skill_id).await {
+                            helpers::report_client_error(
+                                &mut chat.app,
+                                "skill activation failed",
+                                &error,
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                skill_picker::SkillPickerAction::Deactivate(skill_id) => {
-                    if let Err(error) = deactivate_skill(client, chat, skill_id).await {
-                        helpers::report_client_error(
-                            &mut chat.app,
-                            "skill deactivation failed",
-                            &error,
-                        );
+                    skill_picker::SkillPickerAction::Deactivate(skill_id) => {
+                        if let Err(error) = deactivate_skill(services.client, chat, skill_id).await
+                        {
+                            helpers::report_client_error(
+                                &mut chat.app,
+                                "skill deactivation failed",
+                                &error,
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                skill_picker::SkillPickerAction::Invoke {
-                    skill_id,
-                    arguments,
-                } => {
-                    if let Err(error) = invoke_skill(client, chat, skill_id, arguments).await {
-                        helpers::report_client_error(
-                            &mut chat.app,
-                            "skill invocation failed",
-                            &error,
-                        );
+                    skill_picker::SkillPickerAction::Invoke {
+                        skill_id,
+                        arguments,
+                    } => {
+                        if let Err(error) =
+                            invoke_skill(services.client, chat, skill_id, arguments).await
+                        {
+                            helpers::report_client_error(
+                                &mut chat.app,
+                                "skill invocation failed",
+                                &error,
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
-            },
+            }
             Event::Mouse(mouse) => {
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)

@@ -7,12 +7,10 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
-use bmux_tui::terminal::Terminal;
 
 use super::helpers;
-use super::keymap::BmuxKeyMap;
 use super::picker_mouse::picker_row_from_mouse;
-use super::terminal_events::TuiInput;
+use super::runtime_context::{TuiIo, TuiServices};
 use super::{
     TuiError, model_picker, model_picker_render, provider_picker, provider_picker_render,
     session_flow::ActiveChat,
@@ -110,18 +108,17 @@ pub async fn show_runtime_status(
 
 /// Pick and set the active model for the current session.
 pub async fn pick_model_for_session<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    keymap: &BmuxKeyMap,
 ) -> Result<(), TuiError> {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let provider_plugin_id = pick_model_provider(terminal, terminal_events, client, keymap).await?;
-    let models = client
+    let provider_plugin_id = pick_model_provider(io, services).await?;
+    let models = services
+        .client
         .session_model_list(provider_plugin_id.clone())
         .await?
         .models;
@@ -131,13 +128,14 @@ pub async fn pick_model_for_session<W: Write>(
     );
     let mut picker = model_picker::ModelPickerApp::new_with_status(models, status);
     loop {
-        terminal.resize(helpers::terminal_area()?);
-        terminal.draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
-        let Some(event) = terminal_events.recv().await? else {
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
+        let Some(event) = io.input.recv().await? else {
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
                 picker.filter_mut().insert_str(&text);
                 picker.refresh_filter();
@@ -147,7 +145,7 @@ pub async fn pick_model_for_session<W: Write>(
                 KeyCode::Enter => {
                     if let Some(model_id) = picker.selected_model_id() {
                         set_session_model(
-                            client,
+                            services.client,
                             chat,
                             session_id,
                             provider_plugin_id.as_ref(),
@@ -162,7 +160,7 @@ pub async fn pick_model_for_session<W: Write>(
                 _ => {
                     let outcome = helpers::handle_text_buffer_key(
                         picker.filter_mut(),
-                        keymap,
+                        services.keymap,
                         stroke,
                         TextInputEnterBehavior::InsertNewline,
                     );
@@ -177,7 +175,7 @@ pub async fn pick_model_for_session<W: Write>(
                     && let Some(model_id) = picker.selected_model_id()
                 {
                     set_session_model(
-                        client,
+                        services.client,
                         chat,
                         session_id,
                         provider_plugin_id.as_ref(),
@@ -193,12 +191,11 @@ pub async fn pick_model_for_session<W: Write>(
 }
 
 async fn pick_model_provider<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
 ) -> Result<Option<String>, TuiError> {
-    let providers = client
+    let providers = services
+        .client
         .plugin_services()
         .await?
         .into_iter()
@@ -209,14 +206,14 @@ async fn pick_model_provider<W: Write>(
     }
     let mut picker = provider_picker::ProviderPickerApp::new(providers);
     loop {
-        terminal.resize(helpers::terminal_area()?);
-        terminal
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
             .draw(|frame| provider_picker_render::render_provider_picker(&mut picker, frame))?;
-        let Some(event) = terminal_events.recv().await? else {
+        let Some(event) = io.input.recv().await? else {
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
                 picker.filter_mut().insert_str(&text);
                 picker.refresh_filter();
@@ -229,7 +226,7 @@ async fn pick_model_provider<W: Write>(
                 _ => {
                     let outcome = helpers::handle_text_buffer_key(
                         picker.filter_mut(),
-                        keymap,
+                        services.keymap,
                         stroke,
                         TextInputEnterBehavior::InsertNewline,
                     );

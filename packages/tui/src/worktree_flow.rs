@@ -3,17 +3,16 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use super::runtime_context::{TuiIo, TuiServices};
 use bcode_client::BcodeClient;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
-use bmux_tui::terminal::Terminal;
 
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::session_flow::ActiveChat;
-use super::terminal_events::TuiInput;
 use super::{
     TuiError, session_flow, worktree_create_dialog, worktree_create_dialog_render, worktree_picker,
     worktree_picker_render,
@@ -29,11 +28,9 @@ enum PickerKeyOutcome {
 
 /// Create a worktree for the current session using a dialog.
 pub async fn create_for_current_session<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    keymap: &BmuxKeyMap,
 ) -> Result<(), TuiError> {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
@@ -45,13 +42,14 @@ pub async fn create_for_current_session<W: Write>(
         .map_or_else(|| format!("session-{session_id}"), ToString::to_string);
     let mut dialog = worktree_create_dialog::WorktreeCreateDialog::new(&default_name);
     loop {
-        terminal.resize(helpers::terminal_area()?);
-        terminal.draw(|frame| worktree_create_dialog_render::render_dialog(&dialog, frame))?;
-        let Some(event) = terminal_events.recv().await? else {
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| worktree_create_dialog_render::render_dialog(&dialog, frame))?;
+        let Some(event) = io.input.recv().await? else {
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text)
                 if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name =>
             {
@@ -76,7 +74,8 @@ pub async fn create_for_current_session<W: Write>(
                         chat.app.set_status("worktree name is required".to_owned());
                         continue;
                     }
-                    let response = client
+                    let response = services
+                        .client
                         .create_worktree(bcode_worktree_models::WorktreeCreateRequest {
                             name,
                             cwd: chat
@@ -107,7 +106,7 @@ pub async fn create_for_current_session<W: Write>(
                 _ if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name => {
                     let _ = helpers::handle_text_buffer_key(
                         dialog.name_mut(),
-                        keymap,
+                        services.keymap,
                         stroke,
                         bmux_tui::input::TextInputEnterBehavior::Submit,
                     );
@@ -125,33 +124,33 @@ pub async fn create_for_current_session<W: Write>(
 
 /// Pick a worktree and attach the current session to it.
 pub async fn attach_current_session<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    keymap: &BmuxKeyMap,
 ) -> Result<(), TuiError> {
     let cwd = chat
         .app
         .working_directory()
         .map(std::path::Path::to_path_buf);
-    let response = client
+    let response = services
+        .client
         .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd })
         .await?;
     let mut picker = worktree_picker::WorktreePickerApp::new(response.worktrees);
     loop {
-        terminal.resize(helpers::terminal_area()?);
-        terminal.draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
-        let Some(event) = terminal_events.recv().await? else {
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
+        let Some(event) = io.input.recv().await? else {
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
                 picker.filter_mut().insert_str(&text);
                 picker.refresh_filter();
             }
-            Event::Key(stroke) => match handle_picker_key(&mut picker, keymap, stroke) {
+            Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
                 PickerKeyOutcome::Continue | PickerKeyOutcome::ForceSelected => {}
                 PickerKeyOutcome::Selected => {
                     let Some(path) = picker
@@ -160,7 +159,7 @@ pub async fn attach_current_session<W: Write>(
                     else {
                         continue;
                     };
-                    attach_path(client, chat, path).await?;
+                    attach_path(services.client, chat, path).await?;
                     return Ok(());
                 }
                 PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
@@ -172,7 +171,7 @@ pub async fn attach_current_session<W: Write>(
                         .selected_worktree()
                         .map(|worktree| worktree.path.clone())
                 {
-                    attach_path(client, chat, path).await?;
+                    attach_path(services.client, chat, path).await?;
                     return Ok(());
                 }
             }
@@ -183,17 +182,16 @@ pub async fn attach_current_session<W: Write>(
 
 /// Pick a worktree and remove it after confirmation.
 pub async fn remove_worktree<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    keymap: &BmuxKeyMap,
 ) -> Result<(), TuiError> {
     let cwd = chat
         .app
         .working_directory()
         .map(std::path::Path::to_path_buf);
-    let response = client
+    let response = services
+        .client
         .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd: cwd.clone() })
         .await?;
     let linked = response
@@ -207,19 +205,20 @@ pub async fn remove_worktree<W: Write>(
             .to_owned(),
     );
     loop {
-        terminal.resize(helpers::terminal_area()?);
-        terminal.draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
-        let Some(event) = terminal_events.recv().await? else {
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
+        let Some(event) = io.input.recv().await? else {
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
                 picker.filter_mut().insert_str(&text);
                 picker.refresh_filter();
             }
             Event::Key(stroke) => {
-                let outcome = handle_picker_key(&mut picker, keymap, stroke);
+                let outcome = handle_picker_key(&mut picker, services.keymap, stroke);
                 match outcome {
                     PickerKeyOutcome::Continue => {}
                     PickerKeyOutcome::Selected | PickerKeyOutcome::ForceSelected => {
@@ -230,7 +229,8 @@ pub async fn remove_worktree<W: Write>(
                         else {
                             continue;
                         };
-                        let removed = client
+                        let removed = services
+                            .client
                             .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
                                 cwd: cwd.clone(),
                                 path: path.clone(),
@@ -251,7 +251,8 @@ pub async fn remove_worktree<W: Write>(
                         .selected_worktree()
                         .map(|worktree| worktree.path.clone())
                 {
-                    let removed = client
+                    let removed = services
+                        .client
                         .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
                             cwd: cwd.clone(),
                             path: path.clone(),

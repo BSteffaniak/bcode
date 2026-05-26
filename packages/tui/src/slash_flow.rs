@@ -9,6 +9,7 @@ use bmux_tui::terminal::Terminal;
 
 use super::helpers;
 use super::keymap::BmuxKeyMap;
+use super::runtime_context::{TuiIo, TuiServices};
 use super::terminal_events::TuiInput;
 use super::{
     TuiError, composer_flow, input, session_flow::ActiveChat, slash_palette, slash_palette_render,
@@ -68,15 +69,15 @@ pub async fn handle_slash_palette_key<W: Write>(
         KeyCode::Enter if stroke.modifiers.is_empty() => {
             if active_palette.selected_matches(chat.app.composer().text()) {
                 *slash_palette = None;
-                match composer_flow::submit_composer(
-                    client,
-                    keymap,
-                    chat,
-                    terminal,
-                    terminal_events,
-                )
-                .await
-                {
+                let outcome = {
+                    let mut io = TuiIo {
+                        terminal,
+                        input: terminal_events,
+                    };
+                    let services = TuiServices { client, keymap };
+                    composer_flow::submit_composer(&mut io, &services, chat).await
+                };
+                match outcome {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) => {
                         helpers::report_client_error(&mut chat.app, "send failed", &error);
@@ -99,15 +100,15 @@ pub async fn handle_slash_palette_key<W: Write>(
                 request_turn_cancellation(client, chat).await;
             }
             if outcome.submitted {
-                match composer_flow::submit_composer(
-                    client,
-                    keymap,
-                    chat,
-                    terminal,
-                    terminal_events,
-                )
-                .await
-                {
+                let outcome = {
+                    let mut io = TuiIo {
+                        terminal,
+                        input: terminal_events,
+                    };
+                    let services = TuiServices { client, keymap };
+                    composer_flow::submit_composer(&mut io, &services, chat).await
+                };
+                match outcome {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) => {
                         helpers::report_client_error(&mut chat.app, "send failed", &error);

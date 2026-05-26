@@ -2,13 +2,10 @@
 
 use std::io::Write;
 
-use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
-use bmux_tui::terminal::Terminal;
 
-use super::keymap::BmuxKeyMap;
+use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
-use super::terminal_events::TuiInput;
 use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands, thinking_dialog};
 
 /// Result of submitting staged composer text.
@@ -49,15 +46,13 @@ fn has_known_slash_command(message: &str) -> bool {
 }
 
 async fn handle_slash_command<W: Write>(
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
     session_id: SessionId,
     message: &str,
 ) -> Result<SubmitComposerOutcome, TuiError> {
-    match slash_commands::execute(client, session_id, message).await? {
+    match slash_commands::execute(services.client, session_id, message).await? {
         slash_commands::SlashCommandOutcome::Unknown(_command) => {}
         slash_commands::SlashCommandOutcome::Handled(status) => {
             chat.app.clear_pending_submission(message);
@@ -89,7 +84,7 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {
             chat.app.clear_pending_submission(message);
-            let status = client.session_model_status(session_id).await?;
+            let status = services.client.session_model_status(session_id).await?;
             chat.app.apply_model_status(status.clone());
             chat.app
                 .set_status("thinking settings: enter apply, esc cancel".to_owned());
@@ -101,23 +96,20 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
             chat.app.clear_pending_submission(message);
-            session_flow::switch_session(client, chat, next_session_id).await?;
+            session_flow::switch_session(services.client, chat, next_session_id).await?;
         }
         slash_commands::SlashCommandOutcome::PickSession => {
             chat.app.clear_pending_submission(message);
-            let next_session_id =
-                session_flow::pick_session(terminal, terminal_events, client, keymap).await?;
-            session_flow::switch_session(client, chat, next_session_id).await?;
+            let next_session_id = session_flow::pick_session(io, services).await?;
+            session_flow::switch_session(services.client, chat, next_session_id).await?;
         }
         slash_commands::SlashCommandOutcome::PickModel => {
             chat.app.clear_pending_submission(message);
-            model_flow::pick_model_for_session(terminal, terminal_events, client, chat, keymap)
-                .await?;
+            model_flow::pick_model_for_session(io, services, chat).await?;
         }
         slash_commands::SlashCommandOutcome::PickSkill => {
             chat.app.clear_pending_submission(message);
-            skill_flow::pick_skill_for_session(terminal, terminal_events, client, chat, keymap)
-                .await?;
+            skill_flow::pick_skill_for_session(io, services, chat).await?;
         }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);
@@ -134,11 +126,9 @@ async fn handle_slash_command<W: Write>(
 
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
 ) -> Result<SubmitComposerOutcome, TuiError> {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
@@ -150,18 +140,13 @@ pub async fn submit_composer<W: Write>(
         return Ok(None);
     }
     if has_known_slash_command(&message) {
-        return handle_slash_command(
-            client,
-            keymap,
-            chat,
-            terminal,
-            terminal_events,
-            session_id,
-            &message,
-        )
-        .await;
+        return handle_slash_command(io, services, chat, session_id, &message).await;
     }
-    match client.send_user_message(session_id, message.clone()).await {
+    match services
+        .client
+        .send_user_message(session_id, message.clone())
+        .await
+    {
         Ok(acceptance) => {
             if acceptance.queued {
                 chat.app.set_idle();

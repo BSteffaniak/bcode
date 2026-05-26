@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
 use super::helpers;
-use super::terminal_events::TuiInput;
+use super::runtime_context::{TuiIo, TuiServices};
 use super::{TuiError, history_flow};
 use super::{session_picker, session_picker_render};
 
@@ -177,24 +177,23 @@ async fn import_selected_session<W: Write>(
 /// Pick an existing session or create one.
 #[allow(clippy::too_many_lines)]
 pub async fn pick_session<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
 ) -> Result<SessionId, TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_status("Loading sessions; press Ctrl-N to create one".to_owned());
-    let mut watcher = client.watch_session_catalog().await?;
+    let mut watcher = services.client.watch_session_catalog().await?;
     apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     loop {
-        terminal.resize(helpers::terminal_area()?);
-        terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
         let event = tokio::select! {
             snapshot = watcher.next_snapshot() => {
                 apply_session_list(&mut picker, snapshot?);
                 continue;
             }
-            event = terminal_events.recv() => {
+            event = io.input.recv() => {
                 event?
             }
         };
@@ -202,21 +201,25 @@ pub async fn pick_session<W: Write>(
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
                 picker.filter_mut().insert_str(&text);
                 picker.refresh_filter();
             }
-            Event::Key(stroke) => match handle_picker_key(&mut picker, keymap, stroke) {
+            Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
                 PickerKeyOutcome::Continue => {}
                 PickerKeyOutcome::Create => {
-                    return Ok(client.create_session(None).await?.id);
+                    return Ok(services.client.create_session(None).await?.id);
                 }
-                PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
-                PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
+                PickerKeyOutcome::Rename => {
+                    rename_picker_session(services.client, &mut picker).await?;
+                }
+                PickerKeyOutcome::Delete => {
+                    delete_picker_session(services.client, &mut picker).await?;
+                }
                 PickerKeyOutcome::Selected => {
                     if let Some(session_id) =
-                        import_selected_session(terminal, client, &mut picker).await?
+                        import_selected_session(io.terminal, services.client, &mut picker).await?
                     {
                         return Ok(session_id);
                     }
@@ -229,7 +232,7 @@ pub async fn pick_session<W: Write>(
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)
                     && let Some(session_id) =
-                        import_selected_session(terminal, client, &mut picker).await?
+                        import_selected_session(io.terminal, services.client, &mut picker).await?
                 {
                     return Ok(session_id);
                 }
@@ -241,15 +244,13 @@ pub async fn pick_session<W: Write>(
 
 /// Pick a session to rename or delete.
 pub async fn pick_session_for_mutation<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
-    client: &BcodeClient,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     start_mode: SessionPickerStartMode,
 ) -> Result<(), TuiError> {
-    let keymap = BmuxKeyMap::from_config(&bcode_config::load_config()?.tui);
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_status("Loading sessions".to_owned());
-    let mut watcher = client.watch_session_catalog().await?;
+    let mut watcher = services.client.watch_session_catalog().await?;
     apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     let mut pending_start_mode = Some(start_mode);
     loop {
@@ -263,14 +264,15 @@ pub async fn pick_session_for_mutation<W: Write>(
                 }
             }
         }
-        terminal.resize(helpers::terminal_area()?);
-        terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
         let event = tokio::select! {
             snapshot = watcher.next_snapshot() => {
                 apply_session_list(&mut picker, snapshot?);
                 continue;
             }
-            event = terminal_events.recv() => {
+            event = io.input.recv() => {
                 event?
             }
         };
@@ -278,7 +280,7 @@ pub async fn pick_session_for_mutation<W: Write>(
             continue;
         };
         match event {
-            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => match picker.mode() {
                 session_picker::SessionPickerMode::Rename => picker.rename_mut().insert_str(&text),
                 session_picker::SessionPickerMode::Filter
@@ -287,12 +289,16 @@ pub async fn pick_session_for_mutation<W: Write>(
                     picker.refresh_filter();
                 }
             },
-            Event::Key(stroke) => match handle_picker_key(&mut picker, &keymap, stroke) {
+            Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
                 PickerKeyOutcome::Continue
                 | PickerKeyOutcome::Create
                 | PickerKeyOutcome::Selected => {}
-                PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
-                PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
+                PickerKeyOutcome::Rename => {
+                    rename_picker_session(services.client, &mut picker).await?;
+                }
+                PickerKeyOutcome::Delete => {
+                    delete_picker_session(services.client, &mut picker).await?;
+                }
                 PickerKeyOutcome::Canceled => {
                     return Ok(());
                 }
