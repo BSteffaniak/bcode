@@ -539,6 +539,11 @@ enum BlimsArtifactCommand {
         #[arg(long)]
         json: bool,
     },
+    Apply {
+        artifact_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1214,6 +1219,9 @@ async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
         ["patch", proposal_id] | ["patch", "proposal", proposal_id] => {
             create_blims_proposal_patch((*proposal_id).to_string(), false).await?;
         }
+        ["apply", artifact_id] | ["apply", "artifact", artifact_id] => {
+            apply_blims_patch_artifact((*artifact_id).to_string(), false).await?;
+        }
         ["work", "task", task_id] | ["work", task_id] => {
             start_blims_task_work((*task_id).to_string()).await?;
         }
@@ -1511,7 +1519,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
     );
 }
 
@@ -1674,6 +1682,9 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
                 print_artifact_detail(&decode_blims_response::<BlimsArtifactDetail>(response)?);
             }
         }
+        BlimsArtifactCommand::Apply { artifact_id, yes } => {
+            apply_blims_patch_artifact(artifact_id, yes).await?;
+        }
     }
     Ok(())
 }
@@ -1763,6 +1774,86 @@ async fn create_blims_proposal_patch(proposal_id: String, json: bool) -> Result<
         let artifact = decode_blims_response::<BlimsArtifactDetail>(response)?;
         println!("patch artifact created: {}", artifact.id);
         println!("initiative: {}", artifact.initiative_id);
+    }
+    Ok(())
+}
+
+async fn apply_blims_patch_artifact(artifact_id: String, yes: bool) -> Result<(), CliError> {
+    let artifact = load_blims_artifact(artifact_id).await?;
+    let patch = patch_from_artifact(&artifact)?;
+    if patch.trim().is_empty() {
+        return Err(CliError::Blims(format!(
+            "artifact {} contains an empty patch",
+            artifact.id
+        )));
+    }
+    if !yes && !confirm_patch_apply(&artifact)? {
+        println!("apply cancelled");
+        return Ok(());
+    }
+    apply_patch_to_current_worktree(&patch)?;
+    println!("applied patch artifact: {}", artifact.id);
+    Ok(())
+}
+
+async fn load_blims_artifact(artifact_id: String) -> Result<BlimsArtifactDetail, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "artifact_id": artifact_id,
+    });
+    let response = call_blims_service("artifact.inspect", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<BlimsArtifactDetail>(response)
+}
+
+fn patch_from_artifact(artifact: &BlimsArtifactDetail) -> Result<String, CliError> {
+    if artifact.kind != "proposal_patch" {
+        return Err(CliError::Blims(format!(
+            "artifact {} is {}, not proposal_patch",
+            artifact.id, artifact.kind
+        )));
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(&artifact.payload_json)?;
+    payload
+        .get("patch")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| CliError::Blims(format!("artifact {} has no patch payload", artifact.id)))
+}
+
+fn confirm_patch_apply(artifact: &BlimsArtifactDetail) -> Result<bool, CliError> {
+    println!(
+        "About to apply patch artifact {} to the current worktree.",
+        artifact.id
+    );
+    println!(
+        "This can modify files under {}.",
+        std::env::current_dir()?.display()
+    );
+    print!("Type `apply` to continue: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim() == "apply")
+}
+
+fn apply_patch_to_current_worktree(patch: &str) -> Result<(), CliError> {
+    let mut child = Command::new("git")
+        .arg("apply")
+        .arg("--3way")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| CliError::Blims("failed to open stdin for git apply".to_string()))?;
+    stdin.write_all(patch.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(CliError::Blims(format!(
+            "git apply failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
     Ok(())
 }
