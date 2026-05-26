@@ -61,3 +61,33 @@ Permission prompts are modal by default: permission actions only apply in the pe
 ### Permissions
 
 Bcode uses an agent-scoped permission model with `allow` / `ask` / `deny` rules under `[agent.<id>.permission]` in `bcode.toml`. See [`docs/permissions.md`](docs/permissions.md) for the full shape, category list, and built-in defaults for the `plan` and `build` agents.
+
+## Session import
+
+Bcode can discover sessions from other coding agents through bundled session-import plugins. The Pi importer is enabled by default and reads Pi JSONL history without mutating Pi's files.
+
+In the TUI, open the session picker or run `/rescan-imports`; importable rows are marked like `[pi import]`. Selecting one copies it into a normal Bcode session and continuation uses Bcode's selected provider, agent, tools, and permissions. Imported external tool calls are inert history and are not replayed.
+
+CLI helpers:
+
+```sh
+bcode session import sources
+bcode session import discover --source pi
+bcode session import discover --source pi --diagnostics
+bcode session import open --source pi <external-session-id>
+```
+
+Configuration lives under `[session_import]` and `[session_import.pi]`:
+
+```toml
+[session_import]
+enabled = true
+hide_already_imported = true
+
+[session_import.pi]
+enabled = true
+path_mode = "defaults_and_custom" # defaults_only, custom_only, defaults_and_custom
+paths = ["/path/to/pi/sessions"]
+```
+
+The default Pi path is `~/.pi/agent/sessions`. Use `custom_only` to avoid scanning the default home-directory location. Import warnings are shown when mappings are lossy, such as image blocks that are not yet copied into Bcode artifacts.

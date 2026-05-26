@@ -472,6 +472,8 @@ enum SessionImportCommand {
         source: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        diagnostics: bool,
     },
     Open {
         #[arg(long, default_value = "pi")]
@@ -3352,8 +3354,15 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
                 println!("{}\t{}", source.source_id, source.display_name);
             }
         }
-        SessionImportCommand::Discover { source, json } => {
-            let request = serde_json::to_vec(&DiscoverImportableSessionsRequest::default())?;
+        SessionImportCommand::Discover {
+            source,
+            json,
+            diagnostics,
+        } => {
+            let request = serde_json::to_vec(&DiscoverImportableSessionsRequest {
+                include_diagnostics: diagnostics,
+                ..DiscoverImportableSessionsRequest::default()
+            })?;
             let response = client
                 .call_plugin_service(
                     SESSION_IMPORT_INTERFACE_ID.to_string(),
@@ -3374,11 +3383,27 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
                 println!("no importable sessions");
             } else {
                 for session in sessions.sessions {
+                    let title = session.title.as_deref().unwrap_or("<untitled>");
+                    let cwd = session
+                        .working_directory
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), |cwd| cwd.display().to_string());
+                    let messages = session
+                        .message_count
+                        .map_or_else(|| "-".to_owned(), |count| count.to_string());
+                    let updated = session
+                        .updated_at_ms
+                        .map_or_else(|| "-".to_owned(), |updated| updated.to_string());
+                    let warning_count = session.warnings.len();
                     println!(
-                        "[{}]\t{}\t{}",
+                        "[{}]\t{}\t{}\tmessages={}\tupdated={}\twarnings={}\tcwd={}",
                         session.source_id,
                         session.external_session_id,
-                        session.title.as_deref().unwrap_or("<untitled>")
+                        title,
+                        messages,
+                        updated,
+                        warning_count,
+                        cwd
                     );
                 }
             }

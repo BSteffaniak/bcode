@@ -39,6 +39,9 @@ pub struct ListImportSourcesResponse {
 pub struct DiscoverImportableSessionsRequest {
     #[serde(default)]
     pub working_directory: Option<PathBuf>,
+    /// Include diagnostic source/status entries in discovery summaries.
+    #[serde(default)]
+    pub include_diagnostics: bool,
 }
 
 /// Lightweight external session summary for picker/catalog views.
@@ -58,7 +61,22 @@ pub struct ImportableSessionSummary {
     #[serde(default)]
     pub message_count: Option<u64>,
     #[serde(default)]
+    pub status: ImportableSessionStatus,
+    #[serde(default)]
     pub warnings: Vec<ImportWarning>,
+}
+
+/// Discovery/load status for an importable session summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportableSessionStatus {
+    /// Session is ready to import.
+    #[default]
+    Available,
+    /// Diagnostic row describing a source/path condition, not an importable session.
+    Diagnostic,
+    /// Source exists but could not be scanned completely.
+    Unavailable,
 }
 
 /// Response returned by [`OP_DISCOVER_IMPORTABLE_SESSIONS`].

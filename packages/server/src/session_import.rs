@@ -42,6 +42,7 @@ pub async fn discover_importable_session_summaries(
     for plugin_id in providers {
         let request = DiscoverImportableSessionsRequest {
             working_directory: Some(working_directory.to_path_buf()),
+            include_diagnostics: false,
         };
         let Ok(response) = state
             .plugins
@@ -56,6 +57,9 @@ pub async fn discover_importable_session_summaries(
             continue;
         };
         for summary in response.sessions {
+            if summary.status != bcode_session_import::ImportableSessionStatus::Available {
+                continue;
+            }
             if existing.iter().any(|session| {
                 session.import.as_ref().is_some_and(|import| {
                     import.source_id == summary.source_id
@@ -159,7 +163,9 @@ pub async fn import_external_session(
             .await
             .map_err(|error| error.to_string())?;
         let Some(summary) = discovery.sessions.into_iter().find(|summary| {
-            summary.source_id == source_id && summary.external_session_id == external_session_id
+            summary.status == bcode_session_import::ImportableSessionStatus::Available
+                && summary.source_id == source_id
+                && summary.external_session_id == external_session_id
         }) else {
             continue;
         };
@@ -379,6 +385,9 @@ async fn external_parts_from_session_id(
             .await
             .ok()?;
         for summary in response.sessions {
+            if summary.status != bcode_session_import::ImportableSessionStatus::Available {
+                continue;
+            }
             if external_session_id(&summary.source_id, &summary.external_session_id) == session_id {
                 return Some((summary.source_id, summary.external_session_id));
             }

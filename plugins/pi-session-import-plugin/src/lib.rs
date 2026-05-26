@@ -9,9 +9,9 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportSourceInfo,
     ImportWarning, ImportableSession, ImportableSessionEvent, ImportableSessionEventKind,
-    ImportableSessionSummary, ListImportSourcesResponse, LoadImportableSessionRequest,
-    OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES, OP_LOAD_IMPORTABLE_SESSION,
-    SESSION_IMPORT_INTERFACE_ID,
+    ImportableSessionStatus, ImportableSessionSummary, ListImportSourcesResponse,
+    LoadImportableSessionRequest, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
+    OP_LOAD_IMPORTABLE_SESSION, SESSION_IMPORT_INTERFACE_ID,
 };
 use serde_json::Value;
 use std::fs::{self, File};
@@ -65,7 +65,10 @@ fn discover_sessions(request: &ServiceRequest) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match discover_pi_sessions(request.working_directory.as_deref()) {
+    match discover_pi_sessions(
+        request.working_directory.as_deref(),
+        request.include_diagnostics,
+    ) {
         Ok(sessions) => json_response(&DiscoverImportableSessionsResponse { sessions }),
         Err(error) => ServiceResponse::error("discover_failed", error.to_string()),
     }
@@ -87,13 +90,34 @@ fn load_session(request: &ServiceRequest) -> ServiceResponse {
 
 fn discover_pi_sessions(
     working_directory: Option<&Path>,
+    include_diagnostics: bool,
 ) -> Result<Vec<ImportableSessionSummary>, std::io::Error> {
     let mut sessions = Vec::new();
     for root in configured_session_roots() {
         if !root.exists() {
+            if include_diagnostics {
+                sessions.push(diagnostic_summary(
+                    &root,
+                    "missing_path",
+                    format!("Pi sessions path does not exist: {}", root.display()),
+                ));
+            }
             continue;
         }
-        discover_root_sessions(&root, working_directory, &mut sessions)?;
+        if let Err(error) = discover_root_sessions(&root, working_directory, &mut sessions) {
+            if include_diagnostics {
+                sessions.push(diagnostic_summary(
+                    &root,
+                    "scan_failed",
+                    format!(
+                        "failed to scan Pi sessions path {}: {error}",
+                        root.display()
+                    ),
+                ));
+                continue;
+            }
+            return Err(error);
+        }
     }
     sessions.sort_by(|left, right| {
         right
@@ -351,14 +375,18 @@ fn read_summary(path: &Path) -> Result<ImportableSessionSummary, std::io::Error>
     let working_directory = string_field(&header, "cwd").map(PathBuf::from);
     let mut title = None;
     let mut first_user = None;
+    let mut message_count = 0_u64;
 
     for (index, line) in reader.lines().enumerate() {
-        if index >= DISCOVERY_LINE_BUDGET || (title.is_some() && first_user.is_some()) {
-            break;
-        }
         let Ok(value) = serde_json::from_str::<Value>(&line?) else {
             continue;
         };
+        if value.get("type").and_then(Value::as_str) == Some("message") {
+            message_count = message_count.saturating_add(1);
+        }
+        if index >= DISCOVERY_LINE_BUDGET || (title.is_some() && first_user.is_some()) {
+            continue;
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("session_info") => {
                 title = string_field(&value, "name").filter(|name| !name.trim().is_empty());
@@ -398,9 +426,26 @@ fn read_summary(path: &Path) -> Result<ImportableSessionSummary, std::io::Error>
         working_directory,
         created_at_ms,
         updated_at_ms,
-        message_count: None,
+        message_count: Some(message_count),
+        status: ImportableSessionStatus::Available,
         warnings: Vec::new(),
     })
+}
+
+fn diagnostic_summary(root: &Path, code: &str, message: String) -> ImportableSessionSummary {
+    ImportableSessionSummary {
+        source_id: SOURCE_ID.to_string(),
+        source_display_name: SOURCE_DISPLAY_NAME.to_string(),
+        external_session_id: format!("diagnostic:{}", root.display()),
+        locator: root.to_string_lossy().into_owned(),
+        title: Some(message.clone()),
+        working_directory: None,
+        created_at_ms: None,
+        updated_at_ms: None,
+        message_count: None,
+        status: ImportableSessionStatus::Diagnostic,
+        warnings: vec![ImportWarning::new(code, message)],
+    }
 }
 
 fn content_text_and_images(content: Option<&Value>) -> (String, u64) {
@@ -595,6 +640,7 @@ mod tests {
             Some(Path::new("/tmp/pi-project"))
         );
         assert_eq!(summary.created_at_ms, Some(1_779_483_433_970));
+        assert_eq!(summary.message_count, Some(3));
     }
 
     #[test]
@@ -619,6 +665,10 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind, ImportableSessionEventKind::UserMessage { .. }))
         );
+        assert!(session.events.iter().any(|event| matches!(
+            event.kind,
+            ImportableSessionEventKind::AssistantReasoningMessage { .. }
+        )));
         assert!(session.events.iter().any(|event| matches!(
             event.kind,
             ImportableSessionEventKind::ToolCallRequested { .. }
