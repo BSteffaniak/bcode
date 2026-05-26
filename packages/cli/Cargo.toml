@@ -46,9 +46,17 @@ static-bundled-bedrock-provider-plugin = [
     "_static-bundled",
     "bcode_server/static-bundled-bedrock-provider-plugin",
 ]
+static-bundled-blims-plugin = [
+    "_static-bundled",
+    "bcode_server/static-bundled-blims-plugin",
+]
 static-bundled-default-agents-plugin = [
     "_static-bundled",
     "bcode_server/static-bundled-default-agents-plugin",
+]
+static-bundled-document-plugin = [
+    "_static-bundled",
+    "bcode_server/static-bundled-document-plugin",
 ]
 static-bundled-fake-provider-plugin = [
     "_static-bundled",
@@ -57,6 +65,10 @@ static-bundled-fake-provider-plugin = [
 static-bundled-filesystem-plugin = [
     "_static-bundled",
     "bcode_server/static-bundled-filesystem-plugin",
+]
+static-bundled-git-plugin = [
+    "_static-bundled",
+    "bcode_server/static-bundled-git-plugin",
 ]
 static-bundled-openai-compatible-provider-plugin = [
     "_static-bundled",
@@ -73,15 +85,28 @@ static-bundled-pi-session-import-plugin = [
 static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
+    "static-bundled-blims-plugin",
     "static-bundled-default-agents-plugin",
+    "static-bundled-document-plugin",
     "static-bundled-fake-provider-plugin",
     "static-bundled-filesystem-plugin",
+    "static-bundled-git-plugin",
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
     "static-bundled-shell-plugin",
+    "static-bundled-web-search-plugin",
+    "static-bundled-worktree-plugin",
 ]
 static-bundled-shell-plugin = [
     "_static-bundled",
     "bcode_server/static-bundled-shell-plugin",
+]
+static-bundled-web-search-plugin = [
+    "_static-bundled",
+    "bcode_server/static-bundled-web-search-plugin",
+]
+static-bundled-worktree-plugin = [
+    "_static-bundled",
+    "bcode_server/static-bundled-worktree-plugin",
 ]

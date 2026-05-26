@@ -14,6 +14,7 @@ version     = { workspace = true }
 base64 = { workspace = true }
 bcode_agent_profile = { workspace = true }
 bcode_bedrock_provider_plugin = { workspace = true, optional = true }
+bcode_blims_plugin = { workspace = true, optional = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
@@ -65,6 +66,11 @@ static-bundled-bedrock-provider-plugin = [
     "dep:bcode_bedrock_provider_plugin",
     "bcode_bedrock_provider_plugin/static-bundled",
 ]
+static-bundled-blims-plugin = [
+    "_static-bundled",
+    "dep:bcode_blims_plugin",
+    "bcode_blims_plugin/static-bundled",
+]
 static-bundled-default-agents-plugin = [
     "_static-bundled",
     "dep:bcode_default_agents_plugin",
@@ -108,6 +114,7 @@ static-bundled-pi-session-import-plugin = [
 static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
+    "static-bundled-blims-plugin",
     "static-bundled-default-agents-plugin",
     "static-bundled-document-plugin",
     "static-bundled-fake-provider-plugin",

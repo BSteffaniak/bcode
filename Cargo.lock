@@ -783,6 +783,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_blims_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1063,6 +1072,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_agent_profile",
  "bcode_bedrock_provider_plugin",
+ "bcode_blims_plugin",
  "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",
