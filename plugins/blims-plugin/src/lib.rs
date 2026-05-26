@@ -64,6 +64,18 @@ pub const OP_ARTIFACT_LIST: &str = "artifact.list";
 /// Artifact inspect operation.
 pub const OP_ARTIFACT_INSPECT: &str = "artifact.inspect";
 
+/// Work proposal register operation.
+pub const OP_PROPOSAL_REGISTER: &str = "proposal.register";
+
+/// Work proposal list operation.
+pub const OP_PROPOSAL_LIST: &str = "proposal.list";
+
+/// Work proposal inspect operation.
+pub const OP_PROPOSAL_INSPECT: &str = "proposal.inspect";
+
+/// Work proposal mark-ready operation.
+pub const OP_PROPOSAL_MARK_READY: &str = "proposal.mark_ready";
+
 /// Agent talk prompt operation.
 pub const OP_AGENT_TALK_PROMPT: &str = "agent.talk_prompt";
 
@@ -108,6 +120,10 @@ impl RustPlugin for BlimsPlugin {
             OP_TASK_WORK_PROMPT => service_task_work_prompt(&context.request),
             OP_ARTIFACT_LIST => service_artifact_list(&context.request),
             OP_ARTIFACT_INSPECT => service_artifact_inspect(&context.request),
+            OP_PROPOSAL_REGISTER => service_proposal_register(&context.request),
+            OP_PROPOSAL_LIST => service_proposal_list(&context.request),
+            OP_PROPOSAL_INSPECT => service_proposal_inspect(&context.request),
+            OP_PROPOSAL_MARK_READY => service_proposal_mark_ready(&context.request),
             OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
@@ -195,6 +211,55 @@ pub struct TaskWorkPrompt {
     pub agent_id: String,
     /// Prompt text.
     pub prompt: String,
+}
+
+/// Request to register a task work proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalRegisterRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Task id.
+    pub task_id: String,
+    /// Session id.
+    pub session_id: String,
+    /// Worktree path.
+    pub worktree_path: PathBuf,
+    /// Branch name.
+    pub branch: String,
+}
+
+/// Request to inspect or update a proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Proposal id.
+    pub proposal_id: String,
+}
+
+/// Work proposal summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkProposalSummary {
+    /// Proposal id.
+    pub id: String,
+    /// Task id.
+    pub task_id: String,
+    /// Initiative id.
+    pub initiative_id: String,
+    /// Agent id.
+    pub agent_id: String,
+    /// Bcode session id.
+    pub session_id: String,
+    /// Worktree path.
+    pub worktree_path: String,
+    /// Branch name.
+    pub branch: String,
+    /// Proposal status.
+    pub status: String,
+    /// Proposal summary.
+    pub summary: String,
+    /// Validation notes.
+    pub validation_notes: String,
 }
 
 /// Request to inspect an initiative.
@@ -711,6 +776,50 @@ fn service_artifact_inspect(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn service_proposal_register(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ProposalRegisterRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match register_proposal(&request) {
+        Ok(proposal) => json_response(&proposal),
+        Err(error) => ServiceResponse::error("proposal_register_failed", error.to_string()),
+    }
+}
+
+fn service_proposal_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_proposals(&request.working_directory) {
+        Ok(proposals) => json_response(&proposals),
+        Err(error) => ServiceResponse::error("proposal_list_failed", error.to_string()),
+    }
+}
+
+fn service_proposal_inspect(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ProposalRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match inspect_proposal(&request) {
+        Ok(proposal) => json_response(&proposal),
+        Err(error) => ServiceResponse::error("proposal_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_proposal_mark_ready(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ProposalRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match mark_proposal_ready(&request) {
+        Ok(proposal) => json_response(&proposal),
+        Err(error) => ServiceResponse::error("proposal_mark_ready_failed", error.to_string()),
+    }
+}
+
 fn service_agent_talk_prompt(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<AgentTalkPromptRequest>() {
         Ok(request) => request,
@@ -985,6 +1094,23 @@ async fn create_work_tables(
         .column(text_column("title"))
         .column(text_column("payload_json"))
         .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("work_proposals")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("task_id"))
+        .column(text_column("initiative_id"))
+        .column(text_column("agent_id"))
+        .column(text_column("session_id"))
+        .column(text_column("worktree_path"))
+        .column(text_column("branch"))
+        .column(text_column("status"))
+        .column(text_column("summary"))
+        .column(text_column("validation_notes"))
+        .column(now_column("created_at"))
+        .column(now_column("updated_at"))
         .primary_key("id")
         .execute(database)
         .await
@@ -1550,6 +1676,87 @@ fn inspect_artifact(request: &ArtifactInspectRequest) -> Result<ArtifactDetail, 
     })
 }
 
+fn register_proposal(
+    request: &ProposalRegisterRequest,
+) -> Result<WorkProposalSummary, BlimsStateError> {
+    let request = request.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let task = load_task(database, &request.task_id).await?;
+            let id = format!("proposal-{}", request.task_id);
+            let summary = format!("Draft work proposal for {}", task.title);
+            database
+                .insert("work_proposals")
+                .value("id", id.clone())
+                .value("task_id", task.id.clone())
+                .value("initiative_id", task.initiative_id.clone())
+                .value("agent_id", task.assigned_agent_id.clone())
+                .value("session_id", request.session_id.clone())
+                .value("worktree_path", request.worktree_path.display().to_string())
+                .value("branch", request.branch.clone())
+                .value("status", "draft")
+                .value("summary", summary.clone())
+                .value("validation_notes", "not yet reported")
+                .execute(database)
+                .await?;
+            Ok(WorkProposalSummary {
+                id,
+                task_id: task.id,
+                initiative_id: task.initiative_id,
+                agent_id: task.assigned_agent_id,
+                session_id: request.session_id,
+                worktree_path: request.worktree_path.display().to_string(),
+                branch: request.branch,
+                status: "draft".to_string(),
+                summary,
+                validation_notes: "not yet reported".to_string(),
+            })
+        })
+    })
+}
+
+fn list_proposals(working_directory: &Path) -> Result<Vec<WorkProposalSummary>, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(async move {
+            database
+                .select("work_proposals")
+                .columns(&proposal_columns())
+                .sort("updated_at", SortDirection::Desc)
+                .execute(database)
+                .await?
+                .iter()
+                .map(proposal_summary)
+                .collect()
+        })
+    })
+}
+
+fn inspect_proposal(request: &ProposalRequest) -> Result<WorkProposalSummary, BlimsStateError> {
+    let proposal_id = request.proposal_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move { load_proposal(database, &proposal_id).await })
+    })
+}
+
+fn mark_proposal_ready(request: &ProposalRequest) -> Result<WorkProposalSummary, BlimsStateError> {
+    let proposal_id = request.proposal_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let proposal = load_proposal(database, &proposal_id).await?;
+            database
+                .update("work_proposals")
+                .value("status", "ready_for_review")
+                .filter(Box::new(where_eq("id", proposal_id.clone())))
+                .execute(database)
+                .await?;
+            Ok(WorkProposalSummary {
+                status: "ready_for_review".to_string(),
+                ..proposal
+            })
+        })
+    })
+}
+
 fn build_agent_talk_prompt(
     request: &AgentTalkPromptRequest,
 ) -> Result<AgentTalkPrompt, BlimsStateError> {
@@ -1710,6 +1917,61 @@ fn import_initiative_plan(
             Ok::<_, BlimsStateError>(plan_for_response)
         })
     })
+}
+
+async fn load_task(database: &dyn Database, task_id: &str) -> Result<TaskSummary, BlimsStateError> {
+    database
+        .select("tasks")
+        .columns(&[
+            "id",
+            "initiative_id",
+            "title",
+            "description",
+            "status",
+            "assigned_agent_id",
+            "rationale",
+            "priority",
+        ])
+        .filter(Box::new(where_eq("id", task_id)))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .as_ref()
+        .map(task_summary)
+        .transpose()?
+        .ok_or(BlimsStateError::MissingColumn("task"))
+}
+
+async fn load_proposal(
+    database: &dyn Database,
+    proposal_id: &str,
+) -> Result<WorkProposalSummary, BlimsStateError> {
+    database
+        .select("work_proposals")
+        .columns(&proposal_columns())
+        .filter(Box::new(where_eq("id", proposal_id)))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .as_ref()
+        .map(proposal_summary)
+        .transpose()?
+        .ok_or(BlimsStateError::MissingColumn("proposal"))
+}
+
+const fn proposal_columns() -> [&'static str; 10] {
+    [
+        "id",
+        "task_id",
+        "initiative_id",
+        "agent_id",
+        "session_id",
+        "worktree_path",
+        "branch",
+        "status",
+        "summary",
+        "validation_notes",
+    ]
 }
 
 async fn load_initiative(
@@ -1930,6 +2192,21 @@ fn artifact_detail(row: &Row) -> Result<ArtifactDetail, BlimsStateError> {
         kind: required_text(row, "kind")?,
         title: required_text(row, "title")?,
         payload_json: required_text(row, "payload_json")?,
+    })
+}
+
+fn proposal_summary(row: &Row) -> Result<WorkProposalSummary, BlimsStateError> {
+    Ok(WorkProposalSummary {
+        id: required_text(row, "id")?,
+        task_id: required_text(row, "task_id")?,
+        initiative_id: required_text(row, "initiative_id")?,
+        agent_id: required_text(row, "agent_id")?,
+        session_id: required_text(row, "session_id")?,
+        worktree_path: required_text(row, "worktree_path")?,
+        branch: required_text(row, "branch")?,
+        status: required_text(row, "status")?,
+        summary: required_text(row, "summary")?,
+        validation_notes: required_text(row, "validation_notes")?,
     })
 }
 
