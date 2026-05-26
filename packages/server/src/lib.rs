@@ -116,6 +116,7 @@ pub struct ServerState {
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
+    active_session_turns: Mutex<BTreeMap<SessionId, ActiveSessionTurn>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -187,6 +188,36 @@ impl SessionTurnPermit {
     const fn enter_turn(&mut self) -> SessionId {
         self.turn_entries = self.turn_entries.saturating_add(1);
         self.session_id
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSessionTurn {
+    turn_id: String,
+    cancel_state: Arc<TurnCancelState>,
+}
+
+#[derive(Debug, Default)]
+struct TurnCancelState {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl TurnCancelState {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 
@@ -427,6 +458,7 @@ impl ServerState {
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
+            active_session_turns: Mutex::default(),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -2809,11 +2841,38 @@ async fn handle_cancel_session_turn(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let Some(active_turn) = state.active_turns.lock().await.get(&session_id).cloned() else {
+    let Some(active_session_turn) = state
+        .active_session_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    else {
         return send_response(
             writer,
             request_id,
             Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: false }),
+        )
+        .await;
+    };
+
+    active_session_turn.cancel_state.cancel();
+    append_system_event(
+        state,
+        session_id,
+        format!(
+            "model turn cancellation requested for {}",
+            active_session_turn.turn_id
+        ),
+    )
+    .await;
+
+    let active_turn = state.active_turns.lock().await.get(&session_id).cloned();
+    let Some(active_turn) = active_turn else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true }),
         )
         .await;
     };
@@ -2829,12 +2888,6 @@ async fn handle_cancel_session_turn(
     .await;
     match cancel_result {
         Ok(_) => {
-            append_system_event(
-                state,
-                session_id,
-                "model turn cancellation requested".to_string(),
-            )
-            .await;
             send_response(
                 writer,
                 request_id,
@@ -2843,10 +2896,16 @@ async fn handle_cancel_session_turn(
             .await
         }
         Err(error) => {
+            append_system_event(
+                state,
+                session_id,
+                format!("provider turn cancellation failed: {error}"),
+            )
+            .await;
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("plugin_error", error)),
+                Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true }),
             )
             .await
         }
@@ -3813,8 +3872,25 @@ async fn run_model_turn(
 ) {
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+    let cancel_state = Arc::new(TurnCancelState::default());
+    state.active_session_turns.lock().await.insert(
+        session_id,
+        ActiveSessionTurn {
+            turn_id: turn_id.clone(),
+            cancel_state: Arc::clone(&cancel_state),
+        },
+    );
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
-    let completion = run_model_turn_inner(state, session_id, trigger_event, runtime_context).await;
+    let completion = run_model_turn_inner(
+        state,
+        session_id,
+        trigger_event,
+        runtime_context,
+        Arc::clone(&cancel_state),
+    )
+    .await;
+    state.active_session_turns.lock().await.remove(&session_id);
+    state.active_turns.lock().await.remove(&session_id);
     append_model_turn_finished_event(
         state,
         session_id,
@@ -3825,11 +3901,13 @@ async fn run_model_turn(
     .await;
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_model_turn_inner(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
     runtime_context: Option<ClientRuntimeContext>,
+    cancel_state: Arc<TurnCancelState>,
 ) -> ModelTurnCompletion {
     let selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
@@ -3849,6 +3927,12 @@ async fn run_model_turn_inner(
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
     loop {
+        if cancel_state.is_cancelled() {
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            );
+        }
         let request = match build_model_turn_request(
             state,
             session_id,
@@ -3876,13 +3960,24 @@ async fn run_model_turn_inner(
             round,
         )
         .await;
-        let outcome =
-            match run_model_turn_round(state, session_id, provider_plugin_id.as_deref(), &request)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(completion) => return completion,
-            };
+        let outcome = match run_model_turn_round(
+            state,
+            session_id,
+            provider_plugin_id.as_deref(),
+            &request,
+            Arc::clone(&cancel_state),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(completion) => return completion,
+        };
+        if cancel_state.is_cancelled() {
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            );
+        }
         match maybe_retry_after_provider_error(
             state,
             session_id,
@@ -4071,14 +4166,22 @@ fn provider_error_message(error: &bcode_model::ProviderError) -> String {
     format!("model error {}: {}", error.code, error.message)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_model_turn_round(
     state: &ServerState,
     session_id: SessionId,
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
+    cancel_state: Arc<TurnCancelState>,
 ) -> Result<ModelPollOutcome, ModelTurnCompletion> {
     let round_start = Instant::now();
     let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
+    if cancel_state.is_cancelled() {
+        return Err(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        ));
+    }
     let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
         state,
         provider_plugin_id.map(ToString::to_string),
@@ -4145,6 +4248,7 @@ async fn run_model_turn_round(
         provider_plugin_id,
         &start.provider_turn_id,
         &request.turn_id,
+        Arc::clone(&cancel_state),
     )
     .await;
 
@@ -4155,6 +4259,13 @@ async fn run_model_turn_round(
     }
 
     let active_turn = state.active_turns.lock().await.remove(&session_id);
+    if cancel_state.is_cancelled() && outcome.completion.is_none() {
+        outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+        outcome.completion = Some(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        ));
+    }
     let finish = FinishTurnRequest {
         provider_turn_id: start.provider_turn_id,
     };
@@ -4184,6 +4295,20 @@ async fn ensure_terminal_poll_outcome(
     outcome: &mut ModelPollOutcome,
 ) {
     if outcome.stop_reason.is_some() || outcome.completion.is_some() {
+        return;
+    }
+    if state
+        .active_session_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .is_some_and(|turn| turn.cancel_state.is_cancelled())
+    {
+        outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+        outcome.completion = Some(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        ));
         return;
     }
     let message = "model provider polling ended without a terminal event".to_string();
@@ -4229,6 +4354,7 @@ async fn poll_model_turn_events(
     provider_plugin_id: Option<&str>,
     provider_turn_id: &str,
     turn_id: &str,
+    cancel_state: Arc<TurnCancelState>,
 ) -> (String, ModelPollOutcome) {
     let mut assistant_text = String::new();
     let mut outcome = ModelPollOutcome::default();
@@ -4236,6 +4362,14 @@ async fn poll_model_turn_events(
     let mut idle_for = Duration::ZERO;
     let mut no_progress_warned = false;
     loop {
+        if cancel_state.is_cancelled() {
+            outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            ));
+            break;
+        }
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
         };
@@ -4258,6 +4392,7 @@ async fn poll_model_turn_events(
                 session_id,
                 idle_for,
                 &mut no_progress_warned,
+                cancel_state.as_ref(),
                 stream_progress.tool_progress_snapshot(),
                 &mut outcome,
             )
@@ -4293,6 +4428,7 @@ async fn poll_model_turn_events(
                 session_id,
                 idle_for,
                 &mut no_progress_warned,
+                cancel_state.as_ref(),
                 stream_progress.tool_progress_snapshot(),
                 &mut outcome,
             )
@@ -4334,6 +4470,7 @@ async fn wait_for_model_progress_or_timeout(
     session_id: SessionId,
     idle_for: Duration,
     warned: &mut bool,
+    cancel_state: &TurnCancelState,
     active_tool_call: Option<ProviderToolCallProgress>,
     outcome: &mut ModelPollOutcome,
 ) -> Option<Duration> {
@@ -4374,8 +4511,17 @@ async fn wait_for_model_progress_or_timeout(
         ));
         return None;
     }
-    tokio::time::sleep(MODEL_POLL_INTERVAL).await;
-    Some(idle_for)
+    tokio::select! {
+        () = tokio::time::sleep(MODEL_POLL_INTERVAL) => Some(idle_for),
+        () = cancel_state.cancelled() => {
+            outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            ));
+            None
+        }
+    }
 }
 
 async fn poll_model_turn(
@@ -4402,6 +4548,20 @@ async fn handle_provider_turn_event(
     outcome: &mut ModelPollOutcome,
     stream_progress: &mut ModelStreamProgress,
 ) {
+    if state
+        .active_session_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .is_some_and(|turn| turn.cancel_state.is_cancelled())
+    {
+        outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+        outcome.completion = Some(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        ));
+        return;
+    }
     match event {
         ProviderTurnEvent::TextDelta { text } => {
             append_provider_event_trace(state, session_id, turn_id, "text_delta", None).await;
@@ -4590,7 +4750,25 @@ async fn handle_provider_tool_call_finished_event(
     if !assistant_text.is_empty() {
         append_assistant_message_event(state, session_id, std::mem::take(assistant_text)).await;
     }
-    execute_model_tool(state, session_id, call).await;
+    let Some(cancel_state) = active_turn_cancel_state(state, session_id).await else {
+        return;
+    };
+    if cancel_state.is_cancelled() {
+        return;
+    }
+    execute_model_tool(state, session_id, call, Arc::clone(&cancel_state)).await;
+}
+
+async fn active_turn_cancel_state(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Option<Arc<TurnCancelState>> {
+    state
+        .active_session_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .map(|turn| Arc::clone(&turn.cancel_state))
 }
 
 async fn handle_provider_metadata_event(
@@ -5638,6 +5816,7 @@ async fn execute_model_tool(
     state: &ServerState,
     session_id: SessionId,
     call: bcode_model::ToolCall,
+    cancel_state: Arc<TurnCancelState>,
 ) {
     append_tool_request_event(
         state,
@@ -5647,8 +5826,21 @@ async fn execute_model_tool(
         serde_json::to_string(&call.arguments).unwrap_or_default(),
     )
     .await;
+    if cancel_state.is_cancelled() {
+        append_tool_finished_event(
+            state,
+            session_id,
+            call.id,
+            "tool skipped because model turn was cancelled".to_string(),
+            true,
+            Vec::new(),
+            None,
+        )
+        .await;
+        return;
+    }
     let tool_start = Instant::now();
-    let result = invoke_model_tool(state, session_id, &call)
+    let result = invoke_model_tool(state, session_id, &call, cancel_state.as_ref())
         .await
         .unwrap_or_else(|error| ToolInvocationResponse {
             output: error,
@@ -5698,10 +5890,19 @@ async fn invoke_model_tool(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
+    cancel_state: &TurnCancelState,
 ) -> Result<ToolInvocationResponse, String> {
     let (plugin_id, definition) = find_tool_provider(state, &call.name)
         .await?
         .ok_or_else(|| format!("tool not found: {}", call.name))?;
+    if cancel_state.is_cancelled() {
+        return Ok(ToolInvocationResponse {
+            output: "tool cancelled before invocation".to_string(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+        });
+    }
     if call.name == "web.search"
         && call
             .arguments
@@ -5763,7 +5964,7 @@ async fn invoke_model_tool(
             });
         }
         AgentDecision::Ask => {
-            if !request_tool_permission(state, session_id, call, &definition).await {
+            if !request_tool_permission(state, session_id, call, &definition, cancel_state).await {
                 return Ok(ToolInvocationResponse {
                     output: "permission denied".to_string(),
                     is_error: true,
@@ -5799,6 +6000,14 @@ async fn invoke_model_tool(
         .map_err(|error| error.to_string())?;
     let response = loop {
         tokio::select! {
+            () = cancel_state.cancelled() => {
+                return Ok(ToolInvocationResponse {
+                    output: "tool invocation cancelled".to_string(),
+                    is_error: true,
+                    content: Vec::new(),
+                    full_output: None,
+                });
+            }
             Some(payload) = invocation.events.recv() => {
                 if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
                     append_tool_stream_event(state, session_id, convert_tool_stream_event(event)).await;
@@ -5989,6 +6198,7 @@ async fn request_tool_permission(
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     definition: &ServiceToolDefinition,
+    cancel_state: &TurnCancelState,
 ) -> bool {
     let permission_id = next_permission_id(state).await;
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
@@ -6051,7 +6261,30 @@ async fn request_tool_permission(
             .await;
             return decision;
         }
-        pending.notify.notified().await;
+        tokio::select! {
+            () = pending.notify.notified() => {}
+            () = cancel_state.cancelled() => {
+                append_trace_event(
+                    state,
+                    session_id,
+                    None,
+                    SessionTracePhase::ToolPermissionWaitFinished,
+                    SessionTracePayload::ToolPermissionWait {
+                        permission_id: pending.summary.permission_id.clone(),
+                        tool_call_id: pending.summary.tool_call_id.clone(),
+                        approved: Some(false),
+                        duration_ms: Some(elapsed_ms(wait_start)),
+                    },
+                )
+                .await;
+                state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .remove(&pending.summary.permission_id);
+                return false;
+            }
+        }
     }
 }
 
