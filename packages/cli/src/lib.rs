@@ -461,6 +461,15 @@ enum BlimsInitiativeCommand {
         #[arg(long)]
         json: bool,
     },
+    PlanPrompt {
+        initiative_id: String,
+    },
+    ImportPlan {
+        initiative_id: String,
+        plan: String,
+        #[arg(long)]
+        file: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -808,6 +817,19 @@ struct BlimsGuidanceSetRequest {
     strength: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BlimsInitiativePlanPromptRequest {
+    working_directory: PathBuf,
+    initiative_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BlimsInitiativeImportPlanRequest {
+    working_directory: PathBuf,
+    initiative_id: String,
+    plan: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsCompanyStatus {
     state: String,
@@ -856,6 +878,12 @@ struct BlimsGuidanceSummary {
     guidance: String,
     strength: String,
     active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsPlanningPrompt {
+    initiative_id: String,
+    prompt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -988,6 +1016,36 @@ async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Res
                     );
                 }
             }
+        }
+        BlimsInitiativeCommand::PlanPrompt { initiative_id } => {
+            let request = BlimsInitiativePlanPromptRequest {
+                working_directory: std::env::current_dir()?,
+                initiative_id,
+            };
+            let response =
+                call_blims_service("initiative.plan_prompt", serde_json::to_vec(&request)?).await?;
+            let prompt = decode_blims_response::<BlimsPlanningPrompt>(response)?;
+            println!("# Initiative {} AI planning prompt", prompt.initiative_id);
+            println!("{}", prompt.prompt);
+        }
+        BlimsInitiativeCommand::ImportPlan {
+            initiative_id,
+            plan,
+            file,
+        } => {
+            let plan_json = if file {
+                std::fs::read_to_string(plan)?
+            } else {
+                plan
+            };
+            let request = BlimsInitiativeImportPlanRequest {
+                working_directory: std::env::current_dir()?,
+                initiative_id,
+                plan: serde_json::from_str(&plan_json)?,
+            };
+            let response =
+                call_blims_service("initiative.import_plan", serde_json::to_vec(&request)?).await?;
+            print_blims_service_response(response);
         }
     }
     Ok(())

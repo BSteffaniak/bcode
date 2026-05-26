@@ -40,6 +40,12 @@ pub const OP_GUIDANCE_SET: &str = "guidance.set";
 /// Guidance list operation.
 pub const OP_GUIDANCE_LIST: &str = "guidance.list";
 
+/// Initiative planning prompt operation.
+pub const OP_INITIATIVE_PLAN_PROMPT: &str = "initiative.plan_prompt";
+
+/// Initiative plan import operation.
+pub const OP_INITIATIVE_IMPORT_PLAN: &str = "initiative.import_plan";
+
 /// World snapshot operation.
 pub const OP_WORLD_SNAPSHOT: &str = "world.snapshot";
 
@@ -73,6 +79,8 @@ impl RustPlugin for BlimsPlugin {
             OP_INITIATIVE_LIST => service_initiative_list(&context.request),
             OP_GUIDANCE_SET => service_guidance_set(&context.request),
             OP_GUIDANCE_LIST => service_guidance_list(&context.request),
+            OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(&context.request),
+            OP_INITIATIVE_IMPORT_PLAN => service_initiative_import_plan(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
             _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
@@ -112,6 +120,76 @@ pub struct GuidanceSetRequest {
     /// Guidance strength label.
     #[serde(default = "default_guidance_strength")]
     pub strength: String,
+}
+
+/// Request to build an AI planning prompt for an initiative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativePlanPromptRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Initiative id to plan.
+    pub initiative_id: String,
+}
+
+/// Request to import an AI-generated plan for an initiative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativeImportPlanRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Initiative id receiving the plan.
+    pub initiative_id: String,
+    /// AI-generated plan payload.
+    pub plan: AiInitiativePlan,
+}
+
+/// AI-generated initiative plan contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiInitiativePlan {
+    /// Short plan summary.
+    pub summary: String,
+    /// Acceptance criteria proposed by AI.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    /// Proposed tasks.
+    #[serde(default)]
+    pub tasks: Vec<AiTaskProposal>,
+    /// Risks identified by AI.
+    #[serde(default)]
+    pub risks: Vec<String>,
+    /// Questions for the CEO.
+    #[serde(default)]
+    pub questions: Vec<String>,
+    /// Cozy/fun game opportunities proposed by AI.
+    #[serde(default)]
+    pub cozy_game_opportunities: Vec<String>,
+}
+
+/// AI-generated task proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiTaskProposal {
+    /// Task title.
+    pub title: String,
+    /// Task description.
+    #[serde(default)]
+    pub description: String,
+    /// Suggested Blims agent owner.
+    #[serde(default)]
+    pub suggested_agent_id: Option<String>,
+    /// AI rationale for this task.
+    #[serde(default)]
+    pub rationale: String,
+    /// Task priority. Lower numbers sort first.
+    #[serde(default = "default_task_priority")]
+    pub priority: i64,
+}
+
+/// Planning prompt returned for Bcode AI/session orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativePlanningPrompt {
+    /// Initiative id.
+    pub initiative_id: String,
+    /// Prompt text to send to an AI planning session.
+    pub prompt: String,
 }
 
 /// Current Blims company lifecycle state.
@@ -256,6 +334,10 @@ fn default_guidance_strength() -> String {
     "strong".to_string()
 }
 
+const fn default_task_priority() -> i64 {
+    100
+}
+
 /// Errors returned by Blims state initialization.
 #[derive(Debug, Error)]
 pub enum BlimsStateError {
@@ -278,6 +360,9 @@ pub enum BlimsStateError {
     /// Schema initialization failed.
     #[error("failed to initialize Blims database schema: {0}")]
     Schema(#[from] switchy_database::DatabaseError),
+    /// JSON serialization failed.
+    #[error("failed to encode Blims JSON payload: {0}")]
+    Json(#[from] serde_json::Error),
     /// State initialization worker panicked.
     #[error("Blims state initialization worker panicked: {0}")]
     WorkerPanicked(String),
@@ -402,6 +487,28 @@ fn service_guidance_list(request: &ServiceRequest) -> ServiceResponse {
     match list_guidance(&request.working_directory) {
         Ok(guidance) => json_response(&guidance),
         Err(error) => ServiceResponse::error("guidance_list_failed", error.to_string()),
+    }
+}
+
+fn service_initiative_plan_prompt(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<InitiativePlanPromptRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match build_initiative_plan_prompt(&request) {
+        Ok(prompt) => json_response(&prompt),
+        Err(error) => ServiceResponse::error("initiative_prompt_failed", error.to_string()),
+    }
+}
+
+fn service_initiative_import_plan(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<InitiativeImportPlanRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match import_initiative_plan(&request) {
+        Ok(plan) => json_response(&plan),
+        Err(error) => ServiceResponse::error("initiative_import_failed", error.to_string()),
     }
 }
 
@@ -651,8 +758,22 @@ async fn create_work_tables(
         .column(text_column("id"))
         .column(text_column("initiative_id"))
         .column(text_column("title"))
+        .column(text_column("description"))
         .column(text_column("status"))
         .column(text_column("assigned_agent_id"))
+        .column(text_column("rationale"))
+        .column(int_column("priority"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("artifacts")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("initiative_id"))
+        .column(text_column("kind"))
+        .column(text_column("title"))
+        .column(text_column("payload_json"))
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
@@ -1086,6 +1207,117 @@ fn list_guidance(working_directory: &Path) -> Result<Vec<GuidanceSummary>, Blims
                 .collect()
         })
     })
+}
+
+fn build_initiative_plan_prompt(
+    request: &InitiativePlanPromptRequest,
+) -> Result<InitiativePlanningPrompt, BlimsStateError> {
+    let initiative_id = request.initiative_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let data = load_company_data_from_database(database).await?;
+            let initiative = load_initiative(database, &initiative_id).await?;
+            Ok(InitiativePlanningPrompt {
+                initiative_id,
+                prompt: planning_prompt(&data, &initiative),
+            })
+        })
+    })
+}
+
+fn import_initiative_plan(
+    request: &InitiativeImportPlanRequest,
+) -> Result<AiInitiativePlan, BlimsStateError> {
+    let initiative_id = request.initiative_id.clone();
+    let plan = request.plan.clone();
+    let plan_for_response = plan.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let payload_json = serde_json::to_string(&plan)?;
+            database
+                .insert("artifacts")
+                .value("id", format!("plan-{initiative_id}"))
+                .value("initiative_id", initiative_id.clone())
+                .value("kind", "ai_plan")
+                .value("title", "AI-generated initiative plan")
+                .value("payload_json", payload_json)
+                .execute(database)
+                .await?;
+            for task in &plan.tasks {
+                let task_id = format!("{}-{}", initiative_id, stable_slug(&task.title));
+                database
+                    .insert("tasks")
+                    .value("id", task_id)
+                    .value("initiative_id", initiative_id.clone())
+                    .value("title", task.title.clone())
+                    .value("description", task.description.clone())
+                    .value("status", "proposed")
+                    .value(
+                        "assigned_agent_id",
+                        task.suggested_agent_id.clone().unwrap_or_default(),
+                    )
+                    .value("rationale", task.rationale.clone())
+                    .value("priority", task.priority)
+                    .execute(database)
+                    .await?;
+            }
+            Ok::<_, BlimsStateError>(plan_for_response)
+        })
+    })
+}
+
+async fn load_initiative(
+    database: &dyn Database,
+    initiative_id: &str,
+) -> Result<InitiativeSummary, BlimsStateError> {
+    database
+        .select("initiatives")
+        .columns(&["id", "title", "description", "status", "priority"])
+        .filter(Box::new(where_eq("id", initiative_id)))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .as_ref()
+        .map(initiative_summary)
+        .transpose()?
+        .ok_or(BlimsStateError::MissingColumn("initiative"))
+}
+
+fn planning_prompt(data: &CompanyData, initiative: &InitiativeSummary) -> String {
+    let agents = data
+        .agents
+        .iter()
+        .map(|agent| format!("* {} (`{}`): {}", agent.name, agent.id, agent.role))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let guidance = data
+        .guidance
+        .iter()
+        .map(|item| format!("* [{}] {}", item.strength, item.guidance))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are Mira, the Product Lead inside Blims, a cozy AI company simulator for Bcode.\n\n\
+         Company mission: {}\n\
+         Company culture: {}\n\n\
+         Active CEO guidance:\n{}\n\n\
+         Current agents:\n{}\n\n\
+         Initiative `{}`: {}\n\
+         Description: {}\n\n\
+         Create a dynamic, creative, useful initial plan. Return ONLY JSON matching this schema:\n\
+         {{\"summary\": string, \"acceptance_criteria\": string[], \"tasks\": [{{\"title\": string, \"description\": string, \"suggested_agent_id\": string|null, \"rationale\": string, \"priority\": number}}], \"risks\": string[], \"questions\": string[], \"cozy_game_opportunities\": string[]}}",
+        data.company.mission,
+        data.company.culture,
+        if guidance.is_empty() {
+            "* none"
+        } else {
+            &guidance
+        },
+        agents,
+        initiative.id,
+        initiative.title,
+        initiative.description,
+    )
 }
 
 fn stable_slug(value: &str) -> String {
