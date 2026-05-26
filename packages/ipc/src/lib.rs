@@ -234,6 +234,7 @@ pub enum Request {
         #[serde(default)]
         sources: Option<Vec<String>>,
     },
+    SubscribeCatalogUpdates,
 }
 
 /// Server stop request policy.
@@ -513,6 +514,7 @@ pub enum ResponsePayload {
         #[serde(default)]
         catalog_revision: u64,
     },
+    CatalogUpdatesSubscribed,
 }
 
 /// Structured error response.

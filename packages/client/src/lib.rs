@@ -214,6 +214,44 @@ pub struct BcodeClient {
     runtime_context: Option<ClientRuntimeContext>,
 }
 
+/// Event-driven session catalog watcher.
+#[derive(Debug)]
+pub struct SessionCatalogWatcher {
+    connection: ClientConnection,
+    last_revision: u64,
+}
+
+impl SessionCatalogWatcher {
+    /// Return the initial catalog snapshot after subscribing to updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn initial_snapshot(&mut self) -> Result<SessionList, ClientError> {
+        let snapshot = self.connection.list_sessions_with_status().await?;
+        self.last_revision = snapshot.catalog_revision;
+        Ok(snapshot)
+    }
+
+    /// Wait for the next catalog revision and fetch its snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon connection fails or listing fails.
+    pub async fn next_snapshot(&mut self) -> Result<SessionList, ClientError> {
+        loop {
+            match self.connection.recv_event().await? {
+                Event::SessionCatalogUpdated { revision } if revision > self.last_revision => {
+                    let snapshot = self.connection.list_sessions_with_status().await?;
+                    self.last_revision = snapshot.catalog_revision.max(revision);
+                    return Ok(snapshot);
+                }
+                Event::SessionCatalogUpdated { .. } | Event::Session(_) => {}
+            }
+        }
+    }
+}
+
 impl BcodeClient {
     /// Create a client that connects to the default endpoint.
     #[must_use]
@@ -238,6 +276,20 @@ impl BcodeClient {
     pub fn with_runtime_context(mut self, runtime_context: Option<ClientRuntimeContext>) -> Self {
         self.runtime_context = runtime_context;
         self
+    }
+
+    /// Create an event-driven session catalog watcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the subscription.
+    pub async fn watch_session_catalog(&self) -> Result<SessionCatalogWatcher, ClientError> {
+        let mut connection = self.connect("bcode-session-catalog").await?;
+        connection.subscribe_catalog_updates().await?;
+        Ok(SessionCatalogWatcher {
+            connection,
+            last_revision: 0,
+        })
     }
 
     /// Check whether the local server accepts requests.
@@ -1101,6 +1153,45 @@ impl ClientConnection {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn refresh_runtime_context(&mut self) -> Result<(), ClientError> {
         self.update_runtime_context(current_runtime_context()).await
+    }
+
+    /// Subscribe this connection to catalog update events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn subscribe_catalog_updates(&mut self) -> Result<(), ClientError> {
+        match self.send_request(Request::SubscribeCatalogUpdates).await? {
+            ResponsePayload::CatalogUpdatesSubscribed => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List sessions for the current working directory on this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_sessions_with_status(&mut self) -> Result<SessionList, ClientError> {
+        match self
+            .send_request(Request::ListSessions {
+                working_directory: current_working_directory(),
+            })
+            .await?
+        {
+            ResponsePayload::SessionList {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            } => Ok(SessionList {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     /// Attach to a session and return replayed history.

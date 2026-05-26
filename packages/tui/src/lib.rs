@@ -88,6 +88,9 @@ pub enum TuiError {
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Task join error.
+    #[error("task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
     /// Session selection was canceled.
     #[error("session selection canceled")]
     Canceled,

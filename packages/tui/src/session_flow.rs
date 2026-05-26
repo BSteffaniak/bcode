@@ -98,11 +98,28 @@ enum PickerKeyOutcome {
     Canceled,
 }
 
-type SessionListTask = JoinHandle<Result<SessionList, bcode_client::ClientError>>;
-
-fn spawn_session_list(client: &BcodeClient) -> SessionListTask {
-    let client = client.clone();
-    tokio::spawn(async move { client.list_sessions_with_status().await })
+fn apply_session_list(picker: &mut session_picker::SessionPickerApp, session_list: SessionList) {
+    let is_loading = catalog_still_loading(&session_list.catalog_status);
+    picker.replace_sessions(session_list.sessions);
+    if is_loading {
+        let loading_sources = session_list
+            .catalog_sources
+            .iter()
+            .filter(|source| catalog_still_loading(&source.status))
+            .map(|source| source.source_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if loading_sources.is_empty() {
+            String::new()
+        } else {
+            format!(" ({loading_sources})")
+        };
+        picker.set_status(format!(
+            "Loading sessions{suffix}; press Ctrl-N to create one"
+        ));
+    } else {
+        picker.set_status("Select a session or press Ctrl-N to create one".to_owned());
+    }
 }
 
 const fn catalog_still_loading(status: &SessionCatalogStatus) -> bool {
@@ -112,61 +129,10 @@ const fn catalog_still_loading(status: &SessionCatalogStatus) -> bool {
     )
 }
 
-async fn poll_session_list(
-    client: &BcodeClient,
-    picker: &mut session_picker::SessionPickerApp,
-    session_load: &mut Option<SessionListTask>,
-) {
-    if !session_load
-        .as_ref()
-        .is_some_and(tokio::task::JoinHandle::is_finished)
-    {
-        return;
-    }
-    let Some(task) = session_load.take() else {
-        return;
-    };
-    match task.await {
-        Ok(Ok(session_list)) => {
-            let is_loading = catalog_still_loading(&session_list.catalog_status);
-            picker.replace_sessions(session_list.sessions);
-            if is_loading {
-                let loading_sources = session_list
-                    .catalog_sources
-                    .iter()
-                    .filter(|source| catalog_still_loading(&source.status))
-                    .map(|source| source.source_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let suffix = if loading_sources.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({loading_sources})")
-                };
-                picker.set_status(format!(
-                    "Loading sessions{suffix}; press Ctrl-N to create one"
-                ));
-                *session_load = Some(spawn_session_list(client));
-            } else {
-                picker.set_status("Select a session or press Ctrl-N to create one".to_owned());
-            }
-        }
-        Ok(Err(error)) => picker.set_status(format!("Session load failed: {error}")),
-        Err(error) => picker.set_status(format!("Session load task failed: {error}")),
-    }
-}
-
-fn abort_session_list(session_load: &mut Option<SessionListTask>) {
-    if let Some(task) = session_load.take() {
-        task.abort();
-    }
-}
-
 async fn import_selected_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     picker: &mut session_picker::SessionPickerApp,
-    session_load: &mut Option<SessionListTask>,
 ) -> Result<Option<SessionId>, TuiError> {
     let selected_import = picker
         .selected_import()
@@ -193,7 +159,6 @@ async fn import_selected_session<W: Write>(
                 };
                 picker.set_status(status);
                 picker.set_last_import(Some((session.clone(), warnings)));
-                abort_session_list(session_load);
                 Ok(Some(session.id))
             }
             Err(error) => {
@@ -202,7 +167,6 @@ async fn import_selected_session<W: Write>(
             }
         }
     } else if let Some(session_id) = picker.selected_session_id() {
-        abort_session_list(session_load);
         Ok(Some(session_id))
     } else {
         picker.set_status("No session selected; press Ctrl-N to create one".to_owned());
@@ -219,12 +183,21 @@ pub async fn pick_session<W: Write>(
 ) -> Result<SessionId, TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_status("Loading sessions; press Ctrl-N to create one".to_owned());
-    let mut session_load = Some(spawn_session_list(client));
+    let mut watcher = client.watch_session_catalog().await?;
+    apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     loop {
-        poll_session_list(client, &mut picker, &mut session_load).await;
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let event = tokio::select! {
+            snapshot = watcher.next_snapshot() => {
+                apply_session_list(&mut picker, snapshot?);
+                continue;
+            }
+            event = tokio::task::spawn_blocking(|| poll_event(EVENT_POLL_TIMEOUT)) => {
+                event??
+            }
+        };
+        let Some(event) = event else {
             continue;
         };
         match event {
@@ -236,21 +209,18 @@ pub async fn pick_session<W: Write>(
             Event::Key(stroke) => match handle_picker_key(&mut picker, keymap, stroke) {
                 PickerKeyOutcome::Continue => {}
                 PickerKeyOutcome::Create => {
-                    abort_session_list(&mut session_load);
                     return Ok(client.create_session(None).await?.id);
                 }
                 PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Selected => {
                     if let Some(session_id) =
-                        import_selected_session(terminal, client, &mut picker, &mut session_load)
-                            .await?
+                        import_selected_session(terminal, client, &mut picker).await?
                     {
                         return Ok(session_id);
                     }
                 }
                 PickerKeyOutcome::Canceled => {
-                    abort_session_list(&mut session_load);
                     return Err(TuiError::Canceled);
                 }
             },
@@ -258,8 +228,7 @@ pub async fn pick_session<W: Write>(
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)
                     && let Some(session_id) =
-                        import_selected_session(terminal, client, &mut picker, &mut session_load)
-                            .await?
+                        import_selected_session(terminal, client, &mut picker).await?
                 {
                     return Ok(session_id);
                 }
@@ -278,13 +247,11 @@ pub async fn pick_session_for_mutation<W: Write>(
     let keymap = BmuxKeyMap::from_config(&bcode_config::load_config()?.tui);
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_status("Loading sessions".to_owned());
-    let mut session_load = Some(spawn_session_list(client));
+    let mut watcher = client.watch_session_catalog().await?;
+    apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     let mut pending_start_mode = Some(start_mode);
     loop {
-        poll_session_list(client, &mut picker, &mut session_load).await;
-        if session_load.is_none()
-            && let Some(start_mode) = pending_start_mode.take()
-        {
+        if let Some(start_mode) = pending_start_mode.take() {
             match start_mode {
                 SessionPickerStartMode::Rename => {
                     picker.start_rename();
@@ -296,7 +263,16 @@ pub async fn pick_session_for_mutation<W: Write>(
         }
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let event = tokio::select! {
+            snapshot = watcher.next_snapshot() => {
+                apply_session_list(&mut picker, snapshot?);
+                continue;
+            }
+            event = tokio::task::spawn_blocking(|| poll_event(EVENT_POLL_TIMEOUT)) => {
+                event??
+            }
+        };
+        let Some(event) = event else {
             continue;
         };
         match event {
@@ -316,7 +292,6 @@ pub async fn pick_session_for_mutation<W: Write>(
                 PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Canceled => {
-                    abort_session_list(&mut session_load);
                     return Ok(());
                 }
             },

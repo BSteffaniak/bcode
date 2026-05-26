@@ -1033,7 +1033,6 @@ async fn handle_registered_client(
 ) -> Result<(), ServerError> {
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
-    state.register_event_client(writer.clone()).await;
     let mut attached_session = None;
 
     loop {
@@ -1118,6 +1117,9 @@ async fn handle_request(
         } => handle_create_session(request_id, state, writer, name, working_directory).await,
         Request::ListSessions { working_directory } => {
             handle_list_sessions(request_id, state, writer, &working_directory).await
+        }
+        Request::SubscribeCatalogUpdates => {
+            handle_subscribe_catalog_updates(request_id, state, writer).await
         }
         Request::ChangeSessionWorkingDirectory {
             session_id,
@@ -1521,6 +1523,20 @@ async fn handle_refresh_session_catalog(
             catalog_sources: snapshot.sources,
             catalog_revision: snapshot.revision,
         }),
+    )
+    .await
+}
+
+async fn handle_subscribe_catalog_updates(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    state.register_event_client(writer.clone()).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::CatalogUpdatesSubscribed),
     )
     .await
 }
