@@ -1,0 +1,9 @@
+{"type":"session","version":3,"id":"pi-session-1","timestamp":"2026-05-22T20:57:13.970Z","cwd":"/tmp/pi-project"}
+{"type":"model_change","id":"model1","parentId":null,"timestamp":"2026-05-22T20:57:14.000Z","provider":"openai-codex","modelId":"gpt-5.5"}
+{"type":"session_info","id":"info1","timestamp":"2026-05-22T20:57:15.000Z","name":"Named Pi Session"}
+{"type":"message","id":"user1","parentId":"info1","timestamp":"2026-05-22T20:57:16.000Z","message":{"role":"user","content":[{"type":"text","text":"Please fix the thing"},{"type":"image","path":"image.png"}]}}
+{"type":"message","id":"assistant1","parentId":"user1","timestamp":"2026-05-22T20:57:17.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"I'll inspect it."},{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"Cargo.toml"}},{"type":"text","text":"Done."}]}}
+{"type":"message","id":"tool1","parentId":"assistant1","timestamp":"2026-05-22T20:57:18.000Z","message":{"role":"toolResult","toolCallId":"call-1","toolName":"read","content":[{"type":"text","text":"contents"}],"isError":false}}
+{"type":"custom","customType":"agent-mode","data":{"mode":"build"},"id":"mode1","timestamp":"2026-05-22T20:57:19.000Z"}
+{"type":"compaction","id":"compact1","timestamp":"2026-05-22T20:57:20.000Z","summary":"summary text"}
+malformed

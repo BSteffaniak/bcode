@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"pi-session-2","timestamp":"2026-05-22T20:57:13.970Z","cwd":"/tmp/pi-project"}
+{"type":"message","id":"user1","timestamp":"2026-05-22T20:57:16.000Z","message":{"role":"user","content":"Fallback title from first user message"}}

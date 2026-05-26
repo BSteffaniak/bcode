@@ -1442,6 +1442,9 @@ async fn discover_importable_session_summaries(
     state: &ServerState,
     working_directory: &Path,
 ) -> Vec<bcode_session_models::SessionSummary> {
+    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
+        return Vec::new();
+    }
     let Some(providers) = state
         .plugins
         .registry()
@@ -1532,6 +1535,9 @@ async fn import_external_session(
     source_id: &str,
     external_session_id: &str,
 ) -> Result<(SessionId, Vec<bcode_session_import::ImportWarning>), String> {
+    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
+        return Err("session import is disabled".to_string());
+    }
     if let Some(existing) = all_cached_sessions(state)
         .await
         .into_iter()

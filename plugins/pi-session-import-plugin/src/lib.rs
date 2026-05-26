@@ -4,6 +4,7 @@
 
 //! Pi JSONL session import provider plugin.
 
+use bcode_config::SessionImportPathMode;
 use bcode_plugin_sdk::prelude::*;
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportSourceInfo,
@@ -55,6 +56,11 @@ impl RustPlugin for PiSessionImportPlugin {
 }
 
 fn discover_sessions(request: &ServiceRequest) -> ServiceResponse {
+    if !pi_import_enabled() {
+        return json_response(&DiscoverImportableSessionsResponse {
+            sessions: Vec::new(),
+        });
+    }
     let request = match request.payload_json::<DiscoverImportableSessionsRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
@@ -82,11 +88,28 @@ fn load_session(request: &ServiceRequest) -> ServiceResponse {
 fn discover_pi_sessions(
     working_directory: Option<&Path>,
 ) -> Result<Vec<ImportableSessionSummary>, std::io::Error> {
-    let root = default_sessions_root();
     let mut sessions = Vec::new();
-    if !root.exists() {
-        return Ok(sessions);
+    for root in configured_session_roots() {
+        if !root.exists() {
+            continue;
+        }
+        discover_root_sessions(&root, working_directory, &mut sessions)?;
     }
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+            .then_with(|| left.external_session_id.cmp(&right.external_session_id))
+    });
+    Ok(sessions)
+}
+
+fn discover_root_sessions(
+    root: &Path,
+    working_directory: Option<&Path>,
+    sessions: &mut Vec<ImportableSessionSummary>,
+) -> Result<(), std::io::Error> {
     for entry in fs::read_dir(root)? {
         let project_dir = entry?.path();
         if !project_dir.is_dir()
@@ -110,14 +133,7 @@ fn discover_pi_sessions(
             sessions.push(summary);
         }
     }
-    sessions.sort_by(|left, right| {
-        right
-            .updated_at_ms
-            .cmp(&left.updated_at_ms)
-            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
-            .then_with(|| left.external_session_id.cmp(&right.external_session_id))
-    });
-    Ok(sessions)
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -440,6 +456,28 @@ fn default_sessions_root() -> PathBuf {
     )
 }
 
+fn pi_import_enabled() -> bool {
+    bcode_config::load_config().map_or(true, |config| {
+        config.session_import.enabled && config.session_import.pi.enabled
+    })
+}
+
+fn configured_session_roots() -> Vec<PathBuf> {
+    let Ok(config) = bcode_config::load_config() else {
+        return vec![default_sessions_root()];
+    };
+    let pi = config.session_import.pi;
+    match pi.path_mode {
+        SessionImportPathMode::DefaultsOnly => vec![default_sessions_root()],
+        SessionImportPathMode::CustomOnly => pi.paths,
+        SessionImportPathMode::DefaultsAndCustom => {
+            let mut paths = vec![default_sessions_root()];
+            paths.extend(pi.paths);
+            paths
+        }
+    }
+}
+
 fn system_time_ms(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH).ok().map(|duration| {
         duration
@@ -498,6 +536,88 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 }
 
 export_plugin!(PiSessionImportPlugin, MANIFEST);
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn summary_prefers_session_info_name() {
+        let summary =
+            read_summary(&fixture_path("pi-session.jsonl")).expect("summary should parse");
+
+        assert_eq!(summary.external_session_id, "pi-session-1");
+        assert_eq!(summary.title.as_deref(), Some("Named Pi Session"));
+        assert_eq!(
+            summary.working_directory.as_deref(),
+            Some(Path::new("/tmp/pi-project"))
+        );
+        assert_eq!(summary.created_at_ms, Some(1_779_483_433_970));
+    }
+
+    #[test]
+    fn summary_falls_back_to_first_user_message() {
+        let summary = read_summary(&fixture_path("pi-session-first-user-title.jsonl"))
+            .expect("summary should parse");
+
+        assert_eq!(
+            summary.title.as_deref(),
+            Some("Fallback title from first user message")
+        );
+    }
+
+    #[test]
+    fn load_maps_core_pi_events_and_aggregates_warnings() {
+        let session =
+            load_pi_session(&fixture_path("pi-session.jsonl")).expect("session should load");
+
+        assert!(
+            session
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ImportableSessionEventKind::UserMessage { .. }))
+        );
+        assert!(session.events.iter().any(|event| matches!(
+            event.kind,
+            ImportableSessionEventKind::ToolCallRequested { .. }
+        )));
+        assert!(session.events.iter().any(|event| matches!(
+            event.kind,
+            ImportableSessionEventKind::ToolCallFinished { .. }
+        )));
+        assert!(
+            session
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ImportableSessionEventKind::AgentChanged { .. }))
+        );
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "skipped_thinking")
+        );
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "skipped_images")
+        );
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "malformed_json")
+        );
+    }
+}
 
 #[cfg(feature = "static-bundled")]
 #[must_use]
