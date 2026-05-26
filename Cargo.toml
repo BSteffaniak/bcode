@@ -8,6 +8,7 @@ members = [
     "plugins/default-agents-plugin",
     "plugins/fake-provider-plugin",
     "plugins/openai-compatible-provider-plugin",
+    "plugins/pi-session-import-plugin",
     "plugins/shell-plugin",
     "plugins/web-search-plugin",
     "packages/agent-policy",
@@ -29,6 +30,7 @@ members = [
     "packages/provider-auth",
     "packages/server",
     "packages/session",
+    "packages/session-import",
     "packages/skill",
     "packages/skill/models",
     "packages/tool",
@@ -70,11 +72,13 @@ bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-f
 bcode_model                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }
 bcode_model_provider_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
 bcode_openai_compatible_provider_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/openai-compatible-provider-plugin" }
+bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/pi-session-import-plugin" }
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
+bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
 bcode_session_models                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
 bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin" }
 bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }

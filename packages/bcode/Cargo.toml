@@ -42,6 +42,10 @@ static-bundled-openai-compatible-provider-plugin = [
     "_static-bundled",
     "bcode_cli/static-bundled-openai-compatible-provider-plugin",
 ]
+static-bundled-pi-session-import-plugin = [
+    "_static-bundled",
+    "bcode_cli/static-bundled-pi-session-import-plugin",
+]
 static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
@@ -49,6 +53,7 @@ static-bundled-plugins = [
     "static-bundled-fake-provider-plugin",
     "static-bundled-filesystem-plugin",
     "static-bundled-openai-compatible-provider-plugin",
+    "static-bundled-pi-session-import-plugin",
     "static-bundled-shell-plugin",
 ]
 static-bundled-shell-plugin = [

@@ -204,8 +204,12 @@ fn session_item(session: &SessionSummary) -> ListItem {
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("untitled");
+    let display_name = session.import.as_ref().map_or_else(
+        || name.to_owned(),
+        |import| format!("[{}] {name}", import.source_id),
+    );
     ListItem::new(Line::from_spans(vec![
-        Span::styled(name.to_owned(), Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(display_name, Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(session.id.to_string(), Style::new().fg(Color::BrightBlack)),
     ]))
@@ -219,6 +223,10 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
         .name
         .as_deref()
         .is_some_and(|name| name.to_ascii_lowercase().contains(query))
+        || session
+            .import
+            .as_ref()
+            .is_some_and(|import| import.source_id.to_ascii_lowercase().contains(query))
         || session.id.to_string().to_ascii_lowercase().contains(query)
 }
 

@@ -932,6 +932,7 @@ mod tests {
             created_at_ms: 10,
             updated_at_ms: 20,
             working_directory: "/tmp/bcode-ipc-test".into(),
+            import: None,
         };
         let response = Response::Ok(ResponsePayload::Attached {
             session_id,

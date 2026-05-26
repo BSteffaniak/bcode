@@ -1,0 +1,19 @@
+id      = "bcode.pi-session-import"
+name    = "Bcode Pi Session Import Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "query"
+description  = "Discover and load Pi sessions for one-time import into Bcode"
+interface_id = "bcode.session_import/v1"
+name         = "Pi Session Import"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version    = 1
+library        = "libbcode_pi_session_import_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

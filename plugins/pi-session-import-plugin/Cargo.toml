@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled Pi session import plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "pi", "session", "import", "plugin"]
+license     = { workspace = true }
+name        = "bcode_pi_session_import_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_import = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

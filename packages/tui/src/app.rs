@@ -1734,6 +1734,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelTurnStarted { .. }
         | SessionEventKind::ModelTurnFinished { .. }
         | SessionEventKind::SessionRenamed { .. }
+        | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SkillActivated { .. }
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }

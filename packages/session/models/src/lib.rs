@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 15;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 16;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -83,6 +83,17 @@ pub struct SessionSummary {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub working_directory: PathBuf,
+    #[serde(default)]
+    pub import: Option<SessionImportSummary>,
+}
+
+/// Display/provenance metadata for imported sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionImportSummary {
+    pub source_id: String,
+    pub source_display_name: String,
+    pub external_session_id: String,
+    pub imported_at_ms: u64,
 }
 
 /// Direction for paged session history reads.
@@ -660,5 +671,12 @@ pub enum SessionEventKind {
     WorkingDirectoryChanged {
         old_working_directory: PathBuf,
         new_working_directory: PathBuf,
+    },
+    /// Durable provenance marker for sessions imported from external agents.
+    SessionImported {
+        source_id: String,
+        source_display_name: String,
+        external_session_id: String,
+        imported_at_ms: u64,
     },
 }

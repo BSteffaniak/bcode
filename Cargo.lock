@@ -1001,6 +1001,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_pi_session_import_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "bcode_session_import",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1050,8 +1060,10 @@ dependencies = [
  "bcode_ipc",
  "bcode_model",
  "bcode_openai_compatible_provider_plugin",
+ "bcode_pi_session_import_plugin",
  "bcode_plugin",
  "bcode_session",
+ "bcode_session_import",
  "bcode_session_models",
  "bcode_shell_plugin",
  "bcode_skill",
@@ -1069,6 +1081,7 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1083,6 +1096,14 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "bcode_session_import"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

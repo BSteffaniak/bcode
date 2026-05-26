@@ -29,8 +29,8 @@ use actor::{AttachMode, SessionHandle};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
     SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary, SessionTokenUsage,
-    SessionTraceEvent, TraceBlobRef,
+    SessionHistoryQuery, SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionSummary,
+    SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1243,6 +1243,7 @@ impl SessionManager {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             working_directory: working_directory.clone(),
+            import: None,
         };
         let state = SessionState {
             summary: summary.clone(),
@@ -1372,6 +1373,35 @@ impl SessionManager {
             )
             .await?;
         Ok(Some(event))
+    }
+
+    /// Import a fully normalized external session as a native Bcode session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if session creation or event persistence fails.
+    pub async fn import_session(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        import: SessionImportSummary,
+        events: Vec<SessionEventKind>,
+    ) -> Result<SessionSummary, SessionError> {
+        let session = self.create_session(name, working_directory).await?;
+        self.append_event(
+            session.id,
+            SessionEventKind::SessionImported {
+                source_id: import.source_id,
+                source_display_name: import.source_display_name,
+                external_session_id: import.external_session_id,
+                imported_at_ms: import.imported_at_ms,
+            },
+        )
+        .await?;
+        for event in events {
+            self.append_event(session.id, event).await?;
+        }
+        self.session_summary(session.id).await
     }
 
     /// Delete a session.
@@ -4188,6 +4218,16 @@ mod tests {
                 SessionEventKind::WorkingDirectoryChanged {
                     old_working_directory: test_working_directory(),
                     new_working_directory: test_working_directory().join("worktree"),
+                },
+            ),
+            (
+                32,
+                "SessionImported",
+                SessionEventKind::SessionImported {
+                    source_id: "pi".to_string(),
+                    source_display_name: "Pi".to_string(),
+                    external_session_id: "external".to_string(),
+                    imported_at_ms: 1,
                 },
             ),
         ]

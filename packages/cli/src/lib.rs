@@ -3637,6 +3637,14 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 new_working_directory.display()
             );
         }
+        SessionEventKind::SessionImported {
+            source_id,
+            external_session_id,
+            ..
+        } => println!(
+            "#{} session imported: [{source_id}] {external_session_id}",
+            event.sequence
+        ),
         SessionEventKind::ContextCompacted {
             compacted_through_sequence,
             ..

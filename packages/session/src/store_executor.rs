@@ -27,7 +27,7 @@ pub struct PersistedSessionMetadata {
 impl PersistedSessionMetadata {
     pub fn from_state(state: &SessionState) -> Self {
         Self {
-            summary: state.summary.clone(),
+            summary: state.summary(),
             working_directory: state.working_directory.clone(),
             next_sequence: state.next_sequence,
             event_count: state.event_count,

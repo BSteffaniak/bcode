@@ -156,8 +156,11 @@ impl SessionHandle {
     }
 
     pub async fn replace_state(&self, state: SessionState) -> Result<(), SessionError> {
-        self.send(|reply| SessionCommand::ReplaceState { state, reply })
-            .await
+        self.send(|reply| SessionCommand::ReplaceState {
+            state: Box::new(state),
+            reply,
+        })
+        .await
     }
 
     pub fn client_count(&self) -> usize {
@@ -216,7 +219,7 @@ enum SessionCommand {
     },
     ClientIds(oneshot::Sender<BTreeSet<ClientId>>),
     ReplaceState {
-        state: SessionState,
+        state: Box<SessionState>,
         reply: oneshot::Sender<()>,
     },
     Shutdown(oneshot::Sender<()>),
@@ -305,7 +308,7 @@ impl SessionActor {
                     let _ = reply.send(self.state.clients.clone());
                 }
                 SessionCommand::ReplaceState { state, reply } => {
-                    self.state = state;
+                    self.state = *state;
                     self.refresh_snapshot();
                     let _ = reply.send(());
                 }

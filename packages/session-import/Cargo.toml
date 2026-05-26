@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Session import plugin contract types for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "session", "import"]
+license     = { workspace = true }
+name        = "bcode_session_import"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

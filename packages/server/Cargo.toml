@@ -25,8 +25,10 @@ bcode_git_plugin = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
 bcode_model = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
+bcode_pi_session_import_plugin = { workspace = true, optional = true }
 bcode_plugin = { workspace = true }
 bcode_session = { workspace = true }
+bcode_session_import = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_shell_plugin = { workspace = true, optional = true }
 bcode_skill = { workspace = true }
@@ -51,6 +53,7 @@ tokio = { workspace = true, features = [
 ] }
 toml = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 _static-bundled = []
@@ -91,6 +94,11 @@ static-bundled-openai-compatible-provider-plugin = [
     "dep:bcode_openai_compatible_provider_plugin",
     "bcode_openai_compatible_provider_plugin/static-bundled",
 ]
+static-bundled-pi-session-import-plugin = [
+    "_static-bundled",
+    "dep:bcode_pi_session_import_plugin",
+    "bcode_pi_session_import_plugin/static-bundled",
+]
 static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
@@ -100,6 +108,7 @@ static-bundled-plugins = [
     "static-bundled-filesystem-plugin",
     "static-bundled-git-plugin",
     "static-bundled-openai-compatible-provider-plugin",
+    "static-bundled-pi-session-import-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",

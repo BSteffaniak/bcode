@@ -1,6 +1,8 @@
 use crate::reader::{SessionReadIssue, SessionReadIssueKind, SessionReadReport};
 use crate::{SessionState, SessionStoreError};
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionSummary};
+use bcode_session_models::{
+    SessionEvent, SessionEventKind, SessionId, SessionImportSummary, SessionSummary,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -140,6 +142,7 @@ impl SessionIndex {
         let mut current_agent = None;
         let mut latest_compaction_sequence = None;
         let mut total_metered_tokens = 0_u64;
+        let mut import = None;
 
         for event in &report.events {
             next_sequence = next_sequence.max(event.sequence.saturating_add(1));
@@ -180,6 +183,19 @@ impl SessionIndex {
                             total_metered_tokens.saturating_add(u64::from(total));
                     }
                 }
+                SessionEventKind::SessionImported {
+                    source_id,
+                    source_display_name,
+                    external_session_id,
+                    imported_at_ms,
+                } => {
+                    import = Some(SessionImportSummary {
+                        source_id: source_id.clone(),
+                        source_display_name: source_display_name.clone(),
+                        external_session_id: external_session_id.clone(),
+                        imported_at_ms: *imported_at_ms,
+                    });
+                }
                 _ => {}
             }
         }
@@ -203,6 +219,7 @@ impl SessionIndex {
                 created_at_ms,
                 updated_at_ms,
                 working_directory: working_directory.clone(),
+                import,
             },
             working_directory,
             next_sequence,
@@ -496,6 +513,7 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
         SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
+        SessionEventKind::SessionImported { .. } => "session_imported",
     }
 }
 
