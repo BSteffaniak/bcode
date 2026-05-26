@@ -117,6 +117,7 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     active_session_turns: Mutex<BTreeMap<SessionId, ActiveSessionTurn>>,
+    active_runtime_work: Mutex<BTreeMap<(SessionId, RuntimeWorkId), ActiveRuntimeWork>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -189,6 +190,31 @@ impl SessionTurnPermit {
     const fn enter_turn(&mut self) -> SessionId {
         self.turn_entries = self.turn_entries.saturating_add(1);
         self.session_id
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRuntimeWork {
+    cancel: RuntimeWorkCancelHandle,
+    cancelled: bool,
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeWorkCancelHandle {
+    SessionTurn(Arc<TurnCancelState>),
+    PluginInvocation(bcode_plugin::PluginInvocationCancelHandle),
+}
+
+impl RuntimeWorkCancelHandle {
+    fn cancel(&self) {
+        match self {
+            Self::SessionTurn(cancel_state) => cancel_state.cancel(),
+            Self::PluginInvocation(cancel) => cancel.cancel(),
+        }
+    }
+
+    const fn is_cancellable(&self) -> bool {
+        matches!(self, Self::SessionTurn(_) | Self::PluginInvocation(_))
     }
 }
 
@@ -460,6 +486,7 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             active_session_turns: Mutex::default(),
+            active_runtime_work: Mutex::default(),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -2895,7 +2922,7 @@ async fn handle_cancel_session_turn(
         Some(client_id),
     )
     .await;
-    append_runtime_work_cancel_requested_event(
+    cancel_registered_runtime_work(
         state,
         session_id,
         RuntimeWorkId::new(format!("model_{}", active_session_turn.turn_id)),
@@ -2977,23 +3004,8 @@ async fn handle_cancel_runtime_work(
     session_id: SessionId,
     work_id: RuntimeWorkId,
 ) -> Result<(), ServerError> {
-    let cancelled = if let Some(active_turn) =
-        state.active_session_turns.lock().await.get(&session_id)
-    {
-        let is_model_turn = work_id == RuntimeWorkId::new(format!("model_{}", active_turn.turn_id));
-        let is_active_tool = state.active_turns.lock().await.contains_key(&session_id)
-            && work_id.0.starts_with("tool_");
-        if is_model_turn || is_active_tool {
-            active_turn.cancel_state.cancel();
-            append_runtime_work_cancel_requested_event(state, session_id, work_id, Some(client_id))
-                .await;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let cancelled =
+        cancel_registered_runtime_work(state, session_id, work_id, Some(client_id)).await;
     send_response(
         writer,
         request_id,
@@ -3963,14 +3975,15 @@ async fn run_model_turn(
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     let model_work_id = RuntimeWorkId::new(format!("model_{turn_id}"));
+    let cancel_state = Arc::new(TurnCancelState::default());
     append_model_runtime_work_started_event(
         state,
         session_id,
         model_work_id.clone(),
         turn_id.clone(),
+        Arc::clone(&cancel_state),
     )
     .await;
-    let cancel_state = Arc::new(TurnCancelState::default());
     state.active_session_turns.lock().await.insert(
         session_id,
         ActiveSessionTurn {
@@ -3997,7 +4010,7 @@ async fn run_model_turn(
         completion.message.clone(),
     )
     .await;
-    append_runtime_work_finished_event(
+    finish_registered_runtime_work(
         state,
         session_id,
         model_work_id,
@@ -5933,7 +5946,7 @@ async fn execute_model_tool(
     )
     .await;
     if cancel_state.is_cancelled() {
-        append_runtime_work_cancel_requested_event(
+        cancel_registered_runtime_work(
             state,
             session_id,
             RuntimeWorkId::new(format!("tool_{}", call.id)),
@@ -6119,12 +6132,19 @@ async fn invoke_model_tool(
         )
         .await
         .map_err(|error| error.to_string())?;
+    state.active_runtime_work.lock().await.insert(
+        (session_id, RuntimeWorkId::new(format!("tool_{}", call.id))),
+        ActiveRuntimeWork {
+            cancel: RuntimeWorkCancelHandle::PluginInvocation(invocation.cancel.clone()),
+            cancelled: false,
+        },
+    );
     let response = loop {
         tokio::select! {
             () = cancel_state.cancelled() => {
                 invocation.cancel.cancel();
                 let _ = std::fs::write(&cancellation_path, b"cancelled\n");
-                append_runtime_work_cancel_requested_event(
+                cancel_registered_runtime_work(
                     state,
                     session_id,
                     RuntimeWorkId::new(format!("tool_{}", call.id)),
@@ -6822,27 +6842,20 @@ async fn append_tool_request_event(
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append tool request: {error}"),
     }
-    match state
-        .sessions
-        .append_runtime_work_started(
-            session_id,
-            SessionEventKind::RuntimeWorkStarted {
-                work_id: runtime_work_id,
-                kind: RuntimeWorkKind::Tool,
-                label: runtime_label,
-                tool_call_id: Some(runtime_tool_call_id),
-                plugin_id: None,
-                service_interface: None,
-                operation: None,
-                started_at_ms: Some(current_unix_millis()),
-                cancellable: true,
-            },
-        )
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append runtime work start: {error}"),
-    }
+    register_runtime_work(
+        state,
+        session_id,
+        runtime_work_id,
+        RuntimeWorkKind::Tool,
+        runtime_label,
+        Some(runtime_tool_call_id),
+        RuntimeWorkCancelHandle::SessionTurn(
+            active_turn_cancel_state(state, session_id)
+                .await
+                .unwrap_or_else(|| Arc::new(TurnCancelState::default())),
+        ),
+    )
+    .await;
 }
 
 async fn append_runtime_work_cancel_requested_event(
@@ -6901,6 +6914,11 @@ async fn append_tool_finished_event_inner(
 ) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
+    state
+        .active_runtime_work
+        .lock()
+        .await
+        .remove(&(session_id, runtime_work_id.clone()));
     let content_note = tool_result_content_model_note(&tool_call_id, &content);
     let event = state
         .sessions
@@ -6986,33 +7004,99 @@ async fn append_system_event(state: &ServerState, session_id: SessionId, text: S
     }
 }
 
-async fn append_model_runtime_work_started_event(
+async fn register_runtime_work(
     state: &ServerState,
     session_id: SessionId,
     work_id: RuntimeWorkId,
-    turn_id: String,
+    kind: RuntimeWorkKind,
+    label: String,
+    tool_call_id: Option<String>,
+    cancel: RuntimeWorkCancelHandle,
 ) {
+    let cancellable = cancel.is_cancellable();
+    state.active_runtime_work.lock().await.insert(
+        (session_id, work_id.clone()),
+        ActiveRuntimeWork {
+            cancel,
+            cancelled: false,
+        },
+    );
     match state
         .sessions
         .append_runtime_work_started(
             session_id,
             SessionEventKind::RuntimeWorkStarted {
                 work_id,
-                kind: RuntimeWorkKind::ModelTurn,
-                label: format!("model turn {turn_id}"),
-                tool_call_id: None,
+                kind,
+                label,
+                tool_call_id,
                 plugin_id: None,
                 service_interface: None,
                 operation: None,
                 started_at_ms: Some(current_unix_millis()),
-                cancellable: true,
+                cancellable,
             },
         )
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append model runtime work start: {error}"),
+        Err(error) => eprintln!("failed to append runtime work start: {error}"),
     }
+}
+
+async fn cancel_registered_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+    client_id: Option<ClientId>,
+) -> bool {
+    let mut active_work = state.active_runtime_work.lock().await;
+    let Some(work) = active_work.get_mut(&(session_id, work_id.clone())) else {
+        return false;
+    };
+    if work.cancelled {
+        return true;
+    }
+    work.cancelled = true;
+    let cancel = work.cancel.clone();
+    drop(active_work);
+    cancel.cancel();
+    append_runtime_work_cancel_requested_event(state, session_id, work_id, client_id).await;
+    true
+}
+
+async fn finish_registered_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+    status: RuntimeWorkStatus,
+    message: Option<String>,
+) {
+    state
+        .active_runtime_work
+        .lock()
+        .await
+        .remove(&(session_id, work_id.clone()));
+    append_runtime_work_finished_event(state, session_id, work_id, status, message).await;
+}
+
+async fn append_model_runtime_work_started_event(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+    turn_id: String,
+    cancel_state: Arc<TurnCancelState>,
+) {
+    register_runtime_work(
+        state,
+        session_id,
+        work_id,
+        RuntimeWorkKind::ModelTurn,
+        format!("model turn {turn_id}"),
+        None,
+        RuntimeWorkCancelHandle::SessionTurn(cancel_state),
+    )
+    .await;
 }
 
 async fn append_model_turn_started_event(
