@@ -1321,12 +1321,9 @@ pub struct StreamingConfig {
     /// Seconds without meaningful provider progress before Bcode times out the turn.
     #[serde(default = "default_streaming_no_progress_timeout_secs")]
     pub no_progress_timeout_secs: u64,
-    /// Minimum streamed argument bytes between visible progress updates.
-    #[serde(default = "default_streaming_progress_event_interval_bytes")]
-    pub progress_event_interval_bytes: usize,
-    /// Minimum seconds between visible progress updates.
-    #[serde(default = "default_streaming_progress_event_interval_secs")]
-    pub progress_event_interval_secs: u64,
+    /// Maximum provider stream progress events emitted for one assembled tool call.
+    #[serde(default = "default_streaming_max_tool_progress_events")]
+    pub max_tool_progress_events: usize,
 }
 
 impl Default for StreamingConfig {
@@ -1334,8 +1331,7 @@ impl Default for StreamingConfig {
         Self {
             no_progress_warning_secs: default_streaming_no_progress_warning_secs(),
             no_progress_timeout_secs: default_streaming_no_progress_timeout_secs(),
-            progress_event_interval_bytes: default_streaming_progress_event_interval_bytes(),
-            progress_event_interval_secs: default_streaming_progress_event_interval_secs(),
+            max_tool_progress_events: default_streaming_max_tool_progress_events(),
         }
     }
 }
@@ -1409,12 +1405,8 @@ const fn default_streaming_no_progress_timeout_secs() -> u64 {
     300
 }
 
-const fn default_streaming_progress_event_interval_bytes() -> usize {
-    256 * 1024
-}
-
-const fn default_streaming_progress_event_interval_secs() -> u64 {
-    2
+const fn default_streaming_max_tool_progress_events() -> usize {
+    1
 }
 
 const fn default_auto_compaction_context_chars() -> usize {
@@ -2141,14 +2133,8 @@ fn write_model_streaming_toml(output: &mut String, streaming: &StreamingConfig) 
     .expect("writing to string should not fail");
     writeln!(
         output,
-        "progress_event_interval_bytes = {}",
-        streaming.progress_event_interval_bytes
-    )
-    .expect("writing to string should not fail");
-    writeln!(
-        output,
-        "progress_event_interval_secs = {}",
-        streaming.progress_event_interval_secs
+        "max_tool_progress_events = {}",
+        streaming.max_tool_progress_events
     )
     .expect("writing to string should not fail");
     output.push('\n');

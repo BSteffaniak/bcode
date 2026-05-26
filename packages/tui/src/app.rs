@@ -1396,12 +1396,10 @@ impl BmuxApp {
             ProviderStreamEvent::ToolCallProgress {
                 tool_name,
                 argument_bytes,
-                chunk_count,
                 ..
             } => {
-                let detail = format!(
-                    "provider stream tool progress: {tool_name} ({argument_bytes} bytes, {chunk_count} chunks)"
-                );
+                let detail =
+                    format!("provider stream tool assembled: {tool_name} ({argument_bytes} bytes)");
                 self.set_activity(ActivityState::ProviderStream {
                     detail: detail.clone(),
                 });
@@ -1421,7 +1419,7 @@ impl BmuxApp {
                     || format!("provider stream idle for {idle_seconds}s"),
                     |tool| {
                         format!(
-                            "provider stream idle for {idle_seconds}s while streaming {}",
+                            "provider stream idle for {idle_seconds}s while assembling {}",
                             tool.tool_name
                         )
                     },

@@ -3934,9 +3934,8 @@ fn provider_stream_event_summary(event: &bcode_session_models::ProviderStreamEve
             tool_call_id,
             tool_name,
             argument_bytes,
-            chunk_count,
         } => format!(
-            "provider stream tool progress {tool_name} ({tool_call_id}) bytes={argument_bytes} chunks={chunk_count}"
+            "provider stream tool assembled {tool_name} ({tool_call_id}) bytes={argument_bytes}"
         ),
         bcode_session_models::ProviderStreamEvent::ToolCallFinished {
             tool_call_id,
@@ -3949,11 +3948,8 @@ fn provider_stream_event_summary(event: &bcode_session_models::ProviderStreamEve
             || format!("provider stream no progress idle_seconds={idle_seconds}"),
             |progress| {
                 format!(
-                    "provider stream no progress idle_seconds={idle_seconds} tool={} ({}) bytes={} chunks={}",
-                    progress.tool_name,
-                    progress.tool_call_id,
-                    progress.argument_bytes,
-                    progress.chunk_count
+                    "provider stream no progress idle_seconds={idle_seconds} tool={} ({}) bytes={}",
+                    progress.tool_name, progress.tool_call_id, progress.argument_bytes
                 )
             },
         ),

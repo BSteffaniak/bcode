@@ -2894,7 +2894,6 @@ mod tests {
                 tool_call_id: "call".to_string(),
                 tool_name: "tool".to_string(),
                 argument_bytes: 12,
-                chunk_count: 2,
             }),
             SessionTracePayload::ToolInvocationStarted {
                 tool_call_id: "call".to_string(),

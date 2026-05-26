@@ -382,16 +382,14 @@ pub enum ProviderStreamEvent {
         /// User-facing tool name.
         tool_name: String,
     },
-    /// Provider is streaming tool-call arguments.
+    /// Provider assembled tool-call arguments.
     ToolCallProgress {
         /// Internal provider tool-call identifier for debugging and event correlation.
         tool_call_id: String,
         /// User-facing tool name.
         tool_name: String,
-        /// Total argument bytes received so far.
+        /// Total assembled argument bytes received so far.
         argument_bytes: usize,
-        /// Total streamed argument chunks received so far.
-        chunk_count: usize,
     },
     /// Provider finished a tool call.
     ToolCallFinished {
@@ -416,10 +414,8 @@ pub struct ProviderToolCallProgress {
     pub tool_call_id: String,
     /// User-facing tool name.
     pub tool_name: String,
-    /// Total argument bytes received so far.
+    /// Total assembled argument bytes received so far.
     pub argument_bytes: usize,
-    /// Total streamed argument chunks received so far.
-    pub chunk_count: usize,
 }
 
 /// Structured diagnostic payload for a [`SessionTraceEvent`].

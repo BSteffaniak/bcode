@@ -1181,7 +1181,7 @@ fn process_responses_stream_line(
             process_responses_output_item(&event, turn, tool_calls, saw_tool_call, name_map);
         }
         "response.function_call_arguments.delta" => {
-            process_responses_function_arguments_delta(&event, turn, tool_calls);
+            process_responses_function_arguments_delta(&event, tool_calls);
         }
         "response.function_call_arguments.done" => {
             process_responses_function_arguments_done(&event, tool_calls);
@@ -1294,7 +1294,6 @@ fn responses_output_index(
 
 fn process_responses_function_arguments_delta(
     event: &serde_json::Value,
-    turn: &TurnState,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
 ) {
     let output_index = event
@@ -1305,12 +1304,6 @@ fn process_responses_function_arguments_delta(
     if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
         let entry = tool_calls.entry(output_index).or_default();
         entry.arguments.push_str(delta);
-        if let Some(call_id) = &entry.id {
-            turn.push(ProviderTurnEvent::ToolCallDelta {
-                call_id: call_id.clone(),
-                delta: delta.to_string(),
-            });
-        }
     }
 }
 
@@ -1463,12 +1456,6 @@ fn process_tool_call_deltas(
             }
             if let Some(arguments) = &function.arguments {
                 entry.arguments.push_str(arguments);
-                if let Some(call_id) = &entry.id {
-                    turn.push(ProviderTurnEvent::ToolCallDelta {
-                        call_id: call_id.clone(),
-                        delta: arguments.clone(),
-                    });
-                }
             }
         }
         if !entry.started
