@@ -115,6 +115,17 @@ pub enum ImportableSessionEventKind {
         #[serde(default)]
         is_error: bool,
     },
+    AssistantReasoningMessage {
+        text: String,
+    },
+    ModelUsage {
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        total_tokens: Option<u32>,
+        cached_input_tokens: Option<u32>,
+        cache_write_input_tokens: Option<u32>,
+        reasoning_tokens: Option<u32>,
+    },
     ModelChanged {
         provider: String,
         model: String,

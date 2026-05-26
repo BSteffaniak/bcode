@@ -23,6 +23,27 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
     };
 
     let bottom_y = render_picker_status(inner, app.status(), status_style(app.mode()), frame);
+    if let Some((session, warnings)) = app.last_import()
+        && !warnings.is_empty()
+    {
+        let warning_text = format_import_warnings(session, warnings);
+        let warning_y = bottom_y.saturating_sub(1);
+        if warning_y > list_y {
+            frame.write_line_with_fallback_style(
+                bmux_tui::geometry::Rect::new(
+                    inner.x.saturating_add(1),
+                    warning_y,
+                    inner.width.saturating_sub(2),
+                    1,
+                ),
+                &Line::from_spans(vec![Span::styled(
+                    warning_text,
+                    Style::new().fg(Color::Yellow),
+                )]),
+                Style::new(),
+            );
+        }
+    }
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };
@@ -47,7 +68,7 @@ const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
 fn header_line(mode: SessionPickerMode) -> Line {
     let help = match mode {
         SessionPickerMode::Filter => {
-            "  Enter selects  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels"
+            "  Enter selects/imports  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels/dismisses"
         }
         SessionPickerMode::Rename => "  Enter saves rename  Esc cancels",
         SessionPickerMode::DeleteConfirm => "  Y confirms delete  N/Esc cancels",
@@ -56,6 +77,36 @@ fn header_line(mode: SessionPickerMode) -> Line {
         Span::styled("Bcode sessions", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw(help),
     ])
+}
+
+fn format_import_warnings(
+    session: &bcode_session_models::SessionSummary,
+    warnings: &[bcode_ipc::SessionImportWarning],
+) -> String {
+    let source = session
+        .import
+        .as_ref()
+        .map_or("external", |import| import.source_id.as_str());
+    let details = warnings
+        .iter()
+        .take(3)
+        .map(|warning| {
+            warning.count.map_or_else(
+                || warning.message.clone(),
+                |count| format!("{} ({count})", warning.message),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if warnings.len() > 3 {
+        format!("; +{} more", warnings.len() - 3)
+    } else {
+        String::new()
+    };
+    format!(
+        "Imported [{source}] with {} warnings: {details}{suffix}. Esc dismisses.",
+        warnings.len()
+    )
 }
 
 const fn status_style(mode: SessionPickerMode) -> Style {

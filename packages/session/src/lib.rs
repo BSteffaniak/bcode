@@ -2089,6 +2089,19 @@ impl SessionState {
             SessionEventKind::SessionRenamed { name } => {
                 self.summary.name.clone_from(name);
             }
+            SessionEventKind::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            } => {
+                self.summary.import = Some(SessionImportSummary {
+                    source_id: source_id.clone(),
+                    source_display_name: source_display_name.clone(),
+                    external_session_id: external_session_id.clone(),
+                    imported_at_ms: *imported_at_ms,
+                });
+            }
             SessionEventKind::UserMessage { .. } => self.has_user_message = true,
             SessionEventKind::WorkingDirectoryChanged {
                 new_working_directory,

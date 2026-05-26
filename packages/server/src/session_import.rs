@@ -201,6 +201,9 @@ pub async fn import_external_session(
                     ImportableSessionEventKind::AssistantMessage { text } => {
                         SessionEventKind::AssistantMessage { text }
                     }
+                    ImportableSessionEventKind::AssistantReasoningMessage { text } => {
+                        SessionEventKind::AssistantReasoningMessage { text }
+                    }
                     ImportableSessionEventKind::ToolCallRequested {
                         tool_call_id,
                         tool_name,
@@ -219,6 +222,24 @@ pub async fn import_external_session(
                         result,
                         is_error,
                         output: None,
+                    },
+                    ImportableSessionEventKind::ModelUsage {
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        cached_input_tokens,
+                        cache_write_input_tokens,
+                        reasoning_tokens,
+                    } => SessionEventKind::ModelUsage {
+                        turn_id: "imported".to_owned(),
+                        usage: bcode_session_models::SessionTokenUsage {
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                            cached_input_tokens,
+                            cache_write_input_tokens,
+                            reasoning_tokens,
+                        },
                     },
                     ImportableSessionEventKind::ModelChanged { provider, model } => {
                         SessionEventKind::ModelChanged { provider, model }

@@ -333,7 +333,7 @@ pub async fn execute(
         return Ok(SlashCommandOutcome::Unknown(message.to_owned()));
     };
     match command {
-        "sessions" => Ok(SlashCommandOutcome::PickSession),
+        "sessions" | "rescan-imports" => Ok(SlashCommandOutcome::PickSession),
         "new" => {
             let session = client.create_session(None).await?;
             Ok(SlashCommandOutcome::SwitchSession(session.id))

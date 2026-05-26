@@ -311,6 +311,8 @@ fn static_items() -> Vec<SlashItem> {
             "Open thinking settings focused on summary",
         ),
         ("/diff", "Toggle diff panel"),
+        ("/worktree attach ", "Set session working directory"),
+        ("/rescan-imports", "Rescan and open importable sessions"),
         ("/skills", "Open skill picker"),
         ("/agent ", "Set session agent by id"),
         ("/skill ", "Invoke skill by id"),

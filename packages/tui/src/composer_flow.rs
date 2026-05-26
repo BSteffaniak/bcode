@@ -28,9 +28,13 @@ fn is_slash_command_name(command: &str) -> bool {
             | "provider"
             | "set-provider"
             | "diff"
+            | "cwd"
+            | "worktree"
+            | "worktrees"
             | "skills"
             | "skill"
             | "thinking"
+            | "rescan-imports"
             | "runtime"
             | "status"
     )
@@ -165,5 +169,13 @@ pub async fn submit_composer<W: Write>(
             chat.app.set_status(format!("send failed: {error}"));
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn recognizes_import_rescan_slash_command() {
+        assert!(super::has_known_slash_command("/rescan-imports"));
     }
 }

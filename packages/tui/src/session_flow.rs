@@ -148,6 +148,54 @@ fn abort_session_list(session_load: &mut Option<SessionListTask>) {
     }
 }
 
+async fn import_selected_session<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    picker: &mut session_picker::SessionPickerApp,
+    session_load: &mut Option<SessionListTask>,
+) -> Result<Option<SessionId>, TuiError> {
+    let selected_import = picker
+        .selected_import()
+        .filter(|import| import.imported_at_ms == 0)
+        .cloned();
+    if let Some(import) = selected_import {
+        picker.set_status(format!("Importing [{}] session...", import.source_id));
+        terminal.draw(|frame| {
+            session_picker_render::render_picker(picker, frame);
+        })?;
+        match client
+            .import_external_session(import.source_id.clone(), import.external_session_id)
+            .await
+        {
+            Ok((session, warnings)) => {
+                let status = if warnings.is_empty() {
+                    format!("Imported [{}] session", import.source_id)
+                } else {
+                    format!(
+                        "Imported [{}] with {} warnings; opening session",
+                        import.source_id,
+                        warnings.len()
+                    )
+                };
+                picker.set_status(status);
+                picker.set_last_import(Some((session.clone(), warnings)));
+                abort_session_list(session_load);
+                Ok(Some(session.id))
+            }
+            Err(error) => {
+                picker.set_status(format!("Import failed: {error}"));
+                Ok(None)
+            }
+        }
+    } else if let Some(session_id) = picker.selected_session_id() {
+        abort_session_list(session_load);
+        Ok(Some(session_id))
+    } else {
+        picker.set_status("No session selected; press Ctrl-N to create one".to_owned());
+        Ok(None)
+    }
+}
+
 /// Pick an existing session or create one.
 #[allow(clippy::too_many_lines)]
 pub async fn pick_session<W: Write>(
@@ -180,54 +228,11 @@ pub async fn pick_session<W: Write>(
                 PickerKeyOutcome::Rename => rename_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Delete => delete_picker_session(client, &mut picker).await?,
                 PickerKeyOutcome::Selected => {
-                    let selected_import = picker
-                        .selected_import()
-                        .filter(|import| import.imported_at_ms == 0)
-                        .cloned();
-                    if let Some(import) = selected_import {
-                        picker.set_status(format!("Importing [{}] session...", import.source_id));
-                        terminal.draw(|frame| {
-                            session_picker_render::render_picker(&mut picker, frame);
-                        })?;
-                        match client
-                            .import_external_session(
-                                import.source_id.clone(),
-                                import.external_session_id.clone(),
-                            )
-                            .await
-                        {
-                            Ok((session, warnings)) => {
-                                if warnings.is_empty() {
-                                    picker.set_status(format!(
-                                        "Imported [{}] session",
-                                        import.source_id
-                                    ));
-                                } else {
-                                    picker.set_status(format!(
-                                        "Imported [{}] with {} warnings: {}",
-                                        import.source_id,
-                                        warnings.len(),
-                                        warnings
-                                            .iter()
-                                            .map(|warning| warning.message.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("; ")
-                                    ));
-                                }
-                                abort_session_list(&mut session_load);
-                                return Ok(session.id);
-                            }
-                            Err(error) => {
-                                picker.set_status(format!("Import failed: {error}"));
-                            }
-                        }
-                    } else if let Some(session_id) = picker.selected_session_id() {
-                        abort_session_list(&mut session_load);
+                    if let Some(session_id) =
+                        import_selected_session(terminal, client, &mut picker, &mut session_load)
+                            .await?
+                    {
                         return Ok(session_id);
-                    } else {
-                        picker.set_status(
-                            "No session selected; press Ctrl-N to create one".to_owned(),
-                        );
                     }
                 }
                 PickerKeyOutcome::Canceled => {
@@ -238,33 +243,11 @@ pub async fn pick_session<W: Write>(
             Event::Mouse(mouse) => {
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)
+                    && let Some(session_id) =
+                        import_selected_session(terminal, client, &mut picker, &mut session_load)
+                            .await?
                 {
-                    let selected_import = picker
-                        .selected_import()
-                        .filter(|import| import.imported_at_ms == 0)
-                        .cloned();
-                    if let Some(import) = selected_import {
-                        picker.set_status(format!("Importing [{}] session...", import.source_id));
-                        terminal.draw(|frame| {
-                            session_picker_render::render_picker(&mut picker, frame);
-                        })?;
-                        match client
-                            .import_external_session(
-                                import.source_id.clone(),
-                                import.external_session_id.clone(),
-                            )
-                            .await
-                        {
-                            Ok((session, _warnings)) => {
-                                abort_session_list(&mut session_load);
-                                return Ok(session.id);
-                            }
-                            Err(error) => picker.set_status(format!("Import failed: {error}")),
-                        }
-                    } else if let Some(session_id) = picker.selected_session_id() {
-                        abort_session_list(&mut session_load);
-                        return Ok(session_id);
-                    }
+                    return Ok(session_id);
                 }
             }
             Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
@@ -343,6 +326,10 @@ fn handle_picker_key(
 ) -> PickerKeyOutcome {
     match picker.mode() {
         session_picker::SessionPickerMode::Filter => {
+            if picker.last_import().is_some() && stroke.key == KeyCode::Escape {
+                picker.clear_last_import();
+                return PickerKeyOutcome::Continue;
+            }
             handle_picker_filter_key(picker, keymap, stroke)
         }
         session_picker::SessionPickerMode::Rename => {

@@ -153,6 +153,9 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
             malformed_lines = malformed_lines.saturating_add(1);
             continue;
         };
+        if let Some(usage_event) = maybe_usage_event(&value) {
+            events.push(usage_event);
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("model_change") => {
                 if let (Some(provider), Some(model)) = (
@@ -213,6 +216,19 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
                                             .unwrap_or_default(),
                                     ),
                                     Some("thinking") => {
+                                        if let Some(thinking) = block
+                                            .get("thinking")
+                                            .or_else(|| block.get("text"))
+                                            .and_then(Value::as_str)
+                                            .filter(|thinking| !thinking.trim().is_empty())
+                                        {
+                                            events.push(import_event(
+                                                &value,
+                                                ImportableSessionEventKind::AssistantReasoningMessage {
+                                                    text: thinking.to_string(),
+                                                },
+                                            ));
+                                        }
                                         skipped_thinking = skipped_thinking.saturating_add(1);
                                     }
                                     Some("toolCall") => {
@@ -291,8 +307,8 @@ fn load_pi_session(path: &Path) -> Result<ImportableSession, std::io::Error> {
 
     if skipped_thinking > 0 {
         warnings.push(ImportWarning::counted(
-            "skipped_thinking",
-            "skipped Pi thinking blocks",
+            "imported_thinking",
+            "imported Pi thinking blocks as reasoning history",
             skipped_thinking,
         ));
     }
@@ -410,6 +426,25 @@ fn content_text_and_images(content: Option<&Value>) -> (String, u64) {
         }
         _ => (String::new(), 0),
     }
+}
+
+fn maybe_usage_event(source: &Value) -> Option<ImportableSessionEvent> {
+    let usage = source.get("usage")?;
+    let token = |name: &str| {
+        usage
+            .get(name)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    let event = ImportableSessionEventKind::ModelUsage {
+        input_tokens: token("inputTokens").or_else(|| token("promptTokens")),
+        output_tokens: token("outputTokens").or_else(|| token("completionTokens")),
+        total_tokens: token("totalTokens"),
+        cached_input_tokens: token("cachedInputTokens"),
+        cache_write_input_tokens: token("cacheWriteInputTokens"),
+        reasoning_tokens: token("reasoningTokens"),
+    };
+    Some(import_event(source, event))
 }
 
 fn import_event(source: &Value, kind: ImportableSessionEventKind) -> ImportableSessionEvent {
@@ -602,7 +637,7 @@ mod tests {
             session
                 .warnings
                 .iter()
-                .any(|warning| warning.code == "skipped_thinking")
+                .any(|warning| warning.code == "imported_thinking")
         );
         assert!(
             session

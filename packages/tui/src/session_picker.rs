@@ -27,6 +27,7 @@ pub struct SessionPickerApp {
     rename: TextEditBuffer,
     list: FilteredListState,
     status: String,
+    last_import: Option<(SessionSummary, Vec<bcode_ipc::SessionImportWarning>)>,
     mode: SessionPickerMode,
 }
 
@@ -41,6 +42,7 @@ impl SessionPickerApp {
             rename: TextEditBuffer::new(),
             list,
             status: "Select a session or press Ctrl-N to create one".to_owned(),
+            last_import: None,
             mode: SessionPickerMode::Filter,
         }
     }
@@ -87,6 +89,27 @@ impl SessionPickerApp {
     /// Set picker status.
     pub fn set_status(&mut self, status: String) {
         self.status = status;
+    }
+
+    /// Record the most recent successful external import for the warning panel.
+    pub fn set_last_import(
+        &mut self,
+        import: Option<(SessionSummary, Vec<bcode_ipc::SessionImportWarning>)>,
+    ) {
+        self.last_import = import;
+    }
+
+    /// Return the most recent successful external import, if any.
+    #[must_use]
+    pub const fn last_import(
+        &self,
+    ) -> Option<&(SessionSummary, Vec<bcode_ipc::SessionImportWarning>)> {
+        self.last_import.as_ref()
+    }
+
+    /// Clear the most recent external import warning panel.
+    pub fn clear_last_import(&mut self) {
+        self.last_import = None;
     }
 
     /// Replace all sessions and refresh the filter.
@@ -213,12 +236,28 @@ fn session_item(session: &SessionSummary) -> ListItem {
         .unwrap_or("untitled");
     let display_name = session.import.as_ref().map_or_else(
         || name.to_owned(),
-        |import| format!("[{}] {name}", import.source_id),
+        |import| {
+            if import.imported_at_ms == 0 {
+                format!("[{} import] {name}", import.source_id)
+            } else {
+                format!("[{}] {name}", import.source_id)
+            }
+        },
+    );
+    let id = session.import.as_ref().map_or_else(
+        || session.id.to_string(),
+        |import| {
+            if import.imported_at_ms == 0 {
+                import.external_session_id.clone()
+            } else {
+                session.id.to_string()
+            }
+        },
     );
     ListItem::new(Line::from_spans(vec![
         Span::styled(display_name, Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(session.id.to_string(), Style::new().fg(Color::BrightBlack)),
+        Span::styled(id, Style::new().fg(Color::BrightBlack)),
     ]))
 }
 
@@ -242,4 +281,47 @@ fn empty_item(message: &str) -> ListItem {
         message.to_owned(),
         Style::new().fg(Color::BrightBlack),
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_models::SessionImportSummary;
+
+    fn summary(imported_at_ms: u64) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(),
+            name: Some("Imported title".to_owned()),
+            client_count: 0,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            import: Some(SessionImportSummary {
+                source_id: "pi".to_owned(),
+                source_display_name: "Pi".to_owned(),
+                external_session_id: "external-1".to_owned(),
+                imported_at_ms,
+            }),
+        }
+    }
+
+    #[test]
+    fn importable_session_item_uses_external_id() {
+        let item = session_item(&summary(0));
+        let rendered = format!("{item:?}");
+
+        assert!(rendered.contains("[pi import] Imported title"));
+        assert!(rendered.contains("external-1"));
+    }
+
+    #[test]
+    fn imported_session_item_uses_native_id() {
+        let session = summary(42);
+        let native_id = session.id.to_string();
+        let item = session_item(&session);
+        let rendered = format!("{item:?}");
+
+        assert!(rendered.contains("[pi] Imported title"));
+        assert!(rendered.contains(&native_id));
+    }
 }
