@@ -432,6 +432,7 @@ enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    Enter,
     Initiative {
         #[command(subcommand)]
         command: BlimsInitiativeCommand,
@@ -942,21 +943,10 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
                 print_blims_service_response(response);
             } else {
                 let world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
-                println!("{}", world.theme);
-                println!("player: {}", world.player_name);
-                println!("rooms:");
-                for room in world.rooms {
-                    println!("* {} ({}) - {}", room.name, room.id, room.purpose);
-                }
-                println!("agents:");
-                for agent in world.agents {
-                    println!(
-                        "* {} ({}) at {} - {}",
-                        agent.name, agent.role, agent.room_id, agent.status
-                    );
-                }
+                print_blims_world(&world);
             }
         }
+        BlimsCommand::Enter => enter_blims_office().await?,
         BlimsCommand::Initiative { command } => handle_blims_initiative_command(command).await?,
         BlimsCommand::Guidance { command } => handle_blims_guidance_command(command).await?,
         BlimsCommand::Report { json } => {
@@ -973,6 +963,182 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+async fn enter_blims_office() -> Result<(), CliError> {
+    let world = load_blims_world().await?;
+    let report = load_blims_report().await?;
+    let mut player_room_id = "ceo-nook".to_string();
+    loop {
+        print_blims_office(&world, &report, &player_room_id);
+        print!("blims> ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let command = input.trim();
+        if matches!(command, "q" | "quit" | "exit") {
+            break;
+        }
+        match command {
+            "h" | "left" => player_room_id = previous_room_id(&world, &player_room_id),
+            "l" | "right" | "j" | "down" | "k" | "up" => {
+                player_room_id = next_room_id(&world, &player_room_id);
+            }
+            "r" | "report" => print_blims_report(&report),
+            "t" | "talk" | "look" => print_room_interaction(&world, &report, &player_room_id),
+            "w" | "world" => print_blims_world(&world),
+            "help" | "?" => print_blims_help(),
+            "" => {}
+            _ => println!("unknown command: {command} (try `help`)"),
+        }
+    }
+    Ok(())
+}
+
+async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
+    let response = call_blims_service("world.snapshot", blims_workspace_payload()?).await?;
+    decode_blims_response::<BlimsWorldSnapshot>(response)
+}
+
+async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
+    let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
+    decode_blims_response::<BlimsMorningReport>(response)
+}
+
+fn print_blims_office(
+    world: &BlimsWorldSnapshot,
+    report: &BlimsMorningReport,
+    player_room_id: &str,
+) {
+    print!("\x1B[2J\x1B[H");
+    println!("┌────────────────────────────────────────────────────────────┐");
+    println!("│ {:^58} │", world.theme);
+    println!("├────────────────────────────────────────────────────────────┤");
+    for room in &world.rooms {
+        let marker = if room.id == player_room_id { "@" } else { " " };
+        let occupants = world
+            .agents
+            .iter()
+            .filter(|agent| agent.room_id == room.id)
+            .map(|agent| agent.name.chars().next().unwrap_or('?'))
+            .collect::<String>();
+        println!(
+            "│ {marker} {:<18} {:<22} {:>12} │",
+            room.name, room.purpose, occupants
+        );
+    }
+    println!("└────────────────────────────────────────────────────────────┘");
+    println!();
+    println!("@ {}", world.player_name);
+    for agent in &world.agents {
+        println!(
+            "{} {} — {} — {}",
+            agent.name.chars().next().unwrap_or('?'),
+            agent.name,
+            agent.role,
+            agent.status
+        );
+    }
+    println!();
+    println!("{}", report.title);
+    for bullet in report.bullets.iter().take(3) {
+        println!("* {bullet}");
+    }
+    println!();
+    print_blims_help();
+}
+
+fn print_blims_help() {
+    println!(
+        "Commands: h/left previous room, l/right next room, t talk/look, r report, w world, q quit"
+    );
+}
+
+fn print_room_interaction(
+    world: &BlimsWorldSnapshot,
+    report: &BlimsMorningReport,
+    player_room_id: &str,
+) {
+    let Some(room) = world.rooms.iter().find(|room| room.id == player_room_id) else {
+        println!("You are between rooms. The office hums softly.");
+        return;
+    };
+    println!("You are in {} — {}", room.name, room.purpose);
+    let agents = world
+        .agents
+        .iter()
+        .filter(|agent| agent.room_id == room.id)
+        .collect::<Vec<_>>();
+    if agents.is_empty() {
+        println!("No agents are here yet.");
+        if room.id == "whiteboard" {
+            println!("The whiteboard is ready for initiatives and CEO guidance.");
+        }
+        return;
+    }
+    for agent in agents {
+        println!("{} says: {}", agent.name, agent_line(agent, report));
+    }
+}
+
+fn agent_line(agent: &BlimsAgentSnapshot, report: &BlimsMorningReport) -> String {
+    let context = report
+        .bullets
+        .iter()
+        .find(|bullet| bullet.starts_with("Top initiative:") || bullet.starts_with("Top guidance:"))
+        .cloned()
+        .unwrap_or_else(|| "I'm waiting for the next CEO direction.".to_string());
+    format!("I'm {}, {}. {}", agent.name, agent.status, context)
+}
+
+fn print_blims_report(report: &BlimsMorningReport) {
+    println!("{}", report.title);
+    for bullet in &report.bullets {
+        println!("* {bullet}");
+    }
+}
+
+fn print_blims_world(world: &BlimsWorldSnapshot) {
+    println!("{}", world.theme);
+    println!("player: {}", world.player_name);
+    println!("rooms:");
+    for room in &world.rooms {
+        println!("* {} ({}) - {}", room.name, room.id, room.purpose);
+    }
+    println!("agents:");
+    for agent in &world.agents {
+        println!(
+            "* {} ({}) at {} - {}",
+            agent.name, agent.role, agent.room_id, agent.status
+        );
+    }
+}
+
+fn next_room_id(world: &BlimsWorldSnapshot, current_room_id: &str) -> String {
+    if world.rooms.is_empty() {
+        return current_room_id.to_string();
+    }
+    let current = room_index(world, current_room_id);
+    world.rooms[(current + 1) % world.rooms.len()].id.clone()
+}
+
+fn previous_room_id(world: &BlimsWorldSnapshot, current_room_id: &str) -> String {
+    if world.rooms.is_empty() {
+        return current_room_id.to_string();
+    }
+    let current = room_index(world, current_room_id);
+    let previous = current
+        .checked_sub(1)
+        .unwrap_or_else(|| world.rooms.len().saturating_sub(1));
+    world.rooms[previous].id.clone()
+}
+
+fn room_index(world: &BlimsWorldSnapshot, current_room_id: &str) -> usize {
+    world
+        .rooms
+        .iter()
+        .position(|room| room.id == current_room_id)
+        .unwrap_or_default()
 }
 
 async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Result<(), CliError> {
