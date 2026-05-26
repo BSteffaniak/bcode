@@ -60,6 +60,9 @@ pub struct ToolInvocationRequest {
     /// Host-managed artifact directory for this invocation/session.
     #[serde(default)]
     pub artifact_dir: Option<PathBuf>,
+    /// Optional host-managed cancellation file. Tools should stop work when this path exists.
+    #[serde(default)]
+    pub cancellation_path: Option<PathBuf>,
 }
 
 /// Incremental event emitted while a tool invocation is running.

@@ -496,6 +496,7 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::AgentChanged { .. } => "agent_changed",
         SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
         SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",

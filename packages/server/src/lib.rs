@@ -1268,7 +1268,7 @@ async fn handle_request(
             .await
         }
         Request::CancelSessionTurn { session_id } => {
-            handle_cancel_session_turn(request_id, state, writer, session_id).await
+            handle_cancel_session_turn(request_id, state, writer, session_id, client_id).await
         }
         Request::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
@@ -2840,6 +2840,7 @@ async fn handle_cancel_session_turn(
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
+    client_id: ClientId,
 ) -> Result<(), ServerError> {
     let Some(active_session_turn) = state
         .active_session_turns
@@ -2857,13 +2858,11 @@ async fn handle_cancel_session_turn(
     };
 
     active_session_turn.cancel_state.cancel();
-    append_system_event(
+    append_model_turn_cancel_requested_event(
         state,
         session_id,
-        format!(
-            "model turn cancellation requested for {}",
-            active_session_turn.turn_id
-        ),
+        active_session_turn.turn_id.clone(),
+        Some(client_id),
     )
     .await;
 
@@ -5827,6 +5826,13 @@ async fn execute_model_tool(
     )
     .await;
     if cancel_state.is_cancelled() {
+        append_runtime_work_cancel_requested_event(
+            state,
+            session_id,
+            RuntimeWorkId::new(format!("tool_{}", call.id)),
+            None,
+        )
+        .await;
         append_tool_finished_event(
             state,
             session_id,
@@ -5980,12 +5986,20 @@ async fn invoke_model_tool(
         .session_working_directory(session_id)
         .await
         .map_err(|error| error.to_string())?;
+    let cancellation_path = default_session_artifact_dir(session_id).join(format!(
+        "tool-cancel-{}",
+        call.id
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>()
+    ));
     let request = ToolInvocationRequest {
         tool_call_id: call.id.clone(),
         name: call.name.clone(),
         arguments: call.arguments.clone(),
         cwd: Some(working_directory),
         artifact_dir: Some(default_session_artifact_dir(session_id)),
+        cancellation_path: Some(cancellation_path.clone()),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let mut invocation = state
@@ -6001,6 +6015,14 @@ async fn invoke_model_tool(
     let response = loop {
         tokio::select! {
             () = cancel_state.cancelled() => {
+                let _ = std::fs::write(&cancellation_path, b"cancelled\n");
+                append_runtime_work_cancel_requested_event(
+                    state,
+                    session_id,
+                    RuntimeWorkId::new(format!("tool_{}", call.id)),
+                    None,
+                )
+                .await;
                 return Ok(ToolInvocationResponse {
                     output: "tool invocation cancelled".to_string(),
                     is_error: true,
@@ -6705,13 +6727,34 @@ async fn append_tool_request_event(
                 service_interface: None,
                 operation: None,
                 started_at_ms: Some(current_unix_millis()),
-                cancellable: false,
+                cancellable: true,
             },
         )
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append runtime work start: {error}"),
+    }
+}
+
+async fn append_runtime_work_cancel_requested_event(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+    client_id: Option<ClientId>,
+) {
+    match state
+        .sessions
+        .append_runtime_work_cancel_requested(
+            session_id,
+            work_id,
+            Some(current_unix_millis()),
+            client_id,
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append runtime work cancel request: {error}"),
     }
 }
 
@@ -6819,7 +6862,9 @@ fn runtime_work_status_from_tool_result(result: &str, is_error: bool) -> Runtime
         return RuntimeWorkStatus::Completed;
     }
     let lower = result.to_ascii_lowercase();
-    if lower.contains("timed_out: true") || lower.contains("\"timed_out\":true") {
+    if lower.contains("cancelled") {
+        RuntimeWorkStatus::Cancelled
+    } else if lower.contains("timed_out: true") || lower.contains("\"timed_out\":true") {
         RuntimeWorkStatus::TimedOut
     } else {
         RuntimeWorkStatus::Failed
@@ -6845,6 +6890,27 @@ async fn append_model_turn_started_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append model turn start: {error}"),
+    }
+}
+
+async fn append_model_turn_cancel_requested_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: String,
+    client_id: Option<ClientId>,
+) {
+    match state
+        .sessions
+        .append_model_turn_cancel_requested(
+            session_id,
+            turn_id,
+            Some(current_unix_millis()),
+            client_id,
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append model turn cancel request: {error}"),
     }
 }
 

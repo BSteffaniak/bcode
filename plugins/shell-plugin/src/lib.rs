@@ -120,6 +120,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             request.name.as_str(),
             request.arguments,
             request.cwd.as_deref(),
+            request.cancellation_path.as_deref(),
         ),
         _ => ToolInvocationResponse {
             output: format!("unknown shell tool: {}", request.name),
@@ -137,6 +138,7 @@ fn run_shell_tool(
     tool_name: &str,
     arguments: serde_json::Value,
     session_cwd: Option<&std::path::Path>,
+    cancellation_path: Option<&std::path::Path>,
 ) -> ToolInvocationResponse {
     let arguments = match serde_json::from_value::<ShellRunArguments>(arguments) {
         Ok(arguments) => arguments,
@@ -168,9 +170,21 @@ fn run_shell_tool(
         },
     );
     let response = if arguments.terminal {
-        run_terminal_shell_command(events, tool_call_id, &arguments, session_cwd)
+        run_terminal_shell_command(
+            events,
+            tool_call_id,
+            &arguments,
+            session_cwd,
+            cancellation_path,
+        )
     } else {
-        match run_shell_command(events, tool_call_id, &arguments, session_cwd) {
+        match run_shell_command(
+            events,
+            tool_call_id,
+            &arguments,
+            session_cwd,
+            cancellation_path,
+        ) {
             Ok(output) => output,
             Err(error) => ToolInvocationResponse {
                 output: error,
@@ -196,6 +210,7 @@ struct TerminalCommandOutput {
     mode: &'static str,
     exit_code: Option<i32>,
     timed_out: bool,
+    cancelled: bool,
     output: String,
     output_truncated: bool,
     output_bytes: u64,
@@ -217,8 +232,15 @@ fn run_terminal_shell_command(
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
+    cancellation_path: Option<&Path>,
 ) -> ToolInvocationResponse {
-    match run_terminal_shell_command_inner(events, tool_call_id, arguments, session_cwd) {
+    match run_terminal_shell_command_inner(
+        events,
+        tool_call_id,
+        arguments,
+        session_cwd,
+        cancellation_path,
+    ) {
         Ok(response) => response,
         Err(error) => ToolInvocationResponse {
             output: error,
@@ -234,6 +256,7 @@ fn run_terminal_shell_command_inner(
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
+    cancellation_path: Option<&Path>,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let columns = arguments.terminal_columns();
@@ -273,9 +296,15 @@ fn run_terminal_shell_command_inner(
 
     let started = Instant::now();
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
+        }
+        if cancellation_path.is_some_and(Path::exists) {
+            cancelled = true;
+            child.kill().map_err(|error| error.to_string())?;
+            break child.wait().map_err(|error| error.to_string())?;
         }
         if started.elapsed() >= timeout {
             timed_out = true;
@@ -291,6 +320,7 @@ fn run_terminal_shell_command_inner(
         mode: "terminal",
         exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
         timed_out,
+        cancelled,
         output: inline_output.text,
         output_truncated: inline_output.truncated,
         output_bytes: u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX),
@@ -302,6 +332,7 @@ fn run_terminal_shell_command_inner(
         mode: "terminal",
         exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
         timed_out,
+        cancelled,
         output: output.text,
         output_truncated: output.truncated,
         output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
@@ -314,7 +345,7 @@ fn run_terminal_shell_command_inner(
         serde_json::to_string(&full_terminal_output).map_err(|error| error.to_string())?;
     Ok(ToolInvocationResponse {
         output: encoded,
-        is_error: timed_out || !status.success(),
+        is_error: timed_out || cancelled || !status.success(),
         content: Vec::new(),
         full_output: Some(full_encoded),
     })
@@ -346,6 +377,7 @@ fn run_shell_command(
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&std::path::Path>,
+    cancellation_path: Option<&std::path::Path>,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let cwd = arguments
@@ -358,9 +390,21 @@ fn run_shell_command(
         .build()
         .map_err(|error| error.to_string())?;
     let tool_call_id = tool_call_id.to_owned();
+    let cancellation_path = cancellation_path.map(Path::to_path_buf);
     let result = runtime
         .block_on(async {
-            ToolExecutionRuntime::new(1)
+            let runtime = ToolExecutionRuntime::new(1);
+            let cancel_handle = runtime.cancellation_handle();
+            let cancel_task = cancellation_path.map(|path| {
+                let cancel_handle = cancel_handle.clone();
+                tokio::spawn(async move {
+                    while !path.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    cancel_handle.cancel();
+                })
+            });
+            let result = runtime
                 .run_process_streaming(
                     ProcessExecutionRequest {
                         program: shell_program().to_string(),
@@ -387,7 +431,11 @@ fn run_shell_command(
                         );
                     },
                 )
-                .await
+                .await;
+            if let Some(cancel_task) = cancel_task {
+                cancel_task.abort();
+            }
+            result
         })
         .map_err(|error| error.to_string())?;
 
@@ -396,12 +444,15 @@ fn run_shell_command(
     let output = format_command_output(
         result.exit_code,
         result.timed_out,
+        result.cancelled,
         &stdout.text,
         &stderr.text,
     );
     Ok(ToolInvocationResponse {
         output,
-        is_error: result.timed_out || result.exit_code.is_none_or(|code| code != 0),
+        is_error: result.timed_out
+            || result.cancelled
+            || result.exit_code.is_none_or(|code| code != 0),
         content: Vec::new(),
         full_output: None,
     })
@@ -514,11 +565,14 @@ fn join_reader(
 fn format_command_output(
     exit_code: Option<i32>,
     timed_out: bool,
+    cancelled: bool,
     stdout: &str,
     stderr: &str,
 ) -> String {
     let exit_code = exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string());
-    format!("exit_code: {exit_code}\ntimed_out: {timed_out}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    format!(
+        "exit_code: {exit_code}\ntimed_out: {timed_out}\ncancelled: {cancelled}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    )
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
@@ -559,6 +613,7 @@ mod tests {
                 columns: None,
                 rows: None,
             },
+            None,
             None,
         )
         .expect("shell command should return timeout output");
@@ -619,6 +674,7 @@ mod tests {
             mode: "terminal",
             exit_code: Some(0),
             timed_out: false,
+            cancelled: false,
             output: output.text,
             output_truncated: output.truncated,
             output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),

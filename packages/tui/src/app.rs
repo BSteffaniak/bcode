@@ -765,6 +765,10 @@ impl BmuxApp {
                 self.set_activity(ActivityState::Thinking);
                 "thinking".clone_into(&mut self.status);
             }
+            SessionEventKind::ModelTurnCancelRequested { .. } => {
+                self.set_cancelling();
+                "cancellation requested".clone_into(&mut self.status);
+            }
             SessionEventKind::ModelTurnFinished {
                 outcome, message, ..
             } => self.finish_model_turn(*outcome, message.as_deref()),
@@ -1730,6 +1734,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelChanged { .. }
         | SessionEventKind::AgentChanged { .. }
         | SessionEventKind::ModelTurnStarted { .. }
+        | SessionEventKind::ModelTurnCancelRequested { .. }
         | SessionEventKind::ModelTurnFinished { .. }
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }

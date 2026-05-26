@@ -3783,6 +3783,12 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::ModelTurnStarted { turn_id } => {
             println!("#{} model turn started: {turn_id}", event.sequence);
         }
+        SessionEventKind::ModelTurnCancelRequested { turn_id, .. } => {
+            println!(
+                "#{} model turn cancellation requested: {turn_id}",
+                event.sequence
+            );
+        }
         SessionEventKind::ModelTurnFinished {
             turn_id,
             outcome,

@@ -675,6 +675,14 @@ pub enum SessionEventKind {
         #[serde(default)]
         message: Option<String>,
     },
+    /// Durable marker that a model turn cancellation was requested.
+    ModelTurnCancelRequested {
+        turn_id: String,
+        #[serde(default)]
+        requested_at_ms: Option<u64>,
+        #[serde(default)]
+        client_id: Option<ClientId>,
+    },
     /// Incremental tool invocation event emitted while a tool is running.
     ToolInvocationStream {
         event: ToolInvocationStreamEvent,

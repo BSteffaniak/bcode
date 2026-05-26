@@ -1779,6 +1779,29 @@ impl SessionManager {
         self.append_event(session_id, event).await
     }
 
+    /// Append a runtime-work cancellation request event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_runtime_work_cancel_requested(
+        &self,
+        session_id: SessionId,
+        work_id: bcode_session_models::RuntimeWorkId,
+        requested_at_ms: Option<u64>,
+        client_id: Option<ClientId>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id,
+                requested_at_ms,
+                client_id,
+            },
+        )
+        .await
+    }
+
     /// Append a runtime-work finished event to a session.
     ///
     /// # Errors
@@ -1894,6 +1917,29 @@ impl SessionManager {
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(session_id, SessionEventKind::ModelTurnStarted { turn_id })
             .await
+    }
+
+    /// Append a model-turn-cancel-requested event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_model_turn_cancel_requested(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        requested_at_ms: Option<u64>,
+        client_id: Option<ClientId>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ModelTurnCancelRequested {
+                turn_id,
+                requested_at_ms,
+                client_id,
+            },
+        )
+        .await
     }
 
     /// Append a model-turn-finished event to a session.
@@ -4303,6 +4349,15 @@ mod tests {
             ),
             (
                 30,
+                "ModelTurnCancelRequested",
+                SessionEventKind::ModelTurnCancelRequested {
+                    turn_id: "turn".to_string(),
+                    requested_at_ms: Some(4),
+                    client_id: Some(client_id),
+                },
+            ),
+            (
+                31,
                 "ToolInvocationStream",
                 SessionEventKind::ToolInvocationStream {
                     event: ToolInvocationStreamEvent::OutputDelta {
@@ -4315,7 +4370,7 @@ mod tests {
                 },
             ),
             (
-                31,
+                32,
                 "WorkingDirectoryChanged",
                 SessionEventKind::WorkingDirectoryChanged {
                     old_working_directory: test_working_directory(),
@@ -4323,7 +4378,7 @@ mod tests {
                 },
             ),
             (
-                32,
+                33,
                 "SessionImported",
                 SessionEventKind::SessionImported {
                     source_id: "pi".to_string(),
