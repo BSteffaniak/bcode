@@ -6,7 +6,6 @@ use bcode_client::{BcodeClient, SessionList};
 use bcode_ipc::{Event as BcodeEvent, SessionCatalogStatus};
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::crossterm::poll_event;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
@@ -19,7 +18,8 @@ use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
 use super::helpers;
-use super::{EVENT_POLL_TIMEOUT, TuiError, history_flow};
+use super::terminal_events::TerminalEventStream;
+use super::{TuiError, history_flow};
 use super::{session_picker, session_picker_render};
 
 /// Active chat session state shared by TUI flows.
@@ -178,6 +178,7 @@ async fn import_selected_session<W: Write>(
 #[allow(clippy::too_many_lines)]
 pub async fn pick_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
 ) -> Result<SessionId, TuiError> {
@@ -193,8 +194,8 @@ pub async fn pick_session<W: Write>(
                 apply_session_list(&mut picker, snapshot?);
                 continue;
             }
-            event = tokio::task::spawn_blocking(|| poll_event(EVENT_POLL_TIMEOUT)) => {
-                event??
+            event = terminal_events.recv() => {
+                event?
             }
         };
         let Some(event) = event else {
@@ -241,6 +242,7 @@ pub async fn pick_session<W: Write>(
 /// Pick a session to rename or delete.
 pub async fn pick_session_for_mutation<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     start_mode: SessionPickerStartMode,
 ) -> Result<(), TuiError> {
@@ -268,8 +270,8 @@ pub async fn pick_session_for_mutation<W: Write>(
                 apply_session_list(&mut picker, snapshot?);
                 continue;
             }
-            event = tokio::task::spawn_blocking(|| poll_event(EVENT_POLL_TIMEOUT)) => {
-                event??
+            event = terminal_events.recv() => {
+                event?
             }
         };
         let Some(event) = event else {

@@ -49,9 +49,10 @@ pub(crate) mod slash_commands;
 pub(crate) mod slash_flow;
 pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
+pub(crate) mod terminal_events;
 #[cfg(test)]
 pub(crate) mod tests;
-pub(crate) mod thinking_dialog;
+mod thinking_dialog;
 pub(crate) mod thinking_dialog_render;
 pub(crate) mod thinking_flow;
 pub(crate) mod tool_present;

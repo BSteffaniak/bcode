@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
 use super::keymap::BmuxKeyMap;
+use super::terminal_events::TerminalEventStream;
 use super::{INITIAL_HISTORY_EVENT_LIMIT, TuiError, chat_loop, history_flow, session_flow};
 
 /// Attach to a session and run the active chat loop.
@@ -20,9 +21,12 @@ pub async fn run_event_loop<W: Write>(
     let config = bcode_config::load_config()?;
     let keymap = BmuxKeyMap::from_config(&config.tui);
     let mouse_scroll_rows = config.tui.mouse.effective_scroll_rows();
+    let mut terminal_events = TerminalEventStream::spawn();
     let session_id = match session_id {
         Some(session_id) => session_id,
-        None => session_flow::pick_session(terminal, &client, &keymap).await?,
+        None => {
+            session_flow::pick_session(terminal, &mut terminal_events, &client, &keymap).await?
+        }
     };
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (attached, event_task) =
@@ -44,8 +48,15 @@ pub async fn run_event_loop<W: Write>(
         event_task,
     };
     session_flow::hydrate_status(&client, &mut chat.app).await;
-    let result =
-        chat_loop::run_with_client(terminal, &client, &keymap, &mut chat, mouse_scroll_rows).await;
+    let result = chat_loop::run_with_client(
+        terminal,
+        &mut terminal_events,
+        &client,
+        &keymap,
+        &mut chat,
+        mouse_scroll_rows,
+    )
+    .await;
     chat.event_task.abort();
     result
 }

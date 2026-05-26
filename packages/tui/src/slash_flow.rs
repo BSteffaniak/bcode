@@ -9,6 +9,7 @@ use bmux_tui::terminal::Terminal;
 
 use super::helpers;
 use super::keymap::BmuxKeyMap;
+use super::terminal_events::TerminalEventStream;
 use super::{
     TuiError, composer_flow, input, session_flow::ActiveChat, slash_palette, slash_palette_render,
 };
@@ -45,6 +46,7 @@ pub async fn handle_slash_palette_key<W: Write>(
     chat: &mut ActiveChat,
     slash_palette: &mut Option<slash_palette::SlashPalette>,
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     stroke: KeyStroke,
 ) -> Result<Option<composer_flow::SubmitComposerOutcome>, TuiError> {
     let Some(active_palette) = slash_palette else {
@@ -66,7 +68,15 @@ pub async fn handle_slash_palette_key<W: Write>(
         KeyCode::Enter if stroke.modifiers.is_empty() => {
             if active_palette.selected_matches(chat.app.composer().text()) {
                 *slash_palette = None;
-                match composer_flow::submit_composer(client, keymap, chat, terminal).await {
+                match composer_flow::submit_composer(
+                    client,
+                    keymap,
+                    chat,
+                    terminal,
+                    terminal_events,
+                )
+                .await
+                {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) => {
                         helpers::report_client_error(&mut chat.app, "send failed", &error);
@@ -89,7 +99,15 @@ pub async fn handle_slash_palette_key<W: Write>(
                 request_turn_cancellation(client, chat).await;
             }
             if outcome.submitted {
-                match composer_flow::submit_composer(client, keymap, chat, terminal).await {
+                match composer_flow::submit_composer(
+                    client,
+                    keymap,
+                    chat,
+                    terminal,
+                    terminal_events,
+                )
+                .await
+                {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) => {
                         helpers::report_client_error(&mut chat.app, "send failed", &error);

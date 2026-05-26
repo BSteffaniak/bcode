@@ -5,7 +5,6 @@ use std::io::Write;
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::crossterm::poll_event;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
@@ -16,6 +15,7 @@ use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
 use super::session_flow::ActiveChat;
+use super::terminal_events::TerminalEventStream;
 use super::{
     EVENT_POLL_TIMEOUT, TuiError, command_palette_render, composer_flow, history_flow, input,
     mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
@@ -32,6 +32,7 @@ struct ModalState {
 /// Run the active chat UI loop.
 pub async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
@@ -101,13 +102,18 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = false;
         }
 
-        if let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? {
+        let event = tokio::select! {
+            event = terminal_events.recv() => event?,
+            () = tokio::time::sleep(EVENT_POLL_TIMEOUT) => None,
+        };
+        if let Some(event) = event {
             if handle_event(
                 client,
                 keymap,
                 chat,
                 &mut modals,
                 terminal,
+                terminal_events,
                 event,
                 mouse_scroll_rows,
             )
@@ -123,12 +129,14 @@ pub async fn run_with_client<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event<W: Write>(
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     modals: &mut ModalState,
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     event: Event,
     mouse_scroll_rows: usize,
 ) -> Result<bool, TuiError> {
@@ -137,7 +145,18 @@ async fn handle_event<W: Write>(
             terminal.resize(Rect::new(0, 0, size.width, size.height));
             Ok(true)
         }
-        Event::Key(stroke) => handle_chat_key(client, keymap, chat, modals, terminal, stroke).await,
+        Event::Key(stroke) => {
+            handle_chat_key(
+                client,
+                keymap,
+                chat,
+                modals,
+                terminal,
+                terminal_events,
+                stroke,
+            )
+            .await
+        }
         Event::Paste(text) => {
             if let Some(palette) = &mut modals.palette {
                 palette.state_mut().query.insert_str(&text);
@@ -158,6 +177,7 @@ async fn handle_event<W: Write>(
                     chat,
                     &mut modals.palette,
                     terminal,
+                    terminal_events,
                     mouse,
                 )
                 .await;
@@ -191,6 +211,7 @@ async fn handle_chat_key<W: Write>(
     chat: &mut ActiveChat,
     modals: &mut ModalState,
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     stroke: KeyStroke,
 ) -> Result<bool, TuiError> {
     if modals.thinking_dialog.is_some() {
@@ -209,6 +230,7 @@ async fn handle_chat_key<W: Write>(
             chat,
             &mut modals.slash_palette,
             terminal,
+            terminal_events,
             stroke,
         )
         .await?
@@ -243,6 +265,7 @@ async fn handle_chat_key<W: Write>(
             chat,
             &mut modals.palette,
             terminal,
+            terminal_events,
             stroke,
         )
         .await;
@@ -264,7 +287,8 @@ async fn handle_chat_key<W: Write>(
         request_turn_cancellation(client, chat).await;
     }
     if outcome.submitted {
-        match composer_flow::submit_composer(client, keymap, chat, terminal).await {
+        match composer_flow::submit_composer(client, keymap, chat, terminal, terminal_events).await
+        {
             Ok(Some(dialog)) => {
                 modals.thinking_dialog = Some(dialog);
             }

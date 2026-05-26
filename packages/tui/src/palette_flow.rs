@@ -13,6 +13,7 @@ use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::session_flow::{self, ActiveChat};
+use super::terminal_events::TerminalEventStream;
 use super::{TuiError, model_flow, skill_flow, worktree_flow};
 
 /// Handle one key while the command palette is open.
@@ -22,6 +23,7 @@ pub async fn handle_palette_key<W: Write>(
     chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     stroke: KeyStroke,
 ) -> Result<bool, TuiError> {
     let Some(active_palette) = palette else {
@@ -35,8 +37,15 @@ pub async fn handle_palette_key<W: Write>(
             let command = active_palette.command_at(index);
             *palette = None;
             if let Some(command) = command
-                && let Err(error) =
-                    execute_palette_command(client, chat, terminal, keymap, command).await
+                && let Err(error) = execute_palette_command(
+                    client,
+                    chat,
+                    terminal,
+                    terminal_events,
+                    keymap,
+                    command,
+                )
+                .await
             {
                 helpers::report_client_error(&mut chat.app, "command failed", &error);
             }
@@ -60,6 +69,7 @@ pub async fn handle_palette_mouse<W: Write>(
     chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     mouse: bmux_tui::event::MouseEvent,
 ) -> Result<bool, TuiError> {
     let Some(index) = command_palette_row_from_mouse(mouse) else {
@@ -71,7 +81,8 @@ pub async fn handle_palette_mouse<W: Write>(
     let command = active_palette.command_at(index);
     *palette = None;
     if let Some(command) = command
-        && let Err(error) = execute_palette_command(client, chat, terminal, keymap, command).await
+        && let Err(error) =
+            execute_palette_command(client, chat, terminal, terminal_events, keymap, command).await
     {
         helpers::report_client_error(&mut chat.app, "command failed", &error);
     }
@@ -82,6 +93,7 @@ async fn execute_palette_command<W: Write>(
     client: &BcodeClient,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     keymap: &BmuxKeyMap,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
@@ -93,6 +105,7 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::SwitchSession => {
             let selected_session_id = session_flow::pick_session(
                 terminal,
+                terminal_events,
                 client,
                 &BmuxKeyMap::from_config(&bcode_config::load_config()?.tui),
             )
@@ -143,6 +156,7 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::RenameSession => {
             session_flow::pick_session_for_mutation(
                 terminal,
+                terminal_events,
                 client,
                 session_flow::SessionPickerStartMode::Rename,
             )
@@ -151,6 +165,7 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::DeleteSession => {
             session_flow::pick_session_for_mutation(
                 terminal,
+                terminal_events,
                 client,
                 session_flow::SessionPickerStartMode::Delete,
             )
