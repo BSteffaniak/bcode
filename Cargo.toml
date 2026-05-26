@@ -155,7 +155,7 @@ reqwest = { version = "0.12.24", default-features = false, features = [
     "rustls-tls",
 ] }
 rpassword = { version = "7.4.0", default-features = false }
-rusqlite = { version = "0.37.0", default-features = false, features = [
+rusqlite = { version = "=0.32.1", default-features = false, features = [
     "bundled",
 ] }
 semver = { version = "1.0.28", default-features = false, features = ["std"] }
@@ -165,6 +165,12 @@ serde_json = { version = "1.0.149", default-features = false, features = [
 ] }
 sha2 = { version = "0.10.9", default-features = false }
 sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", rev = "87973bb7681c68cb9c787931b0ab402468adb517", default-features = false }
+switchy_database = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
+    "sqlite-rusqlite",
+] }
+switchy_database_connection = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
+    "sqlite-rusqlite",
+] }
 syntect = { version = "5.3.0", default-features = false, features = [
     "default-syntaxes",
     "default-themes",

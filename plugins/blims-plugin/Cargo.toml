@@ -14,9 +14,16 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_plugin_sdk = { workspace = true }
-serde            = { workspace = true, features = ["derive", "std"] }
-serde_json       = { workspace = true }
+bcode_plugin_sdk            = { workspace = true }
+serde                       = { workspace = true, features = ["derive", "std"] }
+serde_json                  = { workspace = true }
+switchy_database            = { workspace = true }
+switchy_database_connection = { workspace = true }
+thiserror                   = { workspace = true }
+tokio                       = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default          = []
