@@ -5,7 +5,6 @@ use std::io::Write;
 use bcode_client::BcodeClient;
 use bcode_skill_models::SkillId;
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::crossterm::poll_event;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
@@ -14,13 +13,13 @@ use bmux_tui::terminal::Terminal;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
-use super::{
-    EVENT_POLL_TIMEOUT, TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render,
-};
+use super::terminal_events::TerminalEventStream;
+use super::{TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render};
 
 /// Pick and perform a skill action for the active session.
 pub async fn pick_skill_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -36,7 +35,7 @@ pub async fn pick_skill_for_session<W: Write>(
     loop {
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| skill_picker_render::render_skill_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let Some(event) = terminal_events.recv().await? else {
             continue;
         };
         match event {

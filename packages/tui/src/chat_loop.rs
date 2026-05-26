@@ -17,7 +17,7 @@ use super::permission_dialog::PermissionDialogState;
 use super::session_flow::ActiveChat;
 use super::terminal_events::TerminalEventStream;
 use super::{
-    EVENT_POLL_TIMEOUT, TuiError, command_palette_render, composer_flow, history_flow, input,
+    CHAT_TICK_INTERVAL, TuiError, command_palette_render, composer_flow, history_flow, input,
     mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
     slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
 };
@@ -104,7 +104,7 @@ pub async fn run_with_client<W: Write>(
 
         let event = tokio::select! {
             event = terminal_events.recv() => event?,
-            () = tokio::time::sleep(EVENT_POLL_TIMEOUT) => None,
+            () = tokio::time::sleep(CHAT_TICK_INTERVAL) => None,
         };
         if let Some(event) = event {
             if handle_event(

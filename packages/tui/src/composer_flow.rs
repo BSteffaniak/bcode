@@ -111,11 +111,13 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::PickModel => {
             chat.app.clear_pending_submission(message);
-            model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;
+            model_flow::pick_model_for_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
         }
         slash_commands::SlashCommandOutcome::PickSkill => {
             chat.app.clear_pending_submission(message);
-            skill_flow::pick_skill_for_session(terminal, client, chat, keymap).await?;
+            skill_flow::pick_skill_for_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
         }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);

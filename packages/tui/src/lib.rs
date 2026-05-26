@@ -72,7 +72,7 @@ use bcode_session_models::SessionId;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
 use bmux_tui::terminal::Terminal;
 
-const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
+const CHAT_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const OLDER_HISTORY_EVENT_LIMIT: usize = 500;

@@ -4,7 +4,6 @@ use std::io::Write;
 
 use bcode_client::BcodeClient;
 use bmux_keyboard::KeyCode;
-use bmux_tui::crossterm::poll_event;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
@@ -13,9 +12,10 @@ use bmux_tui::terminal::Terminal;
 use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::picker_row_from_mouse;
+use super::terminal_events::TerminalEventStream;
 use super::{
-    EVENT_POLL_TIMEOUT, TuiError, model_picker, model_picker_render, provider_picker,
-    provider_picker_render, session_flow::ActiveChat,
+    TuiError, model_picker, model_picker_render, provider_picker, provider_picker_render,
+    session_flow::ActiveChat,
 };
 
 /// Show active model status in the transcript.
@@ -111,6 +111,7 @@ pub async fn show_runtime_status(
 /// Pick and set the active model for the current session.
 pub async fn pick_model_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -119,7 +120,7 @@ pub async fn pick_model_for_session<W: Write>(
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let provider_plugin_id = pick_model_provider(terminal, client, keymap).await?;
+    let provider_plugin_id = pick_model_provider(terminal, terminal_events, client, keymap).await?;
     let models = client
         .session_model_list(provider_plugin_id.clone())
         .await?
@@ -132,7 +133,7 @@ pub async fn pick_model_for_session<W: Write>(
     loop {
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let Some(event) = terminal_events.recv().await? else {
             continue;
         };
         match event {
@@ -193,6 +194,7 @@ pub async fn pick_model_for_session<W: Write>(
 
 async fn pick_model_provider<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
 ) -> Result<Option<String>, TuiError> {
@@ -210,7 +212,7 @@ async fn pick_model_provider<W: Write>(
         terminal.resize(helpers::terminal_area()?);
         terminal
             .draw(|frame| provider_picker_render::render_provider_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let Some(event) = terminal_events.recv().await? else {
             continue;
         };
         match event {

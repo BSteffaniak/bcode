@@ -89,6 +89,7 @@ pub async fn handle_palette_mouse<W: Write>(
     Ok(true)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_palette_command<W: Write>(
     client: &BcodeClient,
     chat: &mut ActiveChat,
@@ -116,13 +117,21 @@ async fn execute_palette_command<W: Write>(
             show_worktrees(client, chat).await?;
         }
         PaletteCommand::CreateSessionWorktree => {
-            worktree_flow::create_for_current_session(terminal, client, chat, keymap).await?;
+            worktree_flow::create_for_current_session(
+                terminal,
+                terminal_events,
+                client,
+                chat,
+                keymap,
+            )
+            .await?;
         }
         PaletteCommand::AttachWorktree => {
-            worktree_flow::attach_current_session(terminal, client, chat, keymap).await?;
+            worktree_flow::attach_current_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
         }
         PaletteCommand::RemoveWorktree => {
-            worktree_flow::remove_worktree(terminal, client, chat, keymap).await?;
+            worktree_flow::remove_worktree(terminal, terminal_events, client, chat, keymap).await?;
         }
         PaletteCommand::ShowModelStatus => {
             model_flow::show_model_status(client, chat).await?;
@@ -134,7 +143,8 @@ async fn execute_palette_command<W: Write>(
             model_flow::show_runtime_status(client, chat).await?;
         }
         PaletteCommand::SelectModel => {
-            model_flow::pick_model_for_session(terminal, client, chat, keymap).await?;
+            model_flow::pick_model_for_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
         }
         PaletteCommand::ToggleDiff => {
             let _changed = chat.app.toggle_diff_visible();
@@ -145,7 +155,8 @@ async fn execute_palette_command<W: Write>(
             });
         }
         PaletteCommand::ListSkills => {
-            skill_flow::pick_skill_for_session(terminal, client, chat, keymap).await?;
+            skill_flow::pick_skill_for_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
         }
         PaletteCommand::ActiveSkills => {
             skill_flow::show_active_skills(client, chat).await?;

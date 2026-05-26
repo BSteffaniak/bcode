@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use bcode_client::BcodeClient;
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::crossterm::poll_event;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
@@ -14,9 +13,10 @@ use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::session_flow::ActiveChat;
+use super::terminal_events::TerminalEventStream;
 use super::{
-    EVENT_POLL_TIMEOUT, TuiError, session_flow, worktree_create_dialog,
-    worktree_create_dialog_render, worktree_picker, worktree_picker_render,
+    TuiError, session_flow, worktree_create_dialog, worktree_create_dialog_render, worktree_picker,
+    worktree_picker_render,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,7 @@ enum PickerKeyOutcome {
 /// Create a worktree for the current session using a dialog.
 pub async fn create_for_current_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -46,7 +47,7 @@ pub async fn create_for_current_session<W: Write>(
     loop {
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| worktree_create_dialog_render::render_dialog(&dialog, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let Some(event) = terminal_events.recv().await? else {
             continue;
         };
         match event {
@@ -125,6 +126,7 @@ pub async fn create_for_current_session<W: Write>(
 /// Pick a worktree and attach the current session to it.
 pub async fn attach_current_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -140,7 +142,7 @@ pub async fn attach_current_session<W: Write>(
     loop {
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let Some(event) = terminal_events.recv().await? else {
             continue;
         };
         match event {
@@ -182,6 +184,7 @@ pub async fn attach_current_session<W: Write>(
 /// Pick a worktree and remove it after confirmation.
 pub async fn remove_worktree<W: Write>(
     terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TerminalEventStream,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -206,7 +209,7 @@ pub async fn remove_worktree<W: Write>(
     loop {
         terminal.resize(helpers::terminal_area()?);
         terminal.draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
-        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+        let Some(event) = terminal_events.recv().await? else {
             continue;
         };
         match event {
