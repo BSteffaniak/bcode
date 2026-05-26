@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use bcode_client::BcodeClient;
-use bcode_worktree_models::{WorktreeCreateRequest, WorktreeListRequest};
+use bcode_worktree_models::WorktreeListRequest;
 use bmux_keyboard::KeyStroke;
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
 use bmux_tui::terminal::Terminal;
@@ -103,7 +103,7 @@ async fn execute_palette_command<W: Write>(
             show_worktrees(client, chat).await?;
         }
         PaletteCommand::CreateSessionWorktree => {
-            create_worktree_for_current_session(client, chat).await?;
+            worktree_flow::create_for_current_session(terminal, client, chat, keymap).await?;
         }
         PaletteCommand::AttachWorktree => {
             worktree_flow::attach_current_session(terminal, client, chat, keymap).await?;
@@ -207,47 +207,6 @@ async fn show_worktrees(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(
             .join("\n"),
     );
     chat.app.set_status("shown worktrees".to_owned());
-    Ok(())
-}
-
-async fn create_worktree_for_current_session(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
-    let name = chat
-        .app
-        .session_title()
-        .map_or_else(|| format!("session-{session_id}"), ToString::to_string);
-    let response = client
-        .create_worktree(WorktreeCreateRequest {
-            name,
-            cwd: chat
-                .app
-                .working_directory()
-                .map(std::path::Path::to_path_buf),
-            path: None,
-            branch: None,
-            new_branch: None,
-            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
-            detach: false,
-            force: false,
-            attach_session_id: Some(session_id),
-            new_session: false,
-            no_setup: false,
-        })
-        .await?;
-    if let Some(session) = response.session {
-        chat.app.apply_session_summary(&session);
-    }
-    chat.app.push_system_note(format!(
-        "Created worktree for current session\n* Path: {}",
-        response.path.display()
-    ));
-    chat.app.set_status("created worktree".to_owned());
     Ok(())
 }
 

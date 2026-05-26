@@ -14,7 +14,10 @@ use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::session_flow::ActiveChat;
-use super::{EVENT_POLL_TIMEOUT, TuiError, session_flow, worktree_picker, worktree_picker_render};
+use super::{
+    EVENT_POLL_TIMEOUT, TuiError, session_flow, worktree_create_dialog,
+    worktree_create_dialog_render, worktree_picker, worktree_picker_render,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerKeyOutcome {
@@ -22,6 +25,101 @@ enum PickerKeyOutcome {
     Selected,
     ForceSelected,
     Canceled,
+}
+
+/// Create a worktree for the current session using a dialog.
+pub async fn create_for_current_session<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    keymap: &BmuxKeyMap,
+) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    let default_name = chat
+        .app
+        .session_title()
+        .map_or_else(|| format!("session-{session_id}"), ToString::to_string);
+    let mut dialog = worktree_create_dialog::WorktreeCreateDialog::new(&default_name);
+    loop {
+        terminal.resize(helpers::terminal_area()?);
+        terminal.draw(|frame| worktree_create_dialog_render::render_dialog(&dialog, frame))?;
+        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text)
+                if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name =>
+            {
+                dialog.name_mut().insert_str(&text);
+            }
+            Event::Key(stroke) => match stroke.key {
+                KeyCode::Escape => return Err(TuiError::Canceled),
+                KeyCode::Tab => dialog.focus_next(),
+                KeyCode::Left
+                    if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Base =>
+                {
+                    dialog.previous_base();
+                }
+                KeyCode::Right
+                    if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Base =>
+                {
+                    dialog.next_base();
+                }
+                KeyCode::Enter => {
+                    let name = dialog.name_text();
+                    if name.is_empty() {
+                        chat.app.set_status("worktree name is required".to_owned());
+                        continue;
+                    }
+                    let response = client
+                        .create_worktree(bcode_worktree_models::WorktreeCreateRequest {
+                            name,
+                            cwd: chat
+                                .app
+                                .working_directory()
+                                .map(std::path::Path::to_path_buf),
+                            path: None,
+                            branch: None,
+                            new_branch: None,
+                            base_ref: Some(dialog.base().model()),
+                            detach: false,
+                            force: false,
+                            attach_session_id: Some(session_id),
+                            new_session: false,
+                            no_setup: false,
+                        })
+                        .await?;
+                    if let Some(session) = response.session {
+                        chat.app.apply_session_summary(&session);
+                    }
+                    chat.app.push_system_note(format!(
+                        "Created worktree for current session\n* Path: {}",
+                        response.path.display()
+                    ));
+                    chat.app.set_status("created worktree".to_owned());
+                    return Ok(());
+                }
+                _ if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name => {
+                    let _ = helpers::handle_text_buffer_key(
+                        dialog.name_mut(),
+                        keymap,
+                        stroke,
+                        bmux_tui::input::TextInputEnterBehavior::Submit,
+                    );
+                }
+                _ => {}
+            },
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Tick
+            | Event::User(_)
+            | Event::Mouse(_)
+            | Event::Paste(_) => {}
+        }
+    }
 }
 
 /// Pick a worktree and attach the current session to it.
