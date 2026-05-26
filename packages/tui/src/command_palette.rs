@@ -15,6 +15,8 @@ pub enum PaletteCommand {
     ListWorktrees,
     /// Create a worktree for the current session.
     CreateSessionWorktree,
+    /// Attach current session to an existing worktree.
+    AttachWorktree,
     /// Show active model status.
     ShowModelStatus,
     /// Show server default model/provider.
@@ -48,6 +50,7 @@ impl PaletteCommand {
             Self::SwitchSession => "session.switch",
             Self::ListWorktrees => "worktree.list",
             Self::CreateSessionWorktree => "worktree.createSession",
+            Self::AttachWorktree => "worktree.attach",
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
             Self::ShowRuntimeStatus => "runtime.status",
@@ -69,6 +72,7 @@ impl PaletteCommand {
             "session.switch" => Some(Self::SwitchSession),
             "worktree.list" => Some(Self::ListWorktrees),
             "worktree.createSession" => Some(Self::CreateSessionWorktree),
+            "worktree.attach" => Some(Self::AttachWorktree),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
             "runtime.status" => Some(Self::ShowRuntimeStatus),
@@ -123,6 +127,7 @@ impl BmuxCommandPalette {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn palette_items() -> Vec<PaletteItem> {
     vec![
         item(
@@ -148,6 +153,12 @@ fn palette_items() -> Vec<PaletteItem> {
             "Worktree: Create for Current Session",
             "Create and move this session into a worktree",
             "worktree create current session branch",
+        ),
+        item(
+            PaletteCommand::AttachWorktree,
+            "Worktree: Attach Current Session",
+            "Choose an existing worktree for this session",
+            "worktree attach switch current session picker",
         ),
         item(
             PaletteCommand::ShowModelStatus,

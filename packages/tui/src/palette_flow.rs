@@ -13,7 +13,7 @@ use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::session_flow::{self, ActiveChat};
-use super::{TuiError, model_flow, skill_flow};
+use super::{TuiError, model_flow, skill_flow, worktree_flow};
 
 /// Handle one key while the command palette is open.
 pub async fn handle_palette_key<W: Write>(
@@ -104,6 +104,9 @@ async fn execute_palette_command<W: Write>(
         }
         PaletteCommand::CreateSessionWorktree => {
             create_worktree_for_current_session(client, chat).await?;
+        }
+        PaletteCommand::AttachWorktree => {
+            worktree_flow::attach_current_session(terminal, client, chat, keymap).await?;
         }
         PaletteCommand::ShowModelStatus => {
             model_flow::show_model_status(client, chat).await?;

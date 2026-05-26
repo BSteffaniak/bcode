@@ -58,6 +58,9 @@ pub(crate) mod tool_present;
 pub(crate) mod transcript;
 pub(crate) mod transcript_layout;
 pub(crate) mod transcript_viewport;
+pub(crate) mod worktree_flow;
+pub(crate) mod worktree_picker;
+pub(crate) mod worktree_picker_render;
 
 use std::io;
 use std::time::Duration;
