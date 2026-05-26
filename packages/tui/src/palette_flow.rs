@@ -89,13 +89,48 @@ pub async fn handle_palette_mouse<W: Write>(
     Ok(true)
 }
 
-#[allow(clippy::too_many_lines)]
 async fn execute_palette_command<W: Write>(
     client: &BcodeClient,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
     terminal_events: &mut TuiInput,
     keymap: &BmuxKeyMap,
+    command: PaletteCommand,
+) -> Result<(), TuiError> {
+    match command {
+        PaletteCommand::NewSession
+        | PaletteCommand::SwitchSession
+        | PaletteCommand::RenameSession
+        | PaletteCommand::DeleteSession => {
+            execute_session_command(client, chat, terminal, terminal_events, command).await
+        }
+        PaletteCommand::ListWorktrees
+        | PaletteCommand::CreateSessionWorktree
+        | PaletteCommand::AttachWorktree
+        | PaletteCommand::RemoveWorktree => {
+            execute_worktree_command(client, chat, terminal, terminal_events, keymap, command).await
+        }
+        PaletteCommand::ShowModelStatus
+        | PaletteCommand::ShowServerModelStatus
+        | PaletteCommand::ShowRuntimeStatus
+        | PaletteCommand::SelectModel => {
+            execute_model_command(client, chat, terminal, terminal_events, keymap, command).await
+        }
+        PaletteCommand::ListSkills | PaletteCommand::ActiveSkills => {
+            execute_skill_command(client, chat, terminal, terminal_events, keymap, command).await
+        }
+        PaletteCommand::ToggleDiff
+        | PaletteCommand::Help
+        | PaletteCommand::CancelTurn
+        | PaletteCommand::CompactContext => execute_chat_command(client, chat, command).await,
+    }
+}
+
+async fn execute_session_command<W: Write>(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TuiInput,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
@@ -112,57 +147,6 @@ async fn execute_palette_command<W: Write>(
             )
             .await?;
             session_flow::switch_session(client, chat, selected_session_id).await?;
-        }
-        PaletteCommand::ListWorktrees => {
-            show_worktrees(client, chat).await?;
-        }
-        PaletteCommand::CreateSessionWorktree => {
-            worktree_flow::create_for_current_session(
-                terminal,
-                terminal_events,
-                client,
-                chat,
-                keymap,
-            )
-            .await?;
-        }
-        PaletteCommand::AttachWorktree => {
-            worktree_flow::attach_current_session(terminal, terminal_events, client, chat, keymap)
-                .await?;
-        }
-        PaletteCommand::RemoveWorktree => {
-            worktree_flow::remove_worktree(terminal, terminal_events, client, chat, keymap).await?;
-        }
-        PaletteCommand::ShowModelStatus => {
-            model_flow::show_model_status(client, chat).await?;
-        }
-        PaletteCommand::ShowServerModelStatus => {
-            model_flow::show_server_model_status(client, chat).await?;
-        }
-        PaletteCommand::ShowRuntimeStatus => {
-            model_flow::show_runtime_status(client, chat).await?;
-        }
-        PaletteCommand::SelectModel => {
-            model_flow::pick_model_for_session(terminal, terminal_events, client, chat, keymap)
-                .await?;
-        }
-        PaletteCommand::ToggleDiff => {
-            let _changed = chat.app.toggle_diff_visible();
-            chat.app.set_status(if chat.app.diff_visible() {
-                "diff panel shown".to_owned()
-            } else {
-                "diff panel hidden".to_owned()
-            });
-        }
-        PaletteCommand::ListSkills => {
-            skill_flow::pick_skill_for_session(terminal, terminal_events, client, chat, keymap)
-                .await?;
-        }
-        PaletteCommand::ActiveSkills => {
-            skill_flow::show_active_skills(client, chat).await?;
-        }
-        PaletteCommand::Help => {
-            show_bmux_help(chat);
         }
         PaletteCommand::RenameSession => {
             session_flow::pick_session_for_mutation(
@@ -182,29 +166,130 @@ async fn execute_palette_command<W: Write>(
             )
             .await?;
         }
-        PaletteCommand::CancelTurn => {
-            let Some(session_id) = chat.app.session_id() else {
-                chat.app.set_status("No active session".to_owned());
-                return Ok(());
-            };
-            let cancelled = client.cancel_session_turn(session_id).await?;
-            if cancelled {
-                chat.app.set_cancelling();
-                chat.app.set_status("cancel requested".to_owned());
-            } else {
-                chat.app.set_idle();
-                chat.app.set_status("no active turn to cancel".to_owned());
-            }
-        }
-        PaletteCommand::CompactContext => {
-            let Some(session_id) = chat.app.session_id() else {
-                chat.app.set_status("No active session".to_owned());
-                return Ok(());
-            };
-            let message = client.compact_session(session_id).await?;
-            chat.app.set_status(message);
-        }
+        _ => {}
     }
+    Ok(())
+}
+
+async fn execute_worktree_command<W: Write>(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TuiInput,
+    keymap: &BmuxKeyMap,
+    command: PaletteCommand,
+) -> Result<(), TuiError> {
+    match command {
+        PaletteCommand::ListWorktrees => show_worktrees(client, chat).await?,
+        PaletteCommand::CreateSessionWorktree => {
+            worktree_flow::create_for_current_session(
+                terminal,
+                terminal_events,
+                client,
+                chat,
+                keymap,
+            )
+            .await?;
+        }
+        PaletteCommand::AttachWorktree => {
+            worktree_flow::attach_current_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
+        }
+        PaletteCommand::RemoveWorktree => {
+            worktree_flow::remove_worktree(terminal, terminal_events, client, chat, keymap).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn execute_model_command<W: Write>(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TuiInput,
+    keymap: &BmuxKeyMap,
+    command: PaletteCommand,
+) -> Result<(), TuiError> {
+    match command {
+        PaletteCommand::ShowModelStatus => model_flow::show_model_status(client, chat).await?,
+        PaletteCommand::ShowServerModelStatus => {
+            model_flow::show_server_model_status(client, chat).await?;
+        }
+        PaletteCommand::ShowRuntimeStatus => model_flow::show_runtime_status(client, chat).await?,
+        PaletteCommand::SelectModel => {
+            model_flow::pick_model_for_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn execute_skill_command<W: Write>(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    terminal: &mut Terminal<&mut W>,
+    terminal_events: &mut TuiInput,
+    keymap: &BmuxKeyMap,
+    command: PaletteCommand,
+) -> Result<(), TuiError> {
+    match command {
+        PaletteCommand::ListSkills => {
+            skill_flow::pick_skill_for_session(terminal, terminal_events, client, chat, keymap)
+                .await?;
+        }
+        PaletteCommand::ActiveSkills => skill_flow::show_active_skills(client, chat).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn execute_chat_command(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    command: PaletteCommand,
+) -> Result<(), TuiError> {
+    match command {
+        PaletteCommand::ToggleDiff => {
+            let _changed = chat.app.toggle_diff_visible();
+            chat.app.set_status(if chat.app.diff_visible() {
+                "diff panel shown".to_owned()
+            } else {
+                "diff panel hidden".to_owned()
+            });
+        }
+        PaletteCommand::Help => show_bmux_help(chat),
+        PaletteCommand::CancelTurn => cancel_turn(client, chat).await?,
+        PaletteCommand::CompactContext => compact_context(client, chat).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn cancel_turn(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    let cancelled = client.cancel_session_turn(session_id).await?;
+    if cancelled {
+        chat.app.set_cancelling();
+        chat.app.set_status("cancel requested".to_owned());
+    } else {
+        chat.app.set_idle();
+        chat.app.set_status("no active turn to cancel".to_owned());
+    }
+    Ok(())
+}
+
+async fn compact_context(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return Ok(());
+    };
+    let message = client.compact_session(session_id).await?;
+    chat.app.set_status(message);
     Ok(())
 }
 
