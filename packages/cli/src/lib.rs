@@ -518,6 +518,9 @@ enum BlimsTaskCommand {
         #[arg(long)]
         json: bool,
     },
+    Work {
+        task_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -962,6 +965,13 @@ struct BlimsAgentTalkPrompt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsTaskWorkPrompt {
+    task_id: String,
+    agent_id: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsPlanningPrompt {
     initiative_id: String,
     prompt: String,
@@ -1096,6 +1106,20 @@ async fn refresh_blims_office(
 async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
     let parts = command.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
+        ["new" | "create", "initiative", rest @ ..] => {
+            create_office_initiative(&rest.join(" ")).await?;
+        }
+        ["plan", "initiative", initiative_id] | ["plan", initiative_id] => {
+            start_blims_initiative_plan((*initiative_id).to_string()).await?;
+        }
+        ["import", "plan", initiative_id, plan_path] => {
+            import_blims_initiative_plan(
+                (*initiative_id).to_string(),
+                (*plan_path).to_string(),
+                true,
+            )
+            .await?;
+        }
         ["inspect", "initiative", initiative_id] | ["initiative", initiative_id] => {
             print_office_initiative(initiative_id).await?;
         }
@@ -1104,6 +1128,9 @@ async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
         }
         ["inspect", "artifact", artifact_id] | ["artifact", artifact_id] => {
             print_office_artifact(artifact_id).await?;
+        }
+        ["work", "task", task_id] | ["work", task_id] => {
+            start_blims_task_work((*task_id).to_string()).await?;
         }
         ["talk" | "ai", agent_id] => {
             start_blims_agent_talk((*agent_id).to_string()).await?;
@@ -1128,6 +1155,31 @@ async fn print_office_initiatives() -> Result<(), CliError> {
     print_initiative_list(&decode_blims_response::<Vec<BlimsInitiativeSummary>>(
         response,
     )?);
+    Ok(())
+}
+
+async fn create_office_initiative(title: &str) -> Result<(), CliError> {
+    let title = title.trim();
+    if title.is_empty() {
+        println!("usage: new initiative <title>");
+        return Ok(());
+    }
+    let request = BlimsInitiativeCreateRequest {
+        working_directory: std::env::current_dir()?,
+        title: title.to_string(),
+        description: None,
+        priority: None,
+    };
+    let response = call_blims_service("initiative.create", serde_json::to_vec(&request)?).await?;
+    let initiative = decode_blims_response::<BlimsInitiativeSummary>(response)?;
+    println!(
+        "initiative created: {} ({})",
+        initiative.title, initiative.id
+    );
+    println!(
+        "Tip: run `plan {}` here in the office to ask Blims for a dynamic plan.",
+        initiative.id
+    );
     Ok(())
 }
 
@@ -1236,6 +1288,28 @@ async fn start_agent_talk_session(prompt: BlimsAgentTalkPrompt) -> Result<(), Cl
     Ok(())
 }
 
+async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "task_id": task_id,
+    });
+    let response = call_blims_service("task.work_prompt", serde_json::to_vec(&request)?).await?;
+    let prompt = decode_blims_response::<BlimsTaskWorkPrompt>(response)?;
+    let session = BcodeClient::default_endpoint()
+        .create_session(Some(format!("Blims task: {}", prompt.task_id)))
+        .await?;
+    BcodeClient::default_endpoint()
+        .send_user_message(session.id, prompt.prompt)
+        .await?;
+    println!(
+        "task work session for {} as {}: {}",
+        prompt.task_id, prompt.agent_id, session.id
+    );
+    println!("Attaching now. Press Ctrl-C to return.");
+    attach_session(session.id).await?;
+    Ok(())
+}
+
 fn print_blims_office(
     world: &BlimsWorldSnapshot,
     report: &BlimsMorningReport,
@@ -1281,7 +1355,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, inspect <initiative|task|artifact> <id>, refresh, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, inspect <initiative|task|artifact> <id>, refresh, w world, q quit"
     );
 }
 
@@ -1407,6 +1481,9 @@ async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliE
             } else {
                 print_task_detail(&decode_blims_response::<BlimsTaskSummary>(response)?);
             }
+        }
+        BlimsTaskCommand::Work { task_id } => {
+            start_blims_task_work(task_id).await?;
         }
     }
     Ok(())
@@ -1550,37 +1627,14 @@ async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Res
             println!("{}", prompt.prompt);
         }
         BlimsInitiativeCommand::Plan { initiative_id } => {
-            let prompt = blims_initiative_plan_prompt(initiative_id).await?;
-            let session = BcodeClient::default_endpoint()
-                .create_session(Some(format!("Blims plan: {}", prompt.initiative_id)))
-                .await?;
-            BcodeClient::default_endpoint()
-                .send_user_message(session.id, prompt.prompt)
-                .await?;
-            println!("planning session: {}", session.id);
-            println!(
-                "When the AI returns JSON, import it with: bcode blims initiative import-plan {} '<json>'",
-                prompt.initiative_id
-            );
+            start_blims_initiative_plan(initiative_id).await?;
         }
         BlimsInitiativeCommand::ImportPlan {
             initiative_id,
             plan,
             file,
         } => {
-            let plan_json = if file {
-                std::fs::read_to_string(plan)?
-            } else {
-                plan
-            };
-            let request = BlimsInitiativeImportPlanRequest {
-                working_directory: std::env::current_dir()?,
-                initiative_id,
-                plan: serde_json::from_str(&plan_json)?,
-            };
-            let response =
-                call_blims_service("initiative.import_plan", serde_json::to_vec(&request)?).await?;
-            print_blims_service_response(response);
+            import_blims_initiative_plan(initiative_id, plan, file).await?;
         }
     }
     Ok(())
@@ -1596,6 +1650,49 @@ async fn blims_initiative_plan_prompt(
     let response =
         call_blims_service("initiative.plan_prompt", serde_json::to_vec(&request)?).await?;
     decode_blims_response::<BlimsPlanningPrompt>(response)
+}
+
+async fn start_blims_initiative_plan(initiative_id: String) -> Result<(), CliError> {
+    let prompt = blims_initiative_plan_prompt(initiative_id).await?;
+    let session = BcodeClient::default_endpoint()
+        .create_session(Some(format!("Blims plan: {}", prompt.initiative_id)))
+        .await?;
+    BcodeClient::default_endpoint()
+        .send_user_message(session.id, prompt.prompt)
+        .await?;
+    println!("planning session: {}", session.id);
+    println!(
+        "When the AI returns JSON, import it with: bcode blims initiative import-plan {} '<json>'",
+        prompt.initiative_id
+    );
+    println!(
+        "Or save the JSON and run in-office: import plan {} <file>",
+        prompt.initiative_id
+    );
+    println!("Attaching now. Press Ctrl-C to return.");
+    attach_session(session.id).await?;
+    Ok(())
+}
+
+async fn import_blims_initiative_plan(
+    initiative_id: String,
+    plan: String,
+    file: bool,
+) -> Result<(), CliError> {
+    let plan_json = if file {
+        std::fs::read_to_string(plan)?
+    } else {
+        plan
+    };
+    let request = BlimsInitiativeImportPlanRequest {
+        working_directory: std::env::current_dir()?,
+        initiative_id,
+        plan: serde_json::from_str(&plan_json)?,
+    };
+    let response =
+        call_blims_service("initiative.import_plan", serde_json::to_vec(&request)?).await?;
+    print_blims_service_response(response);
+    Ok(())
 }
 
 async fn handle_blims_guidance_command(command: BlimsGuidanceCommand) -> Result<(), CliError> {

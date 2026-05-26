@@ -55,6 +55,9 @@ pub const OP_TASK_LIST: &str = "task.list";
 /// Task inspect operation.
 pub const OP_TASK_INSPECT: &str = "task.inspect";
 
+/// Task work prompt operation.
+pub const OP_TASK_WORK_PROMPT: &str = "task.work_prompt";
+
 /// Artifact list operation.
 pub const OP_ARTIFACT_LIST: &str = "artifact.list";
 
@@ -102,6 +105,7 @@ impl RustPlugin for BlimsPlugin {
             OP_INITIATIVE_IMPORT_PLAN => service_initiative_import_plan(&context.request),
             OP_TASK_LIST => service_task_list(&context.request),
             OP_TASK_INSPECT => service_task_inspect(&context.request),
+            OP_TASK_WORK_PROMPT => service_task_work_prompt(&context.request),
             OP_ARTIFACT_LIST => service_artifact_list(&context.request),
             OP_ARTIFACT_INSPECT => service_artifact_inspect(&context.request),
             OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
@@ -180,6 +184,17 @@ pub struct ArtifactInspectRequest {
     pub working_directory: PathBuf,
     /// Artifact id.
     pub artifact_id: String,
+}
+
+/// Prompt for starting real task work through Bcode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskWorkPrompt {
+    /// Task id.
+    pub task_id: String,
+    /// Suggested agent id.
+    pub agent_id: String,
+    /// Prompt text.
+    pub prompt: String,
 }
 
 /// Request to inspect an initiative.
@@ -660,6 +675,17 @@ fn service_task_inspect(request: &ServiceRequest) -> ServiceResponse {
     match inspect_task(&request) {
         Ok(task) => json_response(&task),
         Err(error) => ServiceResponse::error("task_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_task_work_prompt(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<TaskInspectRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match build_task_work_prompt(&request) {
+        Ok(prompt) => json_response(&prompt),
+        Err(error) => ServiceResponse::error("task_work_prompt_failed", error.to_string()),
     }
 }
 
@@ -1455,6 +1481,40 @@ fn inspect_task(request: &TaskInspectRequest) -> Result<TaskSummary, BlimsStateE
     })
 }
 
+fn build_task_work_prompt(request: &TaskInspectRequest) -> Result<TaskWorkPrompt, BlimsStateError> {
+    let task_id = request.task_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let data = load_company_data_from_database(database).await?;
+            let task = database
+                .select("tasks")
+                .columns(&[
+                    "id",
+                    "initiative_id",
+                    "title",
+                    "description",
+                    "status",
+                    "assigned_agent_id",
+                    "rationale",
+                    "priority",
+                ])
+                .filter(Box::new(where_eq("id", task_id)))
+                .limit(1)
+                .execute_first(database)
+                .await?
+                .as_ref()
+                .map(task_summary)
+                .transpose()?
+                .ok_or(BlimsStateError::MissingColumn("task"))?;
+            Ok(TaskWorkPrompt {
+                task_id: task.id.clone(),
+                agent_id: task.assigned_agent_id.clone(),
+                prompt: task_work_prompt_text(&task, &data),
+            })
+        })
+    })
+}
+
 fn list_artifacts(working_directory: &Path) -> Result<Vec<ArtifactSummary>, BlimsStateError> {
     with_database(working_directory, |database| {
         Box::pin(async move {
@@ -1510,6 +1570,51 @@ fn build_agent_talk_prompt(
             })
         })
     })
+}
+
+fn task_work_prompt_text(task: &TaskSummary, data: &CompanyData) -> String {
+    let initiative = data
+        .initiatives
+        .iter()
+        .find(|initiative| initiative.id == task.initiative_id);
+    let assigned_agent = data
+        .agents
+        .iter()
+        .find(|agent| agent.id == task.assigned_agent_id);
+    let guidance = data
+        .guidance
+        .iter()
+        .map(|item| format!("* [{}] {}", item.strength, item.guidance))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are working as a Blims agent inside Bcode. Do real useful work for this repo, but keep changes sandboxed/proposed unless explicitly approved.\n\n\
+         Company mission: {}\nCulture: {}\n\nActive CEO guidance:\n{}\n\n\
+         Initiative: {}\nInitiative description: {}\n\n\
+         Task `{}`: {}\nDescription: {}\nStatus: {}\nPriority: {}\nAssigned agent: {}\nRationale: {}\n\n\
+         Produce concrete implementation, review, research, docs, or artifact work as appropriate. Prefer small reviewable changes. Explain what you changed or propose, validation to run, risks, and next steps.",
+        data.company.mission,
+        data.company.culture,
+        if guidance.is_empty() {
+            "* none"
+        } else {
+            &guidance
+        },
+        initiative.map_or("unknown initiative", |initiative| initiative.title.as_str()),
+        initiative.map_or("unknown initiative description", |initiative| {
+            initiative.description.as_str()
+        }),
+        task.id,
+        task.title,
+        task.description,
+        task.status,
+        task.priority,
+        assigned_agent.map_or_else(
+            || task.assigned_agent_id.clone(),
+            |agent| format!("{} ({})", agent.name, agent.role),
+        ),
+        task.rationale
+    )
 }
 
 fn agent_talk_prompt_text(agent: &AgentRecord, data: &CompanyData) -> String {
