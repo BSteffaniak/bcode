@@ -83,7 +83,7 @@ pub struct CompanyStatus {
     pub daemon_connected: bool,
     /// Resolved Blims state root.
     pub state_root: PathBuf,
-    /// Resolved Blims SQLite database path.
+    /// Resolved Blims `SQLite` database path.
     pub database_path: PathBuf,
 }
 
@@ -131,7 +131,7 @@ pub enum BlimsStateError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
-    /// SQLite initialization failed.
+    /// `SQLite` initialization failed.
     #[error("failed to initialize Blims SQLite database {path}: {source}")]
     InitDatabase {
         /// Database path that could not be opened.
@@ -142,6 +142,9 @@ pub enum BlimsStateError {
     /// Schema initialization failed.
     #[error("failed to initialize Blims database schema: {0}")]
     Schema(#[from] switchy_database::DatabaseError),
+    /// State initialization worker panicked.
+    #[error("Blims state initialization worker panicked")]
+    WorkerPanicked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,8 +156,7 @@ struct StatePaths {
 #[must_use]
 fn state_paths(working_directory: &Path) -> StatePaths {
     let state_root = env::var_os(BLIMS_STATE_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| working_directory.join(DEFAULT_STATE_ROOT));
+        .map_or_else(|| working_directory.join(DEFAULT_STATE_ROOT), PathBuf::from);
     let database_path = state_root.join(DATABASE_FILE_NAME);
 
     StatePaths {
@@ -218,19 +220,24 @@ fn create_company_state(working_directory: &Path) -> Result<CompanyStatus, Blims
         }
     })?;
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("current-thread Tokio runtime should build");
-    runtime.block_on(async {
-        let database = switchy_database_connection::init(Some(&paths.database_path), None)
-            .await
-            .map_err(|source| BlimsStateError::InitDatabase {
-                path: paths.database_path.clone(),
-                source,
-            })?;
-        initialize_schema(database.as_ref()).await?;
-        Ok::<(), BlimsStateError>(())
-    })?;
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread Tokio runtime should build");
+        runtime.block_on(async {
+            let database = switchy_database_connection::init(Some(&paths.database_path), None)
+                .await
+                .map_err(|source| BlimsStateError::InitDatabase {
+                    path: paths.database_path.clone(),
+                    source,
+                })?;
+            initialize_schema(database.as_ref()).await?;
+            Ok::<(), BlimsStateError>(())
+        })
+    })
+    .join()
+    .map_err(|_| BlimsStateError::WorkerPanicked)??;
 
     Ok(company_status(working_directory))
 }

@@ -23,7 +23,7 @@ use bcode_worktree_models::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Read as _, Write as _};
@@ -83,6 +83,8 @@ pub enum CliError {
     NewSessionWithCommand,
     #[error("{0}")]
     LoginProfile(String),
+    #[error("Blims error: {0}")]
+    Blims(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
 }
@@ -137,6 +139,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             SessionCommand::Repair { session_id } => session_repair(session_id)?,
         },
         Commands::Worktree { command } => handle_worktree_command(command).await?,
+        Commands::Blims { command } => handle_blims_command(command).await?,
         Commands::Migrate { command } => handle_migrate_command(command)?,
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
@@ -268,6 +271,10 @@ enum Commands {
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
+    },
+    Blims {
+        #[command(subcommand)]
+        command: BlimsCommand,
     },
     Migrate {
         #[command(subcommand)]
@@ -405,6 +412,22 @@ enum WorktreeBaseRefArg {
     Auto,
     DefaultBranch,
     Head,
+}
+
+#[derive(Debug, Subcommand)]
+enum BlimsCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Create {
+        #[arg(long)]
+        json: bool,
+    },
+    Report {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl WorktreeBaseRefArg {
@@ -715,6 +738,102 @@ enum PluginCommand {
         topic: String,
         payload: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BlimsWorkspaceRequest {
+    working_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsCompanyStatus {
+    state: String,
+    message: String,
+    daemon_connected: bool,
+    state_root: PathBuf,
+    database_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsMorningReport {
+    title: String,
+    bullets: Vec<String>,
+}
+
+async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    match command {
+        BlimsCommand::Status { json } => {
+            let response = call_blims_service("company.status", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
+                println!("Blims: {}", status.state);
+                println!("{}", status.message);
+                println!("daemon connected: {}", status.daemon_connected);
+                println!("state root: {}", status.state_root.display());
+                println!("database: {}", status.database_path.display());
+            }
+        }
+        BlimsCommand::Create { json } => {
+            let response = call_blims_service("company.create", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
+                println!("Blims company created");
+                println!("state root: {}", status.state_root.display());
+                println!("database: {}", status.database_path.display());
+            }
+        }
+        BlimsCommand::Report { json } => {
+            let response = call_blims_service("report.morning", Vec::new()).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let report = decode_blims_response::<BlimsMorningReport>(response)?;
+                println!("{}", report.title);
+                for bullet in report.bullets {
+                    println!("* {bullet}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn blims_workspace_payload() -> Result<Vec<u8>, CliError> {
+    let request = BlimsWorkspaceRequest {
+        working_directory: std::env::current_dir()?,
+    };
+    Ok(serde_json::to_vec(&request)?)
+}
+
+async fn call_blims_service(
+    operation: &str,
+    payload: Vec<u8>,
+) -> Result<bcode_ipc::PluginServiceResponse, CliError> {
+    BcodeClient::default_endpoint()
+        .call_plugin_service("bcode.blims/v1".to_string(), operation.to_string(), payload)
+        .await
+        .map_err(CliError::from)
+}
+
+fn decode_blims_response<T: for<'de> Deserialize<'de>>(
+    response: bcode_ipc::PluginServiceResponse,
+) -> Result<T, CliError> {
+    if let Some(error) = response.error {
+        return Err(CliError::Blims(format!(
+            "{}: {}",
+            error.code, error.message
+        )));
+    }
+    Ok(serde_json::from_slice(&response.payload)?)
+}
+
+fn print_blims_service_response(response: bcode_ipc::PluginServiceResponse) {
+    print_service_response(response);
 }
 
 async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {

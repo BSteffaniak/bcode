@@ -3,7 +3,7 @@ name    = "Blims"
 version = "0.0.1"
 
 [[services]]
-class        = "company_simulation"
+class        = "service"
 description  = "Persistent cozy AI company simulator services"
 interface_id = "bcode.blims/v1"
 name         = "Blims Company Simulator"

@@ -20,7 +20,7 @@ serde_json                  = { workspace = true }
 switchy_database            = { workspace = true }
 switchy_database_connection = { workspace = true }
 thiserror                   = { workspace = true }
-tokio                       = { workspace = true, features = ["rt"] }
+tokio                       = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
