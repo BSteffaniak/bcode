@@ -436,6 +436,14 @@ enum BlimsCommand {
     Talk {
         agent_id: String,
     },
+    Task {
+        #[command(subcommand)]
+        command: BlimsTaskCommand,
+    },
+    Artifact {
+        #[command(subcommand)]
+        command: BlimsArtifactCommand,
+    },
     Initiative {
         #[command(subcommand)]
         command: BlimsInitiativeCommand,
@@ -488,6 +496,22 @@ enum BlimsGuidanceCommand {
         #[arg(long)]
         json: bool,
     },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlimsTaskCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlimsArtifactCommand {
     List {
         #[arg(long)]
         json: bool,
@@ -888,6 +912,32 @@ struct BlimsGuidanceSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsTaskSummary {
+    id: String,
+    initiative_id: String,
+    title: String,
+    description: String,
+    status: String,
+    assigned_agent_id: String,
+    rationale: String,
+    priority: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsArtifactSummary {
+    id: String,
+    initiative_id: String,
+    kind: String,
+    title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsAgentTalkPrompt {
+    agent_id: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsPlanningPrompt {
     initiative_id: String,
     prompt: String,
@@ -951,6 +1001,8 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
         }
         BlimsCommand::Enter => enter_blims_office().await?,
         BlimsCommand::Talk { agent_id } => start_blims_agent_talk(agent_id).await?,
+        BlimsCommand::Task { command } => handle_blims_task_command(command).await?,
+        BlimsCommand::Artifact { command } => handle_blims_artifact_command(command).await?,
         BlimsCommand::Initiative { command } => handle_blims_initiative_command(command).await?,
         BlimsCommand::Guidance { command } => handle_blims_guidance_command(command).await?,
         BlimsCommand::Report { json } => {
@@ -1011,19 +1063,19 @@ async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
 }
 
 async fn start_blims_agent_talk(agent_id: String) -> Result<(), CliError> {
-    let world = load_blims_world().await?;
-    let report = load_blims_report().await?;
-    let Some(agent) = world.agents.iter().find(|agent| agent.id == agent_id) else {
-        return Err(CliError::Blims(format!("unknown Blims agent: {agent_id}")));
-    };
-    start_agent_talk_session(agent, &world, &report).await
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": agent_id,
+    });
+    let response = call_blims_service("agent.talk_prompt", serde_json::to_vec(&request)?).await?;
+    let prompt = decode_blims_response::<BlimsAgentTalkPrompt>(response)?;
+    start_agent_talk_session(prompt).await
 }
 
 async fn start_room_agent_talk(
     world: &BlimsWorldSnapshot,
     player_room_id: &str,
 ) -> Result<(), CliError> {
-    let report = load_blims_report().await?;
     let Some(agent) = world
         .agents
         .iter()
@@ -1032,45 +1084,19 @@ async fn start_room_agent_talk(
         println!("No agent is here to start an AI chat with.");
         return Ok(());
     };
-    start_agent_talk_session(agent, world, &report).await
+    start_blims_agent_talk(agent.id.clone()).await
 }
 
-async fn start_agent_talk_session(
-    agent: &BlimsAgentSnapshot,
-    world: &BlimsWorldSnapshot,
-    report: &BlimsMorningReport,
-) -> Result<(), CliError> {
-    let prompt = agent_talk_prompt(agent, world, report);
+async fn start_agent_talk_session(prompt: BlimsAgentTalkPrompt) -> Result<(), CliError> {
     let session = BcodeClient::default_endpoint()
-        .create_session(Some(format!("Blims talk: {}", agent.name)))
+        .create_session(Some(format!("Blims talk: {}", prompt.agent_id)))
         .await?;
     BcodeClient::default_endpoint()
-        .send_user_message(session.id, prompt)
+        .send_user_message(session.id, prompt.prompt)
         .await?;
-    println!("AI chat session with {}: {}", agent.name, session.id);
+    println!("AI chat session with {}: {}", prompt.agent_id, session.id);
     println!("Open it with: bcode attach {}", session.id);
     Ok(())
-}
-
-fn agent_talk_prompt(
-    agent: &BlimsAgentSnapshot,
-    world: &BlimsWorldSnapshot,
-    report: &BlimsMorningReport,
-) -> String {
-    let report_lines = report
-        .bullets
-        .iter()
-        .map(|bullet| format!("* {bullet}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "You are {}, a {} inside Blims, a cozy AI company simulator running inside Bcode.\n\n\
-         You are currently in room `{}` in the {}. Your visible status is: {}.\n\n\
-         Current CEO/company report:\n{}\n\n\
-         Reply in-character as this Blims agent. Be cozy, useful, dynamic, and candid. \
-         Tell the CEO what you are thinking about, what you recommend next, and whether anything needs attention.",
-        agent.name, agent.role, agent.room_id, world.theme, agent.status, report_lines
-    )
 }
 
 fn print_blims_office(
@@ -1207,6 +1233,53 @@ fn room_index(world: &BlimsWorldSnapshot, current_room_id: &str) -> usize {
         .iter()
         .position(|room| room.id == current_room_id)
         .unwrap_or_default()
+}
+
+async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliError> {
+    match command {
+        BlimsTaskCommand::List { json } => {
+            let response = call_blims_service("task.list", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let tasks = decode_blims_response::<Vec<BlimsTaskSummary>>(response)?;
+                for task in tasks {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        task.id,
+                        task.initiative_id,
+                        task.priority,
+                        task.status,
+                        task.assigned_agent_id,
+                        task.title,
+                        task.description,
+                        task.rationale
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<(), CliError> {
+    match command {
+        BlimsArtifactCommand::List { json } => {
+            let response = call_blims_service("artifact.list", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let artifacts = decode_blims_response::<Vec<BlimsArtifactSummary>>(response)?;
+                for artifact in artifacts {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        artifact.id, artifact.initiative_id, artifact.kind, artifact.title
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Result<(), CliError> {

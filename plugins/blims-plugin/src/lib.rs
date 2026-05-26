@@ -46,6 +46,15 @@ pub const OP_INITIATIVE_PLAN_PROMPT: &str = "initiative.plan_prompt";
 /// Initiative plan import operation.
 pub const OP_INITIATIVE_IMPORT_PLAN: &str = "initiative.import_plan";
 
+/// Task list operation.
+pub const OP_TASK_LIST: &str = "task.list";
+
+/// Artifact list operation.
+pub const OP_ARTIFACT_LIST: &str = "artifact.list";
+
+/// Agent talk prompt operation.
+pub const OP_AGENT_TALK_PROMPT: &str = "agent.talk_prompt";
+
 /// World snapshot operation.
 pub const OP_WORLD_SNAPSHOT: &str = "world.snapshot";
 
@@ -81,6 +90,9 @@ impl RustPlugin for BlimsPlugin {
             OP_GUIDANCE_LIST => service_guidance_list(&context.request),
             OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(&context.request),
             OP_INITIATIVE_IMPORT_PLAN => service_initiative_import_plan(&context.request),
+            OP_TASK_LIST => service_task_list(&context.request),
+            OP_ARTIFACT_LIST => service_artifact_list(&context.request),
+            OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
             _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
@@ -129,6 +141,15 @@ pub struct InitiativePlanPromptRequest {
     pub working_directory: PathBuf,
     /// Initiative id to plan.
     pub initiative_id: String,
+}
+
+/// Request to build an AI talk prompt for an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTalkPromptRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Blims agent id.
+    pub agent_id: String,
 }
 
 /// Request to import an AI-generated plan for an initiative.
@@ -190,6 +211,49 @@ pub struct InitiativePlanningPrompt {
     pub initiative_id: String,
     /// Prompt text to send to an AI planning session.
     pub prompt: String,
+}
+
+/// Agent talk prompt returned for Bcode AI/session orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTalkPrompt {
+    /// Agent id.
+    pub agent_id: String,
+    /// Prompt text to send to an AI conversation session.
+    pub prompt: String,
+}
+
+/// Persisted task summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    /// Task id.
+    pub id: String,
+    /// Parent initiative id.
+    pub initiative_id: String,
+    /// Task title.
+    pub title: String,
+    /// Task description.
+    pub description: String,
+    /// Task status.
+    pub status: String,
+    /// Assigned agent id, if any.
+    pub assigned_agent_id: String,
+    /// Task rationale.
+    pub rationale: String,
+    /// Task priority. Lower numbers sort first.
+    pub priority: i64,
+}
+
+/// Persisted artifact summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactSummary {
+    /// Artifact id.
+    pub id: String,
+    /// Parent initiative id.
+    pub initiative_id: String,
+    /// Artifact kind.
+    pub kind: String,
+    /// Artifact title.
+    pub title: String,
 }
 
 /// Current Blims company lifecycle state.
@@ -509,6 +573,39 @@ fn service_initiative_import_plan(request: &ServiceRequest) -> ServiceResponse {
     match import_initiative_plan(&request) {
         Ok(plan) => json_response(&plan),
         Err(error) => ServiceResponse::error("initiative_import_failed", error.to_string()),
+    }
+}
+
+fn service_task_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_tasks(&request.working_directory) {
+        Ok(tasks) => json_response(&tasks),
+        Err(error) => ServiceResponse::error("task_list_failed", error.to_string()),
+    }
+}
+
+fn service_artifact_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_artifacts(&request.working_directory) {
+        Ok(artifacts) => json_response(&artifacts),
+        Err(error) => ServiceResponse::error("artifact_list_failed", error.to_string()),
+    }
+}
+
+fn service_agent_talk_prompt(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<AgentTalkPromptRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match build_agent_talk_prompt(&request) {
+        Ok(prompt) => json_response(&prompt),
+        Err(error) => ServiceResponse::error("agent_talk_prompt_failed", error.to_string()),
     }
 }
 
@@ -1209,6 +1306,107 @@ fn list_guidance(working_directory: &Path) -> Result<Vec<GuidanceSummary>, Blims
     })
 }
 
+fn list_tasks(working_directory: &Path) -> Result<Vec<TaskSummary>, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(async move {
+            database
+                .select("tasks")
+                .columns(&[
+                    "id",
+                    "initiative_id",
+                    "title",
+                    "description",
+                    "status",
+                    "assigned_agent_id",
+                    "rationale",
+                    "priority",
+                ])
+                .sort("priority", SortDirection::Asc)
+                .execute(database)
+                .await?
+                .iter()
+                .map(task_summary)
+                .collect()
+        })
+    })
+}
+
+fn list_artifacts(working_directory: &Path) -> Result<Vec<ArtifactSummary>, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(async move {
+            database
+                .select("artifacts")
+                .columns(&["id", "initiative_id", "kind", "title"])
+                .sort("created_at", SortDirection::Desc)
+                .execute(database)
+                .await?
+                .iter()
+                .map(artifact_summary)
+                .collect()
+        })
+    })
+}
+
+fn build_agent_talk_prompt(
+    request: &AgentTalkPromptRequest,
+) -> Result<AgentTalkPrompt, BlimsStateError> {
+    let agent_id = request.agent_id.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let data = load_company_data_from_database(database).await?;
+            let agent = data
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .ok_or_else(|| {
+                    BlimsStateError::InvalidRequest(format!("unknown Blims agent: {agent_id}"))
+                })?;
+            Ok(AgentTalkPrompt {
+                agent_id,
+                prompt: agent_talk_prompt_text(agent, &data),
+            })
+        })
+    })
+}
+
+fn agent_talk_prompt_text(agent: &AgentRecord, data: &CompanyData) -> String {
+    let initiatives = data
+        .initiatives
+        .iter()
+        .map(|initiative| format!("* [{}] {}", initiative.status, initiative.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let guidance = data
+        .guidance
+        .iter()
+        .map(|item| format!("* [{}] {}", item.strength, item.guidance))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are {}, a {} inside Blims, a cozy AI company simulator running inside Bcode.\n\n\
+         Room: {}\nStatus: {}\nCompany mission: {}\nCulture: {}\n\n\
+         Active CEO guidance:\n{}\n\nActive initiatives:\n{}\n\n\
+         Reply in-character as this Blims agent. Be cozy, useful, dynamic, candid, and specific. \
+         Tell the CEO what you are thinking about, what you recommend next, and whether anything needs attention.",
+        agent.name,
+        agent.role,
+        agent.room_id,
+        agent.status,
+        data.company.mission,
+        data.company.culture,
+        if guidance.is_empty() {
+            "* none"
+        } else {
+            &guidance
+        },
+        if initiatives.is_empty() {
+            "* none"
+        } else {
+            &initiatives
+        },
+    )
+}
+
 fn build_initiative_plan_prompt(
     request: &InitiativePlanPromptRequest,
 ) -> Result<InitiativePlanningPrompt, BlimsStateError> {
@@ -1452,6 +1650,28 @@ fn guidance_summary(row: &Row) -> Result<GuidanceSummary, BlimsStateError> {
         guidance: required_text(row, "guidance")?,
         strength: required_text(row, "strength")?,
         active: required_bool(row, "active")?,
+    })
+}
+
+fn task_summary(row: &Row) -> Result<TaskSummary, BlimsStateError> {
+    Ok(TaskSummary {
+        id: required_text(row, "id")?,
+        initiative_id: required_text(row, "initiative_id")?,
+        title: required_text(row, "title")?,
+        description: required_text(row, "description")?,
+        status: required_text(row, "status")?,
+        assigned_agent_id: required_text(row, "assigned_agent_id")?,
+        rationale: required_text(row, "rationale")?,
+        priority: required_i64(row, "priority")?,
+    })
+}
+
+fn artifact_summary(row: &Row) -> Result<ArtifactSummary, BlimsStateError> {
+    Ok(ArtifactSummary {
+        id: required_text(row, "id")?,
+        initiative_id: required_text(row, "initiative_id")?,
+        kind: required_text(row, "kind")?,
+        title: required_text(row, "title")?,
     })
 }
 
