@@ -14,6 +14,7 @@ use super::command_palette::BmuxCommandPalette;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
+use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::terminal_events::TuiInput;
 use super::{
@@ -30,11 +31,21 @@ struct ModalState {
 }
 
 struct ChatEventContext<'a, 'b, W: Write> {
-    client: &'a BcodeClient,
-    keymap: &'a BmuxKeyMap,
+    services: TuiServices<'a>,
     terminal: &'a mut Terminal<&'b mut W>,
     terminal_events: &'a mut TuiInput,
     mouse_scroll_rows: usize,
+}
+
+impl<'a, 'b, W: Write> ChatEventContext<'a, 'b, W> {
+    const fn flow_context(&mut self) -> (TuiIo<'_, 'b, W>, TuiServices<'a>) {
+        let services = self.services;
+        let io = TuiIo {
+            terminal: self.terminal,
+            input: self.terminal_events,
+        };
+        (io, services)
+    }
 }
 
 /// Run the active chat UI loop.
@@ -116,8 +127,7 @@ pub async fn run_with_client<W: Write>(
         };
         if let Some(event) = event {
             let mut context = ChatEventContext {
-                client,
-                keymap,
+                services: TuiServices { client, keymap },
                 terminal,
                 terminal_events,
                 mouse_scroll_rows,
@@ -155,19 +165,23 @@ async fn handle_event<W: Write>(
             chat.app.reset_input_history_navigation();
             chat.app.paste_composer_text(&text);
             chat.app.wake_cursor();
-            slash_flow::update_slash_palette(context.client, chat, &mut modals.slash_palette).await;
+            slash_flow::update_slash_palette(
+                context.services.client,
+                chat,
+                &mut modals.slash_palette,
+            )
+            .await;
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
         Event::Mouse(mouse) => {
             if modals.palette.is_some() {
+                let (mut io, services) = context.flow_context();
                 return palette_flow::handle_palette_mouse(
-                    context.client,
-                    context.keymap,
+                    &mut io,
+                    &services,
                     chat,
                     &mut modals.palette,
-                    context.terminal,
-                    context.terminal_events,
                     mouse,
                 )
                 .await;
@@ -183,7 +197,7 @@ async fn handle_event<W: Write>(
             let hit_id = mouse_flow::mouse_hit_id(context.terminal.hits(), mouse);
             mouse_flow::handle_mouse(
                 hit_id,
-                context.client,
+                context.services.client,
                 chat,
                 &mut modals.permission_dialog,
                 mouse,
@@ -203,7 +217,7 @@ async fn handle_chat_key<W: Write>(
 ) -> Result<bool, TuiError> {
     if modals.thinking_dialog.is_some() {
         return thinking_flow::handle_thinking_key(
-            context.client,
+            context.services.client,
             chat,
             &mut modals.thinking_dialog,
             stroke,
@@ -211,18 +225,18 @@ async fn handle_chat_key<W: Write>(
         .await;
     }
     if modals.slash_palette.is_some() {
-        if let Some(dialog) = slash_flow::handle_slash_palette_key(
-            context.client,
-            context.keymap,
-            chat,
-            &mut modals.slash_palette,
-            context.terminal,
-            context.terminal_events,
-            stroke,
-        )
-        .await?
-        .flatten()
-        {
+        if let Some(dialog) = {
+            let (mut io, services) = context.flow_context();
+            slash_flow::handle_slash_palette_key(
+                &mut io,
+                &services,
+                chat,
+                &mut modals.slash_palette,
+                stroke,
+            )
+            .await?
+            .flatten()
+        } {
             modals.thinking_dialog = Some(dialog);
         }
         return Ok(true);
@@ -237,8 +251,8 @@ async fn handle_chat_key<W: Write>(
     }
     if modals.permission_dialog.is_some() {
         return permission_flow::handle_permission_key(
-            context.client,
-            context.keymap,
+            context.services.client,
+            context.services.keymap,
             chat,
             &mut modals.permission_dialog,
             stroke,
@@ -246,42 +260,36 @@ async fn handle_chat_key<W: Write>(
         .await;
     }
     if modals.palette.is_some() {
+        let (mut io, services) = context.flow_context();
         return palette_flow::handle_palette_key(
-            context.client,
-            context.keymap,
+            &mut io,
+            &services,
             chat,
             &mut modals.palette,
-            context.terminal,
-            context.terminal_events,
             stroke,
         )
         .await;
     }
-    if is_palette_open_key(context.keymap, stroke) {
+    if is_palette_open_key(context.services.keymap, stroke) {
         modals.palette = Some(BmuxCommandPalette::new());
         chat.app
             .set_status("command palette: type to filter, enter to run, esc close".to_owned());
         return Ok(true);
     }
-    if is_clipboard_image_paste_key(context.keymap, stroke) {
+    if is_clipboard_image_paste_key(context.services.keymap, stroke) {
         paste_clipboard_image(chat);
-        slash_flow::update_slash_palette(context.client, chat, &mut modals.slash_palette).await;
+        slash_flow::update_slash_palette(context.services.client, chat, &mut modals.slash_palette)
+            .await;
         return Ok(true);
     }
-    let outcome = input::handle_key(&mut chat.app, context.keymap, stroke);
-    slash_flow::update_slash_palette(context.client, chat, &mut modals.slash_palette).await;
+    let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
+    slash_flow::update_slash_palette(context.services.client, chat, &mut modals.slash_palette)
+        .await;
     if outcome.interrupted {
-        request_turn_cancellation(context.client, chat).await;
+        request_turn_cancellation(context.services.client, chat).await;
     }
     if outcome.submitted {
-        let mut io = super::runtime_context::TuiIo {
-            terminal: context.terminal,
-            input: context.terminal_events,
-        };
-        let services = super::runtime_context::TuiServices {
-            client: context.client,
-            keymap: context.keymap,
-        };
+        let (mut io, services) = context.flow_context();
         match composer_flow::submit_composer(&mut io, &services, chat).await {
             Ok(Some(dialog)) => {
                 modals.thinking_dialog = Some(dialog);

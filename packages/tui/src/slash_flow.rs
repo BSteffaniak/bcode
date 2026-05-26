@@ -8,9 +8,7 @@ use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::terminal::Terminal;
 
 use super::helpers;
-use super::keymap::BmuxKeyMap;
 use super::runtime_context::{TuiIo, TuiServices};
-use super::terminal_events::TuiInput;
 use super::{
     TuiError, composer_flow, input, session_flow::ActiveChat, slash_palette, slash_palette_render,
 };
@@ -42,12 +40,10 @@ pub async fn update_slash_palette(
 
 /// Handle one key while the slash completion palette is open.
 pub async fn handle_slash_palette_key<W: Write>(
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     slash_palette: &mut Option<slash_palette::SlashPalette>,
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
     stroke: KeyStroke,
 ) -> Result<Option<composer_flow::SubmitComposerOutcome>, TuiError> {
     let Some(active_palette) = slash_palette else {
@@ -69,14 +65,7 @@ pub async fn handle_slash_palette_key<W: Write>(
         KeyCode::Enter if stroke.modifiers.is_empty() => {
             if active_palette.selected_matches(chat.app.composer().text()) {
                 *slash_palette = None;
-                let outcome = {
-                    let mut io = TuiIo {
-                        terminal,
-                        input: terminal_events,
-                    };
-                    let services = TuiServices { client, keymap };
-                    composer_flow::submit_composer(&mut io, &services, chat).await
-                };
+                let outcome = submit_from_slash_palette(io, services, chat).await;
                 match outcome {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) => {
@@ -94,20 +83,13 @@ pub async fn handle_slash_palette_key<W: Write>(
             Ok(Some(None))
         }
         _ => {
-            let outcome = input::handle_key(&mut chat.app, keymap, stroke);
-            update_slash_palette(client, chat, slash_palette).await;
+            let outcome = input::handle_key(&mut chat.app, services.keymap, stroke);
+            update_slash_palette(services.client, chat, slash_palette).await;
             if outcome.interrupted {
-                request_turn_cancellation(client, chat).await;
+                request_turn_cancellation(services.client, chat).await;
             }
             if outcome.submitted {
-                let outcome = {
-                    let mut io = TuiIo {
-                        terminal,
-                        input: terminal_events,
-                    };
-                    let services = TuiServices { client, keymap };
-                    composer_flow::submit_composer(&mut io, &services, chat).await
-                };
+                let outcome = submit_from_slash_palette(io, services, chat).await;
                 match outcome {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) => {
@@ -152,6 +134,14 @@ pub fn handle_slash_palette_mouse<W: Write>(
         *slash_palette = None;
     }
     true
+}
+
+async fn submit_from_slash_palette<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<composer_flow::SubmitComposerOutcome, TuiError> {
+    composer_flow::submit_composer(io, services, chat).await
 }
 
 async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) {

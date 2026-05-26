@@ -6,25 +6,20 @@ use bcode_client::BcodeClient;
 use bcode_worktree_models::WorktreeListRequest;
 use bmux_keyboard::KeyStroke;
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
-use bmux_tui::terminal::Terminal;
 
 use super::command_palette::{BmuxCommandPalette, PaletteCommand};
 use super::helpers;
-use super::keymap::BmuxKeyMap;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
-use super::terminal_events::TuiInput;
 use super::{TuiError, model_flow, skill_flow, worktree_flow};
 
 /// Handle one key while the command palette is open.
 pub async fn handle_palette_key<W: Write>(
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
     stroke: KeyStroke,
 ) -> Result<bool, TuiError> {
     let Some(active_palette) = palette else {
@@ -32,18 +27,17 @@ pub async fn handle_palette_key<W: Write>(
     };
     let items = active_palette.cloned_items();
     let widget = CommandPalette::new(&items);
-    let outcome = widget.handle_key(active_palette.state_mut(), terminal.area().height, stroke);
+    let outcome = widget.handle_key(
+        active_palette.state_mut(),
+        io.terminal.area().height,
+        stroke,
+    );
     match outcome {
         CommandPaletteKeyOutcome::Activated(index) => {
             let command = active_palette.command_at(index);
             *palette = None;
-            let mut io = TuiIo {
-                terminal,
-                input: terminal_events,
-            };
-            let services = TuiServices { client, keymap };
             if let Some(command) = command
-                && let Err(error) = execute_palette_command(&mut io, services, chat, command).await
+                && let Err(error) = execute_palette_command(io, services, chat, command).await
             {
                 helpers::report_client_error(&mut chat.app, "command failed", &error);
             }
@@ -62,12 +56,10 @@ pub async fn handle_palette_key<W: Write>(
 
 /// Handle one mouse event while the command palette is open.
 pub async fn handle_palette_mouse<W: Write>(
-    client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
-    terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TuiInput,
     mouse: bmux_tui::event::MouseEvent,
 ) -> Result<bool, TuiError> {
     let Some(index) = command_palette_row_from_mouse(mouse) else {
@@ -78,13 +70,8 @@ pub async fn handle_palette_mouse<W: Write>(
     };
     let command = active_palette.command_at(index);
     *palette = None;
-    let mut io = TuiIo {
-        terminal,
-        input: terminal_events,
-    };
-    let services = TuiServices { client, keymap };
     if let Some(command) = command
-        && let Err(error) = execute_palette_command(&mut io, services, chat, command).await
+        && let Err(error) = execute_palette_command(io, services, chat, command).await
     {
         helpers::report_client_error(&mut chat.app, "command failed", &error);
     }
@@ -93,7 +80,7 @@ pub async fn handle_palette_mouse<W: Write>(
 
 async fn execute_palette_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
-    services: TuiServices<'_>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
@@ -102,62 +89,47 @@ async fn execute_palette_command<W: Write>(
         | PaletteCommand::SwitchSession
         | PaletteCommand::RenameSession
         | PaletteCommand::DeleteSession => {
-            execute_session_command(services.client, chat, io, services, command).await
+            execute_session_command(io, services, chat, command).await
         }
         PaletteCommand::ListWorktrees
         | PaletteCommand::CreateSessionWorktree
         | PaletteCommand::AttachWorktree
         | PaletteCommand::RemoveWorktree => {
-            execute_worktree_command(services.client, chat, io, services, command).await
+            execute_worktree_command(io, services, chat, command).await
         }
         PaletteCommand::ShowModelStatus
         | PaletteCommand::ShowServerModelStatus
         | PaletteCommand::ShowRuntimeStatus
-        | PaletteCommand::SelectModel => {
-            execute_model_command(services.client, chat, io, services, command).await
-        }
+        | PaletteCommand::SelectModel => execute_model_command(io, services, chat, command).await,
         PaletteCommand::ListSkills | PaletteCommand::ActiveSkills => {
-            execute_skill_command(services.client, chat, io, services, command).await
+            execute_skill_command(io, services, chat, command).await
         }
         PaletteCommand::ToggleDiff
         | PaletteCommand::Help
         | PaletteCommand::CancelTurn
-        | PaletteCommand::CompactContext => {
-            execute_chat_command(services.client, chat, command).await
-        }
+        | PaletteCommand::CompactContext => execute_chat_command(services, chat, command).await,
     }
 }
 
 async fn execute_session_command<W: Write>(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
     io: &mut TuiIo<'_, '_, W>,
-    services: TuiServices<'_>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
         PaletteCommand::NewSession => {
-            let session = client.create_session(None).await?;
-            session_flow::switch_session(client, chat, session.id).await?;
+            let session = services.client.create_session(None).await?;
+            session_flow::switch_session(services.client, chat, session.id).await?;
         }
         PaletteCommand::SwitchSession => {
-            let selected_session_id = session_flow::pick_session(
-                io,
-                &TuiServices {
-                    client,
-                    keymap: services.keymap,
-                },
-            )
-            .await?;
-            session_flow::switch_session(client, chat, selected_session_id).await?;
+            let selected_session_id = session_flow::pick_session(io, services).await?;
+            session_flow::switch_session(services.client, chat, selected_session_id).await?;
         }
         PaletteCommand::RenameSession => {
             session_flow::pick_session_for_mutation(
                 io,
-                &TuiServices {
-                    client,
-                    keymap: services.keymap,
-                },
+                services,
                 session_flow::SessionPickerStartMode::Rename,
             )
             .await?;
@@ -165,10 +137,7 @@ async fn execute_session_command<W: Write>(
         PaletteCommand::DeleteSession => {
             session_flow::pick_session_for_mutation(
                 io,
-                &TuiServices {
-                    client,
-                    keymap: services.keymap,
-                },
+                services,
                 session_flow::SessionPickerStartMode::Delete,
             )
             .await?;
@@ -179,22 +148,21 @@ async fn execute_session_command<W: Write>(
 }
 
 async fn execute_worktree_command<W: Write>(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
     io: &mut TuiIo<'_, '_, W>,
-    services: TuiServices<'_>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::ListWorktrees => show_worktrees(client, chat).await?,
+        PaletteCommand::ListWorktrees => show_worktrees(services, chat).await?,
         PaletteCommand::CreateSessionWorktree => {
-            worktree_flow::create_for_current_session(io, &services, chat).await?;
+            worktree_flow::create_for_current_session(io, services, chat).await?;
         }
         PaletteCommand::AttachWorktree => {
-            worktree_flow::attach_current_session(io, &services, chat).await?;
+            worktree_flow::attach_current_session(io, services, chat).await?;
         }
         PaletteCommand::RemoveWorktree => {
-            worktree_flow::remove_worktree(io, &services, chat).await?;
+            worktree_flow::remove_worktree(io, services, chat).await?;
         }
         _ => {}
     }
@@ -202,20 +170,23 @@ async fn execute_worktree_command<W: Write>(
 }
 
 async fn execute_model_command<W: Write>(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
     io: &mut TuiIo<'_, '_, W>,
-    services: TuiServices<'_>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::ShowModelStatus => model_flow::show_model_status(client, chat).await?,
-        PaletteCommand::ShowServerModelStatus => {
-            model_flow::show_server_model_status(client, chat).await?;
+        PaletteCommand::ShowModelStatus => {
+            model_flow::show_model_status(services.client, chat).await?;
         }
-        PaletteCommand::ShowRuntimeStatus => model_flow::show_runtime_status(client, chat).await?,
+        PaletteCommand::ShowServerModelStatus => {
+            model_flow::show_server_model_status(services.client, chat).await?;
+        }
+        PaletteCommand::ShowRuntimeStatus => {
+            model_flow::show_runtime_status(services.client, chat).await?;
+        }
         PaletteCommand::SelectModel => {
-            model_flow::pick_model_for_session(io, &services, chat).await?;
+            model_flow::pick_model_for_session(io, services, chat).await?;
         }
         _ => {}
     }
@@ -223,24 +194,25 @@ async fn execute_model_command<W: Write>(
 }
 
 async fn execute_skill_command<W: Write>(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
     io: &mut TuiIo<'_, '_, W>,
-    services: TuiServices<'_>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
         PaletteCommand::ListSkills => {
-            skill_flow::pick_skill_for_session(io, &services, chat).await?;
+            skill_flow::pick_skill_for_session(io, services, chat).await?;
         }
-        PaletteCommand::ActiveSkills => skill_flow::show_active_skills(client, chat).await?,
+        PaletteCommand::ActiveSkills => {
+            skill_flow::show_active_skills(services.client, chat).await?;
+        }
         _ => {}
     }
     Ok(())
 }
 
 async fn execute_chat_command(
-    client: &BcodeClient,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
@@ -254,8 +226,8 @@ async fn execute_chat_command(
             });
         }
         PaletteCommand::Help => show_bmux_help(chat),
-        PaletteCommand::CancelTurn => cancel_turn(client, chat).await?,
-        PaletteCommand::CompactContext => compact_context(client, chat).await?,
+        PaletteCommand::CancelTurn => cancel_turn(services.client, chat).await?,
+        PaletteCommand::CompactContext => compact_context(services.client, chat).await?,
         _ => {}
     }
     Ok(())
@@ -287,8 +259,9 @@ async fn compact_context(client: &BcodeClient, chat: &mut ActiveChat) -> Result<
     Ok(())
 }
 
-async fn show_worktrees(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let response = client
+async fn show_worktrees(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let response = services
+        .client
         .list_worktrees(WorktreeListRequest {
             cwd: chat
                 .app

@@ -1,4 +1,8 @@
-//! Shared TUI runtime context types.
+//! Shared context types for threading TUI flow dependencies.
+//!
+//! These structs keep interactive flow signatures focused without introducing
+//! global mutable state: `TuiIo` carries the mutable terminal/input handles, and
+//! `TuiServices` carries immutable service dependencies.
 
 use std::io::Write;
 
