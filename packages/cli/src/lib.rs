@@ -464,6 +464,9 @@ enum BlimsInitiativeCommand {
     PlanPrompt {
         initiative_id: String,
     },
+    Plan {
+        initiative_id: String,
+    },
     ImportPlan {
         initiative_id: String,
         plan: String,
@@ -1018,15 +1021,23 @@ async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Res
             }
         }
         BlimsInitiativeCommand::PlanPrompt { initiative_id } => {
-            let request = BlimsInitiativePlanPromptRequest {
-                working_directory: std::env::current_dir()?,
-                initiative_id,
-            };
-            let response =
-                call_blims_service("initiative.plan_prompt", serde_json::to_vec(&request)?).await?;
-            let prompt = decode_blims_response::<BlimsPlanningPrompt>(response)?;
+            let prompt = blims_initiative_plan_prompt(initiative_id).await?;
             println!("# Initiative {} AI planning prompt", prompt.initiative_id);
             println!("{}", prompt.prompt);
+        }
+        BlimsInitiativeCommand::Plan { initiative_id } => {
+            let prompt = blims_initiative_plan_prompt(initiative_id).await?;
+            let session = BcodeClient::default_endpoint()
+                .create_session(Some(format!("Blims plan: {}", prompt.initiative_id)))
+                .await?;
+            BcodeClient::default_endpoint()
+                .send_user_message(session.id, prompt.prompt)
+                .await?;
+            println!("planning session: {}", session.id);
+            println!(
+                "When the AI returns JSON, import it with: bcode blims initiative import-plan {} '<json>'",
+                prompt.initiative_id
+            );
         }
         BlimsInitiativeCommand::ImportPlan {
             initiative_id,
@@ -1049,6 +1060,18 @@ async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Res
         }
     }
     Ok(())
+}
+
+async fn blims_initiative_plan_prompt(
+    initiative_id: String,
+) -> Result<BlimsPlanningPrompt, CliError> {
+    let request = BlimsInitiativePlanPromptRequest {
+        working_directory: std::env::current_dir()?,
+        initiative_id,
+    };
+    let response =
+        call_blims_service("initiative.plan_prompt", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<BlimsPlanningPrompt>(response)
 }
 
 async fn handle_blims_guidance_command(command: BlimsGuidanceCommand) -> Result<(), CliError> {
