@@ -20,6 +20,7 @@ use super::{EVENT_POLL_TIMEOUT, TuiError, session_flow, worktree_picker, worktre
 enum PickerKeyOutcome {
     Continue,
     Selected,
+    ForceSelected,
     Canceled,
 }
 
@@ -51,7 +52,7 @@ pub async fn attach_current_session<W: Write>(
                 picker.refresh_filter();
             }
             Event::Key(stroke) => match handle_picker_key(&mut picker, keymap, stroke) {
-                PickerKeyOutcome::Continue => {}
+                PickerKeyOutcome::Continue | PickerKeyOutcome::ForceSelected => {}
                 PickerKeyOutcome::Selected => {
                     let Some(path) = picker
                         .selected_worktree()
@@ -72,6 +73,92 @@ pub async fn attach_current_session<W: Write>(
                         .map(|worktree| worktree.path.clone())
                 {
                     attach_path(client, chat, path).await?;
+                    return Ok(());
+                }
+            }
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
+        }
+    }
+}
+
+/// Pick a worktree and remove it after confirmation.
+pub async fn remove_worktree<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    keymap: &BmuxKeyMap,
+) -> Result<(), TuiError> {
+    let cwd = chat
+        .app
+        .working_directory()
+        .map(std::path::Path::to_path_buf);
+    let response = client
+        .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd: cwd.clone() })
+        .await?;
+    let linked = response
+        .worktrees
+        .into_iter()
+        .filter(|worktree| !worktree.is_main)
+        .collect::<Vec<_>>();
+    let mut picker = worktree_picker::WorktreePickerApp::new(linked);
+    picker.set_status(
+        "Select linked worktree to remove. Enter removes; F force-removes dirty worktrees; Esc cancels"
+            .to_owned(),
+    );
+    loop {
+        terminal.resize(helpers::terminal_area()?);
+        terminal.draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
+        let Some(event) = poll_event(EVENT_POLL_TIMEOUT)? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => {
+                picker.filter_mut().insert_str(&text);
+                picker.refresh_filter();
+            }
+            Event::Key(stroke) => {
+                let outcome = handle_picker_key(&mut picker, keymap, stroke);
+                match outcome {
+                    PickerKeyOutcome::Continue => {}
+                    PickerKeyOutcome::Selected | PickerKeyOutcome::ForceSelected => {
+                        let force = matches!(outcome, PickerKeyOutcome::ForceSelected);
+                        let Some(path) = picker
+                            .selected_worktree()
+                            .map(|worktree| worktree.path.clone())
+                        else {
+                            continue;
+                        };
+                        let removed = client
+                            .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
+                                cwd: cwd.clone(),
+                                path: path.clone(),
+                                force,
+                            })
+                            .await?;
+                        chat.app
+                            .set_status(format!("removed worktree {}", removed.path.display()));
+                        return Ok(());
+                    }
+                    PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
+                }
+            }
+            Event::Mouse(mouse) => {
+                if let Some(row) = picker_row_from_mouse(mouse)
+                    && picker.select_visible(row)
+                    && let Some(path) = picker
+                        .selected_worktree()
+                        .map(|worktree| worktree.path.clone())
+                {
+                    let removed = client
+                        .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                            force: false,
+                        })
+                        .await?;
+                    chat.app
+                        .set_status(format!("removed worktree {}", removed.path.display()));
                     return Ok(());
                 }
             }
@@ -119,6 +206,7 @@ fn handle_picker_key(
         };
     }
     match stroke.key {
+        KeyCode::Char('f' | 'F') => PickerKeyOutcome::ForceSelected,
         KeyCode::Char(character) => {
             picker.filter_mut().insert_char(character);
             picker.refresh_filter();

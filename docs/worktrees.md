@@ -63,6 +63,8 @@ The command palette includes:
 
 * `Worktree: List`
 * `Worktree: Create for Current Session`
+* `Worktree: Attach Current Session`
+* `Worktree: Remove`
 
 Slash commands are also available:
 

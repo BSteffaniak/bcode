@@ -52,6 +52,11 @@ impl WorktreePickerApp {
         &self.status
     }
 
+    /// Set picker status.
+    pub fn set_status(&mut self, status: String) {
+        self.status = status;
+    }
+
     /// Return visible list items.
     #[must_use]
     pub fn list_items(&self) -> Vec<ListItem> {

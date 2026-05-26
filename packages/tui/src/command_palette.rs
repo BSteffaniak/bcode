@@ -17,6 +17,8 @@ pub enum PaletteCommand {
     CreateSessionWorktree,
     /// Attach current session to an existing worktree.
     AttachWorktree,
+    /// Remove a Git worktree.
+    RemoveWorktree,
     /// Show active model status.
     ShowModelStatus,
     /// Show server default model/provider.
@@ -51,6 +53,7 @@ impl PaletteCommand {
             Self::ListWorktrees => "worktree.list",
             Self::CreateSessionWorktree => "worktree.createSession",
             Self::AttachWorktree => "worktree.attach",
+            Self::RemoveWorktree => "worktree.remove",
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
             Self::ShowRuntimeStatus => "runtime.status",
@@ -73,6 +76,7 @@ impl PaletteCommand {
             "worktree.list" => Some(Self::ListWorktrees),
             "worktree.createSession" => Some(Self::CreateSessionWorktree),
             "worktree.attach" => Some(Self::AttachWorktree),
+            "worktree.remove" => Some(Self::RemoveWorktree),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
             "runtime.status" => Some(Self::ShowRuntimeStatus),
@@ -159,6 +163,12 @@ fn palette_items() -> Vec<PaletteItem> {
             "Worktree: Attach Current Session",
             "Choose an existing worktree for this session",
             "worktree attach switch current session picker",
+        ),
+        item(
+            PaletteCommand::RemoveWorktree,
+            "Worktree: Remove",
+            "Choose a linked worktree to remove",
+            "worktree remove delete linked cleanup",
         ),
         item(
             PaletteCommand::ShowModelStatus,

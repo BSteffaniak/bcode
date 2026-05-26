@@ -108,6 +108,9 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::AttachWorktree => {
             worktree_flow::attach_current_session(terminal, client, chat, keymap).await?;
         }
+        PaletteCommand::RemoveWorktree => {
+            worktree_flow::remove_worktree(terminal, client, chat, keymap).await?;
+        }
         PaletteCommand::ShowModelStatus => {
             model_flow::show_model_status(client, chat).await?;
         }
