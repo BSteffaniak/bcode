@@ -424,6 +424,14 @@ enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    Agents {
+        #[arg(long)]
+        json: bool,
+    },
+    World {
+        #[arg(long)]
+        json: bool,
+    },
     Report {
         #[arg(long)]
         json: bool,
@@ -755,6 +763,30 @@ struct BlimsCompanyStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsAgentSnapshot {
+    id: String,
+    name: String,
+    role: String,
+    status: String,
+    room_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsRoomSnapshot {
+    id: String,
+    name: String,
+    purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsWorldSnapshot {
+    theme: String,
+    player_name: String,
+    rooms: Vec<BlimsRoomSnapshot>,
+    agents: Vec<BlimsAgentSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsMorningReport {
     title: String,
     bullets: Vec<String>,
@@ -787,8 +819,43 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
                 println!("database: {}", status.database_path.display());
             }
         }
+        BlimsCommand::Agents { json } => {
+            let response = call_blims_service("agent.list", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let agents = decode_blims_response::<Vec<BlimsAgentSnapshot>>(response)?;
+                for agent in agents {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        agent.id, agent.name, agent.role, agent.room_id, agent.status
+                    );
+                }
+            }
+        }
+        BlimsCommand::World { json } => {
+            let response = call_blims_service("world.snapshot", blims_workspace_payload()?).await?;
+            if json {
+                print_blims_service_response(response);
+            } else {
+                let world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
+                println!("{}", world.theme);
+                println!("player: {}", world.player_name);
+                println!("rooms:");
+                for room in world.rooms {
+                    println!("* {} ({}) - {}", room.name, room.id, room.purpose);
+                }
+                println!("agents:");
+                for agent in world.agents {
+                    println!(
+                        "* {} ({}) at {} - {}",
+                        agent.name, agent.role, agent.room_id, agent.status
+                    );
+                }
+            }
+        }
         BlimsCommand::Report { json } => {
-            let response = call_blims_service("report.morning", Vec::new()).await?;
+            let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
             if json {
                 print_blims_service_response(response);
             } else {
