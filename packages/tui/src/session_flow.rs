@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
 use super::helpers;
-use super::terminal_events::TerminalEventStream;
+use super::terminal_events::TuiInput;
 use super::{TuiError, history_flow};
 use super::{session_picker, session_picker_render};
 
@@ -178,7 +178,7 @@ async fn import_selected_session<W: Write>(
 #[allow(clippy::too_many_lines)]
 pub async fn pick_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
 ) -> Result<SessionId, TuiError> {
@@ -242,7 +242,7 @@ pub async fn pick_session<W: Write>(
 /// Pick a session to rename or delete.
 pub async fn pick_session_for_mutation<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     start_mode: SessionPickerStartMode,
 ) -> Result<(), TuiError> {

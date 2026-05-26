@@ -8,7 +8,7 @@ use bmux_tui::terminal::Terminal;
 
 use super::keymap::BmuxKeyMap;
 use super::session_flow::ActiveChat;
-use super::terminal_events::TerminalEventStream;
+use super::terminal_events::TuiInput;
 use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands, thinking_dialog};
 
 /// Result of submitting staged composer text.
@@ -53,7 +53,7 @@ async fn handle_slash_command<W: Write>(
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     session_id: SessionId,
     message: &str,
 ) -> Result<SubmitComposerOutcome, TuiError> {
@@ -138,7 +138,7 @@ pub async fn submit_composer<W: Write>(
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
 ) -> Result<SubmitComposerOutcome, TuiError> {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());

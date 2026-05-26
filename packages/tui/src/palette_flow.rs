@@ -13,7 +13,7 @@ use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::session_flow::{self, ActiveChat};
-use super::terminal_events::TerminalEventStream;
+use super::terminal_events::TuiInput;
 use super::{TuiError, model_flow, skill_flow, worktree_flow};
 
 /// Handle one key while the command palette is open.
@@ -23,7 +23,7 @@ pub async fn handle_palette_key<W: Write>(
     chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     stroke: KeyStroke,
 ) -> Result<bool, TuiError> {
     let Some(active_palette) = palette else {
@@ -69,7 +69,7 @@ pub async fn handle_palette_mouse<W: Write>(
     chat: &mut ActiveChat,
     palette: &mut Option<BmuxCommandPalette>,
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     mouse: bmux_tui::event::MouseEvent,
 ) -> Result<bool, TuiError> {
     let Some(index) = command_palette_row_from_mouse(mouse) else {
@@ -94,7 +94,7 @@ async fn execute_palette_command<W: Write>(
     client: &BcodeClient,
     chat: &mut ActiveChat,
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     keymap: &BmuxKeyMap,
     command: PaletteCommand,
 ) -> Result<(), TuiError> {

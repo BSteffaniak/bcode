@@ -13,7 +13,7 @@ use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::session_flow::ActiveChat;
-use super::terminal_events::TerminalEventStream;
+use super::terminal_events::TuiInput;
 use super::{
     TuiError, session_flow, worktree_create_dialog, worktree_create_dialog_render, worktree_picker,
     worktree_picker_render,
@@ -30,7 +30,7 @@ enum PickerKeyOutcome {
 /// Create a worktree for the current session using a dialog.
 pub async fn create_for_current_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -126,7 +126,7 @@ pub async fn create_for_current_session<W: Write>(
 /// Pick a worktree and attach the current session to it.
 pub async fn attach_current_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -184,7 +184,7 @@ pub async fn attach_current_session<W: Write>(
 /// Pick a worktree and remove it after confirmation.
 pub async fn remove_worktree<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,

@@ -12,7 +12,7 @@ use bmux_tui::terminal::Terminal;
 use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::picker_mouse::picker_row_from_mouse;
-use super::terminal_events::TerminalEventStream;
+use super::terminal_events::TuiInput;
 use super::{
     TuiError, model_picker, model_picker_render, provider_picker, provider_picker_render,
     session_flow::ActiveChat,
@@ -111,7 +111,7 @@ pub async fn show_runtime_status(
 /// Pick and set the active model for the current session.
 pub async fn pick_model_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
@@ -194,7 +194,7 @@ pub async fn pick_model_for_session<W: Write>(
 
 async fn pick_model_provider<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     keymap: &BmuxKeyMap,
 ) -> Result<Option<String>, TuiError> {

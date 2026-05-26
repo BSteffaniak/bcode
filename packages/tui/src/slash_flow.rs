@@ -9,7 +9,7 @@ use bmux_tui::terminal::Terminal;
 
 use super::helpers;
 use super::keymap::BmuxKeyMap;
-use super::terminal_events::TerminalEventStream;
+use super::terminal_events::TuiInput;
 use super::{
     TuiError, composer_flow, input, session_flow::ActiveChat, slash_palette, slash_palette_render,
 };
@@ -46,7 +46,7 @@ pub async fn handle_slash_palette_key<W: Write>(
     chat: &mut ActiveChat,
     slash_palette: &mut Option<slash_palette::SlashPalette>,
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     stroke: KeyStroke,
 ) -> Result<Option<composer_flow::SubmitComposerOutcome>, TuiError> {
     let Some(active_palette) = slash_palette else {

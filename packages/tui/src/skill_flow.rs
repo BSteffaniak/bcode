@@ -13,13 +13,13 @@ use bmux_tui::terminal::Terminal;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
-use super::terminal_events::TerminalEventStream;
+use super::terminal_events::TuiInput;
 use super::{TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render};
 
 /// Pick and perform a skill action for the active session.
 pub async fn pick_skill_for_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    terminal_events: &mut TerminalEventStream,
+    terminal_events: &mut TuiInput,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     keymap: &BmuxKeyMap,
