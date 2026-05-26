@@ -433,6 +433,9 @@ enum BlimsCommand {
         json: bool,
     },
     Enter,
+    Talk {
+        agent_id: String,
+    },
     Initiative {
         #[command(subcommand)]
         command: BlimsInitiativeCommand,
@@ -947,6 +950,7 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
             }
         }
         BlimsCommand::Enter => enter_blims_office().await?,
+        BlimsCommand::Talk { agent_id } => start_blims_agent_talk(agent_id).await?,
         BlimsCommand::Initiative { command } => handle_blims_initiative_command(command).await?,
         BlimsCommand::Guidance { command } => handle_blims_guidance_command(command).await?,
         BlimsCommand::Report { json } => {
@@ -986,6 +990,7 @@ async fn enter_blims_office() -> Result<(), CliError> {
             }
             "r" | "report" => print_blims_report(&report),
             "t" | "talk" | "look" => print_room_interaction(&world, &report, &player_room_id),
+            "ai" => start_room_agent_talk(&world, &player_room_id).await?,
             "w" | "world" => print_blims_world(&world),
             "help" | "?" => print_blims_help(),
             "" => {}
@@ -1003,6 +1008,69 @@ async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
 async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
     let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
     decode_blims_response::<BlimsMorningReport>(response)
+}
+
+async fn start_blims_agent_talk(agent_id: String) -> Result<(), CliError> {
+    let world = load_blims_world().await?;
+    let report = load_blims_report().await?;
+    let Some(agent) = world.agents.iter().find(|agent| agent.id == agent_id) else {
+        return Err(CliError::Blims(format!("unknown Blims agent: {agent_id}")));
+    };
+    start_agent_talk_session(agent, &world, &report).await
+}
+
+async fn start_room_agent_talk(
+    world: &BlimsWorldSnapshot,
+    player_room_id: &str,
+) -> Result<(), CliError> {
+    let report = load_blims_report().await?;
+    let Some(agent) = world
+        .agents
+        .iter()
+        .find(|agent| agent.room_id == player_room_id)
+    else {
+        println!("No agent is here to start an AI chat with.");
+        return Ok(());
+    };
+    start_agent_talk_session(agent, world, &report).await
+}
+
+async fn start_agent_talk_session(
+    agent: &BlimsAgentSnapshot,
+    world: &BlimsWorldSnapshot,
+    report: &BlimsMorningReport,
+) -> Result<(), CliError> {
+    let prompt = agent_talk_prompt(agent, world, report);
+    let session = BcodeClient::default_endpoint()
+        .create_session(Some(format!("Blims talk: {}", agent.name)))
+        .await?;
+    BcodeClient::default_endpoint()
+        .send_user_message(session.id, prompt)
+        .await?;
+    println!("AI chat session with {}: {}", agent.name, session.id);
+    println!("Open it with: bcode attach {}", session.id);
+    Ok(())
+}
+
+fn agent_talk_prompt(
+    agent: &BlimsAgentSnapshot,
+    world: &BlimsWorldSnapshot,
+    report: &BlimsMorningReport,
+) -> String {
+    let report_lines = report
+        .bullets
+        .iter()
+        .map(|bullet| format!("* {bullet}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are {}, a {} inside Blims, a cozy AI company simulator running inside Bcode.\n\n\
+         You are currently in room `{}` in the {}. Your visible status is: {}.\n\n\
+         Current CEO/company report:\n{}\n\n\
+         Reply in-character as this Blims agent. Be cozy, useful, dynamic, and candid. \
+         Tell the CEO what you are thinking about, what you recommend next, and whether anything needs attention.",
+        agent.name, agent.role, agent.room_id, world.theme, agent.status, report_lines
+    )
 }
 
 fn print_blims_office(
@@ -1050,7 +1118,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look, r report, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look, ai start AI chat, r report, w world, q quit"
     );
 }
 
