@@ -3630,6 +3630,7 @@ async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
             event = connection.recv_event() => {
                 match event? {
                     Event::Session(event) => print_session_event(&event),
+                    Event::SessionCatalogUpdated { .. } => {}
                 }
             }
             signal = tokio::signal::ctrl_c() => {

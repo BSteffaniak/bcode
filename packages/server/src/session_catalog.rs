@@ -88,6 +88,41 @@ impl SessionCatalog {
         self.apply_native(sessions, status).await;
     }
 
+    /// Force a catalog refresh for the selected sources.
+    pub async fn refresh(
+        &self,
+        state: &Arc<ServerState>,
+        working_directory: &Path,
+        sources: Option<&[String]>,
+    ) -> SessionCatalogSnapshot {
+        self.invalidate_sources(working_directory, sources).await;
+        self.snapshot(state, working_directory).await
+    }
+
+    async fn invalidate_sources(&self, working_directory: &Path, sources: Option<&[String]>) {
+        let mut inner = self.inner.lock().await;
+        let refresh_all = sources.is_none_or(<[String]>::is_empty);
+        let should_refresh = |source_id: &str| {
+            refresh_all
+                || sources.is_some_and(|sources| sources.iter().any(|source| source == source_id))
+        };
+        if should_refresh(NATIVE_SOURCE_ID) {
+            inner.native.requested = false;
+            inner.native.status = SessionCatalogStatus::NotStarted;
+        }
+        for (key, source) in &mut inner.imports {
+            if key.working_directory == working_directory && should_refresh(&key.source_id) {
+                source.requested = false;
+                source.status = SessionCatalogStatus::NotStarted;
+                source.sessions.clear();
+            }
+        }
+        inner.revision = inner.revision.saturating_add(1);
+        let _ = self.revision_tx.send(inner.revision);
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+
     async fn ensure_native_refresh(&self, state: &Arc<ServerState>) {
         let should_spawn = {
             let mut inner = self.inner.lock().await;

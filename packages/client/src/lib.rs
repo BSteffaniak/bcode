@@ -380,6 +380,38 @@ impl BcodeClient {
         }
     }
 
+    /// Refresh the session catalog and return the refreshed snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn refresh_session_catalog(
+        &self,
+        sources: Option<Vec<String>>,
+    ) -> Result<SessionList, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::RefreshSessionCatalog {
+                working_directory: Some(current_working_directory()),
+                sources,
+            })
+            .await?
+        {
+            ResponsePayload::SessionCatalogRefreshed {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            } => Ok(SessionList {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Change a session's canonical working directory.
     ///
     /// # Errors

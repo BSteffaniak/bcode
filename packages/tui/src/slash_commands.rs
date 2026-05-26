@@ -318,6 +318,35 @@ async fn worktree_command(
     }
 }
 
+async fn resync_command(
+    client: &BcodeClient,
+    parts: &[&str],
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    match parts.get(1).copied() {
+        Some("sessions") | None => {
+            let sources = if parts.len() > 2 {
+                Some(
+                    parts
+                        .iter()
+                        .skip(2)
+                        .map(|part| (*part).to_owned())
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            let list = client.refresh_session_catalog(sources).await?;
+            Ok(SlashCommandOutcome::Handled(format!(
+                "session catalog refresh requested (revision {})",
+                list.catalog_revision
+            )))
+        }
+        Some(other) => Ok(SlashCommandOutcome::Handled(format!(
+            "unknown resync target: {other}; usage: /resync sessions [source]"
+        ))),
+    }
+}
+
 /// Execute a slash command.
 ///
 /// # Errors
@@ -333,7 +362,14 @@ pub async fn execute(
         return Ok(SlashCommandOutcome::Unknown(message.to_owned()));
     };
     match command {
-        "sessions" | "rescan-imports" => Ok(SlashCommandOutcome::PickSession),
+        "sessions" => Ok(SlashCommandOutcome::PickSession),
+        "resync" => resync_command(client, &parts).await,
+        "rescan-imports" => client.refresh_session_catalog(None).await.map(|list| {
+            SlashCommandOutcome::Handled(format!(
+                "session catalog refresh requested (revision {})",
+                list.catalog_revision
+            ))
+        }),
         "new" => {
             let session = client.create_session(None).await?;
             Ok(SlashCommandOutcome::SwitchSession(session.id))

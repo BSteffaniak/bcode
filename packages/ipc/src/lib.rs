@@ -228,6 +228,12 @@ pub enum Request {
         source_id: String,
         external_session_id: String,
     },
+    RefreshSessionCatalog {
+        #[serde(default)]
+        working_directory: Option<PathBuf>,
+        #[serde(default)]
+        sources: Option<Vec<String>>,
+    },
 }
 
 /// Server stop request policy.
@@ -498,6 +504,15 @@ pub enum ResponsePayload {
         session: SessionSummary,
         warnings: Vec<SessionImportWarning>,
     },
+    SessionCatalogRefreshed {
+        sessions: Vec<SessionSummary>,
+        #[serde(default)]
+        catalog_status: SessionCatalogStatus,
+        #[serde(default)]
+        catalog_sources: Vec<SessionCatalogSourceStatus>,
+        #[serde(default)]
+        catalog_revision: u64,
+    },
 }
 
 /// Structured error response.
@@ -528,10 +543,15 @@ pub enum Response {
 }
 
 /// Server-to-client event payloads.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     Session(SessionEvent),
+    SessionCatalogUpdated {
+        #[serde(default)]
+        revision: u64,
+    },
 }
 
 /// Errors returned by Bcode IPC encoding/decoding.

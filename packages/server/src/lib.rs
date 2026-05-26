@@ -126,6 +126,8 @@ pub struct ServerState {
     client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
     active_session_namespaces: Mutex<BTreeMap<SessionId, String>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
+    event_clients: Mutex<Vec<SharedWriter>>,
+    catalog_events_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     shutdown: broadcast::Sender<()>,
@@ -435,6 +437,8 @@ impl ServerState {
             client_session_namespaces: Mutex::default(),
             active_session_namespaces: Mutex::default(),
             message_accepted_clients: Mutex::default(),
+            event_clients: Mutex::default(),
+            catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
             shutdown,
@@ -612,6 +616,34 @@ impl ServerState {
             plugin_runtime: self.plugins.executor_statuses(),
             daemon: self.daemon_status.clone(),
         }
+    }
+
+    async fn register_event_client(&self, writer: SharedWriter) {
+        self.event_clients.lock().await.push(writer);
+    }
+
+    fn start_catalog_event_forwarder(self: &Arc<Self>) {
+        if self
+            .catalog_events_started
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut revisions = state.session_catalog.subscribe();
+            loop {
+                if revisions.changed().await.is_err() {
+                    break;
+                }
+                let revision = *revisions.borrow_and_update();
+                broadcast_catalog_update(&state, revision).await;
+            }
+        });
+    }
+
+    async fn event_client_writers(&self) -> Vec<SharedWriter> {
+        self.event_clients.lock().await.clone()
     }
 
     fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
@@ -958,6 +990,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             )),
         },
     ));
+    state.start_catalog_event_forwarder();
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
     tracing::info!(target: "bcode_server::startup", "server ready; accepting clients");
@@ -1000,6 +1033,7 @@ async fn handle_registered_client(
 ) -> Result<(), ServerError> {
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
+    state.register_event_client(writer.clone()).await;
     let mut attached_session = None;
 
     loop {
@@ -1155,6 +1189,21 @@ async fn handle_request(
                 writer,
                 &source_id,
                 &external_session_id,
+            )
+            .await
+        }
+        Request::RefreshSessionCatalog {
+            working_directory,
+            sources,
+        } => {
+            let working_directory =
+                working_directory.unwrap_or_else(bcode_ipc::current_working_directory);
+            handle_refresh_session_catalog(
+                request_id,
+                state,
+                writer,
+                &working_directory,
+                sources.as_deref(),
             )
             .await
         }
@@ -1443,6 +1492,30 @@ async fn handle_list_sessions(
         writer,
         request_id,
         Response::Ok(ResponsePayload::SessionList {
+            sessions: snapshot.sessions,
+            catalog_status: snapshot.status,
+            catalog_sources: snapshot.sources,
+            catalog_revision: snapshot.revision,
+        }),
+    )
+    .await
+}
+
+async fn handle_refresh_session_catalog(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    working_directory: &Path,
+    sources: Option<&[String]>,
+) -> Result<(), ServerError> {
+    let snapshot = state
+        .session_catalog
+        .refresh(state, working_directory, sources)
+        .await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionCatalogRefreshed {
             sessions: snapshot.sessions,
             catalog_status: snapshot.status,
             catalog_sources: snapshot.sources,
@@ -6693,6 +6766,22 @@ async fn publish_session_event(state: &ServerState, event: &bcode_session_models
     match response {
         Ok(_) => {}
         Err(error) => eprintln!("failed to publish plugin session event: {error}"),
+    }
+}
+
+async fn broadcast_catalog_update(state: &ServerState, revision: u64) {
+    let envelope = match event_envelope(&Event::SessionCatalogUpdated { revision }) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            eprintln!("failed to encode catalog update event: {error}");
+            return;
+        }
+    };
+    for writer in state.event_client_writers().await {
+        let mut writer = writer.lock().await;
+        if let Err(error) = send_envelope(&mut *writer, &envelope).await {
+            eprintln!("failed to send catalog update event: {error}");
+        }
     }
 }
 
