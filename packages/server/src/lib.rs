@@ -1337,6 +1337,9 @@ async fn handle_request(
         Request::ListRuntimeWork { session_id } => {
             handle_list_runtime_work(request_id, state, writer, session_id).await
         }
+        Request::RuntimeWorkHistory { session_id, limit } => {
+            handle_runtime_work_history(request_id, state, writer, session_id, limit).await
+        }
         Request::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
         }
@@ -3030,7 +3033,7 @@ async fn handle_cancel_runtime_work(
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+        Response::Ok(ResponsePayload::RuntimeWorkCancellationRequested { cancelled }),
     )
     .await
 }
@@ -3046,6 +3049,39 @@ async fn handle_list_runtime_work(
         writer,
         request_id,
         Response::Ok(ResponsePayload::RuntimeWorkList { work }),
+    )
+    .await
+}
+
+async fn handle_runtime_work_history(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let mut events = state
+        .sessions
+        .session_history(session_id)
+        .await?
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                SessionEventKind::RuntimeWorkStarted { .. }
+                    | SessionEventKind::RuntimeWorkCancelRequested { .. }
+                    | SessionEventKind::RuntimeWorkProgress { .. }
+                    | SessionEventKind::RuntimeWorkFinished { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if limit > 0 && events.len() > limit {
+        events.drain(0..events.len() - limit);
+    }
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::RuntimeWorkHistory { events }),
     )
     .await
 }
@@ -7059,6 +7095,7 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
     let plugin_id = spec.plugin_id.clone();
     let service_interface = spec.service_interface.clone();
     let operation = spec.operation.clone();
+    let parent_work_id = spec.parent_work_id.clone();
     let cancellable = state.runtime_work.start(session_id, spec).await;
     match state
         .sessions
@@ -7072,6 +7109,7 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
                 plugin_id,
                 service_interface,
                 operation,
+                parent_work_id,
                 started_at_ms: Some(current_unix_millis()),
                 cancellable,
             },

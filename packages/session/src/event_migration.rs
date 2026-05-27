@@ -36,6 +36,7 @@ const BUILTIN_SESSION_EVENT_MIGRATIONS: &[NoOpSessionEventMigration] = &[
     NoOpSessionEventMigration::new("sessions-events-v14-to-v15", 14, 15),
     NoOpSessionEventMigration::new("sessions-events-v15-to-v16", 15, 16),
     NoOpSessionEventMigration::new("sessions-events-v16-to-v17", 16, 17),
+    NoOpSessionEventMigration::new("sessions-events-v17-to-v18", 17, 18),
 ];
 
 trait SessionEventMigrationStep {
@@ -507,6 +508,7 @@ fn migrate_v10_event_to_v11(event: SessionEvent) -> Vec<SessionEvent> {
                 plugin_id: None,
                 service_interface: None,
                 operation: None,
+                parent_work_id: None,
                 started_at_ms: None,
                 cancellable: false,
             };

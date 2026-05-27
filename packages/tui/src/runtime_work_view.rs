@@ -39,6 +39,13 @@ impl RuntimeWorkViewState {
                     item.status = RuntimeWorkStatus::Cancelling;
                 }
             }
+            SessionEventKind::RuntimeWorkProgress {
+                work_id, message, ..
+            } => {
+                if let Some(item) = self.active.get_mut(work_id) {
+                    item.label = format!("{} — {message}", item.label);
+                }
+            }
             SessionEventKind::RuntimeWorkFinished { work_id, .. } => {
                 self.active.remove(work_id);
             }

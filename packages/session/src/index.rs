@@ -512,6 +512,7 @@ const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
         SessionEventKind::RuntimeWorkStarted { .. } => "runtime_work_started",
         SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
+        SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
         SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::SessionImported { .. } => "session_imported",

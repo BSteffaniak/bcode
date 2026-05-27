@@ -826,6 +826,7 @@ impl BmuxApp {
             SessionEventKind::TraceEvent { trace } => self.apply_trace_event(trace),
             SessionEventKind::RuntimeWorkStarted { .. }
             | SessionEventKind::RuntimeWorkCancelRequested { .. }
+            | SessionEventKind::RuntimeWorkProgress { .. }
             | SessionEventKind::RuntimeWorkFinished { .. } => self.apply_runtime_work_event(event),
             _ => {}
         }
@@ -1755,6 +1756,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SkillInvocationFailed { .. }
         | SessionEventKind::RuntimeWorkStarted { .. }
         | SessionEventKind::RuntimeWorkCancelRequested { .. }
+        | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::RuntimeWorkFinished { .. }
         | SessionEventKind::ToolInvocationStream { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }

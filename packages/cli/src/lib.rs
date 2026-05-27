@@ -365,6 +365,11 @@ enum RuntimeWorkCommand {
         session_id: SessionId,
         work_id: String,
     },
+    History {
+        session_id: SessionId,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3637,6 +3642,11 @@ async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), 
                 println!("no active runtime work");
             }
         }
+        RuntimeWorkCommand::History { session_id, limit } => {
+            for event in client.runtime_work_history(session_id, limit).await? {
+                print_session_event(&event);
+            }
+        }
     }
     Ok(())
 }
@@ -3924,6 +3934,12 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             "#{} runtime work cancel requested: {work_id}",
             event.sequence
         ),
+        SessionEventKind::RuntimeWorkProgress {
+            work_id, message, ..
+        } => println!(
+            "#{} runtime work progress: {work_id} {}",
+            event.sequence, message
+        ),
         SessionEventKind::RuntimeWorkFinished {
             work_id,
             status,
@@ -3999,6 +4015,22 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
                 usage.metered_total_tokens(),
                 usage.cached_input_tokens
             );
+        }
+        SessionEventKind::RuntimeWorkStarted { work_id, label, .. } => {
+            println!("{prefix} runtime work started: {work_id} {label}");
+        }
+        SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
+            println!("{prefix} runtime work cancel requested: {work_id}");
+        }
+        SessionEventKind::RuntimeWorkProgress {
+            work_id, message, ..
+        } => {
+            println!("{prefix} runtime work progress: {work_id} {message}");
+        }
+        SessionEventKind::RuntimeWorkFinished {
+            work_id, status, ..
+        } => {
+            println!("{prefix} runtime work finished: {work_id} {status:?}");
         }
         SessionEventKind::TraceEvent { trace } => {
             println!(

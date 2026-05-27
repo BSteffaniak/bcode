@@ -775,7 +775,7 @@ impl BcodeClient {
             })
             .await?
         {
-            ResponsePayload::TurnCancellationRequested { cancelled } => Ok(cancelled),
+            ResponsePayload::RuntimeWorkCancellationRequested { cancelled } => Ok(cancelled),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -795,6 +795,26 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::RuntimeWorkList { work } => Ok(work),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return recent durable runtime-work lifecycle events for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn runtime_work_history(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Vec<bcode_session_models::SessionEvent>, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::RuntimeWorkHistory { session_id, limit })
+            .await?
+        {
+            ResponsePayload::RuntimeWorkHistory { events } => Ok(events),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

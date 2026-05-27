@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 17;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 18;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -654,6 +654,8 @@ pub enum SessionEventKind {
         #[serde(default)]
         operation: Option<String>,
         #[serde(default)]
+        parent_work_id: Option<RuntimeWorkId>,
+        #[serde(default)]
         started_at_ms: Option<u64>,
         #[serde(default)]
         cancellable: bool,
@@ -674,6 +676,17 @@ pub enum SessionEventKind {
         finished_at_ms: Option<u64>,
         #[serde(default)]
         message: Option<String>,
+    },
+    /// Durable runtime work progress marker.
+    RuntimeWorkProgress {
+        work_id: RuntimeWorkId,
+        message: String,
+        #[serde(default)]
+        progress_at_ms: Option<u64>,
+        #[serde(default)]
+        completed_units: Option<u64>,
+        #[serde(default)]
+        total_units: Option<u64>,
     },
     /// Durable marker that a model turn cancellation was requested.
     ModelTurnCancelRequested {

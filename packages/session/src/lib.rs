@@ -4324,6 +4324,7 @@ mod tests {
                     plugin_id: Some("plugin".to_string()),
                     service_interface: Some("service".to_string()),
                     operation: Some("invoke".to_string()),
+                    parent_work_id: None,
                     started_at_ms: Some(1),
                     cancellable: true,
                 },
@@ -4349,6 +4350,17 @@ mod tests {
             ),
             (
                 30,
+                "RuntimeWorkProgress",
+                SessionEventKind::RuntimeWorkProgress {
+                    work_id: RuntimeWorkId::new("work"),
+                    message: "progress".to_string(),
+                    progress_at_ms: Some(4),
+                    completed_units: Some(1),
+                    total_units: Some(2),
+                },
+            ),
+            (
+                31,
                 "ModelTurnCancelRequested",
                 SessionEventKind::ModelTurnCancelRequested {
                     turn_id: "turn".to_string(),
@@ -4357,7 +4369,7 @@ mod tests {
                 },
             ),
             (
-                31,
+                32,
                 "ToolInvocationStream",
                 SessionEventKind::ToolInvocationStream {
                     event: ToolInvocationStreamEvent::OutputDelta {
@@ -4370,7 +4382,7 @@ mod tests {
                 },
             ),
             (
-                32,
+                33,
                 "WorkingDirectoryChanged",
                 SessionEventKind::WorkingDirectoryChanged {
                     old_working_directory: test_working_directory(),
@@ -4378,7 +4390,7 @@ mod tests {
                 },
             ),
             (
-                33,
+                34,
                 "SessionImported",
                 SessionEventKind::SessionImported {
                     source_id: "pi".to_string(),

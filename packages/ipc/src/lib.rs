@@ -243,6 +243,10 @@ pub enum Request {
     ListRuntimeWork {
         session_id: SessionId,
     },
+    RuntimeWorkHistory {
+        session_id: SessionId,
+        limit: usize,
+    },
     SubscribeCatalogUpdates,
 }
 
@@ -537,6 +541,12 @@ pub enum ResponsePayload {
     CatalogUpdatesSubscribed,
     RuntimeWorkList {
         work: Vec<RuntimeWorkSnapshot>,
+    },
+    RuntimeWorkCancellationRequested {
+        cancelled: bool,
+    },
+    RuntimeWorkHistory {
+        events: Vec<SessionEvent>,
     },
 }
 
