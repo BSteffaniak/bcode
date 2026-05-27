@@ -1073,11 +1073,16 @@ async fn recover_abandoned_session_runtime_work(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let mut active = BTreeMap::<RuntimeWorkId, String>::new();
+    let mut active = BTreeMap::<RuntimeWorkId, (String, Option<RuntimeWorkId>)>::new();
     for event in state.sessions.session_history(session_id).await? {
         match event.kind {
-            SessionEventKind::RuntimeWorkStarted { work_id, label, .. } => {
-                active.insert(work_id, label);
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                label,
+                parent_work_id,
+                ..
+            } => {
+                active.insert(work_id, (label, parent_work_id));
             }
             SessionEventKind::RuntimeWorkFinished { work_id, .. } => {
                 active.remove(&work_id);
@@ -1085,15 +1090,25 @@ async fn recover_abandoned_session_runtime_work(
             _ => {}
         }
     }
-    for (work_id, label) in active {
+    let work_ids = active.keys().cloned().collect::<Vec<_>>();
+    for work_id in work_ids {
+        let Some((label, parent_work_id)) = active.remove(&work_id) else {
+            continue;
+        };
+        let message = if parent_work_id
+            .as_ref()
+            .is_some_and(|parent| !active.contains_key(parent))
+        {
+            format!("parent work ended before child finished: {label}")
+        } else {
+            format!("daemon stopped before runtime work finished: {label}")
+        };
         append_runtime_work_finished_event(
             state,
             session_id,
             work_id,
             RuntimeWorkStatus::Failed,
-            Some(format!(
-                "daemon stopped before runtime work finished: {label}"
-            )),
+            Some(message),
         )
         .await;
     }
@@ -6264,6 +6279,7 @@ async fn append_tool_stream_event(
     session_id: SessionId,
     event: ToolInvocationStreamEvent,
 ) {
+    let progress = runtime_work_progress_from_tool_stream_event(&event);
     if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
         let _ = state
             .sessions
@@ -6279,6 +6295,46 @@ async fn append_tool_stream_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append tool stream event: {error}"),
+    }
+    if let Some((work_id, message)) = progress {
+        append_runtime_work_progress_event(state, session_id, work_id, message, None, None).await;
+    }
+}
+
+fn runtime_work_progress_from_tool_stream_event(
+    event: &ToolInvocationStreamEvent,
+) -> Option<(RuntimeWorkId, String)> {
+    match event {
+        ToolInvocationStreamEvent::Status {
+            tool_call_id,
+            message,
+            ..
+        } => Some((
+            RuntimeWorkId::new(format!("tool_{tool_call_id}")),
+            message.clone(),
+        )),
+        ToolInvocationStreamEvent::Started {
+            tool_call_id,
+            tool_name,
+            ..
+        } => Some((
+            RuntimeWorkId::new(format!("tool_{tool_call_id}")),
+            format!("started {tool_name}"),
+        )),
+        ToolInvocationStreamEvent::Finished {
+            tool_call_id,
+            is_error,
+            ..
+        } => Some((
+            RuntimeWorkId::new(format!("tool_{tool_call_id}")),
+            if *is_error {
+                "finished with error"
+            } else {
+                "finished"
+            }
+            .to_string(),
+        )),
+        ToolInvocationStreamEvent::OutputDelta { .. } => None,
     }
 }
 
@@ -6506,6 +6562,13 @@ async fn request_tool_permission(
                     .lock()
                     .await
                     .remove(&pending.summary.permission_id);
+                append_permission_resolved_event(
+                    state,
+                    session_id,
+                    pending.summary.permission_id.clone(),
+                    false,
+                )
+                .await;
                 return false;
             }
         }
@@ -7184,6 +7247,33 @@ async fn append_model_turn_started_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append model turn start: {error}"),
+    }
+}
+
+async fn append_runtime_work_progress_event(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: RuntimeWorkId,
+    message: String,
+    completed_units: Option<u64>,
+    total_units: Option<u64>,
+) {
+    match state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::RuntimeWorkProgress {
+                work_id,
+                message,
+                progress_at_ms: Some(current_unix_millis()),
+                completed_units,
+                total_units,
+            },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append runtime work progress: {error}"),
     }
 }
 

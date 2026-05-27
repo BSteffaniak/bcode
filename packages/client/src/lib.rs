@@ -14,12 +14,89 @@ use bcode_ipc::{
     decode, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionInputHistoryEntry, SessionSummary,
+    ClientId, RuntimeWorkId, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryPage,
+    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::BTreeMap;
 use thiserror::Error;
+
+/// Grouped runtime-work lifecycle span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkSpan {
+    pub work_id: RuntimeWorkId,
+    pub parent_work_id: Option<RuntimeWorkId>,
+    pub label: String,
+    pub status: Option<RuntimeWorkStatus>,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+    pub cancelled: bool,
+    pub message: Option<String>,
+}
+
+impl RuntimeWorkSpan {
+    #[must_use]
+    pub fn duration_ms(&self) -> Option<u64> {
+        Some(self.finished_at_ms?.saturating_sub(self.started_at_ms?))
+    }
+}
+
+fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
+    let mut spans = BTreeMap::new();
+    for event in events {
+        match event.kind {
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                label,
+                parent_work_id,
+                started_at_ms,
+                ..
+            } => {
+                spans.insert(
+                    work_id.clone(),
+                    RuntimeWorkSpan {
+                        work_id,
+                        parent_work_id,
+                        label,
+                        status: None,
+                        started_at_ms,
+                        finished_at_ms: None,
+                        cancelled: false,
+                        message: None,
+                    },
+                );
+            }
+            SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
+                if let Some(span) = spans.get_mut(&work_id) {
+                    span.cancelled = true;
+                }
+            }
+            SessionEventKind::RuntimeWorkProgress {
+                work_id, message, ..
+            } => {
+                if let Some(span) = spans.get_mut(&work_id) {
+                    span.message = Some(message);
+                }
+            }
+            SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status,
+                finished_at_ms,
+                message,
+            } => {
+                if let Some(span) = spans.get_mut(&work_id) {
+                    span.status = Some(status);
+                    span.finished_at_ms = finished_at_ms;
+                    if message.is_some() {
+                        span.message = message;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    spans.into_values().collect()
+}
 
 /// Errors returned by the Bcode client.
 #[derive(Debug, Error)]
@@ -817,6 +894,21 @@ impl BcodeClient {
             ResponsePayload::RuntimeWorkHistory { events } => Ok(events),
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Return grouped runtime-work lifecycle spans for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the history request.
+    pub async fn runtime_work_spans(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Vec<RuntimeWorkSpan>, ClientError> {
+        Ok(runtime_work_spans(
+            self.runtime_work_history(session_id, limit).await?,
+        ))
     }
 
     /// Compact the model-visible context for a session while preserving append-only history.

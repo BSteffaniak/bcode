@@ -3643,8 +3643,21 @@ async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), 
             }
         }
         RuntimeWorkCommand::History { session_id, limit } => {
-            for event in client.runtime_work_history(session_id, limit).await? {
-                print_session_event(&event);
+            for span in client.runtime_work_spans(session_id, limit).await? {
+                println!(
+                    "{} status={:?} cancelled={} duration_ms={:?} parent={} label={}{}",
+                    span.work_id,
+                    span.status,
+                    span.cancelled,
+                    span.duration_ms(),
+                    span.parent_work_id
+                        .as_ref()
+                        .map_or_else(|| "-".to_string(), ToString::to_string),
+                    span.label,
+                    span.message
+                        .as_ref()
+                        .map_or_else(String::new, |message| format!(" message={message}"))
+                );
             }
         }
     }
