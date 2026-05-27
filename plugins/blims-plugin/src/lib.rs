@@ -115,6 +115,12 @@ pub const OP_AGENT_TALK_PROMPT: &str = "agent.talk_prompt";
 /// World snapshot operation.
 pub const OP_WORLD_SNAPSHOT: &str = "world.snapshot";
 
+/// Move player operation.
+pub const OP_WORLD_MOVE_PLAYER: &str = "world.move_player";
+
+/// Available world interactions operation.
+pub const OP_WORLD_AVAILABLE_INTERACTIONS: &str = "world.available_interactions";
+
 /// Morning report operation.
 pub const OP_REPORT_MORNING: &str = "report.morning";
 
@@ -146,96 +152,79 @@ impl RustPlugin for BlimsPlugin {
             );
         }
 
-        match context.request.operation.as_str() {
-            OP_COMPANY_STATUS => service_company_status(&context.request),
-            OP_COMPANY_CREATE | OP_COMPANY_LOAD => service_company_create(&context.request),
-            OP_COMPANY_PAUSE => service_company_lifecycle(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "paused",
-            ),
-            OP_COMPANY_RESUME => service_company_lifecycle(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "running",
-            ),
-            OP_COMPANY_SHUTDOWN => service_company_lifecycle(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "shutdown",
-            ),
-            OP_AGENT_LIST => service_agent_list(&context.request),
-            OP_INITIATIVE_CREATE => service_initiative_create(
-                &context.request,
-                &EventContext::from_request(&context.request),
-            ),
-            OP_INITIATIVE_LIST => service_initiative_list(&context.request),
-            OP_INITIATIVE_INSPECT => service_initiative_inspect(&context.request),
-            OP_INITIATIVE_SET_GUIDANCE => service_initiative_set_guidance(
-                &context.request,
-                &EventContext::from_request(&context.request),
-            ),
-            OP_INITIATIVE_PAUSE => service_initiative_status(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "paused",
-            ),
-            OP_INITIATIVE_RESUME => service_initiative_status(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "active",
-            ),
-            OP_GUIDANCE_SET => service_guidance_set(
-                &context.request,
-                &EventContext::from_request(&context.request),
-            ),
-            OP_GUIDANCE_LIST => service_guidance_list(&context.request),
-            OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(&context.request),
-            OP_INITIATIVE_IMPORT_PLAN => service_initiative_import_plan(
-                &context.request,
-                &EventContext::from_request(&context.request),
-            ),
-            OP_TASK_LIST => service_task_list(&context.request),
-            OP_TASK_INSPECT => service_task_inspect(&context.request),
-            OP_TASK_WORK_PROMPT => service_task_work_prompt(&context.request),
-            OP_ARTIFACT_LIST => service_artifact_list(&context.request),
-            OP_ARTIFACT_INSPECT => service_artifact_inspect(&context.request),
-            OP_PROPOSAL_REGISTER => service_proposal_register(
-                &context.request,
-                &EventContext::from_request(&context.request),
-            ),
-            OP_PROPOSAL_LIST => service_proposal_list(&context.request),
-            OP_PROPOSAL_INSPECT => service_proposal_inspect(&context.request),
-            OP_PROPOSAL_MARK_READY => service_proposal_mark_ready(
-                &context.request,
-                &EventContext::from_request(&context.request),
-            ),
-            OP_PROPOSAL_APPROVE => service_proposal_status(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "approved",
-            ),
-            OP_PROPOSAL_REJECT => service_proposal_status(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "rejected",
-            ),
-            OP_PROPOSAL_DEFER => service_proposal_status(
-                &context.request,
-                &EventContext::from_request(&context.request),
-                "deferred",
-            ),
-            OP_PROPOSAL_RECORD_PATCH => service_proposal_record_patch(
-                &context.request,
-                &EventContext::from_request(&context.request),
-            ),
-            OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
-            OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
-            OP_REPORT_MORNING => service_morning_report(&context.request),
-            OP_EVENT_LIST => service_event_list(&context.request),
-            OP_EVENT_REBUILD_PROJECTIONS => service_event_rebuild_projections(&context.request),
-            _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
+        invoke_blims_service(&context.request)
+    }
+}
+
+fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
+    match request.operation.as_str() {
+        OP_COMPANY_STATUS => service_company_status(request),
+        OP_COMPANY_CREATE | OP_COMPANY_LOAD => service_company_create(request),
+        OP_COMPANY_PAUSE => {
+            service_company_lifecycle(request, &EventContext::from_request(request), "paused")
         }
+        OP_COMPANY_RESUME => {
+            service_company_lifecycle(request, &EventContext::from_request(request), "running")
+        }
+        OP_COMPANY_SHUTDOWN => {
+            service_company_lifecycle(request, &EventContext::from_request(request), "shutdown")
+        }
+        OP_AGENT_LIST => service_agent_list(request),
+        OP_INITIATIVE_CREATE => {
+            service_initiative_create(request, &EventContext::from_request(request))
+        }
+        OP_INITIATIVE_LIST => service_initiative_list(request),
+        OP_INITIATIVE_INSPECT => service_initiative_inspect(request),
+        OP_INITIATIVE_SET_GUIDANCE => {
+            service_initiative_set_guidance(request, &EventContext::from_request(request))
+        }
+        OP_INITIATIVE_PAUSE => {
+            service_initiative_status(request, &EventContext::from_request(request), "paused")
+        }
+        OP_INITIATIVE_RESUME => {
+            service_initiative_status(request, &EventContext::from_request(request), "active")
+        }
+        OP_GUIDANCE_SET => service_guidance_set(request, &EventContext::from_request(request)),
+        OP_GUIDANCE_LIST => service_guidance_list(request),
+        OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(request),
+        OP_INITIATIVE_IMPORT_PLAN => {
+            service_initiative_import_plan(request, &EventContext::from_request(request))
+        }
+        OP_TASK_LIST => service_task_list(request),
+        OP_TASK_INSPECT => service_task_inspect(request),
+        OP_TASK_WORK_PROMPT => service_task_work_prompt(request),
+        OP_ARTIFACT_LIST => service_artifact_list(request),
+        OP_ARTIFACT_INSPECT => service_artifact_inspect(request),
+        OP_PROPOSAL_REGISTER => {
+            service_proposal_register(request, &EventContext::from_request(request))
+        }
+        OP_PROPOSAL_LIST => service_proposal_list(request),
+        OP_PROPOSAL_INSPECT => service_proposal_inspect(request),
+        OP_PROPOSAL_MARK_READY => {
+            service_proposal_mark_ready(request, &EventContext::from_request(request))
+        }
+        OP_PROPOSAL_APPROVE => {
+            service_proposal_status(request, &EventContext::from_request(request), "approved")
+        }
+        OP_PROPOSAL_REJECT => {
+            service_proposal_status(request, &EventContext::from_request(request), "rejected")
+        }
+        OP_PROPOSAL_DEFER => {
+            service_proposal_status(request, &EventContext::from_request(request), "deferred")
+        }
+        OP_PROPOSAL_RECORD_PATCH => {
+            service_proposal_record_patch(request, &EventContext::from_request(request))
+        }
+        OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(request),
+        OP_WORLD_SNAPSHOT => service_world_snapshot(request),
+        OP_WORLD_MOVE_PLAYER => {
+            service_world_move_player(request, &EventContext::from_request(request))
+        }
+        OP_WORLD_AVAILABLE_INTERACTIONS => service_world_available_interactions(request),
+        OP_REPORT_MORNING => service_morning_report(request),
+        OP_EVENT_LIST => service_event_list(request),
+        OP_EVENT_REBUILD_PROJECTIONS => service_event_rebuild_projections(request),
+        _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
     }
 }
 
@@ -418,6 +407,24 @@ pub struct ProjectionRebuildReport {
     pub rooms_projected: usize,
     /// Current projected company lifecycle status.
     pub lifecycle_status: String,
+}
+
+/// Request to move the CEO/player avatar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldMovePlayerRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Destination room id.
+    pub room_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to build an AI talk prompt for an agent.
@@ -743,6 +750,26 @@ pub struct CompanyStatus {
     pub lifecycle_status: String,
 }
 
+/// World interaction available to the player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldInteraction {
+    /// Stable interaction id.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Suggested CLI command.
+    pub command: String,
+}
+
+/// Available interactions for the current player room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableInteractions {
+    /// Current room id.
+    pub room_id: String,
+    /// Available interactions.
+    pub interactions: Vec<WorldInteraction>,
+}
+
 /// Blims world room snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomSnapshot {
@@ -980,6 +1007,9 @@ enum BlimsEventPayload {
     AgentStatusSet {
         agent_id: String,
         status: String,
+    },
+    PlayerMoved {
+        room_id: String,
     },
     DepartmentCreated {
         id: String,
@@ -1412,32 +1442,35 @@ fn service_world_snapshot(request: &ServiceRequest) -> ServiceResponse {
         Err(error) => return invalid_request(&error),
     };
 
-    match load_company_data(&request.working_directory) {
-        Ok(data) => json_response(&WorldSnapshot {
-            theme: data.world_theme,
-            player_name: "CEO".to_string(),
-            rooms: data
-                .rooms
-                .into_iter()
-                .map(|room| RoomSnapshot {
-                    id: room.id,
-                    name: room.name,
-                    purpose: room.purpose,
-                })
-                .collect(),
-            agents: data
-                .agents
-                .into_iter()
-                .map(|agent| AgentSnapshot {
-                    id: agent.id,
-                    name: agent.name,
-                    role: agent.role,
-                    status: agent.status,
-                    room_id: agent.room_id,
-                })
-                .collect(),
-        }),
-        Err(_) => json_response(&fallback_world_snapshot()),
+    world_snapshot(&request.working_directory).map_or_else(
+        |_| json_response(&fallback_world_snapshot()),
+        |snapshot| json_response(&snapshot),
+    )
+}
+
+fn service_world_move_player(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<WorldMovePlayerRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match move_player(&request, &event_context) {
+        Ok(snapshot) => json_response(&snapshot),
+        Err(error) => ServiceResponse::error("world_move_player_failed", error.to_string()),
+    }
+}
+
+fn service_world_available_interactions(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match available_interactions(&request.working_directory) {
+        Ok(interactions) => json_response(&interactions),
+        Err(error) => ServiceResponse::error("world_interactions_failed", error.to_string()),
     }
 }
 
@@ -1672,6 +1705,19 @@ async fn create_world_tables(
         .column(text_column("theme"))
         .column(text_column("player_room_id"))
         .primary_key("id")
+        .execute(database)
+        .await?;
+    database
+        .delete("worlds")
+        .filter(Box::new(where_eq("id", "default")))
+        .execute(database)
+        .await?;
+    database
+        .insert("worlds")
+        .value("id", "default")
+        .value("company_id", "default")
+        .value("theme", "Cozy Startup Loft")
+        .value("player_room_id", "ceo-nook")
         .execute(database)
         .await?;
     create_table("world_rooms")
@@ -2060,6 +2106,7 @@ fn fallback_morning_report() -> MorningReport {
 struct CompanyData {
     company: CompanyRecord,
     world_theme: String,
+    player_room_id: String,
     rooms: Vec<RoomRecord>,
     agents: Vec<AgentRecord>,
     initiatives: Vec<InitiativeSummary>,
@@ -2288,6 +2335,14 @@ async fn apply_org_world_event_projection(
         BlimsEventPayload::WorldRoomCreated { room } => {
             replace_one_world_room_projection(database, &room.clone().into()).await?;
         }
+        BlimsEventPayload::PlayerMoved { room_id } => {
+            database
+                .update("worlds")
+                .value("player_room_id", room_id.clone())
+                .filter(Box::new(where_eq("id", "default")))
+                .execute(database)
+                .await?;
+        }
         BlimsEventPayload::InitiativePlanImported { .. }
         | BlimsEventPayload::CompanyLifecycleSet { .. }
         | BlimsEventPayload::InitiativeCreated { .. }
@@ -2306,6 +2361,125 @@ fn load_company_data(working_directory: &Path) -> Result<CompanyData, BlimsState
     with_database(working_directory, |database| {
         Box::pin(load_company_data_from_database(database))
     })
+}
+
+fn world_snapshot(working_directory: &Path) -> Result<WorldSnapshot, BlimsStateError> {
+    load_company_data(working_directory).map(world_snapshot_from_data)
+}
+
+fn world_snapshot_from_data(data: CompanyData) -> WorldSnapshot {
+    WorldSnapshot {
+        theme: data.world_theme,
+        player_name: "CEO".to_string(),
+        rooms: data
+            .rooms
+            .into_iter()
+            .map(|room| RoomSnapshot {
+                id: room.id,
+                name: room.name,
+                purpose: room.purpose,
+            })
+            .collect(),
+        agents: data
+            .agents
+            .into_iter()
+            .map(|agent| AgentSnapshot {
+                id: agent.id,
+                name: agent.name,
+                role: agent.role,
+                status: agent.status,
+                room_id: agent.room_id,
+            })
+            .collect(),
+    }
+}
+
+fn move_player(
+    request: &WorldMovePlayerRequest,
+    event_context: &EventContext,
+) -> Result<WorldSnapshot, BlimsStateError> {
+    let room_id = request.room_id.trim().to_string();
+    if room_id.is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "room_id cannot be empty".to_string(),
+        ));
+    }
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let room_exists = database
+                .select("world_rooms")
+                .columns(&["id"])
+                .filter(Box::new(where_eq("id", room_id.clone())))
+                .limit(1)
+                .execute_first(database)
+                .await?
+                .is_some();
+            if !room_exists {
+                return Err(BlimsStateError::InvalidRequest(format!(
+                    "unknown room: {room_id}"
+                )));
+            }
+            append_event(
+                database,
+                &event_context,
+                "player.moved",
+                format!("CEO moved to room {room_id}."),
+                &BlimsEventPayload::PlayerMoved { room_id },
+            )
+            .await?;
+            let data = load_company_data_from_database(database).await?;
+            Ok(world_snapshot_from_data(data))
+        })
+    })
+}
+
+fn available_interactions(
+    working_directory: &Path,
+) -> Result<AvailableInteractions, BlimsStateError> {
+    let data = load_company_data(working_directory)?;
+    Ok(available_interactions_from_data(&data))
+}
+
+fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions {
+    let room_id = data.player_room_id.clone();
+    let mut interactions = vec![WorldInteraction {
+        id: "look".to_string(),
+        label: "Look around".to_string(),
+        command: "look".to_string(),
+    }];
+    for agent in data.agents.iter().filter(|agent| agent.room_id == room_id) {
+        interactions.push(WorldInteraction {
+            id: format!("talk-{}", agent.id),
+            label: format!("Talk to {}", agent.name),
+            command: format!("ai {}", agent.id),
+        });
+    }
+    if room_id == "whiteboard" {
+        interactions.push(WorldInteraction {
+            id: "initiatives".to_string(),
+            label: "Review initiatives".to_string(),
+            command: "initiatives".to_string(),
+        });
+    }
+    if room_id == "engineering" {
+        interactions.push(WorldInteraction {
+            id: "tasks".to_string(),
+            label: "Review tasks".to_string(),
+            command: "tasks".to_string(),
+        });
+    }
+    if room_id == "review" {
+        interactions.push(WorldInteraction {
+            id: "proposals".to_string(),
+            label: "Review proposals and artifacts".to_string(),
+            command: "proposals".to_string(),
+        });
+    }
+    AvailableInteractions {
+        room_id,
+        interactions,
+    }
 }
 
 fn create_initiative(
@@ -3155,7 +3329,7 @@ async fn load_company_data_from_database(
         .ok_or(BlimsStateError::MissingColumn("companies"))?;
     let world = database
         .select("worlds")
-        .columns(&["theme"])
+        .columns(&["theme", "player_room_id"])
         .limit(1)
         .execute_first(database)
         .await?
@@ -3217,6 +3391,7 @@ async fn load_company_data_from_database(
             lifecycle_status: required_text(&company, "lifecycle_status")?,
         },
         world_theme: required_text(&world, "theme")?,
+        player_room_id: required_text(&world, "player_room_id")?,
         rooms: room_rows
             .iter()
             .map(room_record)
@@ -3399,6 +3574,8 @@ fn replay_event(
                 agent.status = status;
             }
         }
+        BlimsEventPayload::PlayerMoved { .. }
+        | BlimsEventPayload::InitiativePlanImported { .. } => {}
         BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
             upsert_by_id(
                 &mut state.departments,
@@ -3426,7 +3603,6 @@ fn replay_event(
         BlimsEventPayload::WorldRoomCreated { room } => {
             upsert_by_id(&mut state.rooms, room.into(), |room| &room.id);
         }
-        BlimsEventPayload::InitiativePlanImported { .. } => {}
     }
     Ok(())
 }

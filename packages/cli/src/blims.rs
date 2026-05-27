@@ -285,6 +285,19 @@ struct BlimsWorldSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsWorldInteraction {
+    id: String,
+    label: String,
+    command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsAvailableInteractions {
+    room_id: String,
+    interactions: Vec<BlimsWorldInteraction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsInitiativeSummary {
     id: String,
     title: String,
@@ -456,9 +469,10 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
 async fn enter_blims_office() -> Result<(), CliError> {
     let mut world = load_blims_world().await?;
     let mut report = load_blims_report().await?;
-    let mut player_room_id = "ceo-nook".to_string();
+    let mut interactions = load_blims_interactions().await?;
+    let mut player_room_id = interactions.room_id.clone();
     loop {
-        print_blims_office(&world, &report, &player_room_id);
+        print_blims_office(&world, &report, &interactions, &player_room_id);
         print!("blims> ");
         std::io::stdout().flush()?;
         let mut input = String::new();
@@ -468,12 +482,22 @@ async fn enter_blims_office() -> Result<(), CliError> {
             break;
         }
         match command {
-            "h" | "left" => player_room_id = previous_room_id(&world, &player_room_id),
+            "h" | "left" => {
+                player_room_id = previous_room_id(&world, &player_room_id);
+                world = move_blims_player(&player_room_id).await?;
+                interactions = load_blims_interactions().await?;
+            }
             "l" | "right" | "j" | "down" | "k" | "up" => {
                 player_room_id = next_room_id(&world, &player_room_id);
+                world = move_blims_player(&player_room_id).await?;
+                interactions = load_blims_interactions().await?;
             }
             "r" | "report" => print_blims_report(&report),
-            "refresh" | "reload" => refresh_blims_office(&mut world, &mut report).await?,
+            "refresh" | "reload" => {
+                refresh_blims_office(&mut world, &mut report).await?;
+                interactions = load_blims_interactions().await?;
+                player_room_id = interactions.room_id.clone();
+            }
             "tasks" | "task" => print_office_tasks().await?,
             "artifacts" | "artifact" => print_office_artifacts().await?,
             "proposals" | "proposal" => print_office_proposals().await?,
@@ -570,6 +594,21 @@ async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
 
 async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
     let response = call_blims_service("world.snapshot", blims_workspace_payload()?).await?;
+    decode_blims_response::<BlimsWorldSnapshot>(response)
+}
+
+async fn load_blims_interactions() -> Result<BlimsAvailableInteractions, CliError> {
+    let response =
+        call_blims_service("world.available_interactions", blims_workspace_payload()?).await?;
+    decode_blims_response::<BlimsAvailableInteractions>(response)
+}
+
+async fn move_blims_player(room_id: &str) -> Result<BlimsWorldSnapshot, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "room_id": room_id,
+    });
+    let response = call_blims_service("world.move_player", serde_json::to_vec(&request)?).await?;
     decode_blims_response::<BlimsWorldSnapshot>(response)
 }
 
@@ -812,6 +851,7 @@ async fn register_blims_work_proposal(
 fn print_blims_office(
     world: &BlimsWorldSnapshot,
     report: &BlimsMorningReport,
+    interactions: &BlimsAvailableInteractions,
     player_room_id: &str,
 ) {
     print!("\x1B[2J\x1B[H");
@@ -849,12 +889,17 @@ fn print_blims_office(
         println!("* {bullet}");
     }
     println!();
+    println!("Available interactions:");
+    for interaction in &interactions.interactions {
+        println!("* {} — `{}`", interaction.label, interaction.command);
+    }
+    println!();
     print_blims_help();
 }
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look/interactions, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
     );
 }
 
