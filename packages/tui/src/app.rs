@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 
 use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
 use bcode_session_models::{
-    ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
-    SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
+    SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionTraceEvent,
+    SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -59,6 +59,7 @@ pub struct BmuxApp {
     transcript: Vec<TranscriptItem>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
+    active_runtime_work: BTreeMap<RuntimeWorkId, RuntimeWorkStatus>,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
@@ -115,6 +116,7 @@ impl BmuxApp {
             transcript: Vec::new(),
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
+            active_runtime_work: BTreeMap::new(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
@@ -821,6 +823,26 @@ impl BmuxApp {
                 self.current_agent_id.clone_from(agent_id);
             }
             SessionEventKind::TraceEvent { trace } => self.apply_trace_event(trace),
+            SessionEventKind::RuntimeWorkStarted { work_id, .. } => {
+                self.active_runtime_work
+                    .insert(work_id.clone(), RuntimeWorkStatus::Running);
+                self.set_activity(ActivityState::Thinking);
+            }
+            SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
+                self.active_runtime_work
+                    .insert(work_id.clone(), RuntimeWorkStatus::Cancelling);
+                self.set_cancelling();
+            }
+            SessionEventKind::RuntimeWorkFinished {
+                work_id, status, ..
+            } => {
+                self.active_runtime_work.remove(work_id);
+                if self.active_runtime_work.is_empty() {
+                    self.set_activity(ActivityState::Idle);
+                } else if *status == RuntimeWorkStatus::Cancelled {
+                    self.set_cancelling();
+                }
+            }
             _ => {}
         }
     }

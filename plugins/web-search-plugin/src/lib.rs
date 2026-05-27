@@ -65,6 +65,9 @@ impl WebSearchPlugin {
             Ok(invocation) => invocation,
             Err(error) => return invalid_request(&error),
         };
+        if context.cancellation.is_cancelled() {
+            return json_response(&tool_error("web tool cancelled".to_string()));
+        }
         let response = match invocation.name.as_str() {
             "web.search" => self.invoke_search(&context.config, &invocation),
             "web.fetch" => self.invoke_fetch(&context.config, &invocation),

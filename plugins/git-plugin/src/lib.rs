@@ -23,7 +23,7 @@ pub struct GitPlugin;
 impl RustPlugin for GitPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
-            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context.request),
+            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported Git plugin service interface",
@@ -32,10 +32,11 @@ impl RustPlugin for GitPlugin {
     }
 }
 
-fn invoke_tool_service(request: &ServiceRequest) -> ServiceResponse {
+fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
-        OP_INVOKE_TOOL => invoke_tool(request),
+        OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported Git tool service operation",
@@ -52,11 +53,15 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     })
 }
 
-fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
+fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
     let invocation = match request.payload_json::<ToolInvocationRequest>() {
         Ok(invocation) => invocation,
         Err(error) => return invalid_request(&error),
     };
+    if context.cancellation.is_cancelled() {
+        return json_response(&tool_error("git tool cancelled".to_string()));
+    }
     let response = match invocation.name.as_str() {
         "git.clone" | "github.clone" => invoke_clone(&invocation),
         _ => ToolInvocationResponse {

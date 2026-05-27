@@ -21,7 +21,7 @@ pub struct WorktreePlugin;
 impl RustPlugin for WorktreePlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
-            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context.request),
+            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported worktree plugin service interface",
@@ -30,10 +30,11 @@ impl RustPlugin for WorktreePlugin {
     }
 }
 
-fn invoke_tool_service(request: &ServiceRequest) -> ServiceResponse {
+fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
-        OP_INVOKE_TOOL => invoke_tool(request),
+        OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported worktree tool service operation",
@@ -50,11 +51,15 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     })
 }
 
-fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
+fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
     let invocation = match request.payload_json::<ToolInvocationRequest>() {
         Ok(invocation) => invocation,
         Err(error) => return invalid_request(&error),
     };
+    if context.cancellation.is_cancelled() {
+        return json_response(&tool_error("worktree tool cancelled".to_string()));
+    }
     let response = match invocation.name.as_str() {
         "worktree.list" => invoke_list(&invocation),
         "worktree.create" => invoke_create(&invocation),

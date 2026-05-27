@@ -39,8 +39,8 @@ pub struct FilesystemPlugin;
 impl RustPlugin for FilesystemPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
-            FILESYSTEM_INTERFACE_ID => invoke_filesystem_service(&context.request),
-            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context.request),
+            FILESYSTEM_INTERFACE_ID => invoke_filesystem_service(&context),
+            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported filesystem plugin service interface",
@@ -186,7 +186,8 @@ struct StatResponse {
     len: Option<u64>,
 }
 
-fn invoke_filesystem_service(request: &ServiceRequest) -> ServiceResponse {
+fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
     match request.operation.as_str() {
         "read" => read_file(request),
         "write" => write_file(request),
@@ -203,10 +204,11 @@ fn invoke_filesystem_service(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn invoke_tool_service(request: &ServiceRequest) -> ServiceResponse {
+fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
-        OP_INVOKE_TOOL => invoke_tool(request),
+        OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported tool service operation",
@@ -372,11 +374,20 @@ fn stat_tool_definition() -> ToolDefinition {
     }
 }
 
-fn invoke_tool(request: &ServiceRequest) -> ServiceResponse {
+fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
     let request = match request.payload_json::<ToolInvocationRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
+    if context.cancellation.is_cancelled() {
+        return json_response(&ToolInvocationResponse {
+            output: "filesystem tool cancelled".to_string(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+        });
+    }
     let cwd = request.cwd.clone();
     let response = match request.name.as_str() {
         "filesystem.read" => tool_read(request.arguments, cwd.as_deref()),

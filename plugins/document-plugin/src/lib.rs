@@ -40,7 +40,7 @@ impl Default for DocumentPlugin {
 impl RustPlugin for DocumentPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
-            TOOL_SERVICE_INTERFACE_ID => self.invoke_tool_service(&context.request),
+            TOOL_SERVICE_INTERFACE_ID => self.invoke_tool_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported document plugin service interface",
@@ -50,10 +50,11 @@ impl RustPlugin for DocumentPlugin {
 }
 
 impl DocumentPlugin {
-    fn invoke_tool_service(&self, request: &ServiceRequest) -> ServiceResponse {
+    fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let request = &context.request;
         match request.operation.as_str() {
             OP_LIST_TOOLS => list_tools(request),
-            OP_INVOKE_TOOL => self.invoke_tool(request),
+            OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported document tool service operation",
@@ -61,11 +62,15 @@ impl DocumentPlugin {
         }
     }
 
-    fn invoke_tool(&self, request: &ServiceRequest) -> ServiceResponse {
+    fn invoke_tool(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let request = &context.request;
         let invocation = match request.payload_json::<ToolInvocationRequest>() {
             Ok(invocation) => invocation,
             Err(error) => return invalid_request(&error),
         };
+        if context.cancellation.is_cancelled() {
+            return json_response(&tool_error("document tool cancelled".to_string()));
+        }
         let response = match invocation.name.as_str() {
             "document.extract" => self.invoke_extract(&invocation),
             "document.status" => invoke_status(),
