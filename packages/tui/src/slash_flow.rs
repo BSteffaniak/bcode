@@ -10,7 +10,8 @@ use bmux_tui::terminal::Terminal;
 use super::helpers;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::{
-    TuiError, composer_flow, input, session_flow::ActiveChat, slash_palette, slash_palette_render,
+    TuiError, composer_flow, input, input::KeyRequest, session_flow::ActiveChat, slash_palette,
+    slash_palette_render,
 };
 
 /// Refresh slash completions for the current composer text.
@@ -85,15 +86,16 @@ pub async fn handle_slash_palette_key<W: Write>(
         _ => {
             let outcome = input::handle_key(&mut chat.app, services.keymap, stroke);
             update_slash_palette(services.client, chat, slash_palette).await;
-            if outcome.interrupted {
-                request_turn_cancellation(services.client, chat).await;
-            }
-            if outcome.submitted {
-                let outcome = submit_from_slash_palette(io, services, chat).await;
-                match outcome {
-                    Ok(outcome) => return Ok(Some(outcome)),
-                    Err(error) => {
-                        helpers::report_client_error(&mut chat.app, "send failed", &error);
+            match outcome.request {
+                KeyRequest::None | KeyRequest::CycleAgent => {}
+                KeyRequest::Interrupt => request_turn_cancellation(services.client, chat).await,
+                KeyRequest::Submit => {
+                    let outcome = submit_from_slash_palette(io, services, chat).await;
+                    match outcome {
+                        Ok(outcome) => return Ok(Some(outcome)),
+                        Err(error) => {
+                            helpers::report_client_error(&mut chat.app, "send failed", &error);
+                        }
                     }
                 }
             }

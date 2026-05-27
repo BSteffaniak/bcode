@@ -2,6 +2,7 @@
 
 use std::io::Write;
 
+use bcode_agent_profile::AgentInfo;
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -19,8 +20,8 @@ use super::session_flow::ActiveChat;
 use super::terminal_events::TuiInput;
 use super::{
     CHAT_TICK_INTERVAL, TuiError, command_palette_render, composer_flow, history_flow, input,
-    mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
-    slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
+    input::KeyRequest, mouse_flow, palette_flow, permission_dialog_render, permission_flow, render,
+    slash_flow, slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
 };
 
 struct ModalState {
@@ -287,17 +288,19 @@ async fn handle_chat_key<W: Write>(
     let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
     slash_flow::update_slash_palette(context.services.client, chat, &mut modals.slash_palette)
         .await;
-    if outcome.interrupted {
-        request_turn_cancellation(context.services.client, chat).await;
-    }
-    if outcome.submitted {
-        let (mut io, services) = context.flow_context();
-        match composer_flow::submit_composer(&mut io, &services, chat).await {
-            Ok(Some(dialog)) => {
-                modals.thinking_dialog = Some(dialog);
+    match outcome.request {
+        KeyRequest::None => {}
+        KeyRequest::Interrupt => request_turn_cancellation(context.services.client, chat).await,
+        KeyRequest::CycleAgent => cycle_session_agent(context.services.client, chat).await,
+        KeyRequest::Submit => {
+            let (mut io, services) = context.flow_context();
+            match composer_flow::submit_composer(&mut io, &services, chat).await {
+                Ok(Some(dialog)) => {
+                    modals.thinking_dialog = Some(dialog);
+                }
+                Ok(None) => {}
+                Err(error) => helpers::report_client_error(&mut chat.app, "send failed", &error),
             }
-            Ok(None) => {}
-            Err(error) => helpers::report_client_error(&mut chat.app, "send failed", &error),
         }
     }
     Ok(outcome.redraw)
@@ -323,6 +326,44 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
             chat.app.set_status(format!("cancel failed: {error}"));
         }
     }
+}
+
+async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return;
+    };
+    let agents = match client.list_agents().await {
+        Ok(agents) => agents,
+        Err(error) => {
+            chat.app.set_status(format!("agent cycle failed: {error}"));
+            return;
+        }
+    };
+    let Some(agent) = next_agent(&agents, chat.app.current_agent_id()) else {
+        chat.app.set_status("no agents available".to_owned());
+        return;
+    };
+    let agent_id = agent.id.clone();
+    let agent_name = agent.name.clone();
+    match client.set_session_agent(session_id, agent_id).await {
+        Ok(()) => chat.app.set_status(format!("agent set to {agent_name}")),
+        Err(error) => chat.app.set_status(format!("agent switch failed: {error}")),
+    }
+}
+
+#[must_use]
+pub fn next_agent<'a>(agents: &'a [AgentInfo], current_agent_id: &str) -> Option<&'a AgentInfo> {
+    if agents.is_empty() {
+        return None;
+    }
+    if let Some(index) = agents.iter().position(|agent| agent.id == current_agent_id) {
+        return agents.get((index + 1) % agents.len());
+    }
+    agents
+        .iter()
+        .find(|agent| agent.is_default)
+        .or_else(|| agents.first())
 }
 
 fn is_palette_open_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {

@@ -374,6 +374,7 @@ fn handle_picker_filter_key(
             | BmuxAction::AppInterrupt
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
+            | BmuxAction::AgentCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop

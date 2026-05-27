@@ -236,6 +236,7 @@ fn handle_skill_picker_action(
         | BmuxAction::AppInterrupt
         | BmuxAction::ClipboardPasteImage
         | BmuxAction::CommandPaletteOpen
+        | BmuxAction::AgentCycle
         | BmuxAction::TranscriptPageUp
         | BmuxAction::TranscriptPageDown
         | BmuxAction::TranscriptTop

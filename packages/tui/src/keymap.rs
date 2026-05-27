@@ -28,6 +28,7 @@ pub enum BmuxAction {
     AppInterrupt,
     ClipboardPasteImage,
     CommandPaletteOpen,
+    AgentCycle,
     TranscriptPageUp,
     TranscriptPageDown,
     TranscriptTop,
@@ -78,6 +79,7 @@ impl BmuxAction {
             "app.interrupt" => Self::AppInterrupt,
             "app.clipboard.pasteImage" => Self::ClipboardPasteImage,
             "app.command_palette" => Self::CommandPaletteOpen,
+            "tui.agent.cycle" => Self::AgentCycle,
             "transcript.pageUp" => Self::TranscriptPageUp,
             "transcript.pageDown" => Self::TranscriptPageDown,
             "transcript.top" => Self::TranscriptTop,
@@ -170,6 +172,7 @@ impl BmuxKeyMap {
             (BmuxAction::AppExit, "exit"),
             (BmuxAction::ClipboardPasteImage, "paste image"),
             (BmuxAction::CommandPaletteOpen, "palette"),
+            (BmuxAction::AgentCycle, "agent"),
         ]
         .into_iter()
         .filter_map(|(action, label)| {
@@ -219,6 +222,7 @@ impl BmuxKeyMap {
             | BmuxAction::AppInterrupt
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
+            | BmuxAction::AgentCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -269,6 +273,7 @@ impl BmuxKeyMap {
             | BmuxAction::AppInterrupt
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
+            | BmuxAction::AgentCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -368,6 +373,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
                 bind("escape", BmuxAction::AppInterrupt),
                 bind("ctrl+v", BmuxAction::ClipboardPasteImage),
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),
+                bind("tab", BmuxAction::AgentCycle),
                 bind("pageUp", BmuxAction::TranscriptPageUp),
                 bind("pageDown", BmuxAction::TranscriptPageDown),
                 bind("ctrl+home", BmuxAction::TranscriptTop),

@@ -9,15 +9,27 @@ use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 const TRANSCRIPT_SCROLL_ROWS: usize = 3;
 const TRANSCRIPT_PAGE_ROWS: usize = 10;
 
+/// Follow-up request produced by handling one key stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyRequest {
+    /// No follow-up request.
+    #[default]
+    None,
+    /// Submit staged composer text.
+    Submit,
+    /// Interrupt the active turn.
+    Interrupt,
+    /// Cycle to the next available agent.
+    CycleAgent,
+}
+
 /// Result of handling one key stroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KeyOutcome {
     /// Whether the caller should redraw the UI.
     pub redraw: bool,
-    /// Whether the composer was submitted.
-    pub submitted: bool,
-    /// Whether active turn interruption was requested.
-    pub interrupted: bool,
+    /// Follow-up request for the caller to perform.
+    pub request: KeyRequest,
 }
 
 /// Handle a key stroke.
@@ -29,8 +41,7 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
         app.extend_composer_selection(motion);
         return KeyOutcome {
             redraw: true,
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         };
     }
     if let Some(command) = keymap.editor_command_for_key(stroke) {
@@ -39,8 +50,7 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
         app.wake_cursor();
         return KeyOutcome {
             redraw: true,
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         };
     }
 
@@ -56,8 +66,7 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
             app.wake_cursor();
             KeyOutcome {
                 redraw: true,
-                submitted: false,
-                interrupted: false,
+                request: KeyRequest::None,
             }
         }
         TextInputKeyOutcome::Ignored => KeyOutcome::default(),
@@ -77,47 +86,43 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
             }
             KeyOutcome {
                 redraw: true,
-                submitted: false,
-                interrupted: false,
+                request: KeyRequest::None,
             }
         }
         BmuxAction::AppInterrupt => KeyOutcome {
             redraw: true,
-            submitted: false,
-            interrupted: true,
+            request: KeyRequest::Interrupt,
         },
         BmuxAction::InputSubmit => submit(app),
+        BmuxAction::AgentCycle => KeyOutcome {
+            redraw: true,
+            request: KeyRequest::CycleAgent,
+        },
         BmuxAction::InputHistoryPrevious => history_previous(app),
         BmuxAction::InputHistoryNext => history_next(app),
         BmuxAction::TranscriptPageUp => KeyOutcome {
             redraw: app.scroll_transcript_up(TRANSCRIPT_PAGE_ROWS),
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         },
         BmuxAction::TranscriptPageDown => KeyOutcome {
             redraw: app.scroll_transcript_down(TRANSCRIPT_PAGE_ROWS),
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         },
         BmuxAction::TranscriptTop => KeyOutcome {
             redraw: app.scroll_transcript_up(usize::MAX / 2),
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         },
         BmuxAction::TranscriptBottom => KeyOutcome {
             redraw: app.scroll_transcript_to_bottom(),
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         },
         BmuxAction::TranscriptLineUp => KeyOutcome {
             redraw: app.scroll_transcript_up(TRANSCRIPT_SCROLL_ROWS),
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         },
         BmuxAction::TranscriptLineDown => KeyOutcome {
             redraw: app.scroll_transcript_down(TRANSCRIPT_SCROLL_ROWS),
-            submitted: false,
-            interrupted: false,
+            request: KeyRequest::None,
         },
         BmuxAction::ClipboardPasteImage
         | BmuxAction::CommandPaletteOpen
@@ -164,8 +169,7 @@ fn history_previous(app: &mut BmuxApp) -> KeyOutcome {
         } else {
             app.move_composer_visual_up() || app.previous_input_history()
         },
-        submitted: false,
-        interrupted: false,
+        request: KeyRequest::None,
     }
 }
 
@@ -176,8 +180,7 @@ fn history_next(app: &mut BmuxApp) -> KeyOutcome {
         } else {
             app.move_composer_visual_down() || app.next_input_history()
         },
-        submitted: false,
-        interrupted: false,
+        request: KeyRequest::None,
     }
 }
 
@@ -186,7 +189,6 @@ fn submit(app: &mut BmuxApp) -> KeyOutcome {
     app.wake_cursor();
     KeyOutcome {
         redraw: true,
-        submitted: true,
-        interrupted: false,
+        request: KeyRequest::Submit,
     }
 }

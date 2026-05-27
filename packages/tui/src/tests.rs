@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use bcode_agent_profile::AgentInfo;
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionSummary,
     SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
@@ -16,6 +17,7 @@ use bmux_tui::geometry::{Point, Rect};
 use super::{
     app::BmuxApp,
     input,
+    input::KeyRequest,
     keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
     render, slash_palette, slash_palette_render,
     time_format::{format_duration_nanos, format_millis},
@@ -79,7 +81,7 @@ fn escape_interrupt_does_not_exit_chat() {
 
     let outcome = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
 
-    assert!(outcome.interrupted);
+    assert_eq!(outcome.request, KeyRequest::Interrupt);
     assert!(!app.should_exit());
 }
 
@@ -96,11 +98,80 @@ fn configured_ctrl_enter_submits_while_enter_inserts_newline() {
 
     let enter = input::handle_key(&mut app, &keymap, key(KeyCode::Enter));
     assert!(enter.redraw);
-    assert!(!enter.submitted);
+    assert_ne!(enter.request, KeyRequest::Submit);
     assert_eq!(app.composer().text(), "draft\n");
 
     let ctrl_enter = input::handle_key(&mut app, &keymap, ctrl_key_code(KeyCode::Enter));
-    assert!(ctrl_enter.submitted);
+    assert_eq!(ctrl_enter.request, KeyRequest::Submit);
+}
+
+#[test]
+fn default_tab_requests_agent_cycle_in_chat_input() {
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.replace_composer_with("draft");
+
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, key(KeyCode::Tab)),
+        Some(BmuxAction::AgentCycle)
+    );
+
+    let outcome = input::handle_key(&mut app, &keymap, key(KeyCode::Tab));
+
+    assert!(outcome.redraw);
+    assert_eq!(outcome.request, KeyRequest::CycleAgent);
+    assert_ne!(outcome.request, KeyRequest::Submit);
+    assert_eq!(app.composer().text(), "draft");
+}
+
+#[test]
+fn configured_agent_cycle_binding_can_be_changed() {
+    let mut config = bcode_config::TuiConfig::default();
+    config.keybindings.chat = BTreeMap::from([("ctrl+a".to_owned(), "tui.agent.cycle".to_owned())]);
+    let keymap = BmuxKeyMap::from_config(&config);
+
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, key(KeyCode::Tab)),
+        None
+    );
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, ctrl_key('a')),
+        Some(BmuxAction::AgentCycle)
+    );
+}
+
+#[test]
+fn next_agent_preserves_list_order_and_wraps() {
+    let agents = agent_infos(&[("plan", false), ("review", false), ("build", true)]);
+
+    assert_eq!(
+        super::chat_loop::next_agent(&agents, "plan").map(|agent| agent.id.as_str()),
+        Some("review")
+    );
+    assert_eq!(
+        super::chat_loop::next_agent(&agents, "review").map(|agent| agent.id.as_str()),
+        Some("build")
+    );
+    assert_eq!(
+        super::chat_loop::next_agent(&agents, "build").map(|agent| agent.id.as_str()),
+        Some("plan")
+    );
+}
+
+#[test]
+fn next_agent_uses_default_or_first_when_current_is_unknown() {
+    let agents = agent_infos(&[("plan", false), ("build", true)]);
+    let no_default = agent_infos(&[("plan", false), ("build", false)]);
+
+    assert_eq!(
+        super::chat_loop::next_agent(&agents, "custom").map(|agent| agent.id.as_str()),
+        Some("build")
+    );
+    assert_eq!(
+        super::chat_loop::next_agent(&no_default, "custom").map(|agent| agent.id.as_str()),
+        Some("plan")
+    );
+    assert!(super::chat_loop::next_agent(&[], "custom").is_none());
 }
 
 #[test]
@@ -1701,6 +1772,20 @@ fn rendered_text(buffer: &Buffer) -> String {
         .filter_map(|row| buffer.row_symbols(row))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn agent_infos(items: &[(&str, bool)]) -> Vec<AgentInfo> {
+    items
+        .iter()
+        .map(|(id, is_default)| AgentInfo {
+            id: (*id).to_owned(),
+            name: (*id).to_owned(),
+            description: String::new(),
+            badge: None,
+            aliases: Vec::new(),
+            is_default: *is_default,
+        })
+        .collect()
 }
 
 #[test]
