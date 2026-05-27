@@ -40,6 +40,21 @@ pub const OP_COMPANY_SHUTDOWN: &str = "company.shutdown";
 /// Agent list operation.
 pub const OP_AGENT_LIST: &str = "agent.list";
 
+/// Agent inspect operation.
+pub const OP_AGENT_INSPECT: &str = "agent.inspect";
+
+/// Agent hire operation.
+pub const OP_AGENT_HIRE: &str = "agent.hire";
+
+/// Agent suspend operation.
+pub const OP_AGENT_SUSPEND: &str = "agent.suspend";
+
+/// Agent fire operation.
+pub const OP_AGENT_FIRE: &str = "agent.fire";
+
+/// Agent update contract operation.
+pub const OP_AGENT_UPDATE_CONTRACT: &str = "agent.update_contract";
+
 /// Initiative create operation.
 pub const OP_INITIATIVE_CREATE: &str = "initiative.create";
 
@@ -170,6 +185,17 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
             service_company_lifecycle(request, &EventContext::from_request(request), "shutdown")
         }
         OP_AGENT_LIST => service_agent_list(request),
+        OP_AGENT_INSPECT => service_agent_inspect(request),
+        OP_AGENT_HIRE => service_agent_hire(request, &EventContext::from_request(request)),
+        OP_AGENT_SUSPEND => {
+            service_agent_employment(request, &EventContext::from_request(request), "suspended")
+        }
+        OP_AGENT_FIRE => {
+            service_agent_employment(request, &EventContext::from_request(request), "fired")
+        }
+        OP_AGENT_UPDATE_CONTRACT => {
+            service_agent_update_contract(request, &EventContext::from_request(request))
+        }
         OP_INITIATIVE_CREATE => {
             service_initiative_create(request, &EventContext::from_request(request))
         }
@@ -293,6 +319,73 @@ pub struct BlimsProtocolResponse<T> {
     pub protocol_version: u16,
     /// Typed response payload.
     pub payload: T,
+}
+
+/// Request to inspect or change an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Agent id.
+    pub agent_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to hire a new agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHireRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// New agent id.
+    pub agent_id: String,
+    /// Agent display name.
+    pub name: String,
+    /// Agent role/title.
+    pub role: String,
+    /// Starting room id.
+    #[serde(default = "default_agent_room")]
+    pub room_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to update an agent contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContractUpdateRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Agent id.
+    pub agent_id: String,
+    /// Responsibilities text.
+    pub responsibilities: String,
+    /// Restrictions text.
+    pub restrictions: String,
+    /// Escalation text.
+    pub escalation: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to create a company initiative.
@@ -935,6 +1028,10 @@ const fn default_event_limit() -> u64 {
     100
 }
 
+fn default_agent_room() -> String {
+    "ceo-nook".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlimsCommandEnvelope<T> {
     /// Unique command id supplied by caller or daemon.
@@ -1007,6 +1104,12 @@ enum BlimsEventPayload {
     AgentStatusSet {
         agent_id: String,
         status: String,
+    },
+    AgentContractUpdated {
+        agent_id: String,
+        responsibilities: String,
+        restrictions: String,
+        escalation: String,
     },
     PlayerMoved {
         room_id: String,
@@ -1175,6 +1278,60 @@ fn service_agent_list(request: &ServiceRequest) -> ServiceResponse {
                 .collect::<Vec<_>>(),
         ),
         Err(error) => ServiceResponse::error("state_read_failed", error.to_string()),
+    }
+}
+
+fn service_agent_inspect(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<AgentRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match inspect_agent(&request) {
+        Ok(agent) => json_response(&agent),
+        Err(error) => ServiceResponse::error("agent_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_agent_hire(request: &ServiceRequest, event_context: &EventContext) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<AgentHireRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match hire_agent(&request, &event_context) {
+        Ok(agent) => json_response(&agent),
+        Err(error) => ServiceResponse::error("agent_hire_failed", error.to_string()),
+    }
+}
+
+fn service_agent_employment(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+    status: &str,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<AgentRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match set_agent_status(&request, &event_context, status) {
+        Ok(agent) => json_response(&agent),
+        Err(error) => ServiceResponse::error("agent_employment_failed", error.to_string()),
+    }
+}
+
+fn service_agent_update_contract(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<AgentContractUpdateRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match update_agent_contract(&request, &event_context) {
+        Ok(contract) => json_response(&contract),
+        Err(error) => ServiceResponse::error("agent_contract_update_failed", error.to_string()),
     }
 }
 
@@ -2304,6 +2461,21 @@ async fn apply_org_world_event_projection(
                 .execute(database)
                 .await?;
         }
+        BlimsEventPayload::AgentContractUpdated {
+            agent_id,
+            responsibilities,
+            restrictions,
+            escalation,
+        } => {
+            replace_one_agent_contract_projection(
+                database,
+                agent_id,
+                responsibilities,
+                restrictions,
+                escalation,
+            )
+            .await?;
+        }
         BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
             replace_one_department_projection(
                 database,
@@ -2360,6 +2532,113 @@ async fn apply_org_world_event_projection(
 fn load_company_data(working_directory: &Path) -> Result<CompanyData, BlimsStateError> {
     with_database(working_directory, |database| {
         Box::pin(load_company_data_from_database(database))
+    })
+}
+
+fn inspect_agent(request: &AgentRequest) -> Result<AgentSnapshot, BlimsStateError> {
+    let agent_id = request.agent_id.clone();
+    load_company_data(&request.working_directory).and_then(|data| {
+        data.agents
+            .into_iter()
+            .find(|agent| agent.id == agent_id)
+            .map(AgentRecord::snapshot)
+            .ok_or_else(|| BlimsStateError::InvalidRequest(format!("unknown agent: {agent_id}")))
+    })
+}
+
+fn hire_agent(
+    request: &AgentHireRequest,
+    event_context: &EventContext,
+) -> Result<AgentSnapshot, BlimsStateError> {
+    let agent = AgentSnapshot {
+        id: stable_slug(&request.agent_id),
+        name: request.name.trim().to_string(),
+        role: request.role.trim().to_string(),
+        status: "active".to_string(),
+        room_id: request.room_id.clone(),
+    };
+    if agent.id.is_empty() || agent.name.is_empty() || agent.role.is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "agent id, name, and role are required".to_string(),
+        ));
+    }
+    let event_context = event_context.clone();
+    let working_directory = request.working_directory.clone();
+    let response_agent = agent.clone();
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "agent.hired",
+                format!("Agent hired: {}", agent.name),
+                &BlimsEventPayload::AgentHired { agent },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(response_agent)
+        })
+    })
+}
+
+fn set_agent_status(
+    request: &AgentRequest,
+    event_context: &EventContext,
+    status: &str,
+) -> Result<AgentSnapshot, BlimsStateError> {
+    let agent = inspect_agent(request)?;
+    let agent_id = request.agent_id.clone();
+    let status = status.to_string();
+    let event_context = event_context.clone();
+    let working_directory = request.working_directory.clone();
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "agent.status_set",
+                format!("Agent {agent_id} status set to {status}."),
+                &BlimsEventPayload::AgentStatusSet {
+                    agent_id,
+                    status: status.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(AgentSnapshot { status, ..agent })
+        })
+    })
+}
+
+fn update_agent_contract(
+    request: &AgentContractUpdateRequest,
+    event_context: &EventContext,
+) -> Result<AgentContractUpdateRequest, BlimsStateError> {
+    inspect_agent(&AgentRequest {
+        working_directory: request.working_directory.clone(),
+        agent_id: request.agent_id.clone(),
+        correlation_id: None,
+        causation_id: None,
+        expected_latest_event_id: None,
+    })?;
+    let request = request.clone();
+    let working_directory = request.working_directory.clone();
+    let event_context = event_context.clone();
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "agent.contract_updated",
+                format!("Agent {} contract updated.", request.agent_id),
+                &BlimsEventPayload::AgentContractUpdated {
+                    agent_id: request.agent_id.clone(),
+                    responsibilities: request.responsibilities.clone(),
+                    restrictions: request.restrictions.clone(),
+                    escalation: request.escalation.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(request)
+        })
     })
 }
 
@@ -3561,20 +3840,13 @@ fn replay_event(
         BlimsEventPayload::TaskCreated { task } => {
             upsert_by_id(&mut state.tasks, task, |task| &task.id);
         }
-        BlimsEventPayload::AgentHired { agent } => {
-            upsert_by_id(&mut state.agents, agent.into(), |agent| &agent.id);
+        BlimsEventPayload::AgentHired { .. }
+        | BlimsEventPayload::AgentMoved { .. }
+        | BlimsEventPayload::AgentStatusSet { .. } => {
+            replay_agent_event(payload, state);
         }
-        BlimsEventPayload::AgentMoved { agent_id, room_id } => {
-            if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
-                agent.room_id = room_id;
-            }
-        }
-        BlimsEventPayload::AgentStatusSet { agent_id, status } => {
-            if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
-                agent.status = status;
-            }
-        }
-        BlimsEventPayload::PlayerMoved { .. }
+        BlimsEventPayload::AgentContractUpdated { .. }
+        | BlimsEventPayload::PlayerMoved { .. }
         | BlimsEventPayload::InitiativePlanImported { .. } => {}
         BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
             upsert_by_id(
@@ -3605,6 +3877,25 @@ fn replay_event(
         }
     }
     Ok(())
+}
+
+fn replay_agent_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
+    match payload {
+        BlimsEventPayload::AgentHired { agent } => {
+            upsert_by_id(&mut state.agents, agent.into(), |agent| &agent.id);
+        }
+        BlimsEventPayload::AgentMoved { agent_id, room_id } => {
+            if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                agent.room_id = room_id;
+            }
+        }
+        BlimsEventPayload::AgentStatusSet { agent_id, status } => {
+            if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                agent.status = status;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn upsert_by_id<T>(items: &mut Vec<T>, item: T, id: impl Fn(&T) -> &String) {
@@ -3894,6 +4185,11 @@ async fn replace_one_agent_projection(
     agent: &AgentRecord,
 ) -> Result<(), BlimsStateError> {
     database
+        .delete("agents")
+        .filter(Box::new(where_eq("id", agent.id.clone())))
+        .execute(database)
+        .await?;
+    database
         .insert("agents")
         .value("id", agent.id.clone())
         .value("name", agent.name.clone())
@@ -3915,6 +4211,29 @@ async fn replace_agent_projections(
     for agent in agents {
         replace_one_agent_projection(database, agent).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_agent_contract_projection(
+    database: &dyn Database,
+    agent_id: &str,
+    responsibilities: &str,
+    restrictions: &str,
+    escalation: &str,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("agent_contracts")
+        .filter(Box::new(where_eq("agent_id", agent_id)))
+        .execute(database)
+        .await?;
+    database
+        .insert("agent_contracts")
+        .value("agent_id", agent_id)
+        .value("responsibilities", responsibilities)
+        .value("restrictions", restrictions)
+        .value("escalation", escalation)
+        .execute(database)
+        .await?;
     Ok(())
 }
 

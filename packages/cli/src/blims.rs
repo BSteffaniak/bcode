@@ -32,6 +32,30 @@ pub enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    Inspect {
+        agent_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Hire {
+        agent_id: String,
+        name: String,
+        role: String,
+        #[arg(long, default_value = "ceo-nook")]
+        room_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Suspend {
+        agent_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Fire {
+        agent_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     Agents {
         #[arg(long)]
         json: bool,
@@ -385,31 +409,8 @@ struct BlimsMorningReport {
 pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
     ensure_server_running().await?;
     match command {
-        BlimsCommand::Status { json } => {
-            let response = call_blims_service("company.status", blims_workspace_payload()?).await?;
-            if json {
-                print_blims_service_response(response);
-            } else {
-                let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
-                println!("Blims: {}", status.state);
-                println!("{}", status.message);
-                println!("daemon connected: {}", status.daemon_connected);
-                println!("lifecycle: {}", status.lifecycle_status);
-                println!("state root: {}", status.state_root.display());
-                println!("database: {}", status.database_path.display());
-            }
-        }
-        BlimsCommand::Create { json } => {
-            let response = call_blims_service("company.create", blims_workspace_payload()?).await?;
-            if json {
-                print_blims_service_response(response);
-            } else {
-                let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
-                println!("Blims company created");
-                println!("state root: {}", status.state_root.display());
-                println!("database: {}", status.database_path.display());
-            }
-        }
+        BlimsCommand::Status { json } => print_blims_status(json).await?,
+        BlimsCommand::Create { json } => create_blims_company(json).await?,
         BlimsCommand::Pause { json } => {
             print_company_lifecycle_update("company.pause", "Blims company paused", json).await?;
         }
@@ -419,6 +420,24 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
         BlimsCommand::Shutdown { json } => {
             print_company_lifecycle_update("company.shutdown", "Blims company shut down", json)
                 .await?;
+        }
+        BlimsCommand::Inspect { agent_id, json } => {
+            print_agent_service_result("agent.inspect", &agent_id, json).await?;
+        }
+        BlimsCommand::Hire {
+            agent_id,
+            name,
+            role,
+            room_id,
+            json,
+        } => {
+            hire_blims_agent(agent_id, name, role, room_id, json).await?;
+        }
+        BlimsCommand::Suspend { agent_id, json } => {
+            print_agent_service_result("agent.suspend", &agent_id, json).await?;
+        }
+        BlimsCommand::Fire { agent_id, json } => {
+            print_agent_service_result("agent.fire", &agent_id, json).await?;
         }
         BlimsCommand::Agents { json } => {
             let response = call_blims_service("agent.list", blims_workspace_payload()?).await?;
@@ -988,6 +1007,81 @@ fn room_index(world: &BlimsWorldSnapshot, current_room_id: &str) -> usize {
         .iter()
         .position(|room| room.id == current_room_id)
         .unwrap_or_default()
+}
+
+async fn print_blims_status(json: bool) -> Result<(), CliError> {
+    let response = call_blims_service("company.status", blims_workspace_payload()?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
+        println!("Blims: {}", status.state);
+        println!("{}", status.message);
+        println!("daemon connected: {}", status.daemon_connected);
+        println!("lifecycle: {}", status.lifecycle_status);
+        println!("state root: {}", status.state_root.display());
+        println!("database: {}", status.database_path.display());
+    }
+    Ok(())
+}
+
+async fn create_blims_company(json: bool) -> Result<(), CliError> {
+    let response = call_blims_service("company.create", blims_workspace_payload()?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
+        println!("Blims company created");
+        println!("state root: {}", status.state_root.display());
+        println!("database: {}", status.database_path.display());
+    }
+    Ok(())
+}
+
+async fn print_agent_service_result(
+    operation: &str,
+    agent_id: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": agent_id,
+    });
+    let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let agent = decode_blims_response::<BlimsAgentSnapshot>(response)?;
+        println!(
+            "{} ({}) at {} — {}",
+            agent.name, agent.role, agent.room_id, agent.status
+        );
+    }
+    Ok(())
+}
+
+async fn hire_blims_agent(
+    agent_id: String,
+    name: String,
+    role: String,
+    room_id: String,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": agent_id,
+        "name": name,
+        "role": role,
+        "room_id": room_id,
+    });
+    let response = call_blims_service("agent.hire", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let agent = decode_blims_response::<BlimsAgentSnapshot>(response)?;
+        println!("agent hired: {} ({})", agent.name, agent.id);
+    }
+    Ok(())
 }
 
 async fn print_company_lifecycle_update(
