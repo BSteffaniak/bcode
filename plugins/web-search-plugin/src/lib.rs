@@ -8,7 +8,8 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
+    ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,38 @@ const DEFAULT_MAX_RESULTS: usize = 8;
 const DEFAULT_FETCH_MAX_BYTES: usize = 256 * 1024;
 const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const USER_AGENT: &str = concat!("Bcode/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Clone)]
+struct ProgressReporter {
+    events: ServiceEventEmitter,
+    tool_call_id: String,
+    sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ProgressReporter {
+    fn new(events: ServiceEventEmitter, tool_call_id: String) -> Self {
+        Self {
+            events,
+            tool_call_id,
+            sequence: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn emit(&self, message: impl Into<String>) {
+        let sequence = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let event = ToolInvocationStreamEvent::Status {
+            tool_call_id: self.tool_call_id.clone(),
+            sequence,
+            message: message.into(),
+        };
+        if let Ok(payload) = serde_json::to_vec(&event) {
+            self.events.emit(&payload);
+        }
+    }
+}
 
 /// Bundled web search plugin.
 pub struct WebSearchPlugin {
@@ -69,8 +102,18 @@ impl WebSearchPlugin {
             return json_response(&tool_error("web tool cancelled".to_string()));
         }
         let response = match invocation.name.as_str() {
-            "web.search" => self.invoke_search(&context.config, &context.cancellation, &invocation),
-            "web.fetch" => self.invoke_fetch(&context.config, &context.cancellation, &invocation),
+            "web.search" => self.invoke_search(
+                &context.config,
+                &context.cancellation,
+                &invocation,
+                context.events,
+            ),
+            "web.fetch" => self.invoke_fetch(
+                &context.config,
+                &context.cancellation,
+                &invocation,
+                context.events,
+            ),
             "web.status" => invoke_status(&context.config),
             "web.inspect" => invoke_inspect(&invocation),
             _ => ToolInvocationResponse {
@@ -88,6 +131,7 @@ impl WebSearchPlugin {
         config: &bcode_plugin_sdk::PluginConfigContext,
         cancellation: &bcode_plugin_sdk::ServiceCancellation,
         invocation: &ToolInvocationRequest,
+        events: ServiceEventEmitter,
     ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<SearchRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
@@ -101,8 +145,10 @@ impl WebSearchPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
+        let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
+        progress.emit(format!("search: query {}", request.query));
         match runtime.block_on(run_cancellable(
-            search_async(request, plugin_config),
+            search_async(request, plugin_config, Some(progress)),
             cancellation.clone(),
         )) {
             Ok(Ok(response)) => json_tool_response(&response),
@@ -116,6 +162,7 @@ impl WebSearchPlugin {
         config: &bcode_plugin_sdk::PluginConfigContext,
         cancellation: &bcode_plugin_sdk::ServiceCancellation,
         invocation: &ToolInvocationRequest,
+        events: ServiceEventEmitter,
     ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<FetchRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
@@ -129,8 +176,10 @@ impl WebSearchPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
+        let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
+        progress.emit(format!("fetch: requesting {}", request.url));
         match runtime.block_on(run_cancellable(
-            fetch_async(request, plugin_config),
+            fetch_async(request, plugin_config, Some(progress)),
             cancellation.clone(),
         )) {
             Ok(Ok(response)) => json_tool_response(&response),
@@ -564,10 +613,14 @@ enum WebError {
 async fn search_async(
     request: SearchRequest,
     config: WebSearchConfig,
+    progress: Option<ProgressReporter>,
 ) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
     let provider = search_provider(request.provider.as_deref(), &config)?;
-    match provider.as_str() {
+    if let Some(progress) = &progress {
+        progress.emit(format!("search: provider selected: {provider}"));
+    }
+    let response = match provider.as_str() {
         "brave" => search_brave(request, &config).await,
         "tavily" => search_tavily(request, &config).await,
         "exa" => search_exa(request, &config).await,
@@ -589,7 +642,14 @@ async fn search_async(
         _ => Err(WebError::InvalidRequest(format!(
             "unsupported web search provider: {provider}"
         ))),
+    }?;
+    if let Some(progress) = &progress {
+        progress.emit(format!(
+            "search: provider {provider} returned {} results",
+            response.results.len()
+        ));
     }
+    Ok(response)
 }
 
 async fn search_brave(
@@ -1011,17 +1071,24 @@ fn percent_decode(input: &str) -> String {
 async fn fetch_async(
     request: FetchRequest,
     config: WebSearchConfig,
+    progress: Option<ProgressReporter>,
 ) -> Result<FetchResponse, WebError> {
     validate_url(&request.url)?;
     if request.render {
+        if let Some(progress) = &progress {
+            progress.emit("fetch: using rendered fetch adapter");
+        }
         let mut response = fetch_rendered(&request, &config)?;
         apply_prompt_extraction(&mut response, &request, &config).await?;
         return Ok(response);
     }
     let fallbacks = fetch_fallbacks(&config);
-    let plain_result = fetch_plain_async(&request, &config).await;
+    let plain_result = fetch_plain_async(&request, &config, progress.clone()).await;
     let mut response = if should_try_jina(&fallbacks, &plain_result) {
-        match fetch_jina_reader_async(&request, &config).await {
+        if let Some(progress) = &progress {
+            progress.emit("fetch: trying Jina reader fallback");
+        }
+        match fetch_jina_reader_async(&request, &config, progress.clone()).await {
             Ok(response) => response,
             Err(_) => plain_result?,
         }
@@ -1029,6 +1096,13 @@ async fn fetch_async(
         plain_result?
     };
     apply_prompt_extraction(&mut response, &request, &config).await?;
+    if let Some(progress) = &progress {
+        progress.emit(format!(
+            "fetch: extracted {} bytes via {}",
+            response.text.len(),
+            response.fallback_used
+        ));
+    }
     Ok(response)
 }
 
@@ -1176,6 +1250,7 @@ fn bounded_prompt_content(text: &str) -> String {
 async fn fetch_plain_async(
     request: &FetchRequest,
     config: &WebSearchConfig,
+    progress: Option<ProgressReporter>,
 ) -> Result<FetchResponse, WebError> {
     let max_bytes = request
         .max_bytes
@@ -1186,12 +1261,18 @@ async fn fetch_plain_async(
     let response = client.get(&request.url).send().await?;
     let status = response.status();
     let final_url = response.url().to_string();
+    if let Some(progress) = &progress {
+        progress.emit(format!("fetch: response {status} from {final_url}"));
+    }
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
     let body = response.bytes().await?;
+    if let Some(progress) = &progress {
+        progress.emit(format!("fetch: received {} bytes", body.len()));
+    }
     let truncated = body.len() > max_bytes;
     let bytes = &body[..body.len().min(max_bytes)];
     let raw = String::from_utf8_lossy(bytes);
@@ -1226,6 +1307,7 @@ async fn fetch_plain_async(
 async fn fetch_jina_reader_async(
     request: &FetchRequest,
     config: &WebSearchConfig,
+    progress: Option<ProgressReporter>,
 ) -> Result<FetchResponse, WebError> {
     let max_bytes = request
         .max_bytes
@@ -1237,12 +1319,18 @@ async fn fetch_jina_reader_async(
     let response = client.get(&jina_url).send().await?;
     let status = response.status();
     let final_url = response.url().to_string();
+    if let Some(progress) = &progress {
+        progress.emit(format!("fetch: Jina response {status} from {final_url}"));
+    }
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
     let body = response.bytes().await?;
+    if let Some(progress) = &progress {
+        progress.emit(format!("fetch: received {} bytes", body.len()));
+    }
     let truncated = body.len() > max_bytes;
     let text = String::from_utf8_lossy(&body[..body.len().min(max_bytes)]).to_string();
     let prompt_response = prompt_response(request, &text);

@@ -8,7 +8,8 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
+    ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,38 @@ impl RustPlugin for DocumentPlugin {
     }
 }
 
+#[derive(Clone)]
+struct ProgressReporter {
+    events: ServiceEventEmitter,
+    tool_call_id: String,
+    sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ProgressReporter {
+    fn new(events: ServiceEventEmitter, tool_call_id: String) -> Self {
+        Self {
+            events,
+            tool_call_id,
+            sequence: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn emit(&self, message: impl Into<String>) {
+        let sequence = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let event = ToolInvocationStreamEvent::Status {
+            tool_call_id: self.tool_call_id.clone(),
+            sequence,
+            message: message.into(),
+        };
+        if let Ok(payload) = serde_json::to_vec(&event) {
+            self.events.emit(&payload);
+        }
+    }
+}
+
 impl DocumentPlugin {
     fn invoke_tool_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         let request = &context.request;
@@ -72,7 +105,7 @@ impl DocumentPlugin {
             return json_response(&tool_error("document tool cancelled".to_string()));
         }
         let response = match invocation.name.as_str() {
-            "document.extract" => self.invoke_extract(&invocation),
+            "document.extract" => self.invoke_extract(&invocation, context.events),
             "document.status" => invoke_status(),
             _ => ToolInvocationResponse {
                 output: format!("unsupported document tool: {}", invocation.name),
@@ -84,7 +117,11 @@ impl DocumentPlugin {
         json_response(&response)
     }
 
-    fn invoke_extract(&self, invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
+    fn invoke_extract(
+        &self,
+        invocation: &ToolInvocationRequest,
+        events: ServiceEventEmitter,
+    ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<ExtractRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
             Err(error) => return tool_error(error.to_string()),
@@ -94,7 +131,9 @@ impl DocumentPlugin {
             Err(error) => return tool_error(format!("document runtime unavailable: {error}")),
         };
         let artifact_dir = invocation.artifact_dir.clone();
-        match runtime.block_on(extract_async(request, artifact_dir)) {
+        let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
+        progress.emit("document extraction started");
+        match runtime.block_on(extract_async(request, artifact_dir, Some(progress))) {
             Ok(Ok(response)) => json_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
@@ -168,6 +207,7 @@ enum DocumentError {
 async fn extract_async(
     request: ExtractRequest,
     artifact_dir: Option<PathBuf>,
+    progress: Option<ProgressReporter>,
 ) -> Result<ExtractResponse, DocumentError> {
     let source = source(&request)?;
     let artifact_root = artifact_dir
@@ -181,18 +221,47 @@ async fn extract_async(
         .clamp(1, MAX_BYTES);
     let document_path = match &source {
         DocumentSource::Url(url) => {
-            download_document(url, &artifact_root, max_bytes, request.timeout_ms).await?
+            if let Some(progress) = &progress {
+                progress.emit(format!("document download started: {url}"));
+            }
+            let path = download_document(
+                url,
+                &artifact_root,
+                max_bytes,
+                request.timeout_ms,
+                progress.clone(),
+            )
+            .await?;
+            if let Some(progress) = &progress {
+                progress.emit(format!("document downloaded: {}", path.display()));
+            }
+            path
         }
-        DocumentSource::Path(path) => path.clone(),
+        DocumentSource::Path(path) => {
+            if let Some(progress) = &progress {
+                progress.emit(format!("document source path: {}", path.display()));
+            }
+            path.clone()
+        }
     };
     if !is_pdf_path(&document_path) {
         return Err(DocumentError::UnsupportedDocument);
     }
+    if let Some(progress) = &progress {
+        progress.emit("document text extraction started");
+    }
     let text_path = document_path.with_extension("txt");
-    let extraction = extract_pdf_text(&document_path, &text_path)?;
+    let extraction = extract_pdf_text(&document_path, &text_path, progress.as_ref())?;
     let bytes = extraction.text.as_bytes();
     let truncated = bytes.len() > max_bytes;
     let text = String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]).to_string();
+    if let Some(progress) = &progress {
+        progress.emit(format!(
+            "document text extracted: {} bytes{}",
+            bytes.len(),
+            if truncated { " (truncated)" } else { "" }
+        ));
+    }
     Ok(ExtractResponse {
         source: source.as_string(),
         content_type: "application/pdf".to_string(),
@@ -221,26 +290,55 @@ struct PdfExtraction {
 fn extract_pdf_text(
     document_path: &Path,
     text_path: &Path,
+    progress: Option<&ProgressReporter>,
 ) -> Result<PdfExtraction, DocumentError> {
+    if let Some(progress) = &progress {
+        progress.emit("document native extraction started");
+    }
     match extract_pdf_text_native(document_path, text_path) {
-        Ok(text) if meaningful_text(&text) => Ok(PdfExtraction {
-            text,
-            extractor: "native".to_string(),
-            fallback_used: None,
-        }),
+        Ok(text) if meaningful_text(&text) => {
+            if let Some(progress) = &progress {
+                progress.emit(format!(
+                    "document native extraction succeeded: {} bytes",
+                    text.len()
+                ));
+            }
+            Ok(PdfExtraction {
+                text,
+                extractor: "native".to_string(),
+                fallback_used: None,
+            })
+        }
         Ok(_) | Err(_) if pdftotext_available() => {
+            if let Some(progress) = &progress {
+                progress.emit("document native extraction low text; trying pdftotext");
+            }
             let text = extract_pdf_text_pdftotext(document_path, text_path)?;
+            if let Some(progress) = &progress {
+                progress.emit(format!(
+                    "document pdftotext extraction succeeded: {} bytes",
+                    text.len()
+                ));
+            }
             Ok(PdfExtraction {
                 text,
                 extractor: "pdftotext".to_string(),
                 fallback_used: Some("native_unavailable_or_low_text".to_string()),
             })
         }
-        Ok(text) => Ok(PdfExtraction {
-            text,
-            extractor: "native".to_string(),
-            fallback_used: Some("native_low_text".to_string()),
-        }),
+        Ok(text) => {
+            if let Some(progress) = &progress {
+                progress.emit(format!(
+                    "document native extraction low text: {} bytes",
+                    text.len()
+                ));
+            }
+            Ok(PdfExtraction {
+                text,
+                extractor: "native".to_string(),
+                fallback_used: Some("native_low_text".to_string()),
+            })
+        }
         Err(error) => Err(error),
     }
 }
@@ -296,6 +394,7 @@ async fn download_document(
     artifact_root: &Path,
     max_bytes: usize,
     timeout_ms: Option<u64>,
+    progress: Option<ProgressReporter>,
 ) -> Result<PathBuf, DocumentError> {
     let client = Client::builder()
         .timeout(Duration::from_millis(
@@ -305,7 +404,13 @@ async fn download_document(
         .build()?;
     let response = client.get(url).send().await?;
     let final_url = response.url().to_string();
+    if let Some(progress) = &progress {
+        progress.emit(format!("document response received: {final_url}"));
+    }
     let bytes = response.bytes().await?;
+    if let Some(progress) = &progress {
+        progress.emit(format!("document received {} bytes", bytes.len()));
+    }
     let extension = if final_url.to_ascii_lowercase().contains(".pdf") {
         "pdf"
     } else {
@@ -313,6 +418,9 @@ async fn download_document(
     };
     let path = artifact_root.join(format!("{}.{extension}", stable_name(&final_url)));
     std::fs::write(&path, &bytes[..bytes.len().min(max_bytes)])?;
+    if let Some(progress) = &progress {
+        progress.emit(format!("document artifact written: {}", path.display()));
+    }
     Ok(path)
 }
 
