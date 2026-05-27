@@ -186,6 +186,14 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Provider { command } => handle_provider_command(command)?,
         Commands::Permission { command } => handle_permission_command(command).await?,
+        Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
+        command => handle_session_io_command(command).await?,
+    }
+    Ok(())
+}
+
+async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
+    match command {
         Commands::Cancel {
             session_id,
             clear_queue,
@@ -199,6 +207,18 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             session_id,
             message,
         } => send_message(session_id, message).await?,
+        Commands::Server { .. }
+        | Commands::Session { .. }
+        | Commands::Worktree { .. }
+        | Commands::Blims { .. }
+        | Commands::Migrate { .. }
+        | Commands::Plugin { .. }
+        | Commands::Model { .. }
+        | Commands::Auth { .. }
+        | Commands::Login { .. }
+        | Commands::Provider { .. }
+        | Commands::Permission { .. }
+        | Commands::RuntimeWork { .. } => unreachable!("handled by handle_cli"),
     }
     Ok(())
 }
@@ -309,6 +329,10 @@ enum Commands {
         #[command(subcommand)]
         command: PermissionCommand,
     },
+    RuntimeWork {
+        #[command(subcommand)]
+        command: RuntimeWorkCommand,
+    },
     Cancel {
         session_id: SessionId,
         #[arg(long)]
@@ -330,6 +354,17 @@ impl Default for Commands {
     fn default() -> Self {
         Self::Tui { session_id: None }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeWorkCommand {
+    List {
+        session_id: SessionId,
+    },
+    Cancel {
+        session_id: SessionId,
+        work_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3573,6 +3608,37 @@ fn session_repair(session_id: SessionId) -> Result<(), CliError> {
 
 fn default_session_store_dir() -> PathBuf {
     bcode_config::default_state_dir().join("sessions")
+}
+
+async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    match command {
+        RuntimeWorkCommand::List { session_id } => {
+            for work in client.list_runtime_work(session_id).await? {
+                println!(
+                    "{} {:?} {:?} {} cancellable={}",
+                    work.work_id, work.kind, work.status, work.label, work.cancellable
+                );
+            }
+        }
+        RuntimeWorkCommand::Cancel {
+            session_id,
+            work_id,
+        } => {
+            if client
+                .cancel_runtime_work(
+                    session_id,
+                    bcode_session_models::RuntimeWorkId::new(work_id),
+                )
+                .await?
+            {
+                println!("runtime work cancellation requested");
+            } else {
+                println!("no active runtime work");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn cancel_session_turn(session_id: SessionId, clear_queue: bool) -> Result<(), CliError> {

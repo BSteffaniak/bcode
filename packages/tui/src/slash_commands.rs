@@ -52,20 +52,24 @@ async fn describe_skill(
 
 async fn runtime_status(
     client: &BcodeClient,
+    session_id: SessionId,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
-    let status = client.server_status().await?;
-    let running = status
-        .plugin_runtime
-        .iter()
-        .map(|plugin| plugin.running)
-        .sum::<usize>();
-    let queued = status
-        .plugin_runtime
-        .iter()
-        .map(|plugin| plugin.queued)
-        .sum::<usize>();
+    let work = client.list_runtime_work(session_id).await?;
+    if work.is_empty() {
+        return Ok(SlashCommandOutcome::Handled("runtime: idle".to_string()));
+    }
+    let lines = work
+        .into_iter()
+        .map(|item| {
+            format!(
+                "{} {:?} {:?} {}",
+                item.work_id, item.kind, item.status, item.label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(SlashCommandOutcome::Handled(format!(
-        "runtime: {running} running, {queued} queued"
+        "runtime work:\n{lines}"
     )))
 }
 
@@ -347,6 +351,34 @@ async fn resync_command(
     }
 }
 
+async fn skill_command(
+    client: &BcodeClient,
+    session_id: SessionId,
+    parts: &[&str],
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    if parts.get(1) == Some(&"describe") && parts.len() > 2 {
+        return describe_skill(client, parts[2]).await;
+    }
+    let Some(skill) = parts.get(1) else {
+        return Ok(SlashCommandOutcome::PickSkill);
+    };
+    let skill_id = bcode_skill_models::SkillId::new(*skill);
+    let arguments = parts.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
+    let display_text = if arguments.is_empty() {
+        format!("Invoke skill {skill_id}")
+    } else {
+        format!("Invoke skill {skill_id}: {arguments}")
+    };
+    let acceptance = client
+        .invoke_skill(session_id, skill_id.clone(), arguments, display_text)
+        .await?;
+    Ok(SlashCommandOutcome::Handled(if acceptance.queued {
+        format!("skill {skill_id} queued")
+    } else {
+        format!("skill {skill_id} invoked")
+    }))
+}
+
 async fn stop_command(
     client: &BcodeClient,
     session_id: SessionId,
@@ -358,6 +390,29 @@ async fn stop_command(
         "turn cancellation requested; queued messages cleared".to_string()
     } else {
         "no active turn".to_string()
+    }))
+}
+
+async fn cancel_runtime_command(
+    client: &BcodeClient,
+    session_id: SessionId,
+    parts: &[&str],
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    let Some(work_id) = parts.get(1) else {
+        return Ok(SlashCommandOutcome::Handled(
+            "usage: /cancel-runtime <work-id>".to_string(),
+        ));
+    };
+    let cancelled = client
+        .cancel_runtime_work(
+            session_id,
+            bcode_session_models::RuntimeWorkId::new(*work_id),
+        )
+        .await?;
+    Ok(SlashCommandOutcome::Handled(if cancelled {
+        "runtime work cancellation requested".to_string()
+    } else {
+        "no active runtime work".to_string()
     }))
 }
 
@@ -444,29 +499,11 @@ pub async fn execute(
         "cwd" => cwd_command(client, session_id, &parts).await,
         "worktree" | "worktrees" => worktree_command(client, session_id, &parts).await,
         "skills" => Ok(SlashCommandOutcome::PickSkill),
-        "skill" if parts.get(1) == Some(&"describe") && parts.len() > 2 => {
-            describe_skill(client, parts[2]).await
-        }
-        "skill" if parts.len() > 1 => {
-            let skill_id = bcode_skill_models::SkillId::new(parts[1]);
-            let arguments = parts.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
-            let display_text = if arguments.is_empty() {
-                format!("Invoke skill {skill_id}")
-            } else {
-                format!("Invoke skill {skill_id}: {arguments}")
-            };
-            let acceptance = client
-                .invoke_skill(session_id, skill_id.clone(), arguments, display_text)
-                .await?;
-            Ok(SlashCommandOutcome::Handled(if acceptance.queued {
-                format!("skill {skill_id} queued")
-            } else {
-                format!("skill {skill_id} invoked")
-            }))
-        }
+        "skill" => skill_command(client, session_id, &parts).await,
         "thinking" => thinking_command(client, session_id, &parts).await,
         "stop" => stop_command(client, session_id).await,
-        "runtime" | "status" => runtime_status(client).await,
+        "cancel-runtime" => cancel_runtime_command(client, session_id, &parts).await,
+        "runtime" | "status" => runtime_status(client, session_id).await,
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }
 }

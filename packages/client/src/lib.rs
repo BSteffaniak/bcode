@@ -757,6 +757,29 @@ impl BcodeClient {
         }
     }
 
+    /// Request cancellation of a specific active runtime-work item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn cancel_runtime_work(
+        &self,
+        session_id: SessionId,
+        work_id: bcode_session_models::RuntimeWorkId,
+    ) -> Result<bool, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::CancelRuntimeWork {
+                session_id,
+                work_id,
+            })
+            .await?
+        {
+            ResponsePayload::TurnCancellationRequested { cancelled } => Ok(cancelled),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List active runtime work for a session.
     ///
     /// # Errors

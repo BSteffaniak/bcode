@@ -833,6 +833,9 @@ impl BmuxApp {
 
     pub fn apply_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
         self.runtime_work.apply_snapshots(snapshots);
+        if let Some(status) = self.runtime_work.status_label() {
+            self.status = status;
+        }
         if self.runtime_work.is_cancelling() {
             self.set_cancelling();
         } else if self.runtime_work.is_busy() {
@@ -1345,6 +1348,9 @@ impl BmuxApp {
 
     fn apply_runtime_work_event(&mut self, event: &SessionEvent) {
         self.runtime_work.apply_event(event);
+        if let Some(status) = self.runtime_work.status_label() {
+            self.status = status;
+        }
         if self.runtime_work.is_cancelling() {
             self.set_cancelling();
         } else if self.runtime_work.is_busy() {

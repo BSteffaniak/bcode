@@ -1033,6 +1033,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         },
     ));
     state.start_catalog_event_forwarder();
+    recover_abandoned_runtime_work(&state).await?;
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
     tracing::info!(target: "bcode_server::startup", "server ready; accepting clients");
@@ -1056,6 +1057,46 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         bcode_daemon_lifecycle::remove_record_path(path)?;
     }
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
+    Ok(())
+}
+
+async fn recover_abandoned_runtime_work(state: &ServerState) -> Result<(), ServerError> {
+    state.sessions.wait_catalog_loaded().await?;
+    let summaries = state.sessions.all_session_summaries().await;
+    for summary in summaries {
+        recover_abandoned_session_runtime_work(state, summary.id).await?;
+    }
+    Ok(())
+}
+
+async fn recover_abandoned_session_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let mut active = BTreeMap::<RuntimeWorkId, String>::new();
+    for event in state.sessions.session_history(session_id).await? {
+        match event.kind {
+            SessionEventKind::RuntimeWorkStarted { work_id, label, .. } => {
+                active.insert(work_id, label);
+            }
+            SessionEventKind::RuntimeWorkFinished { work_id, .. } => {
+                active.remove(&work_id);
+            }
+            _ => {}
+        }
+    }
+    for (work_id, label) in active {
+        append_runtime_work_finished_event(
+            state,
+            session_id,
+            work_id,
+            RuntimeWorkStatus::Failed,
+            Some(format!(
+                "daemon stopped before runtime work finished: {label}"
+            )),
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -7048,10 +7089,17 @@ async fn cancel_registered_runtime_work(
     work_id: RuntimeWorkId,
     client_id: Option<ClientId>,
 ) -> bool {
-    if !state.runtime_work.cancel(session_id, &work_id).await {
+    let cancelled_work_ids = state
+        .runtime_work
+        .cancel_with_children(session_id, &work_id)
+        .await;
+    if cancelled_work_ids.is_empty() {
         return false;
     }
-    append_runtime_work_cancel_requested_event(state, session_id, work_id, client_id).await;
+    for cancelled_work_id in cancelled_work_ids {
+        append_runtime_work_cancel_requested_event(state, session_id, cancelled_work_id, client_id)
+            .await;
+    }
     true
 }
 

@@ -132,14 +132,19 @@ impl RuntimeWorkManager {
         replaced
     }
 
-    /// Cancel active work by exact ID. Returns false if no such active work exists.
-    pub async fn cancel(&self, session_id: SessionId, work_id: &RuntimeWorkId) -> bool {
+    /// Cancel active work by exact ID and return every work item newly signalled.
+    pub async fn cancel_with_children(
+        &self,
+        session_id: SessionId,
+        work_id: &RuntimeWorkId,
+    ) -> Vec<RuntimeWorkId> {
         let mut active = self.active.lock().await;
         if !active.contains_key(&(session_id, work_id.clone())) {
-            return false;
+            return Vec::new();
         }
         let mut pending = vec![work_id.clone()];
         let mut cancellations = Vec::new();
+        let mut cancelled_work_ids = Vec::new();
         while let Some(next_work_id) = pending.pop() {
             let key = (session_id, next_work_id.clone());
             let Some(work) = active.get_mut(&key) else {
@@ -149,6 +154,7 @@ impl RuntimeWorkManager {
                 continue;
             }
             work.cancelled = true;
+            cancelled_work_ids.push(next_work_id.clone());
             cancellations.push(work.spec.cancellation.clone());
             let children = active
                 .iter()
@@ -164,7 +170,7 @@ impl RuntimeWorkManager {
         for cancellation in cancellations {
             cancellation.cancel();
         }
-        true
+        cancelled_work_ids
     }
 
     /// Finish work and remove it from the active registry.
@@ -225,7 +231,12 @@ mod tests {
                 .await
         );
         assert_eq!(manager.active_for_session(session_id).await.len(), 1);
-        assert!(manager.cancel(session_id, &work_id).await);
+        assert!(
+            !manager
+                .cancel_with_children(session_id, &work_id)
+                .await
+                .is_empty()
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(
             manager.active_for_session(session_id).await[0].status,
@@ -245,8 +256,18 @@ mod tests {
         manager
             .start(session_id, test_spec("work", Arc::clone(&count)))
             .await;
-        assert!(manager.cancel(session_id, &work_id).await);
-        assert!(manager.cancel(session_id, &work_id).await);
+        assert!(
+            !manager
+                .cancel_with_children(session_id, &work_id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            manager
+                .cancel_with_children(session_id, &work_id)
+                .await
+                .is_empty()
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -270,7 +291,12 @@ mod tests {
                 )
                 .await
         );
-        assert!(manager.cancel(session_id, &work_id).await);
+        assert!(
+            !manager
+                .cancel_with_children(session_id, &work_id)
+                .await
+                .is_empty()
+        );
         assert_eq!(first.load(Ordering::SeqCst), 0);
         assert_eq!(second.load(Ordering::SeqCst), 1);
     }
@@ -294,7 +320,12 @@ mod tests {
             )
             .await;
 
-        assert!(manager.cancel(session_id, &parent_id).await);
+        assert!(
+            !manager
+                .cancel_with_children(session_id, &parent_id)
+                .await
+                .is_empty()
+        );
         assert_eq!(parent_count.load(Ordering::SeqCst), 1);
         assert_eq!(child_count.load(Ordering::SeqCst), 1);
         assert_eq!(
