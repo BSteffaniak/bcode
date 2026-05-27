@@ -286,6 +286,8 @@ pub struct ProjectionRebuildReport {
     pub artifacts_projected: usize,
     /// Number of projected work proposals.
     pub proposals_projected: usize,
+    /// Number of projected tasks.
+    pub tasks_projected: usize,
     /// Current projected company lifecycle status.
     pub lifecycle_status: String,
 }
@@ -723,6 +725,9 @@ enum BlimsEventPayload {
     },
     ArtifactCreated {
         artifact: ArtifactDetail,
+    },
+    TaskCreated {
+        task: TaskSummary,
     },
     InitiativePlanImported {
         initiative_id: String,
@@ -2496,8 +2501,19 @@ fn import_initiative_plan(
                 .value("payload_json", payload_json)
                 .execute(database)
                 .await?;
+            let mut task_summaries = Vec::new();
             for task in &plan.tasks {
                 let task_id = format!("{}-{}", initiative_id, stable_slug(&task.title));
+                let task_summary = TaskSummary {
+                    id: task_id.clone(),
+                    initiative_id: initiative_id.clone(),
+                    title: task.title.clone(),
+                    description: task.description.clone(),
+                    status: "proposed".to_string(),
+                    assigned_agent_id: task.suggested_agent_id.clone().unwrap_or_default(),
+                    rationale: task.rationale.clone(),
+                    priority: task.priority,
+                };
                 database
                     .insert("tasks")
                     .value("id", task_id)
@@ -2513,6 +2529,7 @@ fn import_initiative_plan(
                     .value("priority", task.priority)
                     .execute(database)
                     .await?;
+                task_summaries.push(task_summary);
             }
             append_event(
                 database,
@@ -2521,6 +2538,15 @@ fn import_initiative_plan(
                 &BlimsEventPayload::ArtifactCreated { artifact },
             )
             .await?;
+            for task in &task_summaries {
+                append_event(
+                    database,
+                    "task.created",
+                    format!("Task created: {}", task.title),
+                    &BlimsEventPayload::TaskCreated { task: task.clone() },
+                )
+                .await?;
+            }
             append_event(
                 database,
                 "initiative.plan_imported",
@@ -2811,6 +2837,7 @@ struct ProjectionState {
     guidance: Vec<GuidanceSummary>,
     artifacts: Vec<ArtifactDetail>,
     proposals: Vec<WorkProposalSummary>,
+    tasks: Vec<TaskSummary>,
 }
 
 impl ProjectionState {
@@ -2821,6 +2848,7 @@ impl ProjectionState {
             guidance_projected: self.guidance.len(),
             artifacts_projected: self.artifacts.len(),
             proposals_projected: self.proposals.len(),
+            tasks_projected: self.tasks.len(),
             lifecycle_status: self.lifecycle_status.clone(),
         }
     }
@@ -2894,6 +2922,9 @@ fn replay_event(
         BlimsEventPayload::ArtifactCreated { artifact } => {
             upsert_by_id(&mut state.artifacts, artifact, |artifact| &artifact.id);
         }
+        BlimsEventPayload::TaskCreated { task } => {
+            upsert_by_id(&mut state.tasks, task, |task| &task.id);
+        }
         BlimsEventPayload::InitiativePlanImported { .. } => {}
     }
     Ok(())
@@ -2921,7 +2952,8 @@ async fn apply_projection_state(
     replace_initiative_projections(database, &state.initiatives).await?;
     replace_guidance_projections(database, &state.guidance).await?;
     replace_artifact_projections(database, &state.artifacts).await?;
-    replace_proposal_projections(database, &state.proposals).await
+    replace_proposal_projections(database, &state.proposals).await?;
+    replace_task_projections(database, &state.tasks).await
 }
 
 async fn replace_initiative_projections(
@@ -3002,6 +3034,28 @@ async fn replace_proposal_projections(
             .value("status", proposal.status.clone())
             .value("summary", proposal.summary.clone())
             .value("validation_notes", proposal.validation_notes.clone())
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_task_projections(
+    database: &dyn Database,
+    tasks: &[TaskSummary],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM tasks").await?;
+    for task in tasks {
+        database
+            .insert("tasks")
+            .value("id", task.id.clone())
+            .value("initiative_id", task.initiative_id.clone())
+            .value("title", task.title.clone())
+            .value("description", task.description.clone())
+            .value("status", task.status.clone())
+            .value("assigned_agent_id", task.assigned_agent_id.clone())
+            .value("rationale", task.rationale.clone())
+            .value("priority", task.priority)
             .execute(database)
             .await?;
     }
@@ -3223,6 +3277,16 @@ mod tests {
             priority: 1,
         };
         let initiative_id = initiative.id.clone();
+        let task = TaskSummary {
+            id: "launch-blims-sketch-loop".to_string(),
+            initiative_id: "launch-blims".to_string(),
+            title: "Sketch the loop".to_string(),
+            description: "Describe the event sourced game loop".to_string(),
+            status: "proposed".to_string(),
+            assigned_agent_id: "mira".to_string(),
+            rationale: "Need a playable first loop".to_string(),
+            priority: 5,
+        };
         let events = vec![
             test_event(
                 1,
@@ -3244,6 +3308,7 @@ mod tests {
                     status: "paused".to_string(),
                 },
             ),
+            test_event(4, "task.created", &BlimsEventPayload::TaskCreated { task }),
         ];
 
         let state = replay_events(&events).expect("events should replay");
@@ -3251,6 +3316,8 @@ mod tests {
         assert_eq!(state.lifecycle_status, "running");
         assert_eq!(state.initiatives.len(), 1);
         assert_eq!(state.initiatives[0].status, "paused");
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].assigned_agent_id, "mira");
     }
 
     fn test_event(id: i64, kind: &str, payload: &BlimsEventPayload) -> BlimsEventSummary {
