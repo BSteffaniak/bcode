@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
 use super::transcript::pretty_jsonish;
+use crate::time_format::format_millis;
 use bmux_tui::text_width::truncate_to_display_width;
 
 /// One labeled permission-detail row.
@@ -229,7 +230,7 @@ fn shell_permission(
         details.push(PermissionDetail::new("cwd", cwd.to_owned()));
     }
     if let Some(timeout_ms) = timeout_ms {
-        details.push(PermissionDetail::new("timeout", format!("{timeout_ms}ms")));
+        details.push(PermissionDetail::new("timeout", format_millis(timeout_ms)));
     }
     PermissionPresentation {
         title: tool_name.to_owned(),

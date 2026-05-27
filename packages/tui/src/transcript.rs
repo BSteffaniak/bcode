@@ -84,6 +84,10 @@ pub enum TranscriptItemKind {
         columns: u16,
         /// Terminal rows used by the producer.
         rows: u16,
+        /// Unix timestamp in milliseconds when execution started.
+        started_at_ms: Option<u64>,
+        /// Unix timestamp in milliseconds when execution finished.
+        finished_at_ms: Option<u64>,
         /// Process exit code once known.
         exit_code: Option<i32>,
         /// Whether execution timed out once known.
@@ -205,14 +209,19 @@ impl TranscriptItem {
         exit_code: Option<i32>,
         timed_out: bool,
         is_error: bool,
+        finished_at_ms: Option<u64>,
     ) {
         if let TranscriptItemKind::TerminalOutput {
+            finished_at_ms: terminal_finished_at_ms,
             exit_code: terminal_exit_code,
             timed_out: terminal_timed_out,
             is_error: terminal_error,
             ..
         } = &mut self.kind
         {
+            if finished_at_ms.is_some() {
+                *terminal_finished_at_ms = finished_at_ms;
+            }
             *terminal_exit_code = exit_code;
             *terminal_timed_out = Some(timed_out);
             *terminal_error = is_error;
@@ -228,6 +237,17 @@ impl TranscriptItem {
         } = &mut self.kind
         {
             *terminal_error = is_error;
+        }
+    }
+
+    /// Set the terminal output finish timestamp.
+    pub const fn set_terminal_finished_at(&mut self, finished_at_ms: Option<u64>) {
+        if let TranscriptItemKind::TerminalOutput {
+            finished_at_ms: terminal_finished_at_ms,
+            ..
+        } = &mut self.kind
+        {
+            *terminal_finished_at_ms = finished_at_ms;
         }
     }
 
@@ -272,6 +292,8 @@ struct StreamedToolReplayContext {
     index: Option<usize>,
     columns: u16,
     rows: u16,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
     saw_output: bool,
 }
 
@@ -358,6 +380,7 @@ pub fn streaming_terminal_output_item(
     text: &str,
     columns: u16,
     rows: u16,
+    started_at_ms: Option<u64>,
 ) -> TranscriptItem {
     TranscriptItem::with_kind(
         "Terminal",
@@ -369,6 +392,8 @@ pub fn streaming_terminal_output_item(
             output: text.to_owned(),
             columns,
             rows,
+            started_at_ms,
+            finished_at_ms: None,
             exit_code: None,
             timed_out: None,
             is_error: false,
@@ -547,7 +572,12 @@ fn push_transcript_item_from_event(
                     && let Some(item) = items.get_mut(index)
                 {
                     if let Some((exit_code, timed_out)) = terminal_shell_result_metadata(result) {
-                        item.finish_terminal(exit_code, timed_out, *is_error);
+                        item.finish_terminal(
+                            exit_code,
+                            timed_out,
+                            *is_error,
+                            replay.finished_at_ms,
+                        );
                     } else {
                         item.set_terminal_error(*is_error);
                         item.finish_streaming();
@@ -763,6 +793,7 @@ fn apply_tool_invocation_stream_event(
             terminal,
             columns,
             rows,
+            started_at_ms,
             ..
         } => {
             if *terminal {
@@ -772,6 +803,8 @@ fn apply_tool_invocation_stream_event(
                         index: None,
                         columns: columns.unwrap_or(120).max(1),
                         rows: rows.unwrap_or(24).max(1),
+                        started_at_ms: *started_at_ms,
+                        finished_at_ms: None,
                         saw_output: false,
                     },
                 );
@@ -802,6 +835,7 @@ fn apply_tool_invocation_stream_event(
                 text,
                 columns,
                 rows,
+                replay.as_ref().and_then(|replay| replay.started_at_ms),
             ));
             streamed_tool_results.insert(
                 tool_call_id.clone(),
@@ -809,6 +843,8 @@ fn apply_tool_invocation_stream_event(
                     index: Some(items.len().saturating_sub(1)),
                     columns,
                     rows,
+                    started_at_ms: replay.as_ref().and_then(|replay| replay.started_at_ms),
+                    finished_at_ms: replay.as_ref().and_then(|replay| replay.finished_at_ms),
                     saw_output: true,
                 },
             );
@@ -816,6 +852,7 @@ fn apply_tool_invocation_stream_event(
         ToolInvocationStreamEvent::Finished {
             tool_call_id,
             is_error,
+            finished_at_ms,
             ..
         } => {
             if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
@@ -823,6 +860,8 @@ fn apply_tool_invocation_stream_event(
                 && let Some(item) = items.get_mut(index)
             {
                 item.set_terminal_error(*is_error);
+                item.set_terminal_finished_at(*finished_at_ms);
+                replay.finished_at_ms = *finished_at_ms;
             }
         }
         _ => {}

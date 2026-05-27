@@ -57,6 +57,7 @@ pub(crate) mod tests;
 mod thinking_dialog;
 pub(crate) mod thinking_dialog_render;
 pub(crate) mod thinking_flow;
+pub(crate) mod time_format;
 pub(crate) mod tool_present;
 pub(crate) mod transcript;
 pub(crate) mod transcript_layout;

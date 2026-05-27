@@ -18,6 +18,7 @@ use super::{
     input,
     keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
     render, slash_palette, slash_palette_render,
+    time_format::{format_duration_nanos, format_millis},
     transcript::{TranscriptItemKind, transcript_items_from_events_with_reasoning},
 };
 
@@ -51,6 +52,15 @@ fn composer_expands_and_scrolls_when_input_exceeds_max_rows() {
 
     assert!(buffer.row_symbols(12).unwrap().contains("Message"));
     assert!(output.contains('9'));
+}
+
+#[test]
+fn duration_formatting_uses_readable_units() {
+    assert_eq!(format_duration_nanos(12), "12ns");
+    assert_eq!(format_duration_nanos(1_500), "1.5µs");
+    assert_eq!(format_duration_nanos(1_500_000), "1.5ms");
+    assert_eq!(format_millis(120_000), "2m");
+    assert_eq!(format_millis(90_000), "1m 30s");
 }
 
 #[test]
@@ -814,6 +824,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
                 terminal: false,
                 columns: None,
                 rows: None,
+                started_at_ms: None,
             },
         },
     ));
@@ -1076,7 +1087,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · ok · exit 0 · timed out false"));
+    assert!(output.contains("Terminal · shell.run · ok · exit 0"));
     assert!(output.contains("terminal: 80x10"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 12"));
@@ -1179,6 +1190,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
+                started_at_ms: Some(1_000),
             },
         },
     ));
@@ -1202,8 +1214,9 @@ fn streamed_terminal_output_renders_running_until_final_result() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Terminal · shell.run · running"));
-    assert!(output.contains("running · terminal"));
-    assert!(!output.contains("exit code 0 · terminal · timed out false"));
+    assert!(output.contains("running ·"));
+    assert!(output.contains(" · terminal"));
+    assert!(!output.contains("exit code 0 · terminal"));
 }
 
 #[test]
@@ -1230,6 +1243,7 @@ fn streamed_terminal_output_preserves_ansi_color() {
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
+                started_at_ms: None,
             },
         },
     ));
@@ -1283,6 +1297,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
+                started_at_ms: None,
             },
         },
     ));
@@ -1324,8 +1339,8 @@ fn streamed_terminal_output_updates_header_after_final_result() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · failed · exit 2 · timed out false"));
-    assert!(output.contains("exit code 2 · terminal · timed out false"));
+    assert!(output.contains("Terminal · shell.run · failed · exit 2"));
+    assert!(output.contains("exit code 2 · terminal"));
     assert!(!output.contains("Terminal · shell.run · running"));
 }
 
@@ -1380,6 +1395,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
+                started_at_ms: None,
             },
         },
     ));
@@ -1503,6 +1519,7 @@ fn streamed_tool_without_output_renders_final_result() {
                     terminal: true,
                     columns: Some(120),
                     rows: Some(40),
+                    started_at_ms: None,
                 },
             },
         ),
@@ -1521,6 +1538,27 @@ fn streamed_tool_without_output_renders_final_result() {
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
     assert!(transcript.iter().any(|item| item.text() == "final result"));
+}
+
+#[test]
+fn streamed_terminal_output_renders_finished_elapsed_duration() {
+    let session_id = SessionId::new();
+    let events = streamed_terminal_tool_events(session_id);
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(
+        output.contains("Terminal · shell.run · ok · exit 7 · 1.5s · timed out"),
+        "{output}"
+    );
+    assert!(
+        output.contains("exit code 7 · 1.5s · terminal · timed out"),
+        "{output}"
+    );
 }
 
 fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
@@ -1544,6 +1582,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                     terminal: true,
                     columns: Some(120),
                     rows: Some(40),
+                    started_at_ms: Some(1_000),
                 },
             },
         ),
@@ -1568,6 +1607,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                     tool_call_id: "call-stream".to_owned(),
                     sequence: 2,
                     is_error: false,
+                    finished_at_ms: Some(2_500),
                 },
             },
         ),

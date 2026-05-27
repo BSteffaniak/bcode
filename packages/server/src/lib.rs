@@ -6416,12 +6416,14 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             terminal,
             columns,
             rows,
+            started_at_ms,
         } => ToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
             terminal,
             columns,
             rows,
+            started_at_ms: started_at_ms.or_else(|| Some(current_unix_millis())),
         },
         ServiceToolInvocationStreamEvent::OutputDelta {
             tool_call_id,
@@ -6449,10 +6451,12 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             tool_call_id,
             sequence,
             is_error,
+            finished_at_ms,
         } => ToolInvocationStreamEvent::Finished {
             tool_call_id,
             sequence,
             is_error,
+            finished_at_ms: finished_at_ms.or_else(|| Some(current_unix_millis())),
         },
     }
 }

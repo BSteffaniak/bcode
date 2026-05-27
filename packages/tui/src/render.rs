@@ -30,6 +30,7 @@ use super::tool_present::{
 };
 use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
+use crate::time_format::{format_elapsed_millis, format_millis};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -621,6 +622,8 @@ fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptIte
         output,
         columns,
         rows: terminal_rows,
+        started_at_ms,
+        finished_at_ms,
         exit_code,
         timed_out,
         is_error,
@@ -636,6 +639,8 @@ fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptIte
             output,
             columns: *columns,
             rows: *terminal_rows,
+            started_at_ms: *started_at_ms,
+            finished_at_ms: *finished_at_ms,
             exit_code: *exit_code,
             timed_out: *timed_out,
             is_error: *is_error,
@@ -652,6 +657,8 @@ struct TerminalToolRenderContext<'a> {
     output: &'a str,
     columns: u16,
     rows: u16,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
     exit_code: Option<i32>,
     timed_out: Option<bool>,
     is_error: bool,
@@ -669,6 +676,8 @@ fn push_terminal_tool_result_rows(
         context.timed_out,
         context.is_error,
         context.streaming,
+        context.started_at_ms,
+        context.finished_at_ms,
     );
     push_wrapped_styled_text(
         rows,
@@ -689,6 +698,7 @@ fn push_terminal_tool_result_rows(
         &TerminalOutputTranscript {
             exit_code: context.exit_code,
             timed_out: context.timed_out,
+            elapsed: format_elapsed_millis(context.started_at_ms, context.finished_at_ms),
             output: context.output.to_owned(),
             output_truncated: false,
             output_bytes: None,
@@ -717,6 +727,8 @@ fn terminal_title(
     timed_out: Option<bool>,
     is_error: bool,
     streaming: bool,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
 ) -> String {
     let status = if streaming || timed_out.is_none() {
         "running".to_owned()
@@ -727,12 +739,16 @@ fn terminal_title(
         let outcome = if is_error { "failed" } else { "ok" };
         format!("{outcome} · signal")
     };
+    let elapsed = format_elapsed_millis(started_at_ms, finished_at_ms)
+        .map(|elapsed| format!(" · {elapsed}"))
+        .unwrap_or_default();
     let timeout = timed_out
-        .map(|value| format!(" · timed out {value}"))
+        .filter(|timed_out| *timed_out)
+        .map(|_| " · timed out".to_owned())
         .unwrap_or_default();
     tool_name.map_or_else(
-        || format!("Terminal · {status}{timeout}"),
-        |name| format!("Terminal · {name} · {status}{timeout}"),
+        || format!("Terminal · {status}{elapsed}{timeout}"),
+        |name| format!("Terminal · {name} · {status}{elapsed}{timeout}"),
     )
 }
 
@@ -763,6 +779,8 @@ fn push_tool_result_rows(
             Some(*timed_out),
             context.is_error,
             false,
+            None,
+            None,
         ),
         _ => context.tool_name.map_or_else(
             || format!("Tool result · {status}"),
@@ -854,7 +872,7 @@ fn push_tool_request_presentation_rows(
                 push_kv_row(rows, "cwd", cwd, width);
             }
             if let Some(timeout_ms) = timeout_ms {
-                push_kv_row(rows, "timeout", &format!("{timeout_ms}ms"), width);
+                push_kv_row(rows, "timeout", &format_millis(*timeout_ms), width);
             }
             push_kv_row(rows, "terminal", "yes", width);
         }
@@ -1706,6 +1724,7 @@ fn push_shell_result_rows(rows: &mut Vec<Line>, shell: &ShellResultPresentation,
             &TerminalOutputTranscript {
                 exit_code: *exit_code,
                 timed_out: Some(*timed_out),
+                elapsed: None,
                 output: output.clone(),
                 output_truncated: *output_truncated,
                 output_bytes: *output_bytes,
@@ -1762,6 +1781,7 @@ fn push_shell_output_rows(rows: &mut Vec<Line>, output: &CaptureShellOutput, wid
 struct TerminalOutputTranscript {
     exit_code: Option<i32>,
     timed_out: Option<bool>,
+    elapsed: Option<String>,
     output: String,
     output_truncated: bool,
     output_bytes: Option<u64>,
@@ -1927,13 +1947,19 @@ const fn ansi_indexed_color(index: u8) -> Color {
 }
 
 fn terminal_status(output: &TerminalOutputTranscript) -> String {
+    let elapsed = output
+        .elapsed
+        .as_ref()
+        .map(|elapsed| format!(" · {elapsed}"))
+        .unwrap_or_default();
     let Some(timed_out) = output.timed_out else {
-        return "running · terminal".to_owned();
+        return format!("running{elapsed} · terminal");
     };
     let exit_code = output
         .exit_code
         .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-    format!("exit code {exit_code} · terminal · timed out {timed_out}")
+    let timeout = if timed_out { " · timed out" } else { "" };
+    format!("exit code {exit_code}{elapsed} · terminal{timeout}")
 }
 
 fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {

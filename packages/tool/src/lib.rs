@@ -79,6 +79,8 @@ pub enum ToolInvocationStreamEvent {
         columns: Option<u16>,
         #[serde(default)]
         rows: Option<u16>,
+        #[serde(default)]
+        started_at_ms: Option<u64>,
     },
     /// A chunk of live tool output is available.
     OutputDelta {
@@ -100,6 +102,8 @@ pub enum ToolInvocationStreamEvent {
         tool_call_id: String,
         sequence: u64,
         is_error: bool,
+        #[serde(default)]
+        finished_at_ms: Option<u64>,
     },
 }
 

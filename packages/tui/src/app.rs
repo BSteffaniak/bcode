@@ -85,6 +85,7 @@ struct StreamedToolResultContext {
     index: Option<usize>,
     columns: u16,
     rows: u16,
+    started_at_ms: Option<u64>,
     saw_output: bool,
 }
 
@@ -857,7 +858,7 @@ impl BmuxApp {
 
     /// Advance time-based UI state.
     pub fn tick(&mut self) -> bool {
-        self.cursor.tick()
+        self.cursor.tick() || self.has_live_timed_tool_output()
     }
 
     /// Return whether the TUI should exit.
@@ -894,6 +895,20 @@ impl BmuxApp {
         self.selected_model_id = model_to_display_selection(model);
         self.token_usage.clear_model_info();
         self.status = format!("model: {provider}/{model}");
+    }
+
+    fn has_live_timed_tool_output(&self) -> bool {
+        self.transcript.iter().any(|item| {
+            item.streaming()
+                && matches!(
+                    item.kind(),
+                    TranscriptItemKind::TerminalOutput {
+                        started_at_ms: Some(_),
+                        finished_at_ms: None,
+                        ..
+                    }
+                )
+        })
     }
 
     fn extend_composer_selection_to_visual_delta(&mut self, width: usize, delta: isize) {
@@ -1019,7 +1034,7 @@ impl BmuxApp {
                     ..
                 }) = result.and_then(terminal_shell_presentation)
                 {
-                    item.finish_terminal(exit_code, timed_out, is_error.unwrap_or(false));
+                    item.finish_terminal(exit_code, timed_out, is_error.unwrap_or(false), None);
                 } else {
                     if let Some(is_error) = is_error {
                         item.set_terminal_error(is_error);
@@ -1085,6 +1100,8 @@ impl BmuxApp {
                 terminal,
                 columns,
                 rows,
+                started_at_ms,
+                ..
             } => {
                 if *terminal {
                     self.streamed_tool_results.insert(
@@ -1093,6 +1110,7 @@ impl BmuxApp {
                             index: None,
                             columns: columns.unwrap_or(120).max(1),
                             rows: rows.unwrap_or(24).max(1),
+                            started_at_ms: *started_at_ms,
                             saw_output: false,
                         },
                     );
@@ -1108,6 +1126,7 @@ impl BmuxApp {
             ToolInvocationStreamEvent::Finished {
                 tool_call_id,
                 is_error,
+                finished_at_ms,
                 ..
             } => {
                 if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id)
@@ -1115,6 +1134,7 @@ impl BmuxApp {
                     && let Some(item) = self.transcript.get_mut(index)
                 {
                     item.set_terminal_error(*is_error);
+                    item.set_terminal_finished_at(*finished_at_ms);
                 }
                 self.finish_tool_request_preview(tool_call_id);
                 if *is_error {
@@ -1159,6 +1179,7 @@ impl BmuxApp {
                 index: Some(self.transcript.len().saturating_sub(1)),
                 columns: 0,
                 rows: 0,
+                started_at_ms: None,
                 saw_output: true,
             },
         );
@@ -1180,6 +1201,7 @@ impl BmuxApp {
                 text,
                 context.columns,
                 context.rows,
+                context.started_at_ms,
             ));
             context.index = Some(self.transcript.len().saturating_sub(1));
             return;
@@ -1191,6 +1213,7 @@ impl BmuxApp {
             text,
             120,
             24,
+            None,
         ));
         self.streamed_tool_results.insert(
             tool_call_id.to_owned(),
@@ -1198,6 +1221,7 @@ impl BmuxApp {
                 index: Some(self.transcript.len().saturating_sub(1)),
                 columns: 120,
                 rows: 24,
+                started_at_ms: None,
                 saw_output: true,
             },
         );

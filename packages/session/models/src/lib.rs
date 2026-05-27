@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 18;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 19;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -234,6 +234,8 @@ pub enum ToolInvocationStreamEvent {
         columns: Option<u16>,
         #[serde(default)]
         rows: Option<u16>,
+        #[serde(default)]
+        started_at_ms: Option<u64>,
     },
     /// A chunk of live tool output is available.
     OutputDelta {
@@ -255,6 +257,8 @@ pub enum ToolInvocationStreamEvent {
         tool_call_id: String,
         sequence: u64,
         is_error: bool,
+        #[serde(default)]
+        finished_at_ms: Option<u64>,
     },
 }
 

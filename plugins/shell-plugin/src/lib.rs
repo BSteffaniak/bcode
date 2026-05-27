@@ -169,6 +169,7 @@ fn run_shell_tool(
             terminal: arguments.terminal,
             columns: arguments.terminal.then_some(arguments.terminal_columns()),
             rows: arguments.terminal.then_some(arguments.terminal_rows()),
+            started_at_ms: None,
         },
     );
     emit_tool_status(
@@ -210,6 +211,7 @@ fn run_shell_tool(
             tool_call_id: tool_call_id.to_owned(),
             sequence: 0,
             is_error: response.is_error,
+            finished_at_ms: None,
         },
     );
     response
