@@ -1827,10 +1827,10 @@ async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database:
     seed_company_created_event(database).await?;
     seed_starter_org_events(database).await?;
     seed_starter_world_events(database).await?;
-    seed_departments(database).await?;
-    seed_teams(database).await?;
-    seed_world(database).await?;
-    seed_agents(database).await
+    rebuild_projections_from_database(database)
+        .await
+        .map_err(|error| switchy_database::DatabaseError::QueryFailed(error.to_string()))?;
+    Ok(())
 }
 
 async fn seed_company_created_event(
@@ -1981,95 +1981,6 @@ const fn starter_teams() -> [(&'static str, &'static str, &'static str, &'static
             "make Blims delightful and memorable",
         ),
     ]
-}
-
-async fn seed_departments(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
-    for (id, name, purpose) in starter_departments() {
-        database
-            .exec_raw(&format!(
-                "INSERT INTO departments (id, company_id, name, purpose) \
-                 SELECT '{id}', 'default', '{name}', '{purpose}' \
-                 WHERE NOT EXISTS (SELECT 1 FROM departments WHERE id = '{id}')"
-            ))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn seed_teams(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
-    for (id, department_id, name, purpose) in starter_teams() {
-        database
-            .exec_raw(&format!(
-                "INSERT INTO teams (id, department_id, name, purpose) \
-                 SELECT '{id}', '{department_id}', '{name}', '{purpose}' \
-                 WHERE NOT EXISTS (SELECT 1 FROM teams WHERE id = '{id}')"
-            ))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn seed_world(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
-    database
-        .exec_raw(
-            "INSERT INTO worlds (id, company_id, theme, player_room_id) \
-             SELECT 'default', 'default', 'Cozy Startup Loft', 'ceo-nook' \
-             WHERE NOT EXISTS (SELECT 1 FROM worlds WHERE id = 'default')",
-        )
-        .await?;
-    for (id, name, purpose) in [
-        (
-            "ceo-nook",
-            "CEO Nook",
-            "company policy and executive guidance",
-        ),
-        (
-            "whiteboard",
-            "Whiteboard",
-            "initiatives, priorities, and planning",
-        ),
-        (
-            "engineering",
-            "Engineering Desks",
-            "implementation focus and worktree coding",
-        ),
-        (
-            "creative",
-            "Creative Corner",
-            "branding, docs, and design ideas",
-        ),
-        ("review", "Review Wall", "artifact inspection and approval"),
-    ] {
-        database
-            .exec_raw(&format!(
-                "INSERT INTO world_rooms (id, world_id, name, purpose) \
-                 SELECT '{id}', 'default', '{name}', '{purpose}' \
-                 WHERE NOT EXISTS (SELECT 1 FROM world_rooms WHERE id = '{id}')"
-            ))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn seed_agents(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
-    for agent in starter_agents() {
-        database
-            .exec_raw(&format!(
-                "INSERT INTO agents (id, name, role, department_id, team_id, status, room_id) \
-                 SELECT '{}', '{}', '{}', '{}', '{}', '{}', '{}' \
-                 WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = '{}')",
-                agent.id,
-                agent.name,
-                agent.role,
-                agent.department_id,
-                agent.team_id,
-                agent.status,
-                agent.room_id,
-                agent.id
-            ))
-            .await?;
-    }
-    Ok(())
 }
 
 fn starter_agents() -> Vec<AgentRecord> {
@@ -2619,13 +2530,17 @@ fn rebuild_projections(
     working_directory: &Path,
 ) -> Result<ProjectionRebuildReport, BlimsStateError> {
     with_database(working_directory, |database| {
-        Box::pin(async move {
-            let events = load_event_stream(database).await?;
-            let state = replay_events(&events)?;
-            apply_projection_state(database, &state).await?;
-            Ok(state.report(events.len()))
-        })
+        Box::pin(async move { rebuild_projections_from_database(database).await })
     })
+}
+
+async fn rebuild_projections_from_database(
+    database: &dyn Database,
+) -> Result<ProjectionRebuildReport, BlimsStateError> {
+    let events = load_event_stream(database).await?;
+    let state = replay_events(&events)?;
+    apply_projection_state(database, &state).await?;
+    Ok(state.report(events.len()))
 }
 
 async fn load_event_stream(
