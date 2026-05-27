@@ -831,6 +831,15 @@ impl BmuxApp {
         }
     }
 
+    pub fn apply_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
+        self.runtime_work.apply_snapshots(snapshots);
+        if self.runtime_work.is_cancelling() {
+            self.set_cancelling();
+        } else if self.runtime_work.is_busy() {
+            self.set_activity(ActivityState::Thinking);
+        }
+    }
+
     /// Return whether the composer cursor should be visible.
     #[must_use]
     pub const fn cursor_visible(&self) -> bool {

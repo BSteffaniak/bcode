@@ -52,6 +52,7 @@ pub struct RuntimeWorkSpec {
     pub plugin_id: Option<String>,
     pub service_interface: Option<String>,
     pub operation: Option<String>,
+    pub parent_work_id: Option<RuntimeWorkId>,
     pub cancellation: CancellationHandle,
 }
 
@@ -71,12 +72,18 @@ impl RuntimeWorkSpec {
             plugin_id: None,
             service_interface: None,
             operation: None,
+            parent_work_id: None,
             cancellation,
         }
     }
 
     pub fn with_tool_call_id(mut self, tool_call_id: Option<String>) -> Self {
         self.tool_call_id = tool_call_id;
+        self
+    }
+
+    pub fn with_parent_work_id(mut self, parent_work_id: Option<RuntimeWorkId>) -> Self {
+        self.parent_work_id = parent_work_id;
         self
     }
 }
@@ -128,16 +135,35 @@ impl RuntimeWorkManager {
     /// Cancel active work by exact ID. Returns false if no such active work exists.
     pub async fn cancel(&self, session_id: SessionId, work_id: &RuntimeWorkId) -> bool {
         let mut active = self.active.lock().await;
-        let Some(work) = active.get_mut(&(session_id, work_id.clone())) else {
+        if !active.contains_key(&(session_id, work_id.clone())) {
             return false;
-        };
-        if work.cancelled {
-            return true;
         }
-        work.cancelled = true;
-        let cancellation = work.spec.cancellation.clone();
+        let mut pending = vec![work_id.clone()];
+        let mut cancellations = Vec::new();
+        while let Some(next_work_id) = pending.pop() {
+            let key = (session_id, next_work_id.clone());
+            let Some(work) = active.get_mut(&key) else {
+                continue;
+            };
+            if work.cancelled {
+                continue;
+            }
+            work.cancelled = true;
+            cancellations.push(work.spec.cancellation.clone());
+            let children = active
+                .iter()
+                .filter(|((child_session_id, _), child)| {
+                    *child_session_id == session_id
+                        && child.spec.parent_work_id.as_ref() == Some(&next_work_id)
+                })
+                .map(|((_, child_work_id), _)| child_work_id.clone())
+                .collect::<Vec<_>>();
+            pending.extend(children);
+        }
         drop(active);
-        cancellation.cancel();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
         true
     }
 
@@ -247,5 +273,39 @@ mod tests {
         assert!(manager.cancel(session_id, &work_id).await);
         assert_eq!(first.load(Ordering::SeqCst), 0);
         assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn cancelling_parent_cancels_child() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let parent_count = Arc::new(AtomicUsize::new(0));
+        let child_count = Arc::new(AtomicUsize::new(0));
+        let parent_id = RuntimeWorkId::new("parent");
+        let child_id = RuntimeWorkId::new("child");
+
+        manager
+            .start(session_id, test_spec("parent", Arc::clone(&parent_count)))
+            .await;
+        manager
+            .start(
+                session_id,
+                test_spec("child", Arc::clone(&child_count))
+                    .with_parent_work_id(Some(parent_id.clone())),
+            )
+            .await;
+
+        assert!(manager.cancel(session_id, &parent_id).await);
+        assert_eq!(parent_count.load(Ordering::SeqCst), 1);
+        assert_eq!(child_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .active_for_session(session_id)
+                .await
+                .into_iter()
+                .find(|work| work.work_id == child_id)
+                .expect("child remains active until finished")
+                .status,
+            RuntimeWorkStatus::Cancelling
+        );
     }
 }

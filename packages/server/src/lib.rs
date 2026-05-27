@@ -6852,7 +6852,15 @@ async fn append_tool_request_event(
                     .unwrap_or_else(|| Arc::new(TurnCancelState::default())),
             ),
         )
-        .with_tool_call_id(Some(runtime_tool_call_id)),
+        .with_tool_call_id(Some(runtime_tool_call_id))
+        .with_parent_work_id(
+            state
+                .active_session_turns
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|turn| RuntimeWorkId::new(format!("model_{}", turn.turn_id))),
+        ),
     )
     .await;
 }

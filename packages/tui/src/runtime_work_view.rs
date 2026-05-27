@@ -1,3 +1,4 @@
+use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_session_models::{RuntimeWorkId, RuntimeWorkStatus, SessionEvent, SessionEventKind};
 use std::collections::BTreeMap;
 
@@ -21,6 +22,17 @@ impl RuntimeWorkViewState {
                 self.active.remove(work_id);
             }
             _ => {}
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: &RuntimeWorkSnapshot) {
+        self.active
+            .insert(snapshot.work_id.clone(), snapshot.status);
+    }
+
+    pub fn apply_snapshots(&mut self, snapshots: &[RuntimeWorkSnapshot]) {
+        for snapshot in snapshots {
+            self.apply_snapshot(snapshot);
         }
     }
 

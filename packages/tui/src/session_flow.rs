@@ -49,6 +49,9 @@ pub async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
     if let Some(model) = model {
         app.apply_model_status(model);
     }
+    if let Ok(work) = client.list_runtime_work(session_id).await {
+        app.apply_runtime_work_snapshots(&work);
+    }
     let skill_count = active_skills.as_ref().map_or(0, Vec::len);
     app.set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
