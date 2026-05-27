@@ -8,7 +8,7 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
     TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolList, ToolResultContent, ToolSideEffect,
+    ToolInvocationStreamEvent, ToolList, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -47,6 +47,49 @@ impl RustPlugin for FilesystemPlugin {
             ),
         }
     }
+}
+
+struct ProgressReporter {
+    events: ServiceEventEmitter,
+    tool_call_id: String,
+    sequence: u64,
+    next_visited_report: usize,
+}
+
+impl ProgressReporter {
+    const fn new(events: ServiceEventEmitter, tool_call_id: String) -> Self {
+        Self {
+            events,
+            tool_call_id,
+            sequence: 0,
+            next_visited_report: 250,
+        }
+    }
+
+    fn emit(&mut self, message: impl Into<String>) {
+        self.sequence = self.sequence.saturating_add(1);
+        let event = ToolInvocationStreamEvent::Status {
+            tool_call_id: self.tool_call_id.clone(),
+            sequence: self.sequence,
+            message: message.into(),
+        };
+        if let Ok(payload) = serde_json::to_vec(&event) {
+            self.events.emit(&payload);
+        }
+    }
+
+    fn maybe_visited(&mut self, kind: &str, visited_entries: usize) {
+        if visited_entries >= self.next_visited_report {
+            self.emit(format!("{kind}: visited {visited_entries} entries"));
+            self.next_visited_report = self.next_visited_report.saturating_add(250);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProgressSummary {
+    matches: usize,
+    bytes_scanned: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,9 +437,27 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         "filesystem.write" => tool_write(request.arguments, cwd.as_deref()),
         "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref()),
         "filesystem.exists" => tool_exists(request.arguments, cwd.as_deref()),
-        "filesystem.list" => tool_list(request.arguments, cwd.as_deref(), &context.cancellation),
-        "filesystem.find" => tool_find(request.arguments, cwd.as_deref(), &context.cancellation),
-        "filesystem.grep" => tool_grep(request.arguments, cwd.as_deref(), &context.cancellation),
+        "filesystem.list" => tool_list(
+            request.arguments,
+            cwd.as_deref(),
+            &context.cancellation,
+            context.events,
+            &request.tool_call_id,
+        ),
+        "filesystem.find" => tool_find(
+            request.arguments,
+            cwd.as_deref(),
+            &context.cancellation,
+            context.events,
+            &request.tool_call_id,
+        ),
+        "filesystem.grep" => tool_grep(
+            request.arguments,
+            cwd.as_deref(),
+            &context.cancellation,
+            context.events,
+            &request.tool_call_id,
+        ),
         "filesystem.stat" => tool_stat(request.arguments, cwd.as_deref()),
         _ => ToolInvocationResponse {
             output: format!("unknown filesystem tool: {}", request.name),
@@ -604,6 +665,8 @@ fn tool_list(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
 ) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<ListRequest>(arguments)
@@ -612,7 +675,10 @@ fn tool_list(
                 request
             })
             .and_then(|request| {
-                list_directory(&request, cancellation.clone()).map_err(serde_json::Error::io)
+                let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+                progress.emit("list: scanning entries");
+                list_directory(&request, cancellation.clone(), Some(&mut progress))
+                    .map_err(serde_json::Error::io)
             }),
     )
 }
@@ -621,6 +687,8 @@ fn tool_find(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
 ) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<FindRequest>(arguments)
@@ -629,7 +697,9 @@ fn tool_find(
                 request
             })
             .and_then(|request| {
-                find_paths_with_cancellation(&request, cancellation.clone())
+                let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+                progress.emit(format!("find: searching for {}", request.pattern));
+                find_paths_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
                     .map_err(serde_json::Error::io)
             }),
     )
@@ -639,6 +709,8 @@ fn tool_grep(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
 ) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<GrepRequest>(arguments)
@@ -647,7 +719,9 @@ fn tool_grep(
                 request
             })
             .and_then(|request| {
-                grep_files_with_cancellation(&request, cancellation.clone())
+                let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+                progress.emit(format!("grep: searching for {}", request.pattern));
+                grep_files_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
                     .map_err(serde_json::Error::io)
             }),
     )
@@ -720,7 +794,12 @@ fn list_directory_service(request: &ServiceRequest) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    list_directory(&request, bcode_plugin_sdk::ServiceCancellation::default()).map_or_else(
+    list_directory(
+        &request,
+        bcode_plugin_sdk::ServiceCancellation::default(),
+        None,
+    )
+    .map_or_else(
         |error| io_error(&error),
         |response| json_response(&response),
     )
@@ -808,6 +887,7 @@ fn timeout_message(kind: &str, timeout_ms: u64) -> String {
 fn list_directory(
     request: &ListRequest,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> Result<ListResponse, std::io::Error> {
     let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
     let max_entries = request.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
@@ -818,7 +898,15 @@ fn list_directory(
         max_entries,
         &mut budget,
         &mut entries,
+        progress.as_deref_mut(),
     )?;
+    if let Some(progress) = progress {
+        progress.emit(format!(
+            "list: visited {} entries; retained {}",
+            budget.visited_entries,
+            entries.len()
+        ));
+    }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let partial = budget.timed_out || entries.len() >= max_entries;
     Ok(ListResponse {
@@ -839,6 +927,7 @@ fn collect_entries(
     max_entries: usize,
     budget: &mut SearchBudget,
     entries: &mut Vec<ListEntry>,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> Result<(), std::io::Error> {
     if entries.len() >= max_entries || !budget.check() {
         return Ok(());
@@ -846,6 +935,9 @@ fn collect_entries(
     for entry in std::fs::read_dir(path)? {
         if entries.len() >= max_entries || !budget.visit() {
             break;
+        }
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.maybe_visited("list", budget.visited_entries);
         }
         let entry = entry?;
         let entry_path = entry.path();
@@ -855,19 +947,31 @@ fn collect_entries(
             kind,
         });
         if recursive && entry_path.is_dir() {
-            collect_entries(&entry_path, recursive, max_entries, budget, entries)?;
+            collect_entries(
+                &entry_path,
+                recursive,
+                max_entries,
+                budget,
+                entries,
+                progress.as_deref_mut(),
+            )?;
         }
     }
     Ok(())
 }
 
 fn find_paths(request: &FindRequest) -> Result<FindResponse, std::io::Error> {
-    find_paths_with_cancellation(request, bcode_plugin_sdk::ServiceCancellation::default())
+    find_paths_with_cancellation(
+        request,
+        bcode_plugin_sdk::ServiceCancellation::default(),
+        None,
+    )
 }
 
 fn find_paths_with_cancellation(
     request: &FindRequest,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
+    progress: Option<&mut ProgressReporter>,
 ) -> Result<FindResponse, std::io::Error> {
     let max_results = request.max_results.unwrap_or(DEFAULT_FIND_MAX_RESULTS);
     if let Some(response) = find_paths_with_fd(request, max_results)? {
@@ -876,13 +980,14 @@ fn find_paths_with_cancellation(
     if let Some(response) = find_paths_with_find(request, max_results)? {
         return Ok(response);
     }
-    find_paths_with_rust(request, max_results, cancellation)
+    find_paths_with_rust(request, max_results, cancellation, progress)
 }
 
 fn find_paths_with_rust(
     request: &FindRequest,
     max_results: usize,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> Result<FindResponse, std::io::Error> {
     let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
     let mut paths = Vec::new();
@@ -893,7 +998,15 @@ fn find_paths_with_rust(
         max_results,
         &mut budget,
         &mut paths,
+        progress.as_deref_mut(),
     )?;
+    if let Some(progress) = progress {
+        progress.emit(format!(
+            "find: visited {} entries; matched {}",
+            budget.visited_entries,
+            paths.len()
+        ));
+    }
     paths.sort();
     let partial = budget.timed_out || paths.len() >= max_results;
     Ok(FindResponse {
@@ -915,6 +1028,7 @@ fn collect_find_matches(
     max_results: usize,
     budget: &mut SearchBudget,
     paths: &mut Vec<String>,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> Result<(), std::io::Error> {
     if paths.len() >= max_results || !budget.check() {
         return Ok(());
@@ -922,6 +1036,9 @@ fn collect_find_matches(
     for entry in std::fs::read_dir(path)? {
         if paths.len() >= max_results || !budget.visit() {
             break;
+        }
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.maybe_visited("find", budget.visited_entries);
         }
         let entry = entry?;
         let entry_path = entry.path();
@@ -932,41 +1049,64 @@ fn collect_find_matches(
             paths.push(entry_path.display().to_string());
         }
         if entry_path.is_dir() {
-            collect_find_matches(root, &entry_path, pattern, max_results, budget, paths)?;
+            collect_find_matches(
+                root,
+                &entry_path,
+                pattern,
+                max_results,
+                budget,
+                paths,
+                progress.as_deref_mut(),
+            )?;
         }
     }
     Ok(())
 }
 
 fn grep_files(request: &GrepRequest) -> Result<GrepResponse, std::io::Error> {
-    grep_files_with_cancellation(request, bcode_plugin_sdk::ServiceCancellation::default())
+    grep_files_with_cancellation(
+        request,
+        bcode_plugin_sdk::ServiceCancellation::default(),
+        None,
+    )
 }
 
 fn grep_files_with_cancellation(
     request: &GrepRequest,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
+    progress: Option<&mut ProgressReporter>,
 ) -> Result<GrepResponse, std::io::Error> {
     let max_matches = request.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
     if let Some(response) = grep_files_with_rg(request, max_matches)? {
         return Ok(response);
     }
-    grep_files_with_rust(request, max_matches, cancellation)
+    grep_files_with_rust(request, max_matches, cancellation, progress)
 }
 
 fn grep_files_with_rust(
     request: &GrepRequest,
     max_matches: usize,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> Result<GrepResponse, std::io::Error> {
     let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
     let mut matches = Vec::new();
+    let mut summary = ProgressSummary::default();
     collect_grep_matches(
         &request.path,
         request,
         max_matches,
         &mut budget,
         &mut matches,
+        &mut summary,
+        progress.as_deref_mut(),
     )?;
+    if let Some(progress) = progress {
+        progress.emit(format!(
+            "grep: visited {} entries; matched {}; scanned {} bytes",
+            budget.visited_entries, summary.matches, summary.bytes_scanned
+        ));
+    }
     let partial = budget.timed_out || matches.len() >= max_matches;
     Ok(GrepResponse {
         matches,
@@ -986,6 +1126,8 @@ fn collect_grep_matches(
     max_matches: usize,
     budget: &mut SearchBudget,
     matches: &mut Vec<GrepMatch>,
+    summary: &mut ProgressSummary,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> Result<(), std::io::Error> {
     if matches.len() >= max_matches || !budget.check() {
         return Ok(());
@@ -995,7 +1137,18 @@ fn collect_grep_matches(
             if matches.len() >= max_matches || !budget.visit() {
                 break;
             }
-            collect_grep_matches(&entry?.path(), request, max_matches, budget, matches)?;
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.maybe_visited("grep", budget.visited_entries);
+            }
+            collect_grep_matches(
+                &entry?.path(),
+                request,
+                max_matches,
+                budget,
+                matches,
+                summary,
+                progress.as_deref_mut(),
+            )?;
         }
         return Ok(());
     }
@@ -1006,6 +1159,7 @@ fn collect_grep_matches(
     if metadata.len() > MAX_RUST_GREP_FILE_BYTES {
         return Ok(());
     }
+    summary.bytes_scanned = summary.bytes_scanned.saturating_add(metadata.len());
     let Ok(contents) = std::fs::read_to_string(path) else {
         return Ok(());
     };
@@ -1029,6 +1183,12 @@ fn collect_grep_matches(
                 line_number: line_index.saturating_add(1),
                 line: line.to_string(),
             });
+            summary.matches = summary.matches.saturating_add(1);
+            if let Some(progress) = progress.as_deref_mut()
+                && summary.matches.is_multiple_of(25)
+            {
+                progress.emit(format!("grep: matched {} lines", summary.matches));
+            }
         }
     }
     Ok(())
@@ -1529,6 +1689,7 @@ mod tests {
             },
             10,
             bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
         )
         .expect("grep response");
 
@@ -1560,6 +1721,7 @@ mod tests {
             },
             1,
             bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
         )
         .expect("find response");
 
