@@ -149,33 +149,86 @@ impl RustPlugin for BlimsPlugin {
         match context.request.operation.as_str() {
             OP_COMPANY_STATUS => service_company_status(&context.request),
             OP_COMPANY_CREATE | OP_COMPANY_LOAD => service_company_create(&context.request),
-            OP_COMPANY_PAUSE => service_company_lifecycle(&context.request, "paused"),
-            OP_COMPANY_RESUME => service_company_lifecycle(&context.request, "running"),
-            OP_COMPANY_SHUTDOWN => service_company_lifecycle(&context.request, "shutdown"),
+            OP_COMPANY_PAUSE => service_company_lifecycle(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "paused",
+            ),
+            OP_COMPANY_RESUME => service_company_lifecycle(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "running",
+            ),
+            OP_COMPANY_SHUTDOWN => service_company_lifecycle(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "shutdown",
+            ),
             OP_AGENT_LIST => service_agent_list(&context.request),
-            OP_INITIATIVE_CREATE => service_initiative_create(&context.request),
+            OP_INITIATIVE_CREATE => service_initiative_create(
+                &context.request,
+                &EventContext::from_request(&context.request),
+            ),
             OP_INITIATIVE_LIST => service_initiative_list(&context.request),
             OP_INITIATIVE_INSPECT => service_initiative_inspect(&context.request),
-            OP_INITIATIVE_SET_GUIDANCE => service_initiative_set_guidance(&context.request),
-            OP_INITIATIVE_PAUSE => service_initiative_status(&context.request, "paused"),
-            OP_INITIATIVE_RESUME => service_initiative_status(&context.request, "active"),
-            OP_GUIDANCE_SET => service_guidance_set(&context.request),
+            OP_INITIATIVE_SET_GUIDANCE => service_initiative_set_guidance(
+                &context.request,
+                &EventContext::from_request(&context.request),
+            ),
+            OP_INITIATIVE_PAUSE => service_initiative_status(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "paused",
+            ),
+            OP_INITIATIVE_RESUME => service_initiative_status(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "active",
+            ),
+            OP_GUIDANCE_SET => service_guidance_set(
+                &context.request,
+                &EventContext::from_request(&context.request),
+            ),
             OP_GUIDANCE_LIST => service_guidance_list(&context.request),
             OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(&context.request),
-            OP_INITIATIVE_IMPORT_PLAN => service_initiative_import_plan(&context.request),
+            OP_INITIATIVE_IMPORT_PLAN => service_initiative_import_plan(
+                &context.request,
+                &EventContext::from_request(&context.request),
+            ),
             OP_TASK_LIST => service_task_list(&context.request),
             OP_TASK_INSPECT => service_task_inspect(&context.request),
             OP_TASK_WORK_PROMPT => service_task_work_prompt(&context.request),
             OP_ARTIFACT_LIST => service_artifact_list(&context.request),
             OP_ARTIFACT_INSPECT => service_artifact_inspect(&context.request),
-            OP_PROPOSAL_REGISTER => service_proposal_register(&context.request),
+            OP_PROPOSAL_REGISTER => service_proposal_register(
+                &context.request,
+                &EventContext::from_request(&context.request),
+            ),
             OP_PROPOSAL_LIST => service_proposal_list(&context.request),
             OP_PROPOSAL_INSPECT => service_proposal_inspect(&context.request),
-            OP_PROPOSAL_MARK_READY => service_proposal_mark_ready(&context.request),
-            OP_PROPOSAL_APPROVE => service_proposal_status(&context.request, "approved"),
-            OP_PROPOSAL_REJECT => service_proposal_status(&context.request, "rejected"),
-            OP_PROPOSAL_DEFER => service_proposal_status(&context.request, "deferred"),
-            OP_PROPOSAL_RECORD_PATCH => service_proposal_record_patch(&context.request),
+            OP_PROPOSAL_MARK_READY => service_proposal_mark_ready(
+                &context.request,
+                &EventContext::from_request(&context.request),
+            ),
+            OP_PROPOSAL_APPROVE => service_proposal_status(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "approved",
+            ),
+            OP_PROPOSAL_REJECT => service_proposal_status(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "rejected",
+            ),
+            OP_PROPOSAL_DEFER => service_proposal_status(
+                &context.request,
+                &EventContext::from_request(&context.request),
+                "deferred",
+            ),
+            OP_PROPOSAL_RECORD_PATCH => service_proposal_record_patch(
+                &context.request,
+                &EventContext::from_request(&context.request),
+            ),
             OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
@@ -191,6 +244,111 @@ impl RustPlugin for BlimsPlugin {
 pub struct WorkspaceRequest {
     /// Workspace or repository directory.
     pub working_directory: PathBuf,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventContext {
+    correlation_id: String,
+    causation_id: String,
+}
+
+impl EventContext {
+    fn from_request(request: &ServiceRequest) -> Self {
+        Self {
+            correlation_id: format!("service:{}", request.operation),
+            causation_id: format!("service:{}", request.operation),
+        }
+    }
+
+    fn merge_workspace_request(&self, request: &WorkspaceRequest) -> Self {
+        Self {
+            correlation_id: request
+                .correlation_id
+                .clone()
+                .unwrap_or_else(|| self.correlation_id.clone()),
+            causation_id: request
+                .causation_id
+                .clone()
+                .unwrap_or_else(|| self.causation_id.clone()),
+        }
+    }
+
+    fn merge_optional_ids(
+        &self,
+        correlation_id: Option<&String>,
+        causation_id: Option<&String>,
+    ) -> Self {
+        Self {
+            correlation_id: correlation_id
+                .cloned()
+                .unwrap_or_else(|| self.correlation_id.clone()),
+            causation_id: causation_id
+                .cloned()
+                .unwrap_or_else(|| self.causation_id.clone()),
+        }
+    }
+
+    fn merge_initiative_create_request(&self, request: &InitiativeCreateRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
+
+    fn merge_initiative_guidance_request(&self, request: &InitiativeGuidanceRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
+
+    fn merge_guidance_set_request(&self, request: &GuidanceSetRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
+
+    fn merge_initiative_import_plan_request(&self, request: &InitiativeImportPlanRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
+
+    fn merge_proposal_register_request(&self, request: &ProposalRegisterRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
+
+    fn merge_initiative_inspect_request(&self, request: &InitiativeInspectRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
+
+    fn merge_proposal_request(&self, request: &ProposalRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
+
+    fn merge_proposal_record_patch_request(&self, request: &ProposalRecordPatchRequest) -> Self {
+        self.merge_optional_ids(
+            request.correlation_id.as_ref(),
+            request.causation_id.as_ref(),
+        )
+    }
 }
 
 /// Typed Blims IPC request envelope for future daemon/frontends.
@@ -226,6 +384,12 @@ pub struct InitiativeCreateRequest {
     /// Optional initiative priority. Lower numbers sort first.
     #[serde(default)]
     pub priority: Option<i64>,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// Request to add initiative-specific CEO guidance.
@@ -240,6 +404,12 @@ pub struct InitiativeGuidanceRequest {
     /// Guidance strength label.
     #[serde(default = "default_guidance_strength")]
     pub strength: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// Request to add CEO guidance.
@@ -252,6 +422,12 @@ pub struct GuidanceSetRequest {
     /// Guidance strength label.
     #[serde(default = "default_guidance_strength")]
     pub strength: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// Request to build an AI planning prompt for an initiative.
@@ -347,6 +523,12 @@ pub struct ProposalRegisterRequest {
     pub worktree_path: PathBuf,
     /// Branch name.
     pub branch: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// Request to inspect or update a proposal.
@@ -356,6 +538,12 @@ pub struct ProposalRequest {
     pub working_directory: PathBuf,
     /// Proposal id.
     pub proposal_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// Request to record a proposal patch artifact.
@@ -367,6 +555,12 @@ pub struct ProposalRecordPatchRequest {
     pub proposal_id: String,
     /// Patch text.
     pub patch: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// Work proposal summary.
@@ -401,6 +595,12 @@ pub struct InitiativeInspectRequest {
     pub working_directory: PathBuf,
     /// Initiative id.
     pub initiative_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// Request to import an AI-generated plan for an initiative.
@@ -412,6 +612,12 @@ pub struct InitiativeImportPlanRequest {
     pub initiative_id: String,
     /// AI-generated plan payload.
     pub plan: AiInitiativePlan,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
 }
 
 /// AI-generated initiative plan contract.
@@ -877,13 +1083,18 @@ fn service_company_create(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn service_company_lifecycle(request: &ServiceRequest, lifecycle_status: &str) -> ServiceResponse {
+fn service_company_lifecycle(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+    lifecycle_status: &str,
+) -> ServiceResponse {
     let request = match request.payload_json::<WorkspaceRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
 
-    match set_company_lifecycle(&request.working_directory, lifecycle_status) {
+    let event_context = event_context.merge_workspace_request(&request);
+    match set_company_lifecycle(&request.working_directory, &event_context, lifecycle_status) {
         Ok(status) => json_response(&status),
         Err(error) => ServiceResponse::error("company_lifecycle_failed", error.to_string()),
     }
@@ -907,12 +1118,16 @@ fn service_agent_list(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn service_initiative_create(request: &ServiceRequest) -> ServiceResponse {
+fn service_initiative_create(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
     let request = match request.payload_json::<InitiativeCreateRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match create_initiative(&request) {
+    let event_context = event_context.merge_initiative_create_request(&request);
+    match create_initiative(&request, &event_context) {
         Ok(initiative) => json_response(&initiative),
         Err(error) => ServiceResponse::error("initiative_create_failed", error.to_string()),
     }
@@ -940,34 +1155,44 @@ fn service_initiative_inspect(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn service_initiative_set_guidance(request: &ServiceRequest) -> ServiceResponse {
+fn service_initiative_set_guidance(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
     let request = match request.payload_json::<InitiativeGuidanceRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match set_initiative_guidance(&request) {
+    let event_context = event_context.merge_initiative_guidance_request(&request);
+    match set_initiative_guidance(&request, &event_context) {
         Ok(guidance) => json_response(&guidance),
         Err(error) => ServiceResponse::error("initiative_guidance_failed", error.to_string()),
     }
 }
 
-fn service_initiative_status(request: &ServiceRequest, status: &str) -> ServiceResponse {
+fn service_initiative_status(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+    status: &str,
+) -> ServiceResponse {
     let request = match request.payload_json::<InitiativeInspectRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match set_initiative_status(&request, status) {
+    let event_context = event_context.merge_initiative_inspect_request(&request);
+    match set_initiative_status(&request, &event_context, status) {
         Ok(initiative) => json_response(&initiative),
         Err(error) => ServiceResponse::error("initiative_status_failed", error.to_string()),
     }
 }
 
-fn service_guidance_set(request: &ServiceRequest) -> ServiceResponse {
+fn service_guidance_set(request: &ServiceRequest, event_context: &EventContext) -> ServiceResponse {
     let request = match request.payload_json::<GuidanceSetRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match set_guidance(&request) {
+    let event_context = event_context.merge_guidance_set_request(&request);
+    match set_guidance(&request, &event_context) {
         Ok(guidance) => json_response(&guidance),
         Err(error) => ServiceResponse::error("guidance_set_failed", error.to_string()),
     }
@@ -995,12 +1220,16 @@ fn service_initiative_plan_prompt(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn service_initiative_import_plan(request: &ServiceRequest) -> ServiceResponse {
+fn service_initiative_import_plan(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
     let request = match request.payload_json::<InitiativeImportPlanRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match import_initiative_plan(&request) {
+    let event_context = event_context.merge_initiative_import_plan_request(&request);
+    match import_initiative_plan(&request, &event_context) {
         Ok(plan) => json_response(&plan),
         Err(error) => ServiceResponse::error("initiative_import_failed", error.to_string()),
     }
@@ -1061,12 +1290,16 @@ fn service_artifact_inspect(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn service_proposal_register(request: &ServiceRequest) -> ServiceResponse {
+fn service_proposal_register(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
     let request = match request.payload_json::<ProposalRegisterRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match register_proposal(&request) {
+    let event_context = event_context.merge_proposal_register_request(&request);
+    match register_proposal(&request, &event_context) {
         Ok(proposal) => json_response(&proposal),
         Err(error) => ServiceResponse::error("proposal_register_failed", error.to_string()),
     }
@@ -1094,27 +1327,39 @@ fn service_proposal_inspect(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn service_proposal_mark_ready(request: &ServiceRequest) -> ServiceResponse {
-    service_proposal_status(request, "ready_for_review")
+fn service_proposal_mark_ready(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    service_proposal_status(request, event_context, "ready_for_review")
 }
 
-fn service_proposal_status(request: &ServiceRequest, status: &str) -> ServiceResponse {
+fn service_proposal_status(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+    status: &str,
+) -> ServiceResponse {
     let request = match request.payload_json::<ProposalRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match set_proposal_status(&request, status) {
+    let event_context = event_context.merge_proposal_request(&request);
+    match set_proposal_status(&request, &event_context, status) {
         Ok(proposal) => json_response(&proposal),
         Err(error) => ServiceResponse::error("proposal_status_failed", error.to_string()),
     }
 }
 
-fn service_proposal_record_patch(request: &ServiceRequest) -> ServiceResponse {
+fn service_proposal_record_patch(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
     let request = match request.payload_json::<ProposalRecordPatchRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    match record_proposal_patch(&request) {
+    let event_context = event_context.merge_proposal_record_patch_request(&request);
+    match record_proposal_patch(&request, &event_context) {
         Ok(artifact) => json_response(&artifact),
         Err(error) => ServiceResponse::error("proposal_record_patch_failed", error.to_string()),
     }
@@ -1272,13 +1517,16 @@ fn create_company_state(working_directory: &Path) -> Result<CompanyStatus, Blims
 
 fn set_company_lifecycle(
     working_directory: &Path,
+    event_context: &EventContext,
     lifecycle_status: &str,
 ) -> Result<CompanyStatus, BlimsStateError> {
     let lifecycle_status = lifecycle_status.to_string();
+    let event_context = event_context.clone();
     with_database(working_directory, move |database| {
         Box::pin(async move {
             append_event(
                 database,
+                &event_context,
                 "company.lifecycle_set",
                 format!("Blims company lifecycle set to {lifecycle_status}."),
                 &BlimsEventPayload::CompanyLifecycleSet {
@@ -1852,6 +2100,7 @@ where
 
 async fn append_event(
     database: &dyn Database,
+    event_context: &EventContext,
     kind: &str,
     summary: String,
     payload: &BlimsEventPayload,
@@ -1863,8 +2112,8 @@ async fn append_event(
         .value("kind", kind)
         .value("summary", summary)
         .value("payload_json", payload_json)
-        .value("correlation_id", "local-command")
-        .value("causation_id", "local-command")
+        .value("correlation_id", event_context.correlation_id.clone())
+        .value("causation_id", event_context.causation_id.clone())
         .value("event_version", 1_i64)
         .execute(database)
         .await?;
@@ -1968,6 +2217,7 @@ fn load_company_data(working_directory: &Path) -> Result<CompanyData, BlimsState
 
 fn create_initiative(
     request: &InitiativeCreateRequest,
+    event_context: &EventContext,
 ) -> Result<InitiativeSummary, BlimsStateError> {
     let title = request.title.trim().to_string();
     if title.is_empty() {
@@ -1985,10 +2235,12 @@ fn create_initiative(
         status: "active".to_string(),
         priority,
     };
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             append_event(
                 database,
+                &event_context,
                 "initiative.created",
                 format!("Initiative created: {title}"),
                 &BlimsEventPayload::InitiativeCreated {
@@ -2028,15 +2280,18 @@ fn inspect_initiative(
 
 fn set_initiative_status(
     request: &InitiativeInspectRequest,
+    event_context: &EventContext,
     status: &str,
 ) -> Result<InitiativeSummary, BlimsStateError> {
     let initiative_id = request.initiative_id.clone();
     let status = status.to_string();
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let initiative = load_initiative(database, &initiative_id).await?;
             append_event(
                 database,
+                &event_context,
                 "initiative.status_set",
                 format!("Initiative {initiative_id} status set to {status}."),
                 &BlimsEventPayload::InitiativeStatusSet {
@@ -2055,10 +2310,13 @@ fn set_initiative_status(
 
 fn set_initiative_guidance(
     request: &InitiativeGuidanceRequest,
+    event_context: &EventContext,
 ) -> Result<GuidanceSummary, BlimsStateError> {
     let initiative_request = InitiativeInspectRequest {
         working_directory: request.working_directory.clone(),
         initiative_id: request.initiative_id.clone(),
+        correlation_id: None,
+        causation_id: None,
     };
     inspect_initiative(&initiative_request)?;
     let guidance = request.guidance.trim().to_string();
@@ -2076,10 +2334,12 @@ fn set_initiative_guidance(
         strength,
         active: true,
     };
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             append_event(
                 database,
+                &event_context,
                 "initiative.guidance_set",
                 format!("CEO guidance set for initiative {initiative_id}."),
                 &BlimsEventPayload::InitiativeGuidanceSet {
@@ -2093,7 +2353,10 @@ fn set_initiative_guidance(
     })
 }
 
-fn set_guidance(request: &GuidanceSetRequest) -> Result<GuidanceSummary, BlimsStateError> {
+fn set_guidance(
+    request: &GuidanceSetRequest,
+    event_context: &EventContext,
+) -> Result<GuidanceSummary, BlimsStateError> {
     let guidance = request.guidance.trim().to_string();
     if guidance.is_empty() {
         return Err(BlimsStateError::InvalidRequest(
@@ -2108,10 +2371,12 @@ fn set_guidance(request: &GuidanceSetRequest) -> Result<GuidanceSummary, BlimsSt
         strength,
         active: true,
     };
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             append_event(
                 database,
+                &event_context,
                 "guidance.set",
                 "CEO guidance set.".to_string(),
                 &BlimsEventPayload::GuidanceSet {
@@ -2327,8 +2592,10 @@ fn inspect_artifact(request: &ArtifactInspectRequest) -> Result<ArtifactDetail, 
 
 fn register_proposal(
     request: &ProposalRegisterRequest,
+    event_context: &EventContext,
 ) -> Result<WorkProposalSummary, BlimsStateError> {
     let request = request.clone();
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let task = load_task(database, &request.task_id).await?;
@@ -2348,6 +2615,7 @@ fn register_proposal(
             };
             append_event(
                 database,
+                &event_context,
                 "proposal.registered",
                 format!("Work proposal registered: {}", proposal.id),
                 &BlimsEventPayload::ProposalRegistered {
@@ -2385,15 +2653,18 @@ fn inspect_proposal(request: &ProposalRequest) -> Result<WorkProposalSummary, Bl
 
 fn set_proposal_status(
     request: &ProposalRequest,
+    event_context: &EventContext,
     status: &str,
 ) -> Result<WorkProposalSummary, BlimsStateError> {
     let proposal_id = request.proposal_id.clone();
     let status = status.to_string();
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let proposal = load_proposal(database, &proposal_id).await?;
             append_event(
                 database,
+                &event_context,
                 "proposal.status_set",
                 format!("Proposal {proposal_id} status set to {status}."),
                 &BlimsEventPayload::ProposalStatusSet {
@@ -2409,8 +2680,10 @@ fn set_proposal_status(
 
 fn record_proposal_patch(
     request: &ProposalRecordPatchRequest,
+    event_context: &EventContext,
 ) -> Result<ArtifactDetail, BlimsStateError> {
     let request = request.clone();
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let proposal = load_proposal(database, &request.proposal_id).await?;
@@ -2433,6 +2706,7 @@ fn record_proposal_patch(
             };
             append_event(
                 database,
+                &event_context,
                 "artifact.created",
                 format!("Artifact created: {}", artifact.title),
                 &BlimsEventPayload::ArtifactCreated {
@@ -2568,10 +2842,12 @@ fn build_initiative_plan_prompt(
 
 fn import_initiative_plan(
     request: &InitiativeImportPlanRequest,
+    event_context: &EventContext,
 ) -> Result<AiInitiativePlan, BlimsStateError> {
     let initiative_id = request.initiative_id.clone();
     let plan = request.plan.clone();
     let plan_for_response = plan.clone();
+    let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let payload_json = serde_json::to_string(&plan)?;
@@ -2609,6 +2885,7 @@ fn import_initiative_plan(
             }
             append_event(
                 database,
+                &event_context,
                 "artifact.created",
                 format!("Artifact created: {}", artifact.title),
                 &BlimsEventPayload::ArtifactCreated { artifact },
@@ -2617,6 +2894,7 @@ fn import_initiative_plan(
             for task in &task_summaries {
                 append_event(
                     database,
+                    &event_context,
                     "task.created",
                     format!("Task created: {}", task.title),
                     &BlimsEventPayload::TaskCreated { task: task.clone() },
@@ -2625,6 +2903,7 @@ fn import_initiative_plan(
             }
             append_event(
                 database,
+                &event_context,
                 "initiative.plan_imported",
                 format!("AI plan imported for initiative {initiative_id}."),
                 &BlimsEventPayload::InitiativePlanImported {
@@ -3439,6 +3718,8 @@ mod tests {
             operation: OP_COMPANY_STATUS.to_string(),
             payload: WorkspaceRequest {
                 working_directory: PathBuf::from("/tmp/blims-repo"),
+                correlation_id: None,
+                causation_id: None,
             },
         };
 
