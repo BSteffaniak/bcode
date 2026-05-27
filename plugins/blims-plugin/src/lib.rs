@@ -118,6 +118,9 @@ pub const OP_WORLD_SNAPSHOT: &str = "world.snapshot";
 /// Morning report operation.
 pub const OP_REPORT_MORNING: &str = "report.morning";
 
+/// Event list operation.
+pub const OP_EVENT_LIST: &str = "event.list";
+
 /// Blims protocol version for daemon/UI IPC payloads.
 pub const BLIMS_PROTOCOL_VERSION: u16 = 1;
 
@@ -173,6 +176,7 @@ impl RustPlugin for BlimsPlugin {
             OP_AGENT_TALK_PROMPT => service_agent_talk_prompt(&context.request),
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
+            OP_EVENT_LIST => service_event_list(&context.request),
             _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
         }
     }
@@ -253,6 +257,16 @@ pub struct InitiativePlanPromptRequest {
     pub working_directory: PathBuf,
     /// Initiative id to plan.
     pub initiative_id: String,
+}
+
+/// Request to list persisted Blims events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventListRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Maximum number of events to return.
+    #[serde(default = "default_event_limit")]
+    pub limit: u64,
 }
 
 /// Request to build an AI talk prompt for an agent.
@@ -466,6 +480,27 @@ pub struct ArtifactSummary {
     pub title: String,
 }
 
+/// Persisted Blims event summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlimsEventSummary {
+    /// Monotonic database event id.
+    pub id: i64,
+    /// Event schema version.
+    pub event_version: i64,
+    /// Company id.
+    pub company_id: String,
+    /// Event kind.
+    pub kind: String,
+    /// Human-readable event summary.
+    pub summary: String,
+    /// Typed event payload JSON.
+    pub payload_json: String,
+    /// Correlation id linking related events.
+    pub correlation_id: String,
+    /// Causation id pointing at the triggering event/command.
+    pub causation_id: String,
+}
+
 /// Persisted artifact detail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDetail {
@@ -632,6 +667,46 @@ fn default_guidance_strength() -> String {
 
 const fn default_task_priority() -> i64 {
     100
+}
+
+const fn default_event_limit() -> u64 {
+    100
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BlimsEventPayload {
+    CompanyLifecycleSet {
+        lifecycle_status: String,
+    },
+    InitiativeCreated {
+        initiative: InitiativeSummary,
+    },
+    InitiativeStatusSet {
+        initiative_id: String,
+        status: String,
+    },
+    GuidanceSet {
+        guidance: GuidanceSummary,
+    },
+    InitiativeGuidanceSet {
+        initiative_id: String,
+        guidance: GuidanceSummary,
+    },
+    ProposalRegistered {
+        proposal: WorkProposalSummary,
+    },
+    ProposalStatusSet {
+        proposal_id: String,
+        status: String,
+    },
+    ArtifactCreated {
+        artifact: ArtifactDetail,
+    },
+    InitiativePlanImported {
+        initiative_id: String,
+        task_count: usize,
+    },
 }
 
 /// Errors returned by Blims state initialization.
@@ -1024,6 +1099,17 @@ fn service_morning_report(request: &ServiceRequest) -> ServiceResponse {
     )
 }
 
+fn service_event_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<EventListRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_events(&request) {
+        Ok(events) => json_response(&events),
+        Err(error) => ServiceResponse::error("event_list_failed", error.to_string()),
+    }
+}
+
 fn company_status(working_directory: &Path) -> CompanyStatus {
     let paths = state_paths(working_directory);
     let lifecycle_status = paths.database_path.exists().then(|| {
@@ -1108,17 +1194,15 @@ fn set_company_lifecycle(
                 .filter(Box::new(where_eq("id", "default")))
                 .execute(database)
                 .await?;
-            database
-                .insert("events")
-                .value("company_id", "default")
-                .value("kind", format!("company_{lifecycle_status}"))
-                .value(
-                    "summary",
-                    format!("Blims company lifecycle set to {lifecycle_status}."),
-                )
-                .value("payload_json", "{}")
-                .execute(database)
-                .await?;
+            append_event(
+                database,
+                "company.lifecycle_set",
+                format!("Blims company lifecycle set to {lifecycle_status}."),
+                &BlimsEventPayload::CompanyLifecycleSet {
+                    lifecycle_status: lifecycle_status.clone(),
+                },
+            )
+            .await?;
             Ok::<(), BlimsStateError>(())
         })
     })?;
@@ -1166,6 +1250,9 @@ async fn create_base_tables(
         .column(text_column("kind"))
         .column(text_column("summary"))
         .column(text_column("payload_json"))
+        .column(text_column("correlation_id"))
+        .column(text_column("causation_id"))
+        .column(int_column("event_version"))
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
@@ -1376,17 +1463,23 @@ async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database:
              WHERE NOT EXISTS (SELECT 1 FROM companies WHERE id = 'default')",
         )
         .await?;
-    database
-        .exec_raw(
-            "INSERT INTO events (company_id, kind, summary, payload_json) \
-             SELECT 'default', 'company_created', 'Blims company state initialized.', '{}' \
-             WHERE NOT EXISTS (SELECT 1 FROM events WHERE kind = 'company_created')",
-        )
-        .await?;
+    seed_company_created_event(database).await?;
     seed_departments(database).await?;
     seed_teams(database).await?;
     seed_world(database).await?;
     seed_agents(database).await
+}
+
+async fn seed_company_created_event(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    database
+        .exec_raw(
+            "INSERT INTO events (company_id, kind, summary, payload_json, correlation_id, causation_id, event_version) \
+             SELECT 'default', 'company.created', 'Blims company state initialized.', '{}', 'bootstrap', 'bootstrap', 1 \
+             WHERE NOT EXISTS (SELECT 1 FROM events WHERE kind = 'company.created')",
+        )
+        .await
 }
 
 async fn seed_departments(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
@@ -1634,6 +1727,27 @@ where
     .map_err(panic_to_blims_error)?
 }
 
+async fn append_event(
+    database: &dyn Database,
+    kind: &str,
+    summary: String,
+    payload: &BlimsEventPayload,
+) -> Result<(), BlimsStateError> {
+    let payload_json = serde_json::to_string(payload)?;
+    database
+        .insert("events")
+        .value("company_id", "default")
+        .value("kind", kind)
+        .value("summary", summary)
+        .value("payload_json", payload_json)
+        .value("correlation_id", "local-command")
+        .value("causation_id", "local-command")
+        .value("event_version", 1_i64)
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
 fn load_company_data(working_directory: &Path) -> Result<CompanyData, BlimsStateError> {
     with_database(working_directory, |database| {
         Box::pin(load_company_data_from_database(database))
@@ -1673,6 +1787,15 @@ fn create_initiative(
                 .value("guidance", "")
                 .execute(database)
                 .await?;
+            append_event(
+                database,
+                "initiative.created",
+                format!("Initiative created: {title}"),
+                &BlimsEventPayload::InitiativeCreated {
+                    initiative: initiative.clone(),
+                },
+            )
+            .await?;
             Ok::<_, BlimsStateError>(initiative)
         })
     })
@@ -1715,9 +1838,19 @@ fn set_initiative_status(
             database
                 .update("initiatives")
                 .value("status", status.clone())
-                .filter(Box::new(where_eq("id", initiative_id)))
+                .filter(Box::new(where_eq("id", initiative_id.clone())))
                 .execute(database)
                 .await?;
+            append_event(
+                database,
+                "initiative.status_set",
+                format!("Initiative {initiative_id} status set to {status}."),
+                &BlimsEventPayload::InitiativeStatusSet {
+                    initiative_id,
+                    status: status.clone(),
+                },
+            )
+            .await?;
             Ok(InitiativeSummary {
                 status,
                 ..initiative
@@ -1765,10 +1898,20 @@ fn set_initiative_guidance(
                 .await?;
             database
                 .update("initiatives")
-                .value("guidance", guidance)
-                .filter(Box::new(where_eq("id", initiative_id)))
+                .value("guidance", guidance.clone())
+                .filter(Box::new(where_eq("id", initiative_id.clone())))
                 .execute(database)
                 .await?;
+            append_event(
+                database,
+                "initiative.guidance_set",
+                format!("CEO guidance set for initiative {initiative_id}."),
+                &BlimsEventPayload::InitiativeGuidanceSet {
+                    initiative_id,
+                    guidance: summary.clone(),
+                },
+            )
+            .await?;
             Ok::<_, BlimsStateError>(summary)
         })
     })
@@ -1800,6 +1943,15 @@ fn set_guidance(request: &GuidanceSetRequest) -> Result<GuidanceSummary, BlimsSt
                 .value("active", true)
                 .execute(database)
                 .await?;
+            append_event(
+                database,
+                "guidance.set",
+                "CEO guidance set.".to_string(),
+                &BlimsEventPayload::GuidanceSet {
+                    guidance: summary.clone(),
+                },
+            )
+            .await?;
             Ok::<_, BlimsStateError>(summary)
         })
     })
@@ -1816,6 +1968,33 @@ fn list_guidance(working_directory: &Path) -> Result<Vec<GuidanceSummary>, Blims
                 .await?
                 .iter()
                 .map(guidance_summary)
+                .collect()
+        })
+    })
+}
+
+fn list_events(request: &EventListRequest) -> Result<Vec<BlimsEventSummary>, BlimsStateError> {
+    let limit = usize::try_from(request.limit.min(500)).unwrap_or(500);
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .select("events")
+                .columns(&[
+                    "id",
+                    "event_version",
+                    "company_id",
+                    "kind",
+                    "summary",
+                    "payload_json",
+                    "correlation_id",
+                    "causation_id",
+                ])
+                .sort("id", SortDirection::Desc)
+                .limit(limit)
+                .execute(database)
+                .await?
+                .iter()
+                .map(event_summary)
                 .collect()
         })
     })
@@ -1966,7 +2145,7 @@ fn register_proposal(
                 .value("validation_notes", "not yet reported")
                 .execute(database)
                 .await?;
-            Ok(WorkProposalSummary {
+            let proposal = WorkProposalSummary {
                 id,
                 task_id: task.id,
                 initiative_id: task.initiative_id,
@@ -1977,7 +2156,17 @@ fn register_proposal(
                 status: "draft".to_string(),
                 summary,
                 validation_notes: "not yet reported".to_string(),
-            })
+            };
+            append_event(
+                database,
+                "proposal.registered",
+                format!("Work proposal registered: {}", proposal.id),
+                &BlimsEventPayload::ProposalRegistered {
+                    proposal: proposal.clone(),
+                },
+            )
+            .await?;
+            Ok(proposal)
         })
     })
 }
@@ -2017,9 +2206,19 @@ fn set_proposal_status(
             database
                 .update("work_proposals")
                 .value("status", status.clone())
-                .filter(Box::new(where_eq("id", proposal_id)))
+                .filter(Box::new(where_eq("id", proposal_id.clone())))
                 .execute(database)
                 .await?;
+            append_event(
+                database,
+                "proposal.status_set",
+                format!("Proposal {proposal_id} status set to {status}."),
+                &BlimsEventPayload::ProposalStatusSet {
+                    proposal_id,
+                    status: status.clone(),
+                },
+            )
+            .await?;
             Ok(WorkProposalSummary { status, ..proposal })
         })
     })
@@ -2051,13 +2250,23 @@ fn record_proposal_patch(
                 .value("payload_json", payload_json.clone())
                 .execute(database)
                 .await?;
-            Ok(ArtifactDetail {
+            let artifact = ArtifactDetail {
                 id,
                 initiative_id: proposal.initiative_id,
                 kind: "proposal_patch".to_string(),
                 title: format!("Patch for {}", proposal.id),
                 payload_json,
-            })
+            };
+            append_event(
+                database,
+                "artifact.created",
+                format!("Artifact created: {}", artifact.title),
+                &BlimsEventPayload::ArtifactCreated {
+                    artifact: artifact.clone(),
+                },
+            )
+            .await?;
+            Ok(artifact)
         })
     })
 }
@@ -2192,9 +2401,17 @@ fn import_initiative_plan(
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let payload_json = serde_json::to_string(&plan)?;
+            let artifact_id = format!("plan-{initiative_id}");
+            let artifact = ArtifactDetail {
+                id: artifact_id.clone(),
+                initiative_id: initiative_id.clone(),
+                kind: "ai_plan".to_string(),
+                title: "AI-generated initiative plan".to_string(),
+                payload_json: payload_json.clone(),
+            };
             database
                 .insert("artifacts")
-                .value("id", format!("plan-{initiative_id}"))
+                .value("id", artifact_id)
                 .value("initiative_id", initiative_id.clone())
                 .value("kind", "ai_plan")
                 .value("title", "AI-generated initiative plan")
@@ -2219,6 +2436,23 @@ fn import_initiative_plan(
                     .execute(database)
                     .await?;
             }
+            append_event(
+                database,
+                "artifact.created",
+                format!("Artifact created: {}", artifact.title),
+                &BlimsEventPayload::ArtifactCreated { artifact },
+            )
+            .await?;
+            append_event(
+                database,
+                "initiative.plan_imported",
+                format!("AI plan imported for initiative {initiative_id}."),
+                &BlimsEventPayload::InitiativePlanImported {
+                    initiative_id,
+                    task_count: plan.tasks.len(),
+                },
+            )
+            .await?;
             Ok::<_, BlimsStateError>(plan_for_response)
         })
     })
@@ -2479,6 +2713,19 @@ fn guidance_summary(row: &Row) -> Result<GuidanceSummary, BlimsStateError> {
     })
 }
 
+fn event_summary(row: &Row) -> Result<BlimsEventSummary, BlimsStateError> {
+    Ok(BlimsEventSummary {
+        id: required_i64(row, "id")?,
+        event_version: required_i64(row, "event_version")?,
+        company_id: required_text(row, "company_id")?,
+        kind: required_text(row, "kind")?,
+        summary: required_text(row, "summary")?,
+        payload_json: required_text(row, "payload_json")?,
+        correlation_id: required_text(row, "correlation_id")?,
+        causation_id: required_text(row, "causation_id")?,
+    })
+}
+
 fn task_summary(row: &Row) -> Result<TaskSummary, BlimsStateError> {
     Ok(TaskSummary {
         id: required_text(row, "id")?,
@@ -2671,6 +2918,17 @@ mod tests {
             bmux_codec::from_bytes(&bytes).expect("protocol request should decode");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn typed_event_payload_serializes_with_versionable_shape() {
+        let payload = BlimsEventPayload::CompanyLifecycleSet {
+            lifecycle_status: "paused".to_string(),
+        };
+        let json = serde_json::to_string(&payload).expect("event payload should encode");
+
+        assert!(json.contains("company_lifecycle_set"));
+        assert!(json.contains("paused"));
     }
 
     fn tempfile_path(name: &str) -> PathBuf {
