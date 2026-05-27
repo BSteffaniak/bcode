@@ -1845,47 +1845,58 @@ async fn seed_company_created_event(
         .await
 }
 
+async fn append_bootstrap_event_once(
+    database: &dyn Database,
+    kind: &str,
+    summary: &str,
+    payload: &BlimsEventPayload,
+) -> Result<(), switchy_database::DatabaseError> {
+    let payload_json = serde_json::to_string(payload).expect("bootstrap event should encode");
+    database
+        .insert("events")
+        .value("company_id", "default")
+        .value("kind", kind)
+        .value("summary", summary)
+        .value("payload_json", payload_json)
+        .value("correlation_id", "bootstrap")
+        .value("causation_id", "bootstrap")
+        .value("event_version", 1_i64)
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
 async fn seed_starter_org_events(
     database: &dyn Database,
 ) -> Result<(), switchy_database::DatabaseError> {
     for (id, name, purpose) in starter_departments() {
-        let payload_json = serde_json::to_string(&BlimsEventPayload::DepartmentCreated {
+        let payload = BlimsEventPayload::DepartmentCreated {
             id: id.to_string(),
             name: name.to_string(),
             purpose: purpose.to_string(),
-        })
-        .expect("starter department event should encode");
-        database
-            .insert("events")
-            .value("company_id", "default")
-            .value("kind", "department.created")
-            .value("summary", format!("Starter department created: {name}"))
-            .value("payload_json", payload_json)
-            .value("correlation_id", "bootstrap")
-            .value("causation_id", "bootstrap")
-            .value("event_version", 1_i64)
-            .execute(database)
-            .await?;
+        };
+        append_bootstrap_event_once(
+            database,
+            "department.created",
+            &format!("Starter department created: {name}"),
+            &payload,
+        )
+        .await?;
     }
     for (id, department_id, name, purpose) in starter_teams() {
-        let payload_json = serde_json::to_string(&BlimsEventPayload::TeamCreated {
+        let payload = BlimsEventPayload::TeamCreated {
             id: id.to_string(),
             department_id: department_id.to_string(),
             name: name.to_string(),
             purpose: purpose.to_string(),
-        })
-        .expect("starter team event should encode");
-        database
-            .insert("events")
-            .value("company_id", "default")
-            .value("kind", "team.created")
-            .value("summary", format!("Starter team created: {name}"))
-            .value("payload_json", payload_json)
-            .value("correlation_id", "bootstrap")
-            .value("causation_id", "bootstrap")
-            .value("event_version", 1_i64)
-            .execute(database)
-            .await?;
+        };
+        append_bootstrap_event_once(
+            database,
+            "team.created",
+            &format!("Starter team created: {name}"),
+            &payload,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1894,37 +1905,26 @@ async fn seed_starter_world_events(
     database: &dyn Database,
 ) -> Result<(), switchy_database::DatabaseError> {
     for room in fallback_world_snapshot().rooms {
-        let payload_json =
-            serde_json::to_string(&BlimsEventPayload::WorldRoomCreated { room: room.clone() })
-                .expect("starter room event should encode");
-        database
-            .insert("events")
-            .value("company_id", "default")
-            .value("kind", "world.room_created")
-            .value("summary", format!("Starter room created: {}", room.name))
-            .value("payload_json", payload_json)
-            .value("correlation_id", "bootstrap")
-            .value("causation_id", "bootstrap")
-            .value("event_version", 1_i64)
-            .execute(database)
-            .await?;
+        let payload = BlimsEventPayload::WorldRoomCreated { room: room.clone() };
+        append_bootstrap_event_once(
+            database,
+            "world.room_created",
+            &format!("Starter room created: {}", room.name),
+            &payload,
+        )
+        .await?;
     }
     for agent in fallback_world_snapshot().agents {
-        let payload_json = serde_json::to_string(&BlimsEventPayload::AgentHired {
+        let payload = BlimsEventPayload::AgentHired {
             agent: agent.clone(),
-        })
-        .expect("starter agent event should encode");
-        database
-            .insert("events")
-            .value("company_id", "default")
-            .value("kind", "agent.hired")
-            .value("summary", format!("Starter agent hired: {}", agent.name))
-            .value("payload_json", payload_json)
-            .value("correlation_id", "bootstrap")
-            .value("causation_id", "bootstrap")
-            .value("event_version", 1_i64)
-            .execute(database)
-            .await?;
+        };
+        append_bootstrap_event_once(
+            database,
+            "agent.hired",
+            &format!("Starter agent hired: {}", agent.name),
+            &payload,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3509,6 +3509,11 @@ async fn replace_one_initiative_projection(
     initiative: &InitiativeSummary,
 ) -> Result<(), BlimsStateError> {
     database
+        .delete("initiatives")
+        .filter(Box::new(where_eq("id", initiative.id.clone())))
+        .execute(database)
+        .await?;
+    database
         .insert("initiatives")
         .value("id", initiative.id.clone())
         .value("company_id", "default")
@@ -3527,7 +3532,7 @@ async fn replace_initiative_projections(
     database: &dyn Database,
     initiatives: &[InitiativeSummary],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM initiatives").await?;
+    database.delete("initiatives").execute(database).await?;
     for initiative in initiatives {
         replace_one_initiative_projection(database, initiative).await?;
     }
@@ -3538,6 +3543,11 @@ async fn replace_one_guidance_projection(
     database: &dyn Database,
     item: &GuidanceSummary,
 ) -> Result<(), BlimsStateError> {
+    database
+        .delete("executive_guidance")
+        .filter(Box::new(where_eq("id", item.id.clone())))
+        .execute(database)
+        .await?;
     database
         .insert("executive_guidance")
         .value("id", item.id.clone())
@@ -3554,7 +3564,10 @@ async fn replace_guidance_projections(
     database: &dyn Database,
     guidance: &[GuidanceSummary],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM executive_guidance").await?;
+    database
+        .delete("executive_guidance")
+        .execute(database)
+        .await?;
     for item in guidance {
         replace_one_guidance_projection(database, item).await?;
     }
@@ -3565,6 +3578,11 @@ async fn replace_one_artifact_projection(
     database: &dyn Database,
     artifact: &ArtifactDetail,
 ) -> Result<(), BlimsStateError> {
+    database
+        .delete("artifacts")
+        .filter(Box::new(where_eq("id", artifact.id.clone())))
+        .execute(database)
+        .await?;
     database
         .insert("artifacts")
         .value("id", artifact.id.clone())
@@ -3581,7 +3599,7 @@ async fn replace_artifact_projections(
     database: &dyn Database,
     artifacts: &[ArtifactDetail],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM artifacts").await?;
+    database.delete("artifacts").execute(database).await?;
     for artifact in artifacts {
         replace_one_artifact_projection(database, artifact).await?;
     }
@@ -3592,6 +3610,11 @@ async fn replace_one_proposal_projection(
     database: &dyn Database,
     proposal: &WorkProposalSummary,
 ) -> Result<(), BlimsStateError> {
+    database
+        .delete("work_proposals")
+        .filter(Box::new(where_eq("id", proposal.id.clone())))
+        .execute(database)
+        .await?;
     database
         .insert("work_proposals")
         .value("id", proposal.id.clone())
@@ -3613,7 +3636,7 @@ async fn replace_proposal_projections(
     database: &dyn Database,
     proposals: &[WorkProposalSummary],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM work_proposals").await?;
+    database.delete("work_proposals").execute(database).await?;
     for proposal in proposals {
         replace_one_proposal_projection(database, proposal).await?;
     }
@@ -3624,6 +3647,11 @@ async fn replace_one_task_projection(
     database: &dyn Database,
     task: &TaskSummary,
 ) -> Result<(), BlimsStateError> {
+    database
+        .delete("tasks")
+        .filter(Box::new(where_eq("id", task.id.clone())))
+        .execute(database)
+        .await?;
     database
         .insert("tasks")
         .value("id", task.id.clone())
@@ -3643,7 +3671,7 @@ async fn replace_task_projections(
     database: &dyn Database,
     tasks: &[TaskSummary],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM tasks").await?;
+    database.delete("tasks").execute(database).await?;
     for task in tasks {
         replace_one_task_projection(database, task).await?;
     }
@@ -3669,7 +3697,7 @@ async fn replace_department_projections(
     database: &dyn Database,
     departments: &[DepartmentRecord],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM departments").await?;
+    database.delete("departments").execute(database).await?;
     for department in departments {
         replace_one_department_projection(database, department).await?;
     }
@@ -3695,7 +3723,7 @@ async fn replace_team_projections(
     database: &dyn Database,
     teams: &[TeamRecord],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM teams").await?;
+    database.delete("teams").execute(database).await?;
     for team in teams {
         replace_one_team_projection(database, team).await?;
     }
@@ -3721,7 +3749,7 @@ async fn replace_world_room_projections(
     database: &dyn Database,
     rooms: &[RoomRecord],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM world_rooms").await?;
+    database.delete("world_rooms").execute(database).await?;
     for room in rooms {
         replace_one_world_room_projection(database, room).await?;
     }
@@ -3750,7 +3778,7 @@ async fn replace_agent_projections(
     database: &dyn Database,
     agents: &[AgentRecord],
 ) -> Result<(), BlimsStateError> {
-    database.exec_raw("DELETE FROM agents").await?;
+    database.delete("agents").execute(database).await?;
     for agent in agents {
         replace_one_agent_projection(database, agent).await?;
     }
