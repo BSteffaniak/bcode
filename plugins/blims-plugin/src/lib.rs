@@ -288,6 +288,10 @@ pub struct ProjectionRebuildReport {
     pub proposals_projected: usize,
     /// Number of projected tasks.
     pub tasks_projected: usize,
+    /// Number of projected agents.
+    pub agents_projected: usize,
+    /// Number of projected rooms.
+    pub rooms_projected: usize,
     /// Current projected company lifecycle status.
     pub lifecycle_status: String,
 }
@@ -649,11 +653,35 @@ impl AgentRecord {
     }
 }
 
+impl From<AgentSnapshot> for AgentRecord {
+    fn from(snapshot: AgentSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            name: snapshot.name,
+            role: snapshot.role,
+            department_id: String::new(),
+            team_id: String::new(),
+            status: snapshot.status,
+            room_id: snapshot.room_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoomRecord {
     id: String,
     name: String,
     purpose: String,
+}
+
+impl From<RoomSnapshot> for RoomRecord {
+    fn from(snapshot: RoomSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            name: snapshot.name,
+            purpose: snapshot.purpose,
+        }
+    }
 }
 
 /// Persisted initiative summary.
@@ -728,6 +756,20 @@ enum BlimsEventPayload {
     },
     TaskCreated {
         task: TaskSummary,
+    },
+    AgentHired {
+        agent: AgentSnapshot,
+    },
+    AgentMoved {
+        agent_id: String,
+        room_id: String,
+    },
+    AgentStatusSet {
+        agent_id: String,
+        status: String,
+    },
+    WorldRoomCreated {
+        room: RoomSnapshot,
     },
     InitiativePlanImported {
         initiative_id: String,
@@ -1511,6 +1553,7 @@ async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database:
         )
         .await?;
     seed_company_created_event(database).await?;
+    seed_starter_world_events(database).await?;
     seed_departments(database).await?;
     seed_teams(database).await?;
     seed_world(database).await?;
@@ -1527,6 +1570,45 @@ async fn seed_company_created_event(
              WHERE NOT EXISTS (SELECT 1 FROM events WHERE kind = 'company.created')",
         )
         .await
+}
+
+async fn seed_starter_world_events(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    for room in fallback_world_snapshot().rooms {
+        let payload_json =
+            serde_json::to_string(&BlimsEventPayload::WorldRoomCreated { room: room.clone() })
+                .expect("starter room event should encode");
+        database
+            .insert("events")
+            .value("company_id", "default")
+            .value("kind", "world.room_created")
+            .value("summary", format!("Starter room created: {}", room.name))
+            .value("payload_json", payload_json)
+            .value("correlation_id", "bootstrap")
+            .value("causation_id", "bootstrap")
+            .value("event_version", 1_i64)
+            .execute(database)
+            .await?;
+    }
+    for agent in fallback_world_snapshot().agents {
+        let payload_json = serde_json::to_string(&BlimsEventPayload::AgentHired {
+            agent: agent.clone(),
+        })
+        .expect("starter agent event should encode");
+        database
+            .insert("events")
+            .value("company_id", "default")
+            .value("kind", "agent.hired")
+            .value("summary", format!("Starter agent hired: {}", agent.name))
+            .value("payload_json", payload_json)
+            .value("correlation_id", "bootstrap")
+            .value("causation_id", "bootstrap")
+            .value("event_version", 1_i64)
+            .execute(database)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn seed_departments(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
@@ -2838,6 +2920,8 @@ struct ProjectionState {
     artifacts: Vec<ArtifactDetail>,
     proposals: Vec<WorkProposalSummary>,
     tasks: Vec<TaskSummary>,
+    rooms: Vec<RoomRecord>,
+    agents: Vec<AgentRecord>,
 }
 
 impl ProjectionState {
@@ -2849,6 +2933,8 @@ impl ProjectionState {
             artifacts_projected: self.artifacts.len(),
             proposals_projected: self.proposals.len(),
             tasks_projected: self.tasks.len(),
+            agents_projected: self.agents.len(),
+            rooms_projected: self.rooms.len(),
             lifecycle_status: self.lifecycle_status.clone(),
         }
     }
@@ -2925,6 +3011,22 @@ fn replay_event(
         BlimsEventPayload::TaskCreated { task } => {
             upsert_by_id(&mut state.tasks, task, |task| &task.id);
         }
+        BlimsEventPayload::AgentHired { agent } => {
+            upsert_by_id(&mut state.agents, agent.into(), |agent| &agent.id);
+        }
+        BlimsEventPayload::AgentMoved { agent_id, room_id } => {
+            if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                agent.room_id = room_id;
+            }
+        }
+        BlimsEventPayload::AgentStatusSet { agent_id, status } => {
+            if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                agent.status = status;
+            }
+        }
+        BlimsEventPayload::WorldRoomCreated { room } => {
+            upsert_by_id(&mut state.rooms, room.into(), |room| &room.id);
+        }
         BlimsEventPayload::InitiativePlanImported { .. } => {}
     }
     Ok(())
@@ -2953,7 +3055,9 @@ async fn apply_projection_state(
     replace_guidance_projections(database, &state.guidance).await?;
     replace_artifact_projections(database, &state.artifacts).await?;
     replace_proposal_projections(database, &state.proposals).await?;
-    replace_task_projections(database, &state.tasks).await
+    replace_task_projections(database, &state.tasks).await?;
+    replace_world_room_projections(database, &state.rooms).await?;
+    replace_agent_projections(database, &state.agents).await
 }
 
 async fn replace_initiative_projections(
@@ -3056,6 +3160,45 @@ async fn replace_task_projections(
             .value("assigned_agent_id", task.assigned_agent_id.clone())
             .value("rationale", task.rationale.clone())
             .value("priority", task.priority)
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_world_room_projections(
+    database: &dyn Database,
+    rooms: &[RoomRecord],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM world_rooms").await?;
+    for room in rooms {
+        database
+            .insert("world_rooms")
+            .value("id", room.id.clone())
+            .value("world_id", "default")
+            .value("name", room.name.clone())
+            .value("purpose", room.purpose.clone())
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_agent_projections(
+    database: &dyn Database,
+    agents: &[AgentRecord],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM agents").await?;
+    for agent in agents {
+        database
+            .insert("agents")
+            .value("id", agent.id.clone())
+            .value("name", agent.name.clone())
+            .value("role", agent.role.clone())
+            .value("department_id", agent.department_id.clone())
+            .value("team_id", agent.team_id.clone())
+            .value("status", agent.status.clone())
+            .value("room_id", agent.room_id.clone())
             .execute(database)
             .await?;
     }
@@ -3287,6 +3430,18 @@ mod tests {
             rationale: "Need a playable first loop".to_string(),
             priority: 5,
         };
+        let room = RoomSnapshot {
+            id: "whiteboard".to_string(),
+            name: "Whiteboard".to_string(),
+            purpose: "planning".to_string(),
+        };
+        let agent = AgentSnapshot {
+            id: "mira".to_string(),
+            name: "Mira".to_string(),
+            role: "Product Lead".to_string(),
+            status: "thinking".to_string(),
+            room_id: "whiteboard".to_string(),
+        };
         let events = vec![
             test_event(
                 1,
@@ -3309,6 +3464,28 @@ mod tests {
                 },
             ),
             test_event(4, "task.created", &BlimsEventPayload::TaskCreated { task }),
+            test_event(
+                5,
+                "world.room_created",
+                &BlimsEventPayload::WorldRoomCreated { room },
+            ),
+            test_event(6, "agent.hired", &BlimsEventPayload::AgentHired { agent }),
+            test_event(
+                7,
+                "agent.moved",
+                &BlimsEventPayload::AgentMoved {
+                    agent_id: "mira".to_string(),
+                    room_id: "ceo-nook".to_string(),
+                },
+            ),
+            test_event(
+                8,
+                "agent.status_set",
+                &BlimsEventPayload::AgentStatusSet {
+                    agent_id: "mira".to_string(),
+                    status: "reporting".to_string(),
+                },
+            ),
         ];
 
         let state = replay_events(&events).expect("events should replay");
@@ -3318,6 +3495,10 @@ mod tests {
         assert_eq!(state.initiatives[0].status, "paused");
         assert_eq!(state.tasks.len(), 1);
         assert_eq!(state.tasks[0].assigned_agent_id, "mira");
+        assert_eq!(state.rooms.len(), 1);
+        assert_eq!(state.agents.len(), 1);
+        assert_eq!(state.agents[0].room_id, "ceo-nook");
+        assert_eq!(state.agents[0].status, "reporting");
     }
 
     fn test_event(id: i64, kind: &str, payload: &BlimsEventPayload) -> BlimsEventSummary {
