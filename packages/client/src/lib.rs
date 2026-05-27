@@ -757,6 +757,25 @@ impl BcodeClient {
         }
     }
 
+    /// List active runtime work for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_runtime_work(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<bcode_ipc::RuntimeWorkSnapshot>, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection
+            .send_request(Request::ListRuntimeWork { session_id })
+            .await?
+        {
+            ResponsePayload::RuntimeWorkList { work } => Ok(work),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Compact the model-visible context for a session while preserving append-only history.
     ///
     /// # Errors

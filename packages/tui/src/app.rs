@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 
 use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
 use bcode_session_models::{
-    ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
-    SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionTraceEvent,
-    SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream,
+    ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
+    SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -26,6 +26,7 @@ use super::input_history::{InputHistory, InputHistoryOutcome};
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
+use super::runtime_work_view::RuntimeWorkViewState;
 use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
@@ -59,7 +60,7 @@ pub struct BmuxApp {
     transcript: Vec<TranscriptItem>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
-    active_runtime_work: BTreeMap<RuntimeWorkId, RuntimeWorkStatus>,
+    runtime_work: RuntimeWorkViewState,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
@@ -116,7 +117,7 @@ impl BmuxApp {
             transcript: Vec::new(),
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
-            active_runtime_work: BTreeMap::new(),
+            runtime_work: RuntimeWorkViewState::default(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
@@ -823,26 +824,9 @@ impl BmuxApp {
                 self.current_agent_id.clone_from(agent_id);
             }
             SessionEventKind::TraceEvent { trace } => self.apply_trace_event(trace),
-            SessionEventKind::RuntimeWorkStarted { work_id, .. } => {
-                self.active_runtime_work
-                    .insert(work_id.clone(), RuntimeWorkStatus::Running);
-                self.set_activity(ActivityState::Thinking);
-            }
-            SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
-                self.active_runtime_work
-                    .insert(work_id.clone(), RuntimeWorkStatus::Cancelling);
-                self.set_cancelling();
-            }
-            SessionEventKind::RuntimeWorkFinished {
-                work_id, status, ..
-            } => {
-                self.active_runtime_work.remove(work_id);
-                if self.active_runtime_work.is_empty() {
-                    self.set_activity(ActivityState::Idle);
-                } else if *status == RuntimeWorkStatus::Cancelled {
-                    self.set_cancelling();
-                }
-            }
+            SessionEventKind::RuntimeWorkStarted { .. }
+            | SessionEventKind::RuntimeWorkCancelRequested { .. }
+            | SessionEventKind::RuntimeWorkFinished { .. } => self.apply_runtime_work_event(event),
             _ => {}
         }
     }
@@ -1348,6 +1332,17 @@ impl BmuxApp {
             last.streaming = false;
         }
         self.set_activity(ActivityState::Idle);
+    }
+
+    fn apply_runtime_work_event(&mut self, event: &SessionEvent) {
+        self.runtime_work.apply_event(event);
+        if self.runtime_work.is_cancelling() {
+            self.set_cancelling();
+        } else if self.runtime_work.is_busy() {
+            self.set_activity(ActivityState::Thinking);
+        } else {
+            self.set_activity(ActivityState::Idle);
+        }
     }
 
     fn push_compaction(&mut self, summary: &str) {

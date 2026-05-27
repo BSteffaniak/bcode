@@ -1293,6 +1293,9 @@ async fn handle_request(
             handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
                 .await
         }
+        Request::ListRuntimeWork { session_id } => {
+            handle_list_runtime_work(request_id, state, writer, session_id).await
+        }
         Request::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
         }
@@ -2987,6 +2990,21 @@ async fn handle_cancel_runtime_work(
         writer,
         request_id,
         Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+    )
+    .await
+}
+
+async fn handle_list_runtime_work(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let work = state.runtime_work.active_for_session(session_id).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::RuntimeWorkList { work }),
     )
     .await
 }

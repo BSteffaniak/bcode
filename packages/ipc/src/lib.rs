@@ -6,8 +6,8 @@
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_session_models::{
-    ClientId, RuntimeWorkId, SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionInputHistoryEntry, SessionSummary,
+    ClientId, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionHistoryPage,
+    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -240,6 +240,9 @@ pub enum Request {
         #[serde(default)]
         sources: Option<Vec<String>>,
     },
+    ListRuntimeWork {
+        session_id: SessionId,
+    },
     SubscribeCatalogUpdates,
 }
 
@@ -398,6 +401,17 @@ pub struct SessionImportWarning {
     pub count: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWorkSnapshot {
+    pub work_id: RuntimeWorkId,
+    pub kind: RuntimeWorkKind,
+    pub label: String,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    pub status: RuntimeWorkStatus,
+    pub cancellable: bool,
+}
+
 /// Successful response payload variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -521,6 +535,9 @@ pub enum ResponsePayload {
         catalog_revision: u64,
     },
     CatalogUpdatesSubscribed,
+    RuntimeWorkList {
+        work: Vec<RuntimeWorkSnapshot>,
+    },
 }
 
 /// Structured error response.

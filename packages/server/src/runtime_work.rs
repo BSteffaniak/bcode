@@ -1,5 +1,6 @@
+use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_plugin::PluginInvocationCancelHandle;
-use bcode_session_models::{RuntimeWorkId, RuntimeWorkKind, SessionId};
+use bcode_session_models::{RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -135,5 +136,27 @@ impl RuntimeWorkManager {
             .lock()
             .await
             .remove(&(session_id, work_id.clone()));
+    }
+
+    /// Return active work snapshots for a session.
+    pub async fn active_for_session(&self, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {
+        self.active
+            .lock()
+            .await
+            .iter()
+            .filter(|((active_session_id, _), _)| *active_session_id == session_id)
+            .map(|((_, work_id), work)| RuntimeWorkSnapshot {
+                work_id: work_id.clone(),
+                kind: work.spec.kind,
+                label: work.spec.label.clone(),
+                tool_call_id: work.spec.tool_call_id.clone(),
+                status: if work.cancelled {
+                    RuntimeWorkStatus::Cancelling
+                } else {
+                    RuntimeWorkStatus::Running
+                },
+                cancellable: work.spec.cancellation.is_cancellable(),
+            })
+            .collect()
     }
 }
