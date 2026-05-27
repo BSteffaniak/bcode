@@ -20,6 +20,18 @@ pub enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    Pause {
+        #[arg(long)]
+        json: bool,
+    },
+    Resume {
+        #[arg(long)]
+        json: bool,
+    },
+    Shutdown {
+        #[arg(long)]
+        json: bool,
+    },
     Agents {
         #[arg(long)]
         json: bool,
@@ -74,6 +86,24 @@ pub enum BlimsInitiativeCommand {
         json: bool,
     },
     Inspect {
+        initiative_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    SetGuidance {
+        initiative_id: String,
+        guidance: String,
+        #[arg(long, default_value = "strong")]
+        strength: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Pause {
+        initiative_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Resume {
         initiative_id: String,
         #[arg(long)]
         json: bool,
@@ -200,6 +230,14 @@ struct BlimsGuidanceSetRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BlimsInitiativeGuidanceRequest {
+    working_directory: PathBuf,
+    initiative_id: String,
+    guidance: String,
+    strength: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BlimsInitiativePlanPromptRequest {
     working_directory: PathBuf,
     initiative_id: String,
@@ -219,6 +257,7 @@ struct BlimsCompanyStatus {
     daemon_connected: bool,
     state_root: PathBuf,
     database_path: PathBuf,
+    lifecycle_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -342,6 +381,7 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
                 println!("Blims: {}", status.state);
                 println!("{}", status.message);
                 println!("daemon connected: {}", status.daemon_connected);
+                println!("lifecycle: {}", status.lifecycle_status);
                 println!("state root: {}", status.state_root.display());
                 println!("database: {}", status.database_path.display());
             }
@@ -356,6 +396,16 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
                 println!("state root: {}", status.state_root.display());
                 println!("database: {}", status.database_path.display());
             }
+        }
+        BlimsCommand::Pause { json } => {
+            print_company_lifecycle_update("company.pause", "Blims company paused", json).await?;
+        }
+        BlimsCommand::Resume { json } => {
+            print_company_lifecycle_update("company.resume", "Blims company resumed", json).await?;
+        }
+        BlimsCommand::Shutdown { json } => {
+            print_company_lifecycle_update("company.shutdown", "Blims company shut down", json)
+                .await?;
         }
         BlimsCommand::Agents { json } => {
             let response = call_blims_service("agent.list", blims_workspace_payload()?).await?;
@@ -895,6 +945,23 @@ fn room_index(world: &BlimsWorldSnapshot, current_room_id: &str) -> usize {
         .unwrap_or_default()
 }
 
+async fn print_company_lifecycle_update(
+    operation: &str,
+    message: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let response = call_blims_service(operation, blims_workspace_payload()?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
+        println!("{message}");
+        println!("lifecycle: {}", status.lifecycle_status);
+        println!("state root: {}", status.state_root.display());
+    }
+    Ok(())
+}
+
 async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliError> {
     match command {
         BlimsTaskCommand::List { json } => {
@@ -1254,52 +1321,29 @@ async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Res
             description,
             priority,
             json,
-        } => {
-            let request = BlimsInitiativeCreateRequest {
-                working_directory: std::env::current_dir()?,
-                title,
-                description,
-                priority,
-            };
-            let response =
-                call_blims_service("initiative.create", serde_json::to_vec(&request)?).await?;
-            if json {
-                print_blims_service_response(response);
-            } else {
-                let initiative = decode_blims_response::<BlimsInitiativeSummary>(response)?;
-                println!(
-                    "initiative created: {} ({})",
-                    initiative.title, initiative.id
-                );
-            }
-        }
-        BlimsInitiativeCommand::List { json } => {
-            let response =
-                call_blims_service("initiative.list", blims_workspace_payload()?).await?;
-            if json {
-                print_blims_service_response(response);
-            } else {
-                let initiatives = decode_blims_response::<Vec<BlimsInitiativeSummary>>(response)?;
-                print_initiative_list(&initiatives);
-            }
-        }
+        } => create_blims_initiative(title, description, priority, json).await?,
+        BlimsInitiativeCommand::List { json } => list_blims_initiatives(json).await?,
         BlimsInitiativeCommand::Inspect {
             initiative_id,
             json,
+        } => inspect_blims_initiative(&initiative_id, json).await?,
+        BlimsInitiativeCommand::SetGuidance {
+            initiative_id,
+            guidance,
+            strength,
+            json,
+        } => set_blims_initiative_guidance(initiative_id, guidance, strength, json).await?,
+        BlimsInitiativeCommand::Pause {
+            initiative_id,
+            json,
         } => {
-            let request = serde_json::json!({
-                "working_directory": std::env::current_dir()?,
-                "initiative_id": initiative_id,
-            });
-            let response =
-                call_blims_service("initiative.inspect", serde_json::to_vec(&request)?).await?;
-            if json {
-                print_blims_service_response(response);
-            } else {
-                print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(
-                    response,
-                )?);
-            }
+            print_initiative_status_update("initiative.pause", &initiative_id, json).await?;
+        }
+        BlimsInitiativeCommand::Resume {
+            initiative_id,
+            json,
+        } => {
+            print_initiative_status_update("initiative.resume", &initiative_id, json).await?;
         }
         BlimsInitiativeCommand::PlanPrompt { initiative_id } => {
             let prompt = blims_initiative_plan_prompt(initiative_id).await?;
@@ -1316,6 +1360,97 @@ async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Res
         } => {
             import_blims_initiative_plan(initiative_id, plan, file).await?;
         }
+    }
+    Ok(())
+}
+
+async fn create_blims_initiative(
+    title: String,
+    description: Option<String>,
+    priority: Option<i64>,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = BlimsInitiativeCreateRequest {
+        working_directory: std::env::current_dir()?,
+        title,
+        description,
+        priority,
+    };
+    let response = call_blims_service("initiative.create", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let initiative = decode_blims_response::<BlimsInitiativeSummary>(response)?;
+        println!(
+            "initiative created: {} ({})",
+            initiative.title, initiative.id
+        );
+    }
+    Ok(())
+}
+
+async fn list_blims_initiatives(json: bool) -> Result<(), CliError> {
+    let response = call_blims_service("initiative.list", blims_workspace_payload()?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let initiatives = decode_blims_response::<Vec<BlimsInitiativeSummary>>(response)?;
+        print_initiative_list(&initiatives);
+    }
+    Ok(())
+}
+
+async fn inspect_blims_initiative(initiative_id: &str, json: bool) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "initiative_id": initiative_id,
+    });
+    let response = call_blims_service("initiative.inspect", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(response)?);
+    }
+    Ok(())
+}
+
+async fn set_blims_initiative_guidance(
+    initiative_id: String,
+    guidance: String,
+    strength: String,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = BlimsInitiativeGuidanceRequest {
+        working_directory: std::env::current_dir()?,
+        initiative_id,
+        guidance,
+        strength,
+    };
+    let response =
+        call_blims_service("initiative.set_guidance", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let guidance = decode_blims_response::<BlimsGuidanceSummary>(response)?;
+        println!("initiative guidance set: {}", guidance.guidance);
+    }
+    Ok(())
+}
+
+async fn print_initiative_status_update(
+    operation: &str,
+    initiative_id: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "initiative_id": initiative_id,
+    });
+    let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(response)?);
     }
     Ok(())
 }

@@ -25,6 +25,18 @@ pub const OP_COMPANY_STATUS: &str = "company.status";
 /// Company create operation.
 pub const OP_COMPANY_CREATE: &str = "company.create";
 
+/// Company load operation.
+pub const OP_COMPANY_LOAD: &str = "company.load";
+
+/// Company pause operation.
+pub const OP_COMPANY_PAUSE: &str = "company.pause";
+
+/// Company resume operation.
+pub const OP_COMPANY_RESUME: &str = "company.resume";
+
+/// Company shutdown operation.
+pub const OP_COMPANY_SHUTDOWN: &str = "company.shutdown";
+
 /// Agent list operation.
 pub const OP_AGENT_LIST: &str = "agent.list";
 
@@ -36,6 +48,15 @@ pub const OP_INITIATIVE_LIST: &str = "initiative.list";
 
 /// Initiative inspect operation.
 pub const OP_INITIATIVE_INSPECT: &str = "initiative.inspect";
+
+/// Initiative set guidance operation.
+pub const OP_INITIATIVE_SET_GUIDANCE: &str = "initiative.set_guidance";
+
+/// Initiative pause operation.
+pub const OP_INITIATIVE_PAUSE: &str = "initiative.pause";
+
+/// Initiative resume operation.
+pub const OP_INITIATIVE_RESUME: &str = "initiative.resume";
 
 /// Guidance set operation.
 pub const OP_GUIDANCE_SET: &str = "guidance.set";
@@ -97,6 +118,9 @@ pub const OP_WORLD_SNAPSHOT: &str = "world.snapshot";
 /// Morning report operation.
 pub const OP_REPORT_MORNING: &str = "report.morning";
 
+/// Blims protocol version for daemon/UI IPC payloads.
+pub const BLIMS_PROTOCOL_VERSION: u16 = 1;
+
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
 const BLIMS_STATE_DIR_ENV: &str = "BCODE_BLIMS_STATE_DIR";
 const DEFAULT_STATE_ROOT: &str = ".bcode/blims";
@@ -118,11 +142,17 @@ impl RustPlugin for BlimsPlugin {
 
         match context.request.operation.as_str() {
             OP_COMPANY_STATUS => service_company_status(&context.request),
-            OP_COMPANY_CREATE => service_company_create(&context.request),
+            OP_COMPANY_CREATE | OP_COMPANY_LOAD => service_company_create(&context.request),
+            OP_COMPANY_PAUSE => service_company_lifecycle(&context.request, "paused"),
+            OP_COMPANY_RESUME => service_company_lifecycle(&context.request, "running"),
+            OP_COMPANY_SHUTDOWN => service_company_lifecycle(&context.request, "shutdown"),
             OP_AGENT_LIST => service_agent_list(&context.request),
             OP_INITIATIVE_CREATE => service_initiative_create(&context.request),
             OP_INITIATIVE_LIST => service_initiative_list(&context.request),
             OP_INITIATIVE_INSPECT => service_initiative_inspect(&context.request),
+            OP_INITIATIVE_SET_GUIDANCE => service_initiative_set_guidance(&context.request),
+            OP_INITIATIVE_PAUSE => service_initiative_status(&context.request, "paused"),
+            OP_INITIATIVE_RESUME => service_initiative_status(&context.request, "active"),
             OP_GUIDANCE_SET => service_guidance_set(&context.request),
             OP_GUIDANCE_LIST => service_guidance_list(&context.request),
             OP_INITIATIVE_PLAN_PROMPT => service_initiative_plan_prompt(&context.request),
@@ -155,6 +185,26 @@ pub struct WorkspaceRequest {
     pub working_directory: PathBuf,
 }
 
+/// Typed Blims IPC request envelope for future daemon/frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlimsProtocolRequest<T> {
+    /// Protocol version.
+    pub protocol_version: u16,
+    /// Service operation name.
+    pub operation: String,
+    /// Typed request payload.
+    pub payload: T,
+}
+
+/// Typed Blims IPC response envelope for future daemon/frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlimsProtocolResponse<T> {
+    /// Protocol version.
+    pub protocol_version: u16,
+    /// Typed response payload.
+    pub payload: T,
+}
+
 /// Request to create a company initiative.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitiativeCreateRequest {
@@ -168,6 +218,20 @@ pub struct InitiativeCreateRequest {
     /// Optional initiative priority. Lower numbers sort first.
     #[serde(default)]
     pub priority: Option<i64>,
+}
+
+/// Request to add initiative-specific CEO guidance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativeGuidanceRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Initiative id receiving the guidance.
+    pub initiative_id: String,
+    /// Guidance text.
+    pub guidance: String,
+    /// Guidance strength label.
+    #[serde(default = "default_guidance_strength")]
+    pub strength: String,
 }
 
 /// Request to add CEO guidance.
@@ -423,8 +487,12 @@ pub struct ArtifactDetail {
 pub enum CompanyLifecycleState {
     /// No repo-local Blims company has been created yet.
     NotStarted,
-    /// Repo-local Blims company state exists.
+    /// Repo-local Blims company state exists and background work can run.
     Created,
+    /// Company work is temporarily paused.
+    Paused,
+    /// Company was cleanly shut down and can be resumed from state.
+    Shutdown,
 }
 
 /// Blims company status summary.
@@ -440,6 +508,8 @@ pub struct CompanyStatus {
     pub state_root: PathBuf,
     /// Resolved Blims `SQLite` database path.
     pub database_path: PathBuf,
+    /// Persisted lifecycle status for daemon/frontends.
+    pub lifecycle_status: String,
 }
 
 /// Blims world room snapshot.
@@ -495,6 +565,7 @@ struct CompanyRecord {
     name: String,
     mission: String,
     culture: String,
+    lifecycle_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -653,6 +724,18 @@ fn service_company_create(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn service_company_lifecycle(request: &ServiceRequest, lifecycle_status: &str) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+
+    match set_company_lifecycle(&request.working_directory, lifecycle_status) {
+        Ok(status) => json_response(&status),
+        Err(error) => ServiceResponse::error("company_lifecycle_failed", error.to_string()),
+    }
+}
+
 fn service_agent_list(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<WorkspaceRequest>() {
         Ok(request) => request,
@@ -701,6 +784,28 @@ fn service_initiative_inspect(request: &ServiceRequest) -> ServiceResponse {
     match inspect_initiative(&request) {
         Ok(initiative) => json_response(&initiative),
         Err(error) => ServiceResponse::error("initiative_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_initiative_set_guidance(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<InitiativeGuidanceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match set_initiative_guidance(&request) {
+        Ok(guidance) => json_response(&guidance),
+        Err(error) => ServiceResponse::error("initiative_guidance_failed", error.to_string()),
+    }
+}
+
+fn service_initiative_status(request: &ServiceRequest, status: &str) -> ServiceResponse {
+    let request = match request.payload_json::<InitiativeInspectRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match set_initiative_status(&request, status) {
+        Ok(initiative) => json_response(&initiative),
+        Err(error) => ServiceResponse::error("initiative_status_failed", error.to_string()),
     }
 }
 
@@ -921,14 +1026,27 @@ fn service_morning_report(request: &ServiceRequest) -> ServiceResponse {
 
 fn company_status(working_directory: &Path) -> CompanyStatus {
     let paths = state_paths(working_directory);
-    let state = if paths.database_path.exists() {
-        CompanyLifecycleState::Created
-    } else {
-        CompanyLifecycleState::NotStarted
+    let lifecycle_status = paths.database_path.exists().then(|| {
+        load_company_data(working_directory).map_or_else(
+            |_| "running".to_string(),
+            |data| data.company.lifecycle_status,
+        )
+    });
+    let state = match lifecycle_status.as_deref() {
+        None => CompanyLifecycleState::NotStarted,
+        Some("paused") => CompanyLifecycleState::Paused,
+        Some("shutdown") => CompanyLifecycleState::Shutdown,
+        Some(_) => CompanyLifecycleState::Created,
     };
     let message = match state {
         CompanyLifecycleState::Created => {
             "Blims company state exists. The office is ready to wake.".to_string()
+        }
+        CompanyLifecycleState::Paused => {
+            "Blims company work is paused. Resume when the office should continue.".to_string()
+        }
+        CompanyLifecycleState::Shutdown => {
+            "Blims company is shut down but fully resurrectable from repo-local state.".to_string()
         }
         CompanyLifecycleState::NotStarted => {
             "Blims is bundled and ready. Create a repo-local company to wake the office."
@@ -942,6 +1060,7 @@ fn company_status(working_directory: &Path) -> CompanyStatus {
         daemon_connected: false,
         state_root: paths.state_root,
         database_path: paths.database_path,
+        lifecycle_status: lifecycle_status.unwrap_or_else(|| "not_started".to_string()),
     }
 }
 
@@ -976,6 +1095,36 @@ fn create_company_state(working_directory: &Path) -> Result<CompanyStatus, Blims
     Ok(company_status(working_directory))
 }
 
+fn set_company_lifecycle(
+    working_directory: &Path,
+    lifecycle_status: &str,
+) -> Result<CompanyStatus, BlimsStateError> {
+    let lifecycle_status = lifecycle_status.to_string();
+    with_database(working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .update("companies")
+                .value("lifecycle_status", lifecycle_status.clone())
+                .filter(Box::new(where_eq("id", "default")))
+                .execute(database)
+                .await?;
+            database
+                .insert("events")
+                .value("company_id", "default")
+                .value("kind", format!("company_{lifecycle_status}"))
+                .value(
+                    "summary",
+                    format!("Blims company lifecycle set to {lifecycle_status}."),
+                )
+                .value("payload_json", "{}")
+                .execute(database)
+                .await?;
+            Ok::<(), BlimsStateError>(())
+        })
+    })?;
+    Ok(company_status(working_directory))
+}
+
 async fn initialize_schema(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
     create_core_tables(database).await?;
     seed_core_rows(database).await
@@ -1005,6 +1154,7 @@ async fn create_base_tables(
         .column(text_column("name"))
         .column(text_column("mission"))
         .column(text_column("culture"))
+        .column(text_column("lifecycle_status"))
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
@@ -1110,6 +1260,7 @@ async fn create_work_tables(
         .column(text_column("status"))
         .column(int_column("priority"))
         .column(text_column("created_by"))
+        .column(text_column("guidance"))
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
@@ -1217,10 +1368,11 @@ async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database:
         .await?;
     database
         .exec_raw(
-            "INSERT INTO companies (id, name, mission, culture) \
+            "INSERT INTO companies (id, name, mission, culture, lifecycle_status) \
              SELECT 'default', 'Blims', \
              'Build a cozy autonomous AI company inside Bcode.', \
-             'cozy, fun, dynamic, productive' \
+             'cozy, fun, dynamic, productive', \
+             'running' \
              WHERE NOT EXISTS (SELECT 1 FROM companies WHERE id = 'default')",
         )
         .await?;
@@ -1518,6 +1670,7 @@ fn create_initiative(
                 .value("status", "active")
                 .value("priority", priority)
                 .value("created_by", "ceo")
+                .value("guidance", "")
                 .execute(database)
                 .await?;
             Ok::<_, BlimsStateError>(initiative)
@@ -1547,6 +1700,77 @@ fn inspect_initiative(
     let initiative_id = request.initiative_id.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move { load_initiative(database, &initiative_id).await })
+    })
+}
+
+fn set_initiative_status(
+    request: &InitiativeInspectRequest,
+    status: &str,
+) -> Result<InitiativeSummary, BlimsStateError> {
+    let initiative_id = request.initiative_id.clone();
+    let status = status.to_string();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let initiative = load_initiative(database, &initiative_id).await?;
+            database
+                .update("initiatives")
+                .value("status", status.clone())
+                .filter(Box::new(where_eq("id", initiative_id)))
+                .execute(database)
+                .await?;
+            Ok(InitiativeSummary {
+                status,
+                ..initiative
+            })
+        })
+    })
+}
+
+fn set_initiative_guidance(
+    request: &InitiativeGuidanceRequest,
+) -> Result<GuidanceSummary, BlimsStateError> {
+    let initiative_request = InitiativeInspectRequest {
+        working_directory: request.working_directory.clone(),
+        initiative_id: request.initiative_id.clone(),
+    };
+    inspect_initiative(&initiative_request)?;
+    let guidance = request.guidance.trim().to_string();
+    if guidance.is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "initiative guidance cannot be empty".to_string(),
+        ));
+    }
+    let id = format!("{}-{}", request.initiative_id, stable_slug(&guidance));
+    let strength = request.strength.clone();
+    let initiative_id = request.initiative_id.clone();
+    let summary = GuidanceSummary {
+        id: id.clone(),
+        guidance: guidance.clone(),
+        strength: strength.clone(),
+        active: true,
+    };
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .insert("executive_guidance")
+                .value("id", id)
+                .value("company_id", "default")
+                .value(
+                    "guidance",
+                    format!("Initiative {initiative_id}: {guidance}"),
+                )
+                .value("strength", strength)
+                .value("active", true)
+                .execute(database)
+                .await?;
+            database
+                .update("initiatives")
+                .value("guidance", guidance)
+                .filter(Box::new(where_eq("id", initiative_id)))
+                .execute(database)
+                .await?;
+            Ok::<_, BlimsStateError>(summary)
+        })
     })
 }
 
@@ -2133,7 +2357,7 @@ async fn load_company_data_from_database(
 ) -> Result<CompanyData, BlimsStateError> {
     let company = database
         .select("companies")
-        .columns(&["name", "mission", "culture"])
+        .columns(&["name", "mission", "culture", "lifecycle_status"])
         .limit(1)
         .execute_first(database)
         .await?
@@ -2199,6 +2423,7 @@ async fn load_company_data_from_database(
             name: required_text(&company, "name")?,
             mission: required_text(&company, "mission")?,
             culture: required_text(&company, "culture")?,
+            lifecycle_status: required_text(&company, "lifecycle_status")?,
         },
         world_theme: required_text(&world, "theme")?,
         rooms: room_rows
@@ -2408,6 +2633,7 @@ mod tests {
         assert_eq!(status.state, CompanyLifecycleState::NotStarted);
         assert!(!status.daemon_connected);
         assert_eq!(status.state_root, temp.join(DEFAULT_STATE_ROOT));
+        assert_eq!(status.lifecycle_status, "not_started");
     }
 
     #[test]
@@ -2428,6 +2654,23 @@ mod tests {
 
         assert_eq!(snapshot.theme, "Cozy Startup Loft");
         assert_eq!(snapshot.agents.len(), 3);
+    }
+
+    #[test]
+    fn protocol_envelope_round_trips_through_bmux_codec() {
+        let request = BlimsProtocolRequest {
+            protocol_version: BLIMS_PROTOCOL_VERSION,
+            operation: OP_COMPANY_STATUS.to_string(),
+            payload: WorkspaceRequest {
+                working_directory: PathBuf::from("/tmp/blims-repo"),
+            },
+        };
+
+        let bytes = bmux_codec::to_vec(&request).expect("protocol request should encode");
+        let decoded: BlimsProtocolRequest<WorkspaceRequest> =
+            bmux_codec::from_bytes(&bytes).expect("protocol request should decode");
+
+        assert_eq!(decoded, request);
     }
 
     fn tempfile_path(name: &str) -> PathBuf {
