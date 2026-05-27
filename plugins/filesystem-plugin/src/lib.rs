@@ -394,9 +394,9 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         "filesystem.write" => tool_write(request.arguments, cwd.as_deref()),
         "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref()),
         "filesystem.exists" => tool_exists(request.arguments, cwd.as_deref()),
-        "filesystem.list" => tool_list(request.arguments, cwd.as_deref()),
-        "filesystem.find" => tool_find(request.arguments, cwd.as_deref()),
-        "filesystem.grep" => tool_grep(request.arguments, cwd.as_deref()),
+        "filesystem.list" => tool_list(request.arguments, cwd.as_deref(), &context.cancellation),
+        "filesystem.find" => tool_find(request.arguments, cwd.as_deref(), &context.cancellation),
+        "filesystem.grep" => tool_grep(request.arguments, cwd.as_deref(), &context.cancellation),
         "filesystem.stat" => tool_stat(request.arguments, cwd.as_deref()),
         _ => ToolInvocationResponse {
             output: format!("unknown filesystem tool: {}", request.name),
@@ -600,36 +600,56 @@ fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocati
     }
 }
 
-fn tool_list(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_list(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<ListRequest>(arguments)
             .map(|mut request| {
                 request.path = resolve_session_path(cwd, &request.path);
                 request
             })
-            .and_then(|request| list_directory(&request).map_err(serde_json::Error::io)),
+            .and_then(|request| {
+                list_directory(&request, cancellation.clone()).map_err(serde_json::Error::io)
+            }),
     )
 }
 
-fn tool_find(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_find(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<FindRequest>(arguments)
             .map(|mut request| {
                 request.path = resolve_session_path(cwd, &request.path);
                 request
             })
-            .and_then(|request| find_paths(&request).map_err(serde_json::Error::io)),
+            .and_then(|request| {
+                find_paths_with_cancellation(&request, cancellation.clone())
+                    .map_err(serde_json::Error::io)
+            }),
     )
 }
 
-fn tool_grep(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_grep(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> ToolInvocationResponse {
     json_tool_response(
         serde_json::from_value::<GrepRequest>(arguments)
             .map(|mut request| {
                 request.path = resolve_session_path(cwd, &request.path);
                 request
             })
-            .and_then(|request| grep_files(&request).map_err(serde_json::Error::io)),
+            .and_then(|request| {
+                grep_files_with_cancellation(&request, cancellation.clone())
+                    .map_err(serde_json::Error::io)
+            }),
     )
 }
 
@@ -700,7 +720,7 @@ fn list_directory_service(request: &ServiceRequest) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    list_directory(&request).map_or_else(
+    list_directory(&request, bcode_plugin_sdk::ServiceCancellation::default()).map_or_else(
         |error| io_error(&error),
         |response| json_response(&response),
     )
@@ -745,19 +765,25 @@ struct SearchBudget {
     timeout: Duration,
     visited_entries: usize,
     timed_out: bool,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 }
 
 impl SearchBudget {
-    fn new(timeout_ms: Option<u64>) -> Self {
+    fn new(timeout_ms: Option<u64>, cancellation: bcode_plugin_sdk::ServiceCancellation) -> Self {
         Self {
             started: Instant::now(),
             timeout: Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS)),
             visited_entries: 0,
             timed_out: false,
+            cancellation,
         }
     }
 
     fn check(&mut self) -> bool {
+        if self.cancellation.is_cancelled() {
+            self.timed_out = true;
+            return false;
+        }
         if self.started.elapsed() >= self.timeout {
             self.timed_out = true;
             return false;
@@ -779,8 +805,11 @@ fn timeout_message(kind: &str, timeout_ms: u64) -> String {
     format!("{kind} timed out after {timeout_ms}ms; results are partial")
 }
 
-fn list_directory(request: &ListRequest) -> Result<ListResponse, std::io::Error> {
-    let mut budget = SearchBudget::new(request.timeout_ms);
+fn list_directory(
+    request: &ListRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+) -> Result<ListResponse, std::io::Error> {
+    let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
     let max_entries = request.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
     let mut entries = Vec::new();
     collect_entries(
@@ -833,6 +862,13 @@ fn collect_entries(
 }
 
 fn find_paths(request: &FindRequest) -> Result<FindResponse, std::io::Error> {
+    find_paths_with_cancellation(request, bcode_plugin_sdk::ServiceCancellation::default())
+}
+
+fn find_paths_with_cancellation(
+    request: &FindRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+) -> Result<FindResponse, std::io::Error> {
     let max_results = request.max_results.unwrap_or(DEFAULT_FIND_MAX_RESULTS);
     if let Some(response) = find_paths_with_fd(request, max_results)? {
         return Ok(response);
@@ -840,14 +876,15 @@ fn find_paths(request: &FindRequest) -> Result<FindResponse, std::io::Error> {
     if let Some(response) = find_paths_with_find(request, max_results)? {
         return Ok(response);
     }
-    find_paths_with_rust(request, max_results)
+    find_paths_with_rust(request, max_results, cancellation)
 }
 
 fn find_paths_with_rust(
     request: &FindRequest,
     max_results: usize,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<FindResponse, std::io::Error> {
-    let mut budget = SearchBudget::new(request.timeout_ms);
+    let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
     let mut paths = Vec::new();
     collect_find_matches(
         &request.path,
@@ -902,18 +939,26 @@ fn collect_find_matches(
 }
 
 fn grep_files(request: &GrepRequest) -> Result<GrepResponse, std::io::Error> {
+    grep_files_with_cancellation(request, bcode_plugin_sdk::ServiceCancellation::default())
+}
+
+fn grep_files_with_cancellation(
+    request: &GrepRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+) -> Result<GrepResponse, std::io::Error> {
     let max_matches = request.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
     if let Some(response) = grep_files_with_rg(request, max_matches)? {
         return Ok(response);
     }
-    grep_files_with_rust(request, max_matches)
+    grep_files_with_rust(request, max_matches, cancellation)
 }
 
 fn grep_files_with_rust(
     request: &GrepRequest,
     max_matches: usize,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<GrepResponse, std::io::Error> {
-    let mut budget = SearchBudget::new(request.timeout_ms);
+    let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
     let mut matches = Vec::new();
     collect_grep_matches(
         &request.path,
@@ -1483,6 +1528,7 @@ mod tests {
                 timeout_ms: Some(0),
             },
             10,
+            bcode_plugin_sdk::ServiceCancellation::default(),
         )
         .expect("grep response");
 
@@ -1513,6 +1559,7 @@ mod tests {
                 timeout_ms: Some(30_000),
             },
             1,
+            bcode_plugin_sdk::ServiceCancellation::default(),
         )
         .expect("find response");
 

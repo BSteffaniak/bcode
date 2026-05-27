@@ -14,6 +14,9 @@ pub enum CancellationHandle {
     SessionTurn(Arc<TurnCancelState>),
     /// Cancel an in-flight plugin invocation.
     PluginInvocation(PluginInvocationCancelHandle),
+    /// Test/no-op cancellation hook.
+    #[cfg(test)]
+    Test(Arc<std::sync::atomic::AtomicUsize>),
 }
 
 impl CancellationHandle {
@@ -22,12 +25,20 @@ impl CancellationHandle {
         match self {
             Self::SessionTurn(cancel_state) => cancel_state.cancel(),
             Self::PluginInvocation(cancel) => cancel.cancel(),
+            #[cfg(test)]
+            Self::Test(count) => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
 
     /// Runtime work with a handle is cancellable.
     pub const fn is_cancellable(&self) -> bool {
-        matches!(self, Self::SessionTurn(_) | Self::PluginInvocation(_))
+        match self {
+            Self::SessionTurn(_) | Self::PluginInvocation(_) => true,
+            #[cfg(test)]
+            Self::Test(_) => true,
+        }
     }
 }
 
@@ -158,5 +169,83 @@ impl RuntimeWorkManager {
                 cancellable: work.spec.cancellation.is_cancellable(),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_spec(work_id: &str, count: Arc<AtomicUsize>) -> RuntimeWorkSpec {
+        RuntimeWorkSpec::new(
+            RuntimeWorkId::new(work_id),
+            RuntimeWorkKind::Tool,
+            work_id.to_string(),
+            CancellationHandle::Test(count),
+        )
+    }
+
+    #[tokio::test]
+    async fn start_cancel_finish_tracks_active_work() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let work_id = RuntimeWorkId::new("work");
+
+        assert!(
+            manager
+                .start(session_id, test_spec("work", Arc::clone(&count)))
+                .await
+        );
+        assert_eq!(manager.active_for_session(session_id).await.len(), 1);
+        assert!(manager.cancel(session_id, &work_id).await);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.active_for_session(session_id).await[0].status,
+            RuntimeWorkStatus::Cancelling
+        );
+        manager.finish(session_id, &work_id).await;
+        assert!(manager.active_for_session(session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_cancel_only_signals_once() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let work_id = RuntimeWorkId::new("work");
+
+        manager
+            .start(session_id, test_spec("work", Arc::clone(&count)))
+            .await;
+        assert!(manager.cancel(session_id, &work_id).await);
+        assert!(manager.cancel(session_id, &work_id).await);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn replace_cancellation_changes_signal_target() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let work_id = RuntimeWorkId::new("work");
+
+        manager
+            .start(session_id, test_spec("work", Arc::clone(&first)))
+            .await;
+        assert!(
+            manager
+                .replace_cancellation(
+                    session_id,
+                    &work_id,
+                    CancellationHandle::Test(Arc::clone(&second))
+                )
+                .await
+        );
+        assert!(manager.cancel(session_id, &work_id).await);
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
     }
 }
