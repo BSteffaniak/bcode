@@ -244,6 +244,9 @@ impl RustPlugin for BlimsPlugin {
 pub struct WorkspaceRequest {
     /// Workspace or repository directory.
     pub working_directory: PathBuf,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -254,28 +257,31 @@ pub struct WorkspaceRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventContext {
-    correlation_id: String,
-    causation_id: String,
+    correlation: String,
+    causation: String,
+    expected_latest: Option<i64>,
 }
 
 impl EventContext {
     fn from_request(request: &ServiceRequest) -> Self {
         Self {
-            correlation_id: format!("service:{}", request.operation),
-            causation_id: format!("service:{}", request.operation),
+            correlation: format!("service:{}", request.operation),
+            causation: format!("service:{}", request.operation),
+            expected_latest: None,
         }
     }
 
     fn merge_workspace_request(&self, request: &WorkspaceRequest) -> Self {
         Self {
-            correlation_id: request
+            correlation: request
                 .correlation_id
                 .clone()
-                .unwrap_or_else(|| self.correlation_id.clone()),
-            causation_id: request
+                .unwrap_or_else(|| self.correlation.clone()),
+            causation: request
                 .causation_id
                 .clone()
-                .unwrap_or_else(|| self.causation_id.clone()),
+                .unwrap_or_else(|| self.causation.clone()),
+            expected_latest: request.expected_latest_event_id.or(self.expected_latest),
         }
     }
 
@@ -283,14 +289,16 @@ impl EventContext {
         &self,
         correlation_id: Option<&String>,
         causation_id: Option<&String>,
+        expected_latest_event_id: Option<i64>,
     ) -> Self {
         Self {
-            correlation_id: correlation_id
+            correlation: correlation_id
                 .cloned()
-                .unwrap_or_else(|| self.correlation_id.clone()),
-            causation_id: causation_id
+                .unwrap_or_else(|| self.correlation.clone()),
+            causation: causation_id
                 .cloned()
-                .unwrap_or_else(|| self.causation_id.clone()),
+                .unwrap_or_else(|| self.causation.clone()),
+            expected_latest: expected_latest_event_id.or(self.expected_latest),
         }
     }
 
@@ -298,6 +306,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 
@@ -305,6 +314,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 
@@ -312,6 +322,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 
@@ -319,6 +330,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 
@@ -326,6 +338,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 
@@ -333,6 +346,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 
@@ -340,6 +354,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 
@@ -347,6 +362,7 @@ impl EventContext {
         self.merge_optional_ids(
             request.correlation_id.as_ref(),
             request.causation_id.as_ref(),
+            request.expected_latest_event_id,
         )
     }
 }
@@ -390,6 +406,9 @@ pub struct InitiativeCreateRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to add initiative-specific CEO guidance.
@@ -410,6 +429,9 @@ pub struct InitiativeGuidanceRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to add CEO guidance.
@@ -428,6 +450,9 @@ pub struct GuidanceSetRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to build an AI planning prompt for an initiative.
@@ -533,6 +558,9 @@ pub struct ProposalRegisterRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to inspect or update a proposal.
@@ -548,6 +576,9 @@ pub struct ProposalRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to record a proposal patch artifact.
@@ -565,6 +596,9 @@ pub struct ProposalRecordPatchRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Work proposal summary.
@@ -605,6 +639,9 @@ pub struct InitiativeInspectRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to import an AI-generated plan for an initiative.
@@ -622,6 +659,9 @@ pub struct InitiativeImportPlanRequest {
     /// Optional causation id for event-sourced commands.
     #[serde(default)]
     pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// AI-generated initiative plan contract.
@@ -1060,6 +1100,14 @@ pub enum BlimsStateError {
     /// A request field was invalid.
     #[error("invalid Blims request: {0}")]
     InvalidRequest(String),
+    /// Event stream version did not match optimistic concurrency expectation.
+    #[error("Blims event stream conflict: expected latest event id {expected}, actual {actual}")]
+    EventConflict {
+        /// Expected latest event id.
+        expected: i64,
+        /// Actual latest event id.
+        actual: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2190,18 +2238,48 @@ async fn append_event(
     payload: &BlimsEventPayload,
 ) -> Result<(), BlimsStateError> {
     let payload_json = serde_json::to_string(payload)?;
+    check_expected_latest_event_id(database, event_context.expected_latest).await?;
     database
         .insert("events")
         .value("company_id", "default")
         .value("kind", kind)
         .value("summary", summary)
         .value("payload_json", payload_json)
-        .value("correlation_id", event_context.correlation_id.clone())
-        .value("causation_id", event_context.causation_id.clone())
+        .value("correlation_id", event_context.correlation.clone())
+        .value("causation_id", event_context.causation.clone())
         .value("event_version", 1_i64)
         .execute(database)
         .await?;
     apply_event_projection(database, payload).await
+}
+
+async fn check_expected_latest_event_id(
+    database: &dyn Database,
+    expected_latest_event_id: Option<i64>,
+) -> Result<(), BlimsStateError> {
+    let Some(expected) = expected_latest_event_id else {
+        return Ok(());
+    };
+    let actual = latest_event_id(database).await?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(BlimsStateError::EventConflict { expected, actual })
+    }
+}
+
+async fn latest_event_id(database: &dyn Database) -> Result<i64, switchy_database::DatabaseError> {
+    Ok(database
+        .select("events")
+        .columns(&["id"])
+        .sort("id", SortDirection::Desc)
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .as_ref()
+        .and_then(|row| row.get("id"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default())
 }
 
 async fn apply_event_projection(
@@ -2458,6 +2536,7 @@ fn set_initiative_guidance(
         initiative_id: request.initiative_id.clone(),
         correlation_id: None,
         causation_id: None,
+        expected_latest_event_id: None,
     };
     inspect_initiative(&initiative_request)?;
     let guidance = request.guidance.trim().to_string();
@@ -3969,6 +4048,7 @@ mod tests {
             operation: OP_COMPANY_STATUS.to_string(),
             payload: WorkspaceRequest {
                 working_directory: PathBuf::from("/tmp/blims-repo"),
+                expected_latest_event_id: None,
                 correlation_id: None,
                 causation_id: None,
             },
