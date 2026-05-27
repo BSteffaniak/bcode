@@ -69,8 +69,8 @@ impl WebSearchPlugin {
             return json_response(&tool_error("web tool cancelled".to_string()));
         }
         let response = match invocation.name.as_str() {
-            "web.search" => self.invoke_search(&context.config, &invocation),
-            "web.fetch" => self.invoke_fetch(&context.config, &invocation),
+            "web.search" => self.invoke_search(&context.config, &context.cancellation, &invocation),
+            "web.fetch" => self.invoke_fetch(&context.config, &context.cancellation, &invocation),
             "web.status" => invoke_status(&context.config),
             "web.inspect" => invoke_inspect(&invocation),
             _ => ToolInvocationResponse {
@@ -86,6 +86,7 @@ impl WebSearchPlugin {
     fn invoke_search(
         &self,
         config: &bcode_plugin_sdk::PluginConfigContext,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
         invocation: &ToolInvocationRequest,
     ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<SearchRequest>(invocation.arguments.clone()) {
@@ -100,7 +101,10 @@ impl WebSearchPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
-        match runtime.block_on(search_async(request, plugin_config)) {
+        match runtime.block_on(run_cancellable(
+            search_async(request, plugin_config),
+            cancellation.clone(),
+        )) {
             Ok(Ok(response)) => json_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
@@ -110,6 +114,7 @@ impl WebSearchPlugin {
     fn invoke_fetch(
         &self,
         config: &bcode_plugin_sdk::PluginConfigContext,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
         invocation: &ToolInvocationRequest,
     ) -> ToolInvocationResponse {
         let request = match serde_json::from_value::<FetchRequest>(invocation.arguments.clone()) {
@@ -124,11 +129,30 @@ impl WebSearchPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
-        match runtime.block_on(fetch_async(request, plugin_config)) {
+        match runtime.block_on(run_cancellable(
+            fetch_async(request, plugin_config),
+            cancellation.clone(),
+        )) {
             Ok(Ok(response)) => json_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
+    }
+}
+
+async fn run_cancellable<T>(
+    future: impl std::future::Future<Output = Result<T, WebError>>,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+) -> Result<T, WebError> {
+    tokio::select! {
+        result = future => result,
+        () = wait_for_cancellation(cancellation) => Err(WebError::Cancelled),
+    }
+}
+
+async fn wait_for_cancellation(cancellation: bcode_plugin_sdk::ServiceCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -533,6 +557,8 @@ enum WebError {
     Http { status: u16, body: String },
     #[error("response decode failed: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("tool cancelled")]
+    Cancelled,
 }
 
 async fn search_async(

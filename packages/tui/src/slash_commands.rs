@@ -347,6 +347,20 @@ async fn resync_command(
     }
 }
 
+async fn stop_command(
+    client: &BcodeClient,
+    session_id: SessionId,
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    let cancelled = client
+        .cancel_session_turn_with_options(session_id, true)
+        .await?;
+    Ok(SlashCommandOutcome::Handled(if cancelled {
+        "turn cancellation requested; queued messages cleared".to_string()
+    } else {
+        "no active turn".to_string()
+    }))
+}
+
 /// Execute a slash command.
 ///
 /// # Errors
@@ -451,6 +465,7 @@ pub async fn execute(
             }))
         }
         "thinking" => thinking_command(client, session_id, &parts).await,
+        "stop" => stop_command(client, session_id).await,
         "runtime" | "status" => runtime_status(client).await,
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }

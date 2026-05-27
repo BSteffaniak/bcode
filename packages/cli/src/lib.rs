@@ -186,7 +186,10 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Provider { command } => handle_provider_command(command)?,
         Commands::Permission { command } => handle_permission_command(command).await?,
-        Commands::Cancel { session_id } => cancel_session_turn(session_id).await?,
+        Commands::Cancel {
+            session_id,
+            clear_queue,
+        } => cancel_session_turn(session_id, clear_queue).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
             ensure_server_running().await?;
@@ -308,6 +311,8 @@ enum Commands {
     },
     Cancel {
         session_id: SessionId,
+        #[arg(long)]
+        clear_queue: bool,
     },
     Attach {
         session_id: SessionId,
@@ -3570,9 +3575,12 @@ fn default_session_store_dir() -> PathBuf {
     bcode_config::default_state_dir().join("sessions")
 }
 
-async fn cancel_session_turn(session_id: SessionId) -> Result<(), CliError> {
+async fn cancel_session_turn(session_id: SessionId, clear_queue: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    if client.cancel_session_turn(session_id).await? {
+    if client
+        .cancel_session_turn_with_options(session_id, clear_queue)
+        .await?
+    {
         println!("turn cancellation requested");
     } else {
         println!("no active turn");

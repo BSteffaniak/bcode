@@ -21,6 +21,7 @@ reqwest                      = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
 thiserror                    = { workspace = true }
+tokio                        = { workspace = true, features = ["macros", "time"] }
 
 [features]
 default          = []
