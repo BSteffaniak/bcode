@@ -139,6 +139,12 @@ pub const OP_WORLD_AVAILABLE_INTERACTIONS: &str = "world.available_interactions"
 /// Morning report operation.
 pub const OP_REPORT_MORNING: &str = "report.morning";
 
+/// Department report operation.
+pub const OP_REPORT_DEPARTMENT: &str = "report.department";
+
+/// Agent report operation.
+pub const OP_REPORT_AGENT: &str = "report.agent";
+
 /// Event list operation.
 pub const OP_EVENT_LIST: &str = "event.list";
 
@@ -248,6 +254,8 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         }
         OP_WORLD_AVAILABLE_INTERACTIONS => service_world_available_interactions(request),
         OP_REPORT_MORNING => service_morning_report(request),
+        OP_REPORT_DEPARTMENT => service_department_report(request),
+        OP_REPORT_AGENT => service_agent_report(request),
         OP_EVENT_LIST => service_event_list(request),
         OP_EVENT_REBUILD_PROJECTIONS => service_event_rebuild_projections(request),
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
@@ -386,6 +394,24 @@ pub struct AgentContractUpdateRequest {
     /// Optional expected latest event id for optimistic concurrency.
     #[serde(default)]
     pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request for a department report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepartmentReportRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Department id.
+    pub department_id: String,
+}
+
+/// Request for an agent report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReportRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Agent id.
+    pub agent_id: String,
 }
 
 /// Request to create a company initiative.
@@ -907,6 +933,28 @@ pub struct AgentSnapshot {
 pub struct MorningReport {
     /// Report title.
     pub title: String,
+    /// Report bullet items.
+    pub bullets: Vec<String>,
+}
+
+/// Focused department report summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepartmentReport {
+    /// Report title.
+    pub title: String,
+    /// Department id.
+    pub department_id: String,
+    /// Report bullet items.
+    pub bullets: Vec<String>,
+}
+
+/// Focused agent report summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReport {
+    /// Report title.
+    pub title: String,
+    /// Agent id.
+    pub agent_id: String,
     /// Report bullet items.
     pub bullets: Vec<String>,
 }
@@ -1642,6 +1690,34 @@ fn service_morning_report(request: &ServiceRequest) -> ServiceResponse {
     )
 }
 
+fn service_department_report(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<DepartmentReportRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    load_company_data(&request.working_directory).map_or_else(
+        |error| ServiceResponse::error("state_read_failed", error.to_string()),
+        |data| match department_report(&data, &request.department_id) {
+            Ok(report) => json_response(&report),
+            Err(error) => ServiceResponse::error("department_report_failed", error.to_string()),
+        },
+    )
+}
+
+fn service_agent_report(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<AgentReportRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    load_company_data(&request.working_directory).map_or_else(
+        |error| ServiceResponse::error("state_read_failed", error.to_string()),
+        |data| match agent_report(&data, &request.agent_id) {
+            Ok(report) => json_response(&report),
+            Err(error) => ServiceResponse::error("agent_report_failed", error.to_string()),
+        },
+    )
+}
+
 fn service_event_list(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<EventListRequest>() {
         Ok(request) => request,
@@ -2266,9 +2342,13 @@ struct CompanyData {
     player_room_id: String,
     rooms: Vec<RoomRecord>,
     agents: Vec<AgentRecord>,
+    departments: Vec<DepartmentRecord>,
+    teams: Vec<TeamRecord>,
     initiatives: Vec<InitiativeSummary>,
     guidance: Vec<GuidanceSummary>,
     proposals: Vec<WorkProposalSummary>,
+    tasks: Vec<TaskSummary>,
+    artifacts: Vec<ArtifactSummary>,
 }
 
 fn with_database<T>(
@@ -3599,20 +3679,8 @@ fn stable_slug(value: &str) -> String {
 async fn load_company_data_from_database(
     database: &dyn Database,
 ) -> Result<CompanyData, BlimsStateError> {
-    let company = database
-        .select("companies")
-        .columns(&["name", "mission", "culture", "lifecycle_status"])
-        .limit(1)
-        .execute_first(database)
-        .await?
-        .ok_or(BlimsStateError::MissingColumn("companies"))?;
-    let world = database
-        .select("worlds")
-        .columns(&["theme", "player_room_id"])
-        .limit(1)
-        .execute_first(database)
-        .await?
-        .ok_or(BlimsStateError::MissingColumn("worlds"))?;
+    let company = load_company_record(database).await?;
+    let (world_theme, player_room_id) = load_world_record(database).await?;
     let room_rows = database
         .select("world_rooms")
         .columns(&["id", "name", "purpose"])
@@ -3633,15 +3701,19 @@ async fn load_company_data_from_database(
         .sort("id", SortDirection::Asc)
         .execute(database)
         .await?;
-    let initiatives = database
-        .select("initiatives")
-        .columns(&["id", "title", "description", "status", "priority"])
-        .sort("priority", SortDirection::Asc)
+    let department_rows = database
+        .select("departments")
+        .columns(&["id", "name", "purpose"])
+        .sort("id", SortDirection::Asc)
         .execute(database)
-        .await?
-        .iter()
-        .map(initiative_summary)
-        .collect::<Result<Vec<_>, _>>()?;
+        .await?;
+    let team_rows = database
+        .select("teams")
+        .columns(&["id", "department_id", "name", "purpose"])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?;
+    let initiatives = load_initiatives(database).await?;
     let guidance = database
         .select("executive_guidance")
         .columns(&["id", "guidance", "strength", "active"])
@@ -3652,25 +3724,22 @@ async fn load_company_data_from_database(
         .iter()
         .map(guidance_summary)
         .collect::<Result<Vec<_>, _>>()?;
-    let proposals = database
-        .select("work_proposals")
-        .columns(&proposal_columns())
-        .sort("updated_at", SortDirection::Desc)
+    let proposals = load_proposals(database).await?;
+    let tasks = load_tasks(database).await?;
+    let artifacts = database
+        .select("artifacts")
+        .columns(&["id", "initiative_id", "kind", "title"])
+        .sort("created_at", SortDirection::Desc)
         .execute(database)
         .await?
         .iter()
-        .map(proposal_summary)
+        .map(artifact_summary)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CompanyData {
-        company: CompanyRecord {
-            name: required_text(&company, "name")?,
-            mission: required_text(&company, "mission")?,
-            culture: required_text(&company, "culture")?,
-            lifecycle_status: required_text(&company, "lifecycle_status")?,
-        },
-        world_theme: required_text(&world, "theme")?,
-        player_room_id: required_text(&world, "player_room_id")?,
+        company,
+        world_theme,
+        player_room_id,
         rooms: room_rows
             .iter()
             .map(room_record)
@@ -3679,10 +3748,99 @@ async fn load_company_data_from_database(
             .iter()
             .map(agent_record)
             .collect::<Result<Vec<_>, _>>()?,
+        departments: department_rows
+            .iter()
+            .map(department_record)
+            .collect::<Result<Vec<_>, _>>()?,
+        teams: team_rows
+            .iter()
+            .map(team_record)
+            .collect::<Result<Vec<_>, _>>()?,
         initiatives,
         guidance,
         proposals,
+        tasks,
+        artifacts,
     })
+}
+
+async fn load_initiatives(
+    database: &dyn Database,
+) -> Result<Vec<InitiativeSummary>, BlimsStateError> {
+    database
+        .select("initiatives")
+        .columns(&["id", "title", "description", "status", "priority"])
+        .sort("priority", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(initiative_summary)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn load_proposals(
+    database: &dyn Database,
+) -> Result<Vec<WorkProposalSummary>, BlimsStateError> {
+    database
+        .select("work_proposals")
+        .columns(&proposal_columns())
+        .sort("updated_at", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(proposal_summary)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn load_tasks(database: &dyn Database) -> Result<Vec<TaskSummary>, BlimsStateError> {
+    database
+        .select("tasks")
+        .columns(&[
+            "id",
+            "initiative_id",
+            "title",
+            "description",
+            "status",
+            "assigned_agent_id",
+            "rationale",
+            "priority",
+        ])
+        .sort("priority", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(task_summary)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn load_company_record(database: &dyn Database) -> Result<CompanyRecord, BlimsStateError> {
+    let row = database
+        .select("companies")
+        .columns(&["name", "mission", "culture", "lifecycle_status"])
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .ok_or(BlimsStateError::MissingColumn("companies"))?;
+    Ok(CompanyRecord {
+        name: required_text(&row, "name")?,
+        mission: required_text(&row, "mission")?,
+        culture: required_text(&row, "culture")?,
+        lifecycle_status: required_text(&row, "lifecycle_status")?,
+    })
+}
+
+async fn load_world_record(database: &dyn Database) -> Result<(String, String), BlimsStateError> {
+    let row = database
+        .select("worlds")
+        .columns(&["theme", "player_room_id"])
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .ok_or(BlimsStateError::MissingColumn("worlds"))?;
+    Ok((
+        required_text(&row, "theme")?,
+        required_text(&row, "player_room_id")?,
+    ))
 }
 
 fn room_record(row: &Row) -> Result<RoomRecord, BlimsStateError> {
@@ -3702,6 +3860,23 @@ fn agent_record(row: &Row) -> Result<AgentRecord, BlimsStateError> {
         team_id: required_text(row, "team_id")?,
         status: required_text(row, "status")?,
         room_id: required_text(row, "room_id")?,
+    })
+}
+
+fn department_record(row: &Row) -> Result<DepartmentRecord, BlimsStateError> {
+    Ok(DepartmentRecord {
+        id: required_text(row, "id")?,
+        name: required_text(row, "name")?,
+        purpose: required_text(row, "purpose")?,
+    })
+}
+
+fn team_record(row: &Row) -> Result<TeamRecord, BlimsStateError> {
+    Ok(TeamRecord {
+        id: required_text(row, "id")?,
+        department_id: required_text(row, "department_id")?,
+        name: required_text(row, "name")?,
+        purpose: required_text(row, "purpose")?,
     })
 }
 
@@ -4360,6 +4535,114 @@ fn morning_report(data: &CompanyData) -> MorningReport {
         title: format!("{} morning report", data.company.name),
         bullets,
     }
+}
+
+fn department_report(
+    data: &CompanyData,
+    department_id: &str,
+) -> Result<DepartmentReport, BlimsStateError> {
+    let department = data
+        .departments
+        .iter()
+        .find(|department| department.id == department_id)
+        .ok_or_else(|| {
+            BlimsStateError::InvalidRequest(format!("unknown department: {department_id}"))
+        })?;
+    let teams_count = data
+        .teams
+        .iter()
+        .filter(|team| team.department_id == department.id)
+        .count();
+    let agents = data
+        .agents
+        .iter()
+        .filter(|agent| agent.department_id == department.id)
+        .collect::<Vec<_>>();
+    let active_agents = agents
+        .iter()
+        .filter(|agent| agent.status != "suspended" && agent.status != "fired")
+        .count();
+    let tasks = data
+        .tasks
+        .iter()
+        .filter(|task| {
+            agents
+                .iter()
+                .any(|agent| agent.id == task.assigned_agent_id)
+        })
+        .collect::<Vec<_>>();
+    let ready_reviews = data
+        .proposals
+        .iter()
+        .filter(|proposal| proposal.status == "ready_for_review")
+        .count();
+    let mut bullets = vec![
+        format!("Purpose: {}", department.purpose),
+        format!("Teams: {teams_count}"),
+        format!("Agents: {} total, {active_agents} active", agents.len()),
+        format!("Assigned tasks: {}", tasks.len()),
+        format!("Ready reviews across company: {ready_reviews}"),
+    ];
+    if let Some(task) = tasks.first() {
+        bullets.push(format!("Top task: {} ({})", task.title, task.status));
+    }
+    Ok(DepartmentReport {
+        title: format!("{} department report", department.name),
+        department_id: department.id.clone(),
+        bullets,
+    })
+}
+
+fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, BlimsStateError> {
+    let agent = data
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .ok_or_else(|| BlimsStateError::InvalidRequest(format!("unknown agent: {agent_id}")))?;
+    let assigned_tasks = data
+        .tasks
+        .iter()
+        .filter(|task| task.assigned_agent_id == agent.id)
+        .collect::<Vec<_>>();
+    let proposals = data
+        .proposals
+        .iter()
+        .filter(|proposal| proposal.agent_id == agent.id)
+        .collect::<Vec<_>>();
+    let artifacts = data
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            assigned_tasks
+                .iter()
+                .any(|task| task.initiative_id == artifact.initiative_id)
+        })
+        .count();
+    let mut bullets = vec![
+        format!("Role: {}", agent.role),
+        format!("Status: {}", agent.status),
+        format!("Location: {}", agent.room_id),
+        format!("Assigned tasks: {}", assigned_tasks.len()),
+        format!("Work proposals: {}", proposals.len()),
+        format!("Related artifacts: {artifacts}"),
+    ];
+    if let Some(task) = assigned_tasks.first() {
+        bullets.push(format!(
+            "Current likely focus: {} ({})",
+            task.title, task.status
+        ));
+    }
+    if let Some(proposal) = proposals.first() {
+        bullets.push(format!(
+            "Latest proposal: {} ({})",
+            proposal.summary, proposal.status
+        ));
+    }
+    Ok(AgentReport {
+        title: format!("{} agent report", agent.name),
+        agent_id: agent.id.clone(),
+        bullets,
+    })
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {

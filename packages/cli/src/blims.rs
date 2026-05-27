@@ -92,6 +92,16 @@ pub enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    DepartmentReport {
+        department_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    AgentReport {
+        agent_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -406,6 +416,12 @@ struct BlimsMorningReport {
     bullets: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsFocusedReport {
+    title: String,
+    bullets: Vec<String>,
+}
+
 pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
     ensure_server_running().await?;
     match command {
@@ -471,15 +487,28 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
         BlimsCommand::Guidance { command } => handle_blims_guidance_command(command).await?,
         BlimsCommand::Report { json } => {
             let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
-            if json {
-                print_blims_service_response(response);
-            } else {
-                let report = decode_blims_response::<BlimsMorningReport>(response)?;
-                println!("{}", report.title);
-                for bullet in report.bullets {
-                    println!("* {bullet}");
-                }
-            }
+            print_report_response::<BlimsMorningReport>(response, json)?;
+        }
+        BlimsCommand::DepartmentReport {
+            department_id,
+            json,
+        } => {
+            let request = serde_json::json!({
+                "working_directory": std::env::current_dir()?,
+                "department_id": department_id,
+            });
+            let response =
+                call_blims_service("report.department", serde_json::to_vec(&request)?).await?;
+            print_report_response::<BlimsFocusedReport>(response, json)?;
+        }
+        BlimsCommand::AgentReport { agent_id, json } => {
+            let request = serde_json::json!({
+                "working_directory": std::env::current_dir()?,
+                "agent_id": agent_id,
+            });
+            let response =
+                call_blims_service("report.agent", serde_json::to_vec(&request)?).await?;
+            print_report_response::<BlimsFocusedReport>(response, json)?;
         }
     }
     Ok(())
@@ -1007,6 +1036,50 @@ fn room_index(world: &BlimsWorldSnapshot, current_room_id: &str) -> usize {
         .iter()
         .position(|room| room.id == current_room_id)
         .unwrap_or_default()
+}
+
+trait PrintableReport {
+    fn title(&self) -> &str;
+    fn bullets(&self) -> &[String];
+}
+
+impl PrintableReport for BlimsMorningReport {
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn bullets(&self) -> &[String] {
+        &self.bullets
+    }
+}
+
+impl PrintableReport for BlimsFocusedReport {
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn bullets(&self) -> &[String] {
+        &self.bullets
+    }
+}
+
+fn print_report_response<T>(
+    response: bcode_ipc::PluginServiceResponse,
+    json: bool,
+) -> Result<(), CliError>
+where
+    T: PrintableReport + for<'de> Deserialize<'de>,
+{
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let report = decode_blims_response::<T>(response)?;
+        println!("{}", report.title());
+        for bullet in report.bullets() {
+            println!("* {bullet}");
+        }
+    }
+    Ok(())
 }
 
 async fn print_blims_status(json: bool) -> Result<(), CliError> {
