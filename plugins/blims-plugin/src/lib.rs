@@ -121,6 +121,9 @@ pub const OP_REPORT_MORNING: &str = "report.morning";
 /// Event list operation.
 pub const OP_EVENT_LIST: &str = "event.list";
 
+/// Event projection rebuild operation.
+pub const OP_EVENT_REBUILD_PROJECTIONS: &str = "event.rebuild_projections";
+
 /// Blims protocol version for daemon/UI IPC payloads.
 pub const BLIMS_PROTOCOL_VERSION: u16 = 1;
 
@@ -177,6 +180,7 @@ impl RustPlugin for BlimsPlugin {
             OP_WORLD_SNAPSHOT => service_world_snapshot(&context.request),
             OP_REPORT_MORNING => service_morning_report(&context.request),
             OP_EVENT_LIST => service_event_list(&context.request),
+            OP_EVENT_REBUILD_PROJECTIONS => service_event_rebuild_projections(&context.request),
             _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
         }
     }
@@ -267,6 +271,23 @@ pub struct EventListRequest {
     /// Maximum number of events to return.
     #[serde(default = "default_event_limit")]
     pub limit: u64,
+}
+
+/// Result from rebuilding current-state projections from events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionRebuildReport {
+    /// Number of events replayed.
+    pub events_replayed: usize,
+    /// Number of projected initiatives.
+    pub initiatives_projected: usize,
+    /// Number of projected guidance rows.
+    pub guidance_projected: usize,
+    /// Number of projected artifacts.
+    pub artifacts_projected: usize,
+    /// Number of projected work proposals.
+    pub proposals_projected: usize,
+    /// Current projected company lifecycle status.
+    pub lifecycle_status: String,
 }
 
 /// Request to build an AI talk prompt for an agent.
@@ -734,6 +755,16 @@ pub enum BlimsStateError {
     /// JSON serialization failed.
     #[error("failed to encode Blims JSON payload: {0}")]
     Json(#[from] serde_json::Error),
+    /// Event replay failed.
+    #[error("failed to replay Blims event {event_id} ({kind}): {source}")]
+    EventReplay {
+        /// Event id.
+        event_id: i64,
+        /// Event kind.
+        kind: String,
+        /// Underlying payload decoding error.
+        source: serde_json::Error,
+    },
     /// State initialization worker panicked.
     #[error("Blims state initialization worker panicked: {0}")]
     WorkerPanicked(String),
@@ -1110,6 +1141,17 @@ fn service_event_list(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn service_event_rebuild_projections(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match rebuild_projections(&request.working_directory) {
+        Ok(report) => json_response(&report),
+        Err(error) => ServiceResponse::error("event_projection_rebuild_failed", error.to_string()),
+    }
+}
+
 fn company_status(working_directory: &Path) -> CompanyStatus {
     let paths = state_paths(working_directory);
     let lifecycle_status = paths.database_path.exists().then(|| {
@@ -1476,7 +1518,7 @@ async fn seed_company_created_event(
     database
         .exec_raw(
             "INSERT INTO events (company_id, kind, summary, payload_json, correlation_id, causation_id, event_version) \
-             SELECT 'default', 'company.created', 'Blims company state initialized.', '{}', 'bootstrap', 'bootstrap', 1 \
+             SELECT 'default', 'company.created', 'Blims company state initialized.', '{\"type\":\"company_lifecycle_set\",\"lifecycle_status\":\"running\"}', 'bootstrap', 'bootstrap', 1 \
              WHERE NOT EXISTS (SELECT 1 FROM events WHERE kind = 'company.created')",
         )
         .await
@@ -1998,6 +2040,42 @@ fn list_events(request: &EventListRequest) -> Result<Vec<BlimsEventSummary>, Bli
                 .collect()
         })
     })
+}
+
+fn rebuild_projections(
+    working_directory: &Path,
+) -> Result<ProjectionRebuildReport, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(async move {
+            let events = load_event_stream(database).await?;
+            let state = replay_events(&events)?;
+            apply_projection_state(database, &state).await?;
+            Ok(state.report(events.len()))
+        })
+    })
+}
+
+async fn load_event_stream(
+    database: &dyn Database,
+) -> Result<Vec<BlimsEventSummary>, BlimsStateError> {
+    database
+        .select("events")
+        .columns(&[
+            "id",
+            "event_version",
+            "company_id",
+            "kind",
+            "summary",
+            "payload_json",
+            "correlation_id",
+            "causation_id",
+        ])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(event_summary)
+        .collect()
 }
 
 fn list_tasks(working_directory: &Path) -> Result<Vec<TaskSummary>, BlimsStateError> {
@@ -2726,6 +2804,210 @@ fn event_summary(row: &Row) -> Result<BlimsEventSummary, BlimsStateError> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ProjectionState {
+    lifecycle_status: String,
+    initiatives: Vec<InitiativeSummary>,
+    guidance: Vec<GuidanceSummary>,
+    artifacts: Vec<ArtifactDetail>,
+    proposals: Vec<WorkProposalSummary>,
+}
+
+impl ProjectionState {
+    fn report(&self, events_replayed: usize) -> ProjectionRebuildReport {
+        ProjectionRebuildReport {
+            events_replayed,
+            initiatives_projected: self.initiatives.len(),
+            guidance_projected: self.guidance.len(),
+            artifacts_projected: self.artifacts.len(),
+            proposals_projected: self.proposals.len(),
+            lifecycle_status: self.lifecycle_status.clone(),
+        }
+    }
+}
+
+fn replay_events(events: &[BlimsEventSummary]) -> Result<ProjectionState, BlimsStateError> {
+    let mut state = ProjectionState {
+        lifecycle_status: "running".to_string(),
+        ..ProjectionState::default()
+    };
+    for event in events {
+        replay_event(event, &mut state)?;
+    }
+    Ok(state)
+}
+
+fn replay_event(
+    event: &BlimsEventSummary,
+    state: &mut ProjectionState,
+) -> Result<(), BlimsStateError> {
+    let payload =
+        serde_json::from_str::<BlimsEventPayload>(&event.payload_json).map_err(|source| {
+            BlimsStateError::EventReplay {
+                event_id: event.id,
+                kind: event.kind.clone(),
+                source,
+            }
+        })?;
+    match payload {
+        BlimsEventPayload::CompanyLifecycleSet { lifecycle_status } => {
+            state.lifecycle_status = lifecycle_status;
+        }
+        BlimsEventPayload::InitiativeCreated { initiative } => {
+            upsert_by_id(&mut state.initiatives, initiative, |initiative| {
+                &initiative.id
+            });
+        }
+        BlimsEventPayload::InitiativeStatusSet {
+            initiative_id,
+            status,
+        } => {
+            if let Some(initiative) = state
+                .initiatives
+                .iter_mut()
+                .find(|initiative| initiative.id == initiative_id)
+            {
+                initiative.status = status;
+            }
+        }
+        BlimsEventPayload::GuidanceSet { guidance } => {
+            upsert_by_id(&mut state.guidance, guidance, |guidance| &guidance.id);
+        }
+        BlimsEventPayload::InitiativeGuidanceSet { guidance, .. } => {
+            upsert_by_id(&mut state.guidance, guidance, |guidance| &guidance.id);
+        }
+        BlimsEventPayload::ProposalRegistered { proposal } => {
+            upsert_by_id(&mut state.proposals, proposal, |proposal| &proposal.id);
+        }
+        BlimsEventPayload::ProposalStatusSet {
+            proposal_id,
+            status,
+        } => {
+            if let Some(proposal) = state
+                .proposals
+                .iter_mut()
+                .find(|proposal| proposal.id == proposal_id)
+            {
+                proposal.status = status;
+            }
+        }
+        BlimsEventPayload::ArtifactCreated { artifact } => {
+            upsert_by_id(&mut state.artifacts, artifact, |artifact| &artifact.id);
+        }
+        BlimsEventPayload::InitiativePlanImported { .. } => {}
+    }
+    Ok(())
+}
+
+fn upsert_by_id<T>(items: &mut Vec<T>, item: T, id: impl Fn(&T) -> &String) {
+    let item_id = id(&item).clone();
+    if let Some(existing) = items.iter_mut().find(|existing| id(existing) == &item_id) {
+        *existing = item;
+    } else {
+        items.push(item);
+    }
+}
+
+async fn apply_projection_state(
+    database: &dyn Database,
+    state: &ProjectionState,
+) -> Result<(), BlimsStateError> {
+    database
+        .update("companies")
+        .value("lifecycle_status", state.lifecycle_status.clone())
+        .filter(Box::new(where_eq("id", "default")))
+        .execute(database)
+        .await?;
+    replace_initiative_projections(database, &state.initiatives).await?;
+    replace_guidance_projections(database, &state.guidance).await?;
+    replace_artifact_projections(database, &state.artifacts).await?;
+    replace_proposal_projections(database, &state.proposals).await
+}
+
+async fn replace_initiative_projections(
+    database: &dyn Database,
+    initiatives: &[InitiativeSummary],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM initiatives").await?;
+    for initiative in initiatives {
+        database
+            .insert("initiatives")
+            .value("id", initiative.id.clone())
+            .value("company_id", "default")
+            .value("title", initiative.title.clone())
+            .value("description", initiative.description.clone())
+            .value("status", initiative.status.clone())
+            .value("priority", initiative.priority)
+            .value("created_by", "event_replay")
+            .value("guidance", "")
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_guidance_projections(
+    database: &dyn Database,
+    guidance: &[GuidanceSummary],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM executive_guidance").await?;
+    for item in guidance {
+        database
+            .insert("executive_guidance")
+            .value("id", item.id.clone())
+            .value("company_id", "default")
+            .value("guidance", item.guidance.clone())
+            .value("strength", item.strength.clone())
+            .value("active", item.active)
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_artifact_projections(
+    database: &dyn Database,
+    artifacts: &[ArtifactDetail],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM artifacts").await?;
+    for artifact in artifacts {
+        database
+            .insert("artifacts")
+            .value("id", artifact.id.clone())
+            .value("initiative_id", artifact.initiative_id.clone())
+            .value("kind", artifact.kind.clone())
+            .value("title", artifact.title.clone())
+            .value("payload_json", artifact.payload_json.clone())
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_proposal_projections(
+    database: &dyn Database,
+    proposals: &[WorkProposalSummary],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM work_proposals").await?;
+    for proposal in proposals {
+        database
+            .insert("work_proposals")
+            .value("id", proposal.id.clone())
+            .value("task_id", proposal.task_id.clone())
+            .value("initiative_id", proposal.initiative_id.clone())
+            .value("agent_id", proposal.agent_id.clone())
+            .value("session_id", proposal.session_id.clone())
+            .value("worktree_path", proposal.worktree_path.clone())
+            .value("branch", proposal.branch.clone())
+            .value("status", proposal.status.clone())
+            .value("summary", proposal.summary.clone())
+            .value("validation_notes", proposal.validation_notes.clone())
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
 fn task_summary(row: &Row) -> Result<TaskSummary, BlimsStateError> {
     Ok(TaskSummary {
         id: required_text(row, "id")?,
@@ -2929,6 +3211,59 @@ mod tests {
 
         assert!(json.contains("company_lifecycle_set"));
         assert!(json.contains("paused"));
+    }
+
+    #[test]
+    fn replay_events_reconstructs_projection_state() {
+        let initiative = InitiativeSummary {
+            id: "launch-blims".to_string(),
+            title: "Launch Blims".to_string(),
+            description: "Make the office come alive".to_string(),
+            status: "active".to_string(),
+            priority: 1,
+        };
+        let initiative_id = initiative.id.clone();
+        let events = vec![
+            test_event(
+                1,
+                "company.lifecycle_set",
+                &BlimsEventPayload::CompanyLifecycleSet {
+                    lifecycle_status: "running".to_string(),
+                },
+            ),
+            test_event(
+                2,
+                "initiative.created",
+                &BlimsEventPayload::InitiativeCreated { initiative },
+            ),
+            test_event(
+                3,
+                "initiative.status_set",
+                &BlimsEventPayload::InitiativeStatusSet {
+                    initiative_id,
+                    status: "paused".to_string(),
+                },
+            ),
+        ];
+
+        let state = replay_events(&events).expect("events should replay");
+
+        assert_eq!(state.lifecycle_status, "running");
+        assert_eq!(state.initiatives.len(), 1);
+        assert_eq!(state.initiatives[0].status, "paused");
+    }
+
+    fn test_event(id: i64, kind: &str, payload: &BlimsEventPayload) -> BlimsEventSummary {
+        BlimsEventSummary {
+            id,
+            event_version: 1,
+            company_id: "default".to_string(),
+            kind: kind.to_string(),
+            summary: kind.to_string(),
+            payload_json: serde_json::to_string(&payload).expect("payload should encode"),
+            correlation_id: "test".to_string(),
+            causation_id: "test".to_string(),
+        }
     }
 
     fn tempfile_path(name: &str) -> PathBuf {
