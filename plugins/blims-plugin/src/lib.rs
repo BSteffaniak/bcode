@@ -284,87 +284,6 @@ impl EventContext {
             expected_latest: request.expected_latest_event_id.or(self.expected_latest),
         }
     }
-
-    fn merge_optional_ids(
-        &self,
-        correlation_id: Option<&String>,
-        causation_id: Option<&String>,
-        expected_latest_event_id: Option<i64>,
-    ) -> Self {
-        Self {
-            correlation: correlation_id
-                .cloned()
-                .unwrap_or_else(|| self.correlation.clone()),
-            causation: causation_id
-                .cloned()
-                .unwrap_or_else(|| self.causation.clone()),
-            expected_latest: expected_latest_event_id.or(self.expected_latest),
-        }
-    }
-
-    fn merge_initiative_create_request(&self, request: &InitiativeCreateRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
-
-    fn merge_initiative_guidance_request(&self, request: &InitiativeGuidanceRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
-
-    fn merge_guidance_set_request(&self, request: &GuidanceSetRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
-
-    fn merge_initiative_import_plan_request(&self, request: &InitiativeImportPlanRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
-
-    fn merge_proposal_register_request(&self, request: &ProposalRegisterRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
-
-    fn merge_initiative_inspect_request(&self, request: &InitiativeInspectRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
-
-    fn merge_proposal_request(&self, request: &ProposalRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
-
-    fn merge_proposal_record_patch_request(&self, request: &ProposalRecordPatchRequest) -> Self {
-        self.merge_optional_ids(
-            request.correlation_id.as_ref(),
-            request.causation_id.as_ref(),
-            request.expected_latest_event_id,
-        )
-    }
 }
 
 /// Typed Blims IPC request envelope for future daemon/frontends.
@@ -990,6 +909,35 @@ const fn default_event_limit() -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlimsCommandEnvelope<T> {
+    /// Unique command id supplied by caller or daemon.
+    pub command_id: String,
+    /// Actor issuing the command, such as `ceo` or an agent id.
+    pub actor: String,
+    /// Optional Bcode session id associated with the command.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+    /// Typed command payload.
+    pub payload: T,
+}
+
+impl<T> BlimsCommandEnvelope<T> {
+    fn event_context(&self) -> EventContext {
+        EventContext {
+            correlation: self.command_id.clone(),
+            causation: self
+                .session_id
+                .clone()
+                .unwrap_or_else(|| self.command_id.clone()),
+            expected_latest: self.expected_latest_event_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum BlimsEventPayload {
     CompanyLifecycleSet {
@@ -1091,6 +1039,9 @@ pub enum BlimsStateError {
     /// State initialization worker panicked.
     #[error("Blims state initialization worker panicked: {0}")]
     WorkerPanicked(String),
+    /// Command envelope was invalid.
+    #[error("invalid Blims command envelope: {0}")]
+    InvalidCommandEnvelope(String),
     /// Required state was missing.
     #[error("Blims company state has not been created at {0}")]
     StateMissing(PathBuf),
@@ -1166,10 +1117,11 @@ fn service_company_lifecycle(
     event_context: &EventContext,
     lifecycle_status: &str,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<WorkspaceRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
+    let (request, event_context) =
+        match parse_service_command::<WorkspaceRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
 
     let event_context = event_context.merge_workspace_request(&request);
     match set_company_lifecycle(&request.working_directory, &event_context, lifecycle_status) {
@@ -1200,11 +1152,11 @@ fn service_initiative_create(
     request: &ServiceRequest,
     event_context: &EventContext,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<InitiativeCreateRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_initiative_create_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<InitiativeCreateRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match create_initiative(&request, &event_context) {
         Ok(initiative) => json_response(&initiative),
         Err(error) => ServiceResponse::error("initiative_create_failed", error.to_string()),
@@ -1237,11 +1189,11 @@ fn service_initiative_set_guidance(
     request: &ServiceRequest,
     event_context: &EventContext,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<InitiativeGuidanceRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_initiative_guidance_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<InitiativeGuidanceRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match set_initiative_guidance(&request, &event_context) {
         Ok(guidance) => json_response(&guidance),
         Err(error) => ServiceResponse::error("initiative_guidance_failed", error.to_string()),
@@ -1253,11 +1205,11 @@ fn service_initiative_status(
     event_context: &EventContext,
     status: &str,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<InitiativeInspectRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_initiative_inspect_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<InitiativeInspectRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match set_initiative_status(&request, &event_context, status) {
         Ok(initiative) => json_response(&initiative),
         Err(error) => ServiceResponse::error("initiative_status_failed", error.to_string()),
@@ -1265,11 +1217,11 @@ fn service_initiative_status(
 }
 
 fn service_guidance_set(request: &ServiceRequest, event_context: &EventContext) -> ServiceResponse {
-    let request = match request.payload_json::<GuidanceSetRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_guidance_set_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<GuidanceSetRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match set_guidance(&request, &event_context) {
         Ok(guidance) => json_response(&guidance),
         Err(error) => ServiceResponse::error("guidance_set_failed", error.to_string()),
@@ -1302,11 +1254,11 @@ fn service_initiative_import_plan(
     request: &ServiceRequest,
     event_context: &EventContext,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<InitiativeImportPlanRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_initiative_import_plan_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<InitiativeImportPlanRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match import_initiative_plan(&request, &event_context) {
         Ok(plan) => json_response(&plan),
         Err(error) => ServiceResponse::error("initiative_import_failed", error.to_string()),
@@ -1372,11 +1324,11 @@ fn service_proposal_register(
     request: &ServiceRequest,
     event_context: &EventContext,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<ProposalRegisterRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_proposal_register_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<ProposalRegisterRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match register_proposal(&request, &event_context) {
         Ok(proposal) => json_response(&proposal),
         Err(error) => ServiceResponse::error("proposal_register_failed", error.to_string()),
@@ -1417,11 +1369,11 @@ fn service_proposal_status(
     event_context: &EventContext,
     status: &str,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<ProposalRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_proposal_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<ProposalRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match set_proposal_status(&request, &event_context, status) {
         Ok(proposal) => json_response(&proposal),
         Err(error) => ServiceResponse::error("proposal_status_failed", error.to_string()),
@@ -1432,11 +1384,11 @@ fn service_proposal_record_patch(
     request: &ServiceRequest,
     event_context: &EventContext,
 ) -> ServiceResponse {
-    let request = match request.payload_json::<ProposalRecordPatchRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    let event_context = event_context.merge_proposal_record_patch_request(&request);
+    let (request, event_context) =
+        match parse_service_command::<ProposalRecordPatchRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
     match record_proposal_patch(&request, &event_context) {
         Ok(artifact) => json_response(&artifact),
         Err(error) => ServiceResponse::error("proposal_record_patch_failed", error.to_string()),
@@ -1900,6 +1852,17 @@ async fn append_bootstrap_event_once(
     payload: &BlimsEventPayload,
 ) -> Result<(), switchy_database::DatabaseError> {
     let payload_json = serde_json::to_string(payload).expect("bootstrap event should encode");
+    let existing = database
+        .select("events")
+        .columns(&["id"])
+        .filter(Box::new(where_eq("kind", kind)))
+        .filter(Box::new(where_eq("payload_json", payload_json.clone())))
+        .limit(1)
+        .execute_first(database)
+        .await?;
+    if existing.is_some() {
+        return Ok(());
+    }
     database
         .insert("events")
         .value("company_id", "default")
@@ -3992,6 +3955,33 @@ fn morning_report(data: &CompanyData) -> MorningReport {
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     ServiceResponse::json(value)
         .unwrap_or_else(|error| ServiceResponse::error("serialization_failed", error.to_string()))
+}
+
+fn parse_service_command<T>(
+    request: &ServiceRequest,
+    fallback_context: &EventContext,
+) -> Result<(T, EventContext), BlimsStateError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if let Ok(envelope) = request.payload_json::<BlimsCommandEnvelope<T>>() {
+        if envelope.command_id.trim().is_empty() {
+            return Err(BlimsStateError::InvalidCommandEnvelope(
+                "command_id cannot be empty".to_string(),
+            ));
+        }
+        if envelope.actor.trim().is_empty() {
+            return Err(BlimsStateError::InvalidCommandEnvelope(
+                "actor cannot be empty".to_string(),
+            ));
+        }
+        let event_context = envelope.event_context();
+        return Ok((envelope.payload, event_context));
+    }
+    request
+        .payload_json::<T>()
+        .map(|payload| (payload, fallback_context.clone()))
+        .map_err(|error| BlimsStateError::InvalidRequest(error.to_string()))
 }
 
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
