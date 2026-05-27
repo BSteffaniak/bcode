@@ -171,6 +171,12 @@ fn run_shell_tool(
             rows: arguments.terminal.then_some(arguments.terminal_rows()),
         },
     );
+    emit_tool_status(
+        events,
+        tool_call_id,
+        0,
+        format!("starting command: {}", arguments.command),
+    );
     let response = if arguments.terminal {
         run_terminal_shell_command(
             events,
@@ -310,11 +316,23 @@ fn run_terminal_shell_command_inner(
         }
         if cancellation.is_cancelled() || cancellation_path.is_some_and(Path::exists) {
             cancelled = true;
+            emit_tool_status(
+                events,
+                tool_call_id,
+                1,
+                "cancellation requested; killing terminal process",
+            );
             child.kill().map_err(|error| error.to_string())?;
             break child.wait().map_err(|error| error.to_string())?;
         }
         if started.elapsed() >= timeout {
             timed_out = true;
+            emit_tool_status(
+                events,
+                tool_call_id,
+                1,
+                "timeout reached; killing terminal process",
+            );
             child.kill().map_err(|error| error.to_string())?;
             break child.wait().map_err(|error| error.to_string())?;
         }
@@ -548,6 +566,22 @@ fn emit_tool_output_delta(
             sequence,
             text: String::from_utf8_lossy(bytes).into_owned(),
             byte_len: bytes.len(),
+        },
+    );
+}
+
+fn emit_tool_status(
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+    sequence: u64,
+    message: impl Into<String>,
+) {
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::Status {
+            tool_call_id: tool_call_id.to_owned(),
+            sequence,
+            message: message.into(),
         },
     );
 }

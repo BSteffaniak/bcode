@@ -74,7 +74,9 @@ pub async fn run_with_client<W: Write>(
                     chat.app.absorb_session_event(&event);
                     needs_redraw = true;
                 }
-                BcodeEvent::Session(_) | BcodeEvent::SessionCatalogUpdated { .. } => {}
+                BcodeEvent::Session(_)
+                | BcodeEvent::RuntimeWork(_)
+                | BcodeEvent::SessionCatalogUpdated { .. } => {}
             }
         }
 

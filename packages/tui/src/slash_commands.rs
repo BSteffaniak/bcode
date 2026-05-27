@@ -53,7 +53,38 @@ async fn describe_skill(
 async fn runtime_status(
     client: &BcodeClient,
     session_id: SessionId,
+    parts: &[&str],
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    if parts.get(1) == Some(&"history") {
+        let spans = client.runtime_work_spans(session_id, 50).await?;
+        if spans.is_empty() {
+            return Ok(SlashCommandOutcome::Handled(
+                "runtime history: empty".to_string(),
+            ));
+        }
+        let lines = spans
+            .into_iter()
+            .map(|span| {
+                format!(
+                    "{} {:?} duration_ms={:?} parent={} {}{}",
+                    span.work_id,
+                    span.status,
+                    span.duration_ms(),
+                    span.parent_work_id
+                        .as_ref()
+                        .map_or_else(|| "-".to_string(), ToString::to_string),
+                    span.label,
+                    span.message
+                        .as_ref()
+                        .map_or_else(String::new, |message| format!(" — {message}"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(SlashCommandOutcome::Handled(format!(
+            "runtime history:\n{lines}"
+        )));
+    }
     let work = client.list_runtime_work(session_id).await?;
     if work.is_empty() {
         return Ok(SlashCommandOutcome::Handled("runtime: idle".to_string()));
@@ -387,7 +418,8 @@ async fn stop_command(
         .cancel_session_turn_with_options(session_id, true)
         .await?;
     Ok(SlashCommandOutcome::Handled(if cancelled {
-        "turn cancellation requested; queued messages cleared".to_string()
+        "turn cancellation requested; queued messages cleared; use /runtime to inspect active work"
+            .to_string()
     } else {
         "no active turn".to_string()
     }))
@@ -503,7 +535,7 @@ pub async fn execute(
         "thinking" => thinking_command(client, session_id, &parts).await,
         "stop" => stop_command(client, session_id).await,
         "cancel-runtime" => cancel_runtime_command(client, session_id, &parts).await,
-        "runtime" | "status" => runtime_status(client, session_id).await,
+        "runtime" | "status" => runtime_status(client, session_id, &parts).await,
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }
 }

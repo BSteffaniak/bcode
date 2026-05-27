@@ -323,7 +323,30 @@ impl SessionCatalogWatcher {
                     self.last_revision = snapshot.catalog_revision.max(revision);
                     return Ok(snapshot);
                 }
-                Event::SessionCatalogUpdated { .. } | Event::Session(_) => {}
+                Event::SessionCatalogUpdated { .. } | Event::Session(_) | Event::RuntimeWork(_) => {
+                }
+            }
+        }
+    }
+}
+
+/// Event-driven runtime-work watcher.
+#[derive(Debug)]
+pub struct RuntimeWorkWatcher {
+    connection: ClientConnection,
+}
+
+impl RuntimeWorkWatcher {
+    /// Wait for the next runtime-work lifecycle event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon connection closes or the event cannot be decoded.
+    pub async fn next_event(&mut self) -> Result<SessionEvent, ClientError> {
+        loop {
+            match self.connection.recv_event().await? {
+                Event::RuntimeWork(event) => return Ok(event),
+                Event::Session(_) | Event::SessionCatalogUpdated { .. } => {}
             }
         }
     }
@@ -367,6 +390,20 @@ impl BcodeClient {
             connection,
             last_revision: 0,
         })
+    }
+
+    /// Create an event-driven runtime-work watcher for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the subscription.
+    pub async fn watch_runtime_work(
+        &self,
+        session_id: SessionId,
+    ) -> Result<RuntimeWorkWatcher, ClientError> {
+        let mut connection = self.connect("bcode-runtime-work").await?;
+        connection.subscribe_runtime_work(session_id).await?;
+        Ok(RuntimeWorkWatcher { connection })
     }
 
     /// Check whether the local server accepts requests.
@@ -1334,6 +1371,24 @@ impl ClientConnection {
     pub async fn subscribe_catalog_updates(&mut self) -> Result<(), ClientError> {
         match self.send_request(Request::SubscribeCatalogUpdates).await? {
             ResponsePayload::CatalogUpdatesSubscribed => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Subscribe this connection to runtime-work events for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn subscribe_runtime_work(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::SubscribeRuntimeWork { session_id })
+            .await?
+        {
+            ResponsePayload::RuntimeWorkSubscribed => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

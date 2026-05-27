@@ -370,6 +370,9 @@ enum RuntimeWorkCommand {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    Watch {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3660,6 +3663,13 @@ async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), 
                 );
             }
         }
+        RuntimeWorkCommand::Watch { session_id } => {
+            let mut watcher = client.watch_runtime_work(session_id).await?;
+            loop {
+                let event = watcher.next_event().await?;
+                print_session_event(&event);
+            }
+        }
     }
     Ok(())
 }
@@ -3735,7 +3745,7 @@ async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
         tokio::select! {
             event = connection.recv_event() => {
                 match event? {
-                    Event::Session(event) => print_session_event(&event),
+                    Event::Session(event) | Event::RuntimeWork(event) => print_session_event(&event),
                     Event::SessionCatalogUpdated { .. } => {}
                 }
             }

@@ -1355,6 +1355,9 @@ async fn handle_request(
         Request::RuntimeWorkHistory { session_id, limit } => {
             handle_runtime_work_history(request_id, state, writer, session_id, limit).await
         }
+        Request::SubscribeRuntimeWork { session_id } => {
+            handle_subscribe_runtime_work(request_id, state, writer, session_id).await
+        }
         Request::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
         }
@@ -3097,6 +3100,25 @@ async fn handle_runtime_work_history(
         writer,
         request_id,
         Response::Ok(ResponsePayload::RuntimeWorkHistory { events }),
+    )
+    .await
+}
+
+async fn handle_subscribe_runtime_work(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let attachment = state
+        .sessions
+        .attach_session_recent(session_id, ClientId::new(), 1)
+        .await?;
+    forward_runtime_work_events(writer.clone(), attachment.events);
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::RuntimeWorkSubscribed),
     )
     .await
 }
@@ -7539,6 +7561,37 @@ fn forward_session_events(
             let mut writer = writer.lock().await;
             if let Err(error) = send_envelope(&mut *writer, &envelope).await {
                 eprintln!("failed to send session event: {error}");
+                break;
+            }
+        }
+    });
+}
+
+fn forward_runtime_work_events(
+    writer: SharedWriter,
+    mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
+) {
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if !matches!(
+                event.kind,
+                SessionEventKind::RuntimeWorkStarted { .. }
+                    | SessionEventKind::RuntimeWorkCancelRequested { .. }
+                    | SessionEventKind::RuntimeWorkProgress { .. }
+                    | SessionEventKind::RuntimeWorkFinished { .. }
+            ) {
+                continue;
+            }
+            let envelope = match event_envelope(&Event::RuntimeWork(event)) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    eprintln!("failed to encode runtime work event: {error}");
+                    break;
+                }
+            };
+            let mut writer = writer.lock().await;
+            if let Err(error) = send_envelope(&mut *writer, &envelope).await {
+                eprintln!("failed to send runtime work event: {error}");
                 break;
             }
         }

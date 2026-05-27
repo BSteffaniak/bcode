@@ -247,6 +247,9 @@ pub enum Request {
         session_id: SessionId,
         limit: usize,
     },
+    SubscribeRuntimeWork {
+        session_id: SessionId,
+    },
     SubscribeCatalogUpdates,
 }
 
@@ -548,6 +551,7 @@ pub enum ResponsePayload {
     RuntimeWorkHistory {
         events: Vec<SessionEvent>,
     },
+    RuntimeWorkSubscribed,
 }
 
 /// Structured error response.
@@ -583,6 +587,7 @@ pub enum Response {
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     Session(SessionEvent),
+    RuntimeWork(SessionEvent),
     SessionCatalogUpdated {
         #[serde(default)]
         revision: u64,
