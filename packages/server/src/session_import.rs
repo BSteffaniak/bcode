@@ -240,8 +240,11 @@ pub async fn handle_import_external_session(
 ) -> Result<(), ServerError> {
     match import_external_session(state, source_id, external_session_id).await {
         Ok((session_id, warnings)) => {
-            state.session_catalog.refresh_native_now(state).await;
             let session = state.sessions.session_summary(session_id).await?;
+            state
+                .session_catalog
+                .upsert_native_session(session.clone())
+                .await;
             send_response(
                 writer,
                 request_id,
@@ -286,7 +289,9 @@ pub async fn resolve_attach_session_id(
     };
     match import_external_session(state, &source_id, &external_session_id).await {
         Ok((imported_session_id, warnings)) => {
-            state.session_catalog.refresh_native_now(state).await;
+            if let Ok(session) = state.sessions.session_summary(imported_session_id).await {
+                state.session_catalog.upsert_native_session(session).await;
+            }
             if !warnings.is_empty() {
                 eprintln!(
                     "imported [{source_id}] session with {} warnings",

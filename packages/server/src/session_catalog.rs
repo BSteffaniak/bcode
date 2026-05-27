@@ -1,9 +1,9 @@
 //! Unified non-blocking session catalog snapshots.
 
-use crate::{ServerState, catalog_status_to_ipc};
+use crate::ServerState;
 use bcode_ipc::{SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session_import::ImportableSessionStatus;
-use bcode_session_models::{SessionImportSummary, SessionSummary};
+use bcode_session_models::{SessionId, SessionImportSummary, SessionSummary};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, watch};
 
 const NATIVE_SOURCE_ID: &str = "native";
+const NATIVE_DISPLAY_NAME: &str = "Native Bcode sessions";
 
 /// Server-owned session catalog cache.
 #[derive(Debug)]
@@ -24,21 +25,53 @@ pub struct SessionCatalog {
 #[derive(Debug, Default)]
 struct SessionCatalogInner {
     revision: u64,
-    native: SourceState,
-    imports: BTreeMap<ImportScopeKey, SourceState>,
-}
-
-#[derive(Debug, Default, Clone)]
-struct SourceState {
-    status: SessionCatalogStatus,
-    sessions: Vec<SessionSummary>,
-    requested: bool,
+    sources: BTreeMap<CatalogSourceKey, SourceCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ImportScopeKey {
+struct CatalogSourceKey {
     source_id: String,
-    working_directory: PathBuf,
+    scope: CatalogSourceScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CatalogSourceScope {
+    Global,
+    WorkingDirectory(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+struct SourceMetadata {
+    display_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct SourceCache {
+    metadata: SourceMetadata,
+    state: SourceCacheState,
+}
+
+#[derive(Debug, Clone)]
+enum SourceCacheState {
+    Empty,
+    Loading,
+    Loaded {
+        sessions: Vec<SessionSummary>,
+    },
+    Failed {
+        message: String,
+        sessions: Vec<SessionSummary>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum CatalogSourcePlan {
+    Native,
+    Import {
+        plugin_id: String,
+        source_id: String,
+        working_directory: PathBuf,
+    },
 }
 
 /// Point-in-time catalog response for one working directory.
@@ -74,18 +107,64 @@ impl SessionCatalog {
         state: &Arc<ServerState>,
         working_directory: &Path,
     ) -> SessionCatalogSnapshot {
-        self.ensure_native_refresh(state).await;
-        self.ensure_import_refresh(state, working_directory).await;
-        let mut inner = self.inner.lock().await;
-        sync_native_status_locked(&mut inner, state);
-        snapshot_locked(&inner, working_directory)
+        let working_directory = normalize_path(working_directory);
+        self.ensure_sources(state, &working_directory).await;
+        let inner = self.inner.lock().await;
+        snapshot_locked(&inner, &working_directory)
     }
 
-    /// Mark the catalog dirty after a native session mutation.
-    pub async fn refresh_native_now(&self, state: &Arc<ServerState>) {
-        let sessions = state.sessions.all_session_summaries().await;
-        let status = catalog_status_to_ipc(state.sessions.catalog_status());
-        self.apply_native(sessions, status).await;
+    /// Replace the native source with a fresh view from the session manager.
+    pub async fn refresh_native_now(&self, state: &ServerState) {
+        let result = load_native_source(state).await;
+        self.apply_source_result(native_source_key(), native_metadata(), result)
+            .await;
+    }
+
+    /// Mark native sessions dirty so the next snapshot reloads them.
+    pub async fn invalidate_native(&self) {
+        self.invalidate_source_id(NATIVE_SOURCE_ID).await;
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    /// Update a materialized native session cache after a native session mutation.
+    pub async fn upsert_native_session(&self, session: SessionSummary) {
+        let changed = {
+            let mut inner = self.inner.lock().await;
+            let Some(source) = inner.sources.get_mut(&native_source_key()) else {
+                return;
+            };
+            let sessions = match &mut source.state {
+                SourceCacheState::Loaded { sessions }
+                | SourceCacheState::Failed { sessions, .. } => sessions,
+                SourceCacheState::Empty | SourceCacheState::Loading => return,
+            };
+            upsert_session(sessions, session)
+        };
+        if changed {
+            self.bump_revision().await;
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    /// Remove a native session from a materialized native session cache.
+    pub async fn remove_native_session(&self, session_id: SessionId) {
+        let changed = {
+            let mut inner = self.inner.lock().await;
+            let Some(source) = inner.sources.get_mut(&native_source_key()) else {
+                return;
+            };
+            let sessions = match &mut source.state {
+                SourceCacheState::Loaded { sessions }
+                | SourceCacheState::Failed { sessions, .. } => sessions,
+                SourceCacheState::Empty | SourceCacheState::Loading => return,
+            };
+            let original_len = sessions.len();
+            sessions.retain(|session| session.id != session_id);
+            sessions.len() != original_len
+        };
+        if changed {
+            self.bump_revision().await;
+        }
     }
 
     /// Force a catalog refresh for the selected sources.
@@ -95,178 +174,120 @@ impl SessionCatalog {
         working_directory: &Path,
         sources: Option<&[String]>,
     ) -> SessionCatalogSnapshot {
-        self.invalidate_sources(working_directory, sources).await;
-        self.snapshot(state, working_directory).await
+        let working_directory = normalize_path(working_directory);
+        self.invalidate_sources(&working_directory, sources).await;
+        self.snapshot(state, &working_directory).await
+    }
+
+    async fn ensure_sources(&self, state: &Arc<ServerState>, working_directory: &Path) {
+        for plan in source_plans(state, working_directory).await {
+            self.ensure_source(state, plan).await;
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    async fn ensure_source(&self, state: &Arc<ServerState>, plan: CatalogSourcePlan) {
+        let key = plan.key();
+        let metadata = plan.metadata();
+        let should_spawn = {
+            let mut inner = self.inner.lock().await;
+            let source = inner
+                .sources
+                .entry(key.clone())
+                .or_insert_with(|| SourceCache {
+                    metadata: metadata.clone(),
+                    state: SourceCacheState::Empty,
+                });
+            source.metadata = metadata.clone();
+            match source.state {
+                SourceCacheState::Empty | SourceCacheState::Failed { .. } => {
+                    source.state = SourceCacheState::Loading;
+                    true
+                }
+                SourceCacheState::Loading | SourceCacheState::Loaded { .. } => false,
+            }
+        };
+        if !should_spawn {
+            return;
+        }
+        self.bump_revision().await;
+        let state = Arc::clone(state);
+        let catalog = Arc::clone(&state.session_catalog);
+        tokio::spawn(async move {
+            let key = plan.key();
+            let metadata = plan.metadata();
+            let result = load_source(&state, &plan).await;
+            catalog.apply_source_result(key, metadata, result).await;
+        });
     }
 
     async fn invalidate_sources(&self, working_directory: &Path, sources: Option<&[String]>) {
-        let mut inner = self.inner.lock().await;
         let refresh_all = sources.is_none_or(<[String]>::is_empty);
         let should_refresh = |source_id: &str| {
             refresh_all
                 || sources.is_some_and(|sources| sources.iter().any(|source| source == source_id))
         };
-        if should_refresh(NATIVE_SOURCE_ID) {
-            inner.native.requested = false;
-            inner.native.status = SessionCatalogStatus::NotStarted;
-        }
-        for (key, source) in &mut inner.imports {
-            if key.working_directory == working_directory && should_refresh(&key.source_id) {
-                source.requested = false;
-                source.status = SessionCatalogStatus::NotStarted;
-                source.sessions.clear();
-            }
-        }
-        inner.revision = inner.revision.saturating_add(1);
-        let _ = self.revision_tx.send(inner.revision);
-        drop(inner);
-        self.notify.notify_waiters();
-    }
-
-    async fn ensure_native_refresh(&self, state: &Arc<ServerState>) {
-        let should_spawn = {
+        let mut changed = false;
+        {
             let mut inner = self.inner.lock().await;
-            sync_native_status_locked(&mut inner, state);
-            if matches!(
-                inner.native.status,
-                SessionCatalogStatus::Loaded | SessionCatalogStatus::Loading
-            ) || inner.native.requested
-            {
-                false
-            } else {
-                inner.native.requested = true;
-                inner.native.status = SessionCatalogStatus::Loading;
-                true
+            for (key, source) in &mut inner.sources {
+                let in_scope = matches!(key.scope, CatalogSourceScope::Global)
+                    || matches!(&key.scope, CatalogSourceScope::WorkingDirectory(path) if path == working_directory);
+                if in_scope && should_refresh(&key.source_id) {
+                    source.state = SourceCacheState::Empty;
+                    changed = true;
+                }
             }
-        };
-        if !should_spawn {
-            return;
         }
-        self.bump();
-        state.sessions.start_catalog_load();
-        let state = Arc::clone(state);
-        let catalog = Arc::clone(&state.session_catalog);
-        tokio::spawn(async move {
-            let result = state.sessions.wait_catalog_loaded().await;
-            let status = match result {
-                Ok(()) => SessionCatalogStatus::Loaded,
-                Err(error) => SessionCatalogStatus::Failed(error.to_string()),
-            };
-            let sessions = state.sessions.all_session_summaries().await;
-            catalog.apply_native(sessions, status).await;
-        });
+        if changed {
+            self.bump_revision().await;
+        }
     }
 
-    async fn ensure_import_refresh(&self, state: &Arc<ServerState>, working_directory: &Path) {
-        if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
-            return;
-        }
-        let providers = state
-            .plugins
-            .registry()
-            .service_registry()
-            .providers_for(bcode_session_import::SESSION_IMPORT_INTERFACE_ID)
-            .cloned()
-            .unwrap_or_default();
-        for plugin_id in providers {
-            let source_ids = import_source_ids(state, &plugin_id).await;
-            for source_id in source_ids {
-                self.ensure_import_source_refresh(
-                    state,
-                    plugin_id.clone(),
-                    source_id,
-                    working_directory.to_path_buf(),
-                )
-                .await;
+    async fn invalidate_source_id(&self, source_id: &str) {
+        let mut changed = false;
+        {
+            let mut inner = self.inner.lock().await;
+            for (key, source) in &mut inner.sources {
+                if key.source_id == source_id {
+                    source.state = SourceCacheState::Empty;
+                    changed = true;
+                }
             }
+        }
+        if changed {
+            self.bump_revision().await;
         }
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    async fn ensure_import_source_refresh(
+    async fn apply_source_result(
         &self,
-        state: &Arc<ServerState>,
-        plugin_id: String,
-        source_id: String,
-        working_directory: PathBuf,
-    ) {
-        let key = ImportScopeKey {
-            source_id: source_id.clone(),
-            working_directory: working_directory.clone(),
-        };
-        let should_spawn = {
-            let mut inner = self.inner.lock().await;
-            let source = inner.imports.entry(key.clone()).or_default();
-            if source.requested
-                || matches!(
-                    source.status,
-                    SessionCatalogStatus::Loaded | SessionCatalogStatus::Loading
-                )
-            {
-                false
-            } else {
-                source.requested = true;
-                source.status = SessionCatalogStatus::Loading;
-                true
-            }
-        };
-        if !should_spawn {
-            return;
-        }
-        self.bump();
-        let state = Arc::clone(state);
-        let catalog = Arc::clone(&state.session_catalog);
-        tokio::spawn(async move {
-            let result =
-                discover_import_source(&state, &plugin_id, &source_id, &working_directory).await;
-            match result {
-                Ok(sessions) => {
-                    catalog
-                        .apply_import(key, sessions, SessionCatalogStatus::Loaded)
-                        .await;
-                }
-                Err(error) => {
-                    eprintln!("failed to discover import source {source_id}: {error}");
-                    catalog
-                        .apply_import(key, Vec::new(), SessionCatalogStatus::Failed(error))
-                        .await;
-                }
-            }
-        });
-    }
-
-    async fn apply_native(&self, sessions: Vec<SessionSummary>, status: SessionCatalogStatus) {
-        {
-            let mut inner = self.inner.lock().await;
-            inner.native.sessions = sessions;
-            inner.native.status = status;
-            inner.native.requested = true;
-            inner.revision = inner.revision.saturating_add(1);
-            let _ = self.revision_tx.send(inner.revision);
-        }
-        self.notify.notify_waiters();
-    }
-
-    async fn apply_import(
-        &self,
-        key: ImportScopeKey,
-        sessions: Vec<SessionSummary>,
-        status: SessionCatalogStatus,
+        key: CatalogSourceKey,
+        metadata: SourceMetadata,
+        result: Result<Vec<SessionSummary>, String>,
     ) {
         {
             let mut inner = self.inner.lock().await;
-            let source = inner.imports.entry(key).or_default();
-            source.sessions = sessions;
-            source.status = status;
-            source.requested = true;
-            inner.revision = inner.revision.saturating_add(1);
-            let _ = self.revision_tx.send(inner.revision);
+            let source = inner.sources.entry(key).or_insert_with(|| SourceCache {
+                metadata: metadata.clone(),
+                state: SourceCacheState::Empty,
+            });
+            source.metadata = metadata;
+            source.state = match result {
+                Ok(sessions) => SourceCacheState::Loaded { sessions },
+                Err(message) => SourceCacheState::Failed {
+                    message,
+                    sessions: Vec::new(),
+                },
+            };
         }
-        self.notify.notify_waiters();
+        self.bump_revision().await;
     }
 
-    fn bump(&self) {
-        if let Ok(mut inner) = self.inner.try_lock() {
+    async fn bump_revision(&self) {
+        {
+            let mut inner = self.inner.lock().await;
             inner.revision = inner.revision.saturating_add(1);
             let _ = self.revision_tx.send(inner.revision);
         }
@@ -274,63 +295,173 @@ impl SessionCatalog {
     }
 }
 
-fn sync_native_status_locked(inner: &mut SessionCatalogInner, state: &ServerState) {
-    let status = catalog_status_to_ipc(state.sessions.catalog_status());
-    if inner.native.status != status {
-        inner.native.status = status;
+impl CatalogSourcePlan {
+    fn key(&self) -> CatalogSourceKey {
+        match self {
+            Self::Native => native_source_key(),
+            Self::Import {
+                source_id,
+                working_directory,
+                ..
+            } => CatalogSourceKey {
+                source_id: source_id.clone(),
+                scope: CatalogSourceScope::WorkingDirectory(normalize_path(working_directory)),
+            },
+        }
     }
+
+    fn metadata(&self) -> SourceMetadata {
+        match self {
+            Self::Native => native_metadata(),
+            Self::Import { source_id, .. } => SourceMetadata {
+                display_name: format!("Imported [{source_id}] sessions"),
+            },
+        }
+    }
+}
+
+fn native_source_key() -> CatalogSourceKey {
+    CatalogSourceKey {
+        source_id: NATIVE_SOURCE_ID.to_owned(),
+        scope: CatalogSourceScope::Global,
+    }
+}
+
+fn native_metadata() -> SourceMetadata {
+    SourceMetadata {
+        display_name: NATIVE_DISPLAY_NAME.to_owned(),
+    }
+}
+
+async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<CatalogSourcePlan> {
+    let mut plans = vec![CatalogSourcePlan::Native];
+    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
+        return plans;
+    }
+    let providers = state
+        .plugins
+        .registry()
+        .service_registry()
+        .providers_for(bcode_session_import::SESSION_IMPORT_INTERFACE_ID)
+        .cloned()
+        .unwrap_or_default();
+    for plugin_id in providers {
+        for source_id in import_source_ids(state, &plugin_id).await {
+            plans.push(CatalogSourcePlan::Import {
+                plugin_id: plugin_id.clone(),
+                source_id,
+                working_directory: working_directory.to_path_buf(),
+            });
+        }
+    }
+    plans
+}
+
+async fn load_source(
+    state: &ServerState,
+    plan: &CatalogSourcePlan,
+) -> Result<Vec<SessionSummary>, String> {
+    match plan {
+        CatalogSourcePlan::Native => load_native_source(state).await,
+        CatalogSourcePlan::Import {
+            plugin_id,
+            source_id,
+            working_directory,
+        } => discover_import_source(state, plugin_id, source_id, working_directory).await,
+    }
+}
+
+async fn load_native_source(state: &ServerState) -> Result<Vec<SessionSummary>, String> {
+    state
+        .sessions
+        .wait_catalog_loaded()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(state.sessions.all_session_summaries().await)
 }
 
 fn snapshot_locked(
     inner: &SessionCatalogInner,
     working_directory: &Path,
 ) -> SessionCatalogSnapshot {
-    let native_imports = native_import_identities(&inner.native.sessions);
+    let native_sessions = inner
+        .sources
+        .get(&native_source_key())
+        .map_or(&[][..], SourceCache::sessions);
+    let native_imports = native_import_identities(native_sessions);
     let hide_imported = bcode_config::load_config()
         .map_or(true, |config| config.session_import.hide_already_imported);
-    let mut sessions = inner
-        .native
-        .sessions
-        .iter()
-        .filter(|session| session.working_directory == working_directory)
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut sources = vec![source_status(
-        NATIVE_SOURCE_ID,
-        "Native Bcode sessions",
-        &inner.native.status,
-    )];
-    for (key, source) in &inner.imports {
-        if key.working_directory != working_directory {
+    let mut sessions = Vec::new();
+    let mut sources = Vec::new();
+
+    for (key, source) in &inner.sources {
+        if !source_relevant_to_working_directory(key, working_directory) {
             continue;
         }
-        sources.push(source_status(
-            &key.source_id,
-            format!("Imported [{}] sessions", key.source_id),
-            &source.status,
-        ));
-        sessions.extend(
-            source
-                .sessions
-                .iter()
-                .filter(|session| {
-                    session.import.as_ref().is_none_or(|import| {
-                        !hide_imported
-                            || !native_imports.contains(&(
-                                import.source_id.clone(),
-                                import.external_session_id.clone(),
-                            ))
+        sources.push(source_status(key, source));
+        match &key.scope {
+            CatalogSourceScope::Global => sessions.extend(
+                source
+                    .sessions()
+                    .iter()
+                    .filter(|session| {
+                        normalize_path(&session.working_directory) == working_directory
                     })
-                })
-                .cloned(),
-        );
+                    .cloned(),
+            ),
+            CatalogSourceScope::WorkingDirectory(_) => sessions.extend(
+                source
+                    .sessions()
+                    .iter()
+                    .filter(|session| {
+                        session.import.as_ref().is_none_or(|import| {
+                            !hide_imported
+                                || !native_imports.contains(&(
+                                    import.source_id.clone(),
+                                    import.external_session_id.clone(),
+                                ))
+                        })
+                    })
+                    .cloned(),
+            ),
+        }
     }
+
     sort_sessions(&mut sessions);
     SessionCatalogSnapshot {
         status: aggregate_status(sources.iter().map(|source| &source.status)),
         sessions,
         sources,
         revision: inner.revision,
+    }
+}
+
+impl SourceCache {
+    fn status(&self) -> SessionCatalogStatus {
+        match &self.state {
+            SourceCacheState::Empty => SessionCatalogStatus::NotStarted,
+            SourceCacheState::Loading => SessionCatalogStatus::Loading,
+            SourceCacheState::Loaded { .. } => SessionCatalogStatus::Loaded,
+            SourceCacheState::Failed { message, .. } => {
+                SessionCatalogStatus::Failed(message.clone())
+            }
+        }
+    }
+
+    fn sessions(&self) -> &[SessionSummary] {
+        match &self.state {
+            SourceCacheState::Loaded { sessions } | SourceCacheState::Failed { sessions, .. } => {
+                sessions
+            }
+            SourceCacheState::Empty | SourceCacheState::Loading => &[],
+        }
+    }
+}
+
+fn source_relevant_to_working_directory(key: &CatalogSourceKey, working_directory: &Path) -> bool {
+    match &key.scope {
+        CatalogSourceScope::Global => true,
+        CatalogSourceScope::WorkingDirectory(path) => path == working_directory,
     }
 }
 
@@ -346,15 +477,11 @@ fn native_import_identities(sessions: &[SessionSummary]) -> BTreeSet<(String, St
         .collect()
 }
 
-fn source_status(
-    source_id: impl Into<String>,
-    display_name: impl Into<String>,
-    status: &SessionCatalogStatus,
-) -> SessionCatalogSourceStatus {
+fn source_status(key: &CatalogSourceKey, source: &SourceCache) -> SessionCatalogSourceStatus {
     SessionCatalogSourceStatus {
-        source_id: source_id.into(),
-        display_name: display_name.into(),
-        status: status.clone(),
+        source_id: key.source_id.clone(),
+        display_name: source.metadata.display_name.clone(),
+        status: source.status(),
         updated_at_ms: current_unix_millis(),
     }
 }
@@ -364,14 +491,16 @@ fn aggregate_status<'a>(
 ) -> SessionCatalogStatus {
     let mut has_loading = false;
     let mut failures = Vec::new();
+    let mut saw_status = false;
     for status in statuses {
+        saw_status = true;
         match status {
             SessionCatalogStatus::NotStarted | SessionCatalogStatus::Loading => has_loading = true,
             SessionCatalogStatus::Failed(message) => failures.push(message.clone()),
             SessionCatalogStatus::Loaded => {}
         }
     }
-    if has_loading {
+    if has_loading || !saw_status {
         SessionCatalogStatus::Loading
     } else if failures.is_empty() {
         SessionCatalogStatus::Loaded
@@ -459,6 +588,23 @@ fn importable_to_summary(
     }
 }
 
+fn upsert_session(sessions: &mut Vec<SessionSummary>, session: SessionSummary) -> bool {
+    if let Some(existing) = sessions
+        .iter_mut()
+        .find(|existing| existing.id == session.id)
+    {
+        if *existing == session {
+            false
+        } else {
+            *existing = session;
+            true
+        }
+    } else {
+        sessions.push(session);
+        true
+    }
+}
+
 fn sort_sessions(sessions: &mut [SessionSummary]) {
     sessions.sort_by(|left, right| {
         right
@@ -467,6 +613,10 @@ fn sort_sessions(sessions: &mut [SessionSummary]) {
             .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
             .then_with(|| left.id.cmp(&right.id))
     });
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn current_unix_millis() -> u64 {

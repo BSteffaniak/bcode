@@ -1162,6 +1162,9 @@ async fn handle_registered_client(
         && let Some(event) = state.sessions.detach_session(session_id, client_id).await?
     {
         publish_session_event(state, &event).await;
+        if let Ok(session) = state.sessions.session_summary(session_id).await {
+            state.session_catalog.upsert_native_session(session).await;
+        }
         state
             .deactivate_session_namespace_if_inactive(session_id)
             .await;
@@ -1592,6 +1595,10 @@ async fn handle_create_session(
         .sessions
         .create_session(name, working_directory)
         .await?;
+    state
+        .session_catalog
+        .upsert_native_session(session.clone())
+        .await;
     if let Ok(history) = state.sessions.session_history(session.id).await
         && let Some(event) = history.last()
     {
@@ -1695,6 +1702,12 @@ async fn handle_change_session_working_directory(
                 publish_session_event(state, &event).await;
             }
             let session = state.sessions.session_summary(session_id).await?;
+            if changed {
+                state
+                    .session_catalog
+                    .upsert_native_session(session.clone())
+                    .await;
+            }
             send_response(
                 writer,
                 request_id,
@@ -1770,19 +1783,33 @@ async fn handle_create_worktree(
     match bcode_worktree::create_worktree(&config, &request, &cwd) {
         Ok(mut response) => {
             if let Some(session_id) = request.attach_session_id {
-                if let Some(event) = state
+                let changed = if let Some(event) = state
                     .sessions
                     .change_session_working_directory(session_id, response.path.clone())
                     .await?
                 {
                     publish_session_event(state, &event).await;
+                    true
+                } else {
+                    false
+                };
+                let session = state.sessions.session_summary(session_id).await?;
+                if changed {
+                    state
+                        .session_catalog
+                        .upsert_native_session(session.clone())
+                        .await;
                 }
-                response.session = Some(state.sessions.session_summary(session_id).await?);
+                response.session = Some(session);
             } else if request.new_session {
                 let session = state
                     .sessions
                     .create_session(Some(request.name), response.path.clone())
                     .await?;
+                state
+                    .session_catalog
+                    .upsert_native_session(session.clone())
+                    .await;
                 response.session = Some(session);
             }
             send_response(
@@ -1876,6 +1903,10 @@ async fn handle_rename_session(
         Ok(event) => {
             publish_session_event(state, &event).await;
             let session = state.sessions.session_summary(session_id).await?;
+            state
+                .session_catalog
+                .upsert_native_session(session.clone())
+                .await;
             send_response(
                 writer,
                 request_id,
@@ -1926,6 +1957,10 @@ async fn handle_delete_session(
                 .lock()
                 .await
                 .remove(&session_id);
+            state
+                .session_catalog
+                .remove_native_session(session_id)
+                .await;
             send_response(
                 writer,
                 request_id,
@@ -2058,6 +2093,10 @@ async fn handle_attach_session(
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             publish_session_event(state, &attachment.attached_event).await;
+            state
+                .session_catalog
+                .upsert_native_session(attachment.session.clone())
+                .await;
             send_response(
                 writer,
                 request_id,
@@ -2114,6 +2153,10 @@ async fn handle_attach_session_recent(
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             publish_session_event(state, &attachment.attached_event).await;
+            state
+                .session_catalog
+                .upsert_native_session(attachment.session.clone())
+                .await;
             send_response(
                 writer,
                 request_id,
@@ -2354,6 +2397,11 @@ async fn append_turn_user_message(
         .await?;
     for event in &events {
         publish_session_event(state, event).await;
+    }
+    if !events.is_empty()
+        && let Ok(session) = state.sessions.session_summary(permit.session_id()).await
+    {
+        state.session_catalog.upsert_native_session(session).await;
     }
     Ok(events.last().cloned())
 }
