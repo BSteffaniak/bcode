@@ -1277,12 +1277,6 @@ fn set_company_lifecycle(
     let lifecycle_status = lifecycle_status.to_string();
     with_database(working_directory, move |database| {
         Box::pin(async move {
-            database
-                .update("companies")
-                .value("lifecycle_status", lifecycle_status.clone())
-                .filter(Box::new(where_eq("id", "default")))
-                .execute(database)
-                .await?;
             append_event(
                 database,
                 "company.lifecycle_set",
@@ -1874,6 +1868,95 @@ async fn append_event(
         .value("event_version", 1_i64)
         .execute(database)
         .await?;
+    apply_event_projection(database, payload).await
+}
+
+async fn apply_event_projection(
+    database: &dyn Database,
+    payload: &BlimsEventPayload,
+) -> Result<(), BlimsStateError> {
+    match payload {
+        BlimsEventPayload::CompanyLifecycleSet { lifecycle_status } => {
+            database
+                .update("companies")
+                .value("lifecycle_status", lifecycle_status.clone())
+                .filter(Box::new(where_eq("id", "default")))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::InitiativeCreated { initiative } => {
+            replace_one_initiative_projection(database, initiative).await?;
+        }
+        BlimsEventPayload::InitiativeStatusSet {
+            initiative_id,
+            status,
+        } => {
+            database
+                .update("initiatives")
+                .value("status", status.clone())
+                .filter(Box::new(where_eq("id", initiative_id.clone())))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::GuidanceSet { guidance } => {
+            replace_one_guidance_projection(database, guidance).await?;
+        }
+        BlimsEventPayload::InitiativeGuidanceSet {
+            initiative_id,
+            guidance,
+        } => {
+            replace_one_guidance_projection(database, guidance).await?;
+            database
+                .update("initiatives")
+                .value("guidance", guidance.guidance.clone())
+                .filter(Box::new(where_eq("id", initiative_id.clone())))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::ProposalRegistered { proposal } => {
+            replace_one_proposal_projection(database, proposal).await?;
+        }
+        BlimsEventPayload::ProposalStatusSet {
+            proposal_id,
+            status,
+        } => {
+            database
+                .update("work_proposals")
+                .value("status", status.clone())
+                .filter(Box::new(where_eq("id", proposal_id.clone())))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::ArtifactCreated { artifact } => {
+            replace_one_artifact_projection(database, artifact).await?;
+        }
+        BlimsEventPayload::TaskCreated { task } => {
+            replace_one_task_projection(database, task).await?;
+        }
+        BlimsEventPayload::AgentHired { agent } => {
+            replace_one_agent_projection(database, &agent.clone().into()).await?;
+        }
+        BlimsEventPayload::AgentMoved { agent_id, room_id } => {
+            database
+                .update("agents")
+                .value("room_id", room_id.clone())
+                .filter(Box::new(where_eq("id", agent_id.clone())))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::AgentStatusSet { agent_id, status } => {
+            database
+                .update("agents")
+                .value("status", status.clone())
+                .filter(Box::new(where_eq("id", agent_id.clone())))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::WorldRoomCreated { room } => {
+            replace_one_world_room_projection(database, &room.clone().into()).await?;
+        }
+        BlimsEventPayload::InitiativePlanImported { .. } => {}
+    }
     Ok(())
 }
 
@@ -1896,26 +1979,14 @@ fn create_initiative(
     let description = request.description.clone().unwrap_or_default();
     let priority = request.priority.unwrap_or(100);
     let initiative = InitiativeSummary {
-        id: id.clone(),
+        id,
         title: title.clone(),
-        description: description.clone(),
+        description,
         status: "active".to_string(),
         priority,
     };
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
-            database
-                .insert("initiatives")
-                .value("id", id)
-                .value("company_id", "default")
-                .value("title", title.clone())
-                .value("description", description)
-                .value("status", "active")
-                .value("priority", priority)
-                .value("created_by", "ceo")
-                .value("guidance", "")
-                .execute(database)
-                .await?;
             append_event(
                 database,
                 "initiative.created",
@@ -1964,12 +2035,6 @@ fn set_initiative_status(
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let initiative = load_initiative(database, &initiative_id).await?;
-            database
-                .update("initiatives")
-                .value("status", status.clone())
-                .filter(Box::new(where_eq("id", initiative_id.clone())))
-                .execute(database)
-                .await?;
             append_event(
                 database,
                 "initiative.status_set",
@@ -2006,31 +2071,13 @@ fn set_initiative_guidance(
     let strength = request.strength.clone();
     let initiative_id = request.initiative_id.clone();
     let summary = GuidanceSummary {
-        id: id.clone(),
-        guidance: guidance.clone(),
-        strength: strength.clone(),
+        id,
+        guidance: format!("Initiative {initiative_id}: {guidance}"),
+        strength,
         active: true,
     };
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
-            database
-                .insert("executive_guidance")
-                .value("id", id)
-                .value("company_id", "default")
-                .value(
-                    "guidance",
-                    format!("Initiative {initiative_id}: {guidance}"),
-                )
-                .value("strength", strength)
-                .value("active", true)
-                .execute(database)
-                .await?;
-            database
-                .update("initiatives")
-                .value("guidance", guidance.clone())
-                .filter(Box::new(where_eq("id", initiative_id.clone())))
-                .execute(database)
-                .await?;
             append_event(
                 database,
                 "initiative.guidance_set",
@@ -2056,22 +2103,13 @@ fn set_guidance(request: &GuidanceSetRequest) -> Result<GuidanceSummary, BlimsSt
     let id = stable_slug(&guidance);
     let strength = request.strength.clone();
     let summary = GuidanceSummary {
-        id: id.clone(),
-        guidance: guidance.clone(),
-        strength: strength.clone(),
+        id,
+        guidance,
+        strength,
         active: true,
     };
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
-            database
-                .insert("executive_guidance")
-                .value("id", id)
-                .value("company_id", "default")
-                .value("guidance", guidance.clone())
-                .value("strength", strength)
-                .value("active", true)
-                .execute(database)
-                .await?;
             append_event(
                 database,
                 "guidance.set",
@@ -2296,20 +2334,6 @@ fn register_proposal(
             let task = load_task(database, &request.task_id).await?;
             let id = format!("proposal-{}", request.task_id);
             let summary = format!("Draft work proposal for {}", task.title);
-            database
-                .insert("work_proposals")
-                .value("id", id.clone())
-                .value("task_id", task.id.clone())
-                .value("initiative_id", task.initiative_id.clone())
-                .value("agent_id", task.assigned_agent_id.clone())
-                .value("session_id", request.session_id.clone())
-                .value("worktree_path", request.worktree_path.display().to_string())
-                .value("branch", request.branch.clone())
-                .value("status", "draft")
-                .value("summary", summary.clone())
-                .value("validation_notes", "not yet reported")
-                .execute(database)
-                .await?;
             let proposal = WorkProposalSummary {
                 id,
                 task_id: task.id,
@@ -2368,12 +2392,6 @@ fn set_proposal_status(
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let proposal = load_proposal(database, &proposal_id).await?;
-            database
-                .update("work_proposals")
-                .value("status", status.clone())
-                .filter(Box::new(where_eq("id", proposal_id.clone())))
-                .execute(database)
-                .await?;
             append_event(
                 database,
                 "proposal.status_set",
@@ -2406,15 +2424,6 @@ fn record_proposal_patch(
                 "patch": request.patch,
             });
             let payload_json = serde_json::to_string_pretty(&payload)?;
-            database
-                .insert("artifacts")
-                .value("id", id.clone())
-                .value("initiative_id", proposal.initiative_id.clone())
-                .value("kind", "proposal_patch")
-                .value("title", format!("Patch for {}", proposal.id))
-                .value("payload_json", payload_json.clone())
-                .execute(database)
-                .await?;
             let artifact = ArtifactDetail {
                 id,
                 initiative_id: proposal.initiative_id,
@@ -2596,21 +2605,6 @@ fn import_initiative_plan(
                     rationale: task.rationale.clone(),
                     priority: task.priority,
                 };
-                database
-                    .insert("tasks")
-                    .value("id", task_id)
-                    .value("initiative_id", initiative_id.clone())
-                    .value("title", task.title.clone())
-                    .value("description", task.description.clone())
-                    .value("status", "proposed")
-                    .value(
-                        "assigned_agent_id",
-                        task.suggested_agent_id.clone().unwrap_or_default(),
-                    )
-                    .value("rationale", task.rationale.clone())
-                    .value("priority", task.priority)
-                    .execute(database)
-                    .await?;
                 task_summaries.push(task_summary);
             }
             append_event(
@@ -3060,25 +3054,49 @@ async fn apply_projection_state(
     replace_agent_projections(database, &state.agents).await
 }
 
+async fn replace_one_initiative_projection(
+    database: &dyn Database,
+    initiative: &InitiativeSummary,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("initiatives")
+        .value("id", initiative.id.clone())
+        .value("company_id", "default")
+        .value("title", initiative.title.clone())
+        .value("description", initiative.description.clone())
+        .value("status", initiative.status.clone())
+        .value("priority", initiative.priority)
+        .value("created_by", "event_replay")
+        .value("guidance", "")
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
 async fn replace_initiative_projections(
     database: &dyn Database,
     initiatives: &[InitiativeSummary],
 ) -> Result<(), BlimsStateError> {
     database.exec_raw("DELETE FROM initiatives").await?;
     for initiative in initiatives {
-        database
-            .insert("initiatives")
-            .value("id", initiative.id.clone())
-            .value("company_id", "default")
-            .value("title", initiative.title.clone())
-            .value("description", initiative.description.clone())
-            .value("status", initiative.status.clone())
-            .value("priority", initiative.priority)
-            .value("created_by", "event_replay")
-            .value("guidance", "")
-            .execute(database)
-            .await?;
+        replace_one_initiative_projection(database, initiative).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_guidance_projection(
+    database: &dyn Database,
+    item: &GuidanceSummary,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("executive_guidance")
+        .value("id", item.id.clone())
+        .value("company_id", "default")
+        .value("guidance", item.guidance.clone())
+        .value("strength", item.strength.clone())
+        .value("active", item.active)
+        .execute(database)
+        .await?;
     Ok(())
 }
 
@@ -3088,16 +3106,24 @@ async fn replace_guidance_projections(
 ) -> Result<(), BlimsStateError> {
     database.exec_raw("DELETE FROM executive_guidance").await?;
     for item in guidance {
-        database
-            .insert("executive_guidance")
-            .value("id", item.id.clone())
-            .value("company_id", "default")
-            .value("guidance", item.guidance.clone())
-            .value("strength", item.strength.clone())
-            .value("active", item.active)
-            .execute(database)
-            .await?;
+        replace_one_guidance_projection(database, item).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_artifact_projection(
+    database: &dyn Database,
+    artifact: &ArtifactDetail,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("artifacts")
+        .value("id", artifact.id.clone())
+        .value("initiative_id", artifact.initiative_id.clone())
+        .value("kind", artifact.kind.clone())
+        .value("title", artifact.title.clone())
+        .value("payload_json", artifact.payload_json.clone())
+        .execute(database)
+        .await?;
     Ok(())
 }
 
@@ -3107,16 +3133,29 @@ async fn replace_artifact_projections(
 ) -> Result<(), BlimsStateError> {
     database.exec_raw("DELETE FROM artifacts").await?;
     for artifact in artifacts {
-        database
-            .insert("artifacts")
-            .value("id", artifact.id.clone())
-            .value("initiative_id", artifact.initiative_id.clone())
-            .value("kind", artifact.kind.clone())
-            .value("title", artifact.title.clone())
-            .value("payload_json", artifact.payload_json.clone())
-            .execute(database)
-            .await?;
+        replace_one_artifact_projection(database, artifact).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_proposal_projection(
+    database: &dyn Database,
+    proposal: &WorkProposalSummary,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("work_proposals")
+        .value("id", proposal.id.clone())
+        .value("task_id", proposal.task_id.clone())
+        .value("initiative_id", proposal.initiative_id.clone())
+        .value("agent_id", proposal.agent_id.clone())
+        .value("session_id", proposal.session_id.clone())
+        .value("worktree_path", proposal.worktree_path.clone())
+        .value("branch", proposal.branch.clone())
+        .value("status", proposal.status.clone())
+        .value("summary", proposal.summary.clone())
+        .value("validation_notes", proposal.validation_notes.clone())
+        .execute(database)
+        .await?;
     Ok(())
 }
 
@@ -3126,21 +3165,27 @@ async fn replace_proposal_projections(
 ) -> Result<(), BlimsStateError> {
     database.exec_raw("DELETE FROM work_proposals").await?;
     for proposal in proposals {
-        database
-            .insert("work_proposals")
-            .value("id", proposal.id.clone())
-            .value("task_id", proposal.task_id.clone())
-            .value("initiative_id", proposal.initiative_id.clone())
-            .value("agent_id", proposal.agent_id.clone())
-            .value("session_id", proposal.session_id.clone())
-            .value("worktree_path", proposal.worktree_path.clone())
-            .value("branch", proposal.branch.clone())
-            .value("status", proposal.status.clone())
-            .value("summary", proposal.summary.clone())
-            .value("validation_notes", proposal.validation_notes.clone())
-            .execute(database)
-            .await?;
+        replace_one_proposal_projection(database, proposal).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_task_projection(
+    database: &dyn Database,
+    task: &TaskSummary,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("tasks")
+        .value("id", task.id.clone())
+        .value("initiative_id", task.initiative_id.clone())
+        .value("title", task.title.clone())
+        .value("description", task.description.clone())
+        .value("status", task.status.clone())
+        .value("assigned_agent_id", task.assigned_agent_id.clone())
+        .value("rationale", task.rationale.clone())
+        .value("priority", task.priority)
+        .execute(database)
+        .await?;
     Ok(())
 }
 
@@ -3150,19 +3195,23 @@ async fn replace_task_projections(
 ) -> Result<(), BlimsStateError> {
     database.exec_raw("DELETE FROM tasks").await?;
     for task in tasks {
-        database
-            .insert("tasks")
-            .value("id", task.id.clone())
-            .value("initiative_id", task.initiative_id.clone())
-            .value("title", task.title.clone())
-            .value("description", task.description.clone())
-            .value("status", task.status.clone())
-            .value("assigned_agent_id", task.assigned_agent_id.clone())
-            .value("rationale", task.rationale.clone())
-            .value("priority", task.priority)
-            .execute(database)
-            .await?;
+        replace_one_task_projection(database, task).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_world_room_projection(
+    database: &dyn Database,
+    room: &RoomRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("world_rooms")
+        .value("id", room.id.clone())
+        .value("world_id", "default")
+        .value("name", room.name.clone())
+        .value("purpose", room.purpose.clone())
+        .execute(database)
+        .await?;
     Ok(())
 }
 
@@ -3172,15 +3221,26 @@ async fn replace_world_room_projections(
 ) -> Result<(), BlimsStateError> {
     database.exec_raw("DELETE FROM world_rooms").await?;
     for room in rooms {
-        database
-            .insert("world_rooms")
-            .value("id", room.id.clone())
-            .value("world_id", "default")
-            .value("name", room.name.clone())
-            .value("purpose", room.purpose.clone())
-            .execute(database)
-            .await?;
+        replace_one_world_room_projection(database, room).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_agent_projection(
+    database: &dyn Database,
+    agent: &AgentRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("agents")
+        .value("id", agent.id.clone())
+        .value("name", agent.name.clone())
+        .value("role", agent.role.clone())
+        .value("department_id", agent.department_id.clone())
+        .value("team_id", agent.team_id.clone())
+        .value("status", agent.status.clone())
+        .value("room_id", agent.room_id.clone())
+        .execute(database)
+        .await?;
     Ok(())
 }
 
@@ -3190,17 +3250,7 @@ async fn replace_agent_projections(
 ) -> Result<(), BlimsStateError> {
     database.exec_raw("DELETE FROM agents").await?;
     for agent in agents {
-        database
-            .insert("agents")
-            .value("id", agent.id.clone())
-            .value("name", agent.name.clone())
-            .value("role", agent.role.clone())
-            .value("department_id", agent.department_id.clone())
-            .value("team_id", agent.team_id.clone())
-            .value("status", agent.status.clone())
-            .value("room_id", agent.room_id.clone())
-            .execute(database)
-            .await?;
+        replace_one_agent_projection(database, agent).await?;
     }
     Ok(())
 }
