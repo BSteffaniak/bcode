@@ -466,6 +466,10 @@ pub struct ProjectionRebuildReport {
     pub tasks_projected: usize,
     /// Number of projected agents.
     pub agents_projected: usize,
+    /// Number of projected departments.
+    pub departments_projected: usize,
+    /// Number of projected teams.
+    pub teams_projected: usize,
     /// Number of projected rooms.
     pub rooms_projected: usize,
     /// Current projected company lifecycle status.
@@ -880,6 +884,21 @@ struct RoomRecord {
     purpose: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DepartmentRecord {
+    id: String,
+    name: String,
+    purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TeamRecord {
+    id: String,
+    department_id: String,
+    name: String,
+    purpose: String,
+}
+
 impl From<RoomSnapshot> for RoomRecord {
     fn from(snapshot: RoomSnapshot) -> Self {
         Self {
@@ -973,6 +992,17 @@ enum BlimsEventPayload {
     AgentStatusSet {
         agent_id: String,
         status: String,
+    },
+    DepartmentCreated {
+        id: String,
+        name: String,
+        purpose: String,
+    },
+    TeamCreated {
+        id: String,
+        department_id: String,
+        name: String,
+        purpose: String,
     },
     WorldRoomCreated {
         room: RoomSnapshot,
@@ -1795,6 +1825,7 @@ async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database:
         )
         .await?;
     seed_company_created_event(database).await?;
+    seed_starter_org_events(database).await?;
     seed_starter_world_events(database).await?;
     seed_departments(database).await?;
     seed_teams(database).await?;
@@ -1812,6 +1843,51 @@ async fn seed_company_created_event(
              WHERE NOT EXISTS (SELECT 1 FROM events WHERE kind = 'company.created')",
         )
         .await
+}
+
+async fn seed_starter_org_events(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    for (id, name, purpose) in starter_departments() {
+        let payload_json = serde_json::to_string(&BlimsEventPayload::DepartmentCreated {
+            id: id.to_string(),
+            name: name.to_string(),
+            purpose: purpose.to_string(),
+        })
+        .expect("starter department event should encode");
+        database
+            .insert("events")
+            .value("company_id", "default")
+            .value("kind", "department.created")
+            .value("summary", format!("Starter department created: {name}"))
+            .value("payload_json", payload_json)
+            .value("correlation_id", "bootstrap")
+            .value("causation_id", "bootstrap")
+            .value("event_version", 1_i64)
+            .execute(database)
+            .await?;
+    }
+    for (id, department_id, name, purpose) in starter_teams() {
+        let payload_json = serde_json::to_string(&BlimsEventPayload::TeamCreated {
+            id: id.to_string(),
+            department_id: department_id.to_string(),
+            name: name.to_string(),
+            purpose: purpose.to_string(),
+        })
+        .expect("starter team event should encode");
+        database
+            .insert("events")
+            .value("company_id", "default")
+            .value("kind", "team.created")
+            .value("summary", format!("Starter team created: {name}"))
+            .value("payload_json", payload_json)
+            .value("correlation_id", "bootstrap")
+            .value("causation_id", "bootstrap")
+            .value("event_version", 1_i64)
+            .execute(database)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn seed_starter_world_events(
@@ -1853,8 +1929,8 @@ async fn seed_starter_world_events(
     Ok(())
 }
 
-async fn seed_departments(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
-    for (id, name, purpose) in [
+const fn starter_departments() -> [(&'static str, &'static str, &'static str); 3] {
+    [
         (
             "product",
             "Product",
@@ -1870,20 +1946,11 @@ async fn seed_departments(database: &dyn Database) -> Result<(), switchy_databas
             "Creative",
             "branding, docs tone, cozy design, and playful polish",
         ),
-    ] {
-        database
-            .exec_raw(&format!(
-                "INSERT INTO departments (id, company_id, name, purpose) \
-                 SELECT '{id}', 'default', '{name}', '{purpose}' \
-                 WHERE NOT EXISTS (SELECT 1 FROM departments WHERE id = '{id}')"
-            ))
-            .await?;
-    }
-    Ok(())
+    ]
 }
 
-async fn seed_teams(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
-    for (id, department_id, name, purpose) in [
+const fn starter_teams() -> [(&'static str, &'static str, &'static str, &'static str); 3] {
+    [
         (
             "product-leads",
             "product",
@@ -1902,7 +1969,24 @@ async fn seed_teams(database: &dyn Database) -> Result<(), switchy_database::Dat
             "Creative Studio",
             "make Blims delightful and memorable",
         ),
-    ] {
+    ]
+}
+
+async fn seed_departments(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
+    for (id, name, purpose) in starter_departments() {
+        database
+            .exec_raw(&format!(
+                "INSERT INTO departments (id, company_id, name, purpose) \
+                 SELECT '{id}', 'default', '{name}', '{purpose}' \
+                 WHERE NOT EXISTS (SELECT 1 FROM departments WHERE id = '{id}')"
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn seed_teams(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
+    for (id, department_id, name, purpose) in starter_teams() {
         database
             .exec_raw(&format!(
                 "INSERT INTO teams (id, department_id, name, purpose) \
@@ -2124,6 +2208,16 @@ async fn apply_event_projection(
     database: &dyn Database,
     payload: &BlimsEventPayload,
 ) -> Result<(), BlimsStateError> {
+    if apply_work_event_projection(database, payload).await? {
+        return Ok(());
+    }
+    apply_org_world_event_projection(database, payload).await
+}
+
+async fn apply_work_event_projection(
+    database: &dyn Database,
+    payload: &BlimsEventPayload,
+) -> Result<bool, BlimsStateError> {
     match payload {
         BlimsEventPayload::CompanyLifecycleSet { lifecycle_status } => {
             database
@@ -2182,6 +2276,16 @@ async fn apply_event_projection(
         BlimsEventPayload::TaskCreated { task } => {
             replace_one_task_projection(database, task).await?;
         }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+async fn apply_org_world_event_projection(
+    database: &dyn Database,
+    payload: &BlimsEventPayload,
+) -> Result<(), BlimsStateError> {
+    match payload {
         BlimsEventPayload::AgentHired { agent } => {
             replace_one_agent_projection(database, &agent.clone().into()).await?;
         }
@@ -2201,10 +2305,47 @@ async fn apply_event_projection(
                 .execute(database)
                 .await?;
         }
+        BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
+            replace_one_department_projection(
+                database,
+                &DepartmentRecord {
+                    id: id.clone(),
+                    name: name.clone(),
+                    purpose: purpose.clone(),
+                },
+            )
+            .await?;
+        }
+        BlimsEventPayload::TeamCreated {
+            id,
+            department_id,
+            name,
+            purpose,
+        } => {
+            replace_one_team_projection(
+                database,
+                &TeamRecord {
+                    id: id.clone(),
+                    department_id: department_id.clone(),
+                    name: name.clone(),
+                    purpose: purpose.clone(),
+                },
+            )
+            .await?;
+        }
         BlimsEventPayload::WorldRoomCreated { room } => {
             replace_one_world_room_projection(database, &room.clone().into()).await?;
         }
-        BlimsEventPayload::InitiativePlanImported { .. } => {}
+        BlimsEventPayload::InitiativePlanImported { .. }
+        | BlimsEventPayload::CompanyLifecycleSet { .. }
+        | BlimsEventPayload::InitiativeCreated { .. }
+        | BlimsEventPayload::InitiativeStatusSet { .. }
+        | BlimsEventPayload::GuidanceSet { .. }
+        | BlimsEventPayload::InitiativeGuidanceSet { .. }
+        | BlimsEventPayload::ProposalRegistered { .. }
+        | BlimsEventPayload::ProposalStatusSet { .. }
+        | BlimsEventPayload::ArtifactCreated { .. }
+        | BlimsEventPayload::TaskCreated { .. } => {}
     }
     Ok(())
 }
@@ -3195,6 +3336,8 @@ struct ProjectionState {
     tasks: Vec<TaskSummary>,
     rooms: Vec<RoomRecord>,
     agents: Vec<AgentRecord>,
+    departments: Vec<DepartmentRecord>,
+    teams: Vec<TeamRecord>,
 }
 
 impl ProjectionState {
@@ -3207,6 +3350,8 @@ impl ProjectionState {
             proposals_projected: self.proposals.len(),
             tasks_projected: self.tasks.len(),
             agents_projected: self.agents.len(),
+            departments_projected: self.departments.len(),
+            teams_projected: self.teams.len(),
             rooms_projected: self.rooms.len(),
             lifecycle_status: self.lifecycle_status.clone(),
         }
@@ -3297,6 +3442,30 @@ fn replay_event(
                 agent.status = status;
             }
         }
+        BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
+            upsert_by_id(
+                &mut state.departments,
+                DepartmentRecord { id, name, purpose },
+                |department| &department.id,
+            );
+        }
+        BlimsEventPayload::TeamCreated {
+            id,
+            department_id,
+            name,
+            purpose,
+        } => {
+            upsert_by_id(
+                &mut state.teams,
+                TeamRecord {
+                    id,
+                    department_id,
+                    name,
+                    purpose,
+                },
+                |team| &team.id,
+            );
+        }
         BlimsEventPayload::WorldRoomCreated { room } => {
             upsert_by_id(&mut state.rooms, room.into(), |room| &room.id);
         }
@@ -3329,6 +3498,8 @@ async fn apply_projection_state(
     replace_artifact_projections(database, &state.artifacts).await?;
     replace_proposal_projections(database, &state.proposals).await?;
     replace_task_projections(database, &state.tasks).await?;
+    replace_department_projections(database, &state.departments).await?;
+    replace_team_projections(database, &state.teams).await?;
     replace_world_room_projections(database, &state.rooms).await?;
     replace_agent_projections(database, &state.agents).await
 }
@@ -3475,6 +3646,58 @@ async fn replace_task_projections(
     database.exec_raw("DELETE FROM tasks").await?;
     for task in tasks {
         replace_one_task_projection(database, task).await?;
+    }
+    Ok(())
+}
+
+async fn replace_one_department_projection(
+    database: &dyn Database,
+    department: &DepartmentRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("departments")
+        .value("id", department.id.clone())
+        .value("company_id", "default")
+        .value("name", department.name.clone())
+        .value("purpose", department.purpose.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_department_projections(
+    database: &dyn Database,
+    departments: &[DepartmentRecord],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM departments").await?;
+    for department in departments {
+        replace_one_department_projection(database, department).await?;
+    }
+    Ok(())
+}
+
+async fn replace_one_team_projection(
+    database: &dyn Database,
+    team: &TeamRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("teams")
+        .value("id", team.id.clone())
+        .value("department_id", team.department_id.clone())
+        .value("name", team.name.clone())
+        .value("purpose", team.purpose.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_team_projections(
+    database: &dyn Database,
+    teams: &[TeamRecord],
+) -> Result<(), BlimsStateError> {
+    database.exec_raw("DELETE FROM teams").await?;
+    for team in teams {
+        replace_one_team_projection(database, team).await?;
     }
     Ok(())
 }
@@ -3743,6 +3966,24 @@ mod tests {
 
     #[test]
     fn replay_events_reconstructs_projection_state() {
+        let events = projection_test_events();
+
+        let state = replay_events(&events).expect("events should replay");
+
+        assert_eq!(state.lifecycle_status, "running");
+        assert_eq!(state.initiatives.len(), 1);
+        assert_eq!(state.initiatives[0].status, "paused");
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].assigned_agent_id, "mira");
+        assert_eq!(state.rooms.len(), 1);
+        assert_eq!(state.agents.len(), 1);
+        assert_eq!(state.departments.len(), 1);
+        assert_eq!(state.teams.len(), 1);
+        assert_eq!(state.agents[0].room_id, "ceo-nook");
+        assert_eq!(state.agents[0].status, "reporting");
+    }
+
+    fn projection_test_events() -> Vec<BlimsEventSummary> {
         let initiative = InitiativeSummary {
             id: "launch-blims".to_string(),
             title: "Launch Blims".to_string(),
@@ -3773,7 +4014,8 @@ mod tests {
             status: "thinking".to_string(),
             room_id: "whiteboard".to_string(),
         };
-        let events = vec![
+        let department_id = "product".to_string();
+        vec![
             test_event(
                 1,
                 "company.lifecycle_set",
@@ -3803,6 +4045,25 @@ mod tests {
             test_event(6, "agent.hired", &BlimsEventPayload::AgentHired { agent }),
             test_event(
                 7,
+                "department.created",
+                &BlimsEventPayload::DepartmentCreated {
+                    id: department_id.clone(),
+                    name: "Product".to_string(),
+                    purpose: "strategy".to_string(),
+                },
+            ),
+            test_event(
+                8,
+                "team.created",
+                &BlimsEventPayload::TeamCreated {
+                    id: "product-leads".to_string(),
+                    department_id,
+                    name: "Product Leads".to_string(),
+                    purpose: "direction".to_string(),
+                },
+            ),
+            test_event(
+                9,
                 "agent.moved",
                 &BlimsEventPayload::AgentMoved {
                     agent_id: "mira".to_string(),
@@ -3810,26 +4071,14 @@ mod tests {
                 },
             ),
             test_event(
-                8,
+                10,
                 "agent.status_set",
                 &BlimsEventPayload::AgentStatusSet {
                     agent_id: "mira".to_string(),
                     status: "reporting".to_string(),
                 },
             ),
-        ];
-
-        let state = replay_events(&events).expect("events should replay");
-
-        assert_eq!(state.lifecycle_status, "running");
-        assert_eq!(state.initiatives.len(), 1);
-        assert_eq!(state.initiatives[0].status, "paused");
-        assert_eq!(state.tasks.len(), 1);
-        assert_eq!(state.tasks[0].assigned_agent_id, "mira");
-        assert_eq!(state.rooms.len(), 1);
-        assert_eq!(state.agents.len(), 1);
-        assert_eq!(state.agents[0].room_id, "ceo-nook");
-        assert_eq!(state.agents[0].status, "reporting");
+        ]
     }
 
     fn test_event(id: i64, kind: &str, payload: &BlimsEventPayload) -> BlimsEventSummary {
