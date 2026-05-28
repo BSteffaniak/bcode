@@ -13,6 +13,7 @@ use bmux_tui::prelude::{
 };
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -729,9 +730,26 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
             match stroke.key {
                 KeyCode::Char('?') => app.show_help = !app.show_help,
                 KeyCode::Char('w') => app.show_world_picker = true,
-                KeyCode::Char('r') => app.report = load_blims_report().await?,
-                KeyCode::Char('h') | KeyCode::Left | KeyCode::Up => app.move_previous().await?,
-                KeyCode::Char('l') | KeyCode::Right | KeyCode::Down => app.move_next().await?,
+                KeyCode::Char('r') => {
+                    app.report = load_blims_report().await?;
+                    app.status = "Morning report refreshed.".to_string();
+                }
+                KeyCode::Char('e') | KeyCode::Enter => app.activate_selected_interaction().await?,
+                KeyCode::Tab => app.select_next_interaction(),
+                KeyCode::Char('t') => {
+                    app.selected_interaction = app
+                        .nearby_interactions()
+                        .iter()
+                        .position(|interaction| interaction.source == "agent")
+                        .unwrap_or(app.selected_interaction);
+                    app.activate_selected_interaction().await?;
+                }
+                KeyCode::Char('h') | KeyCode::Left => app.move_player_by(-1, 0).await?,
+                KeyCode::Char('l') | KeyCode::Right => app.move_player_by(1, 0).await?,
+                KeyCode::Char('k') | KeyCode::Up => app.move_player_by(0, -1).await?,
+                KeyCode::Char('j') | KeyCode::Down => app.move_player_by(0, 1).await?,
+                KeyCode::Char('H') => app.move_previous().await?,
+                KeyCode::Char('L') => app.move_next().await?,
                 _ => {}
             }
         }
@@ -747,6 +765,7 @@ async fn handle_blims_tui_picker_key(
         return Ok(false);
     }
     match key {
+        KeyCode::Escape => app.show_world_picker = false,
         KeyCode::Up => app.select_previous_template(),
         KeyCode::Down => app.select_next_template(),
         KeyCode::Enter => app.activate_selected_template().await?,
@@ -762,6 +781,8 @@ struct BlimsTuiApp {
     interactions: BlimsAvailableInteractions,
     templates: Vec<BlimsWorldTemplateSummary>,
     selected_template: usize,
+    player_tile: BlimsTilePosition,
+    selected_interaction: usize,
     show_world_picker: bool,
     show_help: bool,
     status: String,
@@ -777,12 +798,15 @@ impl BlimsTuiApp {
             .iter()
             .position(|template| template.id == world.template_id)
             .unwrap_or_default();
+        let player_tile = player_tile_for_room(&world, &interactions.room_id);
         Ok(Self {
             world,
             report,
             interactions,
             templates,
             selected_template,
+            player_tile,
+            selected_interaction: 0,
             show_world_picker: false,
             show_help: false,
             status: "Welcome CEO — choose a world with w, move with arrows/h/l.".to_string(),
@@ -793,13 +817,79 @@ impl BlimsTuiApp {
         self.world = load_blims_world().await?;
         self.report = load_blims_report().await?;
         self.interactions = load_blims_interactions().await?;
+        self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
+        self.clamp_selected_interaction();
         Ok(())
+    }
+
+    async fn move_player_by(&mut self, dx: i64, dy: i64) -> Result<(), CliError> {
+        let next = BlimsTilePosition {
+            x: self.player_tile.x + dx,
+            y: self.player_tile.y + dy,
+        };
+        if !is_walkable_tile(&self.world, next) {
+            self.status = "Bump — office wall.".to_string();
+            return Ok(());
+        }
+        self.player_tile = next;
+        if let Some(room_id) = room_id_at_tile(&self.world, next)
+            && room_id != self.interactions.room_id
+        {
+            self.world = move_blims_player(&room_id).await?;
+            self.interactions = load_blims_interactions().await?;
+            self.clamp_selected_interaction();
+            self.status = format!("Entered {}", self.current_room_name());
+        }
+        Ok(())
+    }
+
+    async fn activate_selected_interaction(&mut self) -> Result<(), CliError> {
+        let Some(interaction) = self
+            .nearby_interactions()
+            .get(self.selected_interaction)
+            .cloned()
+        else {
+            self.status = "Nothing nearby to use yet.".to_string();
+            return Ok(());
+        };
+        if let Some(agent_id) = interaction.command.strip_prefix("ai ") {
+            start_blims_agent_talk(agent_id.to_string()).await?;
+            self.refresh().await?;
+        } else {
+            self.status = format!("{} — `{}`", interaction.label, interaction.command);
+        }
+        Ok(())
+    }
+
+    fn select_next_interaction(&mut self) {
+        let count = self.nearby_interactions().len();
+        if count > 0 {
+            self.selected_interaction = (self.selected_interaction + 1) % count;
+        }
+    }
+
+    fn clamp_selected_interaction(&mut self) {
+        let count = self.nearby_interactions().len();
+        if count == 0 {
+            self.selected_interaction = 0;
+        } else if self.selected_interaction >= count {
+            self.selected_interaction = count - 1;
+        }
+    }
+
+    fn nearby_interactions(&self) -> Vec<BlimsWorldInteraction> {
+        if !is_near_current_room(&self.world, self.player_tile, &self.interactions.room_id) {
+            return Vec::new();
+        }
+        self.interactions.interactions.clone()
     }
 
     async fn move_next(&mut self) -> Result<(), CliError> {
         let next = next_room_id(&self.world, &self.interactions.room_id);
         self.world = move_blims_player(&next).await?;
         self.interactions = load_blims_interactions().await?;
+        self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
+        self.clamp_selected_interaction();
         self.status = format!("Moved to {}", self.current_room_name());
         Ok(())
     }
@@ -808,6 +898,8 @@ impl BlimsTuiApp {
         let previous = previous_room_id(&self.world, &self.interactions.room_id);
         self.world = move_blims_player(&previous).await?;
         self.interactions = load_blims_interactions().await?;
+        self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
+        self.clamp_selected_interaction();
         self.status = format!("Moved to {}", self.current_room_name());
         Ok(())
     }
@@ -821,6 +913,7 @@ impl BlimsTuiApp {
             self.show_world_picker = false;
             self.status = format!("Selected {}", template.name);
             self.refresh().await?;
+            self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
         }
         Ok(())
     }
@@ -954,40 +1047,47 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         .render(area, frame);
     let line = Line::from_spans(vec![
         Span::styled(
-            " ←/→ ",
+            " arrows/hjkl ",
             Style::new()
                 .fg(Color::BrightCyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("move  "),
+        Span::raw("walk  "),
+        Span::styled(
+            "e/enter",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" use  "),
+        Span::styled(
+            "t",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" talk  "),
+        Span::styled(
+            "tab",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" target  "),
         Span::styled(
             "w",
             Style::new()
                 .fg(Color::BrightYellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" world picker  "),
+        Span::raw(" worlds  "),
         Span::styled(
-            "r",
-            Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" refresh report  "),
-        Span::styled(
-            "?",
-            Style::new()
-                .fg(Color::BrightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" help  "),
-        Span::styled(
-            "q",
+            "r/?/q",
             Style::new()
                 .fg(Color::BrightRed)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" quit  —  "),
+        Span::raw(" report/help/quit — "),
         Span::styled(app.status.clone(), Style::new().fg(Color::BrightGreen)),
     ]);
     frame.write_line_with_fallback_style(
@@ -1000,136 +1100,106 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
 fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     let panel = Panel::new()
         .border(Border::rounded().style(Style::new().fg(Color::BrightCyan)))
-        .title(" Office world ")
+        .title(" Pixel office ")
         .background(Style::new().bg(Color::Rgb(8, 18, 24)));
     panel.render(area, frame);
     let inner = panel.inner_area(area).inset(Insets::all(1));
-    render_room_links(app, inner, frame);
-    for room in &app.world.rooms {
-        render_room_tile(app, room, inner, frame);
-    }
+    render_pixel_world(app, inner, frame);
 }
 
-fn render_room_links(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
-    let points = app
-        .world
-        .rooms
-        .iter()
-        .map(|room| room_point(room, area))
-        .collect::<Vec<_>>();
-    for window in points.windows(2) {
-        let [from, to] = window else { continue };
-        let min_x = from.x.min(to.x);
-        let max_x = from.x.max(to.x);
-        let min_y = from.y.min(to.y);
-        let max_y = from.y.max(to.y);
-        for x in min_x..=max_x {
+fn render_pixel_world(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let viewport = BlimsViewport::for_area(&app.world, app.player_tile, area);
+    for screen_y in 0..area.height {
+        for screen_x in 0..area.width {
+            let tile = BlimsTilePosition {
+                x: viewport.origin.x + i64::from(screen_x),
+                y: viewport.origin.y + i64::from(screen_y),
+            };
+            let (glyph, style) = tile_glyph(app, tile);
             frame.buffer_mut().set_cell(
-                Point::new(x, from.y),
-                "─",
-                Style::new()
-                    .fg(Color::BrightBlack)
-                    .bg(Color::Rgb(8, 18, 24)),
-            );
-        }
-        for y in min_y..=max_y {
-            frame.buffer_mut().set_cell(
-                Point::new(to.x, y),
-                "│",
-                Style::new()
-                    .fg(Color::BrightBlack)
-                    .bg(Color::Rgb(8, 18, 24)),
+                Point::new(area.x + screen_x, area.y + screen_y),
+                glyph,
+                style,
             );
         }
     }
 }
 
-fn render_room_tile(
-    app: &BlimsTuiApp,
-    room: &BlimsRoomSnapshot,
-    area: Rect,
-    frame: &mut Frame<'_>,
-) {
-    let point = room_point(room, area);
-    let tile =
-        Rect::new(point.x.saturating_sub(7), point.y.saturating_sub(2), 15, 5).intersection(area);
-    let active = room.id == app.interactions.room_id;
-    let bg = if active {
-        Color::Rgb(52, 36, 74)
-    } else {
-        Color::Rgb(22, 28, 38)
-    };
-    let fg = if active {
-        Color::BrightYellow
-    } else {
-        color_from_name(&room.color)
-    };
-    let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(fg).bg(bg)))
-        .background(Style::new().bg(bg));
-    panel.render(tile, frame);
-    let inner = panel.inner_area(tile);
-    let occupants = app
-        .world
-        .agents
-        .iter()
-        .filter(|agent| agent.room_id == room.id)
-        .collect::<Vec<_>>();
-    let marker = if active { "@" } else { room.symbol.as_str() };
-    frame.write_line_with_fallback_style(
-        inner,
-        &Line::from_spans(vec![
-            Span::styled(
-                marker.to_string(),
-                Style::new()
-                    .fg(Color::BrightYellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                room.name.clone(),
-                Style::new()
-                    .fg(Color::BrightWhite)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Style::new().bg(bg),
-    );
-    if inner.height > 1 {
-        frame.write_line_with_fallback_style(
-            Rect::new(inner.x, inner.y + 1, inner.width, 1),
-            &Line::raw(format!(
-                "{} +{}",
-                room.room_kind, room.productivity_modifier
-            )),
-            Style::new().fg(Color::BrightBlack).bg(bg),
+fn tile_glyph(app: &BlimsTuiApp, tile: BlimsTilePosition) -> (&'static str, Style) {
+    if tile == app.player_tile {
+        return (
+            "@",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .bg(Color::Rgb(58, 40, 78))
+                .add_modifier(Modifier::BOLD),
         );
     }
-    if inner.height > 2 && !occupants.is_empty() {
-        let names = occupants
-            .iter()
-            .map(|agent| agent.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        frame.write_line_with_fallback_style(
-            Rect::new(inner.x, inner.y + 2, inner.width, 1),
-            &Line::from_spans(vec![Span::styled(
-                names,
-                Style::new().fg(Color::BrightGreen),
-            )]),
-            Style::new().bg(bg),
+    if let Some(agent) = app.world.agents.iter().find(|agent| {
+        room_id_at_tile(&app.world, tile).is_some_and(|room_id| room_id == agent.room_id)
+            && agent_tile(&app.world, agent) == tile
+    }) {
+        return (
+            agent_sprite(agent),
+            Style::new()
+                .fg(Color::BrightGreen)
+                .bg(Color::Rgb(24, 36, 34))
+                .add_modifier(Modifier::BOLD),
         );
+    }
+    let Some(room) = room_at_tile(&app.world, tile) else {
+        return (
+            " ",
+            Style::new()
+                .fg(Color::BrightBlack)
+                .bg(Color::Rgb(5, 10, 14)),
+        );
+    };
+    let rect = room_tile_rect(room);
+    let bg = room_bg(room);
+    let fg = color_from_name(&room.color);
+    if tile.x == rect.x || tile.y == rect.y || tile.x == rect.right() || tile.y == rect.bottom() {
+        return ("▓", Style::new().fg(fg).bg(Color::Rgb(9, 12, 20)));
+    }
+    if tile == room_anchor(room) {
+        return (
+            room_symbol(room),
+            Style::new().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        );
+    }
+    if corridor_tiles(&app.world).contains(&tile) {
+        return (
+            "░",
+            Style::new()
+                .fg(Color::BrightBlack)
+                .bg(Color::Rgb(18, 18, 24)),
+        );
+    }
+    ("·", Style::new().fg(Color::Rgb(88, 92, 104)).bg(bg))
+}
+
+fn agent_sprite(agent: &BlimsAgentSnapshot) -> &'static str {
+    match agent.role.as_str() {
+        role if role.contains("Engineer") || role.contains("developer") => "E",
+        role if role.contains("Designer") || role.contains("Creative") => "D",
+        role if role.contains("Reviewer") || role.contains("QA") => "R",
+        _ => "B",
     }
 }
 
-fn room_point(room: &BlimsRoomSnapshot, area: Rect) -> Point {
-    let max_world_x = 40_i64;
-    let max_world_y = 14_i64;
-    let x_scale = i64::from(area.width.saturating_sub(4)).max(1);
-    let y_scale = i64::from(area.height.saturating_sub(4)).max(1);
-    let x = i64::from(area.x) + 2 + room.x.saturating_mul(x_scale) / max_world_x;
-    let y = i64::from(area.y) + 2 + room.y.saturating_mul(y_scale) / max_world_y;
-    Point::new(clamp_i64_to_u16(x), clamp_i64_to_u16(y))
+fn room_symbol(room: &BlimsRoomSnapshot) -> &'static str {
+    match room.symbol.as_str() {
+        "🏢" | "⌂" => "⌂",
+        "🧠" => "*",
+        "⚙" | "⚙️" => "⚙",
+        "🎨" => "✦",
+        "✓" | "✅" => "✓",
+        "☕" => "☕",
+        _ => "■",
+    }
 }
 
 fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -1177,6 +1247,13 @@ fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
                     "{} · productivity +{}",
                     room.room_kind, room.productivity_modifier
                 )),
+                Line::raw(format!(
+                    "CEO tile {},{} · room anchor {},{}",
+                    app.player_tile.x,
+                    app.player_tile.y,
+                    room_anchor(room).x,
+                    room_anchor(room).y
+                )),
             ])
         },
     );
@@ -1217,21 +1294,40 @@ fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
             .fg(Color::BrightMagenta)
             .add_modifier(Modifier::BOLD),
     )])];
-    lines.extend(
-        app.interactions
-            .interactions
-            .iter()
-            .take(5)
-            .map(|interaction| {
-                Line::from_spans(vec![
-                    Span::styled(
-                        format!("{} ", interaction.source),
-                        Style::new().fg(Color::BrightBlack),
-                    ),
-                    Span::raw(interaction.label.clone()),
-                ])
-            }),
-    );
+    let nearby = app.nearby_interactions();
+    if nearby.is_empty() {
+        lines.push(Line::raw("Walk into a room or up to an agent."));
+    } else {
+        lines.extend(
+            nearby
+                .iter()
+                .take(5)
+                .enumerate()
+                .map(|(index, interaction)| {
+                    let selected = index == app.selected_interaction;
+                    Line::from_spans(vec![
+                        Span::styled(
+                            if selected { "▶ " } else { "  " },
+                            Style::new().fg(Color::BrightYellow),
+                        ),
+                        Span::styled(
+                            format!("{} ", interaction.source),
+                            Style::new().fg(Color::BrightBlack),
+                        ),
+                        Span::styled(
+                            interaction.label.clone(),
+                            if selected {
+                                Style::new()
+                                    .fg(Color::BrightYellow)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::new().fg(Color::White)
+                            },
+                        ),
+                    ])
+                }),
+        );
+    }
     TextBlock::new(Text::from_lines(lines))
         .wrap(TextWrap::Character)
         .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
@@ -1317,12 +1413,12 @@ fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
         .background(Style::new().bg(Color::Rgb(18, 20, 38)));
     panel.render(modal, frame);
     let text = Text::from_lines(vec![
-        Line::raw("←/h and →/l move between rooms"),
-        Line::raw("w opens starter office picker"),
+        Line::raw("arrows/hjkl walk one tile around the top-down office"),
+        Line::raw("e/enter uses the selected nearby interaction"),
+        Line::raw("t talks to a nearby agent; tab cycles interactions"),
+        Line::raw("w opens starter office picker; escape closes modals"),
         Line::raw("r refreshes the morning report"),
-        Line::raw("? toggles this help"),
-        Line::raw("q exits the office"),
-        Line::raw("Use CLI commands for AI chat/work while this TUI grows."),
+        Line::raw("?/q toggle help / exit the office"),
     ]);
     TextBlock::new(text)
         .wrap(TextWrap::Character)
@@ -1346,9 +1442,182 @@ fn color_from_name(name: &str) -> Color {
     }
 }
 
-fn clamp_i64_to_u16(value: i64) -> u16 {
-    u16::try_from(value.clamp(0, i64::from(u16::MAX))).unwrap_or_default()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BlimsTilePosition {
+    x: i64,
+    y: i64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlimsTileRect {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+}
+
+impl BlimsTileRect {
+    const fn right(self) -> i64 {
+        self.x + self.width - 1
+    }
+
+    const fn bottom(self) -> i64 {
+        self.y + self.height - 1
+    }
+
+    const fn contains(self, position: BlimsTilePosition) -> bool {
+        position.x >= self.x
+            && position.x <= self.right()
+            && position.y >= self.y
+            && position.y <= self.bottom()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlimsViewport {
+    origin: BlimsTilePosition,
+}
+
+impl BlimsViewport {
+    fn for_area(world: &BlimsWorldSnapshot, player: BlimsTilePosition, area: Rect) -> Self {
+        let world_width = world_tile_width(world);
+        let world_height = world_tile_height(world);
+        let visible_width = i64::from(area.width).max(1);
+        let visible_height = i64::from(area.height).max(1);
+        let max_x = (world_width - visible_width).max(0);
+        let max_y = (world_height - visible_height).max(0);
+        Self {
+            origin: BlimsTilePosition {
+                x: (player.x - visible_width / 2).clamp(0, max_x),
+                y: (player.y - visible_height / 2).clamp(0, max_y),
+            },
+        }
+    }
+}
+
+fn room_tile_rect(room: &BlimsRoomSnapshot) -> BlimsTileRect {
+    BlimsTileRect {
+        x: room.x.max(0),
+        y: room.y.max(0),
+        width: 12,
+        height: 7,
+    }
+}
+
+fn room_anchor(room: &BlimsRoomSnapshot) -> BlimsTilePosition {
+    let rect = room_tile_rect(room);
+    BlimsTilePosition {
+        x: rect.x + rect.width / 2,
+        y: rect.y + rect.height / 2,
+    }
+}
+
+fn player_tile_for_room(world: &BlimsWorldSnapshot, room_id: &str) -> BlimsTilePosition {
+    world
+        .rooms
+        .iter()
+        .find(|room| room.id == room_id)
+        .map_or(BlimsTilePosition { x: 1, y: 1 }, room_anchor)
+}
+
+fn agent_tile(world: &BlimsWorldSnapshot, agent: &BlimsAgentSnapshot) -> BlimsTilePosition {
+    let base = player_tile_for_room(world, &agent.room_id);
+    let offset = stable_tile_offset(&agent.id);
+    BlimsTilePosition {
+        x: base.x + offset.x,
+        y: base.y + offset.y,
+    }
+}
+
+fn stable_tile_offset(id: &str) -> BlimsTilePosition {
+    let sum = id.bytes().fold(0_u8, u8::wrapping_add);
+    match sum % 5 {
+        0 => BlimsTilePosition { x: -2, y: 0 },
+        1 => BlimsTilePosition { x: 2, y: 0 },
+        2 => BlimsTilePosition { x: 0, y: -1 },
+        3 => BlimsTilePosition { x: 0, y: 1 },
+        _ => BlimsTilePosition { x: 1, y: 1 },
+    }
+}
+
+fn room_at_tile(world: &BlimsWorldSnapshot, tile: BlimsTilePosition) -> Option<&BlimsRoomSnapshot> {
+    world
+        .rooms
+        .iter()
+        .find(|room| room_tile_rect(room).contains(tile))
+}
+
+fn room_id_at_tile(world: &BlimsWorldSnapshot, tile: BlimsTilePosition) -> Option<String> {
+    room_at_tile(world, tile).map(|room| room.id.clone())
+}
+
+fn is_near_current_room(
+    world: &BlimsWorldSnapshot,
+    player: BlimsTilePosition,
+    room_id: &str,
+) -> bool {
+    world.rooms.iter().any(|room| {
+        room.id == room_id
+            && (room_tile_rect(room).contains(player)
+                || manhattan_distance(player, room_anchor(room)) <= 2)
+    })
+}
+
+const fn manhattan_distance(a: BlimsTilePosition, b: BlimsTilePosition) -> i64 {
+    (a.x - b.x).abs() + (a.y - b.y).abs()
+}
+
+fn is_walkable_tile(world: &BlimsWorldSnapshot, tile: BlimsTilePosition) -> bool {
+    room_at_tile(world, tile).is_some() || corridor_tiles(world).contains(&tile)
+}
+
+fn corridor_tiles(world: &BlimsWorldSnapshot) -> BTreeSet<BlimsTilePosition> {
+    let mut tiles = BTreeSet::new();
+    let points = world.rooms.iter().map(room_anchor).collect::<Vec<_>>();
+    for window in points.windows(2) {
+        let [from, to] = window else { continue };
+        for x in from.x.min(to.x)..=from.x.max(to.x) {
+            tiles.insert(BlimsTilePosition { x, y: from.y });
+        }
+        for y in from.y.min(to.y)..=from.y.max(to.y) {
+            tiles.insert(BlimsTilePosition { x: to.x, y });
+        }
+    }
+    tiles
+}
+
+fn world_tile_width(world: &BlimsWorldSnapshot) -> i64 {
+    world
+        .rooms
+        .iter()
+        .map(|room| room_tile_rect(room).right() + 2)
+        .max()
+        .unwrap_or(world.width)
+        .max(world.width)
+        .max(1)
+}
+
+fn world_tile_height(world: &BlimsWorldSnapshot) -> i64 {
+    world
+        .rooms
+        .iter()
+        .map(|room| room_tile_rect(room).bottom() + 2)
+        .max()
+        .unwrap_or(world.height)
+        .max(world.height)
+        .max(1)
+}
+
+fn room_bg(room: &BlimsRoomSnapshot) -> Color {
+    match room.room_kind.as_str() {
+        "planning" | "strategy" => Color::Rgb(38, 31, 58),
+        "engineering" => Color::Rgb(24, 38, 50),
+        "creative" => Color::Rgb(44, 30, 50),
+        "review" => Color::Rgb(28, 42, 34),
+        _ => Color::Rgb(28, 31, 38),
+    }
+}
+
 async fn start_blims_agent_talk(agent_id: String) -> Result<(), CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
