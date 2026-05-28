@@ -574,7 +574,13 @@ async fn enter_blims_office() -> Result<(), CliError> {
             "tasks" | "task" => print_office_tasks().await?,
             "artifacts" | "artifact" => print_office_artifacts().await?,
             "proposals" | "proposal" => print_office_proposals().await?,
-            "initiatives" | "initiative" => print_office_initiatives().await?,
+            "initiatives" | "initiative" | "whiteboard" => print_office_initiatives().await?,
+            "i" | "inspect" => print_room_agent_inspect(&world, &player_room_id).await?,
+            "review" => {
+                print_office_artifacts().await?;
+                print_office_proposals().await?;
+            }
+            "menu" | "dashboard" => print_blims_dashboard(),
             "t" | "talk" | "look" => print_room_interaction(&world, &report, &player_room_id),
             "ai" => {
                 start_room_agent_talk(&world, &player_room_id).await?;
@@ -602,6 +608,10 @@ async fn refresh_blims_office(
 async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
     let parts = command.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
+        ["dashboard" | "menu"] => print_blims_dashboard(),
+        ["inspect", "agent", agent_id] | ["agent", agent_id] => {
+            print_office_agent_report(agent_id).await?;
+        }
         ["new" | "create", "initiative", rest @ ..] => {
             create_office_initiative(&rest.join(" ")).await?;
         }
@@ -804,6 +814,42 @@ async fn print_office_proposal(proposal_id: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn print_office_agent_report(agent_id: &str) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": agent_id,
+    });
+    let response = call_blims_service("report.agent", serde_json::to_vec(&request)?).await?;
+    let report = decode_blims_response::<BlimsFocusedReport>(response)?;
+    println!("{}", report.title);
+    for bullet in report.bullets {
+        println!("* {bullet}");
+    }
+    Ok(())
+}
+
+async fn print_room_agent_inspect(
+    world: &BlimsWorldSnapshot,
+    player_room_id: &str,
+) -> Result<(), CliError> {
+    let Some(agent) = world
+        .agents
+        .iter()
+        .find(|agent| agent.room_id == player_room_id)
+    else {
+        println!("No agent is nearby to inspect.");
+        return Ok(());
+    };
+    print_office_agent_report(&agent.id).await
+}
+
+fn print_blims_dashboard() {
+    println!("Blims CEO dashboard");
+    println!("* status/create/pause/resume/shutdown are global CLI controls");
+    println!("* report, initiatives, tasks, artifacts, proposals work from anywhere");
+    println!("* office locations add flavor and shortcuts, but never hide critical controls");
+}
+
 async fn update_office_proposal_status(
     operation: &str,
     message: &str,
@@ -972,7 +1018,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look/interactions, ai chat here, ai <agent>, r report, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal> <id>, refresh, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look/interactions, i inspect nearby agent, ai chat here, ai <agent>, r report, whiteboard, review, menu/dashboard, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal|agent> <id>, refresh, w world, q quit"
     );
 }
 
