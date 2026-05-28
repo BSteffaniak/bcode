@@ -363,13 +363,18 @@ impl SessionActor {
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.state.index_status = SessionIndexStatusKind::Current;
         if let Some(store) = &self.store {
+            self.state.index_status = SessionIndexStatusKind::Stale;
             let metadata = PersistedSessionMetadata::from_state(&self.state);
-            if let Err(error) = store.write_metadata_index(metadata).await {
-                self.state.index_status = SessionIndexStatusKind::Stale;
-                eprintln!(
-                    "failed to update session index for {}: {error}",
-                    self.state.summary.id
-                );
+            match store.write_metadata_index(metadata).await {
+                Ok(()) => {
+                    self.state.index_status = SessionIndexStatusKind::Current;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "failed to update session index for {}: {error}",
+                        self.state.summary.id
+                    );
+                }
             }
         }
         self.refresh_snapshot();

@@ -115,6 +115,16 @@ pub enum SessionStoreError {
     InvalidFileName(PathBuf),
     #[error("session event file name is not a session ID: {0}")]
     InvalidSessionId(String),
+    #[error(
+        "refusing to write stale session metadata for {session_id}: current event_count={current_event_count}, attempted event_count={attempted_event_count}, current next_sequence={current_next_sequence}, attempted next_sequence={attempted_next_sequence}"
+    )]
+    StaleMetadataWrite {
+        session_id: SessionId,
+        current_event_count: usize,
+        attempted_event_count: usize,
+        current_next_sequence: u64,
+        attempted_next_sequence: u64,
+    },
     #[error("session migration registry error: {0}")]
     MigrationRegistry(#[from] SessionMigrationRegistryError),
 }
@@ -565,6 +575,21 @@ impl SessionEventStore {
         metadata: &PersistedSessionMetadata,
     ) -> Result<(), SessionStoreError> {
         let path = self.event_path(metadata.summary.id);
+        let existing_index = index::load_fresh_index(&self.root, metadata.summary.id, &path)?;
+        if let Some(existing_index) = &existing_index
+            && (metadata.event_count < existing_index.event_count
+                || metadata.next_sequence < existing_index.next_sequence)
+        {
+            self.metrics
+                .increment_counter("session.metadata_index.stale_write_total");
+            return Err(SessionStoreError::StaleMetadataWrite {
+                session_id: metadata.summary.id,
+                current_event_count: existing_index.event_count,
+                attempted_event_count: metadata.event_count,
+                current_next_sequence: existing_index.next_sequence,
+                attempted_next_sequence: metadata.next_sequence,
+            });
+        }
         let file = index::fingerprint(&path)?;
         let index = index::SessionIndex {
             index_version: index::SESSION_INDEX_VERSION,
