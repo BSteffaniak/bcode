@@ -119,14 +119,22 @@ async fn execute_session_command<W: Write>(
 ) -> Result<(), TuiError> {
     match command {
         PaletteCommand::NewSession => {
-            let session = services.client.create_session(None).await?;
-            session_flow::switch_session(io.terminal, services.client, chat, session.id).await?;
+            session_flow::switch_to_draft_session(chat);
         }
-        PaletteCommand::SwitchSession => {
-            let selected_session_id = session_flow::pick_session(io, services).await?;
-            session_flow::switch_session(io.terminal, services.client, chat, selected_session_id)
+        PaletteCommand::SwitchSession => match session_flow::pick_session(io, services).await? {
+            session_flow::PickSessionOutcome::Existing(selected_session_id) => {
+                session_flow::switch_session(
+                    io.terminal,
+                    services.client,
+                    chat,
+                    selected_session_id,
+                )
                 .await?;
-        }
+            }
+            session_flow::PickSessionOutcome::Draft => {
+                session_flow::switch_to_draft_session(chat);
+            }
+        },
         PaletteCommand::RenameSession => {
             session_flow::pick_session_for_mutation(
                 io,

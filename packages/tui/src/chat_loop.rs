@@ -75,7 +75,7 @@ pub async fn run_with_client<W: Write>(
         chat.app.set_key_hints(keymap.chat_hints());
         while let Ok(event) = chat.event_receiver.try_recv() {
             match event {
-                BcodeEvent::Session(event) if event.session_id == chat.session_id => {
+                BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
                     chat.app.absorb_session_event(&event);
                     needs_redraw = true;
                 }
@@ -95,7 +95,7 @@ pub async fn run_with_client<W: Write>(
                 .list_permissions()
                 .await?
                 .into_iter()
-                .find(|permission| permission.session_id == chat.session_id)
+                .find(|permission| Some(permission.session_id) == chat.session_id)
         {
             modals.permission_dialog = Some(PermissionDialogState::new(permission));
             needs_redraw = true;

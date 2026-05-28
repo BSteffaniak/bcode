@@ -169,6 +169,12 @@ impl BmuxApp {
         self.tui_config = config;
     }
 
+    /// Return terminal UI configuration.
+    #[must_use]
+    pub const fn tui_config(&self) -> &TuiConfig {
+        &self.tui_config
+    }
+
     /// Return inline diff preview rendering configuration.
     #[must_use]
     pub const fn inline_diff_config(&self) -> TuiInlineDiffConfig {

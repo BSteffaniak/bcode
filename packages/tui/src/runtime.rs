@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
 use super::keymap::BmuxKeyMap;
-use super::runtime_context::{TuiIo, TuiServices};
 use super::terminal_events::TuiInput;
 use super::{INITIAL_HISTORY_EVENT_LIMIT, TuiError, chat_loop, history_flow, session_flow};
 
@@ -23,18 +22,33 @@ pub async fn run_event_loop<W: Write>(
     let keymap = BmuxKeyMap::from_config(&config.tui);
     let mouse_scroll_rows = config.tui.mouse.effective_scroll_rows();
     let mut terminal_events = TuiInput::start();
-    let services = TuiServices {
-        client: &client,
-        keymap: &keymap,
-    };
-    let session_id = if let Some(session_id) = session_id {
-        session_id
-    } else {
-        let mut io = TuiIo {
-            terminal,
-            input: &mut terminal_events,
+    let Some(session_id) = session_id else {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.apply_tui_config(config.tui);
+        app.set_status("New draft session; send a message to save it".to_owned());
+        let mut chat = session_flow::ActiveChat {
+            app,
+            session_id: None,
+            event_sender,
+            event_receiver,
+            event_task: None,
         };
-        session_flow::pick_session(&mut io, &services).await?
+        let result = {
+            chat_loop::run_with_client(
+                terminal,
+                &mut terminal_events,
+                &client,
+                &keymap,
+                &mut chat,
+                mouse_scroll_rows,
+            )
+            .await
+        };
+        if let Some(event_task) = chat.event_task.take() {
+            event_task.abort();
+        }
+        return result;
     };
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (attached, event_task) =
@@ -50,10 +64,10 @@ pub async fn run_event_loop<W: Write>(
     app.apply_tui_config(config.tui);
     let mut chat = session_flow::ActiveChat {
         app,
-        session_id,
+        session_id: Some(session_id),
         event_sender,
         event_receiver,
-        event_task,
+        event_task: Some(event_task),
     };
     session_flow::hydrate_status(&client, &mut chat.app).await;
     let result = {
@@ -67,6 +81,8 @@ pub async fn run_event_loop<W: Write>(
         )
         .await
     };
-    chat.event_task.abort();
+    if let Some(event_task) = chat.event_task.take() {
+        event_task.abort();
+    }
     result
 }

@@ -8,8 +8,8 @@ use bcode_worktree_models::{WorktreeCreateRequest, WorktreeListRequest};
 pub enum SlashCommandOutcome {
     /// Command was handled in-place.
     Handled(String),
-    /// Switch to a session.
-    SwitchSession(SessionId),
+    /// Switch to a new unpersisted draft session.
+    NewDraftSession,
     /// Open the session picker.
     PickSession,
     /// Open model picker.
@@ -453,9 +453,10 @@ async fn cancel_runtime_command(
 /// # Errors
 ///
 /// Returns an error when the daemon rejects a requested operation.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(
     client: &BcodeClient,
-    session_id: SessionId,
+    session_id: Option<SessionId>,
     message: &str,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     let parts = message.split_whitespace().collect::<Vec<_>>();
@@ -471,11 +472,13 @@ pub async fn execute(
                 list.catalog_revision
             ))
         }),
-        "new" => {
-            let session = client.create_session(None).await?;
-            Ok(SlashCommandOutcome::SwitchSession(session.id))
-        }
+        "new" => Ok(SlashCommandOutcome::NewDraftSession),
         "plan" | "build" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "agent selection requires an active session".to_owned(),
+                ));
+            };
             client
                 .set_session_agent(session_id, command.to_owned())
                 .await?;
@@ -484,6 +487,11 @@ pub async fn execute(
             )))
         }
         "agent" if parts.len() > 1 => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "agent selection requires an active session".to_owned(),
+                ));
+            };
             let agent_id = parts[1].to_owned();
             client
                 .set_session_agent(session_id, agent_id.clone())
@@ -493,11 +501,21 @@ pub async fn execute(
             )))
         }
         "compact" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "compact requires an active session".to_owned(),
+                ));
+            };
             let message = client.compact_session(session_id).await?;
             Ok(SlashCommandOutcome::Handled(message))
         }
         "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         "model" | "set-model" if parts.len() > 1 => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "model selection requires an active session".to_owned(),
+                ));
+            };
             let model_id = parts[1].to_owned();
             client
                 .set_session_model(session_id, None, model_id.clone())
@@ -507,6 +525,11 @@ pub async fn execute(
             )))
         }
         "provider" | "set-provider" if parts.len() > 1 => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "provider selection requires an active session".to_owned(),
+                ));
+            };
             let provider = parts[1].to_owned();
             let model_id = client
                 .session_model_status(session_id)
@@ -521,6 +544,11 @@ pub async fn execute(
             )))
         }
         "provider" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "provider status requires an active session".to_owned(),
+                ));
+            };
             let status = client.session_model_status(session_id).await?;
             Ok(SlashCommandOutcome::Handled(format!(
                 "current provider: {}",
@@ -528,14 +556,62 @@ pub async fn execute(
             )))
         }
         "diff" => Ok(SlashCommandOutcome::ToggleDiff),
-        "cwd" => cwd_command(client, session_id, &parts).await,
-        "worktree" | "worktrees" => worktree_command(client, session_id, &parts).await,
+        "cwd" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "cwd requires an active session".to_owned(),
+                ));
+            };
+            cwd_command(client, session_id, &parts).await
+        }
+        "worktree" | "worktrees" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "worktree commands require an active session".to_owned(),
+                ));
+            };
+            worktree_command(client, session_id, &parts).await
+        }
         "skills" => Ok(SlashCommandOutcome::PickSkill),
-        "skill" => skill_command(client, session_id, &parts).await,
-        "thinking" => thinking_command(client, session_id, &parts).await,
-        "stop" => stop_command(client, session_id).await,
-        "cancel-runtime" => cancel_runtime_command(client, session_id, &parts).await,
-        "runtime" | "status" => runtime_status(client, session_id, &parts).await,
+        "skill" => {
+            let Some(session_id) = session_id else {
+                if let Some(skill_id) = parts.get(1) {
+                    return describe_skill(client, skill_id).await;
+                }
+                return Ok(SlashCommandOutcome::PickSkill);
+            };
+            skill_command(client, session_id, &parts).await
+        }
+        "thinking" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::ToggleThinkingDisplay);
+            };
+            thinking_command(client, session_id, &parts).await
+        }
+        "stop" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "stop requires an active session".to_owned(),
+                ));
+            };
+            stop_command(client, session_id).await
+        }
+        "cancel-runtime" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "runtime cancellation requires an active session".to_owned(),
+                ));
+            };
+            cancel_runtime_command(client, session_id, &parts).await
+        }
+        "runtime" | "status" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "runtime: no active session".to_owned(),
+                ));
+            };
+            runtime_status(client, session_id, &parts).await
+        }
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }
 }

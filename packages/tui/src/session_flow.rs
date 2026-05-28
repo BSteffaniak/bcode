@@ -25,10 +25,10 @@ use super::{session_picker, session_picker_render};
 /// Active chat session state shared by TUI flows.
 pub struct ActiveChat {
     pub app: BmuxApp,
-    pub session_id: SessionId,
+    pub session_id: Option<SessionId>,
     pub event_sender: mpsc::UnboundedSender<BcodeEvent>,
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
-    pub event_task: JoinHandle<()>,
+    pub event_task: Option<JoinHandle<()>>,
 }
 
 /// Hydrate model and skill status for the active session.
@@ -65,7 +65,9 @@ pub async fn switch_session<W: Write>(
 ) -> Result<(), TuiError> {
     chat.app.set_status("Opening session…".to_owned());
     terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
-    chat.event_task.abort();
+    if let Some(event_task) = chat.event_task.take() {
+        event_task.abort();
+    }
     while chat.event_receiver.try_recv().is_ok() {}
     let (attached, next_task) = history_flow::attach_session_event_stream(
         client,
@@ -73,8 +75,8 @@ pub async fn switch_session<W: Write>(
         chat.event_sender.clone(),
     )
     .await?;
-    chat.event_task = next_task;
-    chat.session_id = next_session_id;
+    chat.event_task = Some(next_task);
+    chat.session_id = Some(next_session_id);
     chat.app = BmuxApp::new_with_history(
         Some(next_session_id),
         &attached.history,
@@ -84,6 +86,42 @@ pub async fn switch_session<W: Write>(
     chat.app.apply_session_summary(&attached.session);
     hydrate_status(client, &mut chat.app).await;
     Ok(())
+}
+
+/// Reset the active chat to an unpersisted draft session.
+pub fn switch_to_draft_session(chat: &mut ActiveChat) {
+    if let Some(event_task) = chat.event_task.take() {
+        event_task.abort();
+    }
+    while chat.event_receiver.try_recv().is_ok() {}
+    chat.session_id = None;
+    let tui_config = chat.app.tui_config().clone();
+    chat.app = BmuxApp::new_with_history(None, &[], &[], false);
+    chat.app.apply_tui_config(tui_config);
+    chat.app
+        .set_status("New draft session; send a message to save it".to_owned());
+}
+
+/// Create and attach a persisted session for the active draft chat.
+pub async fn persist_draft_session<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+) -> Result<SessionId, TuiError> {
+    if let Some(session_id) = chat.session_id {
+        return Ok(session_id);
+    }
+    chat.app.set_status("Creating session…".to_owned());
+    terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
+    let session = client.create_session(None).await?;
+    let (attached, event_task) =
+        history_flow::attach_session_event_stream(client, session.id, chat.event_sender.clone())
+            .await?;
+    chat.session_id = Some(session.id);
+    chat.event_task = Some(event_task);
+    chat.app.apply_session_summary(&attached.session);
+    hydrate_status(client, &mut chat.app).await;
+    Ok(session.id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,12 +284,21 @@ async fn import_selected_session<W: Write>(
     }
 }
 
-/// Pick an existing session or create one.
+/// Session picker result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickSessionOutcome {
+    /// An existing session was selected.
+    Existing(SessionId),
+    /// A new unpersisted draft session was requested.
+    Draft,
+}
+
+/// Pick an existing session or request a new draft.
 #[allow(clippy::too_many_lines)]
 pub async fn pick_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
-) -> Result<SessionId, TuiError> {
+) -> Result<PickSessionOutcome, TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_loading_status(
         "Loading sessions: connecting to catalog; press Ctrl-N to create one".to_owned(),
@@ -286,7 +333,7 @@ pub async fn pick_session<W: Write>(
             Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
                 PickerKeyOutcome::Continue => {}
                 PickerKeyOutcome::Create => {
-                    return Ok(services.client.create_session(None).await?.id);
+                    return Ok(PickSessionOutcome::Draft);
                 }
                 PickerKeyOutcome::Rename => {
                     rename_picker_session(services.client, &mut picker).await?;
@@ -298,7 +345,7 @@ pub async fn pick_session<W: Write>(
                     if let Some(session_id) =
                         import_selected_session(io.terminal, services.client, &mut picker).await?
                     {
-                        return Ok(session_id);
+                        return Ok(PickSessionOutcome::Existing(session_id));
                     }
                 }
                 PickerKeyOutcome::Canceled => {
@@ -311,7 +358,7 @@ pub async fn pick_session<W: Write>(
                     && let Some(session_id) =
                         import_selected_session(io.terminal, services.client, &mut picker).await?
                 {
-                    return Ok(session_id);
+                    return Ok(PickSessionOutcome::Existing(session_id));
                 }
             }
             Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}

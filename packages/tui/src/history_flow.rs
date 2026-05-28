@@ -19,9 +19,12 @@ pub async fn load_older_history(
         return Ok(());
     };
     chat.app.set_loading_older_history(true);
+    let Some(session_id) = chat.session_id else {
+        return Ok(());
+    };
     match client
         .session_history_page(
-            chat.session_id,
+            session_id,
             SessionHistoryQuery {
                 cursor: Some(cursor),
                 limit: OLDER_HISTORY_EVENT_LIMIT,

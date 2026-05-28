@@ -38,18 +38,28 @@ fn is_slash_command_name(command: &str) -> bool {
     )
 }
 
-fn has_known_slash_command(message: &str) -> bool {
+fn is_draft_safe_slash_command(command: &str) -> bool {
+    matches!(
+        command,
+        "sessions" | "new" | "diff" | "skills" | "skill" | "thinking" | "rescan-imports"
+    )
+}
+
+fn slash_command_name(message: &str) -> Option<&str> {
     message
         .strip_prefix('/')
         .and_then(|command| command.split_whitespace().next())
-        .is_some_and(is_slash_command_name)
+}
+
+fn has_known_slash_command(message: &str) -> bool {
+    slash_command_name(message).is_some_and(is_slash_command_name)
 }
 
 async fn handle_slash_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    session_id: SessionId,
+    session_id: Option<SessionId>,
     message: &str,
 ) -> Result<SubmitComposerOutcome, TuiError> {
     match slash_commands::execute(services.client, session_id, message).await? {
@@ -84,6 +94,11 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {
             chat.app.clear_pending_submission(message);
+            let Some(session_id) = session_id else {
+                chat.app
+                    .set_status("thinking settings require an active session".to_owned());
+                return Ok(None);
+            };
             let status = services.client.session_model_status(session_id).await?;
             chat.app.apply_model_status(status.clone());
             chat.app
@@ -94,16 +109,26 @@ async fn handle_slash_command<W: Write>(
                 focus,
             )));
         }
-        slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
+        slash_commands::SlashCommandOutcome::NewDraftSession => {
             chat.app.clear_pending_submission(message);
-            session_flow::switch_session(io.terminal, services.client, chat, next_session_id)
-                .await?;
+            session_flow::switch_to_draft_session(chat);
         }
         slash_commands::SlashCommandOutcome::PickSession => {
             chat.app.clear_pending_submission(message);
-            let next_session_id = session_flow::pick_session(io, services).await?;
-            session_flow::switch_session(io.terminal, services.client, chat, next_session_id)
-                .await?;
+            match session_flow::pick_session(io, services).await? {
+                session_flow::PickSessionOutcome::Existing(next_session_id) => {
+                    session_flow::switch_session(
+                        io.terminal,
+                        services.client,
+                        chat,
+                        next_session_id,
+                    )
+                    .await?;
+                }
+                session_flow::PickSessionOutcome::Draft => {
+                    session_flow::switch_to_draft_session(chat);
+                }
+            }
         }
         slash_commands::SlashCommandOutcome::PickModel => {
             chat.app.clear_pending_submission(message);
@@ -132,18 +157,25 @@ pub async fn submit_composer<W: Write>(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<SubmitComposerOutcome, TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(None);
-    };
+    let session_id = chat.app.session_id();
     let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
         chat.app.clear_pending_submission(&message);
         return Ok(None);
     }
     if has_known_slash_command(&message) {
-        return handle_slash_command(io, services, chat, session_id, &message).await;
+        let command = slash_command_name(&message);
+        if session_id.is_some() || command.is_some_and(is_draft_safe_slash_command) {
+            return handle_slash_command(io, services, chat, session_id, &message).await;
+        }
+        chat.app.clear_pending_submission(&message);
+        chat.app.set_status(
+            "slash command requires an active session; send a message first".to_owned(),
+        );
+        return Ok(None);
     }
+    let session_id =
+        session_flow::persist_draft_session(io.terminal, services.client, chat).await?;
     match services
         .client
         .send_user_message(session_id, message.clone())
