@@ -5448,21 +5448,61 @@ async fn build_model_turn_request(
     selection: &SessionModelSelection,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let build_timer = state.metrics.timer();
+    let history_timer = state.metrics.timer();
     let history = state.sessions.model_context_events(session_id).await?;
+    state.metrics.record_histogram(
+        "model.request_build.load_context_events_duration_ms",
+        history_timer.elapsed_ms(),
+    );
     state
         .metrics
         .record_histogram("model.context.event_count", history.len() as u64);
+    let convert_timer = state.metrics.timer();
     let mut messages =
         session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
+    state.metrics.record_histogram(
+        "model.request_build.convert_events_duration_ms",
+        convert_timer.elapsed_ms(),
+    );
+    state
+        .metrics
+        .record_histogram("model.context.message_count", messages.len() as u64);
+    state.metrics.record_histogram(
+        "model.context.message_chars",
+        messages
+            .iter()
+            .map(model_message_context_chars)
+            .sum::<usize>() as u64,
+    );
+    let prompt_cache_timer = state.metrics.timer();
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
+    state.metrics.record_histogram(
+        "model.request_build.prompt_cache_plan_duration_ms",
+        prompt_cache_timer.elapsed_ms(),
+    );
+    let agent_timer = state.metrics.timer();
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;
+    state.metrics.record_histogram(
+        "model.request_build.agent_context_duration_ms",
+        agent_timer.elapsed_ms(),
+    );
+    let working_directory_timer = state.metrics.timer();
     let working_directory = state.sessions.session_working_directory(session_id).await?;
+    state.metrics.record_histogram(
+        "model.request_build.working_directory_duration_ms",
+        working_directory_timer.elapsed_ms(),
+    );
+    let system_prompt_timer = state.metrics.timer();
     let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
         &working_directory,
         agent_context
             .as_ref()
             .and_then(|context| context.system_prompt_suffix.as_deref()),
+    );
+    state.metrics.record_histogram(
+        "model.request_build.system_prompt_duration_ms",
+        system_prompt_timer.elapsed_ms(),
     );
     let mut system_prefix_len = 0;
     if !dynamic_system_context.trim().is_empty() {
@@ -5491,7 +5531,16 @@ async fn build_model_turn_request(
         );
         system_prefix_len += 1;
     }
+    let skill_context_timer = state.metrics.timer();
     let skill_contexts = turn_skill_contexts(state, session_id, trigger_event.sequence).await;
+    state.metrics.record_histogram(
+        "model.request_build.skill_context_duration_ms",
+        skill_context_timer.elapsed_ms(),
+    );
+    state.metrics.record_histogram(
+        "model.context.skill_context_count",
+        skill_contexts.len() as u64,
+    );
     for skill_context in skill_contexts {
         messages.insert(
             system_prefix_len,
@@ -5519,7 +5568,16 @@ async fn build_model_turn_request(
     let enabled_tools = agent_context
         .as_ref()
         .and_then(|context| context.enabled_tools.clone());
+    let tool_collection_timer = state.metrics.timer();
     let tools = collect_model_tools(state, enabled_tools).await;
+    state.metrics.record_histogram(
+        "model.request_build.tool_collection_duration_ms",
+        tool_collection_timer.elapsed_ms(),
+    );
+    state
+        .metrics
+        .record_histogram("model.context.tool_count", tools.len() as u64);
+    let parameters_timer = state.metrics.timer();
     let parameters = {
         let mut p = ModelParameters::default();
         if let Some(level) = &selection.thinking_level {
@@ -5533,7 +5591,12 @@ async fn build_model_turn_request(
         }
         p
     };
+    state.metrics.record_histogram(
+        "model.request_build.parameters_duration_ms",
+        parameters_timer.elapsed_ms(),
+    );
     let model_id = model_id_for_provider_request(selected_model_id);
+    let projection_timer = state.metrics.timer();
     let projection = ConversationProjection::new(
         session_id,
         provider_plugin_id.unwrap_or("<auto>"),
@@ -5543,9 +5606,24 @@ async fn build_model_turn_request(
         &parameters,
         &messages,
     );
+    state.metrics.record_histogram(
+        "model.request_build.conversation_projection_duration_ms",
+        projection_timer.elapsed_ms(),
+    );
+    let conversation_reuse_timer = state.metrics.timer();
     let conversation_reuse = plan_conversation_reuse(state, &projection, messages.len()).await;
+    state.metrics.record_histogram(
+        "model.request_build.conversation_reuse_plan_duration_ms",
+        conversation_reuse_timer.elapsed_ms(),
+    );
+    let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
     insert_reasoning_metadata(&mut metadata, &parameters);
+    state.metrics.record_histogram(
+        "model.request_build.metadata_duration_ms",
+        metadata_timer.elapsed_ms(),
+    );
+    let request_assembly_timer = state.metrics.timer();
     let request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -5559,6 +5637,10 @@ async fn build_model_turn_request(
         conversation_reuse,
         metadata,
     };
+    state.metrics.record_histogram(
+        "model.request_build.request_assembly_duration_ms",
+        request_assembly_timer.elapsed_ms(),
+    );
     state
         .metrics
         .record_histogram("model.request_build_duration_ms", build_timer.elapsed_ms());
