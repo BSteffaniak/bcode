@@ -2982,6 +2982,7 @@ struct CompanyData {
     proposals: Vec<WorkProposalSummary>,
     tasks: Vec<TaskSummary>,
     artifacts: Vec<ArtifactSummary>,
+    contract_violations: Vec<ContractViolationRecord>,
     agent_stats: Vec<AgentStatsRecord>,
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
@@ -4559,6 +4560,7 @@ async fn load_company_data_from_database(
     let memories = load_agent_memories(database).await?;
     let world_objects = load_world_objects(database).await?;
     let permissions = load_agent_permissions(database).await?;
+    let contract_violations = load_contract_violations(database).await?;
 
     Ok(CompanyData {
         company,
@@ -4585,6 +4587,7 @@ async fn load_company_data_from_database(
         proposals,
         tasks,
         artifacts,
+        contract_violations,
         agent_stats,
         relationships,
         memories,
@@ -4755,6 +4758,20 @@ async fn load_agent_permissions(
         .collect::<Result<Vec<_>, _>>()
 }
 
+async fn load_contract_violations(
+    database: &dyn Database,
+) -> Result<Vec<ContractViolationRecord>, BlimsStateError> {
+    database
+        .select("contract_violations")
+        .columns(&["id", "agent_id", "severity", "summary", "action"])
+        .sort("id", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(contract_violation_record)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn load_company_record(database: &dyn Database) -> Result<CompanyRecord, BlimsStateError> {
     let row = database
         .select("companies")
@@ -4871,6 +4888,16 @@ fn agent_permission_record(row: &Row) -> Result<AgentPermissionRecord, BlimsStat
         write: required_text(row, "write")?,
         edit: required_text(row, "edit")?,
         external_directory: required_text(row, "external_directory")?,
+    })
+}
+
+fn contract_violation_record(row: &Row) -> Result<ContractViolationRecord, BlimsStateError> {
+    Ok(ContractViolationRecord {
+        id: required_text(row, "id")?,
+        agent_id: required_text(row, "agent_id")?,
+        severity: required_text(row, "severity")?,
+        summary: required_text(row, "summary")?,
+        action: required_text(row, "action")?,
     })
 }
 
@@ -5901,6 +5928,32 @@ fn morning_report(data: &CompanyData) -> MorningReport {
             data.rooms.len()
         ),
     ];
+    let completed = data
+        .tasks
+        .iter()
+        .filter(|task| task.status == "done" || task.status == "completed")
+        .count();
+    if completed > 0 {
+        bullets.push(format!("Completed work items: {completed}"));
+    }
+    let paused = data
+        .initiatives
+        .iter()
+        .filter(|initiative| initiative.status == "paused")
+        .count();
+    if paused > 0 {
+        bullets.push(format!(
+            "Paused initiatives needing rationale review: {paused}"
+        ));
+    }
+    let blocked = data
+        .tasks
+        .iter()
+        .filter(|task| task.status == "blocked")
+        .count();
+    if blocked > 0 {
+        bullets.push(format!("Blockers: {blocked} task(s) blocked"));
+    }
     if data.guidance.is_empty() {
         bullets.push("No active CEO guidance yet.".to_string());
     } else {
@@ -5939,6 +5992,21 @@ fn morning_report(data: &CompanyData) -> MorningReport {
         if ready > 0 {
             bullets.push(format!("Ready for CEO review: {ready}"));
         }
+    }
+    if !data.contract_violations.is_empty() {
+        bullets.push(format!(
+            "Contract/permission issues: {}",
+            data.contract_violations.len()
+        ));
+        if let Some(violation) = data.contract_violations.first() {
+            bullets.push(format!(
+                "Top issue [{}]: {} — {}",
+                violation.severity, violation.agent_id, violation.summary
+            ));
+        }
+    }
+    if let Some(memory) = data.memories.first() {
+        bullets.push(format!("Notable discovery: {}", memory.summary));
     }
 
     MorningReport {
@@ -5992,7 +6060,22 @@ fn department_report(
         format!("Agents: {} total, {active_agents} active", agents.len()),
         format!("Assigned tasks: {}", tasks.len()),
         format!("Ready reviews across company: {ready_reviews}"),
+        format!("Standup yesterday: moved priority work and kept context fresh."),
+        format!("Standup today: focus on highest-priority active tasks and review queue."),
     ];
+    let risk_count = agents
+        .iter()
+        .filter(|agent| {
+            data.agent_stats
+                .iter()
+                .any(|stats| stats.agent_id == agent.id && (stats.morale < 50 || stats.focus < 50))
+        })
+        .count();
+    if risk_count > 0 {
+        bullets.push(format!(
+            "Morale/focus risk: {risk_count} agent(s) need attention"
+        ));
+    }
     if let Some(task) = tasks.first() {
         bullets.push(format!("Top task: {} ({})", task.title, task.status));
     }
@@ -6019,23 +6102,62 @@ fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, Blims
         .iter()
         .filter(|proposal| proposal.agent_id == agent.id)
         .collect::<Vec<_>>();
-    let artifacts = data
-        .artifacts
+    let artifacts = count_agent_related_artifacts(data, &assigned_tasks);
+    let mut bullets =
+        agent_report_base_bullets(agent, assigned_tasks.len(), proposals.len(), artifacts);
+    append_agent_context_bullets(data, agent, &mut bullets);
+    if let Some(task) = assigned_tasks.first() {
+        bullets.push(format!(
+            "Current likely focus: {} ({})",
+            task.title, task.status
+        ));
+    }
+    if let Some(proposal) = proposals.first() {
+        bullets.push(format!(
+            "Latest proposal: {} ({})",
+            proposal.summary, proposal.status
+        ));
+    }
+    Ok(AgentReport {
+        title: format!("{} agent report", agent.name),
+        agent_id: agent.id.clone(),
+        bullets,
+    })
+}
+
+fn count_agent_related_artifacts(data: &CompanyData, assigned_tasks: &[&TaskSummary]) -> usize {
+    data.artifacts
         .iter()
         .filter(|artifact| {
             assigned_tasks
                 .iter()
                 .any(|task| task.initiative_id == artifact.initiative_id)
         })
-        .count();
-    let mut bullets = vec![
+        .count()
+}
+
+fn agent_report_base_bullets(
+    agent: &AgentRecord,
+    assigned_tasks: usize,
+    proposals: usize,
+    artifacts: usize,
+) -> Vec<String> {
+    vec![
         format!("Role: {}", agent.role),
         format!("Status: {}", agent.status),
         format!("Location: {}", agent.room_id),
-        format!("Assigned tasks: {}", assigned_tasks.len()),
-        format!("Work proposals: {}", proposals.len()),
-        format!("Related artifacts: {artifacts}"),
-    ];
+        format!("What I did: {proposals} proposal(s), {artifacts} related artifact(s)"),
+        format!("What I am doing: {assigned_tasks} assigned task(s)"),
+        "Why I chose this: following priority, CEO guidance, and company culture.".to_string(),
+        "What I need: clear approval on ready proposals and help on blockers.".to_string(),
+    ]
+}
+
+fn append_agent_context_bullets(
+    data: &CompanyData,
+    agent: &AgentRecord,
+    bullets: &mut Vec<String>,
+) {
     if let Some(stats) = data
         .agent_stats
         .iter()
@@ -6046,6 +6168,25 @@ fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, Blims
         bullets.push(format!("Traits: {}", stats.traits));
         bullets.push(format!("Skills: {}", stats.skills));
     }
+    append_agent_social_bullets(data, agent, bullets);
+    if let Some(permission) = data
+        .permissions
+        .iter()
+        .find(|permission| permission.agent_id == agent.id)
+    {
+        bullets.push(format!(
+            "Bcode policy {}: bash {}, read {}, write {}, edit {}, external {}",
+            permission.bcode_agent_id,
+            permission.bash,
+            permission.read,
+            permission.write,
+            permission.edit,
+            permission.external_directory
+        ));
+    }
+}
+
+fn append_agent_social_bullets(data: &CompanyData, agent: &AgentRecord, bullets: &mut Vec<String>) {
     for relationship in data
         .relationships
         .iter()
@@ -6071,38 +6212,6 @@ fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, Blims
             memory.kind, memory.importance, memory.summary
         ));
     }
-    if let Some(permission) = data
-        .permissions
-        .iter()
-        .find(|permission| permission.agent_id == agent.id)
-    {
-        bullets.push(format!(
-            "Bcode policy {}: bash {}, read {}, write {}, edit {}, external {}",
-            permission.bcode_agent_id,
-            permission.bash,
-            permission.read,
-            permission.write,
-            permission.edit,
-            permission.external_directory
-        ));
-    }
-    if let Some(task) = assigned_tasks.first() {
-        bullets.push(format!(
-            "Current likely focus: {} ({})",
-            task.title, task.status
-        ));
-    }
-    if let Some(proposal) = proposals.first() {
-        bullets.push(format!(
-            "Latest proposal: {} ({})",
-            proposal.summary, proposal.status
-        ));
-    }
-    Ok(AgentReport {
-        title: format!("{} agent report", agent.name),
-        agent_id: agent.id.clone(),
-        bullets,
-    })
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
