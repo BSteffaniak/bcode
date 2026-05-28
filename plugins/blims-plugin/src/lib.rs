@@ -1131,6 +1131,17 @@ impl AgentStatsRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentPermissionRecord {
+    agent_id: String,
+    bcode_agent_id: String,
+    bash: String,
+    read: String,
+    write: String,
+    edit: String,
+    external_directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WorktreeRecord {
     id: String,
     task_id: String,
@@ -1363,6 +1374,9 @@ enum BlimsEventPayload {
     },
     AgentMemoryRecorded {
         memory: AgentMemoryRecord,
+    },
+    AgentPermissionSet {
+        permission: AgentPermissionRecord,
     },
     ContractViolationRecorded {
         violation: ContractViolationRecord,
@@ -2165,6 +2179,13 @@ async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_databa
         .primary_key("id")
         .execute(database)
         .await?;
+    create_agent_policy_tables(database).await?;
+    create_agent_context_tables(database).await
+}
+
+async fn create_agent_policy_tables(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
     create_table("agent_contracts")
         .if_not_exists(true)
         .column(text_column("agent_id"))
@@ -2176,6 +2197,23 @@ async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_databa
         .primary_key("agent_id")
         .execute(database)
         .await?;
+    create_table("agent_permissions")
+        .if_not_exists(true)
+        .column(text_column("agent_id"))
+        .column(text_column("bcode_agent_id"))
+        .column(text_column("bash"))
+        .column(text_column("read"))
+        .column(text_column("write"))
+        .column(text_column("edit"))
+        .column(text_column("external_directory"))
+        .primary_key("agent_id")
+        .execute(database)
+        .await
+}
+
+async fn create_agent_context_tables(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
     create_table("agent_stats")
         .if_not_exists(true)
         .column(text_column("agent_id"))
@@ -2580,6 +2618,15 @@ async fn seed_starter_world_events(
             )
             .await?;
         }
+        let permission = starter_agent_permission(&agent.id, &agent.role);
+        let payload = BlimsEventPayload::AgentPermissionSet { permission };
+        append_bootstrap_event_once(
+            database,
+            "agent.permission_set",
+            &format!("Starter permission mapped: {}", agent.name),
+            &payload,
+        )
+        .await?;
     }
     for relationship in starter_agent_relationships() {
         let payload = BlimsEventPayload::AgentRelationshipSet { relationship };
@@ -2764,6 +2811,19 @@ fn starter_agent_stats(agent_id: &str) -> AgentStatsRecord {
     }
 }
 
+fn starter_agent_permission(agent_id: &str, role: &str) -> AgentPermissionRecord {
+    let is_engineer = role.to_lowercase().contains("engineer");
+    AgentPermissionRecord {
+        agent_id: agent_id.to_string(),
+        bcode_agent_id: format!("blims-{agent_id}"),
+        bash: if is_engineer { "ask" } else { "deny" }.to_string(),
+        read: "allow".to_string(),
+        write: if is_engineer { "ask" } else { "deny" }.to_string(),
+        edit: if is_engineer { "ask" } else { "deny" }.to_string(),
+        external_directory: "deny".to_string(),
+    }
+}
+
 fn starter_agent_relationships() -> Vec<AgentRelationshipRecord> {
     vec![
         AgentRelationshipRecord {
@@ -2901,6 +2961,7 @@ struct CompanyData {
     agent_stats: Vec<AgentStatsRecord>,
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
+    permissions: Vec<AgentPermissionRecord>,
     world_objects: Vec<WorldObjectRecord>,
 }
 
@@ -3112,6 +3173,9 @@ async fn apply_org_world_event_projection(
         }
         BlimsEventPayload::AgentMemoryRecorded { memory } => {
             replace_one_agent_memory_projection(database, memory).await?;
+        }
+        BlimsEventPayload::AgentPermissionSet { permission } => {
+            replace_one_agent_permission_projection(database, permission).await?;
         }
         BlimsEventPayload::ContractViolationRecorded { violation } => {
             replace_one_contract_violation_projection(database, violation).await?;
@@ -4466,6 +4530,7 @@ async fn load_company_data_from_database(
     let relationships = load_agent_relationships(database).await?;
     let memories = load_agent_memories(database).await?;
     let world_objects = load_world_objects(database).await?;
+    let permissions = load_agent_permissions(database).await?;
 
     Ok(CompanyData {
         company,
@@ -4495,6 +4560,7 @@ async fn load_company_data_from_database(
         agent_stats,
         relationships,
         memories,
+        permissions,
         world_objects,
     })
 }
@@ -4639,6 +4705,28 @@ async fn load_world_objects(
         .collect::<Result<Vec<_>, _>>()
 }
 
+async fn load_agent_permissions(
+    database: &dyn Database,
+) -> Result<Vec<AgentPermissionRecord>, BlimsStateError> {
+    database
+        .select("agent_permissions")
+        .columns(&[
+            "agent_id",
+            "bcode_agent_id",
+            "bash",
+            "read",
+            "write",
+            "edit",
+            "external_directory",
+        ])
+        .sort("agent_id", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(agent_permission_record)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn load_company_record(database: &dyn Database) -> Result<CompanyRecord, BlimsStateError> {
     let row = database
         .select("companies")
@@ -4746,6 +4834,18 @@ fn world_object_record(row: &Row) -> Result<WorldObjectRecord, BlimsStateError> 
     })
 }
 
+fn agent_permission_record(row: &Row) -> Result<AgentPermissionRecord, BlimsStateError> {
+    Ok(AgentPermissionRecord {
+        agent_id: required_text(row, "agent_id")?,
+        bcode_agent_id: required_text(row, "bcode_agent_id")?,
+        bash: required_text(row, "bash")?,
+        read: required_text(row, "read")?,
+        write: required_text(row, "write")?,
+        edit: required_text(row, "edit")?,
+        external_directory: required_text(row, "external_directory")?,
+    })
+}
+
 fn department_record(row: &Row) -> Result<DepartmentRecord, BlimsStateError> {
     Ok(DepartmentRecord {
         id: required_text(row, "id")?,
@@ -4808,6 +4908,7 @@ struct ProjectionState {
     agent_stats: Vec<AgentStatsRecord>,
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
+    permissions: Vec<AgentPermissionRecord>,
     world_objects: Vec<WorldObjectRecord>,
     contract_violations: Vec<ContractViolationRecord>,
     departments: Vec<DepartmentRecord>,
@@ -4901,6 +5002,7 @@ fn replay_event(
         | BlimsEventPayload::AgentStatsSet { .. }
         | BlimsEventPayload::AgentRelationshipSet { .. }
         | BlimsEventPayload::AgentMemoryRecorded { .. }
+        | BlimsEventPayload::AgentPermissionSet { .. }
         | BlimsEventPayload::ContractViolationRecorded { .. }
         | BlimsEventPayload::AgentStatusSet { .. } => {
             replay_agent_event(payload, state);
@@ -5011,6 +5113,11 @@ fn replay_agent_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
         BlimsEventPayload::AgentMemoryRecorded { memory } => {
             upsert_by_id(&mut state.memories, memory, |memory| &memory.id);
         }
+        BlimsEventPayload::AgentPermissionSet { permission } => {
+            upsert_by_id(&mut state.permissions, permission, |permission| {
+                &permission.agent_id
+            });
+        }
         BlimsEventPayload::ContractViolationRecorded { violation } => {
             upsert_by_id(&mut state.contract_violations, violation, |violation| {
                 &violation.id
@@ -5056,6 +5163,7 @@ async fn apply_projection_state(
     replace_agent_stats_projections(database, &state.agent_stats).await?;
     replace_agent_relationship_projections(database, &state.relationships).await?;
     replace_agent_memory_projections(database, &state.memories).await?;
+    replace_agent_permission_projections(database, &state.permissions).await?;
     replace_contract_violation_projections(database, &state.contract_violations).await?;
     replace_world_object_projections(database, &state.world_objects).await
 }
@@ -5526,6 +5634,43 @@ async fn replace_agent_memory_projections(
     Ok(())
 }
 
+async fn replace_one_agent_permission_projection(
+    database: &dyn Database,
+    permission: &AgentPermissionRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("agent_permissions")
+        .filter(Box::new(where_eq("agent_id", permission.agent_id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("agent_permissions")
+        .value("agent_id", permission.agent_id.clone())
+        .value("bcode_agent_id", permission.bcode_agent_id.clone())
+        .value("bash", permission.bash.clone())
+        .value("read", permission.read.clone())
+        .value("write", permission.write.clone())
+        .value("edit", permission.edit.clone())
+        .value("external_directory", permission.external_directory.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_agent_permission_projections(
+    database: &dyn Database,
+    permissions: &[AgentPermissionRecord],
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("agent_permissions")
+        .execute(database)
+        .await?;
+    for permission in permissions {
+        replace_one_agent_permission_projection(database, permission).await?;
+    }
+    Ok(())
+}
+
 async fn replace_one_contract_violation_projection(
     database: &dyn Database,
     violation: &ContractViolationRecord,
@@ -5845,6 +5990,21 @@ fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, Blims
         bullets.push(format!(
             "Memory [{} · importance {}]: {}",
             memory.kind, memory.importance, memory.summary
+        ));
+    }
+    if let Some(permission) = data
+        .permissions
+        .iter()
+        .find(|permission| permission.agent_id == agent.id)
+    {
+        bullets.push(format!(
+            "Bcode policy {}: bash {}, read {}, write {}, edit {}, external {}",
+            permission.bcode_agent_id,
+            permission.bash,
+            permission.read,
+            permission.write,
+            permission.edit,
+            permission.external_directory
         ));
     }
     if let Some(task) = assigned_tasks.first() {
