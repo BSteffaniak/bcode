@@ -123,7 +123,7 @@ pub enum SessionStoreError {
 #[derive(Debug, Clone)]
 pub struct SessionEventStore {
     root: PathBuf,
-    metrics: MetricsRegistry,
+    pub(crate) metrics: MetricsRegistry,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -398,52 +398,149 @@ impl SessionEventStore {
         Ok(input_history)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn read_model_context_events(
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
-        let index = match index::load_fresh_index(&self.root, session_id, &event_path)? {
-            Some(index) => index,
-            None => index::rebuild_index(&self.root, session_id, &event_path)?
+        let index_timer = self.metrics.timer();
+        let index = if let Some(index) =
+            index::load_fresh_index(&self.root, session_id, &event_path)?
+        {
+            index
+        } else {
+            self.metrics
+                .increment_counter("session.model_context_events.index_rebuild_total");
+            index::rebuild_index(&self.root, session_id, &event_path)?
                 .0
                 .ok_or_else(|| {
                     SessionStoreError::InvalidSessionId(format!("empty session log: {session_id}"))
-                })?,
+                })?
         };
+        self.metrics.record_histogram(
+            "session.model_context_events.load_index_duration_ms",
+            index_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.model_context_events.index_event_count",
+            index.event_count as u64,
+        );
+        let read_entries_timer = self.metrics.timer();
         let mut entries = match index::read_entries(&self.root, session_id) {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
+                self.metrics
+                    .increment_counter("session.model_context_events.entries_rebuild_total");
                 let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
                 index::read_entries(&self.root, session_id)?
             }
         };
+        self.metrics.record_histogram(
+            "session.model_context_events.read_entries_duration_ms",
+            read_entries_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.model_context_events.entry_count",
+            entries.len() as u64,
+        );
+        let sort_timer = self.metrics.timer();
         entries.sort_by_key(|entry| entry.sequence);
-        let Some(compaction_entry) = entries
+        self.metrics.record_histogram(
+            "session.model_context_events.sort_entries_duration_ms",
+            sort_timer.elapsed_ms(),
+        );
+        let find_compaction_timer = self.metrics.timer();
+        let compaction_entry = entries
             .iter()
             .rev()
-            .find(|entry| entry.kind == "context_compacted")
-        else {
-            return self.read_session_events(session_id);
+            .find(|entry| entry.kind == "context_compacted");
+        self.metrics.record_histogram(
+            "session.model_context_events.find_compaction_duration_ms",
+            find_compaction_timer.elapsed_ms(),
+        );
+        let Some(compaction_entry) = compaction_entry else {
+            self.metrics
+                .increment_counter("session.model_context_events.no_compaction_total");
+            let fallback_timer = self.metrics.timer();
+            let events = self.read_session_events(session_id)?;
+            self.metrics.record_histogram(
+                "session.model_context_events.read_full_history_duration_ms",
+                fallback_timer.elapsed_ms(),
+            );
+            self.metrics.record_histogram(
+                "session.model_context_events.result_event_count",
+                events.len() as u64,
+            );
+            self.metrics.record_histogram(
+                "session.model_context_events.total_duration_ms",
+                total_timer.elapsed_ms(),
+            );
+            return Ok(events);
         };
+        let compaction_read_timer = self.metrics.timer();
         let compaction_event = reader::read_event_at(&event_path, compaction_entry.offset)?;
-        let compacted_through_sequence = match &compaction_event.kind {
-            SessionEventKind::ContextCompacted {
-                compacted_through_sequence,
-                ..
-            } => *compacted_through_sequence,
-            _ => return self.read_session_events(session_id),
+        self.metrics.record_histogram(
+            "session.model_context_events.read_compaction_event_duration_ms",
+            compaction_read_timer.elapsed_ms(),
+        );
+        let SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        } = &compaction_event.kind
+        else {
+            self.metrics
+                .increment_counter("session.model_context_events.invalid_compaction_entry_total");
+            let fallback_timer = self.metrics.timer();
+            let events = self.read_session_events(session_id)?;
+            self.metrics.record_histogram(
+                "session.model_context_events.read_full_history_duration_ms",
+                fallback_timer.elapsed_ms(),
+            );
+            self.metrics.record_histogram(
+                "session.model_context_events.result_event_count",
+                events.len() as u64,
+            );
+            self.metrics.record_histogram(
+                "session.model_context_events.total_duration_ms",
+                total_timer.elapsed_ms(),
+            );
+            return Ok(events);
         };
-        let mut events = vec![compaction_event];
-        for entry in entries
+        let compacted_through_sequence = *compacted_through_sequence;
+        let select_timer = self.metrics.timer();
+        let selected_entries = entries
             .iter()
             .filter(|entry| entry.sequence > compacted_through_sequence)
-        {
-            if entry.sequence == compaction_entry.sequence {
-                continue;
-            }
+            .filter(|entry| entry.sequence != compaction_entry.sequence)
+            .collect::<Vec<_>>();
+        self.metrics.record_histogram(
+            "session.model_context_events.select_entries_duration_ms",
+            select_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.model_context_events.selected_entry_count",
+            selected_entries.len() as u64,
+        );
+        let read_selected_timer = self.metrics.timer();
+        let mut events = Vec::with_capacity(selected_entries.len().saturating_add(1));
+        events.push(compaction_event);
+        for entry in selected_entries {
             events.push(reader::read_event_at(&event_path, entry.offset)?);
         }
+        self.metrics.record_histogram(
+            "session.model_context_events.read_selected_events_duration_ms",
+            read_selected_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.model_context_events.result_event_count",
+            events.len() as u64,
+        );
+        self.metrics.record_histogram(
+            "session.model_context_events.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
         Ok(events)
     }
 

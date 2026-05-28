@@ -8,7 +8,7 @@ use bcode_session_models::{
     SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
     SessionSummary,
 };
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 pub struct PersistedSessionMetadata {
     pub summary: SessionSummary,
@@ -130,7 +130,15 @@ impl SessionStoreExecutor {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let queued_at = Instant::now();
         let store = self.store.clone();
-        spawn_blocking(move || store.read_model_context_events(session_id)).await?
+        spawn_blocking(move || {
+            store.metrics.record_histogram(
+                "session.model_context_events.blocking_queue_wait_duration_ms",
+                u64::try_from(queued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            store.read_model_context_events(session_id)
+        })
+        .await?
     }
 }
