@@ -43,6 +43,9 @@ pub const OP_AGENT_LIST: &str = "agent.list";
 /// Agent inspect operation.
 pub const OP_AGENT_INSPECT: &str = "agent.inspect";
 
+/// Agent permission escalation request operation.
+pub const OP_AGENT_REQUEST_PERMISSION: &str = "agent.request_permission";
+
 /// Agent conversation record operation.
 pub const OP_AGENT_RECORD_CONVERSATION: &str = "agent.record_conversation";
 
@@ -197,19 +200,13 @@ impl RustPlugin for BlimsPlugin {
 
 fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
     match request.operation.as_str() {
-        OP_COMPANY_STATUS => service_company_status(request),
-        OP_COMPANY_CREATE | OP_COMPANY_LOAD => service_company_create(request),
-        OP_COMPANY_PAUSE => {
-            service_company_lifecycle(request, &EventContext::from_request(request), "paused")
-        }
-        OP_COMPANY_RESUME => {
-            service_company_lifecycle(request, &EventContext::from_request(request), "running")
-        }
-        OP_COMPANY_SHUTDOWN => {
-            service_company_lifecycle(request, &EventContext::from_request(request), "shutdown")
-        }
+        OP_COMPANY_STATUS | OP_COMPANY_CREATE | OP_COMPANY_LOAD | OP_COMPANY_PAUSE
+        | OP_COMPANY_RESUME | OP_COMPANY_SHUTDOWN => invoke_company_service(request),
         OP_AGENT_LIST => service_agent_list(request),
         OP_AGENT_INSPECT => service_agent_inspect(request),
+        OP_AGENT_REQUEST_PERMISSION => {
+            service_agent_request_permission(request, &EventContext::from_request(request))
+        }
         OP_AGENT_RECORD_CONVERSATION => {
             service_agent_record_conversation(request, &EventContext::from_request(request))
         }
@@ -298,6 +295,26 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn invoke_company_service(request: &ServiceRequest) -> ServiceResponse {
+    match request.operation.as_str() {
+        OP_COMPANY_STATUS => service_company_status(request),
+        OP_COMPANY_CREATE | OP_COMPANY_LOAD => service_company_create(request),
+        OP_COMPANY_PAUSE => {
+            service_company_lifecycle(request, &EventContext::from_request(request), "paused")
+        }
+        OP_COMPANY_RESUME => {
+            service_company_lifecycle(request, &EventContext::from_request(request), "running")
+        }
+        OP_COMPANY_SHUTDOWN => {
+            service_company_lifecycle(request, &EventContext::from_request(request), "shutdown")
+        }
+        _ => ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported Blims company operation",
+        ),
+    }
+}
+
 /// Request carrying the workspace root for repo-local Blims state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRequest {
@@ -372,6 +389,30 @@ pub struct AgentRequest {
     pub working_directory: PathBuf,
     /// Agent id.
     pub agent_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to ask CEO for a permission escalation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionEscalationRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Agent id.
+    pub agent_id: String,
+    /// Permission category.
+    pub category: String,
+    /// Requested policy such as allow/ask/deny.
+    pub requested_policy: String,
+    /// Escalation reason.
+    pub reason: String,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -1216,6 +1257,16 @@ impl AgentStatsRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PermissionEscalationRecord {
+    id: String,
+    agent_id: String,
+    category: String,
+    requested_policy: String,
+    reason: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ConversationRecord {
     id: String,
     agent_id: String,
@@ -1489,6 +1540,9 @@ enum BlimsEventPayload {
     AgentPermissionSet {
         permission: AgentPermissionRecord,
     },
+    PermissionEscalationRequested {
+        request: PermissionEscalationRecord,
+    },
     ContractViolationRecorded {
         violation: ContractViolationRecord,
     },
@@ -1679,6 +1733,21 @@ fn service_agent_inspect(request: &ServiceRequest) -> ServiceResponse {
     match inspect_agent(&request) {
         Ok(agent) => json_response(&agent),
         Err(error) => ServiceResponse::error("agent_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_agent_request_permission(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<PermissionEscalationRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match request_permission_escalation(&request, &event_context) {
+        Ok(escalation) => json_response(&escalation),
+        Err(error) => ServiceResponse::error("permission_escalation_failed", error.to_string()),
     }
 }
 
@@ -2394,7 +2463,20 @@ async fn create_agent_policy_tables(
         .column(text_column("external_directory"))
         .primary_key("agent_id")
         .execute(database)
-        .await
+        .await?;
+    create_table("permission_escalations")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("agent_id"))
+        .column(text_column("category"))
+        .column(text_column("requested_policy"))
+        .column(text_column("reason"))
+        .column(text_column("status"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    Ok(())
 }
 
 async fn create_agent_context_tables(
@@ -3227,6 +3309,7 @@ struct CompanyData {
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
     permissions: Vec<AgentPermissionRecord>,
+    permission_escalations: Vec<PermissionEscalationRecord>,
     world_objects: Vec<WorldObjectRecord>,
 }
 
@@ -3451,6 +3534,9 @@ async fn apply_org_world_event_projection(
         BlimsEventPayload::AgentPermissionSet { permission } => {
             replace_one_agent_permission_projection(database, permission).await?;
         }
+        BlimsEventPayload::PermissionEscalationRequested { request } => {
+            replace_one_permission_escalation_projection(database, request).await?;
+        }
         BlimsEventPayload::ContractViolationRecorded { violation } => {
             replace_one_contract_violation_projection(database, violation).await?;
         }
@@ -3553,6 +3639,40 @@ fn inspect_agent(request: &AgentRequest) -> Result<AgentSnapshot, BlimsStateErro
             .find(|agent| agent.id == agent_id)
             .map(AgentRecord::snapshot)
             .ok_or_else(|| BlimsStateError::InvalidRequest(format!("unknown agent: {agent_id}")))
+    })
+}
+
+fn request_permission_escalation(
+    request: &PermissionEscalationRequest,
+    event_context: &EventContext,
+) -> Result<PermissionEscalationRecord, BlimsStateError> {
+    let escalation = PermissionEscalationRecord {
+        id: format!(
+            "permission-{}-{}",
+            request.agent_id,
+            stable_slug(&request.category)
+        ),
+        agent_id: request.agent_id.clone(),
+        category: request.category.clone(),
+        requested_policy: request.requested_policy.clone(),
+        reason: request.reason.clone(),
+        status: "pending".to_string(),
+    };
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "permission.escalation_requested",
+                format!("Permission escalation requested: {}", escalation.id),
+                &BlimsEventPayload::PermissionEscalationRequested {
+                    request: escalation.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(escalation)
+        })
     })
 }
 
@@ -4823,48 +4943,10 @@ async fn load_company_data_from_database(
 ) -> Result<CompanyData, BlimsStateError> {
     let company = load_company_record(database).await?;
     let (world_theme, player_room_id) = load_world_record(database).await?;
-    let room_rows = database
-        .select("world_rooms")
-        .columns(&[
-            "id",
-            "name",
-            "purpose",
-            "room_kind",
-            "productivity_modifier",
-            "x",
-            "y",
-            "symbol",
-            "color",
-        ])
-        .sort("id", SortDirection::Asc)
-        .execute(database)
-        .await?;
-    let agent_rows = database
-        .select("agents")
-        .columns(&[
-            "id",
-            "name",
-            "role",
-            "department_id",
-            "team_id",
-            "status",
-            "room_id",
-        ])
-        .sort("id", SortDirection::Asc)
-        .execute(database)
-        .await?;
-    let department_rows = database
-        .select("departments")
-        .columns(&["id", "name", "purpose"])
-        .sort("id", SortDirection::Asc)
-        .execute(database)
-        .await?;
-    let team_rows = database
-        .select("teams")
-        .columns(&["id", "department_id", "name", "purpose"])
-        .sort("id", SortDirection::Asc)
-        .execute(database)
-        .await?;
+    let room_rows = load_world_room_rows(database).await?;
+    let agent_rows = load_agent_rows(database).await?;
+    let department_rows = load_department_rows(database).await?;
+    let team_rows = load_team_rows(database).await?;
     let initiatives = load_initiatives(database).await?;
     let guidance = database
         .select("executive_guidance")
@@ -4884,6 +4966,7 @@ async fn load_company_data_from_database(
     let memories = load_agent_memories(database).await?;
     let world_objects = load_world_objects(database).await?;
     let permissions = load_agent_permissions(database).await?;
+    let permission_escalations = load_permission_escalations(database).await?;
     let contract_violations = load_contract_violations(database).await?;
 
     Ok(CompanyData {
@@ -4917,8 +5000,63 @@ async fn load_company_data_from_database(
         relationships,
         memories,
         permissions,
+        permission_escalations,
         world_objects,
     })
+}
+
+async fn load_world_room_rows(database: &dyn Database) -> Result<Vec<Row>, BlimsStateError> {
+    Ok(database
+        .select("world_rooms")
+        .columns(&[
+            "id",
+            "name",
+            "purpose",
+            "room_kind",
+            "productivity_modifier",
+            "x",
+            "y",
+            "symbol",
+            "color",
+        ])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?)
+}
+
+async fn load_agent_rows(database: &dyn Database) -> Result<Vec<Row>, BlimsStateError> {
+    Ok(database
+        .select("agents")
+        .columns(&[
+            "id",
+            "name",
+            "role",
+            "department_id",
+            "team_id",
+            "status",
+            "room_id",
+        ])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?)
+}
+
+async fn load_department_rows(database: &dyn Database) -> Result<Vec<Row>, BlimsStateError> {
+    Ok(database
+        .select("departments")
+        .columns(&["id", "name", "purpose"])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?)
+}
+
+async fn load_team_rows(database: &dyn Database) -> Result<Vec<Row>, BlimsStateError> {
+    Ok(database
+        .select("teams")
+        .columns(&["id", "department_id", "name", "purpose"])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?)
 }
 
 async fn load_initiatives(
@@ -5096,6 +5234,27 @@ async fn load_agent_permissions(
         .collect::<Result<Vec<_>, _>>()
 }
 
+async fn load_permission_escalations(
+    database: &dyn Database,
+) -> Result<Vec<PermissionEscalationRecord>, BlimsStateError> {
+    database
+        .select("permission_escalations")
+        .columns(&[
+            "id",
+            "agent_id",
+            "category",
+            "requested_policy",
+            "reason",
+            "status",
+        ])
+        .sort("id", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(permission_escalation_record)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn load_contract_violations(
     database: &dyn Database,
 ) -> Result<Vec<ContractViolationRecord>, BlimsStateError> {
@@ -5229,6 +5388,17 @@ fn agent_permission_record(row: &Row) -> Result<AgentPermissionRecord, BlimsStat
     })
 }
 
+fn permission_escalation_record(row: &Row) -> Result<PermissionEscalationRecord, BlimsStateError> {
+    Ok(PermissionEscalationRecord {
+        id: required_text(row, "id")?,
+        agent_id: required_text(row, "agent_id")?,
+        category: required_text(row, "category")?,
+        requested_policy: required_text(row, "requested_policy")?,
+        reason: required_text(row, "reason")?,
+        status: required_text(row, "status")?,
+    })
+}
+
 fn contract_violation_record(row: &Row) -> Result<ContractViolationRecord, BlimsStateError> {
     Ok(ContractViolationRecord {
         id: required_text(row, "id")?,
@@ -5313,6 +5483,7 @@ struct ProjectionState {
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
     permissions: Vec<AgentPermissionRecord>,
+    permission_escalations: Vec<PermissionEscalationRecord>,
     world_objects: Vec<WorldObjectRecord>,
     contract_violations: Vec<ContractViolationRecord>,
     departments: Vec<DepartmentRecord>,
@@ -5410,6 +5581,7 @@ fn replay_event(
         | BlimsEventPayload::AgentRelationshipSet { .. }
         | BlimsEventPayload::AgentMemoryRecorded { .. }
         | BlimsEventPayload::AgentPermissionSet { .. }
+        | BlimsEventPayload::PermissionEscalationRequested { .. }
         | BlimsEventPayload::ContractViolationRecorded { .. }
         | BlimsEventPayload::AgentStatusSet { .. } => {
             replay_agent_event(payload, state);
@@ -5527,6 +5699,11 @@ fn replay_agent_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
                 &permission.agent_id
             });
         }
+        BlimsEventPayload::PermissionEscalationRequested { request } => {
+            upsert_by_id(&mut state.permission_escalations, request, |request| {
+                &request.id
+            });
+        }
         BlimsEventPayload::ContractViolationRecorded { violation } => {
             upsert_by_id(&mut state.contract_violations, violation, |violation| {
                 &violation.id
@@ -5574,6 +5751,7 @@ async fn apply_projection_state(
     replace_agent_relationship_projections(database, &state.relationships).await?;
     replace_agent_memory_projections(database, &state.memories).await?;
     replace_agent_permission_projections(database, &state.permissions).await?;
+    replace_permission_escalation_projections(database, &state.permission_escalations).await?;
     replace_contract_violation_projections(database, &state.contract_violations).await?;
     replace_world_object_projections(database, &state.world_objects).await
 }
@@ -6155,6 +6333,42 @@ async fn replace_agent_permission_projections(
     Ok(())
 }
 
+async fn replace_one_permission_escalation_projection(
+    database: &dyn Database,
+    escalation: &PermissionEscalationRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("permission_escalations")
+        .filter(Box::new(where_eq("id", escalation.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("permission_escalations")
+        .value("id", escalation.id.clone())
+        .value("agent_id", escalation.agent_id.clone())
+        .value("category", escalation.category.clone())
+        .value("requested_policy", escalation.requested_policy.clone())
+        .value("reason", escalation.reason.clone())
+        .value("status", escalation.status.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_permission_escalation_projections(
+    database: &dyn Database,
+    escalations: &[PermissionEscalationRecord],
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("permission_escalations")
+        .execute(database)
+        .await?;
+    for escalation in escalations {
+        replace_one_permission_escalation_projection(database, escalation).await?;
+    }
+    Ok(())
+}
+
 async fn replace_one_contract_violation_projection(
     database: &dyn Database,
     violation: &ContractViolationRecord,
@@ -6402,18 +6616,8 @@ fn morning_report(data: &CompanyData) -> MorningReport {
             bullets.push(format!("Ready for CEO review: {ready}"));
         }
     }
-    if !data.contract_violations.is_empty() {
-        bullets.push(format!(
-            "Contract/permission issues: {}",
-            data.contract_violations.len()
-        ));
-        if let Some(violation) = data.contract_violations.first() {
-            bullets.push(format!(
-                "Top issue [{}]: {} — {}",
-                violation.severity, violation.agent_id, violation.summary
-            ));
-        }
-    }
+    append_permission_escalation_report_bullets(data, &mut bullets);
+    append_contract_violation_report_bullets(data, &mut bullets);
     if let Some(memory) = data.memories.first() {
         bullets.push(format!("Notable discovery: {}", memory.summary));
     }
@@ -6421,6 +6625,41 @@ fn morning_report(data: &CompanyData) -> MorningReport {
     MorningReport {
         title: format!("{} morning report", data.company.name),
         bullets,
+    }
+}
+
+fn append_permission_escalation_report_bullets(data: &CompanyData, bullets: &mut Vec<String>) {
+    if data.permission_escalations.is_empty() {
+        return;
+    }
+    bullets.push(format!(
+        "Pending permission escalations: {}",
+        data.permission_escalations.len()
+    ));
+    if let Some(escalation) = data.permission_escalations.first() {
+        bullets.push(format!(
+            "Top permission request [{}]: {} wants {} because {}",
+            escalation.category,
+            escalation.agent_id,
+            escalation.requested_policy,
+            escalation.reason
+        ));
+    }
+}
+
+fn append_contract_violation_report_bullets(data: &CompanyData, bullets: &mut Vec<String>) {
+    if data.contract_violations.is_empty() {
+        return;
+    }
+    bullets.push(format!(
+        "Contract/permission issues: {}",
+        data.contract_violations.len()
+    ));
+    if let Some(violation) = data.contract_violations.first() {
+        bullets.push(format!(
+            "Top issue [{}]: {} — {}",
+            violation.severity, violation.agent_id, violation.summary
+        ));
     }
 }
 
@@ -6578,6 +6817,17 @@ fn append_agent_context_bullets(
         bullets.push(format!("Skills: {}", stats.skills));
     }
     append_agent_social_bullets(data, agent, bullets);
+    for escalation in data
+        .permission_escalations
+        .iter()
+        .filter(|escalation| escalation.agent_id == agent.id && escalation.status == "pending")
+        .take(2)
+    {
+        bullets.push(format!(
+            "Pending permission request [{}]: {} — {}",
+            escalation.category, escalation.requested_policy, escalation.reason
+        ));
+    }
     if let Some(permission) = data
         .permissions
         .iter()
