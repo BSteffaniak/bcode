@@ -47,7 +47,7 @@ pub fn format_duration_nanos(nanos: u128) -> String {
     }
 
     if nanos < 60_000_000_000 {
-        return format_decimal_unit(nanos, 1_000_000_000, "s");
+        return format_decimal_unit_with_trailing_zero(nanos, 1_000_000_000, "s");
     }
     let total_seconds = nanos / 1_000_000_000;
     let minutes = total_seconds / 60;
@@ -89,4 +89,14 @@ fn format_decimal_unit(nanos: u128, unit_nanos: u128, suffix: &str) -> String {
     } else {
         format!("{whole}.{decimal}{suffix}")
     }
+}
+
+fn format_decimal_unit_with_trailing_zero(nanos: u128, unit_nanos: u128, suffix: &str) -> String {
+    let whole = nanos / unit_nanos;
+    let remainder = nanos % unit_nanos;
+    if whole >= 100 {
+        return format!("{whole}{suffix}");
+    }
+    let decimal = remainder.saturating_mul(10) / unit_nanos;
+    format!("{whole}.{decimal}{suffix}")
 }

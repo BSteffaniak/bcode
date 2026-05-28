@@ -61,6 +61,8 @@ fn duration_formatting_uses_readable_units() {
     assert_eq!(format_duration_nanos(12), "12ns");
     assert_eq!(format_duration_nanos(1_500), "1.5µs");
     assert_eq!(format_duration_nanos(1_500_000), "1.5ms");
+    assert_eq!(format_millis(30_000), "30.0s");
+    assert_eq!(format_millis(30_100), "30.1s");
     assert_eq!(format_millis(120_000), "2m");
     assert_eq!(format_millis(90_000), "1m 30s");
 }
