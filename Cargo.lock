@@ -1024,6 +1024,7 @@ dependencies = [
  "bcode_config",
  "bcode_daemon_lifecycle",
  "bcode_ipc",
+ "bcode_metrics",
  "bcode_model",
  "bcode_plugin",
  "bcode_provider_auth",

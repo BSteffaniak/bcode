@@ -10,7 +10,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_config::AuthMode;
-use bcode_ipc::{Event, PermissionSummary, default_endpoint};
+use bcode_ipc::{Event, PermissionSummary, ServerStatus, default_endpoint};
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse,
     ListImportSourcesResponse, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
@@ -25,7 +25,7 @@ use bcode_worktree_models::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Read as _, Write as _};
@@ -130,6 +130,9 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
                 session_export(session_id, format).await?;
             }
             SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
+            SessionCommand::Diagnose { session_id, json } => {
+                session_diagnose(session_id, json).await?;
+            }
             SessionCommand::Doctor {
                 session_id,
                 fix,
@@ -386,6 +389,14 @@ enum ServerCommand {
         #[arg(long)]
         verbose: bool,
     },
+    Metrics {
+        #[arg(long)]
+        json: bool,
+    },
+    Diagnose {
+        #[arg(long)]
+        json: bool,
+    },
     Stop,
     Cleanup,
     StopAll,
@@ -497,6 +508,11 @@ enum SessionCommand {
     },
     Timeline {
         session_id: SessionId,
+    },
+    Diagnose {
+        session_id: SessionId,
+        #[arg(long)]
+        json: bool,
     },
     Doctor {
         session_id: Option<SessionId>,
@@ -785,6 +801,8 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         }
         ServerCommand::Run => run_server_foreground().await?,
         ServerCommand::Status { verbose } => server_status(verbose).await?,
+        ServerCommand::Metrics { json } => server_metrics(json).await?,
+        ServerCommand::Diagnose { json } => server_diagnose(json).await?,
         ServerCommand::Stop => server_stop().await?,
         ServerCommand::Cleanup => server_cleanup(false).await?,
         ServerCommand::StopAll => server_cleanup(true).await?,
@@ -2859,12 +2877,259 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
         }
     }
     print_runtime_summary(&status.plugin_runtime, verbose);
+    if verbose {
+        print_metrics_summary(&status.metrics);
+    }
     println!("log: {}", daemon_log_path().display());
     for session in status.sessions {
         let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
         println!("{}	{}	{} clients", name, session.id, session.client_count);
     }
     Ok(())
+}
+
+async fn server_metrics(json: bool) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let status = client.server_status().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status.metrics)?);
+    } else {
+        print_metrics_summary(&status.metrics);
+    }
+    Ok(())
+}
+
+async fn server_diagnose(json: bool) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let status = client.server_status().await?;
+    let diagnosis = ServerDiagnosis::from_status(status);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+    } else {
+        print_server_diagnosis(&diagnosis);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServerDiagnosis {
+    daemon: bcode_ipc::DaemonStatus,
+    connected_client_count: usize,
+    session_count: usize,
+    sessions: Vec<SessionDiagnosisSummary>,
+    selected_provider_plugin_id: Option<String>,
+    selected_model_id: Option<String>,
+    plugin_runtime: Vec<bcode_plugin::PluginExecutorStatus>,
+    metrics: bcode_metrics::MetricsSnapshot,
+    observations: Vec<DiagnosticObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDiagnosisSummary {
+    session_id: SessionId,
+    name: Option<String>,
+    client_count: usize,
+    updated_at_ms: u64,
+    working_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagnosticObservation {
+    severity: DiagnosticSeverity,
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticSeverity {
+    Info,
+    Warning,
+}
+
+impl ServerDiagnosis {
+    fn from_status(status: ServerStatus) -> Self {
+        let observations = diagnostic_observations(&status);
+        Self {
+            daemon: status.daemon,
+            connected_client_count: status.connected_client_count,
+            session_count: status.sessions.len(),
+            sessions: status
+                .sessions
+                .into_iter()
+                .map(|session| SessionDiagnosisSummary {
+                    session_id: session.id,
+                    name: session.name,
+                    client_count: session.client_count,
+                    updated_at_ms: session.updated_at_ms,
+                    working_directory: session.working_directory,
+                })
+                .collect(),
+            selected_provider_plugin_id: status.selected_provider_plugin_id,
+            selected_model_id: status.selected_model_id,
+            plugin_runtime: status.plugin_runtime,
+            metrics: status.metrics,
+            observations,
+        }
+    }
+}
+
+fn diagnostic_observations(status: &ServerStatus) -> Vec<DiagnosticObservation> {
+    let mut observations = Vec::new();
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "session.event_log.append_duration_ms",
+        100,
+        "slow_session_event_appends",
+        "session event appends have exceeded 100ms",
+    );
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "session.metadata_index.write_duration_ms",
+        100,
+        "slow_session_metadata_writes",
+        "session metadata index writes have exceeded 100ms",
+    );
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "model.request_build_duration_ms",
+        500,
+        "slow_model_request_builds",
+        "model request construction has exceeded 500ms",
+    );
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "model.provider.start_turn_duration_ms",
+        2_000,
+        "slow_model_start_turn",
+        "model provider start_turn has exceeded 2s",
+    );
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "model.provider.poll_turn_events_duration_ms",
+        2_000,
+        "slow_model_poll",
+        "model provider poll_turn_events has exceeded 2s",
+    );
+    if status
+        .metrics
+        .counters
+        .get("model.provider.poll_empty_total")
+        .copied()
+        .unwrap_or_default()
+        > 100
+    {
+        observations.push(DiagnosticObservation {
+            severity: DiagnosticSeverity::Info,
+            code: "many_empty_model_polls".to_string(),
+            message: "model provider has returned many empty poll responses".to_string(),
+        });
+    }
+    observations
+}
+
+fn add_histogram_observation(
+    observations: &mut Vec<DiagnosticObservation>,
+    status: &ServerStatus,
+    key: &str,
+    threshold_ms: u64,
+    code: &str,
+    message: &str,
+) {
+    let Some(histogram) = status.metrics.histograms.get(key) else {
+        return;
+    };
+    if histogram.max.is_some_and(|max| max >= threshold_ms) {
+        observations.push(DiagnosticObservation {
+            severity: DiagnosticSeverity::Warning,
+            code: code.to_string(),
+            message: format!(
+                "{message}; max observed={}ms",
+                histogram.max.unwrap_or_default()
+            ),
+        });
+    }
+}
+
+fn print_server_diagnosis(diagnosis: &ServerDiagnosis) {
+    println!("daemon: running");
+    println!("namespace: {}", diagnosis.daemon.namespace);
+    println!("connected clients: {}", diagnosis.connected_client_count);
+    println!("sessions: {}", diagnosis.session_count);
+    println!(
+        "model provider: {}",
+        diagnosis
+            .selected_provider_plugin_id
+            .as_deref()
+            .unwrap_or("<auto>")
+    );
+    println!(
+        "model: {}",
+        diagnosis
+            .selected_model_id
+            .as_deref()
+            .unwrap_or("<default>")
+    );
+    if diagnosis.observations.is_empty() {
+        println!("observations: none");
+    } else {
+        println!("observations:");
+        for observation in &diagnosis.observations {
+            println!(
+                "  {:?}\t{}\t{}",
+                observation.severity, observation.code, observation.message
+            );
+        }
+    }
+    print_runtime_summary(&diagnosis.plugin_runtime, true);
+    print_metrics_summary(&diagnosis.metrics);
+}
+
+fn print_metrics_summary(metrics: &bcode_metrics::MetricsSnapshot) {
+    println!(
+        "metrics: {} counters, {} gauges, {} histograms",
+        metrics.counters.len(),
+        metrics.gauges.len(),
+        metrics.histograms.len()
+    );
+    if !metrics.counters.is_empty() {
+        println!("metric counters:");
+        for (key, value) in &metrics.counters {
+            println!("  {key}\t{value}");
+        }
+    }
+    if !metrics.gauges.is_empty() {
+        println!("metric gauges:");
+        for (key, value) in &metrics.gauges {
+            println!("  {key}\t{value}");
+        }
+    }
+    if !metrics.histograms.is_empty() {
+        println!("metric histograms:");
+        for (key, histogram) in &metrics.histograms {
+            let avg = if histogram.count == 0 {
+                0
+            } else {
+                histogram.sum / histogram.count
+            };
+            println!(
+                "  {key}\tcount={} avg={} min={} max={}",
+                histogram.count,
+                avg,
+                histogram
+                    .min
+                    .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
+                histogram
+                    .max
+                    .map_or_else(|| "<none>".to_string(), |value| value.to_string())
+            );
+        }
+    }
 }
 
 fn print_runtime_summary(runtime: &[bcode_plugin::PluginExecutorStatus], verbose: bool) {
@@ -3341,6 +3606,154 @@ async fn paged_session_history(session_id: SessionId) -> Result<Vec<SessionEvent
         }
     }
     Ok(history)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDiagnosis {
+    session_id: SessionId,
+    event_count: usize,
+    trace_event_count: usize,
+    first_sequence: Option<u64>,
+    last_sequence: Option<u64>,
+    latest_events: Vec<SessionDiagnosisEvent>,
+    latest_traces: Vec<SessionDiagnosisTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDiagnosisEvent {
+    sequence: u64,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDiagnosisTrace {
+    sequence: u64,
+    timestamp_ms: u64,
+    turn_id: Option<String>,
+    phase: String,
+    payload: bcode_session_models::SessionTracePayload,
+}
+
+async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliError> {
+    let history = paged_session_history(session_id).await?;
+    let diagnosis = SessionDiagnosis::from_history(session_id, &history);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+    } else {
+        print_session_diagnosis(&diagnosis);
+    }
+    Ok(())
+}
+
+impl SessionDiagnosis {
+    fn from_history(session_id: SessionId, history: &[SessionEvent]) -> Self {
+        let trace_event_count = history
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::TraceEvent { .. }))
+            .count();
+        let latest_events = history
+            .iter()
+            .rev()
+            .take(20)
+            .map(|event| SessionDiagnosisEvent {
+                sequence: event.sequence,
+                kind: session_event_kind_name(&event.kind).to_string(),
+            })
+            .collect::<Vec<_>>();
+        let latest_traces = history
+            .iter()
+            .rev()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::TraceEvent { trace } => Some(SessionDiagnosisTrace {
+                    sequence: event.sequence,
+                    timestamp_ms: trace.timestamp_ms,
+                    turn_id: trace.turn_id.clone(),
+                    phase: format!("{:?}", trace.phase),
+                    payload: trace.payload.clone(),
+                }),
+                _ => None,
+            })
+            .take(50)
+            .collect::<Vec<_>>();
+        Self {
+            session_id,
+            event_count: history.len(),
+            trace_event_count,
+            first_sequence: history.first().map(|event| event.sequence),
+            last_sequence: history.last().map(|event| event.sequence),
+            latest_events,
+            latest_traces,
+        }
+    }
+}
+
+fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
+    println!("session: {}", diagnosis.session_id);
+    println!("events: {}", diagnosis.event_count);
+    println!("trace events: {}", diagnosis.trace_event_count);
+    println!(
+        "sequence range: {}..{}",
+        diagnosis
+            .first_sequence
+            .map_or_else(|| "<none>".to_string(), |sequence| sequence.to_string()),
+        diagnosis
+            .last_sequence
+            .map_or_else(|| "<none>".to_string(), |sequence| sequence.to_string())
+    );
+    println!("latest events:");
+    for event in &diagnosis.latest_events {
+        println!("  {}\t{}", event.sequence, event.kind);
+    }
+    println!("latest traces:");
+    for trace in &diagnosis.latest_traces {
+        println!(
+            "  {}\t{}\t{}\t{}",
+            trace.sequence,
+            trace.timestamp_ms,
+            trace.turn_id.as_deref().unwrap_or("<none>"),
+            trace.phase
+        );
+    }
+}
+
+const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
+    match kind {
+        SessionEventKind::SessionCreated { .. } => "session_created",
+        SessionEventKind::ClientAttached { .. } => "client_attached",
+        SessionEventKind::ClientDetached { .. } => "client_detached",
+        SessionEventKind::UserMessage { .. } => "user_message",
+        SessionEventKind::AssistantDelta { .. } => "assistant_delta",
+        SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
+        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::PermissionRequested { .. } => "permission_requested",
+        SessionEventKind::PermissionResolved { .. } => "permission_resolved",
+        SessionEventKind::ModelChanged { .. } => "model_changed",
+        SessionEventKind::SystemMessage { .. } => "system_message",
+        SessionEventKind::AgentChanged { .. } => "agent_changed",
+        SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
+        SessionEventKind::ModelUsage { .. } => "model_usage",
+        SessionEventKind::ContextCompacted { .. } => "context_compacted",
+        SessionEventKind::SessionRenamed { .. } => "session_renamed",
+        SessionEventKind::TraceEvent { .. } => "trace_event",
+        SessionEventKind::SkillInvoked { .. } => "skill_invoked",
+        SessionEventKind::SkillSuggested { .. } => "skill_suggested",
+        SessionEventKind::SkillActivated { .. } => "skill_activated",
+        SessionEventKind::SkillDeactivated { .. } => "skill_deactivated",
+        SessionEventKind::SkillContextLoaded { .. } => "skill_context_loaded",
+        SessionEventKind::SkillInvocationFailed { .. } => "skill_invocation_failed",
+        SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
+        SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
+        SessionEventKind::RuntimeWorkStarted { .. } => "runtime_work_started",
+        SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
+        SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
+        SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
+        SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
+        SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
+        SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
+        SessionEventKind::SessionImported { .. } => "session_imported",
+    }
 }
 
 fn session_doctor(session_id: Option<SessionId>, fix: bool, json: bool) -> Result<(), CliError> {
