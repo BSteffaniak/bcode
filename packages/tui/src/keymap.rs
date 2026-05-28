@@ -402,9 +402,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
             BmuxScope::SessionPicker,
             vec![
                 bind("up", BmuxAction::SelectUp),
-                bind("k", BmuxAction::SelectUp),
                 bind("down", BmuxAction::SelectDown),
-                bind("j", BmuxAction::SelectDown),
                 bind("enter", BmuxAction::SelectConfirm),
                 bind("ctrl+n", BmuxAction::SessionNew),
                 bind("ctrl+r", BmuxAction::SessionRename),
@@ -481,14 +479,39 @@ mod tests {
     }
 
     #[test]
-    fn session_picker_plain_n_is_text_not_new_session() {
+    fn session_picker_plain_alphanumerics_are_text_not_actions() {
         let keymap = default_keymap();
-        let action = keymap.action_for_key(
-            BmuxScope::SessionPicker,
-            KeyStroke::simple(KeyCode::Char('n')),
-        );
 
-        assert_eq!(action, None);
+        for key in '0'..='9' {
+            assert_eq!(
+                keymap.action_for_key(
+                    BmuxScope::SessionPicker,
+                    KeyStroke::simple(KeyCode::Char(key))
+                ),
+                None,
+                "plain {key} should not be bound in the session picker"
+            );
+        }
+        for key in 'a'..='z' {
+            assert_eq!(
+                keymap.action_for_key(
+                    BmuxScope::SessionPicker,
+                    KeyStroke::simple(KeyCode::Char(key))
+                ),
+                None,
+                "plain {key} should not be bound in the session picker"
+            );
+        }
+        for key in 'A'..='Z' {
+            assert_eq!(
+                keymap.action_for_key(
+                    BmuxScope::SessionPicker,
+                    KeyStroke::simple(KeyCode::Char(key))
+                ),
+                None,
+                "plain {key} should not be bound in the session picker"
+            );
+        }
     }
 
     #[test]
