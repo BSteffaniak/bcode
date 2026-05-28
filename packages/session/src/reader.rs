@@ -90,10 +90,25 @@ pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> 
 }
 
 pub fn read_event_at(path: &Path, offset: u64) -> Result<SessionEvent, SessionStoreError> {
+    let mut events = read_events_at_offsets(path, &[offset])?;
+    events
+        .pop()
+        .ok_or_else(|| SessionStoreError::InvalidSessionId(format!("no event at offset {offset}")))
+}
+
+pub fn read_events_at_offsets(
+    path: &Path,
+    offsets: &[u64],
+) -> Result<Vec<SessionEvent>, SessionStoreError> {
     let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let payload = read_frame_payload_at_current_offset(&mut file)?;
-    decode_session_event(&payload).map_err(SessionStoreError::Decode)
+    offsets
+        .iter()
+        .map(|offset| {
+            file.seek(SeekFrom::Start(*offset))?;
+            let payload = read_frame_payload_at_current_offset(&mut file)?;
+            decode_session_event(&payload).map_err(SessionStoreError::Decode)
+        })
+        .collect()
 }
 
 fn decode_session_event(payload: &[u8]) -> Result<SessionEvent, bmux_codec::Error> {

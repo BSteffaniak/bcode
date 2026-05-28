@@ -57,11 +57,14 @@ pub async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
 }
 
 /// Switch the active chat to another session.
-pub async fn switch_session(
+pub async fn switch_session<W: Write>(
+    terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     next_session_id: SessionId,
 ) -> Result<(), TuiError> {
+    chat.app.set_status("Opening session…".to_owned());
+    terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
     chat.event_task.abort();
     while chat.event_receiver.try_recv().is_ok() {}
     let (attached, next_task) = history_flow::attach_session_event_stream(
@@ -170,6 +173,10 @@ async fn import_selected_session<W: Write>(
             }
         }
     } else if let Some(session_id) = picker.selected_session_id() {
+        picker.set_status("Opening session…".to_owned());
+        terminal.draw(|frame| {
+            session_picker_render::render_picker(picker, frame);
+        })?;
         Ok(Some(session_id))
     } else {
         picker.set_status("No session selected; press Ctrl-N to create one".to_owned());

@@ -96,12 +96,14 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::SwitchSession(next_session_id) => {
             chat.app.clear_pending_submission(message);
-            session_flow::switch_session(services.client, chat, next_session_id).await?;
+            session_flow::switch_session(io.terminal, services.client, chat, next_session_id)
+                .await?;
         }
         slash_commands::SlashCommandOutcome::PickSession => {
             chat.app.clear_pending_submission(message);
             let next_session_id = session_flow::pick_session(io, services).await?;
-            session_flow::switch_session(services.client, chat, next_session_id).await?;
+            session_flow::switch_session(io.terminal, services.client, chat, next_session_id)
+                .await?;
         }
         slash_commands::SlashCommandOutcome::PickModel => {
             chat.app.clear_pending_submission(message);

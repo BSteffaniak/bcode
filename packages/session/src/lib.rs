@@ -398,11 +398,12 @@ impl SessionEventStore {
             }
         };
         let mut input_history = Vec::new();
-        for entry in entries {
-            if entry.kind != "user_message" {
-                continue;
-            }
-            let event = reader::read_event_at(&event_path, entry.offset)?;
+        let user_message_entries = entries
+            .into_iter()
+            .filter(|entry| entry.kind == "user_message")
+            .collect::<Vec<_>>();
+        let events = read_indexed_events(&event_path, &user_message_entries)?;
+        for event in events {
             if let SessionEventKind::UserMessage { text, .. } = event.kind {
                 input_history.push(SessionInputHistoryEntry {
                     sequence: event.sequence,
@@ -1132,10 +1133,8 @@ fn read_indexed_events(
     event_path: &Path,
     entries: &[index::SessionIndexEntry],
 ) -> Result<Vec<SessionEvent>, SessionStoreError> {
-    entries
-        .iter()
-        .map(|entry| reader::read_event_at(event_path, entry.offset))
-        .collect()
+    let offsets = entries.iter().map(|entry| entry.offset).collect::<Vec<_>>();
+    reader::read_events_at_offsets(event_path, &offsets)
 }
 
 /// In-memory session manager with optional append-only persistence.
@@ -3807,7 +3806,7 @@ mod tests {
             .create_session(Some("recent".to_string()), test_working_directory())
             .await
             .expect("session should be created");
-        for index in 0..4 {
+        for index in 0..205 {
             manager
                 .append_user_message(session.id, ClientId::new(), format!("message {index}"))
                 .await
@@ -3824,15 +3823,22 @@ mod tests {
         assert_eq!(attachment.session.name.as_deref(), Some("recent"));
         assert!(matches!(
             &attachment.history[0].kind,
-            SessionEventKind::UserMessage { text, .. } if text == "message 3"
+            SessionEventKind::UserMessage { text, .. } if text == "message 204"
         ));
+        assert_eq!(attachment.input_history.len(), 205);
         assert_eq!(
             attachment
                 .input_history
-                .iter()
-                .map(|entry| entry.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["message 0", "message 1", "message 2", "message 3"]
+                .first()
+                .map(|entry| entry.text.as_str()),
+            Some("message 0")
+        );
+        assert_eq!(
+            attachment
+                .input_history
+                .last()
+                .map(|entry| entry.text.as_str()),
+            Some("message 204")
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");

@@ -120,11 +120,12 @@ async fn execute_session_command<W: Write>(
     match command {
         PaletteCommand::NewSession => {
             let session = services.client.create_session(None).await?;
-            session_flow::switch_session(services.client, chat, session.id).await?;
+            session_flow::switch_session(io.terminal, services.client, chat, session.id).await?;
         }
         PaletteCommand::SwitchSession => {
             let selected_session_id = session_flow::pick_session(io, services).await?;
-            session_flow::switch_session(services.client, chat, selected_session_id).await?;
+            session_flow::switch_session(io.terminal, services.client, chat, selected_session_id)
+                .await?;
         }
         PaletteCommand::RenameSession => {
             session_flow::pick_session_for_mutation(
