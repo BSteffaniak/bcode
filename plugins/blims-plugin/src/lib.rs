@@ -1014,6 +1014,19 @@ struct CompanyRecord {
     lifecycle_status: String,
 }
 
+impl CompanyRecord {
+    fn culture_priority_bias(&self) -> &'static str {
+        let culture = self.culture.to_lowercase();
+        if culture.contains("cozy") || culture.contains("safe") {
+            "Prefer small, reversible, well-explained work; avoid high-risk leaps unless guidance is urgent."
+        } else if culture.contains("fast") || culture.contains("bold") {
+            "Prefer fast experiments and visible momentum; escalate risks instead of stalling silently."
+        } else {
+            "Balance usefulness, safety, autonomy, and CEO guidance when choosing priorities."
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentRecord {
     id: String,
@@ -1087,6 +1100,15 @@ impl AgentStatsRecord {
             self.collaboration_modifier
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContractViolationRecord {
+    id: String,
+    agent_id: String,
+    severity: String,
+    summary: String,
+    action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1292,6 +1314,9 @@ enum BlimsEventPayload {
     },
     AgentMemoryRecorded {
         memory: AgentMemoryRecord,
+    },
+    ContractViolationRecorded {
+        violation: ContractViolationRecord,
     },
     AgentContractUpdated {
         agent_id: String,
@@ -2082,6 +2107,8 @@ async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_databa
         .column(text_column("responsibilities"))
         .column(text_column("restrictions"))
         .column(text_column("escalation"))
+        .column(text_column("reporting_expectations"))
+        .column(text_column("disciplinary_policy"))
         .primary_key("agent_id")
         .execute(database)
         .await?;
@@ -2121,6 +2148,17 @@ async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_databa
         .column(text_column("kind"))
         .column(text_column("summary"))
         .column(int_column("importance"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("contract_violations")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("agent_id"))
+        .column(text_column("severity"))
+        .column(text_column("summary"))
+        .column(text_column("action"))
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
@@ -2991,6 +3029,9 @@ async fn apply_org_world_event_projection(
         }
         BlimsEventPayload::AgentMemoryRecorded { memory } => {
             replace_one_agent_memory_projection(database, memory).await?;
+        }
+        BlimsEventPayload::ContractViolationRecorded { violation } => {
+            replace_one_contract_violation_projection(database, violation).await?;
         }
         BlimsEventPayload::AgentStatusSet { agent_id, status } => {
             database
@@ -3920,12 +3961,13 @@ fn task_work_prompt_text(task: &TaskSummary, data: &CompanyData) -> String {
         .join("\n");
     format!(
         "You are working as a Blims agent inside Bcode. Do real useful work for this repo, but keep changes sandboxed/proposed unless explicitly approved.\n\n\
-         Company mission: {}\nCulture: {}\n\nActive CEO guidance:\n{}\n\n\
+         Company mission: {}\nCulture: {}\nCulture priority bias: {}\n\nActive CEO guidance:\n{}\n\n\
          Initiative: {}\nInitiative description: {}\n\n\
          Task `{}`: {}\nDescription: {}\nStatus: {}\nPriority: {}\nAssigned agent: {}\nRationale: {}\n\n\
          Produce concrete implementation, review, research, docs, or artifact work as appropriate. Prefer small reviewable changes. Explain what you changed or propose, validation to run, risks, and next steps.",
         data.company.mission,
         data.company.culture,
+        data.company.culture_priority_bias(),
         if guidance.is_empty() {
             "* none"
         } else {
@@ -3963,7 +4005,7 @@ fn agent_talk_prompt_text(agent: &AgentRecord, data: &CompanyData) -> String {
         .join("\n");
     format!(
         "You are {}, a {} inside Blims, a cozy AI company simulator running inside Bcode.\n\n\
-         Room: {}\nStatus: {}\nCompany mission: {}\nCulture: {}\n\n\
+         Room: {}\nStatus: {}\nCompany mission: {}\nCulture: {}\nCulture priority bias: {}\n\n\
          Active CEO guidance:\n{}\n\nActive initiatives:\n{}\n\n\
          Reply in-character as this Blims agent. Be cozy, useful, dynamic, candid, and specific. \
          Tell the CEO what you are thinking about, what you recommend next, and whether anything needs attention.",
@@ -3973,6 +4015,7 @@ fn agent_talk_prompt_text(agent: &AgentRecord, data: &CompanyData) -> String {
         agent.status,
         data.company.mission,
         data.company.culture,
+        data.company.culture_priority_bias(),
         if guidance.is_empty() {
             "* none"
         } else {
@@ -4617,6 +4660,7 @@ struct ProjectionState {
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
     world_objects: Vec<WorldObjectRecord>,
+    contract_violations: Vec<ContractViolationRecord>,
     departments: Vec<DepartmentRecord>,
     teams: Vec<TeamRecord>,
 }
@@ -4704,6 +4748,7 @@ fn replay_event(
         | BlimsEventPayload::AgentStatsSet { .. }
         | BlimsEventPayload::AgentRelationshipSet { .. }
         | BlimsEventPayload::AgentMemoryRecorded { .. }
+        | BlimsEventPayload::ContractViolationRecorded { .. }
         | BlimsEventPayload::AgentStatusSet { .. } => {
             replay_agent_event(payload, state);
         }
@@ -4813,6 +4858,11 @@ fn replay_agent_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
         BlimsEventPayload::AgentMemoryRecorded { memory } => {
             upsert_by_id(&mut state.memories, memory, |memory| &memory.id);
         }
+        BlimsEventPayload::ContractViolationRecorded { violation } => {
+            upsert_by_id(&mut state.contract_violations, violation, |violation| {
+                &violation.id
+            });
+        }
         BlimsEventPayload::AgentStatusSet { agent_id, status } => {
             if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
                 agent.status = status;
@@ -4853,6 +4903,7 @@ async fn apply_projection_state(
     replace_agent_stats_projections(database, &state.agent_stats).await?;
     replace_agent_relationship_projections(database, &state.relationships).await?;
     replace_agent_memory_projections(database, &state.memories).await?;
+    replace_contract_violation_projections(database, &state.contract_violations).await?;
     replace_world_object_projections(database, &state.world_objects).await
 }
 
@@ -5299,6 +5350,41 @@ async fn replace_agent_memory_projections(
     Ok(())
 }
 
+async fn replace_one_contract_violation_projection(
+    database: &dyn Database,
+    violation: &ContractViolationRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("contract_violations")
+        .filter(Box::new(where_eq("id", violation.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("contract_violations")
+        .value("id", violation.id.clone())
+        .value("agent_id", violation.agent_id.clone())
+        .value("severity", violation.severity.clone())
+        .value("summary", violation.summary.clone())
+        .value("action", violation.action.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_contract_violation_projections(
+    database: &dyn Database,
+    violations: &[ContractViolationRecord],
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("contract_violations")
+        .execute(database)
+        .await?;
+    for violation in violations {
+        replace_one_contract_violation_projection(database, violation).await?;
+    }
+    Ok(())
+}
+
 fn relationship_id(agent_id: &str, other_agent_id: &str) -> String {
     format!("{agent_id}->{other_agent_id}")
 }
@@ -5321,6 +5407,14 @@ async fn replace_one_agent_contract_projection(
         .value("responsibilities", responsibilities)
         .value("restrictions", restrictions)
         .value("escalation", escalation)
+        .value(
+            "reporting_expectations",
+            "Report status, blockers, rationale, validation, risk, and next steps before requesting CEO approval.",
+        )
+        .value(
+            "disciplinary_policy",
+            "Disagreeing with CEO guidance is allowed when logged with rationale; unsafe or hidden violations trigger warning, suspension, or firing workflows.",
+        )
         .execute(database)
         .await?;
     Ok(())
