@@ -1131,6 +1131,17 @@ impl AgentStatsRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorktreeRecord {
+    id: String,
+    task_id: String,
+    agent_id: String,
+    session_id: String,
+    path: String,
+    branch: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ContractViolationRecord {
     id: String,
     agent_id: String,
@@ -1308,6 +1319,9 @@ enum BlimsEventPayload {
     },
     ProposalRegistered {
         proposal: WorkProposalSummary,
+    },
+    WorktreeRecorded {
+        worktree: WorktreeRecord,
     },
     ProposalStatusSet {
         proposal_id: String,
@@ -2340,6 +2354,19 @@ async fn create_work_tables(
         .column(now_column("updated_at"))
         .primary_key("id")
         .execute(database)
+        .await?;
+    create_table("worktree_records")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("task_id"))
+        .column(text_column("agent_id"))
+        .column(text_column("session_id"))
+        .column(text_column("path"))
+        .column(text_column("branch"))
+        .column(text_column("status"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
         .await
 }
 
@@ -3021,6 +3048,9 @@ async fn apply_work_event_projection(
         BlimsEventPayload::ProposalRegistered { proposal } => {
             replace_one_proposal_projection(database, proposal).await?;
         }
+        BlimsEventPayload::WorktreeRecorded { worktree } => {
+            replace_one_worktree_projection(database, worktree).await?;
+        }
         BlimsEventPayload::ProposalStatusSet {
             proposal_id,
             status,
@@ -3158,6 +3188,7 @@ async fn apply_org_world_event_projection(
         | BlimsEventPayload::GuidanceSet { .. }
         | BlimsEventPayload::InitiativeGuidanceSet { .. }
         | BlimsEventPayload::ProposalRegistered { .. }
+        | BlimsEventPayload::WorktreeRecorded { .. }
         | BlimsEventPayload::ProposalStatusSet { .. }
         | BlimsEventPayload::ArtifactCreated { .. }
         | BlimsEventPayload::ArtifactStatusSet { .. }
@@ -3922,6 +3953,24 @@ fn register_proposal(
                 format!("Work proposal registered: {}", proposal.id),
                 &BlimsEventPayload::ProposalRegistered {
                     proposal: proposal.clone(),
+                },
+            )
+            .await?;
+            append_event(
+                database,
+                &event_context,
+                "worktree.recorded",
+                format!("Worktree recorded for task {}", proposal.task_id),
+                &BlimsEventPayload::WorktreeRecorded {
+                    worktree: WorktreeRecord {
+                        id: format!("worktree-{}", proposal.task_id),
+                        task_id: proposal.task_id.clone(),
+                        agent_id: proposal.agent_id.clone(),
+                        session_id: proposal.session_id.clone(),
+                        path: proposal.worktree_path.clone(),
+                        branch: proposal.branch.clone(),
+                        status: "active".to_string(),
+                    },
                 },
             )
             .await?;
@@ -4834,6 +4883,7 @@ fn replay_event(
             upsert_by_id(&mut state.guidance, guidance, |guidance| &guidance.id);
         }
         BlimsEventPayload::ProposalRegistered { .. }
+        | BlimsEventPayload::WorktreeRecorded { .. }
         | BlimsEventPayload::ProposalStatusSet { .. } => {
             replay_proposal_event(payload, state);
         }
@@ -5148,6 +5198,29 @@ async fn replace_proposal_projections(
     for proposal in proposals {
         replace_one_proposal_projection(database, proposal).await?;
     }
+    Ok(())
+}
+
+async fn replace_one_worktree_projection(
+    database: &dyn Database,
+    worktree: &WorktreeRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("worktree_records")
+        .filter(Box::new(where_eq("id", worktree.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("worktree_records")
+        .value("id", worktree.id.clone())
+        .value("task_id", worktree.task_id.clone())
+        .value("agent_id", worktree.agent_id.clone())
+        .value("session_id", worktree.session_id.clone())
+        .value("path", worktree.path.clone())
+        .value("branch", worktree.branch.clone())
+        .value("status", worktree.status.clone())
+        .execute(database)
+        .await?;
     Ok(())
 }
 
