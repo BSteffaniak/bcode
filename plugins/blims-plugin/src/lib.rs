@@ -1056,6 +1056,12 @@ struct AgentStatsRecord {
     morale: i64,
     focus: i64,
     confidence: i64,
+    speed_modifier: i64,
+    quality_modifier: i64,
+    risk_modifier: i64,
+    creativity_modifier: i64,
+    persistence_modifier: i64,
+    collaboration_modifier: i64,
 }
 
 impl AgentStatsRecord {
@@ -1063,6 +1069,18 @@ impl AgentStatsRecord {
         format!(
             "Energy {} · morale {} · focus {} · confidence {}",
             self.energy, self.morale, self.focus, self.confidence
+        )
+    }
+
+    fn mechanics_line(&self) -> String {
+        format!(
+            "Mechanics: speed {:+}, quality {:+}, risk {:+}, creativity {:+}, persistence {:+}, collaboration {:+}",
+            self.speed_modifier,
+            self.quality_modifier,
+            self.risk_modifier,
+            self.creativity_modifier,
+            self.persistence_modifier,
+            self.collaboration_modifier
         )
     }
 }
@@ -2068,6 +2086,12 @@ async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_databa
         .column(int_column("morale"))
         .column(int_column("focus"))
         .column(int_column("confidence"))
+        .column(int_column("speed_modifier"))
+        .column(int_column("quality_modifier"))
+        .column(int_column("risk_modifier"))
+        .column(int_column("creativity_modifier"))
+        .column(int_column("persistence_modifier"))
+        .column(int_column("collaboration_modifier"))
         .primary_key("agent_id")
         .execute(database)
         .await?;
@@ -2575,6 +2599,12 @@ fn starter_agent_stats(agent_id: &str) -> AgentStatsRecord {
             morale: 88,
             focus: 74,
             confidence: 80,
+            speed_modifier: 6,
+            quality_modifier: 8,
+            risk_modifier: -4,
+            creativity_modifier: 9,
+            persistence_modifier: 8,
+            collaboration_modifier: 10,
         },
         "jules" => AgentStatsRecord {
             agent_id: agent_id.to_string(),
@@ -2584,6 +2614,12 @@ fn starter_agent_stats(agent_id: &str) -> AgentStatsRecord {
             morale: 80,
             focus: 90,
             confidence: 76,
+            speed_modifier: 4,
+            quality_modifier: 12,
+            risk_modifier: -8,
+            creativity_modifier: 4,
+            persistence_modifier: 9,
+            collaboration_modifier: 5,
         },
         _ => AgentStatsRecord {
             agent_id: agent_id.to_string(),
@@ -2593,6 +2629,12 @@ fn starter_agent_stats(agent_id: &str) -> AgentStatsRecord {
             morale: 92,
             focus: 70,
             confidence: 84,
+            speed_modifier: 7,
+            quality_modifier: 6,
+            risk_modifier: -2,
+            creativity_modifier: 13,
+            persistence_modifier: 7,
+            collaboration_modifier: 9,
         },
     }
 }
@@ -4297,6 +4339,12 @@ async fn load_agent_stats(
             "morale",
             "focus",
             "confidence",
+            "speed_modifier",
+            "quality_modifier",
+            "risk_modifier",
+            "creativity_modifier",
+            "persistence_modifier",
+            "collaboration_modifier",
         ])
         .sort("agent_id", SortDirection::Asc)
         .execute(database)
@@ -4420,6 +4468,12 @@ fn agent_stats_record(row: &Row) -> Result<AgentStatsRecord, BlimsStateError> {
         morale: required_i64(row, "morale")?,
         focus: required_i64(row, "focus")?,
         confidence: required_i64(row, "confidence")?,
+        speed_modifier: required_i64(row, "speed_modifier")?,
+        quality_modifier: required_i64(row, "quality_modifier")?,
+        risk_modifier: required_i64(row, "risk_modifier")?,
+        creativity_modifier: required_i64(row, "creativity_modifier")?,
+        persistence_modifier: required_i64(row, "persistence_modifier")?,
+        collaboration_modifier: required_i64(row, "collaboration_modifier")?,
     })
 }
 
@@ -5103,6 +5157,12 @@ async fn replace_one_agent_stats_projection(
         .value("morale", stats.morale)
         .value("focus", stats.focus)
         .value("confidence", stats.confidence)
+        .value("speed_modifier", stats.speed_modifier)
+        .value("quality_modifier", stats.quality_modifier)
+        .value("risk_modifier", stats.risk_modifier)
+        .value("creativity_modifier", stats.creativity_modifier)
+        .value("persistence_modifier", stats.persistence_modifier)
+        .value("collaboration_modifier", stats.collaboration_modifier)
         .execute(database)
         .await?;
     Ok(())
@@ -5437,6 +5497,7 @@ fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, Blims
         .find(|stats| stats.agent_id == agent.id)
     {
         bullets.push(stats.report_line());
+        bullets.push(stats.mechanics_line());
         bullets.push(format!("Traits: {}", stats.traits));
         bullets.push(format!("Skills: {}", stats.skills));
     }
