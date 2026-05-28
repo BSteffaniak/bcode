@@ -323,11 +323,17 @@ struct BlimsRoomSnapshot {
     id: String,
     name: String,
     purpose: String,
+    x: i64,
+    y: i64,
+    symbol: String,
+    color: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsWorldSnapshot {
     theme: String,
+    width: i64,
+    height: i64,
     player_name: String,
     rooms: Vec<BlimsRoomSnapshot>,
     agents: Vec<BlimsAgentSnapshot>,
@@ -1013,11 +1019,14 @@ fn print_blims_report(report: &BlimsMorningReport) {
 }
 
 fn print_blims_world(world: &BlimsWorldSnapshot) {
-    println!("{}", world.theme);
+    println!("{} ({}×{})", world.theme, world.width, world.height);
     println!("player: {}", world.player_name);
     println!("rooms:");
     for room in &world.rooms {
-        println!("* {} ({}) - {}", room.name, room.id, room.purpose);
+        println!(
+            "* {} {} ({}) at {},{} [{}] - {}",
+            room.symbol, room.name, room.id, room.x, room.y, room.color, room.purpose
+        );
     }
     println!("agents:");
     for agent in &world.agents {

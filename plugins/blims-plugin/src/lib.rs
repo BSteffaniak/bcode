@@ -929,6 +929,14 @@ pub struct RoomSnapshot {
     pub name: String,
     /// Room purpose or productivity modifier.
     pub purpose: String,
+    /// X coordinate in the office map.
+    pub x: i64,
+    /// Y coordinate in the office map.
+    pub y: i64,
+    /// Visual symbol for terminal frontends.
+    pub symbol: String,
+    /// Suggested terminal color name.
+    pub color: String,
 }
 
 /// Snapshot of the currently visible Blims world.
@@ -936,6 +944,10 @@ pub struct RoomSnapshot {
 pub struct WorldSnapshot {
     /// Starter office theme name.
     pub theme: String,
+    /// Office map width in terminal cells.
+    pub width: i64,
+    /// Office map height in terminal cells.
+    pub height: i64,
     /// Player avatar display name.
     pub player_name: String,
     /// Starter rooms currently available in the office.
@@ -1090,6 +1102,10 @@ struct RoomRecord {
     id: String,
     name: String,
     purpose: String,
+    x: i64,
+    y: i64,
+    symbol: String,
+    color: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1113,6 +1129,10 @@ impl From<RoomSnapshot> for RoomRecord {
             id: snapshot.id,
             name: snapshot.name,
             purpose: snapshot.purpose,
+            x: snapshot.x,
+            y: snapshot.y,
+            symbol: snapshot.symbol,
+            color: snapshot.color,
         }
     }
 }
@@ -2106,6 +2126,10 @@ async fn create_world_tables(
         .column(text_column("world_id"))
         .column(text_column("name"))
         .column(text_column("purpose"))
+        .column(int_column("x"))
+        .column(int_column("y"))
+        .column(text_column("symbol"))
+        .column(text_column("color"))
         .primary_key("id")
         .execute(database)
         .await?;
@@ -2613,22 +2637,54 @@ fn starter_agent_memories(agent_id: &str) -> Vec<AgentMemoryRecord> {
 fn fallback_world_snapshot() -> WorldSnapshot {
     WorldSnapshot {
         theme: "Cozy Startup Loft".to_string(),
+        width: 40,
+        height: 14,
         player_name: "CEO".to_string(),
         rooms: vec![
+            RoomSnapshot {
+                id: "ceo-nook".to_string(),
+                name: "CEO Nook".to_string(),
+                purpose: "orientation, morning reports, and company controls".to_string(),
+                x: 2,
+                y: 1,
+                symbol: "⌂".to_string(),
+                color: "yellow".to_string(),
+            },
             RoomSnapshot {
                 id: "whiteboard".to_string(),
                 name: "Whiteboard".to_string(),
                 purpose: "initiatives, priorities, and planning".to_string(),
+                x: 14,
+                y: 1,
+                symbol: "▦".to_string(),
+                color: "bright-white".to_string(),
             },
             RoomSnapshot {
                 id: "engineering".to_string(),
                 name: "Engineering Desks".to_string(),
                 purpose: "implementation focus and worktree coding".to_string(),
+                x: 2,
+                y: 8,
+                symbol: "⚙".to_string(),
+                color: "cyan".to_string(),
             },
             RoomSnapshot {
                 id: "creative".to_string(),
                 name: "Creative Corner".to_string(),
                 purpose: "branding, docs, and design ideas".to_string(),
+                x: 16,
+                y: 8,
+                symbol: "✦".to_string(),
+                color: "magenta".to_string(),
+            },
+            RoomSnapshot {
+                id: "review".to_string(),
+                name: "Review Wall".to_string(),
+                purpose: "approvals, proposals, and artifact review".to_string(),
+                x: 28,
+                y: 4,
+                symbol: "✓".to_string(),
+                color: "green".to_string(),
             },
         ],
         agents: starter_agents()
@@ -3074,6 +3130,8 @@ fn world_snapshot(working_directory: &Path) -> Result<WorldSnapshot, BlimsStateE
 fn world_snapshot_from_data(data: CompanyData) -> WorldSnapshot {
     WorldSnapshot {
         theme: data.world_theme,
+        width: 40,
+        height: 14,
         player_name: "CEO".to_string(),
         rooms: data
             .rooms
@@ -3082,6 +3140,10 @@ fn world_snapshot_from_data(data: CompanyData) -> WorldSnapshot {
                 id: room.id,
                 name: room.name,
                 purpose: room.purpose,
+                x: room.x,
+                y: room.y,
+                symbol: room.symbol,
+                color: room.color,
             })
             .collect(),
         agents: data
@@ -4080,7 +4142,7 @@ async fn load_company_data_from_database(
     let (world_theme, player_room_id) = load_world_record(database).await?;
     let room_rows = database
         .select("world_rooms")
-        .columns(&["id", "name", "purpose"])
+        .columns(&["id", "name", "purpose", "x", "y", "symbol", "color"])
         .sort("id", SortDirection::Asc)
         .execute(database)
         .await?;
@@ -4330,6 +4392,10 @@ fn room_record(row: &Row) -> Result<RoomRecord, BlimsStateError> {
         id: required_text(row, "id")?,
         name: required_text(row, "name")?,
         purpose: required_text(row, "purpose")?,
+        x: required_i64(row, "x")?,
+        y: required_i64(row, "y")?,
+        symbol: required_text(row, "symbol")?,
+        color: required_text(row, "color")?,
     })
 }
 
@@ -4930,6 +4996,10 @@ async fn replace_one_world_room_projection(
         .value("world_id", "default")
         .value("name", room.name.clone())
         .value("purpose", room.purpose.clone())
+        .value("x", room.x)
+        .value("y", room.y)
+        .value("symbol", room.symbol.clone())
+        .value("color", room.color.clone())
         .execute(database)
         .await?;
     Ok(())
@@ -5566,6 +5636,10 @@ mod tests {
             id: "whiteboard".to_string(),
             name: "Whiteboard".to_string(),
             purpose: "planning".to_string(),
+            x: 1,
+            y: 1,
+            symbol: "▦".to_string(),
+            color: "bright-white".to_string(),
         };
         let agent = AgentSnapshot {
             id: "mira".to_string(),
