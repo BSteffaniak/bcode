@@ -1073,6 +1073,18 @@ struct AgentMemoryRecord {
     importance: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorldObjectRecord {
+    id: String,
+    room_id: String,
+    name: String,
+    kind: String,
+    symbol: String,
+    color: String,
+    interaction: String,
+    productivity_modifier: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoomRecord {
     id: String,
@@ -1257,6 +1269,9 @@ enum BlimsEventPayload {
     },
     WorldRoomCreated {
         room: RoomSnapshot,
+    },
+    WorldObjectPlaced {
+        object: WorldObjectRecord,
     },
     InitiativePlanImported {
         initiative_id: String,
@@ -2093,6 +2108,19 @@ async fn create_world_tables(
         .column(text_column("purpose"))
         .primary_key("id")
         .execute(database)
+        .await?;
+    create_table("world_objects")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("room_id"))
+        .column(text_column("name"))
+        .column(text_column("kind"))
+        .column(text_column("symbol"))
+        .column(text_column("color"))
+        .column(text_column("interaction"))
+        .column(int_column("productivity_modifier"))
+        .primary_key("id")
+        .execute(database)
         .await
 }
 
@@ -2337,6 +2365,18 @@ async fn seed_starter_world_events(
         )
         .await?;
     }
+    for object in starter_world_objects() {
+        let payload = BlimsEventPayload::WorldObjectPlaced {
+            object: object.clone(),
+        };
+        append_bootstrap_event_once(
+            database,
+            "world.object_placed",
+            &format!("Starter object placed: {}", object.name),
+            &payload,
+        )
+        .await?;
+    }
     for agent in fallback_world_snapshot().agents {
         let payload = BlimsEventPayload::AgentHired {
             agent: agent.clone(),
@@ -2452,6 +2492,51 @@ fn starter_agents() -> Vec<AgentRecord> {
             team_id: "creative-studio".to_string(),
             status: "sketching cozy office ideas".to_string(),
             room_id: "creative".to_string(),
+        },
+    ]
+}
+
+fn starter_world_objects() -> Vec<WorldObjectRecord> {
+    vec![
+        WorldObjectRecord {
+            id: "whiteboard-roadmap".to_string(),
+            room_id: "whiteboard".to_string(),
+            name: "Roadmap Whiteboard".to_string(),
+            kind: "planning_hotspot".to_string(),
+            symbol: "▦".to_string(),
+            color: "bright-white".to_string(),
+            interaction: "Review initiatives and CEO guidance".to_string(),
+            productivity_modifier: 8,
+        },
+        WorldObjectRecord {
+            id: "engineering-workbench".to_string(),
+            room_id: "engineering".to_string(),
+            name: "Worktree Workbench".to_string(),
+            kind: "engineering_station".to_string(),
+            symbol: "⚙".to_string(),
+            color: "cyan".to_string(),
+            interaction: "Review tasks and start implementation work".to_string(),
+            productivity_modifier: 10,
+        },
+        WorldObjectRecord {
+            id: "creative-rug".to_string(),
+            room_id: "creative".to_string(),
+            name: "Idea Rug".to_string(),
+            kind: "creative_station".to_string(),
+            symbol: "✦".to_string(),
+            color: "magenta".to_string(),
+            interaction: "Brainstorm delightful artifacts and docs".to_string(),
+            productivity_modifier: 7,
+        },
+        WorldObjectRecord {
+            id: "review-wall".to_string(),
+            room_id: "review".to_string(),
+            name: "Review Wall".to_string(),
+            kind: "approval_hotspot".to_string(),
+            symbol: "✓".to_string(),
+            color: "green".to_string(),
+            interaction: "Review proposals, patches, and artifacts".to_string(),
+            productivity_modifier: 6,
         },
     ]
 }
@@ -2583,6 +2668,7 @@ struct CompanyData {
     agent_stats: Vec<AgentStatsRecord>,
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
+    world_objects: Vec<WorldObjectRecord>,
 }
 
 fn with_database<T>(
@@ -2762,6 +2848,7 @@ async fn apply_work_event_projection(
     Ok(true)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn apply_org_world_event_projection(
     database: &dyn Database,
     payload: &BlimsEventPayload,
@@ -2840,6 +2927,9 @@ async fn apply_org_world_event_projection(
         }
         BlimsEventPayload::WorldRoomCreated { room } => {
             replace_one_world_room_projection(database, &room.clone().into()).await?;
+        }
+        BlimsEventPayload::WorldObjectPlaced { object } => {
+            replace_one_world_object_projection(database, object).await?;
         }
         BlimsEventPayload::PlayerMoved { room_id } => {
             database
@@ -3088,6 +3178,20 @@ fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions
             id: "proposals".to_string(),
             label: "Review proposals and artifacts".to_string(),
             command: "proposals".to_string(),
+        });
+    }
+    for object in data
+        .world_objects
+        .iter()
+        .filter(|object| object.room_id == room_id)
+    {
+        interactions.push(WorldInteraction {
+            id: format!("object-{}", object.id),
+            label: format!(
+                "{} {} — {} (+{} productivity)",
+                object.symbol, object.name, object.interaction, object.productivity_modifier
+            ),
+            command: object.interaction.clone(),
         });
     }
     AvailableInteractions {
@@ -4023,6 +4127,7 @@ async fn load_company_data_from_database(
     let agent_stats = load_agent_stats(database).await?;
     let relationships = load_agent_relationships(database).await?;
     let memories = load_agent_memories(database).await?;
+    let world_objects = load_world_objects(database).await?;
 
     Ok(CompanyData {
         company,
@@ -4052,6 +4157,7 @@ async fn load_company_data_from_database(
         agent_stats,
         relationships,
         memories,
+        world_objects,
     })
 }
 
@@ -4166,6 +4272,29 @@ async fn load_agent_memories(
         .collect::<Result<Vec<_>, _>>()
 }
 
+async fn load_world_objects(
+    database: &dyn Database,
+) -> Result<Vec<WorldObjectRecord>, BlimsStateError> {
+    database
+        .select("world_objects")
+        .columns(&[
+            "id",
+            "room_id",
+            "name",
+            "kind",
+            "symbol",
+            "color",
+            "interaction",
+            "productivity_modifier",
+        ])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(world_object_record)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn load_company_record(database: &dyn Database) -> Result<CompanyRecord, BlimsStateError> {
     let row = database
         .select("companies")
@@ -4248,6 +4377,19 @@ fn agent_memory_record(row: &Row) -> Result<AgentMemoryRecord, BlimsStateError> 
     })
 }
 
+fn world_object_record(row: &Row) -> Result<WorldObjectRecord, BlimsStateError> {
+    Ok(WorldObjectRecord {
+        id: required_text(row, "id")?,
+        room_id: required_text(row, "room_id")?,
+        name: required_text(row, "name")?,
+        kind: required_text(row, "kind")?,
+        symbol: required_text(row, "symbol")?,
+        color: required_text(row, "color")?,
+        interaction: required_text(row, "interaction")?,
+        productivity_modifier: required_i64(row, "productivity_modifier")?,
+    })
+}
+
 fn department_record(row: &Row) -> Result<DepartmentRecord, BlimsStateError> {
     Ok(DepartmentRecord {
         id: required_text(row, "id")?,
@@ -4310,6 +4452,7 @@ struct ProjectionState {
     agent_stats: Vec<AgentStatsRecord>,
     relationships: Vec<AgentRelationshipRecord>,
     memories: Vec<AgentMemoryRecord>,
+    world_objects: Vec<WorldObjectRecord>,
     departments: Vec<DepartmentRecord>,
     teams: Vec<TeamRecord>,
 }
@@ -4430,6 +4573,9 @@ fn replay_event(
         BlimsEventPayload::WorldRoomCreated { room } => {
             upsert_by_id(&mut state.rooms, room.into(), |room| &room.id);
         }
+        BlimsEventPayload::WorldObjectPlaced { object } => {
+            upsert_by_id(&mut state.world_objects, object, |object| &object.id);
+        }
     }
     Ok(())
 }
@@ -4542,7 +4688,8 @@ async fn apply_projection_state(
     replace_agent_projections(database, &state.agents).await?;
     replace_agent_stats_projections(database, &state.agent_stats).await?;
     replace_agent_relationship_projections(database, &state.relationships).await?;
-    replace_agent_memory_projections(database, &state.memories).await
+    replace_agent_memory_projections(database, &state.memories).await?;
+    replace_world_object_projections(database, &state.world_objects).await
 }
 
 async fn replace_one_initiative_projection(
@@ -4795,6 +4942,41 @@ async fn replace_world_room_projections(
     database.delete("world_rooms").execute(database).await?;
     for room in rooms {
         replace_one_world_room_projection(database, room).await?;
+    }
+    Ok(())
+}
+
+async fn replace_one_world_object_projection(
+    database: &dyn Database,
+    object: &WorldObjectRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("world_objects")
+        .filter(Box::new(where_eq("id", object.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("world_objects")
+        .value("id", object.id.clone())
+        .value("room_id", object.room_id.clone())
+        .value("name", object.name.clone())
+        .value("kind", object.kind.clone())
+        .value("symbol", object.symbol.clone())
+        .value("color", object.color.clone())
+        .value("interaction", object.interaction.clone())
+        .value("productivity_modifier", object.productivity_modifier)
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_world_object_projections(
+    database: &dyn Database,
+    objects: &[WorldObjectRecord],
+) -> Result<(), BlimsStateError> {
+    database.delete("world_objects").execute(database).await?;
+    for object in objects {
+        replace_one_world_object_projection(database, object).await?;
     }
     Ok(())
 }
