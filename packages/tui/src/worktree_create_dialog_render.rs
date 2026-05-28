@@ -51,6 +51,11 @@ fn rows(dialog: &WorktreeCreateDialog) -> Vec<Line> {
             dialog.focus() == WorktreeCreateFocus::Name,
         ),
         field_line(
+            "Target",
+            dialog.target().label(),
+            dialog.focus() == WorktreeCreateFocus::Target,
+        ),
+        field_line(
             "Base",
             dialog.base().label(),
             dialog.focus() == WorktreeCreateFocus::Base,
@@ -70,7 +75,7 @@ fn rows(dialog: &WorktreeCreateDialog) -> Vec<Line> {
                 "←/→",
                 Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
             ),
-            Span::styled(" base  ", Style::new().bg(MODAL_BG)),
+            Span::styled(" value  ", Style::new().bg(MODAL_BG)),
             Span::styled(
                 "Esc",
                 Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),

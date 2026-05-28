@@ -7,6 +7,8 @@ use bmux_text_edit::TextEditBuffer;
 pub enum WorktreeCreateFocus {
     /// Worktree/task name field.
     Name,
+    /// Session target field.
+    Target,
     /// Base ref strategy field.
     Base,
 }
@@ -15,22 +17,31 @@ pub enum WorktreeCreateFocus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateDialog {
     name: TextEditBuffer,
+    target: WorktreeCreateTarget,
     base: WorktreeCreateBase,
     focus: WorktreeCreateFocus,
     status: String,
+    current_session_available: bool,
 }
 
 impl WorktreeCreateDialog {
     /// Create a worktree create dialog.
     #[must_use]
-    pub fn new(default_name: &str) -> Self {
+    pub fn new(default_name: &str, current_session_available: bool) -> Self {
         let mut name = TextEditBuffer::new();
         name.insert_str(default_name);
+        let target = if current_session_available {
+            WorktreeCreateTarget::CurrentSession
+        } else {
+            WorktreeCreateTarget::NewSession
+        };
         Self {
             name,
+            target,
             base: WorktreeCreateBase::Head,
             focus: WorktreeCreateFocus::Name,
-            status: "Enter name, Tab changes field, ←/→ changes base, Enter creates".to_owned(),
+            status: "Enter name, Tab changes field, ←/→ changes value, Enter creates".to_owned(),
+            current_session_available,
         }
     }
 
@@ -49,6 +60,12 @@ impl WorktreeCreateDialog {
     /// Return name input mutably.
     pub const fn name_mut(&mut self) -> &mut TextEditBuffer {
         &mut self.name
+    }
+
+    /// Return selected session target.
+    #[must_use]
+    pub const fn target(&self) -> WorktreeCreateTarget {
+        self.target
     }
 
     /// Return selected base ref.
@@ -72,19 +89,78 @@ impl WorktreeCreateDialog {
     /// Move focus to the next field.
     pub const fn focus_next(&mut self) {
         self.focus = match self.focus {
-            WorktreeCreateFocus::Name => WorktreeCreateFocus::Base,
+            WorktreeCreateFocus::Name => WorktreeCreateFocus::Target,
+            WorktreeCreateFocus::Target => WorktreeCreateFocus::Base,
             WorktreeCreateFocus::Base => WorktreeCreateFocus::Name,
         };
     }
 
-    /// Select previous base strategy.
-    pub const fn previous_base(&mut self) {
+    /// Select previous value for the focused choice field.
+    pub const fn previous_choice(&mut self) {
+        match self.focus {
+            WorktreeCreateFocus::Name => {}
+            WorktreeCreateFocus::Target => self.previous_target(),
+            WorktreeCreateFocus::Base => self.previous_base(),
+        }
+    }
+
+    /// Select next value for the focused choice field.
+    pub const fn next_choice(&mut self) {
+        match self.focus {
+            WorktreeCreateFocus::Name => {}
+            WorktreeCreateFocus::Target => self.next_target(),
+            WorktreeCreateFocus::Base => self.next_base(),
+        }
+    }
+
+    const fn previous_target(&mut self) {
+        self.target = self.target.previous(self.current_session_available);
+    }
+
+    const fn next_target(&mut self) {
+        self.target = self.target.next(self.current_session_available);
+    }
+
+    const fn previous_base(&mut self) {
         self.base = self.base.previous();
     }
 
-    /// Select next base strategy.
-    pub const fn next_base(&mut self) {
+    const fn next_base(&mut self) {
         self.base = self.base.next();
+    }
+}
+
+/// Worktree session target in the create dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeCreateTarget {
+    /// Move the current session into the created worktree.
+    CurrentSession,
+    /// Create and switch to a new session rooted at the worktree.
+    NewSession,
+}
+
+impl WorktreeCreateTarget {
+    const fn previous(self, current_session_available: bool) -> Self {
+        self.next(current_session_available)
+    }
+
+    const fn next(self, current_session_available: bool) -> Self {
+        if !current_session_available {
+            return Self::NewSession;
+        }
+        match self {
+            Self::CurrentSession => Self::NewSession,
+            Self::NewSession => Self::CurrentSession,
+        }
+    }
+
+    /// Return display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CurrentSession => "current_session",
+            Self::NewSession => "new_session",
+        }
     }
 }
 

@@ -26,21 +26,25 @@ enum PickerKeyOutcome {
     Canceled,
 }
 
-/// Create a worktree for the current session using a dialog.
+/// Create a worktree using a dialog.
 pub async fn create_for_current_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
-    let default_name = chat
-        .app
-        .session_title()
-        .map_or_else(|| format!("session-{session_id}"), ToString::to_string);
-    let mut dialog = worktree_create_dialog::WorktreeCreateDialog::new(&default_name);
+    let current_session_id = chat.app.session_id();
+    let default_name = current_session_id.map_or_else(
+        || "new-session".to_owned(),
+        |session_id| {
+            chat.app
+                .session_title()
+                .map_or_else(|| format!("session-{session_id}"), ToString::to_string)
+        },
+    );
+    let mut dialog = worktree_create_dialog::WorktreeCreateDialog::new(
+        &default_name,
+        current_session_id.is_some(),
+    );
     loop {
         io.terminal.resize(helpers::terminal_area()?);
         io.terminal
@@ -58,15 +62,11 @@ pub async fn create_for_current_session<W: Write>(
             Event::Key(stroke) => match stroke.key {
                 KeyCode::Escape => return Err(TuiError::Canceled),
                 KeyCode::Tab => dialog.focus_next(),
-                KeyCode::Left
-                    if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Base =>
-                {
-                    dialog.previous_base();
+                KeyCode::Left => {
+                    dialog.previous_choice();
                 }
-                KeyCode::Right
-                    if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Base =>
-                {
-                    dialog.next_base();
+                KeyCode::Right => {
+                    dialog.next_choice();
                 }
                 KeyCode::Enter => {
                     let name = dialog.name_text();
@@ -74,6 +74,15 @@ pub async fn create_for_current_session<W: Write>(
                         chat.app.set_status("worktree name is required".to_owned());
                         continue;
                     }
+                    let target = dialog.target();
+                    let attach_session_id = match target {
+                        worktree_create_dialog::WorktreeCreateTarget::CurrentSession => {
+                            current_session_id
+                        }
+                        worktree_create_dialog::WorktreeCreateTarget::NewSession => None,
+                    };
+                    let new_session =
+                        target == worktree_create_dialog::WorktreeCreateTarget::NewSession;
                     let response = services
                         .client
                         .create_worktree(bcode_worktree_models::WorktreeCreateRequest {
@@ -88,19 +97,12 @@ pub async fn create_for_current_session<W: Write>(
                             base_ref: Some(dialog.base().model()),
                             detach: false,
                             force: false,
-                            attach_session_id: Some(session_id),
-                            new_session: false,
+                            attach_session_id,
+                            new_session,
                             no_setup: false,
                         })
                         .await?;
-                    if let Some(session) = response.session {
-                        chat.app.apply_session_summary(&session);
-                    }
-                    chat.app.push_system_note(format!(
-                        "Created worktree for current session\n* Path: {}",
-                        response.path.display()
-                    ));
-                    chat.app.set_status("created worktree".to_owned());
+                    handle_created_worktree(io, services, chat, response, target).await?;
                     return Ok(());
                 }
                 _ if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name => {
@@ -120,6 +122,44 @@ pub async fn create_for_current_session<W: Write>(
             | Event::Paste(_) => {}
         }
     }
+}
+
+async fn handle_created_worktree<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    response: bcode_worktree_models::WorktreeCreateResponse,
+    target: worktree_create_dialog::WorktreeCreateTarget,
+) -> Result<(), TuiError> {
+    let path = response.path.clone();
+    match target {
+        worktree_create_dialog::WorktreeCreateTarget::CurrentSession => {
+            if let Some(session) = response.session {
+                chat.app.apply_session_summary(&session);
+            }
+            chat.app.push_system_note(format!(
+                "Created worktree for current session\n* Path: {}",
+                path.display()
+            ));
+            chat.app.set_status("created worktree".to_owned());
+        }
+        worktree_create_dialog::WorktreeCreateTarget::NewSession => {
+            let Some(session) = response.session else {
+                chat.app
+                    .set_status("created worktree, but no session was returned".to_owned());
+                return Ok(());
+            };
+            let session_id = session.id;
+            chat.app.push_system_note(format!(
+                "Created worktree with new session\n* Path: {}\n* Session: {session_id}",
+                path.display()
+            ));
+            session_flow::switch_session(io.terminal, services.client, chat, session_id).await?;
+            chat.app
+                .set_status("created worktree and switched session".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Pick a worktree and attach the current session to it.
