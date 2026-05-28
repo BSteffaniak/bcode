@@ -2191,6 +2191,13 @@ async fn create_base_tables(
         .primary_key("id")
         .execute(database)
         .await?;
+    create_table("blims_config")
+        .if_not_exists(true)
+        .column(text_column("key"))
+        .column(text_column("value"))
+        .primary_key("key")
+        .execute(database)
+        .await?;
     create_table("events")
         .if_not_exists(true)
         .column(auto_id_column("id"))
@@ -2544,12 +2551,50 @@ async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database:
              WHERE NOT EXISTS (SELECT 1 FROM companies WHERE id = 'default')",
         )
         .await?;
+    seed_default_config(database).await?;
     seed_company_created_event(database).await?;
     seed_starter_org_events(database).await?;
     seed_starter_world_events(database).await?;
     rebuild_projections_from_database(database)
         .await
         .map_err(|error| switchy_database::DatabaseError::QueryFailed(error.to_string()))?;
+    Ok(())
+}
+
+async fn seed_default_config(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    let defaults = [
+        ("state_root", DEFAULT_STATE_ROOT),
+        ("autonomy.default_level", "guided"),
+        ("agent_roster.default", "mira,jules,pip"),
+        ("starter_office", "cozy-startup-loft"),
+        (
+            "permissions.default",
+            "read=allow,bash=ask,write=ask,edit=ask,external_directory=deny",
+        ),
+        (
+            "contracts.default",
+            "report blockers/risk/validation; log disagreement rationale",
+        ),
+        ("daemon.background", "enabled"),
+        (
+            "pause_behavior",
+            "pause autonomous work, keep state queryable",
+        ),
+        (
+            "shutdown_behavior",
+            "persist state and stop background work",
+        ),
+        ("report_cadence", "on-entry,on-request"),
+    ];
+    for (key, value) in defaults {
+        database
+            .exec_raw(&format!(
+                "INSERT INTO blims_config (key, value) SELECT '{key}', '{value}' WHERE NOT EXISTS (SELECT 1 FROM blims_config WHERE key = '{key}')"
+            ))
+            .await?;
+    }
     Ok(())
 }
 
