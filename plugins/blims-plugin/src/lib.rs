@@ -277,7 +277,7 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
             service_world_move_player(request, &EventContext::from_request(request))
         }
         OP_WORLD_AVAILABLE_INTERACTIONS => service_world_available_interactions(request),
-        OP_REPORT_MORNING => service_morning_report(request),
+        OP_REPORT_MORNING => service_morning_report(request, &EventContext::from_request(request)),
         OP_REPORT_DEPARTMENT => service_department_report(request),
         OP_REPORT_AGENT => service_agent_report(request),
         OP_EVENT_LIST => service_event_list(request),
@@ -1131,6 +1131,14 @@ impl AgentStatsRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReportRecord {
+    id: String,
+    report_type: String,
+    title: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AgentPermissionRecord {
     agent_id: String,
     bcode_agent_id: String,
@@ -1354,6 +1362,9 @@ enum BlimsEventPayload {
         success: bool,
         summary: String,
         stats: AgentStatsRecord,
+    },
+    ReportGenerated {
+        report: ReportRecord,
     },
     AgentHired {
         agent: AgentSnapshot,
@@ -1941,14 +1952,17 @@ fn service_world_available_interactions(request: &ServiceRequest) -> ServiceResp
     }
 }
 
-fn service_morning_report(request: &ServiceRequest) -> ServiceResponse {
+fn service_morning_report(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
     let Ok(request) = request.payload_json::<WorkspaceRequest>() else {
         return json_response(&fallback_morning_report());
     };
 
-    load_company_data(&request.working_directory).map_or_else(
+    generate_morning_report(&request, event_context).map_or_else(
         |_| json_response(&fallback_morning_report()),
-        |data| json_response(&morning_report(&data)),
+        |report| json_response(&report),
     )
 }
 
@@ -2402,6 +2416,16 @@ async fn create_work_tables(
         .column(text_column("path"))
         .column(text_column("branch"))
         .column(text_column("status"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("reports")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("report_type"))
+        .column(text_column("title"))
+        .column(text_column("summary"))
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
@@ -3143,6 +3167,9 @@ async fn apply_work_event_projection(
         BlimsEventPayload::TaskOutcomeRecorded { stats, .. } => {
             replace_one_agent_stats_projection(database, stats).await?;
         }
+        BlimsEventPayload::ReportGenerated { report } => {
+            replace_one_report_projection(database, report).await?;
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -3257,7 +3284,8 @@ async fn apply_org_world_event_projection(
         | BlimsEventPayload::ArtifactCreated { .. }
         | BlimsEventPayload::ArtifactStatusSet { .. }
         | BlimsEventPayload::TaskCreated { .. }
-        | BlimsEventPayload::TaskOutcomeRecorded { .. } => {}
+        | BlimsEventPayload::TaskOutcomeRecorded { .. }
+        | BlimsEventPayload::ReportGenerated { .. } => {}
     }
     Ok(())
 }
@@ -5009,7 +5037,8 @@ fn replay_event(
         }
         BlimsEventPayload::AgentContractUpdated { .. }
         | BlimsEventPayload::PlayerMoved { .. }
-        | BlimsEventPayload::InitiativePlanImported { .. } => {}
+        | BlimsEventPayload::InitiativePlanImported { .. }
+        | BlimsEventPayload::ReportGenerated { .. } => {}
         BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
             upsert_by_id(
                 &mut state.departments,
@@ -5327,6 +5356,26 @@ async fn replace_one_worktree_projection(
         .value("path", worktree.path.clone())
         .value("branch", worktree.branch.clone())
         .value("status", worktree.status.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_one_report_projection(
+    database: &dyn Database,
+    report: &ReportRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("reports")
+        .filter(Box::new(where_eq("id", report.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("reports")
+        .value("id", report.id.clone())
+        .value("report_type", report.report_type.clone())
+        .value("title", report.title.clone())
+        .value("summary", report.summary.clone())
         .execute(database)
         .await?;
     Ok(())
@@ -5810,6 +5859,36 @@ fn required_bool(row: &Row, column: &'static str) -> Result<bool, BlimsStateErro
                 .or_else(|| value.as_i64().map(|value| value != 0))
         })
         .ok_or(BlimsStateError::MissingColumn(column))
+}
+
+fn generate_morning_report(
+    request: &WorkspaceRequest,
+    event_context: &EventContext,
+) -> Result<MorningReport, BlimsStateError> {
+    let event_context = event_context.clone();
+    let working_directory = request.working_directory.clone();
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            let data = load_company_data_from_database(database).await?;
+            let report = morning_report(&data);
+            append_event(
+                database,
+                &event_context,
+                "report.generated",
+                report.title.clone(),
+                &BlimsEventPayload::ReportGenerated {
+                    report: ReportRecord {
+                        id: format!("morning-{}", latest_event_id(database).await? + 1),
+                        report_type: "morning".to_string(),
+                        title: report.title.clone(),
+                        summary: report.bullets.join("\n"),
+                    },
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(report)
+        })
+    })
 }
 
 fn morning_report(data: &CompanyData) -> MorningReport {
