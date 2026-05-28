@@ -417,6 +417,7 @@ struct BlimsArtifactDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsAgentTalkPrompt {
     agent_id: String,
+    conversation_id: String,
     prompt: String,
 }
 
@@ -903,11 +904,27 @@ async fn start_agent_talk_session(prompt: BlimsAgentTalkPrompt) -> Result<(), Cl
         .create_session(Some(format!("Blims talk: {}", prompt.agent_id)))
         .await?;
     BcodeClient::default_endpoint()
-        .send_user_message(session.id, prompt.prompt)
+        .send_user_message(session.id, prompt.prompt.clone())
         .await?;
+    record_blims_conversation(&prompt, &session.id).await?;
     println!("AI chat session with {}: {}", prompt.agent_id, session.id);
     println!("Attaching now. Press Ctrl-C to return to the Blims office.");
     attach_session(session.id).await?;
+    Ok(())
+}
+
+async fn record_blims_conversation(
+    prompt: &BlimsAgentTalkPrompt,
+    session_id: &SessionId,
+) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "conversation_id": prompt.conversation_id,
+        "agent_id": prompt.agent_id,
+        "session_id": session_id.to_string(),
+        "summary": "Bcode conversation session opened from Blims office.",
+    });
+    call_blims_service("agent.record_conversation", serde_json::to_vec(&request)?).await?;
     Ok(())
 }
 

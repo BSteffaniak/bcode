@@ -43,6 +43,9 @@ pub const OP_AGENT_LIST: &str = "agent.list";
 /// Agent inspect operation.
 pub const OP_AGENT_INSPECT: &str = "agent.inspect";
 
+/// Agent conversation record operation.
+pub const OP_AGENT_RECORD_CONVERSATION: &str = "agent.record_conversation";
+
 /// Agent hire operation.
 pub const OP_AGENT_HIRE: &str = "agent.hire";
 
@@ -207,6 +210,9 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         }
         OP_AGENT_LIST => service_agent_list(request),
         OP_AGENT_INSPECT => service_agent_inspect(request),
+        OP_AGENT_RECORD_CONVERSATION => {
+            service_agent_record_conversation(request, &EventContext::from_request(request))
+        }
         OP_AGENT_HIRE => service_agent_hire(request, &EventContext::from_request(request)),
         OP_AGENT_SUSPEND => {
             service_agent_employment(request, &EventContext::from_request(request), "suspended")
@@ -366,6 +372,30 @@ pub struct AgentRequest {
     pub working_directory: PathBuf,
     /// Agent id.
     pub agent_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to record a conversation session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRecordRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Conversation id.
+    pub conversation_id: String,
+    /// Agent id.
+    pub agent_id: String,
+    /// Bcode session id.
+    pub session_id: String,
+    /// Conversation summary.
+    pub summary: String,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -849,6 +879,8 @@ pub struct InitiativePlanningPrompt {
 pub struct AgentTalkPrompt {
     /// Agent id.
     pub agent_id: String,
+    /// Conversation id to associate with a Bcode session.
+    pub conversation_id: String,
     /// Prompt text to send to an AI conversation session.
     pub prompt: String,
 }
@@ -1178,6 +1210,15 @@ impl AgentStatsRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConversationRecord {
+    id: String,
+    agent_id: String,
+    session_id: String,
+    status: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ReportRecord {
     id: String,
     report_type: String,
@@ -1416,6 +1457,9 @@ enum BlimsEventPayload {
     ReportGenerated {
         report: ReportRecord,
     },
+    ConversationRecorded {
+        conversation: ConversationRecord,
+    },
     AgentHired {
         agent: AgentSnapshot,
     },
@@ -1629,6 +1673,21 @@ fn service_agent_inspect(request: &ServiceRequest) -> ServiceResponse {
     match inspect_agent(&request) {
         Ok(agent) => json_response(&agent),
         Err(error) => ServiceResponse::error("agent_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_agent_record_conversation(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<ConversationRecordRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match record_conversation(&request, &event_context) {
+        Ok(conversation) => json_response(&conversation),
+        Err(error) => ServiceResponse::error("conversation_record_failed", error.to_string()),
     }
 }
 
@@ -2519,6 +2578,17 @@ async fn create_task_and_artifact_tables(
         .column(now_column("created_at"))
         .primary_key("id")
         .execute(database)
+        .await?;
+    create_table("conversations")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("agent_id"))
+        .column(text_column("session_id"))
+        .column(text_column("status"))
+        .column(text_column("summary"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
         .await
 }
 
@@ -3303,6 +3373,9 @@ async fn apply_work_event_projection(
         BlimsEventPayload::ReportGenerated { report } => {
             replace_one_report_projection(database, report).await?;
         }
+        BlimsEventPayload::ConversationRecorded { conversation } => {
+            replace_one_conversation_projection(database, conversation).await?;
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -3419,7 +3492,8 @@ async fn apply_org_world_event_projection(
         | BlimsEventPayload::ArtifactStatusSet { .. }
         | BlimsEventPayload::TaskCreated { .. }
         | BlimsEventPayload::TaskOutcomeRecorded { .. }
-        | BlimsEventPayload::ReportGenerated { .. } => {}
+        | BlimsEventPayload::ReportGenerated { .. }
+        | BlimsEventPayload::ConversationRecorded { .. } => {}
     }
     Ok(())
 }
@@ -3438,6 +3512,35 @@ fn inspect_agent(request: &AgentRequest) -> Result<AgentSnapshot, BlimsStateErro
             .find(|agent| agent.id == agent_id)
             .map(AgentRecord::snapshot)
             .ok_or_else(|| BlimsStateError::InvalidRequest(format!("unknown agent: {agent_id}")))
+    })
+}
+
+fn record_conversation(
+    request: &ConversationRecordRequest,
+    event_context: &EventContext,
+) -> Result<ConversationRecord, BlimsStateError> {
+    let conversation = ConversationRecord {
+        id: request.conversation_id.clone(),
+        agent_id: request.agent_id.clone(),
+        session_id: request.session_id.clone(),
+        status: "open".to_string(),
+        summary: request.summary.clone(),
+    };
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "conversation.recorded",
+                format!("Conversation recorded: {}", conversation.id),
+                &BlimsEventPayload::ConversationRecorded {
+                    conversation: conversation.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(conversation)
+        })
     })
 }
 
@@ -4351,8 +4454,14 @@ fn build_agent_talk_prompt(
                 .ok_or_else(|| {
                     BlimsStateError::InvalidRequest(format!("unknown Blims agent: {agent_id}"))
                 })?;
+            let conversation_id = format!(
+                "conversation-{}-{}",
+                agent.id,
+                latest_event_id(database).await? + 1
+            );
             Ok(AgentTalkPrompt {
                 agent_id,
+                conversation_id,
                 prompt: agent_talk_prompt_text(agent, &data),
             })
         })
@@ -5267,7 +5376,8 @@ fn replay_event(
         BlimsEventPayload::AgentContractUpdated { .. }
         | BlimsEventPayload::PlayerMoved { .. }
         | BlimsEventPayload::InitiativePlanImported { .. }
-        | BlimsEventPayload::ReportGenerated { .. } => {}
+        | BlimsEventPayload::ReportGenerated { .. }
+        | BlimsEventPayload::ConversationRecorded { .. } => {}
         BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
             upsert_by_id(
                 &mut state.departments,
@@ -5638,6 +5748,27 @@ async fn replace_one_report_projection(
         .value("report_type", report.report_type.clone())
         .value("title", report.title.clone())
         .value("summary", report.summary.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_one_conversation_projection(
+    database: &dyn Database,
+    conversation: &ConversationRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("conversations")
+        .filter(Box::new(where_eq("id", conversation.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("conversations")
+        .value("id", conversation.id.clone())
+        .value("agent_id", conversation.agent_id.clone())
+        .value("session_id", conversation.session_id.clone())
+        .value("status", conversation.status.clone())
+        .value("summary", conversation.summary.clone())
         .execute(database)
         .await?;
     Ok(())
