@@ -160,6 +160,9 @@ pub const OP_EVENT_LIST: &str = "event.list";
 /// Event projection rebuild operation.
 pub const OP_EVENT_REBUILD_PROJECTIONS: &str = "event.rebuild_projections";
 
+/// Record task outcome operation.
+pub const OP_TASK_RECORD_OUTCOME: &str = "task.record_outcome";
+
 /// Blims protocol version for daemon/UI IPC payloads.
 pub const BLIMS_PROTOCOL_VERSION: u16 = 1;
 
@@ -234,6 +237,9 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_TASK_LIST => service_task_list(request),
         OP_TASK_INSPECT => service_task_inspect(request),
         OP_TASK_WORK_PROMPT => service_task_work_prompt(request),
+        OP_TASK_RECORD_OUTCOME => {
+            service_task_record_outcome(request, &EventContext::from_request(request))
+        }
         OP_ARTIFACT_LIST => service_artifact_list(request),
         OP_ARTIFACT_INSPECT => service_artifact_inspect(request),
         OP_ARTIFACT_APPROVE => {
@@ -580,6 +586,28 @@ pub struct TaskInspectRequest {
     pub working_directory: PathBuf,
     /// Task id.
     pub task_id: String,
+}
+
+/// Request to record a completed task outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOutcomeRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Task id.
+    pub task_id: String,
+    /// Whether the task outcome was successful.
+    pub success: bool,
+    /// Short result summary.
+    pub summary: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Request to inspect an artifact.
@@ -1295,6 +1323,13 @@ enum BlimsEventPayload {
     TaskCreated {
         task: TaskSummary,
     },
+    TaskOutcomeRecorded {
+        task_id: String,
+        agent_id: String,
+        success: bool,
+        summary: String,
+        stats: AgentStatsRecord,
+    },
     AgentHired {
         agent: AgentSnapshot,
     },
@@ -1698,6 +1733,21 @@ fn service_task_work_prompt(request: &ServiceRequest) -> ServiceResponse {
     match build_task_work_prompt(&request) {
         Ok(prompt) => json_response(&prompt),
         Err(error) => ServiceResponse::error("task_work_prompt_failed", error.to_string()),
+    }
+}
+
+fn service_task_record_outcome(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<TaskOutcomeRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match record_task_outcome(&request, &event_context) {
+        Ok(stats) => json_response(&stats),
+        Err(error) => ServiceResponse::error("task_record_outcome_failed", error.to_string()),
     }
 }
 
@@ -2999,6 +3049,9 @@ async fn apply_work_event_projection(
         BlimsEventPayload::TaskCreated { task } => {
             replace_one_task_projection(database, task).await?;
         }
+        BlimsEventPayload::TaskOutcomeRecorded { stats, .. } => {
+            replace_one_agent_stats_projection(database, stats).await?;
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -3108,7 +3161,8 @@ async fn apply_org_world_event_projection(
         | BlimsEventPayload::ProposalStatusSet { .. }
         | BlimsEventPayload::ArtifactCreated { .. }
         | BlimsEventPayload::ArtifactStatusSet { .. }
-        | BlimsEventPayload::TaskCreated { .. } => {}
+        | BlimsEventPayload::TaskCreated { .. }
+        | BlimsEventPayload::TaskOutcomeRecorded { .. } => {}
     }
     Ok(())
 }
@@ -3686,6 +3740,52 @@ fn inspect_task(request: &TaskInspectRequest) -> Result<TaskSummary, BlimsStateE
                 .ok_or(BlimsStateError::MissingColumn("task"))
         })
     })
+}
+
+fn record_task_outcome(
+    request: &TaskOutcomeRequest,
+    event_context: &EventContext,
+) -> Result<AgentStatsRecord, BlimsStateError> {
+    let request = request.clone();
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let task = load_task(database, &request.task_id).await?;
+            let mut stats = load_agent_stats(database)
+                .await?
+                .into_iter()
+                .find(|stats| stats.agent_id == task.assigned_agent_id)
+                .unwrap_or_else(|| starter_agent_stats(&task.assigned_agent_id));
+            apply_task_outcome_to_stats(&mut stats, request.success);
+            append_event(
+                database,
+                &event_context,
+                "task.outcome_recorded",
+                format!("Task outcome recorded: {}", request.summary),
+                &BlimsEventPayload::TaskOutcomeRecorded {
+                    task_id: task.id,
+                    agent_id: stats.agent_id.clone(),
+                    success: request.success,
+                    summary: request.summary,
+                    stats: stats.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(stats)
+        })
+    })
+}
+
+fn apply_task_outcome_to_stats(stats: &mut AgentStatsRecord, success: bool) {
+    if success {
+        stats.confidence = (stats.confidence + 3).min(100);
+        stats.quality_modifier += 1;
+        stats.persistence_modifier += 1;
+    } else {
+        stats.confidence = (stats.confidence - 4).max(0);
+        stats.risk_modifier += 2;
+        stats.focus = (stats.focus + 1).min(100);
+    }
 }
 
 fn build_task_work_prompt(request: &TaskInspectRequest) -> Result<TaskWorkPrompt, BlimsStateError> {
@@ -4742,6 +4842,9 @@ fn replay_event(
         }
         BlimsEventPayload::TaskCreated { task } => {
             upsert_by_id(&mut state.tasks, task, |task| &task.id);
+        }
+        BlimsEventPayload::TaskOutcomeRecorded { stats, .. } => {
+            upsert_by_id(&mut state.agent_stats, stats, |stats| &stats.agent_id);
         }
         BlimsEventPayload::AgentHired { .. }
         | BlimsEventPayload::AgentMoved { .. }
