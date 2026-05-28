@@ -100,6 +100,15 @@ pub const OP_ARTIFACT_LIST: &str = "artifact.list";
 /// Artifact inspect operation.
 pub const OP_ARTIFACT_INSPECT: &str = "artifact.inspect";
 
+/// Artifact approve operation.
+pub const OP_ARTIFACT_APPROVE: &str = "artifact.approve";
+
+/// Artifact reject operation.
+pub const OP_ARTIFACT_REJECT: &str = "artifact.reject";
+
+/// Artifact defer operation.
+pub const OP_ARTIFACT_DEFER: &str = "artifact.defer";
+
 /// Work proposal register operation.
 pub const OP_PROPOSAL_REGISTER: &str = "proposal.register";
 
@@ -227,6 +236,15 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_TASK_WORK_PROMPT => service_task_work_prompt(request),
         OP_ARTIFACT_LIST => service_artifact_list(request),
         OP_ARTIFACT_INSPECT => service_artifact_inspect(request),
+        OP_ARTIFACT_APPROVE => {
+            service_artifact_status(request, &EventContext::from_request(request), "approved")
+        }
+        OP_ARTIFACT_REJECT => {
+            service_artifact_status(request, &EventContext::from_request(request), "rejected")
+        }
+        OP_ARTIFACT_DEFER => {
+            service_artifact_status(request, &EventContext::from_request(request), "deferred")
+        }
         OP_PROPOSAL_REGISTER => {
             service_proposal_register(request, &EventContext::from_request(request))
         }
@@ -571,6 +589,15 @@ pub struct ArtifactInspectRequest {
     pub working_directory: PathBuf,
     /// Artifact id.
     pub artifact_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
 }
 
 /// Prompt for starting real task work through Bcode.
@@ -800,6 +827,8 @@ pub struct ArtifactSummary {
     pub kind: String,
     /// Artifact title.
     pub title: String,
+    /// Artifact status.
+    pub status: String,
 }
 
 /// Persisted Blims event summary.
@@ -834,6 +863,8 @@ pub struct ArtifactDetail {
     pub kind: String,
     /// Artifact title.
     pub title: String,
+    /// Artifact status.
+    pub status: String,
     /// Artifact payload JSON.
     pub payload_json: String,
 }
@@ -1138,6 +1169,10 @@ enum BlimsEventPayload {
     },
     ArtifactCreated {
         artifact: ArtifactDetail,
+    },
+    ArtifactStatusSet {
+        artifact_id: String,
+        status: String,
     },
     TaskCreated {
         task: TaskSummary,
@@ -1552,6 +1587,22 @@ fn service_artifact_inspect(request: &ServiceRequest) -> ServiceResponse {
     match inspect_artifact(&request) {
         Ok(artifact) => json_response(&artifact),
         Err(error) => ServiceResponse::error("artifact_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_artifact_status(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+    status: &str,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<ArtifactInspectRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match set_artifact_status(&request, &event_context, status) {
+        Ok(artifact) => json_response(&artifact),
+        Err(error) => ServiceResponse::error("artifact_status_failed", error.to_string()),
     }
 }
 
@@ -2012,6 +2063,7 @@ async fn create_work_tables(
         .column(text_column("initiative_id"))
         .column(text_column("kind"))
         .column(text_column("title"))
+        .column(text_column("status"))
         .column(text_column("payload_json"))
         .column(now_column("created_at"))
         .primary_key("id")
@@ -2507,7 +2559,18 @@ async fn apply_work_event_projection(
                 .await?;
         }
         BlimsEventPayload::ArtifactCreated { artifact } => {
-            replace_one_artifact_projection(database, artifact).await?;
+            replace_one_artifact_projection(database, artifact, "draft").await?;
+        }
+        BlimsEventPayload::ArtifactStatusSet {
+            artifact_id,
+            status,
+        } => {
+            database
+                .update("artifacts")
+                .value("status", status.clone())
+                .filter(Box::new(where_eq("id", artifact_id.clone())))
+                .execute(database)
+                .await?;
         }
         BlimsEventPayload::TaskCreated { task } => {
             replace_one_task_projection(database, task).await?;
@@ -2604,6 +2667,7 @@ async fn apply_org_world_event_projection(
         | BlimsEventPayload::ProposalRegistered { .. }
         | BlimsEventPayload::ProposalStatusSet { .. }
         | BlimsEventPayload::ArtifactCreated { .. }
+        | BlimsEventPayload::ArtifactStatusSet { .. }
         | BlimsEventPayload::TaskCreated { .. } => {}
     }
     Ok(())
@@ -3191,7 +3255,7 @@ fn list_artifacts(working_directory: &Path) -> Result<Vec<ArtifactSummary>, Blim
         Box::pin(async move {
             database
                 .select("artifacts")
-                .columns(&["id", "initiative_id", "kind", "title"])
+                .columns(&["id", "initiative_id", "kind", "title", "status"])
                 .sort("created_at", SortDirection::Desc)
                 .execute(database)
                 .await?
@@ -3208,7 +3272,14 @@ fn inspect_artifact(request: &ArtifactInspectRequest) -> Result<ArtifactDetail, 
         Box::pin(async move {
             database
                 .select("artifacts")
-                .columns(&["id", "initiative_id", "kind", "title", "payload_json"])
+                .columns(&[
+                    "id",
+                    "initiative_id",
+                    "kind",
+                    "title",
+                    "status",
+                    "payload_json",
+                ])
                 .filter(Box::new(where_eq("id", artifact_id)))
                 .limit(1)
                 .execute_first(database)
@@ -3217,6 +3288,34 @@ fn inspect_artifact(request: &ArtifactInspectRequest) -> Result<ArtifactDetail, 
                 .map(artifact_detail)
                 .transpose()?
                 .ok_or(BlimsStateError::MissingColumn("artifact"))
+        })
+    })
+}
+
+fn set_artifact_status(
+    request: &ArtifactInspectRequest,
+    event_context: &EventContext,
+    status: &str,
+) -> Result<ArtifactDetail, BlimsStateError> {
+    let artifact = inspect_artifact(request)?;
+    let artifact_id = request.artifact_id.clone();
+    let status = status.to_string();
+    let event_context = event_context.clone();
+    let working_directory = request.working_directory.clone();
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "artifact.status_set",
+                format!("Artifact {artifact_id} status set to {status}."),
+                &BlimsEventPayload::ArtifactStatusSet {
+                    artifact_id,
+                    status: status.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(ArtifactDetail { status, ..artifact })
         })
     })
 }
@@ -3333,6 +3432,7 @@ fn record_proposal_patch(
                 initiative_id: proposal.initiative_id,
                 kind: "proposal_patch".to_string(),
                 title: format!("Patch for {}", proposal.id),
+                status: "draft".to_string(),
                 payload_json,
             };
             append_event(
@@ -3488,6 +3588,7 @@ fn import_initiative_plan(
                 initiative_id: initiative_id.clone(),
                 kind: "ai_plan".to_string(),
                 title: "AI-generated initiative plan".to_string(),
+                status: "draft".to_string(),
                 payload_json: payload_json.clone(),
             };
             database
@@ -3496,6 +3597,7 @@ fn import_initiative_plan(
                 .value("initiative_id", initiative_id.clone())
                 .value("kind", "ai_plan")
                 .value("title", "AI-generated initiative plan")
+                .value("status", "draft")
                 .value("payload_json", payload_json)
                 .execute(database)
                 .await?;
@@ -3728,7 +3830,7 @@ async fn load_company_data_from_database(
     let tasks = load_tasks(database).await?;
     let artifacts = database
         .select("artifacts")
-        .columns(&["id", "initiative_id", "kind", "title"])
+        .columns(&["id", "initiative_id", "kind", "title", "status"])
         .sort("created_at", SortDirection::Desc)
         .execute(database)
         .await?
@@ -3994,23 +4096,12 @@ fn replay_event(
         BlimsEventPayload::InitiativeGuidanceSet { guidance, .. } => {
             upsert_by_id(&mut state.guidance, guidance, |guidance| &guidance.id);
         }
-        BlimsEventPayload::ProposalRegistered { proposal } => {
-            upsert_by_id(&mut state.proposals, proposal, |proposal| &proposal.id);
+        BlimsEventPayload::ProposalRegistered { .. }
+        | BlimsEventPayload::ProposalStatusSet { .. } => {
+            replay_proposal_event(payload, state);
         }
-        BlimsEventPayload::ProposalStatusSet {
-            proposal_id,
-            status,
-        } => {
-            if let Some(proposal) = state
-                .proposals
-                .iter_mut()
-                .find(|proposal| proposal.id == proposal_id)
-            {
-                proposal.status = status;
-            }
-        }
-        BlimsEventPayload::ArtifactCreated { artifact } => {
-            upsert_by_id(&mut state.artifacts, artifact, |artifact| &artifact.id);
+        BlimsEventPayload::ArtifactCreated { .. } | BlimsEventPayload::ArtifactStatusSet { .. } => {
+            replay_artifact_event(payload, state);
         }
         BlimsEventPayload::TaskCreated { task } => {
             upsert_by_id(&mut state.tasks, task, |task| &task.id);
@@ -4052,6 +4143,49 @@ fn replay_event(
         }
     }
     Ok(())
+}
+
+fn replay_proposal_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
+    match payload {
+        BlimsEventPayload::ProposalRegistered { proposal } => {
+            upsert_by_id(&mut state.proposals, proposal, |proposal| &proposal.id);
+        }
+        BlimsEventPayload::ProposalStatusSet {
+            proposal_id,
+            status,
+        } => {
+            if let Some(proposal) = state
+                .proposals
+                .iter_mut()
+                .find(|proposal| proposal.id == proposal_id)
+            {
+                proposal.status = status;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replay_artifact_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
+    match payload {
+        BlimsEventPayload::ArtifactCreated { mut artifact } => {
+            artifact.status = "draft".to_string();
+            upsert_by_id(&mut state.artifacts, artifact, |artifact| &artifact.id);
+        }
+        BlimsEventPayload::ArtifactStatusSet {
+            artifact_id,
+            status,
+        } => {
+            if let Some(artifact) = state
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.id == artifact_id)
+            {
+                artifact.status = status;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn replay_agent_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
@@ -4176,6 +4310,7 @@ async fn replace_guidance_projections(
 async fn replace_one_artifact_projection(
     database: &dyn Database,
     artifact: &ArtifactDetail,
+    status: &str,
 ) -> Result<(), BlimsStateError> {
     database
         .delete("artifacts")
@@ -4188,6 +4323,7 @@ async fn replace_one_artifact_projection(
         .value("initiative_id", artifact.initiative_id.clone())
         .value("kind", artifact.kind.clone())
         .value("title", artifact.title.clone())
+        .value("status", status)
         .value("payload_json", artifact.payload_json.clone())
         .execute(database)
         .await?;
@@ -4200,7 +4336,7 @@ async fn replace_artifact_projections(
 ) -> Result<(), BlimsStateError> {
     database.delete("artifacts").execute(database).await?;
     for artifact in artifacts {
-        replace_one_artifact_projection(database, artifact).await?;
+        replace_one_artifact_projection(database, artifact, &artifact.status).await?;
     }
     Ok(())
 }
@@ -4431,6 +4567,7 @@ fn artifact_summary(row: &Row) -> Result<ArtifactSummary, BlimsStateError> {
         initiative_id: required_text(row, "initiative_id")?,
         kind: required_text(row, "kind")?,
         title: required_text(row, "title")?,
+        status: required_text(row, "status")?,
     })
 }
 
@@ -4440,6 +4577,7 @@ fn artifact_detail(row: &Row) -> Result<ArtifactDetail, BlimsStateError> {
         initiative_id: required_text(row, "initiative_id")?,
         kind: required_text(row, "kind")?,
         title: required_text(row, "title")?,
+        status: required_text(row, "status")?,
         payload_json: required_text(row, "payload_json")?,
     })
 }

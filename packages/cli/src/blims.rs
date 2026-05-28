@@ -203,6 +203,21 @@ pub enum BlimsArtifactCommand {
         #[arg(long)]
         yes: bool,
     },
+    Approve {
+        artifact_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Reject {
+        artifact_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Defer {
+        artifact_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -366,6 +381,7 @@ struct BlimsArtifactSummary {
     initiative_id: String,
     kind: String,
     title: String,
+    status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -374,6 +390,7 @@ struct BlimsArtifactDetail {
     initiative_id: String,
     kind: String,
     title: String,
+    status: String,
     payload_json: String,
 }
 
@@ -1227,8 +1244,12 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
                 let artifacts = decode_blims_response::<Vec<BlimsArtifactSummary>>(response)?;
                 for artifact in artifacts {
                     println!(
-                        "{}\t{}\t{}\t{}",
-                        artifact.id, artifact.initiative_id, artifact.kind, artifact.title
+                        "{}\t{}\t{}\t{}\t{}",
+                        artifact.id,
+                        artifact.initiative_id,
+                        artifact.kind,
+                        artifact.status,
+                        artifact.title
                     );
                 }
             }
@@ -1248,6 +1269,23 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
         }
         BlimsArtifactCommand::Apply { artifact_id, yes } => {
             apply_blims_patch_artifact(artifact_id, yes).await?;
+        }
+        BlimsArtifactCommand::Approve { artifact_id, json } => {
+            print_artifact_status_update(
+                "artifact.approve",
+                "artifact approved",
+                artifact_id,
+                json,
+            )
+            .await?;
+        }
+        BlimsArtifactCommand::Reject { artifact_id, json } => {
+            print_artifact_status_update("artifact.reject", "artifact rejected", artifact_id, json)
+                .await?;
+        }
+        BlimsArtifactCommand::Defer { artifact_id, json } => {
+            print_artifact_status_update("artifact.defer", "artifact deferred", artifact_id, json)
+                .await?;
         }
     }
     Ok(())
@@ -1302,6 +1340,27 @@ async fn handle_blims_proposal_command(command: BlimsProposalCommand) -> Result<
         BlimsProposalCommand::Patch { proposal_id, json } => {
             create_blims_proposal_patch(proposal_id, json).await?;
         }
+    }
+    Ok(())
+}
+
+async fn print_artifact_status_update(
+    operation: &str,
+    message: &str,
+    artifact_id: String,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "artifact_id": artifact_id,
+    });
+    let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let artifact = decode_blims_response::<BlimsArtifactDetail>(response)?;
+        println!("{message}: {}", artifact.id);
+        print_artifact_detail(&artifact);
     }
     Ok(())
 }
@@ -1466,6 +1525,7 @@ fn print_artifact_detail(artifact: &BlimsArtifactDetail) {
     println!("id: {}", artifact.id);
     println!("initiative: {}", artifact.initiative_id);
     println!("kind: {}", artifact.kind);
+    println!("status: {}", artifact.status);
     println!("payload:");
     println!("{}", artifact.payload_json);
 }
