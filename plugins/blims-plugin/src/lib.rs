@@ -1035,6 +1035,26 @@ impl From<AgentSnapshot> for AgentRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentStatsRecord {
+    agent_id: String,
+    traits: String,
+    skills: String,
+    energy: i64,
+    morale: i64,
+    focus: i64,
+    confidence: i64,
+}
+
+impl AgentStatsRecord {
+    fn report_line(&self) -> String {
+        format!(
+            "Energy {} · morale {} · focus {} · confidence {}",
+            self.energy, self.morale, self.focus, self.confidence
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoomRecord {
     id: String,
@@ -1187,6 +1207,9 @@ enum BlimsEventPayload {
     AgentStatusSet {
         agent_id: String,
         status: String,
+    },
+    AgentStatsSet {
+        stats: AgentStatsRecord,
     },
     AgentContractUpdated {
         agent_id: String,
@@ -1976,6 +1999,18 @@ async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_databa
         .column(text_column("escalation"))
         .primary_key("agent_id")
         .execute(database)
+        .await?;
+    create_table("agent_stats")
+        .if_not_exists(true)
+        .column(text_column("agent_id"))
+        .column(text_column("traits"))
+        .column(text_column("skills"))
+        .column(int_column("energy"))
+        .column(int_column("morale"))
+        .column(int_column("focus"))
+        .column(int_column("confidence"))
+        .primary_key("agent_id")
+        .execute(database)
         .await
 }
 
@@ -2267,6 +2302,15 @@ async fn seed_starter_world_events(
             &payload,
         )
         .await?;
+        let stats = starter_agent_stats(&agent.id);
+        let payload = BlimsEventPayload::AgentStatsSet { stats };
+        append_bootstrap_event_once(
+            database,
+            "agent.stats_set",
+            &format!("Starter agent stats set: {}", agent.name),
+            &payload,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2346,6 +2390,38 @@ fn starter_agents() -> Vec<AgentRecord> {
     ]
 }
 
+fn starter_agent_stats(agent_id: &str) -> AgentStatsRecord {
+    match agent_id {
+        "mira" => AgentStatsRecord {
+            agent_id: agent_id.to_string(),
+            traits: "curious, diplomatic, product-minded".to_string(),
+            skills: "planning, prioritization, CEO synthesis".to_string(),
+            energy: 82,
+            morale: 88,
+            focus: 74,
+            confidence: 80,
+        },
+        "jules" => AgentStatsRecord {
+            agent_id: agent_id.to_string(),
+            traits: "careful, pragmatic, test-loving".to_string(),
+            skills: "Rust, worktrees, validation, debugging".to_string(),
+            energy: 78,
+            morale: 80,
+            focus: 90,
+            confidence: 76,
+        },
+        _ => AgentStatsRecord {
+            agent_id: agent_id.to_string(),
+            traits: "playful, visual, encouraging".to_string(),
+            skills: "copywriting, design, cozy polish, docs".to_string(),
+            energy: 86,
+            morale: 92,
+            focus: 70,
+            confidence: 84,
+        },
+    }
+}
+
 fn fallback_world_snapshot() -> WorldSnapshot {
     WorldSnapshot {
         theme: "Cozy Startup Loft".to_string(),
@@ -2401,6 +2477,7 @@ struct CompanyData {
     proposals: Vec<WorkProposalSummary>,
     tasks: Vec<TaskSummary>,
     artifacts: Vec<ArtifactSummary>,
+    agent_stats: Vec<AgentStatsRecord>,
 }
 
 fn with_database<T>(
@@ -2595,6 +2672,9 @@ async fn apply_org_world_event_projection(
                 .filter(Box::new(where_eq("id", agent_id.clone())))
                 .execute(database)
                 .await?;
+        }
+        BlimsEventPayload::AgentStatsSet { stats } => {
+            replace_one_agent_stats_projection(database, stats).await?;
         }
         BlimsEventPayload::AgentStatusSet { agent_id, status } => {
             database
@@ -3828,15 +3908,8 @@ async fn load_company_data_from_database(
         .collect::<Result<Vec<_>, _>>()?;
     let proposals = load_proposals(database).await?;
     let tasks = load_tasks(database).await?;
-    let artifacts = database
-        .select("artifacts")
-        .columns(&["id", "initiative_id", "kind", "title", "status"])
-        .sort("created_at", SortDirection::Desc)
-        .execute(database)
-        .await?
-        .iter()
-        .map(artifact_summary)
-        .collect::<Result<Vec<_>, _>>()?;
+    let artifacts = load_artifacts(database).await?;
+    let agent_stats = load_agent_stats(database).await?;
 
     Ok(CompanyData {
         company,
@@ -3863,6 +3936,7 @@ async fn load_company_data_from_database(
         proposals,
         tasks,
         artifacts,
+        agent_stats,
     })
 }
 
@@ -3915,6 +3989,40 @@ async fn load_tasks(database: &dyn Database) -> Result<Vec<TaskSummary>, BlimsSt
         .collect::<Result<Vec<_>, _>>()
 }
 
+async fn load_artifacts(database: &dyn Database) -> Result<Vec<ArtifactSummary>, BlimsStateError> {
+    database
+        .select("artifacts")
+        .columns(&["id", "initiative_id", "kind", "title", "status"])
+        .sort("created_at", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(artifact_summary)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn load_agent_stats(
+    database: &dyn Database,
+) -> Result<Vec<AgentStatsRecord>, BlimsStateError> {
+    database
+        .select("agent_stats")
+        .columns(&[
+            "agent_id",
+            "traits",
+            "skills",
+            "energy",
+            "morale",
+            "focus",
+            "confidence",
+        ])
+        .sort("agent_id", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(agent_stats_record)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn load_company_record(database: &dyn Database) -> Result<CompanyRecord, BlimsStateError> {
     let row = database
         .select("companies")
@@ -3962,6 +4070,18 @@ fn agent_record(row: &Row) -> Result<AgentRecord, BlimsStateError> {
         team_id: required_text(row, "team_id")?,
         status: required_text(row, "status")?,
         room_id: required_text(row, "room_id")?,
+    })
+}
+
+fn agent_stats_record(row: &Row) -> Result<AgentStatsRecord, BlimsStateError> {
+    Ok(AgentStatsRecord {
+        agent_id: required_text(row, "agent_id")?,
+        traits: required_text(row, "traits")?,
+        skills: required_text(row, "skills")?,
+        energy: required_i64(row, "energy")?,
+        morale: required_i64(row, "morale")?,
+        focus: required_i64(row, "focus")?,
+        confidence: required_i64(row, "confidence")?,
     })
 }
 
@@ -4024,6 +4144,7 @@ struct ProjectionState {
     tasks: Vec<TaskSummary>,
     rooms: Vec<RoomRecord>,
     agents: Vec<AgentRecord>,
+    agent_stats: Vec<AgentStatsRecord>,
     departments: Vec<DepartmentRecord>,
     teams: Vec<TeamRecord>,
 }
@@ -4108,6 +4229,7 @@ fn replay_event(
         }
         BlimsEventPayload::AgentHired { .. }
         | BlimsEventPayload::AgentMoved { .. }
+        | BlimsEventPayload::AgentStatsSet { .. }
         | BlimsEventPayload::AgentStatusSet { .. } => {
             replay_agent_event(payload, state);
         }
@@ -4198,6 +4320,9 @@ fn replay_agent_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
                 agent.room_id = room_id;
             }
         }
+        BlimsEventPayload::AgentStatsSet { stats } => {
+            upsert_by_id(&mut state.agent_stats, stats, |stats| &stats.agent_id);
+        }
         BlimsEventPayload::AgentStatusSet { agent_id, status } => {
             if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
                 agent.status = status;
@@ -4234,7 +4359,8 @@ async fn apply_projection_state(
     replace_department_projections(database, &state.departments).await?;
     replace_team_projections(database, &state.teams).await?;
     replace_world_room_projections(database, &state.rooms).await?;
-    replace_agent_projections(database, &state.agents).await
+    replace_agent_projections(database, &state.agents).await?;
+    replace_agent_stats_projections(database, &state.agent_stats).await
 }
 
 async fn replace_one_initiative_projection(
@@ -4525,6 +4651,40 @@ async fn replace_agent_projections(
     Ok(())
 }
 
+async fn replace_one_agent_stats_projection(
+    database: &dyn Database,
+    stats: &AgentStatsRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("agent_stats")
+        .filter(Box::new(where_eq("agent_id", stats.agent_id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("agent_stats")
+        .value("agent_id", stats.agent_id.clone())
+        .value("traits", stats.traits.clone())
+        .value("skills", stats.skills.clone())
+        .value("energy", stats.energy)
+        .value("morale", stats.morale)
+        .value("focus", stats.focus)
+        .value("confidence", stats.confidence)
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_agent_stats_projections(
+    database: &dyn Database,
+    stats: &[AgentStatsRecord],
+) -> Result<(), BlimsStateError> {
+    database.delete("agent_stats").execute(database).await?;
+    for item in stats {
+        replace_one_agent_stats_projection(database, item).await?;
+    }
+    Ok(())
+}
+
 async fn replace_one_agent_contract_projection(
     database: &dyn Database,
     agent_id: &str,
@@ -4764,6 +4924,15 @@ fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, Blims
         format!("Work proposals: {}", proposals.len()),
         format!("Related artifacts: {artifacts}"),
     ];
+    if let Some(stats) = data
+        .agent_stats
+        .iter()
+        .find(|stats| stats.agent_id == agent.id)
+    {
+        bullets.push(stats.report_line());
+        bullets.push(format!("Traits: {}", stats.traits));
+        bullets.push(format!("Skills: {}", stats.skills));
+    }
     if let Some(task) = assigned_tasks.first() {
         bullets.push(format!(
             "Current likely focus: {} ({})",
