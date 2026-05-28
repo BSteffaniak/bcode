@@ -4,6 +4,13 @@ use super::{CliError, attach_session, ensure_server_running, print_service_respo
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse};
+use bmux_keyboard::KeyCode;
+use bmux_tui::layout::centered;
+use bmux_tui::prelude::{
+    Border, Color, Constraint, CrosstermTerminalGuard, Direction, Event, Frame, Insets, Line,
+    Modifier, Panel, Point, Rect, Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget,
+    read_event, split,
+};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
@@ -516,6 +523,11 @@ struct BlimsFocusedReport {
     bullets: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsEventSummary {
+    kind: String,
+}
+
 pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
     ensure_server_running().await?;
     match command {
@@ -651,148 +663,228 @@ async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliErro
 }
 
 async fn enter_blims_office() -> Result<(), CliError> {
-    let mut world = load_blims_world().await?;
-    let mut report = load_blims_report().await?;
-    let mut interactions = load_blims_interactions().await?;
-    let mut player_room_id = interactions.room_id.clone();
+    run_blims_tui().await
+}
+
+async fn run_blims_tui() -> Result<(), CliError> {
+    let mut app = BlimsTuiApp::load().await?;
+    if should_show_world_picker().await? {
+        app.show_world_picker = true;
+    }
+    let stdout = std::io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let mut terminal = Terminal::new(
+        guard
+            .writer_mut()
+            .ok_or_else(|| std::io::Error::other("terminal guard writer unavailable"))?,
+        blims_terminal_area()?,
+    );
+    terminal.draw(|frame| app.render(frame))?;
     loop {
-        print_blims_office(&world, &report, &interactions, &player_room_id);
-        print!("blims> ");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let command = input.trim();
-        if matches!(command, "q" | "quit" | "exit") {
-            break;
-        }
-        match command {
-            "h" | "left" => {
-                player_room_id = previous_room_id(&world, &player_room_id);
-                world = move_blims_player(&player_room_id).await?;
-                interactions = load_blims_interactions().await?;
+        if let Some(event) = read_event()? {
+            if handle_blims_tui_event(&mut app, event).await? {
+                break;
             }
-            "l" | "right" | "j" | "down" | "k" | "up" => {
-                player_room_id = next_room_id(&world, &player_room_id);
-                world = move_blims_player(&player_room_id).await?;
-                interactions = load_blims_interactions().await?;
-            }
-            "r" | "report" => print_blims_report(&report),
-            "refresh" | "reload" => {
-                refresh_blims_office(&mut world, &mut report).await?;
-                interactions = load_blims_interactions().await?;
-                player_room_id = interactions.room_id.clone();
-            }
-            "tasks" | "task" => print_office_tasks().await?,
-            "artifacts" | "artifact" => print_office_artifacts().await?,
-            "proposals" | "proposal" => print_office_proposals().await?,
-            "initiatives" | "initiative" | "whiteboard" => print_office_initiatives().await?,
-            "i" | "inspect" => print_room_agent_inspect(&world, &player_room_id).await?,
-            "review" => {
-                print_office_artifacts().await?;
-                print_office_proposals().await?;
-            }
-            "menu" | "dashboard" => print_blims_dashboard(),
-            "t" | "talk" | "look" => print_room_interaction(&world, &report, &player_room_id),
-            "ai" => {
-                start_room_agent_talk(&world, &player_room_id).await?;
-                refresh_blims_office(&mut world, &mut report).await?;
-            }
-            "w" | "world" => print_blims_world(&world),
-            "help" | "?" => print_blims_help(),
-            "" => {}
-            _ => handle_blims_office_command(command).await?,
+            terminal.resize(blims_terminal_area()?);
+            terminal.draw(|frame| app.render(frame))?;
         }
     }
+    let _stdout = guard.leave()?;
     Ok(())
 }
 
-async fn refresh_blims_office(
-    world: &mut BlimsWorldSnapshot,
-    report: &mut BlimsMorningReport,
-) -> Result<(), CliError> {
-    *world = load_blims_world().await?;
-    *report = load_blims_report().await?;
-    println!("office refreshed");
-    Ok(())
+async fn should_show_world_picker() -> Result<bool, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "limit": 25_u64,
+    });
+    let response = call_blims_service("event.list", serde_json::to_vec(&request)?).await?;
+    let events = decode_blims_response::<Vec<BlimsEventSummary>>(response)?;
+    Ok(!events
+        .iter()
+        .any(|event| event.kind == "world.starter_office_selected"))
 }
 
-async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
-    let parts = command.split_whitespace().collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["dashboard" | "menu"] => print_blims_dashboard(),
-        ["inspect", "agent", agent_id] | ["agent", agent_id] => {
-            print_office_agent_report(agent_id).await?;
+fn blims_terminal_area() -> Result<Rect, CliError> {
+    let (width, height) = crossterm::terminal::size()?;
+    Ok(Rect::new(0, 0, width, height))
+}
+
+async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<bool, CliError> {
+    match event {
+        Event::Resize(_) | Event::Mouse(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {}
+        Event::Paste(text) => {
+            app.status = format!(
+                "Pasted {} bytes (command entry is coming next).",
+                text.len()
+            );
         }
-        ["permissions", agent_id] => {
-            print_agent_permission(agent_id, false).await?;
+        Event::Key(stroke) => {
+            if matches!(stroke.key, KeyCode::Escape | KeyCode::Char('q')) {
+                return Ok(true);
+            }
+            if handle_blims_tui_picker_key(app, stroke.key).await? {
+                return Ok(false);
+            }
+            match stroke.key {
+                KeyCode::Char('?') => app.show_help = !app.show_help,
+                KeyCode::Char('w') => app.show_world_picker = true,
+                KeyCode::Char('r') => app.report = load_blims_report().await?,
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Up => app.move_previous().await?,
+                KeyCode::Char('l') | KeyCode::Right | KeyCode::Down => app.move_next().await?,
+                _ => {}
+            }
         }
-        ["permission", agent_id] => {
-            print_agent_permission_alias(agent_id).await?;
-        }
-        ["set-permission", agent_id, category, policy] => {
-            set_agent_permission_category(agent_id, category, policy).await?;
-        }
-        ["new" | "create", "initiative", rest @ ..] => {
-            create_office_initiative(&rest.join(" ")).await?;
-        }
-        ["plan", "initiative", initiative_id] | ["plan", initiative_id] => {
-            start_blims_initiative_plan((*initiative_id).to_string()).await?;
-        }
-        ["import", "plan", initiative_id, plan_path] => {
-            import_blims_initiative_plan(
-                (*initiative_id).to_string(),
-                (*plan_path).to_string(),
-                true,
-            )
-            .await?;
-        }
-        ["inspect", "initiative", initiative_id] | ["initiative", initiative_id] => {
-            print_office_initiative(initiative_id).await?;
-        }
-        ["inspect", "task", task_id] | ["task", task_id] => {
-            print_office_task(task_id).await?;
-        }
-        ["inspect", "artifact", artifact_id] | ["artifact", artifact_id] => {
-            print_office_artifact(artifact_id).await?;
-        }
-        ["inspect", "proposal", proposal_id] | ["proposal", proposal_id] => {
-            print_office_proposal(proposal_id).await?;
-        }
-        ["ready", proposal_id] | ["ready", "proposal", proposal_id] => {
-            update_office_proposal_status(
-                "proposal.mark_ready",
-                "proposal ready for review",
-                proposal_id,
-            )
-            .await?;
-        }
-        ["approve", proposal_id] | ["approve", "proposal", proposal_id] => {
-            update_office_proposal_status("proposal.approve", "proposal approved", proposal_id)
-                .await?;
-        }
-        ["reject", proposal_id] | ["reject", "proposal", proposal_id] => {
-            update_office_proposal_status("proposal.reject", "proposal rejected", proposal_id)
-                .await?;
-        }
-        ["defer", proposal_id] | ["defer", "proposal", proposal_id] => {
-            update_office_proposal_status("proposal.defer", "proposal deferred", proposal_id)
-                .await?;
-        }
-        ["patch", proposal_id] | ["patch", "proposal", proposal_id] => {
-            create_blims_proposal_patch((*proposal_id).to_string(), false).await?;
-        }
-        ["apply", artifact_id] | ["apply", "artifact", artifact_id] => {
-            apply_blims_patch_artifact((*artifact_id).to_string(), false).await?;
-        }
-        ["work", "task", task_id] | ["work", task_id] => {
-            start_blims_task_work((*task_id).to_string()).await?;
-        }
-        ["talk" | "ai", agent_id] => {
-            start_blims_agent_talk((*agent_id).to_string()).await?;
-        }
-        _ => println!("unknown command: {command} (try `help`)"),
     }
-    Ok(())
+    Ok(false)
+}
+
+async fn handle_blims_tui_picker_key(
+    app: &mut BlimsTuiApp,
+    key: KeyCode,
+) -> Result<bool, CliError> {
+    if !app.show_world_picker {
+        return Ok(false);
+    }
+    match key {
+        KeyCode::Up => app.select_previous_template(),
+        KeyCode::Down => app.select_next_template(),
+        KeyCode::Enter => app.activate_selected_template().await?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+#[derive(Debug)]
+struct BlimsTuiApp {
+    world: BlimsWorldSnapshot,
+    report: BlimsMorningReport,
+    interactions: BlimsAvailableInteractions,
+    templates: Vec<BlimsWorldTemplateSummary>,
+    selected_template: usize,
+    show_world_picker: bool,
+    show_help: bool,
+    status: String,
+}
+
+impl BlimsTuiApp {
+    async fn load() -> Result<Self, CliError> {
+        let world = load_blims_world().await?;
+        let report = load_blims_report().await?;
+        let interactions = load_blims_interactions().await?;
+        let templates = load_world_templates().await?;
+        let selected_template = templates
+            .iter()
+            .position(|template| template.id == world.template_id)
+            .unwrap_or_default();
+        Ok(Self {
+            world,
+            report,
+            interactions,
+            templates,
+            selected_template,
+            show_world_picker: false,
+            show_help: false,
+            status: "Welcome CEO — choose a world with w, move with arrows/h/l.".to_string(),
+        })
+    }
+
+    async fn refresh(&mut self) -> Result<(), CliError> {
+        self.world = load_blims_world().await?;
+        self.report = load_blims_report().await?;
+        self.interactions = load_blims_interactions().await?;
+        Ok(())
+    }
+
+    async fn move_next(&mut self) -> Result<(), CliError> {
+        let next = next_room_id(&self.world, &self.interactions.room_id);
+        self.world = move_blims_player(&next).await?;
+        self.interactions = load_blims_interactions().await?;
+        self.status = format!("Moved to {}", self.current_room_name());
+        Ok(())
+    }
+
+    async fn move_previous(&mut self) -> Result<(), CliError> {
+        let previous = previous_room_id(&self.world, &self.interactions.room_id);
+        self.world = move_blims_player(&previous).await?;
+        self.interactions = load_blims_interactions().await?;
+        self.status = format!("Moved to {}", self.current_room_name());
+        Ok(())
+    }
+
+    async fn activate_selected_template(&mut self) -> Result<(), CliError> {
+        if !self.show_world_picker {
+            return Ok(());
+        }
+        if let Some(template) = self.templates.get(self.selected_template) {
+            select_world_template(template.id.clone(), true).await?;
+            self.show_world_picker = false;
+            self.status = format!("Selected {}", template.name);
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    const fn select_next_template(&mut self) {
+        if self.templates.is_empty() {
+            return;
+        }
+        self.selected_template = (self.selected_template + 1) % self.templates.len();
+    }
+
+    fn select_previous_template(&mut self) {
+        if self.templates.is_empty() {
+            return;
+        }
+        self.selected_template = self
+            .selected_template
+            .checked_sub(1)
+            .unwrap_or_else(|| self.templates.len().saturating_sub(1));
+    }
+
+    fn current_room_name(&self) -> String {
+        self.world
+            .rooms
+            .iter()
+            .find(|room| room.id == self.interactions.room_id)
+            .map_or_else(|| "the hallway".to_string(), |room| room.name.clone())
+    }
+
+    fn render(&self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        frame.fill(area, " ", Style::new().bg(Color::Rgb(12, 10, 18)));
+        let rows = split(
+            area,
+            Direction::Vertical,
+            &[
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(3),
+            ],
+        );
+        if rows.len() < 3 {
+            return;
+        }
+        render_blims_header(self, rows[0], frame);
+        let cols = split(
+            rows[1],
+            Direction::Horizontal,
+            &[Constraint::Min(54), Constraint::Length(42)],
+        );
+        if cols.len() == 2 {
+            render_blims_map(self, cols[0], frame);
+            render_blims_sidebar(self, cols[1], frame);
+        } else {
+            render_blims_map(self, rows[1], frame);
+        }
+        render_blims_footer(self, rows[2], frame);
+        if self.show_world_picker {
+            render_world_picker(self, area, frame);
+        }
+        if self.show_help {
+            render_blims_help_modal(area, frame);
+        }
+    }
 }
 
 async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
@@ -820,167 +912,443 @@ async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
     decode_blims_response::<BlimsMorningReport>(response)
 }
 
-async fn print_office_initiatives() -> Result<(), CliError> {
-    let response = call_blims_service("initiative.list", blims_workspace_payload()?).await?;
-    print_initiative_list(&decode_blims_response::<Vec<BlimsInitiativeSummary>>(
-        response,
-    )?);
-    Ok(())
+async fn load_world_templates() -> Result<Vec<BlimsWorldTemplateSummary>, CliError> {
+    let response = call_blims_service("world.template_list", blims_workspace_payload()?).await?;
+    decode_blims_response::<Vec<BlimsWorldTemplateSummary>>(response)
 }
 
-async fn create_office_initiative(title: &str) -> Result<(), CliError> {
-    let title = title.trim();
-    if title.is_empty() {
-        println!("usage: new initiative <title>");
-        return Ok(());
+fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightMagenta)))
+        .background(Style::new().bg(Color::Rgb(19, 16, 30)))
+        .render(area, frame);
+    let title = Line::from_spans(vec![
+        Span::styled(
+            " ✨ BLIMS ",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.world.theme.clone(),
+            Style::new()
+                .fg(Color::BrightWhite)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  [{}]", app.world.template_id),
+            Style::new().fg(Color::BrightBlack),
+        ),
+    ]);
+    frame.write_line_with_fallback_style(
+        area.inset(Insets::new(1, 2, 0, 2)),
+        &title,
+        Style::new().bg(Color::Rgb(19, 16, 30)),
+    );
+}
+
+fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightBlue)))
+        .background(Style::new().bg(Color::Rgb(10, 14, 24)))
+        .render(area, frame);
+    let line = Line::from_spans(vec![
+        Span::styled(
+            " ←/→ ",
+            Style::new()
+                .fg(Color::BrightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("move  "),
+        Span::styled(
+            "w",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" world picker  "),
+        Span::styled(
+            "r",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" refresh report  "),
+        Span::styled(
+            "?",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" help  "),
+        Span::styled(
+            "q",
+            Style::new()
+                .fg(Color::BrightRed)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" quit  —  "),
+        Span::styled(app.status.clone(), Style::new().fg(Color::BrightGreen)),
+    ]);
+    frame.write_line_with_fallback_style(
+        area.inset(Insets::new(1, 2, 0, 2)),
+        &line,
+        Style::new().bg(Color::Rgb(10, 14, 24)),
+    );
+}
+
+fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightCyan)))
+        .title(" Office world ")
+        .background(Style::new().bg(Color::Rgb(8, 18, 24)));
+    panel.render(area, frame);
+    let inner = panel.inner_area(area).inset(Insets::all(1));
+    render_room_links(app, inner, frame);
+    for room in &app.world.rooms {
+        render_room_tile(app, room, inner, frame);
     }
-    let request = BlimsInitiativeCreateRequest {
-        working_directory: std::env::current_dir()?,
-        title: title.to_string(),
-        description: None,
-        priority: None,
+}
+
+fn render_room_links(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let points = app
+        .world
+        .rooms
+        .iter()
+        .map(|room| room_point(room, area))
+        .collect::<Vec<_>>();
+    for window in points.windows(2) {
+        let [from, to] = window else { continue };
+        let min_x = from.x.min(to.x);
+        let max_x = from.x.max(to.x);
+        let min_y = from.y.min(to.y);
+        let max_y = from.y.max(to.y);
+        for x in min_x..=max_x {
+            frame.buffer_mut().set_cell(
+                Point::new(x, from.y),
+                "─",
+                Style::new()
+                    .fg(Color::BrightBlack)
+                    .bg(Color::Rgb(8, 18, 24)),
+            );
+        }
+        for y in min_y..=max_y {
+            frame.buffer_mut().set_cell(
+                Point::new(to.x, y),
+                "│",
+                Style::new()
+                    .fg(Color::BrightBlack)
+                    .bg(Color::Rgb(8, 18, 24)),
+            );
+        }
+    }
+}
+
+fn render_room_tile(
+    app: &BlimsTuiApp,
+    room: &BlimsRoomSnapshot,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let point = room_point(room, area);
+    let tile =
+        Rect::new(point.x.saturating_sub(7), point.y.saturating_sub(2), 15, 5).intersection(area);
+    let active = room.id == app.interactions.room_id;
+    let bg = if active {
+        Color::Rgb(52, 36, 74)
+    } else {
+        Color::Rgb(22, 28, 38)
     };
-    let response = call_blims_service("initiative.create", serde_json::to_vec(&request)?).await?;
-    let initiative = decode_blims_response::<BlimsInitiativeSummary>(response)?;
-    println!(
-        "initiative created: {} ({})",
-        initiative.title, initiative.id
-    );
-    println!(
-        "Tip: run `plan {}` here in the office to ask Blims for a dynamic plan.",
-        initiative.id
-    );
-    Ok(())
-}
-
-async fn print_office_initiative(initiative_id: &str) -> Result<(), CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
-        "initiative_id": initiative_id,
-    });
-    let response = call_blims_service("initiative.inspect", serde_json::to_vec(&request)?).await?;
-    print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(response)?);
-    Ok(())
-}
-
-async fn print_office_tasks() -> Result<(), CliError> {
-    let response = call_blims_service("task.list", blims_workspace_payload()?).await?;
-    let tasks = decode_blims_response::<Vec<BlimsTaskSummary>>(response)?;
-    if tasks.is_empty() {
-        println!("no tasks yet");
+    let fg = if active {
+        Color::BrightYellow
     } else {
-        for task in tasks {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                task.id,
-                task.initiative_id,
-                task.priority,
-                task.status,
-                task.assigned_agent_id,
-                task.title
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn print_office_task(task_id: &str) -> Result<(), CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
-        "task_id": task_id,
-    });
-    let response = call_blims_service("task.inspect", serde_json::to_vec(&request)?).await?;
-    print_task_detail(&decode_blims_response::<BlimsTaskSummary>(response)?);
-    Ok(())
-}
-
-async fn print_office_artifacts() -> Result<(), CliError> {
-    let response = call_blims_service("artifact.list", blims_workspace_payload()?).await?;
-    let artifacts = decode_blims_response::<Vec<BlimsArtifactSummary>>(response)?;
-    if artifacts.is_empty() {
-        println!("no artifacts yet");
-    } else {
-        for artifact in artifacts {
-            println!(
-                "{}\t{}\t{}\t{}",
-                artifact.id, artifact.initiative_id, artifact.kind, artifact.title
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn print_office_artifact(artifact_id: &str) -> Result<(), CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
-        "artifact_id": artifact_id,
-    });
-    let response = call_blims_service("artifact.inspect", serde_json::to_vec(&request)?).await?;
-    print_artifact_detail(&decode_blims_response::<BlimsArtifactDetail>(response)?);
-    Ok(())
-}
-
-async fn print_office_proposals() -> Result<(), CliError> {
-    let response = call_blims_service("proposal.list", blims_workspace_payload()?).await?;
-    print_proposal_list(&decode_blims_response::<Vec<BlimsWorkProposalSummary>>(
-        response,
-    )?);
-    Ok(())
-}
-
-async fn print_office_proposal(proposal_id: &str) -> Result<(), CliError> {
-    let proposal = load_blims_proposal("proposal.inspect", proposal_id.to_string()).await?;
-    print_proposal_detail(&proposal);
-    Ok(())
-}
-
-async fn print_office_agent_report(agent_id: &str) -> Result<(), CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
-        "agent_id": agent_id,
-    });
-    let response = call_blims_service("report.agent", serde_json::to_vec(&request)?).await?;
-    let report = decode_blims_response::<BlimsFocusedReport>(response)?;
-    println!("{}", report.title);
-    for bullet in report.bullets {
-        println!("* {bullet}");
-    }
-    Ok(())
-}
-
-async fn print_room_agent_inspect(
-    world: &BlimsWorldSnapshot,
-    player_room_id: &str,
-) -> Result<(), CliError> {
-    let Some(agent) = world
+        color_from_name(&room.color)
+    };
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(fg).bg(bg)))
+        .background(Style::new().bg(bg));
+    panel.render(tile, frame);
+    let inner = panel.inner_area(tile);
+    let occupants = app
+        .world
         .agents
         .iter()
-        .find(|agent| agent.room_id == player_room_id)
-    else {
-        println!("No agent is nearby to inspect.");
-        return Ok(());
-    };
-    print_office_agent_report(&agent.id).await
+        .filter(|agent| agent.room_id == room.id)
+        .collect::<Vec<_>>();
+    let marker = if active { "@" } else { room.symbol.as_str() };
+    frame.write_line_with_fallback_style(
+        inner,
+        &Line::from_spans(vec![
+            Span::styled(
+                marker.to_string(),
+                Style::new()
+                    .fg(Color::BrightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                room.name.clone(),
+                Style::new()
+                    .fg(Color::BrightWhite)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Style::new().bg(bg),
+    );
+    if inner.height > 1 {
+        frame.write_line_with_fallback_style(
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            &Line::raw(format!(
+                "{} +{}",
+                room.room_kind, room.productivity_modifier
+            )),
+            Style::new().fg(Color::BrightBlack).bg(bg),
+        );
+    }
+    if inner.height > 2 && !occupants.is_empty() {
+        let names = occupants
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        frame.write_line_with_fallback_style(
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                names,
+                Style::new().fg(Color::BrightGreen),
+            )]),
+            Style::new().bg(bg),
+        );
+    }
 }
 
-fn print_blims_dashboard() {
-    println!("Blims CEO dashboard");
-    println!("* status/create/pause/resume/shutdown are global CLI controls");
-    println!("* report, initiatives, tasks, artifacts, proposals work from anywhere");
-    println!("* office locations add flavor and shortcuts, but never hide critical controls");
+fn room_point(room: &BlimsRoomSnapshot, area: Rect) -> Point {
+    let max_world_x = 40_i64;
+    let max_world_y = 14_i64;
+    let x_scale = i64::from(area.width.saturating_sub(4)).max(1);
+    let y_scale = i64::from(area.height.saturating_sub(4)).max(1);
+    let x = i64::from(area.x) + 2 + room.x.saturating_mul(x_scale) / max_world_x;
+    let y = i64::from(area.y) + 2 + room.y.saturating_mul(y_scale) / max_world_y;
+    Point::new(clamp_i64_to_u16(x), clamp_i64_to_u16(y))
 }
 
-async fn update_office_proposal_status(
-    operation: &str,
-    message: &str,
-    proposal_id: &str,
-) -> Result<(), CliError> {
-    let proposal = load_blims_proposal(operation, proposal_id.to_string()).await?;
-    println!("{message}: {}", proposal.id);
-    print_proposal_detail(&proposal);
-    Ok(())
+fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightGreen)))
+        .title(" CEO console ")
+        .background(Style::new().bg(Color::Rgb(13, 20, 18)));
+    panel.render(area, frame);
+    let inner = panel.inner_area(area).inset(Insets::all(1));
+    let rows = split(
+        inner,
+        Direction::Vertical,
+        &[
+            Constraint::Length(8),
+            Constraint::Min(6),
+            Constraint::Length(8),
+        ],
+    );
+    if rows.len() != 3 {
+        return;
+    }
+    render_current_room_panel(app, rows[0], frame);
+    render_report_panel(app, rows[1], frame);
+    render_interactions_panel(app, rows[2], frame);
 }
 
+fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let room = app
+        .world
+        .rooms
+        .iter()
+        .find(|room| room.id == app.interactions.room_id);
+    let text = room.map_or_else(
+        || Text::raw("Between rooms"),
+        |room| {
+            Text::from_lines(vec![
+                Line::from_spans(vec![Span::styled(
+                    room.name.clone(),
+                    Style::new()
+                        .fg(Color::BrightYellow)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::raw(room.purpose.clone()),
+                Line::raw(format!(
+                    "{} · productivity +{}",
+                    room.room_kind, room.productivity_modifier
+                )),
+            ])
+        },
+    );
+    TextBlock::new(text)
+        .wrap(TextWrap::Character)
+        .style(
+            Style::new()
+                .bg(Color::Rgb(13, 20, 18))
+                .fg(Color::BrightWhite),
+        )
+        .render(area, frame);
+}
+
+fn render_report_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        app.report.title.clone(),
+        Style::new()
+            .fg(Color::BrightCyan)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.extend(
+        app.report
+            .bullets
+            .iter()
+            .take(6)
+            .map(|bullet| Line::raw(format!("• {bullet}"))),
+    );
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        "Interactions",
+        Style::new()
+            .fg(Color::BrightMagenta)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.extend(
+        app.interactions
+            .interactions
+            .iter()
+            .take(5)
+            .map(|interaction| {
+                Line::from_spans(vec![
+                    Span::styled(
+                        format!("{} ", interaction.source),
+                        Style::new().fg(Color::BrightBlack),
+                    ),
+                    Span::raw(interaction.label.clone()),
+                ])
+            }),
+    );
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let picker = centered(area, Size::new(76, 18));
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightYellow)))
+        .title(" Choose your Blims office ")
+        .background(Style::new().bg(Color::Rgb(32, 24, 42)));
+    panel.render(picker, frame);
+    let inner = panel.inner_area(picker).inset(Insets::all(1));
+    for (index, template) in app.templates.iter().enumerate() {
+        let Ok(row) = u16::try_from(index.saturating_mul(4)) else {
+            break;
+        };
+        if row >= inner.height {
+            break;
+        }
+        let selected = index == app.selected_template;
+        let bg = if selected {
+            Color::Rgb(70, 48, 82)
+        } else {
+            Color::Rgb(32, 24, 42)
+        };
+        let style = Style::new().bg(bg).fg(if selected {
+            Color::BrightYellow
+        } else {
+            Color::BrightWhite
+        });
+        let y = inner.y + row;
+        frame.fill(
+            Rect::new(inner.x, y, inner.width, 3),
+            " ",
+            Style::new().bg(bg),
+        );
+        frame.write_line_with_fallback_style(
+            Rect::new(inner.x, y, inner.width, 1),
+            &Line::from_spans(vec![
+                Span::styled(
+                    if selected { "▶ " } else { "  " },
+                    style.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(template.name.clone(), style.add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("  {} rooms", template.rooms),
+                    Style::new().bg(bg).fg(Color::BrightBlack),
+                ),
+            ]),
+            Style::new().bg(bg),
+        );
+        frame.write_line_with_fallback_style(
+            Rect::new(inner.x + 2, y + 1, inner.width.saturating_sub(2), 1),
+            &Line::raw(template.description.clone()),
+            Style::new().bg(bg).fg(Color::White),
+        );
+        frame.write_line_with_fallback_style(
+            Rect::new(inner.x + 2, y + 2, inner.width.saturating_sub(2), 1),
+            &Line::from_spans(vec![Span::styled(
+                template.flavor.clone(),
+                Style::new().bg(bg).fg(Color::BrightCyan),
+            )]),
+            Style::new().bg(bg),
+        );
+    }
+    let hint_y = picker.bottom().saturating_sub(2);
+    frame.write_line_with_fallback_style(
+        Rect::new(inner.x, hint_y, inner.width, 1),
+        &Line::raw("Enter selects · arrows move · q exits"),
+        Style::new()
+            .bg(Color::Rgb(32, 24, 42))
+            .fg(Color::BrightBlack),
+    );
+}
+
+fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
+    let modal = centered(area, Size::new(70, 10));
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightBlue)))
+        .title(" Blims controls ")
+        .background(Style::new().bg(Color::Rgb(18, 20, 38)));
+    panel.render(modal, frame);
+    let text = Text::from_lines(vec![
+        Line::raw("←/h and →/l move between rooms"),
+        Line::raw("w opens starter office picker"),
+        Line::raw("r refreshes the morning report"),
+        Line::raw("? toggles this help"),
+        Line::raw("q exits the office"),
+        Line::raw("Use CLI commands for AI chat/work while this TUI grows."),
+    ]);
+    TextBlock::new(text)
+        .wrap(TextWrap::Character)
+        .style(
+            Style::new()
+                .bg(Color::Rgb(18, 20, 38))
+                .fg(Color::BrightWhite),
+        )
+        .render(panel.inner_area(modal).inset(Insets::all(1)), frame);
+}
+
+fn color_from_name(name: &str) -> Color {
+    match name {
+        "yellow" => Color::Yellow,
+        "bright-white" => Color::BrightWhite,
+        "cyan" => Color::Cyan,
+        "magenta" => Color::Magenta,
+        "green" => Color::Green,
+        "blue" => Color::Blue,
+        _ => Color::White,
+    }
+}
+
+fn clamp_i64_to_u16(value: i64) -> u16 {
+    u16::try_from(value.clamp(0, i64::from(u16::MAX))).unwrap_or_default()
+}
 async fn start_blims_agent_talk(agent_id: String) -> Result<(), CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
@@ -989,21 +1357,6 @@ async fn start_blims_agent_talk(agent_id: String) -> Result<(), CliError> {
     let response = call_blims_service("agent.talk_prompt", serde_json::to_vec(&request)?).await?;
     let prompt = decode_blims_response::<BlimsAgentTalkPrompt>(response)?;
     start_agent_talk_session(prompt).await
-}
-
-async fn start_room_agent_talk(
-    world: &BlimsWorldSnapshot,
-    player_room_id: &str,
-) -> Result<(), CliError> {
-    let Some(agent) = world
-        .agents
-        .iter()
-        .find(|agent| agent.room_id == player_room_id)
-    else {
-        println!("No agent is here to start an AI chat with.");
-        return Ok(());
-    };
-    start_blims_agent_talk(agent.id.clone()).await
 }
 
 async fn start_agent_talk_session(prompt: BlimsAgentTalkPrompt) -> Result<(), CliError> {
@@ -1101,108 +1454,6 @@ async fn register_blims_work_proposal(
     });
     let response = call_blims_service("proposal.register", serde_json::to_vec(&request)?).await?;
     decode_blims_response::<BlimsWorkProposalSummary>(response)
-}
-
-fn print_blims_office(
-    world: &BlimsWorldSnapshot,
-    report: &BlimsMorningReport,
-    interactions: &BlimsAvailableInteractions,
-    player_room_id: &str,
-) {
-    print!("\x1B[2J\x1B[H");
-    println!("┌────────────────────────────────────────────────────────────┐");
-    println!("│ {:^58} │", world.theme);
-    println!("├────────────────────────────────────────────────────────────┤");
-    for room in &world.rooms {
-        let marker = if room.id == player_room_id { "@" } else { " " };
-        let occupants = world
-            .agents
-            .iter()
-            .filter(|agent| agent.room_id == room.id)
-            .map(|agent| agent.name.chars().next().unwrap_or('?'))
-            .collect::<String>();
-        println!(
-            "│ {marker} {:<18} {:<22} {:>12} │",
-            room.name, room.purpose, occupants
-        );
-    }
-    println!("└────────────────────────────────────────────────────────────┘");
-    println!();
-    println!("@ {}", world.player_name);
-    for agent in &world.agents {
-        println!(
-            "{} {} — {} — {}",
-            agent.name.chars().next().unwrap_or('?'),
-            agent.name,
-            agent.role,
-            agent.status
-        );
-    }
-    println!();
-    println!("{}", report.title);
-    for bullet in report.bullets.iter().take(3) {
-        println!("* {bullet}");
-    }
-    println!();
-    println!("Available interactions:");
-    for interaction in &interactions.interactions {
-        println!(
-            "* [{}] {} — `{}`",
-            interaction.source, interaction.label, interaction.command
-        );
-    }
-    println!();
-    print_blims_help();
-}
-
-fn print_blims_help() {
-    println!(
-        "Commands: h/left previous room, l/right next room, t talk/look/interactions, i inspect nearby agent, ai chat here, ai <agent>, permissions <agent>, set-permission <agent> <category> <allow|ask|deny>, r report, whiteboard, review, menu/dashboard, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal|agent> <id>, refresh, w world, q quit"
-    );
-}
-
-fn print_room_interaction(
-    world: &BlimsWorldSnapshot,
-    report: &BlimsMorningReport,
-    player_room_id: &str,
-) {
-    let Some(room) = world.rooms.iter().find(|room| room.id == player_room_id) else {
-        println!("You are between rooms. The office hums softly.");
-        return;
-    };
-    println!("You are in {} — {}", room.name, room.purpose);
-    let agents = world
-        .agents
-        .iter()
-        .filter(|agent| agent.room_id == room.id)
-        .collect::<Vec<_>>();
-    if agents.is_empty() {
-        println!("No agents are here yet.");
-        if room.id == "whiteboard" {
-            println!("The whiteboard is ready for initiatives and CEO guidance.");
-        }
-        return;
-    }
-    for agent in agents {
-        println!("{} says: {}", agent.name, agent_line(agent, report));
-    }
-}
-
-fn agent_line(agent: &BlimsAgentSnapshot, report: &BlimsMorningReport) -> String {
-    let context = report
-        .bullets
-        .iter()
-        .find(|bullet| bullet.starts_with("Top initiative:") || bullet.starts_with("Top guidance:"))
-        .cloned()
-        .unwrap_or_else(|| "I'm waiting for the next CEO direction.".to_string());
-    format!("I'm {}, {}. {}", agent.name, agent.status, context)
-}
-
-fn print_blims_report(report: &BlimsMorningReport) {
-    println!("{}", report.title);
-    for bullet in &report.bullets {
-        println!("* {bullet}");
-    }
 }
 
 fn print_blims_world(world: &BlimsWorldSnapshot) {
@@ -1327,11 +1578,6 @@ async fn print_agent_permission(agent_id: &str, json: bool) -> Result<(), CliErr
     }
     Ok(())
 }
-
-async fn print_agent_permission_alias(agent_id: &str) -> Result<(), CliError> {
-    print_agent_permission(agent_id, false).await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn set_agent_permission(
     agent_id: String,
@@ -1391,37 +1637,6 @@ async fn load_agent_permission(agent_id: &str) -> Result<BlimsAgentPermission, C
         call_blims_service("agent.get_permission", serde_json::to_vec(&request)?).await?;
     decode_blims_response::<BlimsAgentPermission>(response)
 }
-
-async fn set_agent_permission_category(
-    agent_id: &str,
-    category: &str,
-    policy: &str,
-) -> Result<(), CliError> {
-    let mut permission = load_agent_permission(agent_id).await?;
-    match category {
-        "bash" => permission.bash = policy.to_string(),
-        "read" => permission.read = policy.to_string(),
-        "write" => permission.write = policy.to_string(),
-        "edit" => permission.edit = policy.to_string(),
-        "external" | "external_directory" => permission.external_directory = policy.to_string(),
-        _ => {
-            println!("unknown permission category: {category}");
-            return Ok(());
-        }
-    }
-    set_agent_permission(
-        permission.agent_id,
-        Some(permission.bcode_agent_id),
-        Some(permission.bash),
-        Some(permission.read),
-        Some(permission.write),
-        Some(permission.edit),
-        Some(permission.external_directory),
-        false,
-    )
-    .await
-}
-
 async fn print_world_templates(json: bool) -> Result<(), CliError> {
     let response = call_blims_service("world.template_list", blims_workspace_payload()?).await?;
     if json {
