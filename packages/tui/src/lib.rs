@@ -20,6 +20,7 @@ pub(crate) mod helpers;
 pub(crate) mod history_flow;
 pub(crate) mod input;
 pub(crate) mod input_history;
+pub(crate) mod invalidation;
 pub(crate) mod keymap;
 pub(crate) mod model_flow;
 pub(crate) mod model_picker;
@@ -51,6 +52,7 @@ pub(crate) mod slash_commands;
 pub(crate) mod slash_flow;
 pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
+pub(crate) mod temporal;
 pub(crate) mod terminal_events;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -69,14 +71,12 @@ pub(crate) mod worktree_picker;
 pub(crate) mod worktree_picker_render;
 
 use std::io;
-use std::time::Duration;
 
 use bcode_session_models::SessionId;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
 use bmux_tui::terminal::Terminal;
 
-const CHAT_TICK_INTERVAL: Duration = Duration::from_millis(50);
-const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 const OLDER_HISTORY_EVENT_LIMIT: usize = 500;
 

@@ -1,6 +1,7 @@
 //! Main chat event loop for the TUI.
 
 use std::io::Write;
+use std::time::{Instant, SystemTime};
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::BcodeClient;
@@ -13,15 +14,16 @@ use bmux_tui::terminal::Terminal;
 use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
 use super::helpers;
+use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::terminal_events::TuiInput;
 use super::{
-    CHAT_TICK_INTERVAL, TuiError, command_palette_render, composer_flow, history_flow, input,
-    input::KeyRequest, mouse_flow, palette_flow, permission_dialog_render, permission_flow, render,
-    slash_flow, slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
+    TuiError, command_palette_render, composer_flow, history_flow, input, input::KeyRequest,
+    mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
+    slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
 };
 
 struct ModalState {
@@ -65,6 +67,8 @@ pub async fn run_with_client<W: Write>(
         thinking_dialog: None,
     };
     chat.app.set_key_hints(keymap.chat_hints());
+    let mut invalidation_queue = InvalidationQueue::default();
+    refresh_invalidation_queue(chat, &mut invalidation_queue);
     let mut needs_redraw = true;
 
     while !chat.app.should_exit() {
@@ -121,29 +125,84 @@ pub async fn run_with_client<W: Write>(
                     thinking_dialog_render::render_thinking_dialog(dialog, frame);
                 }
             })?;
+            refresh_invalidation_queue(chat, &mut invalidation_queue);
             needs_redraw = false;
         }
 
-        let event = tokio::select! {
-            event = terminal_events.recv() => event?,
-            () = tokio::time::sleep(CHAT_TICK_INTERVAL) => None,
-        };
-        if let Some(event) = event {
-            let mut context = ChatEventContext {
-                services: TuiServices { client, keymap },
-                terminal,
-                terminal_events,
-                mouse_scroll_rows,
-            };
-            if handle_event(&mut context, chat, &mut modals, event).await? {
-                needs_redraw = true;
+        let event = next_chat_loop_event(terminal_events, &mut invalidation_queue).await?;
+        match event {
+            ChatLoopEvent::Terminal(event) => {
+                let event_invalidation = if matches!(event, Event::Resize(_)) {
+                    super::invalidation::UiInvalidation::Full
+                } else {
+                    super::invalidation::UiInvalidation::Layout
+                };
+                let mut context = ChatEventContext {
+                    services: TuiServices { client, keymap },
+                    terminal,
+                    terminal_events,
+                    mouse_scroll_rows,
+                };
+                if handle_event(&mut context, chat, &mut modals, event).await? {
+                    needs_redraw = event_invalidation.needs_render();
+                }
             }
-        } else if chat.app.tick() {
-            needs_redraw = true;
+            ChatLoopEvent::TimedInvalidations(keys) => {
+                if chat
+                    .app
+                    .handle_invalidations(&keys, Instant::now())
+                    .needs_render()
+                {
+                    needs_redraw = true;
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+enum ChatLoopEvent {
+    Terminal(Event),
+    TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
+}
+
+async fn next_chat_loop_event(
+    terminal_events: &mut TuiInput,
+    invalidation_queue: &mut InvalidationQueue,
+) -> Result<ChatLoopEvent, TuiError> {
+    let now = Instant::now();
+    let due = invalidation_queue.take_due(now);
+    if !due.is_empty() {
+        return Ok(ChatLoopEvent::TimedInvalidations(due));
+    }
+    if let Some(next_at) = invalidation_queue.next_at() {
+        let delay = next_at.saturating_duration_since(now);
+        return tokio::select! {
+            event = terminal_events.recv() => event.map(|event| {
+                event.map_or_else(
+                    || ChatLoopEvent::TimedInvalidations(Vec::new()),
+                    ChatLoopEvent::Terminal,
+                )
+            }),
+            () = tokio::time::sleep(delay) => Ok(ChatLoopEvent::TimedInvalidations(
+                invalidation_queue.take_due(Instant::now())
+            )),
+        };
+    }
+    return terminal_events.recv().await.map(|event| {
+        event.map_or_else(
+            || ChatLoopEvent::TimedInvalidations(Vec::new()),
+            ChatLoopEvent::Terminal,
+        )
+    });
+}
+
+fn refresh_invalidation_queue(chat: &ActiveChat, queue: &mut InvalidationQueue) {
+    queue.replace(
+        chat.app
+            .invalidation_requests(Instant::now(), SystemTime::now()),
+    );
 }
 
 async fn handle_event<W: Write>(

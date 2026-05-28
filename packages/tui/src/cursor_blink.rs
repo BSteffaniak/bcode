@@ -2,7 +2,8 @@
 
 use std::time::Instant;
 
-use super::IDLE_REDRAW_INTERVAL;
+use super::CURSOR_BLINK_INTERVAL;
+use super::invalidation::{InvalidationKey, InvalidationRequest};
 
 /// Composer cursor blink state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +13,8 @@ pub struct CursorBlink {
 }
 
 impl CursorBlink {
+    const INVALIDATION_KEY: &'static str = "composer-cursor";
+
     /// Create visible cursor blink state.
     #[must_use]
     pub fn new() -> Self {
@@ -33,13 +36,26 @@ impl CursorBlink {
         self.last_toggle = Instant::now();
     }
 
-    /// Advance time-based cursor blink state.
-    pub fn tick(&mut self) -> bool {
-        if self.last_toggle.elapsed() < IDLE_REDRAW_INTERVAL {
+    /// Return this component's next requested invalidation.
+    #[must_use]
+    pub fn invalidation_request(&self) -> InvalidationRequest {
+        InvalidationRequest::new(
+            InvalidationKey::new(Self::INVALIDATION_KEY),
+            self.last_toggle + CURSOR_BLINK_INTERVAL,
+        )
+    }
+
+    /// Handle a due invalidation key.
+    pub fn handle_invalidation(&mut self, key: &InvalidationKey, now: Instant) -> bool {
+        if key.as_str() != Self::INVALIDATION_KEY {
             return false;
         }
-        self.visible = !self.visible;
-        self.last_toggle = Instant::now();
+        self.toggle(now);
         true
+    }
+
+    const fn toggle(&mut self, now: Instant) {
+        self.visible = !self.visible;
+        self.last_toggle = now;
     }
 }

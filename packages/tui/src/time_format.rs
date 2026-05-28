@@ -5,11 +5,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
 pub fn unix_time_millis_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
+    unix_time_millis(SystemTime::now())
+}
+
+/// Return the Unix timestamp in milliseconds for `time`.
+#[must_use]
+pub fn unix_time_millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |duration| {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    })
 }
 
 /// Format a millisecond duration for display.

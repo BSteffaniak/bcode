@@ -1,6 +1,7 @@
 //! TUI app state.
 
 use std::collections::BTreeMap;
+use std::time::{Instant, SystemTime};
 
 use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
 use bcode_session_models::{
@@ -23,10 +24,12 @@ use super::diff_extract::diff_from_tool_request;
 use super::diff_panel::DiffPanel;
 use super::exit_state::ExitState;
 use super::input_history::{InputHistory, InputHistoryOutcome};
+use super::invalidation::{InvalidationKey, InvalidationRequest, UiInvalidation};
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::runtime_work_view::RuntimeWorkViewState;
+use super::temporal::next_elapsed_invalidation;
 use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
@@ -856,9 +859,33 @@ impl BmuxApp {
         self.cursor.wake();
     }
 
-    /// Advance time-based UI state.
-    pub fn tick(&mut self) -> bool {
-        self.cursor.tick() || self.has_live_timed_tool_output()
+    /// Return currently requested timed invalidations.
+    #[must_use]
+    pub fn invalidation_requests(
+        &self,
+        now: Instant,
+        now_system: SystemTime,
+    ) -> Vec<InvalidationRequest> {
+        let mut requests = vec![self.cursor.invalidation_request()];
+        requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
+        requests
+    }
+
+    /// Handle generic timed invalidation keys.
+    pub fn handle_invalidations(
+        &mut self,
+        keys: &[InvalidationKey],
+        now: Instant,
+    ) -> UiInvalidation {
+        keys.iter().fold(UiInvalidation::None, |invalidation, key| {
+            if self.cursor.handle_invalidation(key, now) {
+                invalidation.merge(UiInvalidation::Paint)
+            } else if is_tool_elapsed_invalidation(key) {
+                invalidation.merge(UiInvalidation::Layout)
+            } else {
+                invalidation
+            }
+        })
     }
 
     /// Return whether the TUI should exit.
@@ -897,17 +924,23 @@ impl BmuxApp {
         self.status = format!("model: {provider}/{model}");
     }
 
-    fn has_live_timed_tool_output(&self) -> bool {
-        self.transcript.iter().any(|item| {
-            item.streaming()
-                && matches!(
-                    item.kind(),
-                    TranscriptItemKind::TerminalOutput {
-                        started_at_ms: Some(_),
-                        finished_at_ms: None,
-                        ..
-                    }
-                )
+    fn tool_elapsed_invalidation_requests(
+        &self,
+        now: Instant,
+        now_system: SystemTime,
+    ) -> impl Iterator<Item = InvalidationRequest> + '_ {
+        self.transcript.iter().filter_map(move |item| {
+            let TranscriptItemKind::TerminalOutput {
+                tool_call_id,
+                started_at_ms: Some(started_at_ms),
+                finished_at_ms,
+                ..
+            } = item.kind()
+            else {
+                return None;
+            };
+            next_elapsed_invalidation(*started_at_ms, *finished_at_ms, now, now_system)
+                .map(|at| InvalidationRequest::new(tool_elapsed_invalidation_key(tool_call_id), at))
         })
     }
 
@@ -1599,6 +1632,16 @@ impl BmuxApp {
 
 pub const fn composer_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
+}
+
+const TOOL_ELAPSED_INVALIDATION_PREFIX: &str = "tool-elapsed:";
+
+fn tool_elapsed_invalidation_key(tool_call_id: &str) -> InvalidationKey {
+    InvalidationKey::new(format!("{TOOL_ELAPSED_INVALIDATION_PREFIX}{tool_call_id}"))
+}
+
+fn is_tool_elapsed_invalidation(key: &InvalidationKey) -> bool {
+    key.as_str().starts_with(TOOL_ELAPSED_INVALIDATION_PREFIX)
 }
 
 fn normalized_tool_name(tool_name: &str) -> String {
