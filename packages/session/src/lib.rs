@@ -133,6 +133,11 @@ struct SessionMigrationBackupManifest {
     files: Vec<SessionMigrationBackupFile>,
 }
 
+pub(crate) struct ModelContextEventsRead {
+    events: Vec<SessionEvent>,
+    refreshed_index: Option<index::SessionIndex>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionMigrationBackupFile {
     session_id: SessionId,
@@ -402,7 +407,7 @@ impl SessionEventStore {
     fn read_model_context_events(
         &self,
         session_id: SessionId,
-    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+    ) -> Result<ModelContextEventsRead, SessionStoreError> {
         let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
         let index_timer = self.metrics.timer();
@@ -428,12 +433,14 @@ impl SessionEventStore {
             index.event_count as u64,
         );
         let read_entries_timer = self.metrics.timer();
+        let mut refreshed_index = None;
         let mut entries = match index::read_entries(&self.root, session_id) {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
                 self.metrics
                     .increment_counter("session.model_context_events.entries_rebuild_total");
-                let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
+                let (rebuilt_index, _) = index::rebuild_index(&self.root, session_id, &event_path)?;
+                refreshed_index = rebuilt_index;
                 index::read_entries(&self.root, session_id)?
             }
         };
@@ -477,7 +484,10 @@ impl SessionEventStore {
                 "session.model_context_events.total_duration_ms",
                 total_timer.elapsed_ms(),
             );
-            return Ok(events);
+            return Ok(ModelContextEventsRead {
+                events,
+                refreshed_index: Some(index),
+            });
         };
         let compaction_read_timer = self.metrics.timer();
         let compaction_event = reader::read_event_at(&event_path, compaction_entry.offset)?;
@@ -506,7 +516,10 @@ impl SessionEventStore {
                 "session.model_context_events.total_duration_ms",
                 total_timer.elapsed_ms(),
             );
-            return Ok(events);
+            return Ok(ModelContextEventsRead {
+                events,
+                refreshed_index: Some(index),
+            });
         };
         let compacted_through_sequence = *compacted_through_sequence;
         let select_timer = self.metrics.timer();
@@ -541,7 +554,10 @@ impl SessionEventStore {
             "session.model_context_events.total_duration_ms",
             total_timer.elapsed_ms(),
         );
-        Ok(events)
+        Ok(ModelContextEventsRead {
+            events,
+            refreshed_index,
+        })
     }
 
     fn write_metadata_index(

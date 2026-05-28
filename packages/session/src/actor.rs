@@ -516,7 +516,7 @@ impl SessionActor {
             .await?)
     }
 
-    async fn model_context_events(&self) -> Result<Vec<SessionEvent>, SessionError> {
+    async fn model_context_events(&mut self) -> Result<Vec<SessionEvent>, SessionError> {
         if let Some(events) = &self.state.events {
             return Ok(model_context_events_from_history(events));
         }
@@ -524,9 +524,18 @@ impl SessionActor {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        Ok(store
+        let (events, refreshed_state) = store
             .read_model_context_events(self.state.summary.id)
-            .await?)
+            .await?;
+        if let Some(mut state) = refreshed_state {
+            state.clients.clone_from(&self.state.clients);
+            state.summary.client_count = self.state.summary.client_count;
+            state.sender = self.state.sender.clone();
+            state.access_status = self.state.access_status;
+            self.state = state;
+            self.refresh_snapshot();
+        }
+        Ok(events)
     }
 
     fn publish_transient_event(&self, kind: SessionEventKind) -> Option<SessionEvent> {

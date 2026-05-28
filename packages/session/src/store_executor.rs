@@ -129,7 +129,7 @@ impl SessionStoreExecutor {
     pub async fn read_model_context_events(
         &self,
         session_id: SessionId,
-    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+    ) -> Result<(Vec<SessionEvent>, Option<SessionState>), SessionStoreError> {
         let queued_at = Instant::now();
         let store = self.store.clone();
         spawn_blocking(move || {
@@ -137,7 +137,11 @@ impl SessionStoreExecutor {
                 "session.model_context_events.blocking_queue_wait_duration_ms",
                 u64::try_from(queued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
-            store.read_model_context_events(session_id)
+            let read = store.read_model_context_events(session_id)?;
+            Ok((
+                read.events,
+                read.refreshed_index.map(SessionState::from_index),
+            ))
         })
         .await?
     }
