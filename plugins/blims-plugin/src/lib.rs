@@ -929,6 +929,10 @@ pub struct RoomSnapshot {
     pub name: String,
     /// Room purpose or productivity modifier.
     pub purpose: String,
+    /// Gameplay room kind, such as library/lab/studio/review.
+    pub room_kind: String,
+    /// Productivity modifier contributed by the room.
+    pub productivity_modifier: i64,
     /// X coordinate in the office map.
     pub x: i64,
     /// Y coordinate in the office map.
@@ -1120,6 +1124,8 @@ struct RoomRecord {
     id: String,
     name: String,
     purpose: String,
+    room_kind: String,
+    productivity_modifier: i64,
     x: i64,
     y: i64,
     symbol: String,
@@ -1147,6 +1153,8 @@ impl From<RoomSnapshot> for RoomRecord {
             id: snapshot.id,
             name: snapshot.name,
             purpose: snapshot.purpose,
+            room_kind: snapshot.room_kind,
+            productivity_modifier: snapshot.productivity_modifier,
             x: snapshot.x,
             y: snapshot.y,
             symbol: snapshot.symbol,
@@ -2150,6 +2158,8 @@ async fn create_world_tables(
         .column(text_column("world_id"))
         .column(text_column("name"))
         .column(text_column("purpose"))
+        .column(text_column("room_kind"))
+        .column(int_column("productivity_modifier"))
         .column(int_column("x"))
         .column(int_column("y"))
         .column(text_column("symbol"))
@@ -2687,6 +2697,8 @@ fn fallback_world_snapshot() -> WorldSnapshot {
                 id: "ceo-nook".to_string(),
                 name: "CEO Nook".to_string(),
                 purpose: "orientation, morning reports, and company controls".to_string(),
+                room_kind: "meeting_room".to_string(),
+                productivity_modifier: 3,
                 x: 2,
                 y: 1,
                 symbol: "⌂".to_string(),
@@ -2696,6 +2708,8 @@ fn fallback_world_snapshot() -> WorldSnapshot {
                 id: "whiteboard".to_string(),
                 name: "Whiteboard".to_string(),
                 purpose: "initiatives, priorities, and planning".to_string(),
+                room_kind: "meeting_room".to_string(),
+                productivity_modifier: 6,
                 x: 14,
                 y: 1,
                 symbol: "▦".to_string(),
@@ -2705,6 +2719,8 @@ fn fallback_world_snapshot() -> WorldSnapshot {
                 id: "engineering".to_string(),
                 name: "Engineering Desks".to_string(),
                 purpose: "implementation focus and worktree coding".to_string(),
+                room_kind: "lab".to_string(),
+                productivity_modifier: 10,
                 x: 2,
                 y: 8,
                 symbol: "⚙".to_string(),
@@ -2714,6 +2730,8 @@ fn fallback_world_snapshot() -> WorldSnapshot {
                 id: "creative".to_string(),
                 name: "Creative Corner".to_string(),
                 purpose: "branding, docs, and design ideas".to_string(),
+                room_kind: "design_studio".to_string(),
+                productivity_modifier: 8,
                 x: 16,
                 y: 8,
                 symbol: "✦".to_string(),
@@ -2723,6 +2741,8 @@ fn fallback_world_snapshot() -> WorldSnapshot {
                 id: "review".to_string(),
                 name: "Review Wall".to_string(),
                 purpose: "approvals, proposals, and artifact review".to_string(),
+                room_kind: "review_room".to_string(),
+                productivity_modifier: 7,
                 x: 28,
                 y: 4,
                 symbol: "✓".to_string(),
@@ -3182,6 +3202,8 @@ fn world_snapshot_from_data(data: CompanyData) -> WorldSnapshot {
                 id: room.id,
                 name: room.name,
                 purpose: room.purpose,
+                room_kind: room.room_kind,
+                productivity_modifier: room.productivity_modifier,
                 x: room.x,
                 y: room.y,
                 symbol: room.symbol,
@@ -3282,6 +3304,16 @@ fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions
             id: "proposals".to_string(),
             label: "Review proposals and artifacts".to_string(),
             command: "proposals".to_string(),
+        });
+    }
+    if let Some(room) = data.rooms.iter().find(|room| room.id == room_id) {
+        interactions.push(WorldInteraction {
+            id: format!("room-{}", room.id),
+            label: format!(
+                "Room effect: {} (+{} productivity)",
+                room.room_kind, room.productivity_modifier
+            ),
+            command: "look".to_string(),
         });
     }
     for object in data
@@ -4184,7 +4216,17 @@ async fn load_company_data_from_database(
     let (world_theme, player_room_id) = load_world_record(database).await?;
     let room_rows = database
         .select("world_rooms")
-        .columns(&["id", "name", "purpose", "x", "y", "symbol", "color"])
+        .columns(&[
+            "id",
+            "name",
+            "purpose",
+            "room_kind",
+            "productivity_modifier",
+            "x",
+            "y",
+            "symbol",
+            "color",
+        ])
         .sort("id", SortDirection::Asc)
         .execute(database)
         .await?;
@@ -4440,6 +4482,8 @@ fn room_record(row: &Row) -> Result<RoomRecord, BlimsStateError> {
         id: required_text(row, "id")?,
         name: required_text(row, "name")?,
         purpose: required_text(row, "purpose")?,
+        room_kind: required_text(row, "room_kind")?,
+        productivity_modifier: required_i64(row, "productivity_modifier")?,
         x: required_i64(row, "x")?,
         y: required_i64(row, "y")?,
         symbol: required_text(row, "symbol")?,
@@ -5045,11 +5089,18 @@ async fn replace_one_world_room_projection(
     room: &RoomRecord,
 ) -> Result<(), BlimsStateError> {
     database
+        .delete("world_rooms")
+        .filter(Box::new(where_eq("id", room.id.clone())))
+        .execute(database)
+        .await?;
+    database
         .insert("world_rooms")
         .value("id", room.id.clone())
         .value("world_id", "default")
         .value("name", room.name.clone())
         .value("purpose", room.purpose.clone())
+        .value("room_kind", room.room_kind.clone())
+        .value("productivity_modifier", room.productivity_modifier)
         .value("x", room.x)
         .value("y", room.y)
         .value("symbol", room.symbol.clone())
@@ -5674,7 +5725,7 @@ mod tests {
         assert_eq!(state.agents[0].status, "reporting");
     }
 
-    fn projection_test_events() -> Vec<BlimsEventSummary> {
+    fn projection_test_initiative() -> (InitiativeSummary, String) {
         let initiative = InitiativeSummary {
             id: "launch-blims".to_string(),
             title: "Launch Blims".to_string(),
@@ -5683,7 +5734,11 @@ mod tests {
             priority: 1,
         };
         let initiative_id = initiative.id.clone();
-        let task = TaskSummary {
+        (initiative, initiative_id)
+    }
+
+    fn projection_test_task() -> TaskSummary {
+        TaskSummary {
             id: "launch-blims-sketch-loop".to_string(),
             initiative_id: "launch-blims".to_string(),
             title: "Sketch the loop".to_string(),
@@ -5692,23 +5747,38 @@ mod tests {
             assigned_agent_id: "mira".to_string(),
             rationale: "Need a playable first loop".to_string(),
             priority: 5,
-        };
-        let room = RoomSnapshot {
+        }
+    }
+
+    fn projection_test_room() -> RoomSnapshot {
+        RoomSnapshot {
             id: "whiteboard".to_string(),
             name: "Whiteboard".to_string(),
             purpose: "planning".to_string(),
+            room_kind: "meeting_room".to_string(),
+            productivity_modifier: 6,
             x: 1,
             y: 1,
             symbol: "▦".to_string(),
             color: "bright-white".to_string(),
-        };
-        let agent = AgentSnapshot {
+        }
+    }
+
+    fn projection_test_agent() -> AgentSnapshot {
+        AgentSnapshot {
             id: "mira".to_string(),
             name: "Mira".to_string(),
             role: "Product Lead".to_string(),
             status: "thinking".to_string(),
             room_id: "whiteboard".to_string(),
-        };
+        }
+    }
+
+    fn projection_test_events() -> Vec<BlimsEventSummary> {
+        let (initiative, initiative_id) = projection_test_initiative();
+        let task = projection_test_task();
+        let room = projection_test_room();
+        let agent = projection_test_agent();
         let department_id = "product".to_string();
         vec![
             test_event(

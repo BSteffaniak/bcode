@@ -323,6 +323,8 @@ struct BlimsRoomSnapshot {
     id: String,
     name: String,
     purpose: String,
+    room_kind: String,
+    productivity_modifier: i64,
     x: i64,
     y: i64,
     symbol: String,
@@ -1024,8 +1026,16 @@ fn print_blims_world(world: &BlimsWorldSnapshot) {
     println!("rooms:");
     for room in &world.rooms {
         println!(
-            "* {} {} ({}) at {},{} [{}] - {}",
-            room.symbol, room.name, room.id, room.x, room.y, room.color, room.purpose
+            "* {} {} ({}) at {},{} [{}] +{} {} - {}",
+            room.symbol,
+            room.name,
+            room.id,
+            room.x,
+            room.y,
+            room.color,
+            room.productivity_modifier,
+            room.room_kind,
+            room.purpose
         );
     }
     println!("agents:");
