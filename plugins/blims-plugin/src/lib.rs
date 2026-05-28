@@ -154,6 +154,12 @@ pub const OP_WORLD_MOVE_PLAYER: &str = "world.move_player";
 /// Available world interactions operation.
 pub const OP_WORLD_AVAILABLE_INTERACTIONS: &str = "world.available_interactions";
 
+/// World template list operation.
+pub const OP_WORLD_TEMPLATE_LIST: &str = "world.template_list";
+
+/// World template select operation.
+pub const OP_WORLD_SELECT_TEMPLATE: &str = "world.select_template";
+
 /// Morning report operation.
 pub const OP_REPORT_MORNING: &str = "report.morning";
 
@@ -286,6 +292,10 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
             service_world_move_player(request, &EventContext::from_request(request))
         }
         OP_WORLD_AVAILABLE_INTERACTIONS => service_world_available_interactions(request),
+        OP_WORLD_TEMPLATE_LIST => service_world_template_list(),
+        OP_WORLD_SELECT_TEMPLATE => {
+            service_world_select_template(request, &EventContext::from_request(request))
+        }
         OP_REPORT_MORNING => service_morning_report(request, &EventContext::from_request(request)),
         OP_REPORT_DEPARTMENT => service_department_report(request),
         OP_REPORT_AGENT => service_agent_report(request),
@@ -636,6 +646,24 @@ pub struct WorldMovePlayerRequest {
     pub working_directory: PathBuf,
     /// Destination room id.
     pub room_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to switch starter office template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldTemplateSelectRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Starter template id.
+    pub template_id: String,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -1054,6 +1082,21 @@ pub struct CompanyStatus {
     pub compatibility: String,
 }
 
+/// Starter office template summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldTemplateSummary {
+    /// Stable template id.
+    pub id: String,
+    /// Template display name.
+    pub name: String,
+    /// Cozy theme summary.
+    pub description: String,
+    /// Room count.
+    pub rooms: usize,
+    /// Main productivity flavor.
+    pub flavor: String,
+}
+
 /// World interaction available to the player.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldInteraction {
@@ -1063,6 +1106,8 @@ pub struct WorldInteraction {
     pub label: String,
     /// Suggested CLI command.
     pub command: String,
+    /// Interaction flavor source, such as agent, room, object, or theme.
+    pub source: String,
 }
 
 /// Available interactions for the current player room.
@@ -1102,6 +1147,8 @@ pub struct RoomSnapshot {
 pub struct WorldSnapshot {
     /// Starter office theme name.
     pub theme: String,
+    /// Starter office template id.
+    pub template_id: String,
     /// Office map width in terminal cells.
     pub width: i64,
     /// Office map height in terminal cells.
@@ -1466,6 +1513,11 @@ impl<T> BlimsCommandEnvelope<T> {
 enum BlimsEventPayload {
     CompanyLifecycleSet {
         lifecycle_status: String,
+    },
+    StarterOfficeSelected {
+        template_id: String,
+        theme: String,
+        player_room_id: String,
     },
     InitiativeCreated {
         initiative: InitiativeSummary,
@@ -2151,6 +2203,25 @@ fn service_world_available_interactions(request: &ServiceRequest) -> ServiceResp
     }
 }
 
+fn service_world_template_list() -> ServiceResponse {
+    json_response(&starter_world_templates())
+}
+
+fn service_world_select_template(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<WorldTemplateSelectRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match select_world_template(&request, &event_context) {
+        Ok(snapshot) => json_response(&snapshot),
+        Err(error) => ServiceResponse::error("world_select_template_failed", error.to_string()),
+    }
+}
+
 fn service_morning_report(
     request: &ServiceRequest,
     event_context: &EventContext,
@@ -2547,19 +2618,6 @@ async fn create_world_tables(
         .primary_key("id")
         .execute(database)
         .await?;
-    database
-        .delete("worlds")
-        .filter(Box::new(where_eq("id", "default")))
-        .execute(database)
-        .await?;
-    database
-        .insert("worlds")
-        .value("id", "default")
-        .value("company_id", "default")
-        .value("theme", "Cozy Startup Loft")
-        .value("player_room_id", "ceo-nook")
-        .execute(database)
-        .await?;
     create_table("world_rooms")
         .if_not_exists(true)
         .column(text_column("id"))
@@ -2911,6 +2969,19 @@ async fn seed_starter_org_events(
 async fn seed_starter_world_events(
     database: &dyn Database,
 ) -> Result<(), switchy_database::DatabaseError> {
+    let template = cozy_startup_loft_template();
+    let payload = BlimsEventPayload::StarterOfficeSelected {
+        template_id: template.id,
+        theme: template.name,
+        player_room_id: template.player_room_id,
+    };
+    append_bootstrap_event_once(
+        database,
+        "world.starter_office_selected",
+        "Starter office selected: Cozy Startup Loft",
+        &payload,
+    )
+    .await?;
     for room in fallback_world_snapshot().rooms {
         let payload = BlimsEventPayload::WorldRoomCreated { room: room.clone() };
         append_bootstrap_event_once(
@@ -3061,51 +3132,6 @@ fn starter_agents() -> Vec<AgentRecord> {
     ]
 }
 
-fn starter_world_objects() -> Vec<WorldObjectRecord> {
-    vec![
-        WorldObjectRecord {
-            id: "whiteboard-roadmap".to_string(),
-            room_id: "whiteboard".to_string(),
-            name: "Roadmap Whiteboard".to_string(),
-            kind: "planning_hotspot".to_string(),
-            symbol: "▦".to_string(),
-            color: "bright-white".to_string(),
-            interaction: "Review initiatives and CEO guidance".to_string(),
-            productivity_modifier: 8,
-        },
-        WorldObjectRecord {
-            id: "engineering-workbench".to_string(),
-            room_id: "engineering".to_string(),
-            name: "Worktree Workbench".to_string(),
-            kind: "engineering_station".to_string(),
-            symbol: "⚙".to_string(),
-            color: "cyan".to_string(),
-            interaction: "Review tasks and start implementation work".to_string(),
-            productivity_modifier: 10,
-        },
-        WorldObjectRecord {
-            id: "creative-rug".to_string(),
-            room_id: "creative".to_string(),
-            name: "Idea Rug".to_string(),
-            kind: "creative_station".to_string(),
-            symbol: "✦".to_string(),
-            color: "magenta".to_string(),
-            interaction: "Brainstorm delightful artifacts and docs".to_string(),
-            productivity_modifier: 7,
-        },
-        WorldObjectRecord {
-            id: "review-wall".to_string(),
-            room_id: "review".to_string(),
-            name: "Review Wall".to_string(),
-            kind: "approval_hotspot".to_string(),
-            symbol: "✓".to_string(),
-            color: "green".to_string(),
-            interaction: "Review proposals, patches, and artifacts".to_string(),
-            productivity_modifier: 6,
-        },
-    ]
-}
-
 fn starter_agent_stats(agent_id: &str) -> AgentStatsRecord {
     match agent_id {
         "mira" => AgentStatsRecord {
@@ -3206,74 +3232,378 @@ fn starter_agent_memories(agent_id: &str) -> Vec<AgentMemoryRecord> {
     }]
 }
 
-fn fallback_world_snapshot() -> WorldSnapshot {
-    WorldSnapshot {
-        theme: "Cozy Startup Loft".to_string(),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StarterWorldTemplate {
+    id: String,
+    name: String,
+    description: String,
+    flavor: String,
+    player_room_id: String,
+    width: i64,
+    height: i64,
+    rooms: Vec<RoomSnapshot>,
+    objects: Vec<WorldObjectRecord>,
+}
+
+fn starter_world_templates() -> Vec<WorldTemplateSummary> {
+    all_starter_world_templates()
+        .into_iter()
+        .map(|template| WorldTemplateSummary {
+            id: template.id,
+            name: template.name,
+            description: template.description,
+            rooms: template.rooms.len(),
+            flavor: template.flavor,
+        })
+        .collect()
+}
+
+fn all_starter_world_templates() -> Vec<StarterWorldTemplate> {
+    vec![
+        cozy_startup_loft_template(),
+        hacker_garage_template(),
+        guild_hall_template(),
+    ]
+}
+
+fn find_starter_world_template(template_id: &str) -> Option<StarterWorldTemplate> {
+    all_starter_world_templates()
+        .into_iter()
+        .find(|template| template.id == template_id)
+}
+
+fn cozy_startup_loft_template() -> StarterWorldTemplate {
+    StarterWorldTemplate {
+        id: "cozy-startup-loft".to_string(),
+        name: "Cozy Startup Loft".to_string(),
+        description: "Warm default office for balanced planning, coding, creativity, and review."
+            .to_string(),
+        flavor: "balanced cozy productivity".to_string(),
+        player_room_id: "ceo-nook".to_string(),
         width: 40,
         height: 14,
+        rooms: cozy_startup_loft_rooms(),
+        objects: cozy_startup_loft_objects(),
+    }
+}
+
+fn fallback_world_snapshot() -> WorldSnapshot {
+    let template = cozy_startup_loft_template();
+    WorldSnapshot {
+        theme: template.name,
+        template_id: template.id,
+        width: template.width,
+        height: template.height,
         player_name: "CEO".to_string(),
-        rooms: vec![
-            RoomSnapshot {
-                id: "ceo-nook".to_string(),
-                name: "CEO Nook".to_string(),
-                purpose: "orientation, morning reports, and company controls".to_string(),
-                room_kind: "meeting_room".to_string(),
-                productivity_modifier: 3,
-                x: 2,
-                y: 1,
-                symbol: "⌂".to_string(),
-                color: "yellow".to_string(),
-            },
-            RoomSnapshot {
-                id: "whiteboard".to_string(),
-                name: "Whiteboard".to_string(),
-                purpose: "initiatives, priorities, and planning".to_string(),
-                room_kind: "meeting_room".to_string(),
-                productivity_modifier: 6,
-                x: 14,
-                y: 1,
-                symbol: "▦".to_string(),
-                color: "bright-white".to_string(),
-            },
-            RoomSnapshot {
-                id: "engineering".to_string(),
-                name: "Engineering Desks".to_string(),
-                purpose: "implementation focus and worktree coding".to_string(),
-                room_kind: "lab".to_string(),
-                productivity_modifier: 10,
-                x: 2,
-                y: 8,
-                symbol: "⚙".to_string(),
-                color: "cyan".to_string(),
-            },
-            RoomSnapshot {
-                id: "creative".to_string(),
-                name: "Creative Corner".to_string(),
-                purpose: "branding, docs, and design ideas".to_string(),
-                room_kind: "design_studio".to_string(),
-                productivity_modifier: 8,
-                x: 16,
-                y: 8,
-                symbol: "✦".to_string(),
-                color: "magenta".to_string(),
-            },
-            RoomSnapshot {
-                id: "review".to_string(),
-                name: "Review Wall".to_string(),
-                purpose: "approvals, proposals, and artifact review".to_string(),
-                room_kind: "review_room".to_string(),
-                productivity_modifier: 7,
-                x: 28,
-                y: 4,
-                symbol: "✓".to_string(),
-                color: "green".to_string(),
-            },
-        ],
+        rooms: template.rooms,
         agents: starter_agents()
             .into_iter()
             .map(AgentRecord::snapshot)
             .collect(),
     }
+}
+
+fn cozy_startup_loft_rooms() -> Vec<RoomSnapshot> {
+    vec![
+        RoomSnapshot {
+            id: "ceo-nook".to_string(),
+            name: "CEO Nook".to_string(),
+            purpose: "orientation, morning reports, and company controls".to_string(),
+            room_kind: "meeting_room".to_string(),
+            productivity_modifier: 3,
+            x: 2,
+            y: 1,
+            symbol: "⌂".to_string(),
+            color: "yellow".to_string(),
+        },
+        RoomSnapshot {
+            id: "whiteboard".to_string(),
+            name: "Whiteboard".to_string(),
+            purpose: "initiatives, priorities, and planning".to_string(),
+            room_kind: "meeting_room".to_string(),
+            productivity_modifier: 6,
+            x: 14,
+            y: 1,
+            symbol: "▦".to_string(),
+            color: "bright-white".to_string(),
+        },
+        RoomSnapshot {
+            id: "engineering".to_string(),
+            name: "Engineering Desks".to_string(),
+            purpose: "implementation focus and worktree coding".to_string(),
+            room_kind: "lab".to_string(),
+            productivity_modifier: 10,
+            x: 2,
+            y: 8,
+            symbol: "⚙".to_string(),
+            color: "cyan".to_string(),
+        },
+        RoomSnapshot {
+            id: "creative".to_string(),
+            name: "Creative Corner".to_string(),
+            purpose: "branding, docs, and design ideas".to_string(),
+            room_kind: "design_studio".to_string(),
+            productivity_modifier: 8,
+            x: 16,
+            y: 8,
+            symbol: "✦".to_string(),
+            color: "magenta".to_string(),
+        },
+        RoomSnapshot {
+            id: "review".to_string(),
+            name: "Review Wall".to_string(),
+            purpose: "approvals, proposals, and artifact review".to_string(),
+            room_kind: "review_room".to_string(),
+            productivity_modifier: 7,
+            x: 28,
+            y: 4,
+            symbol: "✓".to_string(),
+            color: "green".to_string(),
+        },
+    ]
+}
+
+fn hacker_garage_template() -> StarterWorldTemplate {
+    StarterWorldTemplate {
+        id: "hacker-garage".to_string(),
+        name: "Hacker Garage".to_string(),
+        description: "A neon tinkering garage tuned for fast experiments and scrappy builds."
+            .to_string(),
+        flavor: "fast experiments and debugging".to_string(),
+        player_room_id: "garage-bay".to_string(),
+        width: 44,
+        height: 14,
+        rooms: vec![
+            RoomSnapshot {
+                id: "garage-bay".to_string(),
+                name: "Garage Bay".to_string(),
+                purpose: "CEO standups beside the rolling door".to_string(),
+                room_kind: "meeting_room".to_string(),
+                productivity_modifier: 2,
+                x: 2,
+                y: 2,
+                symbol: "▤".to_string(),
+                color: "yellow".to_string(),
+            },
+            RoomSnapshot {
+                id: "debug-bench".to_string(),
+                name: "Debug Bench".to_string(),
+                purpose: "instrumentation, bug hunts, and validation loops".to_string(),
+                room_kind: "lab".to_string(),
+                productivity_modifier: 12,
+                x: 14,
+                y: 2,
+                symbol: "⚡".to_string(),
+                color: "cyan".to_string(),
+            },
+            RoomSnapshot {
+                id: "parts-wall".to_string(),
+                name: "Parts Wall".to_string(),
+                purpose: "research snippets, reusable ideas, and tool notes".to_string(),
+                room_kind: "library".to_string(),
+                productivity_modifier: 6,
+                x: 28,
+                y: 2,
+                symbol: "▣".to_string(),
+                color: "blue".to_string(),
+            },
+            RoomSnapshot {
+                id: "shipping-lane".to_string(),
+                name: "Shipping Lane".to_string(),
+                purpose: "review, package, and hand off completed work".to_string(),
+                room_kind: "review_room".to_string(),
+                productivity_modifier: 8,
+                x: 8,
+                y: 9,
+                symbol: "➜".to_string(),
+                color: "green".to_string(),
+            },
+        ],
+        objects: vec![
+            WorldObjectRecord {
+                id: "garage-build-board".to_string(),
+                room_id: "garage-bay".to_string(),
+                name: "Build Board".to_string(),
+                kind: "planning_hotspot".to_string(),
+                symbol: "▦".to_string(),
+                color: "bright-white".to_string(),
+                interaction: "Prioritize experiments and active builds".to_string(),
+                productivity_modifier: 6,
+            },
+            WorldObjectRecord {
+                id: "debug-oscilloscope".to_string(),
+                room_id: "debug-bench".to_string(),
+                name: "Debug Oscilloscope".to_string(),
+                kind: "engineering_station".to_string(),
+                symbol: "⌁".to_string(),
+                color: "cyan".to_string(),
+                interaction: "Inspect failing checks and validation traces".to_string(),
+                productivity_modifier: 12,
+            },
+            WorldObjectRecord {
+                id: "shipping-crate".to_string(),
+                room_id: "shipping-lane".to_string(),
+                name: "Shipping Crate".to_string(),
+                kind: "approval_hotspot".to_string(),
+                symbol: "□".to_string(),
+                color: "green".to_string(),
+                interaction: "Review ready patches before shipping".to_string(),
+                productivity_modifier: 8,
+            },
+        ],
+    }
+}
+
+fn guild_hall_template() -> StarterWorldTemplate {
+    StarterWorldTemplate {
+        id: "guild-hall".to_string(),
+        name: "Guild Hall".to_string(),
+        description:
+            "A collaborative hall for departments, rituals, long-running quests, and craft review."
+                .to_string(),
+        flavor: "collaboration and deep craft".to_string(),
+        player_room_id: "throne-table".to_string(),
+        width: 46,
+        height: 16,
+        rooms: vec![
+            RoomSnapshot {
+                id: "throne-table".to_string(),
+                name: "Round CEO Table".to_string(),
+                purpose: "company direction, counsel, and morning reports".to_string(),
+                room_kind: "meeting_room".to_string(),
+                productivity_modifier: 5,
+                x: 3,
+                y: 2,
+                symbol: "◉".to_string(),
+                color: "yellow".to_string(),
+            },
+            RoomSnapshot {
+                id: "quest-board".to_string(),
+                name: "Quest Board".to_string(),
+                purpose: "initiatives, tasks, blockers, and party assignments".to_string(),
+                room_kind: "meeting_room".to_string(),
+                productivity_modifier: 8,
+                x: 17,
+                y: 2,
+                symbol: "※".to_string(),
+                color: "bright-white".to_string(),
+            },
+            RoomSnapshot {
+                id: "scribe-library".to_string(),
+                name: "Scribe Library".to_string(),
+                purpose: "docs, research, memory, and non-code artifacts".to_string(),
+                room_kind: "library".to_string(),
+                productivity_modifier: 10,
+                x: 31,
+                y: 2,
+                symbol: "☰".to_string(),
+                color: "blue".to_string(),
+            },
+            RoomSnapshot {
+                id: "forge".to_string(),
+                name: "Code Forge".to_string(),
+                purpose: "implementation work with careful validation".to_string(),
+                room_kind: "lab".to_string(),
+                productivity_modifier: 11,
+                x: 9,
+                y: 10,
+                symbol: "⚒".to_string(),
+                color: "cyan".to_string(),
+            },
+            RoomSnapshot {
+                id: "council-review".to_string(),
+                name: "Council Review".to_string(),
+                purpose: "approvals, tradeoffs, and contract review".to_string(),
+                room_kind: "review_room".to_string(),
+                productivity_modifier: 9,
+                x: 27,
+                y: 10,
+                symbol: "✓".to_string(),
+                color: "green".to_string(),
+            },
+        ],
+        objects: vec![
+            WorldObjectRecord {
+                id: "guild-quest-board".to_string(),
+                room_id: "quest-board".to_string(),
+                name: "Quest Board".to_string(),
+                kind: "planning_hotspot".to_string(),
+                symbol: "※".to_string(),
+                color: "bright-white".to_string(),
+                interaction: "Review quests, priorities, and blockers".to_string(),
+                productivity_modifier: 9,
+            },
+            WorldObjectRecord {
+                id: "scribe-desk".to_string(),
+                room_id: "scribe-library".to_string(),
+                name: "Scribe Desk".to_string(),
+                kind: "creative_station".to_string(),
+                symbol: "✎".to_string(),
+                color: "blue".to_string(),
+                interaction: "Draft docs, briefs, and research summaries".to_string(),
+                productivity_modifier: 10,
+            },
+            WorldObjectRecord {
+                id: "forge-anvil".to_string(),
+                room_id: "forge".to_string(),
+                name: "Validation Anvil".to_string(),
+                kind: "engineering_station".to_string(),
+                symbol: "⚒".to_string(),
+                color: "cyan".to_string(),
+                interaction: "Run implementation and validation loops".to_string(),
+                productivity_modifier: 11,
+            },
+        ],
+    }
+}
+
+fn cozy_startup_loft_objects() -> Vec<WorldObjectRecord> {
+    vec![
+        WorldObjectRecord {
+            id: "whiteboard-roadmap".to_string(),
+            room_id: "whiteboard".to_string(),
+            name: "Roadmap Whiteboard".to_string(),
+            kind: "planning_hotspot".to_string(),
+            symbol: "▦".to_string(),
+            color: "bright-white".to_string(),
+            interaction: "Review initiatives and CEO guidance".to_string(),
+            productivity_modifier: 8,
+        },
+        WorldObjectRecord {
+            id: "engineering-workbench".to_string(),
+            room_id: "engineering".to_string(),
+            name: "Worktree Workbench".to_string(),
+            kind: "engineering_station".to_string(),
+            symbol: "⚙".to_string(),
+            color: "cyan".to_string(),
+            interaction: "Review tasks and start implementation work".to_string(),
+            productivity_modifier: 10,
+        },
+        WorldObjectRecord {
+            id: "creative-rug".to_string(),
+            room_id: "creative".to_string(),
+            name: "Idea Rug".to_string(),
+            kind: "creative_station".to_string(),
+            symbol: "✦".to_string(),
+            color: "magenta".to_string(),
+            interaction: "Brainstorm delightful artifacts and docs".to_string(),
+            productivity_modifier: 7,
+        },
+        WorldObjectRecord {
+            id: "review-wall".to_string(),
+            room_id: "review".to_string(),
+            name: "Review Wall".to_string(),
+            kind: "approval_hotspot".to_string(),
+            symbol: "✓".to_string(),
+            color: "green".to_string(),
+            interaction: "Review proposals, patches, and artifacts".to_string(),
+            productivity_modifier: 6,
+        },
+    ]
+}
+
+fn starter_world_objects() -> Vec<WorldObjectRecord> {
+    cozy_startup_loft_objects()
 }
 
 fn fallback_morning_report() -> MorningReport {
@@ -3605,6 +3935,19 @@ async fn apply_org_world_event_projection(
                 .execute(database)
                 .await?;
         }
+        BlimsEventPayload::StarterOfficeSelected {
+            theme,
+            player_room_id,
+            ..
+        } => {
+            database
+                .update("worlds")
+                .value("theme", theme.clone())
+                .value("player_room_id", player_room_id.clone())
+                .filter(Box::new(where_eq("id", "default")))
+                .execute(database)
+                .await?;
+        }
         BlimsEventPayload::InitiativePlanImported { .. }
         | BlimsEventPayload::CompanyLifecycleSet { .. }
         | BlimsEventPayload::InitiativeCreated { .. }
@@ -3805,11 +4148,22 @@ fn world_snapshot(working_directory: &Path) -> Result<WorldSnapshot, BlimsStateE
     load_company_data(working_directory).map(world_snapshot_from_data)
 }
 
+fn template_id_for_theme(theme: &str) -> String {
+    all_starter_world_templates()
+        .into_iter()
+        .find(|template| template.name == theme)
+        .map_or_else(|| stable_slug(theme), |template| template.id)
+}
+
 fn world_snapshot_from_data(data: CompanyData) -> WorldSnapshot {
+    let template_id = template_id_for_theme(&data.world_theme);
+    let (width, height) = find_starter_world_template(&template_id)
+        .map_or((40, 14), |template| (template.width, template.height));
     WorldSnapshot {
         theme: data.world_theme,
-        width: 40,
-        height: 14,
+        template_id,
+        width,
+        height,
         player_name: "CEO".to_string(),
         rooms: data
             .rooms
@@ -3887,18 +4241,60 @@ fn available_interactions(
     Ok(available_interactions_from_data(&data))
 }
 
+fn select_world_template(
+    request: &WorldTemplateSelectRequest,
+    event_context: &EventContext,
+) -> Result<WorldSnapshot, BlimsStateError> {
+    let template_id = request.template_id.trim().to_string();
+    let template = find_starter_world_template(&template_id).ok_or_else(|| {
+        BlimsStateError::InvalidRequest(format!("unknown template: {template_id}"))
+    })?;
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            replace_world_room_projections(
+                database,
+                &template
+                    .rooms
+                    .iter()
+                    .cloned()
+                    .map(RoomRecord::from)
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+            replace_world_object_projections(database, &template.objects).await?;
+            append_event(
+                database,
+                &event_context,
+                "world.starter_office_selected",
+                format!("Starter office selected: {}", template.name),
+                &BlimsEventPayload::StarterOfficeSelected {
+                    template_id: template.id,
+                    theme: template.name,
+                    player_room_id: template.player_room_id,
+                },
+            )
+            .await?;
+            let data = load_company_data_from_database(database).await?;
+            Ok(world_snapshot_from_data(data))
+        })
+    })
+}
+
 fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions {
     let room_id = data.player_room_id.clone();
     let mut interactions = vec![WorldInteraction {
         id: "look".to_string(),
         label: "Look around".to_string(),
         command: "look".to_string(),
+        source: "room".to_string(),
     }];
     for agent in data.agents.iter().filter(|agent| agent.room_id == room_id) {
         interactions.push(WorldInteraction {
             id: format!("talk-{}", agent.id),
             label: format!("Talk to {}", agent.name),
             command: format!("ai {}", agent.id),
+            source: "agent".to_string(),
         });
     }
     if room_id == "whiteboard" {
@@ -3906,6 +4302,7 @@ fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions
             id: "initiatives".to_string(),
             label: "Review initiatives".to_string(),
             command: "initiatives".to_string(),
+            source: "whiteboard".to_string(),
         });
     }
     if room_id == "engineering" {
@@ -3913,6 +4310,7 @@ fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions
             id: "tasks".to_string(),
             label: "Review tasks".to_string(),
             command: "tasks".to_string(),
+            source: "engineering".to_string(),
         });
     }
     if room_id == "review" {
@@ -3920,6 +4318,7 @@ fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions
             id: "proposals".to_string(),
             label: "Review proposals and artifacts".to_string(),
             command: "proposals".to_string(),
+            source: "review".to_string(),
         });
     }
     if let Some(room) = data.rooms.iter().find(|room| room.id == room_id) {
@@ -3930,6 +4329,7 @@ fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions
                 room.room_kind, room.productivity_modifier
             ),
             command: "look".to_string(),
+            source: "room".to_string(),
         });
     }
     for object in data
@@ -3944,6 +4344,7 @@ fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions
                 object.symbol, object.name, object.interaction, object.productivity_modifier
             ),
             command: object.interaction.clone(),
+            source: object.kind.clone(),
         });
     }
     AvailableInteractions {
@@ -5587,10 +5988,23 @@ fn replay_event(
             replay_agent_event(payload, state);
         }
         BlimsEventPayload::AgentContractUpdated { .. }
+        | BlimsEventPayload::StarterOfficeSelected { .. }
         | BlimsEventPayload::PlayerMoved { .. }
         | BlimsEventPayload::InitiativePlanImported { .. }
         | BlimsEventPayload::ReportGenerated { .. }
         | BlimsEventPayload::ConversationRecorded { .. } => {}
+        BlimsEventPayload::DepartmentCreated { .. }
+        | BlimsEventPayload::TeamCreated { .. }
+        | BlimsEventPayload::WorldRoomCreated { .. }
+        | BlimsEventPayload::WorldObjectPlaced { .. } => {
+            replay_org_world_event(payload, state);
+        }
+    }
+    Ok(())
+}
+
+fn replay_org_world_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
+    match payload {
         BlimsEventPayload::DepartmentCreated { id, name, purpose } => {
             upsert_by_id(
                 &mut state.departments,
@@ -5621,8 +6035,8 @@ fn replay_event(
         BlimsEventPayload::WorldObjectPlaced { object } => {
             upsert_by_id(&mut state.world_objects, object, |object| &object.id);
         }
+        _ => {}
     }
-    Ok(())
 }
 
 fn replay_proposal_event(payload: BlimsEventPayload, state: &mut ProjectionState) {

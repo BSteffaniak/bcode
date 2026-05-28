@@ -64,6 +64,15 @@ pub enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    WorldTemplates {
+        #[arg(long)]
+        json: bool,
+    },
+    SelectWorld {
+        template_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     Enter,
     Talk {
         agent_id: String,
@@ -349,6 +358,7 @@ struct BlimsRoomSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsWorldSnapshot {
     theme: String,
+    template_id: String,
     width: i64,
     height: i64,
     player_name: String,
@@ -361,6 +371,16 @@ struct BlimsWorldInteraction {
     id: String,
     label: String,
     command: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsWorldTemplateSummary {
+    id: String,
+    name: String,
+    description: String,
+    rooms: usize,
+    flavor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -518,6 +538,10 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
                 let world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
                 print_blims_world(&world);
             }
+        }
+        BlimsCommand::WorldTemplates { json } => print_world_templates(json).await?,
+        BlimsCommand::SelectWorld { template_id, json } => {
+            select_world_template(template_id, json).await?;
         }
         BlimsCommand::Enter => enter_blims_office().await?,
         BlimsCommand::Talk { agent_id } => start_blims_agent_talk(agent_id).await?,
@@ -1042,7 +1066,10 @@ fn print_blims_office(
     println!();
     println!("Available interactions:");
     for interaction in &interactions.interactions {
-        println!("* {} — `{}`", interaction.label, interaction.command);
+        println!(
+            "* [{}] {} — `{}`",
+            interaction.source, interaction.label, interaction.command
+        );
     }
     println!();
     print_blims_help();
@@ -1099,7 +1126,10 @@ fn print_blims_report(report: &BlimsMorningReport) {
 }
 
 fn print_blims_world(world: &BlimsWorldSnapshot) {
-    println!("{} ({}×{})", world.theme, world.width, world.height);
+    println!(
+        "{} [{}] ({}×{})",
+        world.theme, world.template_id, world.width, world.height
+    );
     println!("player: {}", world.player_name);
     println!("rooms:");
     for room in &world.rooms {
@@ -1192,6 +1222,39 @@ where
         for bullet in report.bullets() {
             println!("* {bullet}");
         }
+    }
+    Ok(())
+}
+
+async fn print_world_templates(json: bool) -> Result<(), CliError> {
+    let response = call_blims_service("world.template_list", blims_workspace_payload()?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let templates = decode_blims_response::<Vec<BlimsWorldTemplateSummary>>(response)?;
+        for template in templates {
+            println!(
+                "{}\t{}\t{} rooms\t{}\t{}",
+                template.id, template.name, template.rooms, template.flavor, template.description
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn select_world_template(template_id: String, json: bool) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "template_id": template_id,
+    });
+    let response =
+        call_blims_service("world.select_template", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
+        println!("selected world: {} ({})", world.theme, world.template_id);
+        print_blims_world(&world);
     }
     Ok(())
 }
