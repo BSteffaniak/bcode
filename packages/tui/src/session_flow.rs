@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use bcode_client::{BcodeClient, SessionList};
-use bcode_ipc::{Event as BcodeEvent, SessionCatalogStatus};
+use bcode_ipc::{Event as BcodeEvent, SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
@@ -106,26 +106,79 @@ enum PickerKeyOutcome {
 
 fn apply_session_list(picker: &mut session_picker::SessionPickerApp, session_list: SessionList) {
     let is_loading = catalog_still_loading(&session_list.catalog_status);
+    let session_count = session_list.sessions.len();
+    let status = catalog_status_text(&session_list, session_count);
     picker.replace_sessions(session_list.sessions);
     if is_loading {
-        let loading_sources = session_list
-            .catalog_sources
-            .iter()
-            .filter(|source| catalog_still_loading(&source.status))
-            .map(|source| source.source_id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let suffix = if loading_sources.is_empty() {
-            String::new()
-        } else {
-            format!(" ({loading_sources})")
-        };
-        picker.set_status(format!(
-            "Loading sessions{suffix}; press Ctrl-N to create one"
-        ));
+        picker.set_loading_status(status);
     } else {
-        picker.set_status("Select a session or press Ctrl-N to create one".to_owned());
+        picker.set_status(status);
+        picker.set_idle_empty_message();
     }
+}
+
+fn catalog_status_text(session_list: &SessionList, session_count: usize) -> String {
+    if session_list.catalog_sources.is_empty()
+        && catalog_still_loading(&session_list.catalog_status)
+    {
+        return format!(
+            "Loading sessions: discovering sources; {session_count} found so far; press Ctrl-N to create one"
+        );
+    }
+
+    let loaded_sources = status_source_ids(&session_list.catalog_sources, |status| {
+        matches!(status, SessionCatalogStatus::Loaded)
+    });
+    let loading_sources = status_source_ids(&session_list.catalog_sources, catalog_still_loading);
+    let failed_sources = status_source_ids(&session_list.catalog_sources, |status| {
+        matches!(status, SessionCatalogStatus::Failed(_))
+    });
+
+    if catalog_still_loading(&session_list.catalog_status) {
+        let mut phases = Vec::new();
+        if !loaded_sources.is_empty() {
+            phases.push(format!("loaded {}", loaded_sources.join(", ")));
+        }
+        if loading_sources.is_empty() {
+            phases.push("discovering sources".to_owned());
+        } else {
+            phases.push(format!("loading {}", loading_sources.join(", ")));
+        }
+        if !failed_sources.is_empty() {
+            phases.push(format!("failed {}", failed_sources.join(", ")));
+        }
+        return format!(
+            "Loading sessions: {}; {session_count} found so far; press Ctrl-N to create one",
+            phases.join("; ")
+        );
+    }
+
+    let mut phases = Vec::new();
+    if !loaded_sources.is_empty() {
+        phases.push(format!("loaded {}", loaded_sources.join(", ")));
+    }
+    if !failed_sources.is_empty() {
+        phases.push(format!("failed {}", failed_sources.join(", ")));
+    }
+    if phases.is_empty() {
+        format!("Select a session ({session_count} found) or press Ctrl-N to create one")
+    } else {
+        format!(
+            "{}; {session_count} found; press Ctrl-N to create one",
+            phases.join("; ")
+        )
+    }
+}
+
+fn status_source_ids(
+    sources: &[SessionCatalogSourceStatus],
+    matches_status: impl Fn(&SessionCatalogStatus) -> bool,
+) -> Vec<&str> {
+    sources
+        .iter()
+        .filter(|source| matches_status(&source.status))
+        .map(|source| source.source_id.as_str())
+        .collect()
 }
 
 const fn catalog_still_loading(status: &SessionCatalogStatus) -> bool {
@@ -133,6 +186,15 @@ const fn catalog_still_loading(status: &SessionCatalogStatus) -> bool {
         status,
         SessionCatalogStatus::NotStarted | SessionCatalogStatus::Loading
     )
+}
+
+fn draw_session_picker<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    picker: &mut session_picker::SessionPickerApp,
+) -> Result<(), TuiError> {
+    terminal.resize(helpers::terminal_area()?);
+    terminal.draw(|frame| session_picker_render::render_picker(picker, frame))?;
+    Ok(())
 }
 
 async fn import_selected_session<W: Write>(
@@ -191,13 +253,18 @@ pub async fn pick_session<W: Write>(
     services: &TuiServices<'_>,
 ) -> Result<SessionId, TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
-    picker.set_status("Loading sessions; press Ctrl-N to create one".to_owned());
+    picker.set_loading_status(
+        "Loading sessions: connecting to catalog; press Ctrl-N to create one".to_owned(),
+    );
+    draw_session_picker(io.terminal, &mut picker)?;
     let mut watcher = services.client.watch_session_catalog().await?;
+    picker.set_loading_status(
+        "Loading sessions: discovering sources; press Ctrl-N to create one".to_owned(),
+    );
+    draw_session_picker(io.terminal, &mut picker)?;
     apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     loop {
-        io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
+        draw_session_picker(io.terminal, &mut picker)?;
         let event = tokio::select! {
             snapshot = watcher.next_snapshot() => {
                 apply_session_list(&mut picker, snapshot?);
@@ -259,8 +326,11 @@ pub async fn pick_session_for_mutation<W: Write>(
     start_mode: SessionPickerStartMode,
 ) -> Result<(), TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
-    picker.set_status("Loading sessions".to_owned());
+    picker.set_loading_status("Loading sessions: connecting to catalog".to_owned());
+    draw_session_picker(io.terminal, &mut picker)?;
     let mut watcher = services.client.watch_session_catalog().await?;
+    picker.set_loading_status("Loading sessions: discovering sources".to_owned());
+    draw_session_picker(io.terminal, &mut picker)?;
     apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     let mut pending_start_mode = Some(start_mode);
     loop {
@@ -274,9 +344,7 @@ pub async fn pick_session_for_mutation<W: Write>(
                 }
             }
         }
-        io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| session_picker_render::render_picker(&mut picker, frame))?;
+        draw_session_picker(io.terminal, &mut picker)?;
         let event = tokio::select! {
             snapshot = watcher.next_snapshot() => {
                 apply_session_list(&mut picker, snapshot?);

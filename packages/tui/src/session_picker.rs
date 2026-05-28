@@ -27,6 +27,7 @@ pub struct SessionPickerApp {
     rename: TextEditBuffer,
     list: FilteredListState,
     status: String,
+    empty_message: String,
     last_import: Option<(SessionSummary, Vec<bcode_ipc::SessionImportWarning>)>,
     mode: SessionPickerMode,
 }
@@ -42,6 +43,7 @@ impl SessionPickerApp {
             rename: TextEditBuffer::new(),
             list,
             status: "Select a session or press Ctrl-N to create one".to_owned(),
+            empty_message: "No matching sessions. Press Ctrl-N to create a new session.".to_owned(),
             last_import: None,
             mode: SessionPickerMode::Filter,
         }
@@ -91,6 +93,18 @@ impl SessionPickerApp {
         self.status = status;
     }
 
+    /// Set both loading status and empty-list copy.
+    pub fn set_loading_status(&mut self, status: String) {
+        self.status.clone_from(&status);
+        self.empty_message = status;
+    }
+
+    /// Set the default empty-list message for an idle picker.
+    pub fn set_idle_empty_message(&mut self) {
+        "No matching sessions. Press Ctrl-N to create a new session."
+            .clone_into(&mut self.empty_message);
+    }
+
     /// Record the most recent successful external import for the warning panel.
     pub fn set_last_import(
         &mut self,
@@ -122,9 +136,7 @@ impl SessionPickerApp {
     #[must_use]
     pub fn list_items(&self) -> Vec<ListItem> {
         if self.list.indices().is_empty() {
-            return vec![empty_item(
-                "No matching sessions. Press Ctrl-N to create a new session.",
-            )];
+            return vec![empty_item(&self.empty_message)];
         }
 
         self.list
