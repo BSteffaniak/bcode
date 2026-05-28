@@ -853,6 +853,21 @@ pub struct AgentTalkPrompt {
     pub prompt: String,
 }
 
+/// Persisted project summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    /// Project id.
+    pub id: String,
+    /// Parent initiative id.
+    pub initiative_id: String,
+    /// Project title.
+    pub title: String,
+    /// Project status.
+    pub status: String,
+    /// Project rationale.
+    pub rationale: String,
+}
+
 /// Persisted task summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSummary {
@@ -870,6 +885,8 @@ pub struct TaskSummary {
     pub assigned_agent_id: String,
     /// Task rationale.
     pub rationale: String,
+    /// Current blocker text, if any.
+    pub blocker: String,
     /// Task priority. Lower numbers sort first.
     pub priority: i64,
 }
@@ -1368,6 +1385,9 @@ enum BlimsEventPayload {
     },
     ProposalRegistered {
         proposal: WorkProposalSummary,
+    },
+    ProjectCreated {
+        project: ProjectSummary,
     },
     WorktreeRecorded {
         worktree: WorktreeRecord,
@@ -2416,6 +2436,23 @@ async fn create_work_tables(
         .primary_key("id")
         .execute(database)
         .await?;
+    create_table("projects")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("initiative_id"))
+        .column(text_column("title"))
+        .column(text_column("status"))
+        .column(text_column("rationale"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_task_and_artifact_tables(database).await
+}
+
+async fn create_task_and_artifact_tables(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
     create_table("tasks")
         .if_not_exists(true)
         .column(text_column("id"))
@@ -2425,6 +2462,7 @@ async fn create_work_tables(
         .column(text_column("status"))
         .column(text_column("assigned_agent_id"))
         .column(text_column("rationale"))
+        .column(text_column("blocker"))
         .column(int_column("priority"))
         .column(now_column("created_at"))
         .primary_key("id")
@@ -3068,6 +3106,7 @@ struct CompanyData {
     departments: Vec<DepartmentRecord>,
     teams: Vec<TeamRecord>,
     initiatives: Vec<InitiativeSummary>,
+    projects: Vec<ProjectSummary>,
     guidance: Vec<GuidanceSummary>,
     proposals: Vec<WorkProposalSummary>,
     tasks: Vec<TaskSummary>,
@@ -3194,6 +3233,9 @@ async fn apply_work_event_projection(
         }
         BlimsEventPayload::InitiativeCreated { initiative } => {
             replace_one_initiative_projection(database, initiative).await?;
+        }
+        BlimsEventPayload::ProjectCreated { project } => {
+            replace_one_project_projection(database, project).await?;
         }
         BlimsEventPayload::InitiativeStatusSet {
             initiative_id,
@@ -3366,6 +3408,7 @@ async fn apply_org_world_event_projection(
         BlimsEventPayload::InitiativePlanImported { .. }
         | BlimsEventPayload::CompanyLifecycleSet { .. }
         | BlimsEventPayload::InitiativeCreated { .. }
+        | BlimsEventPayload::ProjectCreated { .. }
         | BlimsEventPayload::InitiativeStatusSet { .. }
         | BlimsEventPayload::GuidanceSet { .. }
         | BlimsEventPayload::InitiativeGuidanceSet { .. }
@@ -3916,6 +3959,7 @@ fn list_tasks(working_directory: &Path) -> Result<Vec<TaskSummary>, BlimsStateEr
                     "status",
                     "assigned_agent_id",
                     "rationale",
+                    "blocker",
                     "priority",
                 ])
                 .sort("priority", SortDirection::Asc)
@@ -3942,6 +3986,7 @@ fn inspect_task(request: &TaskInspectRequest) -> Result<TaskSummary, BlimsStateE
                     "status",
                     "assigned_agent_id",
                     "rationale",
+                    "blocker",
                     "priority",
                 ])
                 .filter(Box::new(where_eq("id", task_id)))
@@ -4017,6 +4062,7 @@ fn build_task_work_prompt(request: &TaskInspectRequest) -> Result<TaskWorkPrompt
                     "status",
                     "assigned_agent_id",
                     "rationale",
+                    "blocker",
                     "priority",
                 ])
                 .filter(Box::new(where_eq("id", task_id)))
@@ -4455,6 +4501,7 @@ fn import_initiative_plan(
                     status: "proposed".to_string(),
                     assigned_agent_id: task.suggested_agent_id.clone().unwrap_or_default(),
                     rationale: task.rationale.clone(),
+                    blocker: String::new(),
                     priority: task.priority,
                 };
                 task_summaries.push(task_summary);
@@ -4710,6 +4757,7 @@ async fn load_company_data_from_database(
             .map(team_record)
             .collect::<Result<Vec<_>, _>>()?,
         initiatives,
+        projects: load_projects(database).await?,
         guidance,
         proposals,
         tasks,
@@ -4734,6 +4782,18 @@ async fn load_initiatives(
         .await?
         .iter()
         .map(initiative_summary)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn load_projects(database: &dyn Database) -> Result<Vec<ProjectSummary>, BlimsStateError> {
+    database
+        .select("projects")
+        .columns(&["id", "initiative_id", "title", "status", "rationale"])
+        .sort("id", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(project_summary)
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -4762,6 +4822,7 @@ async fn load_tasks(database: &dyn Database) -> Result<Vec<TaskSummary>, BlimsSt
             "status",
             "assigned_agent_id",
             "rationale",
+            "blocker",
             "priority",
         ])
         .sort("priority", SortDirection::Asc)
@@ -5055,6 +5116,16 @@ fn initiative_summary(row: &Row) -> Result<InitiativeSummary, BlimsStateError> {
     })
 }
 
+fn project_summary(row: &Row) -> Result<ProjectSummary, BlimsStateError> {
+    Ok(ProjectSummary {
+        id: required_text(row, "id")?,
+        initiative_id: required_text(row, "initiative_id")?,
+        title: required_text(row, "title")?,
+        status: required_text(row, "status")?,
+        rationale: required_text(row, "rationale")?,
+    })
+}
+
 fn guidance_summary(row: &Row) -> Result<GuidanceSummary, BlimsStateError> {
     Ok(GuidanceSummary {
         id: required_text(row, "id")?,
@@ -5081,6 +5152,7 @@ fn event_summary(row: &Row) -> Result<BlimsEventSummary, BlimsStateError> {
 struct ProjectionState {
     lifecycle_status: String,
     initiatives: Vec<InitiativeSummary>,
+    projects: Vec<ProjectSummary>,
     guidance: Vec<GuidanceSummary>,
     artifacts: Vec<ArtifactDetail>,
     proposals: Vec<WorkProposalSummary>,
@@ -5146,6 +5218,9 @@ fn replay_event(
             upsert_by_id(&mut state.initiatives, initiative, |initiative| {
                 &initiative.id
             });
+        }
+        BlimsEventPayload::ProjectCreated { project } => {
+            upsert_by_id(&mut state.projects, project, |project| &project.id);
         }
         BlimsEventPayload::InitiativeStatusSet {
             initiative_id,
@@ -5335,6 +5410,7 @@ async fn apply_projection_state(
         .execute(database)
         .await?;
     replace_initiative_projections(database, &state.initiatives).await?;
+    replace_project_projections(database, &state.projects).await?;
     replace_guidance_projections(database, &state.guidance).await?;
     replace_artifact_projections(database, &state.artifacts).await?;
     replace_proposal_projections(database, &state.proposals).await?;
@@ -5382,6 +5458,38 @@ async fn replace_initiative_projections(
     database.delete("initiatives").execute(database).await?;
     for initiative in initiatives {
         replace_one_initiative_projection(database, initiative).await?;
+    }
+    Ok(())
+}
+
+async fn replace_one_project_projection(
+    database: &dyn Database,
+    project: &ProjectSummary,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("projects")
+        .filter(Box::new(where_eq("id", project.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("projects")
+        .value("id", project.id.clone())
+        .value("initiative_id", project.initiative_id.clone())
+        .value("title", project.title.clone())
+        .value("status", project.status.clone())
+        .value("rationale", project.rationale.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_project_projections(
+    database: &dyn Database,
+    projects: &[ProjectSummary],
+) -> Result<(), BlimsStateError> {
+    database.delete("projects").execute(database).await?;
+    for project in projects {
+        replace_one_project_projection(database, project).await?;
     }
     Ok(())
 }
@@ -5553,6 +5661,7 @@ async fn replace_one_task_projection(
         .value("status", task.status.clone())
         .value("assigned_agent_id", task.assigned_agent_id.clone())
         .value("rationale", task.rationale.clone())
+        .value("blocker", task.blocker.clone())
         .value("priority", task.priority)
         .execute(database)
         .await?;
@@ -5953,6 +6062,7 @@ fn task_summary(row: &Row) -> Result<TaskSummary, BlimsStateError> {
         status: required_text(row, "status")?,
         assigned_agent_id: required_text(row, "assigned_agent_id")?,
         rationale: required_text(row, "rationale")?,
+        blocker: required_text(row, "blocker")?,
         priority: required_i64(row, "priority")?,
     })
 }
@@ -6491,6 +6601,7 @@ mod tests {
             status: "proposed".to_string(),
             assigned_agent_id: "mira".to_string(),
             rationale: "Need a playable first loop".to_string(),
+            blocker: String::new(),
             priority: 5,
         }
     }
