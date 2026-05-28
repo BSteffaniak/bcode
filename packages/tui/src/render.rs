@@ -319,12 +319,26 @@ fn transcript_item_signature(
     inline_diff_config: TuiInlineDiffConfig,
 ) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{width}:{inline_diff_config:?}:{}:{}:{:?}:{}",
+        "item:{width}:{inline_diff_config:?}:{}:{}:{:?}:{}:{}",
         item.role(),
         item.streaming(),
         item.kind(),
-        item.text()
+        item.text(),
+        terminal_elapsed_signature_fragment(item).unwrap_or_default()
     ))
+}
+
+fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> {
+    let TranscriptItemKind::TerminalOutput {
+        started_at_ms: Some(started_at_ms),
+        finished_at_ms: None,
+        ..
+    } = item.kind()
+    else {
+        return None;
+    };
+
+    format_elapsed_millis(Some(*started_at_ms), None).map(|elapsed| format!("elapsed:{elapsed}"))
 }
 
 fn pending_submission_signature(
