@@ -9,14 +9,15 @@ use bmux_tui::layout::centered;
 use bmux_tui::prelude::{
     Border, Color, Constraint, CrosstermTerminalGuard, Direction, Event, Frame, Insets, Line,
     Modifier, Panel, Point, Rect, Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget,
-    read_event, split,
+    poll_event, split,
 };
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Subcommand)]
 pub enum BlimsCommand {
@@ -682,13 +683,17 @@ async fn run_blims_tui() -> Result<(), CliError> {
     );
     terminal.draw(|frame| app.render(frame))?;
     loop {
-        if let Some(event) = read_event()? {
-            if handle_blims_tui_event(&mut app, event).await? {
-                break;
-            }
-            terminal.resize(blims_terminal_area()?);
-            terminal.draw(|frame| app.render(frame))?;
+        if let Some(event) = poll_event(Duration::from_millis(120))?
+            && handle_blims_tui_event(&mut app, event).await?
+        {
+            break;
         }
+        app.animate_agents();
+        if app.should_world_tick() {
+            app.tick_world().await?;
+        }
+        terminal.resize(blims_terminal_area()?);
+        terminal.draw(|frame| app.render(frame))?;
     }
     let _stdout = guard.leave()?;
     Ok(())
@@ -780,9 +785,14 @@ struct BlimsTuiApp {
     report: BlimsMorningReport,
     interactions: BlimsAvailableInteractions,
     templates: Vec<BlimsWorldTemplateSummary>,
+    agent_tiles: BTreeMap<String, BlimsTilePosition>,
+    live_log: Vec<String>,
     selected_template: usize,
     player_tile: BlimsTilePosition,
     selected_interaction: usize,
+    last_world_tick: Instant,
+    last_animation: Instant,
+    tick_count: u64,
     show_world_picker: bool,
     show_help: bool,
     status: String,
@@ -799,14 +809,20 @@ impl BlimsTuiApp {
             .position(|template| template.id == world.template_id)
             .unwrap_or_default();
         let player_tile = player_tile_for_room(&world, &interactions.room_id);
+        let agent_tiles = initial_agent_tiles(&world);
         Ok(Self {
             world,
             report,
             interactions,
             templates,
+            agent_tiles,
+            live_log: vec!["Blims office is live.".to_string()],
             selected_template,
             player_tile,
             selected_interaction: 0,
+            last_world_tick: Instant::now(),
+            last_animation: Instant::now(),
+            tick_count: 0,
             show_world_picker: false,
             show_help: false,
             status: "Welcome CEO — choose a world with w, move with arrows/h/l.".to_string(),
@@ -817,6 +833,7 @@ impl BlimsTuiApp {
         self.world = load_blims_world().await?;
         self.report = load_blims_report().await?;
         self.interactions = load_blims_interactions().await?;
+        self.sync_agent_targets();
         self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
         self.clamp_selected_interaction();
         Ok(())
@@ -882,6 +899,71 @@ impl BlimsTuiApp {
             return Vec::new();
         }
         self.interactions.interactions.clone()
+    }
+
+    fn should_world_tick(&self) -> bool {
+        self.last_world_tick.elapsed() >= Duration::from_millis(1_800)
+    }
+
+    async fn tick_world(&mut self) -> Result<(), CliError> {
+        self.tick_count = self.tick_count.saturating_add(1);
+        let previous = self.world.clone();
+        self.world = tick_blims_world(self.tick_count).await?;
+        self.interactions = load_blims_interactions().await?;
+        self.record_world_changes(&previous);
+        self.sync_agent_targets();
+        self.clamp_selected_interaction();
+        self.last_world_tick = Instant::now();
+        Ok(())
+    }
+
+    fn animate_agents(&mut self) {
+        if self.last_animation.elapsed() < Duration::from_millis(120) {
+            return;
+        }
+        let targets = self
+            .world
+            .agents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent_tile(&self.world, agent)))
+            .collect::<Vec<_>>();
+        for (agent_id, target) in targets {
+            let current = self.agent_tiles.entry(agent_id).or_insert(target);
+            *current = step_toward(*current, target);
+        }
+        self.last_animation = Instant::now();
+    }
+
+    fn sync_agent_targets(&mut self) {
+        for agent in &self.world.agents {
+            self.agent_tiles
+                .entry(agent.id.clone())
+                .or_insert_with(|| agent_tile(&self.world, agent));
+        }
+        self.agent_tiles
+            .retain(|agent_id, _| self.world.agents.iter().any(|agent| agent.id == *agent_id));
+    }
+
+    fn record_world_changes(&mut self, previous: &BlimsWorldSnapshot) {
+        let mut messages = Vec::new();
+        for agent in &self.world.agents {
+            if let Some(before) = previous.agents.iter().find(|before| before.id == agent.id) {
+                if before.room_id != agent.room_id {
+                    messages.push(format!("{} walked to {}.", agent.name, agent.room_id));
+                }
+                if before.status != agent.status {
+                    messages.push(format!("{}: {}", agent.name, agent.status));
+                }
+            }
+        }
+        for message in messages {
+            self.push_live_log(message);
+        }
+    }
+
+    fn push_live_log(&mut self, message: String) {
+        self.live_log.insert(0, message);
+        self.live_log.truncate(6);
     }
 
     async fn move_next(&mut self) -> Result<(), CliError> {
@@ -997,6 +1079,21 @@ async fn move_blims_player(room_id: &str) -> Result<BlimsWorldSnapshot, CliError
         "room_id": room_id,
     });
     let response = call_blims_service("world.move_player", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<BlimsWorldSnapshot>(response)
+}
+
+async fn tick_blims_world(tick_count: u64) -> Result<BlimsWorldSnapshot, CliError> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_i64, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        });
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "tick_id": format!("tui-{tick_count}"),
+        "now_ms": now_ms,
+    });
+    let response = call_blims_service("world.tick", serde_json::to_vec(&request)?).await?;
     decode_blims_response::<BlimsWorldSnapshot>(response)
 }
 
@@ -1139,8 +1236,9 @@ fn tile_glyph(app: &BlimsTuiApp, tile: BlimsTilePosition) -> (&'static str, Styl
         );
     }
     if let Some(agent) = app.world.agents.iter().find(|agent| {
-        room_id_at_tile(&app.world, tile).is_some_and(|room_id| room_id == agent.room_id)
-            && agent_tile(&app.world, agent) == tile
+        app.agent_tiles
+            .get(&agent.id)
+            .is_some_and(|position| *position == tile)
     }) {
         return (
             agent_sprite(agent),
@@ -1216,14 +1314,16 @@ fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
             Constraint::Length(8),
             Constraint::Min(6),
             Constraint::Length(8),
+            Constraint::Length(7),
         ],
     );
-    if rows.len() != 3 {
+    if rows.len() != 4 {
         return;
     }
     render_current_room_panel(app, rows[0], frame);
     render_report_panel(app, rows[1], frame);
     render_interactions_panel(app, rows[2], frame);
+    render_live_log_panel(app, rows[3], frame);
 }
 
 fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -1328,6 +1428,25 @@ fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
                 }),
         );
     }
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        "Live company",
+        Style::new()
+            .fg(Color::BrightGreen)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.extend(
+        app.live_log
+            .iter()
+            .take(5)
+            .map(|message| Line::raw(format!("• {message}"))),
+    );
     TextBlock::new(Text::from_lines(lines))
         .wrap(TextWrap::Character)
         .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
@@ -1491,6 +1610,31 @@ impl BlimsViewport {
                 x: (player.x - visible_width / 2).clamp(0, max_x),
                 y: (player.y - visible_height / 2).clamp(0, max_y),
             },
+        }
+    }
+}
+
+fn initial_agent_tiles(world: &BlimsWorldSnapshot) -> BTreeMap<String, BlimsTilePosition> {
+    world
+        .agents
+        .iter()
+        .map(|agent| (agent.id.clone(), agent_tile(world, agent)))
+        .collect()
+}
+
+fn step_toward(current: BlimsTilePosition, target: BlimsTilePosition) -> BlimsTilePosition {
+    if current == target {
+        return current;
+    }
+    if current.x == target.x {
+        BlimsTilePosition {
+            x: current.x,
+            y: current.y + (target.y - current.y).signum(),
+        }
+    } else {
+        BlimsTilePosition {
+            x: current.x + (target.x - current.x).signum(),
+            y: current.y,
         }
     }
 }

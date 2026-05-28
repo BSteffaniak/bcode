@@ -160,6 +160,9 @@ pub const OP_WORLD_MOVE_PLAYER: &str = "world.move_player";
 /// Available world interactions operation.
 pub const OP_WORLD_AVAILABLE_INTERACTIONS: &str = "world.available_interactions";
 
+/// Advance lightweight world simulation operation.
+pub const OP_WORLD_TICK: &str = "world.tick";
+
 /// World template list operation.
 pub const OP_WORLD_TEMPLATE_LIST: &str = "world.template_list";
 
@@ -290,6 +293,7 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
             service_world_move_player(request, &EventContext::from_request(request))
         }
         OP_WORLD_AVAILABLE_INTERACTIONS => service_world_available_interactions(request),
+        OP_WORLD_TICK => service_world_tick(request, &EventContext::from_request(request)),
         OP_WORLD_TEMPLATE_LIST => service_world_template_list(),
         OP_WORLD_SELECT_TEMPLATE => {
             service_world_select_template(request, &EventContext::from_request(request))
@@ -380,6 +384,24 @@ impl EventContext {
             correlation: format!("service:{}", request.operation),
             causation: format!("service:{}", request.operation),
             expected_latest: None,
+        }
+    }
+
+    fn merge_world_tick_request(&self, request: &WorldTickRequest) -> Self {
+        let tick_id = request
+            .tick_id
+            .clone()
+            .unwrap_or_else(|| "frontend-tick".to_string());
+        Self {
+            correlation: request
+                .correlation_id
+                .clone()
+                .unwrap_or_else(|| format!("world.tick:{tick_id}")),
+            causation: request
+                .causation_id
+                .clone()
+                .unwrap_or_else(|| self.causation.clone()),
+            expected_latest: request.expected_latest_event_id.or(self.expected_latest),
         }
     }
 
@@ -702,6 +724,28 @@ pub struct WorldMovePlayerRequest {
     pub working_directory: PathBuf,
     /// Destination room id.
     pub room_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to advance lightweight world simulation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldTickRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Caller tick id for deterministic event correlation.
+    #[serde(default)]
+    pub tick_id: Option<String>,
+    /// Optional wall-clock milliseconds supplied by the frontend.
+    #[serde(default)]
+    pub now_ms: Option<i64>,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -2282,6 +2326,18 @@ fn service_world_available_interactions(request: &ServiceRequest) -> ServiceResp
     match available_interactions(&request.working_directory) {
         Ok(interactions) => json_response(&interactions),
         Err(error) => ServiceResponse::error("world_interactions_failed", error.to_string()),
+    }
+}
+
+fn service_world_tick(request: &ServiceRequest, event_context: &EventContext) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<WorldTickRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match tick_world(&request, &event_context) {
+        Ok(snapshot) => json_response(&snapshot),
+        Err(error) => ServiceResponse::error("world_tick_failed", error.to_string()),
     }
 }
 
@@ -4399,6 +4455,158 @@ fn move_player(
             Ok(world_snapshot_from_data(data))
         })
     })
+}
+
+fn tick_world(
+    request: &WorldTickRequest,
+    event_context: &EventContext,
+) -> Result<WorldSnapshot, BlimsStateError> {
+    let event_context = event_context.merge_world_tick_request(request);
+    let tick_seed = request
+        .now_ms
+        .unwrap_or_default()
+        .saturating_add(stable_i64(request.tick_id.as_deref().unwrap_or("tick")));
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let data = load_company_data_from_database(database).await?;
+            if data.company.lifecycle_status != "running" {
+                return Ok(world_snapshot_from_data(data));
+            }
+            if data.rooms.is_empty() || data.agents.is_empty() {
+                return Ok(world_snapshot_from_data(data));
+            }
+            for (index, agent) in data.agents.iter().enumerate() {
+                let decision = tick_decision(tick_seed, index, agent, &data.rooms);
+                if let Some(room_id) = decision.room_id
+                    && room_id != agent.room_id
+                {
+                    append_event(
+                        database,
+                        &event_context,
+                        "agent.moved",
+                        format!("{} walked to {room_id}.", agent.name),
+                        &BlimsEventPayload::AgentMoved {
+                            agent_id: agent.id.clone(),
+                            room_id,
+                        },
+                    )
+                    .await?;
+                }
+                if decision.status != agent.status {
+                    append_event(
+                        database,
+                        &event_context,
+                        "agent.status_set",
+                        format!("{} is now {}.", agent.name, decision.status),
+                        &BlimsEventPayload::AgentStatusSet {
+                            agent_id: agent.id.clone(),
+                            status: decision.status,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            let data = load_company_data_from_database(database).await?;
+            Ok(world_snapshot_from_data(data))
+        })
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentTickDecision {
+    room_id: Option<String>,
+    status: String,
+}
+
+fn tick_decision(
+    tick_seed: i64,
+    index: usize,
+    agent: &AgentRecord,
+    rooms: &[RoomRecord],
+) -> AgentTickDecision {
+    let seed = tick_seed
+        .saturating_add(stable_i64(&agent.id))
+        .saturating_add(i64::try_from(index).unwrap_or_default() * 17);
+    let room_id = if seed.rem_euclid(4) == 0 {
+        preferred_agent_room(agent, rooms, seed).map(|room| room.id.clone())
+    } else {
+        None
+    };
+    AgentTickDecision {
+        room_id,
+        status: agent_activity(agent, seed).to_string(),
+    }
+}
+
+fn preferred_agent_room<'a>(
+    agent: &AgentRecord,
+    rooms: &'a [RoomRecord],
+    seed: i64,
+) -> Option<&'a RoomRecord> {
+    let role = agent.role.to_lowercase();
+    let preferred_kind = if role.contains("engineer") || role.contains("developer") {
+        "engineering"
+    } else if role.contains("design") || role.contains("creative") {
+        "creative"
+    } else if role.contains("review") || role.contains("qa") {
+        "review"
+    } else if role.contains("strategy") || role.contains("lead") {
+        "planning"
+    } else {
+        ""
+    };
+    rooms
+        .iter()
+        .find(|room| !preferred_kind.is_empty() && room.room_kind == preferred_kind)
+        .or_else(|| {
+            let len = i64::try_from(rooms.len()).ok()?;
+            rooms.get(usize::try_from(seed.rem_euclid(len)).ok()?)
+        })
+}
+
+fn agent_activity(agent: &AgentRecord, seed: i64) -> &'static str {
+    let role = agent.role.to_lowercase();
+    let activities: &[&str] = if role.contains("engineer") || role.contains("developer") {
+        &[
+            "pairing with Bcode",
+            "debugging a tiny gremlin",
+            "scouting the repo",
+            "writing implementation notes",
+        ]
+    } else if role.contains("design") || role.contains("creative") {
+        &[
+            "sketching an initiative pitch",
+            "tuning the office vibe",
+            "making the UI feel cozy",
+            "storyboarding agent rituals",
+        ]
+    } else if role.contains("review") || role.contains("qa") {
+        &[
+            "reviewing open proposals",
+            "checking validation notes",
+            "looking for risky edges",
+            "curating the approval queue",
+        ]
+    } else {
+        &[
+            "waiting for CEO guidance",
+            "organizing company memory",
+            "walking with purpose",
+            "prioritizing the next initiative",
+        ]
+    };
+    let len = i64::try_from(activities.len()).unwrap_or(1);
+    let index = usize::try_from(seed.rem_euclid(len)).unwrap_or_default();
+    activities[index]
+}
+
+fn stable_i64(value: &str) -> i64 {
+    value
+        .bytes()
+        .fold(0_i64, |acc, byte| {
+            acc.saturating_mul(31).saturating_add(i64::from(byte))
+        })
+        .abs()
 }
 
 fn available_interactions(
