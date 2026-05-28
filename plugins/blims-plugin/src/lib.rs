@@ -1005,6 +1005,12 @@ pub struct CompanyStatus {
     pub database_path: PathBuf,
     /// Persisted lifecycle status for daemon/frontends.
     pub lifecycle_status: String,
+    /// Local daemon namespace id for this repo/state root/build.
+    pub daemon_namespace: String,
+    /// Local daemon metadata path.
+    pub daemon_metadata_path: PathBuf,
+    /// Protocol/build compatibility string.
+    pub compatibility: String,
 }
 
 /// World interaction available to the player.
@@ -2154,7 +2160,25 @@ fn company_status(working_directory: &Path) -> CompanyStatus {
         Some("shutdown") => CompanyLifecycleState::Shutdown,
         Some(_) => CompanyLifecycleState::Created,
     };
-    let message = match state {
+    let message = company_status_message(&state);
+    let daemon_namespace = daemon_namespace(working_directory, &paths);
+    let daemon_metadata_path = paths.state_root.join("daemon.json");
+
+    CompanyStatus {
+        state,
+        message,
+        daemon_connected: daemon_metadata_path.exists(),
+        state_root: paths.state_root,
+        database_path: paths.database_path,
+        lifecycle_status: lifecycle_status.unwrap_or_else(|| "not_started".to_string()),
+        daemon_namespace,
+        daemon_metadata_path,
+        compatibility: format!("blims-protocol-v{BLIMS_PROTOCOL_VERSION}"),
+    }
+}
+
+fn company_status_message(state: &CompanyLifecycleState) -> String {
+    match state {
         CompanyLifecycleState::Created => {
             "Blims company state exists. The office is ready to wake.".to_string()
         }
@@ -2168,16 +2192,16 @@ fn company_status(working_directory: &Path) -> CompanyStatus {
             "Blims is bundled and ready. Create a repo-local company to wake the office."
                 .to_string()
         }
-    };
-
-    CompanyStatus {
-        state,
-        message,
-        daemon_connected: false,
-        state_root: paths.state_root,
-        database_path: paths.database_path,
-        lifecycle_status: lifecycle_status.unwrap_or_else(|| "not_started".to_string()),
     }
+}
+
+fn daemon_namespace(working_directory: &Path, paths: &StatePaths) -> String {
+    format!(
+        "blims-{}-{}-v{}",
+        stable_slug(&working_directory.display().to_string()),
+        stable_slug(&paths.state_root.display().to_string()),
+        BLIMS_PROTOCOL_VERSION
+    )
 }
 
 fn create_company_state(working_directory: &Path) -> Result<CompanyStatus, BlimsStateError> {
@@ -2202,6 +2226,12 @@ fn create_company_state(working_directory: &Path) -> Result<CompanyStatus, Blims
                     source,
                 })?;
             initialize_schema(database.as_ref()).await?;
+            write_daemon_metadata(&paths).map_err(|source| {
+                BlimsStateError::CreateStateDirectory {
+                    path: paths.state_root.clone(),
+                    source,
+                }
+            })?;
             Ok::<(), BlimsStateError>(())
         })
     })
@@ -2209,6 +2239,17 @@ fn create_company_state(working_directory: &Path) -> Result<CompanyStatus, Blims
     .map_err(panic_to_blims_error)??;
 
     Ok(company_status(working_directory))
+}
+
+fn write_daemon_metadata(paths: &StatePaths) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(&paths.state_root)?;
+    std::fs::write(
+        paths.state_root.join("daemon.json"),
+        format!(
+            "{{\n  \"transport\": \"bmux-ipc-local-placeholder\",\n  \"protocol_version\": {BLIMS_PROTOCOL_VERSION},\n  \"database\": \"{}\",\n  \"background\": true\n}}\n",
+            paths.database_path.display()
+        ),
+    )
 }
 
 fn set_company_lifecycle(

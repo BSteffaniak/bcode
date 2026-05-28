@@ -319,6 +319,9 @@ struct BlimsCompanyStatus {
     state_root: PathBuf,
     database_path: PathBuf,
     lifecycle_status: String,
+    daemon_namespace: String,
+    daemon_metadata_path: PathBuf,
+    compatibility: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1205,6 +1208,9 @@ async fn print_blims_status(json: bool) -> Result<(), CliError> {
         println!("lifecycle: {}", status.lifecycle_status);
         println!("state root: {}", status.state_root.display());
         println!("database: {}", status.database_path.display());
+        println!("daemon namespace: {}", status.daemon_namespace);
+        println!("daemon metadata: {}", status.daemon_metadata_path.display());
+        println!("compatibility: {}", status.compatibility);
     }
     Ok(())
 }
@@ -1218,6 +1224,8 @@ async fn create_blims_company(json: bool) -> Result<(), CliError> {
         println!("Blims company created");
         println!("state root: {}", status.state_root.display());
         println!("database: {}", status.database_path.display());
+        println!("daemon namespace: {}", status.daemon_namespace);
+        println!("daemon metadata: {}", status.daemon_metadata_path.display());
     }
     Ok(())
 }
