@@ -43,6 +43,12 @@ pub const OP_AGENT_LIST: &str = "agent.list";
 /// Agent inspect operation.
 pub const OP_AGENT_INSPECT: &str = "agent.inspect";
 
+/// Agent permission get operation.
+pub const OP_AGENT_GET_PERMISSION: &str = "agent.get_permission";
+
+/// Agent permission set operation.
+pub const OP_AGENT_SET_PERMISSION: &str = "agent.set_permission";
+
 /// Agent permission escalation request operation.
 pub const OP_AGENT_REQUEST_PERMISSION: &str = "agent.request_permission";
 
@@ -208,24 +214,16 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
     match request.operation.as_str() {
         OP_COMPANY_STATUS | OP_COMPANY_CREATE | OP_COMPANY_LOAD | OP_COMPANY_PAUSE
         | OP_COMPANY_RESUME | OP_COMPANY_SHUTDOWN => invoke_company_service(request),
-        OP_AGENT_LIST => service_agent_list(request),
-        OP_AGENT_INSPECT => service_agent_inspect(request),
-        OP_AGENT_REQUEST_PERMISSION => {
-            service_agent_request_permission(request, &EventContext::from_request(request))
-        }
-        OP_AGENT_RECORD_CONVERSATION => {
-            service_agent_record_conversation(request, &EventContext::from_request(request))
-        }
-        OP_AGENT_HIRE => service_agent_hire(request, &EventContext::from_request(request)),
-        OP_AGENT_SUSPEND => {
-            service_agent_employment(request, &EventContext::from_request(request), "suspended")
-        }
-        OP_AGENT_FIRE => {
-            service_agent_employment(request, &EventContext::from_request(request), "fired")
-        }
-        OP_AGENT_UPDATE_CONTRACT => {
-            service_agent_update_contract(request, &EventContext::from_request(request))
-        }
+        OP_AGENT_LIST
+        | OP_AGENT_INSPECT
+        | OP_AGENT_GET_PERMISSION
+        | OP_AGENT_SET_PERMISSION
+        | OP_AGENT_REQUEST_PERMISSION
+        | OP_AGENT_RECORD_CONVERSATION
+        | OP_AGENT_HIRE
+        | OP_AGENT_SUSPEND
+        | OP_AGENT_FIRE
+        | OP_AGENT_UPDATE_CONTRACT => invoke_agent_service(request),
         OP_INITIATIVE_CREATE => {
             service_initiative_create(request, &EventContext::from_request(request))
         }
@@ -325,6 +323,34 @@ fn invoke_company_service(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn invoke_agent_service(request: &ServiceRequest) -> ServiceResponse {
+    match request.operation.as_str() {
+        OP_AGENT_LIST => service_agent_list(request),
+        OP_AGENT_INSPECT => service_agent_inspect(request),
+        OP_AGENT_GET_PERMISSION => service_agent_get_permission(request),
+        OP_AGENT_SET_PERMISSION => {
+            service_agent_set_permission(request, &EventContext::from_request(request))
+        }
+        OP_AGENT_REQUEST_PERMISSION => {
+            service_agent_request_permission(request, &EventContext::from_request(request))
+        }
+        OP_AGENT_RECORD_CONVERSATION => {
+            service_agent_record_conversation(request, &EventContext::from_request(request))
+        }
+        OP_AGENT_HIRE => service_agent_hire(request, &EventContext::from_request(request)),
+        OP_AGENT_SUSPEND => {
+            service_agent_employment(request, &EventContext::from_request(request), "suspended")
+        }
+        OP_AGENT_FIRE => {
+            service_agent_employment(request, &EventContext::from_request(request), "fired")
+        }
+        OP_AGENT_UPDATE_CONTRACT => {
+            service_agent_update_contract(request, &EventContext::from_request(request))
+        }
+        _ => ServiceResponse::error("unsupported_operation", "unsupported Blims agent operation"),
+    }
+}
+
 /// Request carrying the workspace root for repo-local Blims state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRequest {
@@ -399,6 +425,36 @@ pub struct AgentRequest {
     pub working_directory: PathBuf,
     /// Agent id.
     pub agent_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to update a Blims agent's mapped Bcode permissions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPermissionUpdateRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Agent id.
+    pub agent_id: String,
+    /// Mapped Bcode agent id.
+    pub bcode_agent_id: String,
+    /// Bash permission policy.
+    pub bash: String,
+    /// Read permission policy.
+    pub read: String,
+    /// Write permission policy.
+    pub write: String,
+    /// Edit permission policy.
+    pub edit: String,
+    /// External directory permission policy.
+    pub external_directory: String,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -1785,6 +1841,32 @@ fn service_agent_inspect(request: &ServiceRequest) -> ServiceResponse {
     match inspect_agent(&request) {
         Ok(agent) => json_response(&agent),
         Err(error) => ServiceResponse::error("agent_inspect_failed", error.to_string()),
+    }
+}
+
+fn service_agent_get_permission(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<AgentRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match inspect_agent_permission(&request) {
+        Ok(permission) => json_response(&permission),
+        Err(error) => ServiceResponse::error("agent_permission_read_failed", error.to_string()),
+    }
+}
+
+fn service_agent_set_permission(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<AgentPermissionUpdateRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match set_agent_permission(&request, &event_context) {
+        Ok(permission) => json_response(&permission),
+        Err(error) => ServiceResponse::error("agent_permission_update_failed", error.to_string()),
     }
 }
 
@@ -3983,6 +4065,66 @@ fn inspect_agent(request: &AgentRequest) -> Result<AgentSnapshot, BlimsStateErro
             .map(AgentRecord::snapshot)
             .ok_or_else(|| BlimsStateError::InvalidRequest(format!("unknown agent: {agent_id}")))
     })
+}
+
+fn inspect_agent_permission(
+    request: &AgentRequest,
+) -> Result<AgentPermissionRecord, BlimsStateError> {
+    let agent_id = request.agent_id.clone();
+    load_company_data(&request.working_directory).and_then(|data| {
+        data.permissions
+            .into_iter()
+            .find(|permission| permission.agent_id == agent_id)
+            .ok_or_else(|| {
+                BlimsStateError::InvalidRequest(format!("unknown agent permission: {agent_id}"))
+            })
+    })
+}
+
+fn set_agent_permission(
+    request: &AgentPermissionUpdateRequest,
+    event_context: &EventContext,
+) -> Result<AgentPermissionRecord, BlimsStateError> {
+    validate_permission_policy("bash", &request.bash)?;
+    validate_permission_policy("read", &request.read)?;
+    validate_permission_policy("write", &request.write)?;
+    validate_permission_policy("edit", &request.edit)?;
+    validate_permission_policy("external_directory", &request.external_directory)?;
+    let permission = AgentPermissionRecord {
+        agent_id: request.agent_id.clone(),
+        bcode_agent_id: request.bcode_agent_id.clone(),
+        bash: request.bash.clone(),
+        read: request.read.clone(),
+        write: request.write.clone(),
+        edit: request.edit.clone(),
+        external_directory: request.external_directory.clone(),
+    };
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "agent.permission_set",
+                format!("Agent permission updated: {}", permission.agent_id),
+                &BlimsEventPayload::AgentPermissionSet {
+                    permission: permission.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(permission)
+        })
+    })
+}
+
+fn validate_permission_policy(category: &str, policy: &str) -> Result<(), BlimsStateError> {
+    if matches!(policy, "allow" | "ask" | "deny") {
+        Ok(())
+    } else {
+        Err(BlimsStateError::InvalidRequest(format!(
+            "{category} policy must be allow, ask, or deny"
+        )))
+    }
 }
 
 fn request_permission_escalation(

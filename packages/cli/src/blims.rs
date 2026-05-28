@@ -56,6 +56,28 @@ pub enum BlimsCommand {
         #[arg(long)]
         json: bool,
     },
+    Permissions {
+        agent_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    SetPermission {
+        agent_id: String,
+        #[arg(long)]
+        bcode_agent_id: Option<String>,
+        #[arg(long)]
+        bash: Option<String>,
+        #[arg(long)]
+        read: Option<String>,
+        #[arg(long)]
+        write: Option<String>,
+        #[arg(long)]
+        edit: Option<String>,
+        #[arg(long)]
+        external_directory: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     Agents {
         #[arg(long)]
         json: bool,
@@ -342,6 +364,17 @@ struct BlimsAgentSnapshot {
     room_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BlimsAgentPermission {
+    agent_id: String,
+    bcode_agent_id: String,
+    bash: String,
+    read: String,
+    write: String,
+    edit: String,
+    external_directory: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsRoomSnapshot {
     id: String,
@@ -498,24 +531,12 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
             print_company_lifecycle_update("company.shutdown", "Blims company shut down", json)
                 .await?;
         }
-        BlimsCommand::Inspect { agent_id, json } => {
-            print_agent_service_result("agent.inspect", &agent_id, json).await?;
-        }
-        BlimsCommand::Hire {
-            agent_id,
-            name,
-            role,
-            room_id,
-            json,
-        } => {
-            hire_blims_agent(agent_id, name, role, room_id, json).await?;
-        }
-        BlimsCommand::Suspend { agent_id, json } => {
-            print_agent_service_result("agent.suspend", &agent_id, json).await?;
-        }
-        BlimsCommand::Fire { agent_id, json } => {
-            print_agent_service_result("agent.fire", &agent_id, json).await?;
-        }
+        BlimsCommand::Inspect { .. }
+        | BlimsCommand::Hire { .. }
+        | BlimsCommand::Suspend { .. }
+        | BlimsCommand::Fire { .. }
+        | BlimsCommand::Permissions { .. }
+        | BlimsCommand::SetPermission { .. } => handle_blims_agent_command(command).await?,
         BlimsCommand::Agents { json } => {
             let response = call_blims_service("agent.list", blims_workspace_payload()?).await?;
             if json {
@@ -575,6 +596,56 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
                 call_blims_service("report.agent", serde_json::to_vec(&request)?).await?;
             print_report_response::<BlimsFocusedReport>(response, json)?;
         }
+    }
+    Ok(())
+}
+
+async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliError> {
+    match command {
+        BlimsCommand::Inspect { agent_id, json } => {
+            print_agent_service_result("agent.inspect", &agent_id, json).await?;
+        }
+        BlimsCommand::Hire {
+            agent_id,
+            name,
+            role,
+            room_id,
+            json,
+        } => {
+            hire_blims_agent(agent_id, name, role, room_id, json).await?;
+        }
+        BlimsCommand::Suspend { agent_id, json } => {
+            print_agent_service_result("agent.suspend", &agent_id, json).await?;
+        }
+        BlimsCommand::Fire { agent_id, json } => {
+            print_agent_service_result("agent.fire", &agent_id, json).await?;
+        }
+        BlimsCommand::Permissions { agent_id, json } => {
+            print_agent_permission(&agent_id, json).await?;
+        }
+        BlimsCommand::SetPermission {
+            agent_id,
+            bcode_agent_id,
+            bash,
+            read,
+            write,
+            edit,
+            external_directory,
+            json,
+        } => {
+            set_agent_permission(
+                agent_id,
+                bcode_agent_id,
+                bash,
+                read,
+                write,
+                edit,
+                external_directory,
+                json,
+            )
+            .await?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -651,6 +722,15 @@ async fn handle_blims_office_command(command: &str) -> Result<(), CliError> {
         ["dashboard" | "menu"] => print_blims_dashboard(),
         ["inspect", "agent", agent_id] | ["agent", agent_id] => {
             print_office_agent_report(agent_id).await?;
+        }
+        ["permissions", agent_id] => {
+            print_agent_permission(agent_id, false).await?;
+        }
+        ["permission", agent_id] => {
+            print_agent_permission_alias(agent_id).await?;
+        }
+        ["set-permission", agent_id, category, policy] => {
+            set_agent_permission_category(agent_id, category, policy).await?;
         }
         ["new" | "create", "initiative", rest @ ..] => {
             create_office_initiative(&rest.join(" ")).await?;
@@ -1077,7 +1157,7 @@ fn print_blims_office(
 
 fn print_blims_help() {
     println!(
-        "Commands: h/left previous room, l/right next room, t talk/look/interactions, i inspect nearby agent, ai chat here, ai <agent>, r report, whiteboard, review, menu/dashboard, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal|agent> <id>, refresh, w world, q quit"
+        "Commands: h/left previous room, l/right next room, t talk/look/interactions, i inspect nearby agent, ai chat here, ai <agent>, permissions <agent>, set-permission <agent> <category> <allow|ask|deny>, r report, whiteboard, review, menu/dashboard, initiatives, tasks, artifacts, proposals, new initiative <title>, plan <initiative-id>, import plan <initiative-id> <file>, work <task-id>, ready/approve/reject/defer <proposal-id>, patch <proposal-id>, apply <artifact-id>, inspect <initiative|task|artifact|proposal|agent> <id>, refresh, w world, q quit"
     );
 }
 
@@ -1224,6 +1304,122 @@ where
         }
     }
     Ok(())
+}
+
+async fn print_agent_permission(agent_id: &str, json: bool) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": agent_id,
+    });
+    let response =
+        call_blims_service("agent.get_permission", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let permission = decode_blims_response::<BlimsAgentPermission>(response)?;
+        println!("agent: {}", permission.agent_id);
+        println!("bcode agent: {}", permission.bcode_agent_id);
+        println!("bash: {}", permission.bash);
+        println!("read: {}", permission.read);
+        println!("write: {}", permission.write);
+        println!("edit: {}", permission.edit);
+        println!("external_directory: {}", permission.external_directory);
+    }
+    Ok(())
+}
+
+async fn print_agent_permission_alias(agent_id: &str) -> Result<(), CliError> {
+    print_agent_permission(agent_id, false).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_agent_permission(
+    agent_id: String,
+    bcode_agent_id: Option<String>,
+    bash: Option<String>,
+    read: Option<String>,
+    write: Option<String>,
+    edit: Option<String>,
+    external_directory: Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    let current = load_agent_permission(&agent_id).await?;
+    let request = BlimsAgentPermission {
+        agent_id,
+        bcode_agent_id: bcode_agent_id.unwrap_or(current.bcode_agent_id),
+        bash: bash.unwrap_or(current.bash),
+        read: read.unwrap_or(current.read),
+        write: write.unwrap_or(current.write),
+        edit: edit.unwrap_or(current.edit),
+        external_directory: external_directory.unwrap_or(current.external_directory),
+    };
+    let payload = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": request.agent_id,
+        "bcode_agent_id": request.bcode_agent_id,
+        "bash": request.bash,
+        "read": request.read,
+        "write": request.write,
+        "edit": request.edit,
+        "external_directory": request.external_directory,
+    });
+    let response =
+        call_blims_service("agent.set_permission", serde_json::to_vec(&payload)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let permission = decode_blims_response::<BlimsAgentPermission>(response)?;
+        println!(
+            "permission updated: {} -> bash {}, read {}, write {}, edit {}, external {}",
+            permission.agent_id,
+            permission.bash,
+            permission.read,
+            permission.write,
+            permission.edit,
+            permission.external_directory
+        );
+    }
+    Ok(())
+}
+
+async fn load_agent_permission(agent_id: &str) -> Result<BlimsAgentPermission, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": agent_id,
+    });
+    let response =
+        call_blims_service("agent.get_permission", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<BlimsAgentPermission>(response)
+}
+
+async fn set_agent_permission_category(
+    agent_id: &str,
+    category: &str,
+    policy: &str,
+) -> Result<(), CliError> {
+    let mut permission = load_agent_permission(agent_id).await?;
+    match category {
+        "bash" => permission.bash = policy.to_string(),
+        "read" => permission.read = policy.to_string(),
+        "write" => permission.write = policy.to_string(),
+        "edit" => permission.edit = policy.to_string(),
+        "external" | "external_directory" => permission.external_directory = policy.to_string(),
+        _ => {
+            println!("unknown permission category: {category}");
+            return Ok(());
+        }
+    }
+    set_agent_permission(
+        permission.agent_id,
+        Some(permission.bcode_agent_id),
+        Some(permission.bash),
+        Some(permission.read),
+        Some(permission.write),
+        Some(permission.edit),
+        Some(permission.external_directory),
+        false,
+    )
+    .await
 }
 
 async fn print_world_templates(json: bool) -> Result<(), CliError> {
