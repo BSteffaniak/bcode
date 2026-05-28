@@ -26,6 +26,7 @@ members = [
     "packages/model",
     "packages/model-provider-runtime",
     "packages/markdown-render",
+    "packages/metrics",
     "packages/syntax-render",
     "packages/plugin",
     "packages/plugin-sdk",
@@ -72,6 +73,7 @@ bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-f
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }
 bcode_ipc                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
+bcode_metrics                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/metrics" }
 bcode_model                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }
 bcode_model_provider_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
 bcode_openai_compatible_provider_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/openai-compatible-provider-plugin" }

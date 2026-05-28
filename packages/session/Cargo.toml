@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_metrics        = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_skill_models   = { workspace = true }
 bmux_codec           = { workspace = true }

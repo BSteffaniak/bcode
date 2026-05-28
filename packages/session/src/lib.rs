@@ -26,6 +26,7 @@ pub use migration::{
 };
 
 use actor::{AttachMode, SessionHandle};
+use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
     SessionEventKind, SessionEventProvenance, SessionHistoryCursor, SessionHistoryDirection,
@@ -122,6 +123,7 @@ pub enum SessionStoreError {
 #[derive(Debug, Clone)]
 pub struct SessionEventStore {
     root: PathBuf,
+    metrics: MetricsRegistry,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -156,7 +158,19 @@ impl SessionEventStore {
     /// Create an event store rooted at the provided directory.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            metrics: MetricsRegistry::default(),
+        }
+    }
+
+    /// Create an event store rooted at the provided directory with metrics instrumentation.
+    #[must_use]
+    pub fn with_metrics(root: impl Into<PathBuf>, metrics: MetricsRegistry) -> Self {
+        Self {
+            root: root.into(),
+            metrics,
+        }
     }
 
     fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
@@ -223,6 +237,7 @@ impl SessionEventStore {
     }
 
     fn append(&self, event: &SessionEvent) -> Result<index::SessionIndexEntry, SessionStoreError> {
+        let append_timer = self.metrics.timer();
         fs::create_dir_all(&self.root)?;
         let path = self.event_path(event.session_id);
         let mut file = OpenOptions::new()
@@ -231,15 +246,35 @@ impl SessionEventStore {
             .read(true)
             .open(&path)?;
         let offset = file.seek(SeekFrom::End(0))?;
+        let write_timer = self.metrics.timer();
         let frame_len = write_event_frame(&mut file, event)?;
         file.flush()?;
+        self.metrics.record_histogram(
+            "session.event_log.write_flush_duration_ms",
+            write_timer.elapsed_ms(),
+        );
+        self.metrics
+            .record_histogram("session.event_log.frame_bytes", frame_len);
+        self.metrics
+            .increment_counter("session.event_log.append_total");
         let entry = index::SessionIndexEntry::from_event(event, offset, frame_len);
+        let index_timer = self.metrics.timer();
         if let Err(error) = index::append_entry(&self.root, event.session_id, &entry) {
+            self.metrics
+                .increment_counter("session.event_index.append_error_total");
             eprintln!(
                 "failed to update session entry index for {}: {error}",
                 event.session_id
             );
         }
+        self.metrics.record_histogram(
+            "session.event_index.append_duration_ms",
+            index_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.event_log.append_duration_ms",
+            append_timer.elapsed_ms(),
+        );
         Ok(entry)
     }
 
@@ -442,7 +477,17 @@ impl SessionEventStore {
             max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             issues: metadata.index_issues.clone(),
         };
-        index::write_index(&self.root, &index)
+        let timer = self.metrics.timer();
+        let result = index::write_index(&self.root, &index);
+        self.metrics.record_histogram(
+            "session.metadata_index.write_duration_ms",
+            timer.elapsed_ms(),
+        );
+        if result.is_err() {
+            self.metrics
+                .increment_counter("session.metadata_index.write_error_total");
+        }
+        result
     }
 
     /// Repair a session log by backing up and truncating an unreadable tail.
@@ -1047,7 +1092,19 @@ impl SessionManager {
     ///
     /// Returns an error if persisted session history cannot be loaded.
     pub fn persistent(root: impl Into<PathBuf>) -> Result<Self, SessionStoreError> {
-        let store = SessionEventStore::new(root);
+        Self::persistent_with_metrics(root, MetricsRegistry::default())
+    }
+
+    /// Create a session manager backed by an append-only event store with metrics instrumentation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisted session history cannot be loaded.
+    pub fn persistent_with_metrics(
+        root: impl Into<PathBuf>,
+        metrics: MetricsRegistry,
+    ) -> Result<Self, SessionStoreError> {
+        let store = SessionEventStore::with_metrics(root, metrics);
         store.migrate_all_event_logs_to_current()?;
         let sessions = store.load_sessions()?;
         Ok(Self::from_store(store, sessions, true))
@@ -1056,7 +1113,16 @@ impl SessionManager {
     /// Create a session manager whose catalog and event logs are loaded on demand.
     #[must_use]
     pub fn persistent_lazy(root: impl Into<PathBuf>) -> Self {
-        let store = SessionEventStore::new(root);
+        Self::persistent_lazy_with_metrics(root, MetricsRegistry::default())
+    }
+
+    /// Create a lazy persistent session manager with metrics instrumentation.
+    #[must_use]
+    pub fn persistent_lazy_with_metrics(
+        root: impl Into<PathBuf>,
+        metrics: MetricsRegistry,
+    ) -> Self {
+        let store = SessionEventStore::with_metrics(root, metrics);
         Self::from_store(store, BTreeMap::new(), false)
     }
 

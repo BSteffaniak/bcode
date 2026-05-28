@@ -1173,6 +1173,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
+ "bcode_metrics",
  "bcode_model",
  "bcode_plugin",
  "bcode_session_models",
@@ -1198,6 +1199,13 @@ dependencies = [
  "hyperchad_transformer_models",
  "test-log",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "bcode_metrics"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1306,6 +1314,7 @@ dependencies = [
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_ipc",
+ "bcode_metrics",
  "bcode_model",
  "bcode_openai_compatible_provider_plugin",
  "bcode_opencode_session_import_plugin",
@@ -1337,6 +1346,7 @@ dependencies = [
 name = "bcode_session"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_metrics",
  "bcode_session_models",
  "bcode_skill_models",
  "bmux_codec",

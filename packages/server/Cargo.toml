@@ -24,6 +24,7 @@ bcode_fake_provider_plugin = { workspace = true, optional = true }
 bcode_filesystem_plugin = { workspace = true, optional = true }
 bcode_git_plugin = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
+bcode_metrics = { workspace = true }
 bcode_model = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_opencode_session_import_plugin = { workspace = true, optional = true }

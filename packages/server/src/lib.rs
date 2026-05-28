@@ -21,6 +21,7 @@ use bcode_ipc::{
     WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
     response_envelope, send_envelope,
 };
+use bcode_metrics::MetricsRegistry;
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
@@ -134,6 +135,7 @@ pub struct ServerState {
     catalog_events_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
+    metrics: MetricsRegistry,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -430,6 +432,7 @@ struct ServerStateInit {
     skill_context_bytes: usize,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
+    metrics: MetricsRegistry,
 }
 
 impl ServerState {
@@ -478,6 +481,7 @@ impl ServerState {
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
+            metrics: init.metrics,
             shutdown,
         }
     }
@@ -652,6 +656,7 @@ impl ServerState {
             selected_model_id: self.selected_model_id.clone(),
             plugin_runtime: self.plugins.executor_statuses(),
             daemon: self.daemon_status.clone(),
+            metrics: self.metrics.snapshot(),
         }
     }
 
@@ -959,6 +964,7 @@ fn redact_plugin_config_value(value: &serde_json::Value) -> serde_json::Value {
 /// # Errors
 ///
 /// Returns an error when the server cannot bind or accept local IPC connections.
+#[allow(clippy::too_many_lines)]
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let config = bcode_config::load_config()?;
@@ -985,7 +991,9 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let daemon_status = daemon_status_from_record(&daemon_record);
     tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
     tracing::debug!(target: "bcode_server::startup", "initializing lazy session services");
-    let sessions = SessionManager::persistent_lazy(default_session_store_dir());
+    let metrics = MetricsRegistry::default();
+    let sessions =
+        SessionManager::persistent_lazy_with_metrics(default_session_store_dir(), metrics.clone());
     tracing::debug!(target: "bcode_server::startup", "lazy session services ready");
     let resolved_model = config.resolved_model_selection();
     tracing::debug!(
@@ -1030,6 +1038,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
                 &bcode_config::default_state_dir(),
                 &daemon_record.namespace,
             )),
+            metrics,
         },
     ));
     state.start_catalog_event_forwarder();
@@ -4458,6 +4467,7 @@ async fn run_model_turn_round(
             "model turn cancelled",
         ));
     }
+    let start_timer = state.metrics.timer();
     let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
         state,
         provider_plugin_id.map(ToString::to_string),
@@ -4465,6 +4475,10 @@ async fn run_model_turn_round(
         request.clone(),
     )
     .await;
+    state.metrics.record_histogram(
+        "model.provider.start_turn_duration_ms",
+        start_timer.elapsed_ms(),
+    );
     let start = match start {
         Ok(start) => start,
         Err(error) => {
@@ -4649,7 +4663,12 @@ async fn poll_model_turn_events(
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
         };
+        let poll_timer = state.metrics.timer();
         let response = poll_model_turn(state, provider_plugin_id, &poll).await;
+        state.metrics.record_histogram(
+            "model.provider.poll_turn_events_duration_ms",
+            poll_timer.elapsed_ms(),
+        );
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -4663,6 +4682,9 @@ async fn poll_model_turn_events(
             }
         };
         if response.events.is_empty() {
+            state
+                .metrics
+                .increment_counter("model.provider.poll_empty_total");
             let Some(next_idle_for) = wait_for_model_progress_or_timeout(
                 state,
                 session_id,
@@ -4680,6 +4702,10 @@ async fn poll_model_turn_events(
             continue;
         }
         let saw_progress = model_events_include_progress(&response.events);
+        state.metrics.record_histogram(
+            "model.provider.poll_events_per_response",
+            response.events.len() as u64,
+        );
         for event in response.events {
             handle_provider_turn_event(
                 state,
@@ -4841,6 +4867,10 @@ async fn handle_provider_turn_event(
     match event {
         ProviderTurnEvent::TextDelta { text } => {
             append_provider_event_trace(state, session_id, turn_id, "text_delta", None).await;
+            state.metrics.record_histogram(
+                "model.provider.text_delta_chars",
+                text.chars().count() as u64,
+            );
             assistant_text.push_str(&text);
             append_assistant_delta_event(state, session_id, text).await;
         }
@@ -5417,7 +5447,11 @@ async fn build_model_turn_request(
     retry_instruction: Option<&str>,
     selection: &SessionModelSelection,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
+    let build_timer = state.metrics.timer();
     let history = state.sessions.model_context_events(session_id).await?;
+    state
+        .metrics
+        .record_histogram("model.context.event_count", history.len() as u64);
     let mut messages =
         session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
@@ -5512,7 +5546,7 @@ async fn build_model_turn_request(
     let conversation_reuse = plan_conversation_reuse(state, &projection, messages.len()).await;
     let mut metadata = projection.metadata();
     insert_reasoning_metadata(&mut metadata, &parameters);
-    Ok(ModelTurnRequest {
+    let request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id,
@@ -5524,7 +5558,11 @@ async fn build_model_turn_request(
         prompt_cache,
         conversation_reuse,
         metadata,
-    })
+    };
+    state
+        .metrics
+        .record_histogram("model.request_build_duration_ms", build_timer.elapsed_ms());
+    Ok(request)
 }
 
 fn insert_reasoning_metadata(
@@ -8707,6 +8745,7 @@ mod tests {
                 skill_context_bytes: 0,
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
+                metrics: MetricsRegistry::default(),
             },
         );
         let delta = ToolInvocationStreamEvent::OutputDelta {
@@ -8785,6 +8824,7 @@ mod tests {
                 skill_context_bytes: 0,
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
+                metrics: MetricsRegistry::default(),
             },
         );
 

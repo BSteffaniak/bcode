@@ -13,6 +13,7 @@ version     = { workspace = true }
 [dependencies]
 bcode_agent_profile   = { workspace = true }
 bcode_command         = { workspace = true }
+bcode_metrics         = { workspace = true }
 bcode_model           = { workspace = true }
 bcode_plugin          = { workspace = true }
 bcode_session_models  = { workspace = true }

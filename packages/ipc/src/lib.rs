@@ -5,6 +5,7 @@
 //! Client/server IPC protocol for bcode.
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
+use bcode_metrics::MetricsSnapshot;
 use bcode_session_models::{
     ClientId, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionHistoryPage,
     SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
@@ -321,6 +322,9 @@ pub struct ServerStatus {
     /// Server process identity and lifecycle metadata.
     #[serde(default)]
     pub daemon: DaemonStatus,
+    /// Lightweight runtime metrics snapshot.
+    #[serde(default)]
+    pub metrics: MetricsSnapshot,
 }
 
 /// Server process identity and lifecycle metadata.

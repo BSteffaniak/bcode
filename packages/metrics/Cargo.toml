@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Lightweight runtime metrics for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "metrics"]
+license     = { workspace = true }
+name        = "bcode_metrics"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default          = []
+fail-on-warnings = []
