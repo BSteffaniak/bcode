@@ -2923,12 +2923,37 @@ async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database:
         )
         .await?;
     seed_default_config(database).await?;
+    seed_default_world(database).await?;
     seed_company_created_event(database).await?;
     seed_starter_org_events(database).await?;
     seed_starter_world_events(database).await?;
     rebuild_projections_from_database(database)
         .await
         .map_err(|error| switchy_database::DatabaseError::QueryFailed(error.to_string()))?;
+    Ok(())
+}
+
+async fn seed_default_world(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    let existing = database
+        .select("worlds")
+        .columns(&["id"])
+        .filter(Box::new(where_eq("id", "default")))
+        .limit(1)
+        .execute_first(database)
+        .await?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    database
+        .insert("worlds")
+        .value("id", "default")
+        .value("company_id", "default")
+        .value("theme", "Cozy Startup Loft")
+        .value("player_room_id", "ceo-nook")
+        .execute(database)
+        .await?;
     Ok(())
 }
 
@@ -7537,6 +7562,23 @@ mod tests {
 
         assert!(json.contains("company_lifecycle_set"));
         assert!(json.contains("paused"));
+    }
+
+    #[test]
+    fn create_company_state_seeds_world_row() {
+        let temp = tempfile_path("world-row");
+        if temp.exists() {
+            std::fs::remove_dir_all(&temp).expect("stale temp state should be removable");
+        }
+        create_company_state(&temp).expect("company state should initialize");
+
+        let world = world_snapshot(&temp).expect("world snapshot should load after create");
+        let interactions =
+            available_interactions(&temp).expect("interactions should load after create");
+
+        assert_eq!(world.theme, "Cozy Startup Loft");
+        assert_eq!(interactions.room_id, "ceo-nook");
+        std::fs::remove_dir_all(temp).expect("temp state should be removable");
     }
 
     #[test]
