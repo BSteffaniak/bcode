@@ -1055,6 +1055,24 @@ impl AgentStatsRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentRelationshipRecord {
+    agent_id: String,
+    other_agent_id: String,
+    affinity: i64,
+    trust: i64,
+    notes: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentMemoryRecord {
+    id: String,
+    agent_id: String,
+    kind: String,
+    summary: String,
+    importance: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoomRecord {
     id: String,
@@ -1210,6 +1228,12 @@ enum BlimsEventPayload {
     },
     AgentStatsSet {
         stats: AgentStatsRecord,
+    },
+    AgentRelationshipSet {
+        relationship: AgentRelationshipRecord,
+    },
+    AgentMemoryRecorded {
+        memory: AgentMemoryRecord,
     },
     AgentContractUpdated {
         agent_id: String,
@@ -2011,6 +2035,28 @@ async fn create_org_tables(database: &dyn Database) -> Result<(), switchy_databa
         .column(int_column("confidence"))
         .primary_key("agent_id")
         .execute(database)
+        .await?;
+    create_table("agent_relationships")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("agent_id"))
+        .column(text_column("other_agent_id"))
+        .column(int_column("affinity"))
+        .column(int_column("trust"))
+        .column(text_column("notes"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("memories")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("agent_id"))
+        .column(text_column("kind"))
+        .column(text_column("summary"))
+        .column(int_column("importance"))
+        .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
         .await
 }
 
@@ -2311,6 +2357,26 @@ async fn seed_starter_world_events(
             &payload,
         )
         .await?;
+        for memory in starter_agent_memories(&agent.id) {
+            let payload = BlimsEventPayload::AgentMemoryRecorded { memory };
+            append_bootstrap_event_once(
+                database,
+                "agent.memory_recorded",
+                &format!("Starter memory recorded: {}", agent.name),
+                &payload,
+            )
+            .await?;
+        }
+    }
+    for relationship in starter_agent_relationships() {
+        let payload = BlimsEventPayload::AgentRelationshipSet { relationship };
+        append_bootstrap_event_once(
+            database,
+            "agent.relationship_set",
+            "Starter agent relationship set",
+            &payload,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2422,6 +2488,43 @@ fn starter_agent_stats(agent_id: &str) -> AgentStatsRecord {
     }
 }
 
+fn starter_agent_relationships() -> Vec<AgentRelationshipRecord> {
+    vec![
+        AgentRelationshipRecord {
+            agent_id: "mira".to_string(),
+            other_agent_id: "jules".to_string(),
+            affinity: 78,
+            trust: 84,
+            notes: "Mira trusts Jules to keep plans grounded in shippable slices.".to_string(),
+        },
+        AgentRelationshipRecord {
+            agent_id: "jules".to_string(),
+            other_agent_id: "pip".to_string(),
+            affinity: 74,
+            trust: 70,
+            notes: "Jules appreciates Pip's polish when scope stays crisp.".to_string(),
+        },
+        AgentRelationshipRecord {
+            agent_id: "pip".to_string(),
+            other_agent_id: "mira".to_string(),
+            affinity: 86,
+            trust: 80,
+            notes: "Pip looks to Mira for product direction before making things sparkly."
+                .to_string(),
+        },
+    ]
+}
+
+fn starter_agent_memories(agent_id: &str) -> Vec<AgentMemoryRecord> {
+    vec![AgentMemoryRecord {
+        id: format!("{agent_id}-origin"),
+        agent_id: agent_id.to_string(),
+        kind: "origin".to_string(),
+        summary: "Joined Blims at founding to make the company feel alive and useful.".to_string(),
+        importance: 80,
+    }]
+}
+
 fn fallback_world_snapshot() -> WorldSnapshot {
     WorldSnapshot {
         theme: "Cozy Startup Loft".to_string(),
@@ -2478,6 +2581,8 @@ struct CompanyData {
     tasks: Vec<TaskSummary>,
     artifacts: Vec<ArtifactSummary>,
     agent_stats: Vec<AgentStatsRecord>,
+    relationships: Vec<AgentRelationshipRecord>,
+    memories: Vec<AgentMemoryRecord>,
 }
 
 fn with_database<T>(
@@ -2675,6 +2780,12 @@ async fn apply_org_world_event_projection(
         }
         BlimsEventPayload::AgentStatsSet { stats } => {
             replace_one_agent_stats_projection(database, stats).await?;
+        }
+        BlimsEventPayload::AgentRelationshipSet { relationship } => {
+            replace_one_agent_relationship_projection(database, relationship).await?;
+        }
+        BlimsEventPayload::AgentMemoryRecorded { memory } => {
+            replace_one_agent_memory_projection(database, memory).await?;
         }
         BlimsEventPayload::AgentStatusSet { agent_id, status } => {
             database
@@ -3910,6 +4021,8 @@ async fn load_company_data_from_database(
     let tasks = load_tasks(database).await?;
     let artifacts = load_artifacts(database).await?;
     let agent_stats = load_agent_stats(database).await?;
+    let relationships = load_agent_relationships(database).await?;
+    let memories = load_agent_memories(database).await?;
 
     Ok(CompanyData {
         company,
@@ -3937,6 +4050,8 @@ async fn load_company_data_from_database(
         tasks,
         artifacts,
         agent_stats,
+        relationships,
+        memories,
     })
 }
 
@@ -4023,6 +4138,34 @@ async fn load_agent_stats(
         .collect::<Result<Vec<_>, _>>()
 }
 
+async fn load_agent_relationships(
+    database: &dyn Database,
+) -> Result<Vec<AgentRelationshipRecord>, BlimsStateError> {
+    database
+        .select("agent_relationships")
+        .columns(&["agent_id", "other_agent_id", "affinity", "trust", "notes"])
+        .sort("agent_id", SortDirection::Asc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(agent_relationship_record)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn load_agent_memories(
+    database: &dyn Database,
+) -> Result<Vec<AgentMemoryRecord>, BlimsStateError> {
+    database
+        .select("memories")
+        .columns(&["id", "agent_id", "kind", "summary", "importance"])
+        .sort("importance", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(agent_memory_record)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn load_company_record(database: &dyn Database) -> Result<CompanyRecord, BlimsStateError> {
     let row = database
         .select("companies")
@@ -4082,6 +4225,26 @@ fn agent_stats_record(row: &Row) -> Result<AgentStatsRecord, BlimsStateError> {
         morale: required_i64(row, "morale")?,
         focus: required_i64(row, "focus")?,
         confidence: required_i64(row, "confidence")?,
+    })
+}
+
+fn agent_relationship_record(row: &Row) -> Result<AgentRelationshipRecord, BlimsStateError> {
+    Ok(AgentRelationshipRecord {
+        agent_id: required_text(row, "agent_id")?,
+        other_agent_id: required_text(row, "other_agent_id")?,
+        affinity: required_i64(row, "affinity")?,
+        trust: required_i64(row, "trust")?,
+        notes: required_text(row, "notes")?,
+    })
+}
+
+fn agent_memory_record(row: &Row) -> Result<AgentMemoryRecord, BlimsStateError> {
+    Ok(AgentMemoryRecord {
+        id: required_text(row, "id")?,
+        agent_id: required_text(row, "agent_id")?,
+        kind: required_text(row, "kind")?,
+        summary: required_text(row, "summary")?,
+        importance: required_i64(row, "importance")?,
     })
 }
 
@@ -4145,6 +4308,8 @@ struct ProjectionState {
     rooms: Vec<RoomRecord>,
     agents: Vec<AgentRecord>,
     agent_stats: Vec<AgentStatsRecord>,
+    relationships: Vec<AgentRelationshipRecord>,
+    memories: Vec<AgentMemoryRecord>,
     departments: Vec<DepartmentRecord>,
     teams: Vec<TeamRecord>,
 }
@@ -4230,6 +4395,8 @@ fn replay_event(
         BlimsEventPayload::AgentHired { .. }
         | BlimsEventPayload::AgentMoved { .. }
         | BlimsEventPayload::AgentStatsSet { .. }
+        | BlimsEventPayload::AgentRelationshipSet { .. }
+        | BlimsEventPayload::AgentMemoryRecorded { .. }
         | BlimsEventPayload::AgentStatusSet { .. } => {
             replay_agent_event(payload, state);
         }
@@ -4323,6 +4490,19 @@ fn replay_agent_event(payload: BlimsEventPayload, state: &mut ProjectionState) {
         BlimsEventPayload::AgentStatsSet { stats } => {
             upsert_by_id(&mut state.agent_stats, stats, |stats| &stats.agent_id);
         }
+        BlimsEventPayload::AgentRelationshipSet { relationship } => {
+            if let Some(existing) = state.relationships.iter_mut().find(|existing| {
+                existing.agent_id == relationship.agent_id
+                    && existing.other_agent_id == relationship.other_agent_id
+            }) {
+                *existing = relationship;
+            } else {
+                state.relationships.push(relationship);
+            }
+        }
+        BlimsEventPayload::AgentMemoryRecorded { memory } => {
+            upsert_by_id(&mut state.memories, memory, |memory| &memory.id);
+        }
         BlimsEventPayload::AgentStatusSet { agent_id, status } => {
             if let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) {
                 agent.status = status;
@@ -4360,7 +4540,9 @@ async fn apply_projection_state(
     replace_team_projections(database, &state.teams).await?;
     replace_world_room_projections(database, &state.rooms).await?;
     replace_agent_projections(database, &state.agents).await?;
-    replace_agent_stats_projections(database, &state.agent_stats).await
+    replace_agent_stats_projections(database, &state.agent_stats).await?;
+    replace_agent_relationship_projections(database, &state.relationships).await?;
+    replace_agent_memory_projections(database, &state.memories).await
 }
 
 async fn replace_one_initiative_projection(
@@ -4685,6 +4867,79 @@ async fn replace_agent_stats_projections(
     Ok(())
 }
 
+async fn replace_one_agent_relationship_projection(
+    database: &dyn Database,
+    relationship: &AgentRelationshipRecord,
+) -> Result<(), BlimsStateError> {
+    let id = relationship_id(&relationship.agent_id, &relationship.other_agent_id);
+    database
+        .delete("agent_relationships")
+        .filter(Box::new(where_eq("id", id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("agent_relationships")
+        .value("id", id)
+        .value("agent_id", relationship.agent_id.clone())
+        .value("other_agent_id", relationship.other_agent_id.clone())
+        .value("affinity", relationship.affinity)
+        .value("trust", relationship.trust)
+        .value("notes", relationship.notes.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_agent_relationship_projections(
+    database: &dyn Database,
+    relationships: &[AgentRelationshipRecord],
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("agent_relationships")
+        .execute(database)
+        .await?;
+    for relationship in relationships {
+        replace_one_agent_relationship_projection(database, relationship).await?;
+    }
+    Ok(())
+}
+
+async fn replace_one_agent_memory_projection(
+    database: &dyn Database,
+    memory: &AgentMemoryRecord,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("memories")
+        .filter(Box::new(where_eq("id", memory.id.clone())))
+        .execute(database)
+        .await?;
+    database
+        .insert("memories")
+        .value("id", memory.id.clone())
+        .value("agent_id", memory.agent_id.clone())
+        .value("kind", memory.kind.clone())
+        .value("summary", memory.summary.clone())
+        .value("importance", memory.importance)
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn replace_agent_memory_projections(
+    database: &dyn Database,
+    memories: &[AgentMemoryRecord],
+) -> Result<(), BlimsStateError> {
+    database.delete("memories").execute(database).await?;
+    for memory in memories {
+        replace_one_agent_memory_projection(database, memory).await?;
+    }
+    Ok(())
+}
+
+fn relationship_id(agent_id: &str, other_agent_id: &str) -> String {
+    format!("{agent_id}->{other_agent_id}")
+}
+
 async fn replace_one_agent_contract_projection(
     database: &dyn Database,
     agent_id: &str,
@@ -4932,6 +5187,31 @@ fn agent_report(data: &CompanyData, agent_id: &str) -> Result<AgentReport, Blims
         bullets.push(stats.report_line());
         bullets.push(format!("Traits: {}", stats.traits));
         bullets.push(format!("Skills: {}", stats.skills));
+    }
+    for relationship in data
+        .relationships
+        .iter()
+        .filter(|relationship| relationship.agent_id == agent.id)
+        .take(2)
+    {
+        bullets.push(format!(
+            "Relationship with {}: affinity {}, trust {} — {}",
+            relationship.other_agent_id,
+            relationship.affinity,
+            relationship.trust,
+            relationship.notes
+        ));
+    }
+    for memory in data
+        .memories
+        .iter()
+        .filter(|memory| memory.agent_id == agent.id)
+        .take(2)
+    {
+        bullets.push(format!(
+            "Memory [{} · importance {}]: {}",
+            memory.kind, memory.importance, memory.summary
+        ));
     }
     if let Some(task) = assigned_tasks.first() {
         bullets.push(format!(
