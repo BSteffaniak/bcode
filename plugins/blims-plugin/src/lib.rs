@@ -97,6 +97,9 @@ pub const OP_TASK_WORK_PROMPT: &str = "task.work_prompt";
 /// Artifact list operation.
 pub const OP_ARTIFACT_LIST: &str = "artifact.list";
 
+/// Artifact create operation.
+pub const OP_ARTIFACT_CREATE: &str = "artifact.create";
+
 /// Artifact inspect operation.
 pub const OP_ARTIFACT_INSPECT: &str = "artifact.inspect";
 
@@ -241,6 +244,9 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
             service_task_record_outcome(request, &EventContext::from_request(request))
         }
         OP_ARTIFACT_LIST => service_artifact_list(request),
+        OP_ARTIFACT_CREATE => {
+            service_artifact_create(request, &EventContext::from_request(request))
+        }
         OP_ARTIFACT_INSPECT => service_artifact_inspect(request),
         OP_ARTIFACT_APPROVE => {
             service_artifact_status(request, &EventContext::from_request(request), "approved")
@@ -599,6 +605,30 @@ pub struct TaskOutcomeRequest {
     pub success: bool,
     /// Short result summary.
     pub summary: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to create a non-code Blims artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactCreateRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Parent initiative id.
+    pub initiative_id: String,
+    /// Artifact kind.
+    pub kind: String,
+    /// Artifact title.
+    pub title: String,
+    /// Artifact payload JSON or text.
+    pub payload_json: String,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -1798,6 +1828,21 @@ fn service_artifact_list(request: &ServiceRequest) -> ServiceResponse {
     match list_artifacts(&request.working_directory) {
         Ok(artifacts) => json_response(&artifacts),
         Err(error) => ServiceResponse::error("artifact_list_failed", error.to_string()),
+    }
+}
+
+fn service_artifact_create(
+    request: &ServiceRequest,
+    event_context: &EventContext,
+) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<ArtifactCreateRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match create_artifact(&request, &event_context) {
+        Ok(artifact) => json_response(&artifact),
+        Err(error) => ServiceResponse::error("artifact_create_failed", error.to_string()),
     }
 }
 
@@ -3958,6 +4003,43 @@ fn list_artifacts(working_directory: &Path) -> Result<Vec<ArtifactSummary>, Blim
                 .iter()
                 .map(artifact_summary)
                 .collect()
+        })
+    })
+}
+
+fn create_artifact(
+    request: &ArtifactCreateRequest,
+    event_context: &EventContext,
+) -> Result<ArtifactDetail, BlimsStateError> {
+    let kind = request.kind.trim().to_string();
+    let title = request.title.trim().to_string();
+    if kind.is_empty() || title.is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "artifact kind and title are required".to_string(),
+        ));
+    }
+    let artifact = ArtifactDetail {
+        id: format!("{}-{}", stable_slug(&kind), stable_slug(&title)),
+        initiative_id: request.initiative_id.clone(),
+        kind,
+        title,
+        status: "draft".to_string(),
+        payload_json: request.payload_json.clone(),
+    };
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            append_event(
+                database,
+                &event_context,
+                "artifact.created",
+                format!("Artifact created: {}", artifact.title),
+                &BlimsEventPayload::ArtifactCreated {
+                    artifact: artifact.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(artifact)
         })
     })
 }

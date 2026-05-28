@@ -203,6 +203,18 @@ pub enum BlimsArtifactCommand {
         #[arg(long)]
         yes: bool,
     },
+    Create {
+        kind: String,
+        title: String,
+        #[arg(long)]
+        initiative_id: String,
+        #[arg(long)]
+        payload: Option<String>,
+        #[arg(long)]
+        file: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Approve {
         artifact_id: String,
         #[arg(long)]
@@ -1335,6 +1347,16 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
         BlimsArtifactCommand::Apply { artifact_id, yes } => {
             apply_blims_patch_artifact(artifact_id, yes).await?;
         }
+        BlimsArtifactCommand::Create {
+            kind,
+            title,
+            initiative_id,
+            payload,
+            file,
+            json,
+        } => {
+            create_blims_artifact(kind, title, initiative_id, payload, file, json).await?;
+        }
         BlimsArtifactCommand::Approve { artifact_id, json } => {
             print_artifact_status_update(
                 "artifact.approve",
@@ -1405,6 +1427,37 @@ async fn handle_blims_proposal_command(command: BlimsProposalCommand) -> Result<
         BlimsProposalCommand::Patch { proposal_id, json } => {
             create_blims_proposal_patch(proposal_id, json).await?;
         }
+    }
+    Ok(())
+}
+
+async fn create_blims_artifact(
+    kind: String,
+    title: String,
+    initiative_id: String,
+    payload: Option<String>,
+    file: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let payload_json = match payload {
+        Some(payload) if file => std::fs::read_to_string(payload)?,
+        Some(payload) => payload,
+        None => "{}".to_string(),
+    };
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "initiative_id": initiative_id,
+        "kind": kind,
+        "title": title,
+        "payload_json": payload_json,
+    });
+    let response = call_blims_service("artifact.create", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let artifact = decode_blims_response::<BlimsArtifactDetail>(response)?;
+        println!("artifact created: {} ({})", artifact.title, artifact.id);
+        print_artifact_detail(&artifact);
     }
     Ok(())
 }
