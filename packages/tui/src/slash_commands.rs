@@ -2,7 +2,7 @@
 
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
-use bcode_worktree_models::{WorktreeCreateRequest, WorktreeListRequest};
+use bcode_worktree_models::WorktreeListRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommandOutcome {
@@ -14,6 +14,8 @@ pub enum SlashCommandOutcome {
     PickSession,
     /// Open model picker.
     PickModel,
+    /// Open worktree create dialog.
+    OpenWorktreeCreateDialog,
     /// Open skill picker.
     PickSkill,
     /// Open thinking settings dialog.
@@ -294,11 +296,11 @@ async fn cwd_command(
 
 async fn worktree_command(
     client: &BcodeClient,
-    session_id: SessionId,
+    session_id: Option<SessionId>,
     parts: &[&str],
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     match parts.get(1).copied() {
-        Some("list") | None => {
+        Some("list") => {
             let response = client
                 .list_worktrees(WorktreeListRequest { cwd: None })
                 .await?;
@@ -310,34 +312,13 @@ async fn worktree_command(
             }));
             Ok(SlashCommandOutcome::SystemNote(lines.join("\n")))
         }
-        Some("create") => {
-            let name = parts.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
-            if name.trim().is_empty() {
-                return Ok(SlashCommandOutcome::Handled(
-                    "usage: /worktree create <name>".to_string(),
-                ));
-            }
-            let response = client
-                .create_worktree(WorktreeCreateRequest {
-                    name,
-                    cwd: None,
-                    path: None,
-                    branch: None,
-                    new_branch: None,
-                    base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
-                    detach: false,
-                    force: false,
-                    attach_session_id: Some(session_id),
-                    new_session: false,
-                    no_setup: false,
-                })
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "created worktree {}",
-                response.path.display()
-            )))
-        }
+        Some("create") | None => Ok(SlashCommandOutcome::OpenWorktreeCreateDialog),
         Some("attach") if parts.len() > 2 => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "worktree attach requires an active session".to_owned(),
+                ));
+            };
             let path = parts.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
             let session = client
                 .change_session_working_directory(session_id, path)
@@ -348,7 +329,7 @@ async fn worktree_command(
             )))
         }
         Some(_) => Ok(SlashCommandOutcome::Handled(
-            "usage: /worktree [list|create <name>|attach <path>]".to_string(),
+            "usage: /worktree [list|create|attach <path>]".to_string(),
         )),
     }
 }
@@ -564,14 +545,7 @@ pub async fn execute(
             };
             cwd_command(client, session_id, &parts).await
         }
-        "worktree" | "worktrees" => {
-            let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::Handled(
-                    "worktree commands require an active session".to_owned(),
-                ));
-            };
-            worktree_command(client, session_id, &parts).await
-        }
+        "worktree" | "worktrees" => worktree_command(client, session_id, &parts).await,
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" => {
             let Some(session_id) = session_id else {

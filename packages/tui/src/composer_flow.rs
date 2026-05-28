@@ -6,7 +6,9 @@ use bcode_session_models::SessionId;
 
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
-use super::{TuiError, model_flow, session_flow, skill_flow, slash_commands, thinking_dialog};
+use super::{
+    TuiError, model_flow, session_flow, skill_flow, slash_commands, thinking_dialog, worktree_flow,
+};
 
 /// Result of submitting staged composer text.
 pub type SubmitComposerOutcome = Option<thinking_dialog::ThinkingDialogState>;
@@ -41,7 +43,15 @@ fn is_slash_command_name(command: &str) -> bool {
 fn is_draft_safe_slash_command(command: &str) -> bool {
     matches!(
         command,
-        "sessions" | "new" | "diff" | "skills" | "skill" | "thinking" | "rescan-imports"
+        "sessions"
+            | "new"
+            | "diff"
+            | "worktree"
+            | "worktrees"
+            | "skills"
+            | "skill"
+            | "thinking"
+            | "rescan-imports"
     )
 }
 
@@ -137,6 +147,10 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::PickSkill => {
             chat.app.clear_pending_submission(message);
             skill_flow::pick_skill_for_session(io, services, chat).await?;
+        }
+        slash_commands::SlashCommandOutcome::OpenWorktreeCreateDialog => {
+            chat.app.clear_pending_submission(message);
+            worktree_flow::create_for_current_session(io, services, chat).await?;
         }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);
