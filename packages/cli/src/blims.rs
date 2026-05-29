@@ -865,14 +865,7 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
                 }
                 KeyCode::Char('e') | KeyCode::Enter => app.activate_selected_interaction().await?,
                 KeyCode::Tab => app.select_next_interaction(),
-                KeyCode::Char('t') => {
-                    app.selected_interaction = app
-                        .nearby_interactions()
-                        .iter()
-                        .position(|interaction| interaction.source == "agent")
-                        .unwrap_or(app.selected_interaction);
-                    app.activate_selected_interaction().await?;
-                }
+                KeyCode::Char('t') => app.open_nearest_agent_conversation().await?,
                 KeyCode::Char('h') | KeyCode::Left => app.move_player_by(-1, 0),
                 KeyCode::Char('l') | KeyCode::Right => app.move_player_by(1, 0),
                 KeyCode::Char('k') | KeyCode::Up => app.move_player_by(0, -1),
@@ -1104,6 +1097,27 @@ impl BlimsTuiApp {
         Ok(())
     }
 
+    async fn open_nearest_agent_conversation(&mut self) -> Result<(), CliError> {
+        let Some(agent_id) = self.nearest_talkable_agent_id() else {
+            self.status = "Walk next to a coworker, then press t to talk.".to_string();
+            return Ok(());
+        };
+        self.open_agent_conversation(agent_id).await
+    }
+
+    fn nearest_talkable_agent_id(&self) -> Option<String> {
+        self.world
+            .agents
+            .iter()
+            .filter_map(|agent| {
+                let sprite = self.agent_sprites.get(&agent.id)?;
+                let distance = manhattan_distance(self.player_tile, sprite.position);
+                (distance <= 2).then(|| (distance, agent.id.clone()))
+            })
+            .min_by_key(|(distance, agent_id)| (*distance, agent_id.clone()))
+            .map(|(_, agent_id)| agent_id)
+    }
+
     fn select_next_interaction(&mut self) {
         let count = self.nearby_interactions().len();
         if count > 0 {
@@ -1121,10 +1135,24 @@ impl BlimsTuiApp {
     }
 
     fn nearby_interactions(&self) -> Vec<BlimsWorldInteraction> {
-        if !is_near_current_room(&self.world, self.player_tile, &self.interactions.room_id) {
-            return Vec::new();
-        }
-        self.interactions.interactions.clone()
+        let mut interactions =
+            if is_near_current_room(&self.world, self.player_tile, &self.interactions.room_id) {
+                self.interactions.interactions.clone()
+            } else {
+                Vec::new()
+            };
+        interactions.extend(self.world.agents.iter().filter_map(|agent| {
+            let sprite = self.agent_sprites.get(&agent.id)?;
+            (manhattan_distance(self.player_tile, sprite.position) <= 2).then(|| {
+                BlimsWorldInteraction {
+                    id: format!("talk-{}", agent.id),
+                    label: format!("Talk to {}", agent.name),
+                    command: format!("ai {}", agent.id),
+                    source: "agent".to_string(),
+                }
+            })
+        }));
+        interactions
     }
 
     fn should_world_tick(&self) -> bool {
@@ -1249,7 +1277,7 @@ impl BlimsTuiApp {
     }
 
     fn animate_agents(&mut self) -> bool {
-        if self.last_animation.elapsed() < Duration::from_millis(48) {
+        if self.last_animation.elapsed() < Duration::from_millis(160) {
             return false;
         }
         let mut dirty = false;
