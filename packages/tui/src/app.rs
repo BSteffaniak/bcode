@@ -126,7 +126,7 @@ impl BmuxApp {
             runtime_work: RuntimeWorkViewState::default(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
-            transcript_history: history.to_vec(),
+            transcript_history: Vec::new(),
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
             pending_assistant_stream_anchor: false,

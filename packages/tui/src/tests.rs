@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
+use bcode_config::TuiThinkingConfig;
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionSummary,
     SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
@@ -844,6 +845,47 @@ fn assistant_final_replaces_stream_when_usage_is_interleaved() {
     assert_eq!(assistant_items[0].text(), "Fixed.");
     assert!(!assistant_items[0].streaming());
     assert!(app.transcript().iter().any(|item| item.role() == "Usage"));
+}
+
+#[test]
+fn history_rebuild_does_not_duplicate_initial_history() {
+    let session_id = SessionId::new();
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "first".to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "second".to_owned(),
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+    app.apply_thinking_config(TuiThinkingConfig::default());
+
+    let user_items = app
+        .transcript()
+        .iter()
+        .filter(|item| item.role() == "You")
+        .collect::<Vec<_>>();
+    let assistant_items = app
+        .transcript()
+        .iter()
+        .filter(|item| item.role() == "Assistant")
+        .collect::<Vec<_>>();
+
+    assert_eq!(user_items.len(), 1);
+    assert_eq!(user_items[0].text(), "first");
+    assert_eq!(assistant_items.len(), 1);
+    assert_eq!(assistant_items[0].text(), "second");
 }
 
 #[test]
