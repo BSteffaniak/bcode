@@ -1777,10 +1777,8 @@ impl BlimsTuiApp {
 
 async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
     let operation =
-        submit_blims_command(serde_json::json!({ "type": "refresh_dashboard" })).await?;
-    let response =
-        call_blims_service("projection.dashboard.get", blims_workspace_payload()?).await?;
-    let projection = decode_blims_response::<BlimsDashboardProjection>(response)?;
+        submit_blims_command(&serde_json::json!({ "type": "refresh_dashboard" })).await?;
+    let projection = load_ceo_dashboard_projection().await?;
     Ok(BlimsCeoDashboardState {
         initiatives: projection.initiatives,
         tasks: projection.tasks,
@@ -1793,9 +1791,21 @@ async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
     })
 }
 
+async fn load_ceo_dashboard_projection() -> Result<BlimsDashboardProjection, CliError> {
+    let response =
+        call_blims_service("projection.dashboard.get", blims_workspace_payload()?).await?;
+    decode_blims_response::<BlimsDashboardProjection>(response)
+}
+
 async fn submit_blims_command(
-    command: serde_json::Value,
+    command: &serde_json::Value,
 ) -> Result<BlimsCommandSubmitResponse, CliError> {
+    let request = blims_command_request(command)?;
+    let response = call_blims_service("command.submit", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<BlimsCommandSubmitResponse>(response)
+}
+
+fn blims_command_request(command: &serde_json::Value) -> Result<serde_json::Value, CliError> {
     let command_type = command
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -1803,15 +1813,13 @@ async fn submit_blims_command(
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0_u128, |duration| duration.as_millis());
-    let request = serde_json::json!({
+    Ok(serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "command_id": format!("tui-{command_type}-{now_ms}"),
         "actor": "ceo",
         "frontend_id": "tui",
         "command": command,
-    });
-    let response = call_blims_service("command.submit", serde_json::to_vec(&request)?).await?;
-    decode_blims_response::<BlimsCommandSubmitResponse>(response)
+    }))
 }
 
 async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
@@ -1826,7 +1834,7 @@ async fn load_blims_interactions() -> Result<BlimsAvailableInteractions, CliErro
 }
 
 async fn move_blims_player_blocking(room_id: &str) -> Result<BlimsWorldSnapshot, CliError> {
-    let _operation = submit_blims_command(serde_json::json!({
+    let _operation = submit_blims_command(&serde_json::json!({
         "type": "move_player",
         "room_id": room_id,
     }))
@@ -1841,7 +1849,7 @@ async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot
         .map_or(0_i64, |duration| {
             i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
         });
-    let _operation = submit_blims_command(serde_json::json!({
+    let _operation = submit_blims_command(&serde_json::json!({
         "type": "tick_world",
         "tick_id": format!("tui-{tick_count}"),
         "now_ms": now_ms,
@@ -3459,13 +3467,15 @@ async fn print_world_templates(json: bool) -> Result<(), CliError> {
 async fn select_world_template_state(
     template_id: String,
 ) -> Result<(BlimsWorldSelection, bcode_ipc::PluginServiceResponse), CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
-        "template_id": template_id,
-    });
-    let response =
-        call_blims_service("world.select_template", serde_json::to_vec(&request)?).await?;
-    let world = decode_blims_response::<BlimsWorldSnapshot>(response.clone())?;
+    let response = call_blims_service(
+        "command.submit",
+        serde_json::to_vec(&blims_command_request(&serde_json::json!({
+            "type": "select_world_template",
+            "template_id": template_id,
+        }))?)?,
+    )
+    .await?;
+    let world = load_blims_world().await?;
     let interactions = load_blims_interactions().await?;
     let report = load_blims_report().await?;
     Ok((
@@ -3808,19 +3818,44 @@ async fn update_blims_proposal_status(
     operation: &str,
     proposal_id: String,
 ) -> Result<BlimsWorkProposalSummary, CliError> {
-    load_blims_proposal(operation, proposal_id).await
+    let status = status_from_legacy_operation(operation)?;
+    let _operation = submit_blims_command(&serde_json::json!({
+        "type": "set_proposal_status",
+        "proposal_id": proposal_id,
+        "status": status,
+    }))
+    .await?;
+    let dashboard = load_ceo_dashboard_projection().await?;
+    dashboard
+        .proposals
+        .into_iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .ok_or_else(|| CliError::Blims(format!("unknown proposal: {proposal_id}")))
 }
 
 async fn update_blims_artifact_status(
     operation: &str,
     artifact_id: String,
 ) -> Result<BlimsArtifactDetail, CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
+    let status = status_from_legacy_operation(operation)?;
+    let _operation = submit_blims_command(&serde_json::json!({
+        "type": "set_artifact_status",
         "artifact_id": artifact_id,
-    });
-    let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
-    decode_blims_response::<BlimsArtifactDetail>(response)
+        "status": status,
+    }))
+    .await?;
+    load_blims_artifact(artifact_id).await
+}
+
+fn status_from_legacy_operation(operation: &str) -> Result<&'static str, CliError> {
+    match operation.rsplit('.').next() {
+        Some("approve") => Ok("approved"),
+        Some("reject") => Ok("rejected"),
+        Some("defer") => Ok("deferred"),
+        _ => Err(CliError::Blims(format!(
+            "unsupported status operation: {operation}"
+        ))),
+    }
 }
 
 async fn print_proposal_status_update(

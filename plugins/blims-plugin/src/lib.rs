@@ -830,6 +830,22 @@ pub enum BlimsCommand {
         #[serde(default)]
         now_ms: Option<i64>,
     },
+    SelectWorldTemplate {
+        /// Starter template id.
+        template_id: String,
+    },
+    SetProposalStatus {
+        /// Proposal id.
+        proposal_id: String,
+        /// New proposal status.
+        status: String,
+    },
+    SetArtifactStatus {
+        /// Artifact id.
+        artifact_id: String,
+        /// New artifact status.
+        status: String,
+    },
     /// Record that a frontend opened a dashboard view.
     OpenDashboardView,
     /// Record that a frontend closed a dashboard view.
@@ -842,6 +858,9 @@ impl BlimsCommand {
             Self::RefreshDashboard => "dashboard.refresh",
             Self::MovePlayer { .. } => "world.move_player",
             Self::TickWorld { .. } => "world.tick",
+            Self::SelectWorldTemplate { .. } => "world.select_template",
+            Self::SetProposalStatus { .. } => "proposal.status_set",
+            Self::SetArtifactStatus { .. } => "artifact.status_set",
             Self::OpenDashboardView => "dashboard.open_view",
             Self::CloseDashboardView => "dashboard.close_view",
         }
@@ -851,6 +870,9 @@ impl BlimsCommand {
         match self {
             Self::RefreshDashboard
             | Self::MovePlayer { .. }
+            | Self::SelectWorldTemplate { .. }
+            | Self::SetProposalStatus { .. }
+            | Self::SetArtifactStatus { .. }
             | Self::OpenDashboardView
             | Self::CloseDashboardView => BlimsOperationPriority::Interactive,
             Self::TickWorld { .. } => BlimsOperationPriority::Background,
@@ -5123,39 +5145,48 @@ fn select_world_template(
     event_context: &EventContext,
 ) -> Result<WorldSnapshot, BlimsStateError> {
     let template_id = request.template_id.trim().to_string();
-    let template = find_starter_world_template(&template_id).ok_or_else(|| {
-        BlimsStateError::InvalidRequest(format!("unknown template: {template_id}"))
-    })?;
     let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
-            replace_world_room_projections(
-                database,
-                &template
-                    .rooms
-                    .iter()
-                    .cloned()
-                    .map(RoomRecord::from)
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
-            replace_world_object_projections(database, &template.objects).await?;
-            append_event(
-                database,
-                &event_context,
-                "world.starter_office_selected",
-                format!("Starter office selected: {}", template.name),
-                &BlimsEventPayload::StarterOfficeSelected {
-                    template_id: template.id,
-                    theme: template.name,
-                    player_room_id: template.player_room_id,
-                },
-            )
-            .await?;
+            select_world_template_in_database(database, &template_id, &event_context).await?;
             let data = load_company_data_from_database(database).await?;
             Ok(world_snapshot_from_data(data))
         })
     })
+}
+
+async fn select_world_template_in_database(
+    database: &dyn Database,
+    template_id: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    let template_id = template_id.trim().to_string();
+    let template = find_starter_world_template(&template_id).ok_or_else(|| {
+        BlimsStateError::InvalidRequest(format!("unknown template: {template_id}"))
+    })?;
+    replace_world_room_projections(
+        database,
+        &template
+            .rooms
+            .iter()
+            .cloned()
+            .map(RoomRecord::from)
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    replace_world_object_projections(database, &template.objects).await?;
+    append_event(
+        database,
+        event_context,
+        "world.starter_office_selected",
+        format!("Starter office selected: {}", template.name),
+        &BlimsEventPayload::StarterOfficeSelected {
+            template_id: template.id,
+            theme: template.name,
+            player_room_id: template.player_room_id,
+        },
+    )
+    .await
 }
 
 fn available_interactions_from_data(data: &CompanyData) -> AvailableInteractions {
@@ -5682,27 +5713,32 @@ fn create_artifact(
 fn inspect_artifact(request: &ArtifactInspectRequest) -> Result<ArtifactDetail, BlimsStateError> {
     let artifact_id = request.artifact_id.clone();
     with_database(&request.working_directory, move |database| {
-        Box::pin(async move {
-            database
-                .select("artifacts")
-                .columns(&[
-                    "id",
-                    "initiative_id",
-                    "kind",
-                    "title",
-                    "status",
-                    "payload_json",
-                ])
-                .filter(Box::new(where_eq("id", artifact_id)))
-                .limit(1)
-                .execute_first(database)
-                .await?
-                .as_ref()
-                .map(artifact_detail)
-                .transpose()?
-                .ok_or(BlimsStateError::MissingColumn("artifact"))
-        })
+        Box::pin(async move { load_artifact(database, &artifact_id).await })
     })
+}
+
+async fn load_artifact(
+    database: &dyn Database,
+    artifact_id: &str,
+) -> Result<ArtifactDetail, BlimsStateError> {
+    database
+        .select("artifacts")
+        .columns(&[
+            "id",
+            "initiative_id",
+            "kind",
+            "title",
+            "status",
+            "payload_json",
+        ])
+        .filter(Box::new(where_eq("id", artifact_id.to_string())))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .as_ref()
+        .map(artifact_detail)
+        .transpose()?
+        .ok_or(BlimsStateError::MissingColumn("artifact"))
 }
 
 fn set_artifact_status(
@@ -5710,27 +5746,40 @@ fn set_artifact_status(
     event_context: &EventContext,
     status: &str,
 ) -> Result<ArtifactDetail, BlimsStateError> {
-    let artifact = inspect_artifact(request)?;
     let artifact_id = request.artifact_id.clone();
     let status = status.to_string();
     let event_context = event_context.clone();
     let working_directory = request.working_directory.clone();
     with_database(&working_directory, move |database| {
         Box::pin(async move {
-            append_event(
-                database,
-                &event_context,
-                "artifact.status_set",
-                format!("Artifact {artifact_id} status set to {status}."),
-                &BlimsEventPayload::ArtifactStatusSet {
-                    artifact_id,
-                    status: status.clone(),
-                },
-            )
-            .await?;
+            let artifact = load_artifact(database, &artifact_id).await?;
+            set_artifact_status_in_database(database, &artifact_id, &status, &event_context)
+                .await?;
             Ok::<_, BlimsStateError>(ArtifactDetail { status, ..artifact })
         })
     })
+}
+
+async fn set_artifact_status_in_database(
+    database: &dyn Database,
+    artifact_id: &str,
+    status: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    let artifact_id = artifact_id.to_string();
+    let status = status.to_string();
+    load_artifact(database, &artifact_id).await?;
+    append_event(
+        database,
+        event_context,
+        "artifact.status_set",
+        format!("Artifact {artifact_id} status set to {status}."),
+        &BlimsEventPayload::ArtifactStatusSet {
+            artifact_id,
+            status,
+        },
+    )
+    .await
 }
 
 fn register_proposal(
@@ -5823,20 +5872,33 @@ fn set_proposal_status(
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
             let proposal = load_proposal(database, &proposal_id).await?;
-            append_event(
-                database,
-                &event_context,
-                "proposal.status_set",
-                format!("Proposal {proposal_id} status set to {status}."),
-                &BlimsEventPayload::ProposalStatusSet {
-                    proposal_id,
-                    status: status.clone(),
-                },
-            )
-            .await?;
+            set_proposal_status_in_database(database, &proposal_id, &status, &event_context)
+                .await?;
             Ok(WorkProposalSummary { status, ..proposal })
         })
     })
+}
+
+async fn set_proposal_status_in_database(
+    database: &dyn Database,
+    proposal_id: &str,
+    status: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    let proposal_id = proposal_id.to_string();
+    let status = status.to_string();
+    load_proposal(database, &proposal_id).await?;
+    append_event(
+        database,
+        event_context,
+        "proposal.status_set",
+        format!("Proposal {proposal_id} status set to {status}."),
+        &BlimsEventPayload::ProposalStatusSet {
+            proposal_id,
+            status,
+        },
+    )
+    .await
 }
 
 fn record_proposal_patch(
@@ -6422,6 +6484,24 @@ async fn run_command_operation(
         }
         BlimsCommand::TickWorld { tick_id, now_ms } => {
             tick_world_in_database(database, tick_id.as_deref(), *now_ms, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
+        BlimsCommand::SelectWorldTemplate { template_id } => {
+            select_world_template_in_database(database, template_id, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
+        BlimsCommand::SetProposalStatus {
+            proposal_id,
+            status,
+        } => {
+            set_proposal_status_in_database(database, proposal_id, status, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
+        BlimsCommand::SetArtifactStatus {
+            artifact_id,
+            status,
+        } => {
+            set_artifact_status_in_database(database, artifact_id, status, &event_context).await?;
             complete_operation(database, &event_context, operation_id).await
         }
         BlimsCommand::OpenDashboardView | BlimsCommand::CloseDashboardView => {
