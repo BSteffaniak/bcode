@@ -1078,6 +1078,7 @@ impl BlimsTuiApp {
     }
 
     async fn open_agent_conversation(&mut self, agent_id: String) -> Result<(), CliError> {
+        self.freeze_agent_sprite(&agent_id);
         let handle = create_blims_agent_conversation(agent_id.clone()).await?;
         let agent_name = self
             .world
@@ -1095,6 +1096,13 @@ impl BlimsTuiApp {
         refresh_conversation_transcript(&mut conversation).await?;
         self.mode = BlimsTuiMode::Conversation(conversation);
         Ok(())
+    }
+
+    fn freeze_agent_sprite(&mut self, agent_id: &str) {
+        if let Some(sprite) = self.agent_sprites.get_mut(agent_id) {
+            sprite.target = sprite.position;
+            sprite.path.clear();
+        }
     }
 
     async fn open_nearest_agent_conversation(&mut self) -> Result<(), CliError> {
@@ -1116,6 +1124,13 @@ impl BlimsTuiApp {
             })
             .min_by_key(|(distance, agent_id)| (*distance, agent_id.clone()))
             .map(|(_, agent_id)| agent_id)
+    }
+
+    fn active_conversation_agent_id(&self) -> Option<String> {
+        match &self.mode {
+            BlimsTuiMode::Conversation(conversation) => Some(conversation.handle.agent_id.clone()),
+            BlimsTuiMode::Office => None,
+        }
     }
 
     fn select_next_interaction(&mut self) {
@@ -1158,6 +1173,7 @@ impl BlimsTuiApp {
     fn should_world_tick(&self) -> bool {
         matches!(self.mode, BlimsTuiMode::Office)
             && self.jobs.world_template_select.is_none()
+            && self.active_conversation_agent_id().is_none()
             && self.last_world_tick.elapsed() >= Duration::from_millis(900)
     }
 
@@ -1194,9 +1210,18 @@ impl BlimsTuiApp {
 
     fn poll_background_jobs(&mut self) -> bool {
         let mut dirty = false;
+        let active_conversation_agent_id = self.active_conversation_agent_id();
         if let Some(BlimsBackgroundJob::WorldTick(receiver)) = &self.jobs.world_tick {
             match receiver.try_recv() {
-                Ok(Ok(world)) => {
+                Ok(Ok(mut world)) => {
+                    if let Some(agent_id) = &active_conversation_agent_id {
+                        keep_conversation_agent_in_place(
+                            &self.world,
+                            &mut world,
+                            &mut self.agent_sprites,
+                            agent_id,
+                        );
+                    }
                     let previous = self.world.clone();
                     self.apply_world_snapshot(world);
                     self.record_world_changes(&previous);
@@ -1280,6 +1305,7 @@ impl BlimsTuiApp {
         if self.last_animation.elapsed() < Duration::from_millis(160) {
             return false;
         }
+        let active_conversation_agent_id = self.active_conversation_agent_id();
         let mut dirty = false;
         let targets = self
             .world
@@ -1295,8 +1321,13 @@ impl BlimsTuiApp {
         for (agent_id, target) in targets {
             let sprite = self
                 .agent_sprites
-                .entry(agent_id)
+                .entry(agent_id.clone())
                 .or_insert_with(|| BlimsAgentSpriteState::new(target));
+            if active_conversation_agent_id.as_ref() == Some(&agent_id) {
+                sprite.target = sprite.position;
+                sprite.path.clear();
+                continue;
+            }
             if sprite.target != target {
                 sprite.target = target;
                 sprite.path.clear();
@@ -1312,12 +1343,18 @@ impl BlimsTuiApp {
     }
 
     fn sync_agent_targets(&mut self) {
+        let active_conversation_agent_id = self.active_conversation_agent_id();
         for agent in &self.world.agents {
             let target = agent_tile(&self.world, &self.geometry, agent);
             let sprite = self
                 .agent_sprites
                 .entry(agent.id.clone())
                 .or_insert_with(|| BlimsAgentSpriteState::new(target));
+            if active_conversation_agent_id.as_ref() == Some(&agent.id) {
+                sprite.target = sprite.position;
+                sprite.path.clear();
+                continue;
+            }
             if sprite.target != target {
                 sprite.target = target;
                 sprite.path.clear();
@@ -2352,6 +2389,29 @@ impl BlimsAgentSpriteState {
             target: position,
             path: VecDeque::new(),
         }
+    }
+}
+
+fn keep_conversation_agent_in_place(
+    previous_world: &BlimsWorldSnapshot,
+    next_world: &mut BlimsWorldSnapshot,
+    sprites: &mut BTreeMap<String, BlimsAgentSpriteState>,
+    agent_id: &str,
+) {
+    if let Some(previous_agent) = previous_world
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        && let Some(next_agent) = next_world
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == agent_id)
+    {
+        next_agent.room_id.clone_from(&previous_agent.room_id);
+    }
+    if let Some(sprite) = sprites.get_mut(agent_id) {
+        sprite.target = sprite.position;
+        sprite.path.clear();
     }
 }
 
