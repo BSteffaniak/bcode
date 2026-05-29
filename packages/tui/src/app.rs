@@ -39,7 +39,7 @@ use super::transcript::{
     push_streaming_transcript_item, streaming_terminal_output_item, streaming_tool_output_item,
     tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
-use super::transcript_layout::TranscriptLayoutCache;
+use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_viewport::TranscriptViewport;
 
 /// State owned by the terminal user interface.
@@ -68,6 +68,7 @@ pub struct BmuxApp {
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
     viewport: TranscriptViewport,
+    pending_assistant_stream_anchor: bool,
     older_history: OlderHistoryState,
     activity: ActivityState,
     status: String,
@@ -126,6 +127,7 @@ impl BmuxApp {
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
+            pending_assistant_stream_anchor: false,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
             status: String::from("TUI connected. Enter submits; Esc/Ctrl-C exits."),
@@ -460,6 +462,19 @@ impl BmuxApp {
         self.viewport.offset()
     }
 
+    /// Return the number of virtual transcript rows below the newest content.
+    #[must_use]
+    pub const fn bottom_overscroll(&self) -> usize {
+        self.viewport.bottom_overscroll()
+    }
+
+    /// Return the transcript row that should render at the top of the viewport.
+    #[must_use]
+    pub fn transcript_top_row(&self, viewport_height: u16) -> usize {
+        self.viewport
+            .top_row(self.transcript_layout.total_rows(), viewport_height)
+    }
+
     /// Return whether older history may be available.
     #[must_use]
     pub const fn has_older_history(&self) -> bool {
@@ -668,7 +683,7 @@ impl BmuxApp {
     }
 
     /// Scroll transcript down by rendered rows.
-    pub const fn scroll_transcript_down(&mut self, rows: usize) -> bool {
+    pub fn scroll_transcript_down(&mut self, rows: usize) -> bool {
         self.viewport.scroll_down(rows)
     }
 
@@ -678,9 +693,34 @@ impl BmuxApp {
     }
 
     /// Sync cached rendered transcript scroll bounds from the latest frame.
-    pub fn sync_transcript_scroll_max(&mut self, max_scroll_offset: usize) {
-        self.viewport
-            .sync_max(max_scroll_offset, &mut self.older_history);
+    pub fn sync_transcript_scroll_max(
+        &mut self,
+        max_scroll_offset: usize,
+        max_bottom_overscroll: usize,
+    ) {
+        self.viewport.sync_max(
+            max_scroll_offset,
+            max_bottom_overscroll,
+            &mut self.older_history,
+        );
+    }
+
+    /// Resolve deferred live-stream top anchoring against the latest cached layout.
+    pub fn sync_transcript_stream_anchor(&mut self) {
+        if !self.pending_assistant_stream_anchor {
+            return;
+        }
+        if let Some(index) = self
+            .transcript
+            .iter()
+            .rposition(|item| item.role() == "Assistant" && item.streaming())
+            && let Some(top_row) = self
+                .transcript_layout
+                .entry_start_row(VisibleTranscriptSource::Transcript, index)
+        {
+            self.viewport.follow_anchor(top_row);
+            self.pending_assistant_stream_anchor = false;
+        }
     }
 
     /// Absorb replayed history events.
@@ -722,6 +762,7 @@ impl BmuxApp {
     /// Absorb one live session event.
     #[allow(clippy::too_many_lines)]
     pub fn absorb_session_event(&mut self, event: &SessionEvent) {
+        let was_following = self.viewport.following();
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();
         }
@@ -729,7 +770,12 @@ impl BmuxApp {
             SessionEventKind::UserMessage { text, .. } => {
                 self.push_committed_user_message(event.sequence, text);
             }
-            SessionEventKind::AssistantDelta { text } => self.push_live_assistant_delta(text),
+            SessionEventKind::AssistantDelta { text } => {
+                if was_following {
+                    self.pending_assistant_stream_anchor = true;
+                }
+                self.push_live_assistant_delta(text);
+            }
             SessionEventKind::AssistantMessage { text } => {
                 self.finish_streaming_item("Assistant", text);
             }

@@ -126,16 +126,17 @@ impl TranscriptLayoutCache {
             )
     }
 
-    /// Return visible cached rows for a bottom-origin scroll offset and viewport height.
+    /// Return visible cached rows for a top-origin start row and viewport height.
     #[must_use]
-    pub fn visible_lines(
+    pub fn visible_lines_from_top(
         &self,
-        scroll_offset: usize,
+        start: usize,
         viewport_height: u16,
     ) -> Vec<VisibleTranscriptLine> {
         let total_rows = self.total_rows();
-        let end = total_rows.saturating_sub(scroll_offset).min(total_rows);
-        let start = end.saturating_sub(usize::from(viewport_height));
+        let end = start
+            .saturating_add(usize::from(viewport_height))
+            .min(total_rows);
         let mut visible = Vec::new();
         let mut row_cursor = 0usize;
 
@@ -186,9 +187,35 @@ impl TranscriptLayoutCache {
         }?;
         entry.rows.get(visible.row_in_entry)
     }
+    /// Return the global start row for a cached transcript entry.
+    #[must_use]
+    pub fn entry_start_row(
+        &self,
+        source: VisibleTranscriptSource,
+        entry_index: usize,
+    ) -> Option<usize> {
+        let mut row_cursor = 0usize;
+        if let Some(entry) = &self.history_banner {
+            if source == VisibleTranscriptSource::HistoryBanner && entry_index == 0 {
+                return Some(row_cursor);
+            }
+            row_cursor = row_cursor.saturating_add(entry.row_count());
+        }
+        for (index, entry) in self.transcript_entries.iter().enumerate() {
+            if source == VisibleTranscriptSource::Transcript && index == entry_index {
+                return Some(row_cursor);
+            }
+            row_cursor = row_cursor.saturating_add(entry.row_count());
+        }
+        for (index, entry) in self.pending_entries.iter().enumerate() {
+            if source == VisibleTranscriptSource::Pending && index == entry_index {
+                return Some(row_cursor);
+            }
+            row_cursor = row_cursor.saturating_add(entry.row_count());
+        }
+        None
+    }
 }
-
-/// Transcript layout synchronization input.
 pub struct TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R> {
     /// Render width.
     pub width: u16,

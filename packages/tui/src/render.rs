@@ -66,7 +66,11 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
     let transcript_area = transcript_area_for_body(app, body);
     sync_transcript_layout(app, transcript_area.width);
-    app.sync_transcript_scroll_max(max_transcript_scroll_offset(app, transcript_area));
+    app.sync_transcript_scroll_max(
+        max_transcript_scroll_offset(app, transcript_area),
+        max_transcript_bottom_overscroll(transcript_area),
+    );
+    app.sync_transcript_stream_anchor();
     render_body(app, body, frame);
 
     let status = Rect::new(
@@ -174,6 +178,10 @@ fn max_transcript_scroll_offset(app: &BmuxApp, area: Rect) -> usize {
         .saturating_sub(usize::from(area.height))
 }
 
+fn max_transcript_bottom_overscroll(area: Rect) -> usize {
+    usize::from(area.height).saturating_sub(1)
+}
+
 fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -185,7 +193,7 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     let mut y = area.y;
     for visible in app
         .transcript_layout()
-        .visible_lines(app.scroll_offset(), area.height)
+        .visible_lines_from_top(app.transcript_top_row(area.height), area.height)
     {
         if y >= area.bottom() {
             break;
@@ -2259,6 +2267,11 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if app.scroll_offset() > 0 {
         spans.push(Span::styled(
             format!(" · {} rows from bottom", app.scroll_offset()),
+            Style::new().fg(Color::BrightBlack),
+        ));
+    } else if app.bottom_overscroll() > 0 {
+        spans.push(Span::styled(
+            format!(" · {} rows below latest", app.bottom_overscroll()),
             Style::new().fg(Color::BrightBlack),
         ));
     }
