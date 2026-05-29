@@ -537,6 +537,120 @@ struct BlimsWorldSelection {
     interactions: BlimsAvailableInteractions,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsCeoDashboardState {
+    initiatives: Vec<BlimsInitiativeSummary>,
+    tasks: Vec<BlimsTaskSummary>,
+    proposals: Vec<BlimsWorkProposalSummary>,
+    artifacts: Vec<BlimsArtifactSummary>,
+    guidance: Vec<BlimsGuidanceSummary>,
+    selected_section: usize,
+    selected_item: usize,
+    status: String,
+}
+
+impl BlimsCeoDashboardState {
+    const SECTIONS: usize = 4;
+
+    const fn select_next_section(&mut self) {
+        self.selected_section = (self.selected_section + 1) % Self::SECTIONS;
+        self.selected_item = 0;
+    }
+
+    fn select_previous_section(&mut self) {
+        self.selected_section = self
+            .selected_section
+            .checked_sub(1)
+            .unwrap_or(Self::SECTIONS - 1);
+        self.selected_item = 0;
+    }
+
+    fn select_next_item(&mut self) {
+        let count = self.selected_count();
+        if count > 0 {
+            self.selected_item = (self.selected_item + 1) % count;
+        }
+    }
+
+    fn select_previous_item(&mut self) {
+        let count = self.selected_count();
+        if count > 0 {
+            self.selected_item = self
+                .selected_item
+                .checked_sub(1)
+                .unwrap_or_else(|| count.saturating_sub(1));
+        }
+    }
+
+    fn selected_count(&self) -> usize {
+        match self.selected_section {
+            0 => self.tasks.len().min(8),
+            1 => self.proposals.len().min(8),
+            2 => self.artifacts.len().min(8),
+            3 => self
+                .guidance
+                .len()
+                .min(3)
+                .saturating_add(self.initiatives.len().min(5)),
+            _ => 0,
+        }
+    }
+
+    fn selected_proposal_id(&self) -> Option<String> {
+        (self.selected_section == 1)
+            .then(|| {
+                self.proposals
+                    .get(self.selected_item)
+                    .map(|proposal| proposal.id.clone())
+            })
+            .flatten()
+    }
+
+    fn selected_artifact_id(&self) -> Option<String> {
+        (self.selected_section == 2)
+            .then(|| {
+                self.artifacts
+                    .get(self.selected_item)
+                    .map(|artifact| artifact.id.clone())
+            })
+            .flatten()
+    }
+
+    fn update_proposal(&mut self, proposal: BlimsWorkProposalSummary) {
+        if let Some(existing) = self
+            .proposals
+            .iter_mut()
+            .find(|existing| existing.id == proposal.id)
+        {
+            *existing = proposal;
+        }
+    }
+
+    fn update_artifact(&mut self, artifact: BlimsArtifactDetail) {
+        if let Some(existing) = self
+            .artifacts
+            .iter_mut()
+            .find(|existing| existing.id == artifact.id)
+        {
+            existing.status = artifact.status;
+            existing.title = artifact.title;
+            existing.kind = artifact.kind;
+            existing.initiative_id = artifact.initiative_id;
+        }
+    }
+
+    fn selected_action_hint(&self) -> String {
+        match self.selected_section {
+            0 => "Task selected. Use task work from CLI for now; in-world launch is next."
+                .to_string(),
+            1 => "Proposal selected. Press a approve, x reject, f defer.".to_string(),
+            2 => "Artifact selected. Press a approve, x reject, f defer.".to_string(),
+            3 => "Guidance/initiative selected. Whiteboard editing is next.".to_string(),
+            _ => "Nothing selected.".to_string(),
+        }
+    }
+}
+
 pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
     ensure_server_running().await?;
     match command {
@@ -850,6 +964,9 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
             if handle_blims_tui_conversation_key(app, stroke.key).await? {
                 return Ok(false);
             }
+            if handle_blims_tui_dashboard_key(app, stroke.key).await? {
+                return Ok(false);
+            }
             if matches!(stroke.key, KeyCode::Escape | KeyCode::Char('q')) {
                 return Ok(true);
             }
@@ -858,6 +975,7 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
             }
             match stroke.key {
                 KeyCode::Char('?') => app.show_help = !app.show_help,
+                KeyCode::Char('d') => app.open_ceo_dashboard().await?,
                 KeyCode::Char('w') => app.show_world_picker = true,
                 KeyCode::Char('r') => {
                     app.report = load_blims_report().await?;
@@ -913,6 +1031,73 @@ async fn handle_blims_tui_conversation_key(
     Ok(true)
 }
 
+async fn handle_blims_tui_dashboard_key(
+    app: &mut BlimsTuiApp,
+    key: KeyCode,
+) -> Result<bool, CliError> {
+    let BlimsTuiMode::Dashboard(dashboard) = &mut app.mode else {
+        return Ok(false);
+    };
+    match key {
+        KeyCode::Escape | KeyCode::Char('d') => {
+            app.mode = BlimsTuiMode::Office;
+            app.status = "Returned to office.".to_string();
+        }
+        KeyCode::Char('r') => {
+            let refreshed = load_ceo_dashboard().await?;
+            app.mode = BlimsTuiMode::Dashboard(refreshed);
+        }
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => dashboard.select_next_section(),
+        KeyCode::Left | KeyCode::Char('h') => dashboard.select_previous_section(),
+        KeyCode::Down | KeyCode::Char('j') => dashboard.select_next_item(),
+        KeyCode::Up | KeyCode::Char('k') => dashboard.select_previous_item(),
+        KeyCode::Enter => dashboard.status = dashboard.selected_action_hint(),
+        KeyCode::Char('a') => {
+            if let Some(proposal_id) = dashboard.selected_proposal_id() {
+                let proposal =
+                    update_blims_proposal_status("proposal.approve", proposal_id).await?;
+                dashboard.update_proposal(proposal);
+                dashboard.status = "Proposal approved.".to_string();
+            } else if let Some(artifact_id) = dashboard.selected_artifact_id() {
+                let artifact =
+                    update_blims_artifact_status("artifact.approve", artifact_id).await?;
+                dashboard.update_artifact(artifact);
+                dashboard.status = "Artifact approved.".to_string();
+            } else {
+                dashboard.status = "Select a proposal or artifact to approve.".to_string();
+            }
+        }
+        KeyCode::Char('x') => {
+            if let Some(proposal_id) = dashboard.selected_proposal_id() {
+                let proposal = update_blims_proposal_status("proposal.reject", proposal_id).await?;
+                dashboard.update_proposal(proposal);
+                dashboard.status = "Proposal rejected.".to_string();
+            } else if let Some(artifact_id) = dashboard.selected_artifact_id() {
+                let artifact = update_blims_artifact_status("artifact.reject", artifact_id).await?;
+                dashboard.update_artifact(artifact);
+                dashboard.status = "Artifact rejected.".to_string();
+            } else {
+                dashboard.status = "Select a proposal or artifact to reject.".to_string();
+            }
+        }
+        KeyCode::Char('f') => {
+            if let Some(proposal_id) = dashboard.selected_proposal_id() {
+                let proposal = update_blims_proposal_status("proposal.defer", proposal_id).await?;
+                dashboard.update_proposal(proposal);
+                dashboard.status = "Proposal deferred.".to_string();
+            } else if let Some(artifact_id) = dashboard.selected_artifact_id() {
+                let artifact = update_blims_artifact_status("artifact.defer", artifact_id).await?;
+                dashboard.update_artifact(artifact);
+                dashboard.status = "Artifact deferred.".to_string();
+            } else {
+                dashboard.status = "Select a proposal or artifact to defer.".to_string();
+            }
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
 fn handle_blims_tui_picker_key(app: &mut BlimsTuiApp, key: KeyCode) -> bool {
     if !app.show_world_picker {
         return false;
@@ -953,6 +1138,7 @@ struct BlimsConversationState {
 enum BlimsTuiMode {
     Office,
     Conversation(BlimsConversationState),
+    Dashboard(BlimsCeoDashboardState),
 }
 
 #[derive(Debug)]
@@ -1129,8 +1315,15 @@ impl BlimsTuiApp {
     fn active_conversation_agent_id(&self) -> Option<String> {
         match &self.mode {
             BlimsTuiMode::Conversation(conversation) => Some(conversation.handle.agent_id.clone()),
-            BlimsTuiMode::Office => None,
+            BlimsTuiMode::Office | BlimsTuiMode::Dashboard(_) => None,
         }
+    }
+
+    async fn open_ceo_dashboard(&mut self) -> Result<(), CliError> {
+        self.status = "Opening CEO dashboard…".to_string();
+        let dashboard = load_ceo_dashboard().await?;
+        self.mode = BlimsTuiMode::Dashboard(dashboard);
+        Ok(())
     }
 
     fn select_next_interaction(&mut self) {
@@ -1478,7 +1671,31 @@ impl BlimsTuiApp {
         if let BlimsTuiMode::Conversation(conversation) = &self.mode {
             render_conversation_modal(conversation, area, frame);
         }
+        if let BlimsTuiMode::Dashboard(dashboard) = &self.mode {
+            render_ceo_dashboard_modal(dashboard, area, frame);
+        }
     }
+}
+
+async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
+    let initiatives_response =
+        call_blims_service("initiative.list", blims_workspace_payload()?).await?;
+    let tasks_response = call_blims_service("task.list", blims_workspace_payload()?).await?;
+    let proposals_response =
+        call_blims_service("proposal.list", blims_workspace_payload()?).await?;
+    let artifacts_response =
+        call_blims_service("artifact.list", blims_workspace_payload()?).await?;
+    let guidance_response = call_blims_service("guidance.list", blims_workspace_payload()?).await?;
+    Ok(BlimsCeoDashboardState {
+        initiatives: decode_blims_response::<Vec<BlimsInitiativeSummary>>(initiatives_response)?,
+        tasks: decode_blims_response::<Vec<BlimsTaskSummary>>(tasks_response)?,
+        proposals: decode_blims_response::<Vec<BlimsWorkProposalSummary>>(proposals_response)?,
+        artifacts: decode_blims_response::<Vec<BlimsArtifactSummary>>(artifacts_response)?,
+        guidance: decode_blims_response::<Vec<BlimsGuidanceSummary>>(guidance_response)?,
+        selected_section: 0,
+        selected_item: 0,
+        status: "CEO dashboard loaded.".to_string(),
+    })
 }
 
 async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
@@ -2050,6 +2267,265 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
+fn render_ceo_dashboard_modal(
+    dashboard: &BlimsCeoDashboardState,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let modal = centered(area, Size::new(96, 30));
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightYellow)))
+        .title(" CEO operating dashboard ")
+        .background(Style::new().bg(Color::Rgb(16, 17, 28)));
+    panel.render(modal, frame);
+    let inner = panel.inner_area(modal).inset(Insets::all(1));
+    let rows = split(
+        inner,
+        Direction::Vertical,
+        &[
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ],
+    );
+    if rows.len() != 4 {
+        return;
+    }
+    TextBlock::new(Text::from_lines(vec![
+        Line::from_spans(vec![Span::styled(
+            "Company inbox",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(format!(
+            "{} initiative(s), {} task(s), {} proposal(s), {} artifact(s), {} active guidance item(s)",
+            dashboard.initiatives.len(),
+            dashboard.tasks.len(),
+            dashboard.proposals.len(),
+            dashboard.artifacts.len(),
+            dashboard.guidance.len()
+        )),
+    ]))
+    .style(
+        Style::new()
+            .bg(Color::Rgb(16, 17, 28))
+            .fg(Color::BrightWhite),
+    )
+    .render(rows[0], frame);
+
+    let columns = split(
+        rows[1],
+        Direction::Horizontal,
+        &[Constraint::Percentage(50), Constraint::Percentage(50)],
+    );
+    if columns.len() == 2 {
+        render_dashboard_agent_work(dashboard, columns[0], frame);
+        render_dashboard_proposals(dashboard, columns[1], frame);
+    }
+    let bottom_columns = split(
+        rows[2],
+        Direction::Horizontal,
+        &[Constraint::Percentage(50), Constraint::Percentage(50)],
+    );
+    if bottom_columns.len() == 2 {
+        render_dashboard_artifacts(dashboard, bottom_columns[0], frame);
+        render_dashboard_guidance(dashboard, bottom_columns[1], frame);
+    }
+    frame.write_line_with_fallback_style(
+        rows[3],
+        &Line::raw(format!(
+            "tab/←/→ sections · ↑/↓ select · a approve · x reject · f defer · r refresh · d/Esc closes · {}",
+            dashboard.status
+        )),
+        Style::new()
+            .bg(Color::Rgb(16, 17, 28))
+            .fg(Color::BrightBlack),
+    );
+}
+
+fn render_dashboard_agent_work(
+    dashboard: &BlimsCeoDashboardState,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        "Agent work",
+        Style::new()
+            .fg(Color::BrightCyan)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    if dashboard.tasks.is_empty() {
+        lines.push(Line::raw("No tasks yet. Create or plan an initiative."));
+    } else {
+        lines.extend(
+            dashboard
+                .tasks
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(index, task)| {
+                    dashboard_line(
+                        dashboard.selected_section == 0 && dashboard.selected_item == index,
+                        format!(
+                            "{} · {} · {} — {}",
+                            task.assigned_agent_id, task.status, task.id, task.title
+                        ),
+                    )
+                }),
+        );
+    }
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn render_dashboard_proposals(
+    dashboard: &BlimsCeoDashboardState,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        "Proposal inbox",
+        Style::new()
+            .fg(Color::BrightMagenta)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    if dashboard.proposals.is_empty() {
+        lines.push(Line::raw("No proposals yet. Ask an agent to plan/work."));
+    } else {
+        lines.extend(
+            dashboard
+                .proposals
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(index, proposal)| {
+                    dashboard_line(
+                        dashboard.selected_section == 1 && dashboard.selected_item == index,
+                        format!(
+                            "{} · {} · {} — {}",
+                            proposal.status, proposal.agent_id, proposal.id, proposal.summary
+                        ),
+                    )
+                }),
+        );
+    }
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn render_dashboard_artifacts(
+    dashboard: &BlimsCeoDashboardState,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        "Review artifacts",
+        Style::new()
+            .fg(Color::BrightGreen)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    if dashboard.artifacts.is_empty() {
+        lines.push(Line::raw("No artifacts yet."));
+    } else {
+        lines.extend(
+            dashboard
+                .artifacts
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(index, artifact)| {
+                    dashboard_line(
+                        dashboard.selected_section == 2 && dashboard.selected_item == index,
+                        format!(
+                            "{} · {} · {} — {}",
+                            artifact.status, artifact.kind, artifact.id, artifact.title
+                        ),
+                    )
+                }),
+        );
+    }
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn render_dashboard_guidance(
+    dashboard: &BlimsCeoDashboardState,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        "CEO guidance / initiatives",
+        Style::new()
+            .fg(Color::BrightYellow)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.extend(
+        dashboard
+            .guidance
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, guidance)| {
+                dashboard_line(
+                    dashboard.selected_section == 3 && dashboard.selected_item == index,
+                    format!("{} — {}", guidance.strength, guidance.guidance),
+                )
+            }),
+    );
+    let guidance_count = dashboard.guidance.len().min(3);
+    lines.extend(
+        dashboard
+            .initiatives
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(index, initiative)| {
+                dashboard_line(
+                    dashboard.selected_section == 3
+                        && dashboard.selected_item == guidance_count.saturating_add(index),
+                    format!(
+                        "{} · p{} — {}",
+                        initiative.status, initiative.priority, initiative.title
+                    ),
+                )
+            }),
+    );
+    if lines.len() == 1 {
+        lines.push(Line::raw("No guidance or initiatives yet."));
+    }
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(16, 17, 28)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn dashboard_line(selected: bool, text: String) -> Line {
+    Line::from_spans(vec![
+        Span::styled(
+            if selected { "▶ " } else { "  " },
+            Style::new().fg(Color::BrightYellow),
+        ),
+        Span::styled(
+            text,
+            if selected {
+                Style::new()
+                    .fg(Color::BrightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::White)
+            },
+        ),
+    ])
+}
+
 fn render_conversation_modal(
     conversation: &BlimsConversationState,
     area: Rect,
@@ -2110,7 +2586,7 @@ fn render_conversation_modal(
     frame.write_line_with_fallback_style(
         rows[2],
         &Line::raw(format!(
-            "Enter sends · Esc returns to office · session {}",
+            "Enter sends · Esc returns to office · d CEO dashboard · session {}",
             conversation.handle.session
         )),
         Style::new()
@@ -2130,6 +2606,7 @@ fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
         Line::raw("arrows/hjkl walk one tile around the top-down office"),
         Line::raw("e/enter uses the selected nearby interaction"),
         Line::raw("t opens native in-game coworker chat; tab cycles interactions"),
+        Line::raw("d opens CEO dashboard with initiatives, tasks, proposals, artifacts"),
         Line::raw("w opens starter office picker; escape closes modals"),
         Line::raw("r refreshes the morning report"),
         Line::raw("?/q toggle help / exit the office"),
@@ -3209,6 +3686,25 @@ async fn print_artifact_status_update(
         print_artifact_detail(&artifact);
     }
     Ok(())
+}
+
+async fn update_blims_proposal_status(
+    operation: &str,
+    proposal_id: String,
+) -> Result<BlimsWorkProposalSummary, CliError> {
+    load_blims_proposal(operation, proposal_id).await
+}
+
+async fn update_blims_artifact_status(
+    operation: &str,
+    artifact_id: String,
+) -> Result<BlimsArtifactDetail, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "artifact_id": artifact_id,
+    });
+    let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<BlimsArtifactDetail>(response)
 }
 
 async fn print_proposal_status_update(
