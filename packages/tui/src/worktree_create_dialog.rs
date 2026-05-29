@@ -1,6 +1,8 @@
 //! TUI worktree create dialog state.
 
-use bmux_text_edit::TextEditBuffer;
+use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+use bmux_tui::geometry::Rect;
+use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 
 /// Focused field in the worktree create dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +18,7 @@ pub enum WorktreeCreateFocus {
 /// Worktree create dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateDialog {
-    name: TextEditBuffer,
+    name: TextInputState,
     target: WorktreeCreateTarget,
     base: WorktreeCreateBase,
     focus: WorktreeCreateFocus,
@@ -28,15 +30,15 @@ impl WorktreeCreateDialog {
     /// Create a worktree create dialog.
     #[must_use]
     pub fn new(default_name: &str, current_session_available: bool) -> Self {
-        let mut name = TextEditBuffer::new();
-        name.insert_str(default_name);
+        let mut name = TextEditBuffer::from_text(default_name);
+        name.move_cursor_with_selection(TextMotion::Start, SelectionMode::Extend);
         let target = if current_session_available {
             WorktreeCreateTarget::CurrentSession
         } else {
             WorktreeCreateTarget::NewSession
         };
         Self {
-            name,
+            name: TextInputState::new(name),
             target,
             base: WorktreeCreateBase::Head,
             focus: WorktreeCreateFocus::Name,
@@ -51,15 +53,20 @@ impl WorktreeCreateDialog {
         self.focus
     }
 
-    /// Return name input.
+    /// Return name input state.
     #[must_use]
-    pub const fn name(&self) -> &TextEditBuffer {
+    pub const fn name(&self) -> &TextInputState {
         &self.name
     }
 
-    /// Return name input mutably.
-    pub const fn name_mut(&mut self) -> &mut TextEditBuffer {
+    /// Return name input state mutably.
+    pub const fn name_mut(&mut self) -> &mut TextInputState {
         &mut self.name
+    }
+
+    /// Update the latest name input content area.
+    pub fn set_name_content_area(&mut self, area: Rect) {
+        self.name.set_content_area(area, &name_input_policy());
     }
 
     /// Return selected session target.
@@ -83,7 +90,7 @@ impl WorktreeCreateDialog {
     /// Return the requested worktree name.
     #[must_use]
     pub fn name_text(&self) -> String {
-        self.name.text().trim().to_owned()
+        self.name.buffer().text().trim().to_owned()
     }
 
     /// Move focus to the next field.
@@ -128,6 +135,12 @@ impl WorktreeCreateDialog {
     const fn next_base(&mut self) {
         self.base = self.base.next();
     }
+}
+
+/// Return the text-input policy used by the worktree name field.
+#[must_use]
+pub const fn name_input_policy() -> TextInputPolicy {
+    TextInputPolicy::chat_composer()
 }
 
 /// Worktree session target in the create dialog.

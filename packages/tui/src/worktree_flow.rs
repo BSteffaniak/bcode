@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use super::runtime_context::{TuiIo, TuiServices};
 use bcode_client::BcodeClient;
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::{Event, FocusEvent};
+use bmux_tui::event::{Event, FocusEvent, MouseEvent};
 use bmux_tui::geometry::Rect;
+use bmux_tui_components::text_input::TextInputControl;
 
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -48,7 +49,7 @@ pub async fn create_for_current_session<W: Write>(
     loop {
         io.terminal.resize(helpers::terminal_area()?);
         io.terminal
-            .draw(|frame| worktree_create_dialog_render::render_dialog(&dialog, frame))?;
+            .draw(|frame| worktree_create_dialog_render::render_dialog(&mut dialog, frame))?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };
@@ -57,7 +58,8 @@ pub async fn create_for_current_session<W: Write>(
             Event::Paste(text)
                 if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name =>
             {
-                dialog.name_mut().insert_str(&text);
+                let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
+                    .handle_paste(dialog.name_mut(), &text);
             }
             Event::Key(stroke) => match stroke.key {
                 KeyCode::Escape => return Err(TuiError::Canceled),
@@ -106,22 +108,31 @@ pub async fn create_for_current_session<W: Write>(
                     return Ok(());
                 }
                 _ if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name => {
-                    let _ = helpers::handle_text_buffer_key(
-                        dialog.name_mut(),
-                        services.keymap,
-                        stroke,
-                        bmux_tui::input::TextInputEnterBehavior::Submit,
-                    );
+                    let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
+                        .handle_key(dialog.name_mut(), stroke);
                 }
                 _ => {}
             },
             Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
             | Event::Tick
             | Event::User(_)
-            | Event::Mouse(_)
             | Event::Paste(_) => {}
+            Event::Mouse(mouse) => {
+                handle_dialog_mouse(&mut dialog, mouse);
+            }
         }
     }
+}
+
+fn handle_dialog_mouse(
+    dialog: &mut worktree_create_dialog::WorktreeCreateDialog,
+    mouse: MouseEvent,
+) {
+    if dialog.focus() != worktree_create_dialog::WorktreeCreateFocus::Name {
+        return;
+    }
+    let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
+        .handle_mouse(dialog.name_mut(), mouse);
 }
 
 async fn handle_created_worktree<W: Write>(
