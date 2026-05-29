@@ -64,6 +64,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use tokio::task::JoinHandle;
+
+const CLIENT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
@@ -131,6 +134,8 @@ pub struct ServerState {
     client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
     active_session_namespaces: Mutex<BTreeMap<SessionId, String>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
+    attached_client_sessions: Mutex<BTreeMap<ClientId, SessionId>>,
+    client_forwarders: Mutex<BTreeMap<ClientId, Vec<JoinHandle<()>>>>,
     event_clients: Mutex<BTreeMap<ClientId, CatalogEventSubscription>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
@@ -172,7 +177,17 @@ impl ClientEventSink {
     async fn send(&self, event: Event) -> Result<(), CodecError> {
         let envelope = event_envelope(&event)?;
         let mut writer = self.writer.lock().await;
-        send_envelope(&mut *writer, &envelope).await
+        tokio::time::timeout(
+            CLIENT_EVENT_SEND_TIMEOUT,
+            send_envelope(&mut *writer, &envelope),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(CodecError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out sending event to client {}", self.client_id),
+            )))
+        })
     }
 }
 
@@ -514,6 +529,8 @@ impl ServerState {
             client_session_namespaces: Mutex::default(),
             active_session_namespaces: Mutex::default(),
             message_accepted_clients: Mutex::default(),
+            attached_client_sessions: Mutex::default(),
+            client_forwarders: Mutex::default(),
             event_clients: Mutex::default(),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
@@ -541,8 +558,58 @@ impl ServerState {
         self.unregister_catalog_event_client(client_id).await;
     }
 
-    async fn close_client(&self, client_id: ClientId) {
+    async fn attach_client_session(&self, client_id: ClientId, session_id: SessionId) {
+        self.attached_client_sessions
+            .lock()
+            .await
+            .insert(client_id, session_id);
+    }
+
+    async fn detach_client_session(
+        &self,
+        client_id: ClientId,
+    ) -> Result<(), bcode_session::SessionError> {
+        let session_id = self
+            .attached_client_sessions
+            .lock()
+            .await
+            .remove(&client_id);
+        if let Some(session_id) = session_id
+            && let Some(event) = self.sessions.detach_session(session_id, client_id).await?
+        {
+            publish_session_event(self, &event).await;
+            if let Ok(session) = self.sessions.session_summary(session_id).await {
+                self.session_catalog.upsert_native_session(session).await;
+            }
+            self.deactivate_session_namespace_if_inactive(session_id)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn register_client_forwarder(&self, client_id: ClientId, handle: JoinHandle<()>) {
+        self.client_forwarders
+            .lock()
+            .await
+            .entry(client_id)
+            .or_default()
+            .push(handle);
+    }
+
+    async fn abort_client_forwarders(&self, client_id: ClientId) {
+        let handles = self.client_forwarders.lock().await.remove(&client_id);
+        if let Some(handles) = handles {
+            for handle in handles {
+                handle.abort();
+            }
+        }
+    }
+
+    async fn close_client(&self, client_id: ClientId) -> Result<(), ServerError> {
+        self.abort_client_forwarders(client_id).await;
+        self.detach_client_session(client_id).await?;
         self.unregister_client(client_id).await;
+        Ok(())
     }
 
     async fn register_message_accepted_client(&self, client_id: ClientId) {
@@ -1199,8 +1266,11 @@ async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Resul
     state.register_client(client_id).await;
 
     let result = handle_registered_client(stream, &state, client_id).await;
-    state.close_client(client_id).await;
-    result
+    let cleanup_result = state.close_client(client_id).await;
+    match (result, cleanup_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 async fn handle_registered_client(
@@ -1210,7 +1280,7 @@ async fn handle_registered_client(
 ) -> Result<(), ServerError> {
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
-    let mut attached_session = None;
+    let mut attached_session: Option<SessionId> = None;
 
     loop {
         let envelope = match recv_envelope(&mut reader).await {
@@ -1235,18 +1305,6 @@ async fn handle_registered_client(
             &mut attached_session,
         )
         .await?;
-    }
-
-    if let Some(session_id) = attached_session
-        && let Some(event) = state.sessions.detach_session(session_id, client_id).await?
-    {
-        publish_session_event(state, &event).await;
-        if let Ok(session) = state.sessions.session_summary(session_id).await {
-            state.session_catalog.upsert_native_session(session).await;
-        }
-        state
-            .deactivate_session_namespace_if_inactive(session_id)
-            .await;
     }
 
     Ok(())
@@ -2174,6 +2232,7 @@ async fn handle_attach_session(
         Ok(attachment) => {
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
+            state.attach_client_session(client_id, session_id).await;
             publish_session_event(state, &attachment.attached_event).await;
             state
                 .session_catalog
@@ -2191,10 +2250,11 @@ async fn handle_attach_session(
                 }),
             )
             .await?;
-            forward_session_events(
+            let handle = forward_session_events(
                 ClientEventSink::new(client_id, writer.clone()),
                 attachment.events,
             );
+            state.register_client_forwarder(client_id, handle).await;
             Ok(())
         }
         Err(error) => {
@@ -2337,6 +2397,9 @@ async fn finish_attach_session_recent_success(
         elapsed_ms(restore_started_at),
     );
     *context.attached_session = Some(session_id);
+    state
+        .attach_client_session(context.client_id, session_id)
+        .await;
     let publish_started_at = Instant::now();
     publish_session_event(state, &attachment.attached_event).await;
     state.metrics.record_histogram(
@@ -2383,10 +2446,13 @@ async fn finish_attach_session_recent_success(
         "server.attach_recent.total_duration_ms",
         elapsed_ms(timings.total_started_at),
     );
-    forward_session_events(
+    let handle = forward_session_events(
         ClientEventSink::new(context.client_id, context.writer.clone()),
         attachment.events,
     );
+    state
+        .register_client_forwarder(context.client_id, handle)
+        .await;
     Ok(())
 }
 
@@ -3370,10 +3436,11 @@ async fn handle_subscribe_runtime_work(
         .sessions
         .attach_session_recent(session_id, ClientId::new(), 1)
         .await?;
-    forward_runtime_work_events(
+    let handle = forward_runtime_work_events(
         ClientEventSink::new(client_id, writer.clone()),
         attachment.events,
     );
+    state.register_client_forwarder(client_id, handle).await;
     send_response(
         writer,
         request_id,
@@ -7932,6 +7999,7 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
                     | std::io::ErrorKind::ConnectionReset
                     | std::io::ErrorKind::UnexpectedEof
                     | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
             )
     )
 }
@@ -7939,7 +8007,7 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
 fn forward_session_events(
     sink: ClientEventSink,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok(event) = events.recv().await {
             if let Err(error) = sink.send(Event::Session(event)).await {
@@ -7952,13 +8020,13 @@ fn forward_session_events(
                 break;
             }
         }
-    });
+    })
 }
 
 fn forward_runtime_work_events(
     sink: ClientEventSink,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok(event) = events.recv().await {
             if !matches!(
@@ -7980,7 +8048,7 @@ fn forward_runtime_work_events(
                 break;
             }
         }
-    });
+    })
 }
 
 fn compact_attach_history(
