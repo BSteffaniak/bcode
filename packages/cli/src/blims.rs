@@ -552,6 +552,19 @@ struct BlimsCeoDashboardState {
 impl BlimsCeoDashboardState {
     const SECTIONS: usize = 4;
 
+    const fn loading(status: String) -> Self {
+        Self {
+            initiatives: Vec::new(),
+            tasks: Vec::new(),
+            proposals: Vec::new(),
+            artifacts: Vec::new(),
+            guidance: Vec::new(),
+            selected_section: 0,
+            selected_item: 0,
+            status,
+        }
+    }
+
     const fn select_next_section(&mut self) {
         self.selected_section = (self.selected_section + 1) % Self::SECTIONS;
         self.selected_item = 0;
@@ -975,7 +988,7 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
             }
             match stroke.key {
                 KeyCode::Char('?') => app.show_help = !app.show_help,
-                KeyCode::Char('d') => app.open_ceo_dashboard().await?,
+                KeyCode::Char('d') => app.open_ceo_dashboard(),
                 KeyCode::Char('w') => app.show_world_picker = true,
                 KeyCode::Char('r') => {
                     app.report = load_blims_report().await?;
@@ -1044,8 +1057,12 @@ async fn handle_blims_tui_dashboard_key(
             app.status = "Returned to office.".to_string();
         }
         KeyCode::Char('r') => {
-            let refreshed = load_ceo_dashboard().await?;
-            app.mode = BlimsTuiMode::Dashboard(refreshed);
+            dashboard.status = "Refreshing CEO dashboard…".to_string();
+            if app.jobs.dashboard_load.is_none() {
+                app.jobs.dashboard_load = Some(BlimsBackgroundJob::DashboardLoad(
+                    spawn_blims_background(|| Box::pin(load_ceo_dashboard())),
+                ));
+            }
         }
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => dashboard.select_next_section(),
         KeyCode::Left | KeyCode::Char('h') => dashboard.select_previous_section(),
@@ -1146,6 +1163,7 @@ enum BlimsBackgroundJob {
     WorldTick(Receiver<Result<BlimsWorldSnapshot, CliError>>),
     PlayerRoomSync(Receiver<Result<BlimsWorldSnapshot, CliError>>),
     WorldTemplateSelect(Receiver<Result<BlimsWorldSelection, CliError>>),
+    DashboardLoad(Receiver<Result<BlimsCeoDashboardState, CliError>>),
 }
 
 #[derive(Debug)]
@@ -1153,6 +1171,7 @@ struct BlimsBackgroundJobs {
     world_tick: Option<BlimsBackgroundJob>,
     player_room_sync: Option<BlimsBackgroundJob>,
     world_template_select: Option<BlimsBackgroundJob>,
+    dashboard_load: Option<BlimsBackgroundJob>,
 }
 
 impl BlimsBackgroundJobs {
@@ -1161,6 +1180,7 @@ impl BlimsBackgroundJobs {
             world_tick: None,
             player_room_sync: None,
             world_template_select: None,
+            dashboard_load: None,
         }
     }
 }
@@ -1319,11 +1339,16 @@ impl BlimsTuiApp {
         }
     }
 
-    async fn open_ceo_dashboard(&mut self) -> Result<(), CliError> {
-        self.status = "Opening CEO dashboard…".to_string();
-        let dashboard = load_ceo_dashboard().await?;
-        self.mode = BlimsTuiMode::Dashboard(dashboard);
-        Ok(())
+    fn open_ceo_dashboard(&mut self) {
+        self.mode = BlimsTuiMode::Dashboard(BlimsCeoDashboardState::loading(
+            "Loading CEO dashboard…".to_string(),
+        ));
+        self.status = "Loading CEO dashboard…".to_string();
+        if self.jobs.dashboard_load.is_none() {
+            self.jobs.dashboard_load = Some(BlimsBackgroundJob::DashboardLoad(
+                spawn_blims_background(|| Box::pin(load_ceo_dashboard())),
+            ));
+        }
     }
 
     fn select_next_interaction(&mut self) {
@@ -1366,6 +1391,7 @@ impl BlimsTuiApp {
     fn should_world_tick(&self) -> bool {
         matches!(self.mode, BlimsTuiMode::Office)
             && self.jobs.world_template_select.is_none()
+            && self.jobs.dashboard_load.is_none()
             && self.active_conversation_agent_id().is_none()
             && self.last_world_tick.elapsed() >= Duration::from_millis(900)
     }
@@ -1373,6 +1399,7 @@ impl BlimsTuiApp {
     fn schedule_background_jobs(&mut self) {
         if self.should_world_tick()
             && self.jobs.world_tick.is_none()
+            && self.jobs.dashboard_load.is_none()
             && self.pending_world_template_name.is_none()
         {
             self.tick_count = self.tick_count.saturating_add(1);
@@ -1402,6 +1429,14 @@ impl BlimsTuiApp {
     }
 
     fn poll_background_jobs(&mut self) -> bool {
+        let mut dirty = self.poll_world_tick_job();
+        dirty |= self.poll_player_room_sync_job();
+        dirty |= self.poll_world_template_select_job();
+        dirty |= self.poll_dashboard_load_job();
+        dirty
+    }
+
+    fn poll_world_tick_job(&mut self) -> bool {
         let mut dirty = false;
         let active_conversation_agent_id = self.active_conversation_agent_id();
         if let Some(BlimsBackgroundJob::WorldTick(receiver)) = &self.jobs.world_tick {
@@ -1434,6 +1469,11 @@ impl BlimsTuiApp {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        dirty
+    }
+
+    fn poll_player_room_sync_job(&mut self) -> bool {
+        let mut dirty = false;
         if let Some(BlimsBackgroundJob::PlayerRoomSync(receiver)) = &self.jobs.player_room_sync {
             match receiver.try_recv() {
                 Ok(Ok(world)) => {
@@ -1454,6 +1494,11 @@ impl BlimsTuiApp {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        dirty
+    }
+
+    fn poll_world_template_select_job(&mut self) -> bool {
+        let mut dirty = false;
         if let Some(BlimsBackgroundJob::WorldTemplateSelect(receiver)) =
             &self.jobs.world_template_select
         {
@@ -1479,6 +1524,38 @@ impl BlimsTuiApp {
                 Err(TryRecvError::Disconnected) => {
                     self.status = "world select worker disconnected".to_string();
                     self.jobs.world_template_select = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        dirty
+    }
+
+    fn poll_dashboard_load_job(&mut self) -> bool {
+        let mut dirty = false;
+        if let Some(BlimsBackgroundJob::DashboardLoad(receiver)) = &self.jobs.dashboard_load {
+            match receiver.try_recv() {
+                Ok(Ok(dashboard)) => {
+                    self.mode = BlimsTuiMode::Dashboard(dashboard);
+                    self.status = "CEO dashboard loaded.".to_string();
+                    self.jobs.dashboard_load = None;
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    if let BlimsTuiMode::Dashboard(dashboard) = &mut self.mode {
+                        dashboard.status = format!("dashboard load failed: {error}");
+                    }
+                    self.status = format!("dashboard load failed: {error}");
+                    self.jobs.dashboard_load = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    if let BlimsTuiMode::Dashboard(dashboard) = &mut self.mode {
+                        dashboard.status = "dashboard loader disconnected".to_string();
+                    }
+                    self.status = "dashboard loader disconnected".to_string();
+                    self.jobs.dashboard_load = None;
                     dirty = true;
                 }
                 Err(TryRecvError::Empty) => {}
