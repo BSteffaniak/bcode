@@ -17,7 +17,7 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>) {
             Span::styled("Select model", Style::new().add_modifier(Modifier::BOLD)),
             Span::raw("  Enter selects  Esc cancels"),
         ]),
-        app.filter(),
+        app.filter_mut(),
         "Filter models",
         frame,
     ) else {

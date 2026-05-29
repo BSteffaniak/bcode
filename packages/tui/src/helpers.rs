@@ -11,21 +11,6 @@ use crossterm::terminal::size;
 
 use super::TuiError;
 use super::app::BmuxApp;
-use super::keymap::BmuxKeyMap;
-
-/// Apply a key stroke to a text buffer using configured editor bindings first.
-pub fn handle_text_buffer_key(
-    buffer: &mut bmux_text_edit::TextEditBuffer,
-    keymap: &BmuxKeyMap,
-    stroke: KeyStroke,
-    enter_behavior: TextInputEnterBehavior,
-) -> TextInputKeyOutcome {
-    if let Some(command) = keymap.editor_command_for_key(stroke) {
-        buffer.apply_command(command);
-        return TextInputKeyOutcome::Edited;
-    }
-    handle_default_text_key(buffer, stroke, enter_behavior)
-}
 
 /// Apply a key stroke to a text buffer using the default text-input bindings.
 ///

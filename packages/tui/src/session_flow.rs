@@ -8,7 +8,6 @@ use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
 
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -19,6 +18,7 @@ use tokio::task::JoinHandle;
 use super::app::BmuxApp;
 use super::helpers;
 use super::runtime_context::{TuiIo, TuiServices};
+use super::text_input_flow;
 use super::{TuiError, history_flow};
 use super::{session_picker, session_picker_render};
 
@@ -327,7 +327,7 @@ pub async fn pick_session<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
-                picker.filter_mut().insert_str(&text);
+                let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                 picker.refresh_filter();
             }
             Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
@@ -407,10 +407,12 @@ pub async fn pick_session_for_mutation<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => match picker.mode() {
-                session_picker::SessionPickerMode::Rename => picker.rename_mut().insert_str(&text),
+                session_picker::SessionPickerMode::Rename => {
+                    let _ = text_input_flow::handle_paste(picker.rename_mut(), &text);
+                }
                 session_picker::SessionPickerMode::Filter
                 | session_picker::SessionPickerMode::DeleteConfirm => {
-                    picker.filter_mut().insert_str(&text);
+                    let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                     picker.refresh_filter();
                 }
             },
@@ -541,13 +543,9 @@ fn handle_picker_filter_key(
             PickerKeyOutcome::Continue
         }
         _ => {
-            let outcome = helpers::handle_text_buffer_key(
-                picker.filter_mut(),
-                keymap,
-                stroke,
-                TextInputEnterBehavior::InsertNewline,
-            );
-            if outcome == TextInputKeyOutcome::Edited {
+            if text_input_flow::handle_key(picker.filter_mut(), keymap, stroke)
+                != bmux_tui_components::text_input::TextInputOutcome::Ignored
+            {
                 picker.refresh_filter();
             }
             PickerKeyOutcome::Continue
@@ -567,13 +565,9 @@ fn handle_picker_rename_key(
     if stroke.key == KeyCode::Enter {
         return PickerKeyOutcome::Rename;
     }
-    let outcome = helpers::handle_text_buffer_key(
-        picker.rename_mut(),
-        keymap,
-        stroke,
-        TextInputEnterBehavior::Submit,
-    );
-    if outcome == TextInputKeyOutcome::Submitted {
+    if text_input_flow::handle_key(picker.rename_mut(), keymap, stroke)
+        == bmux_tui_components::text_input::TextInputOutcome::Submitted
+    {
         PickerKeyOutcome::Rename
     } else {
         PickerKeyOutcome::Continue
@@ -602,7 +596,7 @@ async fn rename_picker_session(
         picker.finish_mutation("No session selected to rename".to_owned());
         return Ok(());
     };
-    let name = picker.rename().text().trim();
+    let name = picker.rename().buffer().text().trim();
     let name = (!name.is_empty()).then(|| name.to_owned());
     match client.rename_session(session_id, name).await {
         Ok(_) => {

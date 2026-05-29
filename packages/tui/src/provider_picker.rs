@@ -1,10 +1,10 @@
 //! TUI provider picker state.
 
 use bcode_ipc::PluginServiceSummary;
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
 
@@ -12,7 +12,7 @@ use super::filtered_list::FilteredListState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPickerApp {
     providers: Vec<PluginServiceSummary>,
-    filter: TextEditBuffer,
+    filter: TextInputState,
     list: FilteredListState,
 }
 
@@ -23,19 +23,13 @@ impl ProviderPickerApp {
         let list = FilteredListState::new(providers.len());
         Self {
             providers,
-            filter: TextEditBuffer::new(),
+            filter: super::text_input_flow::empty_state(),
             list,
         }
     }
 
-    /// Return filter input.
-    #[must_use]
-    pub const fn filter(&self) -> &TextEditBuffer {
-        &self.filter
-    }
-
     /// Return filter input mutably.
-    pub const fn filter_mut(&mut self) -> &mut TextEditBuffer {
+    pub const fn filter_mut(&mut self) -> &mut TextInputState {
         &mut self.filter
     }
 
@@ -66,7 +60,7 @@ impl ProviderPickerApp {
 
     /// Refresh filter.
     pub fn refresh_filter(&mut self) {
-        let query = self.filter.text().trim().to_ascii_lowercase();
+        let query = self.filter.buffer().text().trim().to_ascii_lowercase();
         let filtered_indices = self
             .providers
             .iter()

@@ -16,8 +16,8 @@ use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::session_flow::ActiveChat;
 use super::{
-    TuiError, session_flow, worktree_create_dialog, worktree_create_dialog_render, worktree_picker,
-    worktree_picker_render,
+    TuiError, session_flow, text_input_flow, worktree_create_dialog, worktree_create_dialog_render,
+    worktree_picker, worktree_picker_render,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,7 +228,7 @@ pub async fn attach_current_session<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
-                picker.filter_mut().insert_str(&text);
+                let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                 picker.refresh_filter();
             }
             Event::Key(stroke) => match handle_picker_key(&mut picker, services.keymap, stroke) {
@@ -295,7 +295,7 @@ pub async fn remove_worktree<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
-                picker.filter_mut().insert_str(&text);
+                let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                 picker.refresh_filter();
             }
             Event::Key(stroke) => {
@@ -390,16 +390,6 @@ fn handle_picker_key(
     }
     match stroke.key {
         KeyCode::Char('f' | 'F') => PickerKeyOutcome::ForceSelected,
-        KeyCode::Char(character) => {
-            picker.filter_mut().insert_char(character);
-            picker.refresh_filter();
-            PickerKeyOutcome::Continue
-        }
-        KeyCode::Backspace => {
-            picker.filter_mut().delete_backward();
-            picker.refresh_filter();
-            PickerKeyOutcome::Continue
-        }
         KeyCode::Escape => PickerKeyOutcome::Canceled,
         KeyCode::Enter => PickerKeyOutcome::Selected,
         KeyCode::Up => {
@@ -410,6 +400,13 @@ fn handle_picker_key(
             picker.select_next();
             PickerKeyOutcome::Continue
         }
-        _ => PickerKeyOutcome::Continue,
+        _ => {
+            if text_input_flow::handle_key(picker.filter_mut(), keymap, stroke)
+                != bmux_tui_components::text_input::TextInputOutcome::Ignored
+            {
+                picker.refresh_filter();
+            }
+            PickerKeyOutcome::Continue
+        }
     }
 }

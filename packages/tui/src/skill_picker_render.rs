@@ -10,6 +10,7 @@ use super::picker_render::{
     picker_base_style, picker_list_area, render_picker_chrome, render_picker_list,
 };
 use super::skill_picker::{SkillPickerApp, SkillPickerMode};
+use super::text_input_flow;
 
 /// Render the skill picker.
 pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>) {
@@ -19,7 +20,7 @@ pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>) {
             Span::styled("Skills", Style::new().add_modifier(Modifier::BOLD)),
             Span::raw("  Enter invoke  a activate  d deactivate  ? help  Esc cancel"),
         ]),
-        app.filter(),
+        app.filter_mut(),
         "Filter skills",
         frame,
     ) else {
@@ -34,7 +35,7 @@ pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>) {
     render_picker_list(&items, app.list_state_mut(), list_area, frame);
 }
 
-fn render_bottom(app: &SkillPickerApp, inner: Rect, frame: &mut Frame<'_>) -> u16 {
+fn render_bottom(app: &mut SkillPickerApp, inner: Rect, frame: &mut Frame<'_>) -> u16 {
     let bottom_height = match app.mode() {
         SkillPickerMode::Filter => 1,
         SkillPickerMode::Argument => 3,
@@ -49,14 +50,16 @@ fn render_bottom(app: &SkillPickerApp, inner: Rect, frame: &mut Frame<'_>) -> u1
             )]),
             picker_base_style(),
         );
-        TextInput::new(app.argument())
+        let input_area = Rect::new(inner.x, bottom_y.saturating_add(1), inner.width, 1);
+        app.argument_mut()
+            .set_content_area(input_area, &text_input_flow::single_line_policy());
+        TextInput::new(app.argument().buffer())
             .style(picker_base_style())
+            .selection_style(Style::new().fg(Color::Black).bg(Color::Yellow))
             .placeholder("Optional arguments")
             .placeholder_style(Style::new().fg(Color::BrightBlack).bg(Color::Black))
-            .render(
-                Rect::new(inner.x, bottom_y.saturating_add(1), inner.width, 1),
-                frame,
-            );
+            .vertical_scroll(app.argument().vertical_scroll())
+            .render(input_area, frame);
     } else {
         frame.write_line_with_fallback_style(
             Rect::new(inner.x, bottom_y, inner.width, 1),

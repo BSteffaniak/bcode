@@ -1,10 +1,10 @@
 //! TUI worktree picker state.
 
 use bcode_worktree_models::WorktreeInfo;
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
 
@@ -12,7 +12,7 @@ use super::filtered_list::FilteredListState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreePickerApp {
     worktrees: Vec<WorktreeInfo>,
-    filter: TextEditBuffer,
+    filter: TextInputState,
     list: FilteredListState,
     status: String,
 }
@@ -24,20 +24,14 @@ impl WorktreePickerApp {
         let list = FilteredListState::new(worktrees.len());
         Self {
             worktrees,
-            filter: TextEditBuffer::new(),
+            filter: super::text_input_flow::empty_state(),
             list,
             status: "Select a worktree or Esc to cancel".to_owned(),
         }
     }
 
-    /// Return the filter input.
-    #[must_use]
-    pub const fn filter(&self) -> &TextEditBuffer {
-        &self.filter
-    }
-
     /// Return the filter input mutably.
-    pub const fn filter_mut(&mut self) -> &mut TextEditBuffer {
+    pub const fn filter_mut(&mut self) -> &mut TextInputState {
         &mut self.filter
     }
 
@@ -94,7 +88,7 @@ impl WorktreePickerApp {
 
     /// Refresh filter state.
     pub fn refresh_filter(&mut self) {
-        let query = self.filter.text().trim().to_ascii_lowercase();
+        let query = self.filter.buffer().text().trim().to_ascii_lowercase();
         let indices = self
             .worktrees
             .iter()
@@ -126,14 +120,11 @@ fn worktree_item(worktree: &WorktreeInfo) -> ListItem {
     ListItem::new(Line::from_spans(vec![
         Span::styled(branch.to_owned(), Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(marker.to_owned(), Style::new().fg(Color::Cyan)),
+        Span::styled(marker.to_owned(), Style::new().fg(Color::BrightBlack)),
         Span::raw("  "),
         Span::styled(commit.to_owned(), Style::new().fg(Color::BrightBlack)),
         Span::raw("  "),
-        Span::styled(
-            worktree.path.display().to_string(),
-            Style::new().fg(Color::BrightBlack),
-        ),
+        Span::raw(worktree.path.display().to_string()),
     ]))
 }
 

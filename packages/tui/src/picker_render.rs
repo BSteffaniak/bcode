@@ -1,6 +1,5 @@
 //! Shared rendering helpers for TUI pickers.
 
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
@@ -8,6 +7,9 @@ use bmux_tui::input::TextInput;
 use bmux_tui::list::{List, ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::text_input::TextInputState;
+
+use super::text_input_flow;
 
 const PICKER_BG: Color = Color::Black;
 
@@ -24,7 +26,7 @@ pub const fn picker_base_style() -> Style {
 pub fn render_picker_chrome(
     title: &'static str,
     header: &Line,
-    input: &TextEditBuffer,
+    input: &mut TextInputState,
     placeholder: &'static str,
     frame: &mut Frame<'_>,
 ) -> Option<(Rect, u16)> {
@@ -40,10 +42,13 @@ pub fn render_picker_chrome(
         picker_style(),
     );
     let input_area = Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1);
-    TextInput::new(input)
+    input.set_content_area(input_area, &text_input_flow::single_line_policy());
+    TextInput::new(input.buffer())
         .style(picker_style())
+        .selection_style(Style::new().fg(Color::Black).bg(Color::Yellow))
         .placeholder(placeholder)
         .placeholder_style(Style::new().fg(Color::BrightBlack).bg(PICKER_BG))
+        .vertical_scroll(input.vertical_scroll())
         .render(input_area, frame);
     Some((inner, input_area.y.saturating_add(2)))
 }

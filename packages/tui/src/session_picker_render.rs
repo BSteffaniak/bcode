@@ -1,6 +1,5 @@
 //! TUI session picker rendering.
 
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::frame::Frame;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
@@ -12,11 +11,12 @@ use super::session_picker::{SessionPickerApp, SessionPickerMode};
 
 /// Render the session picker.
 pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
+    let mode = app.mode();
     let Some((inner, list_y)) = render_picker_chrome(
         " Sessions ",
-        &header_line(app.mode()),
-        filter_input(app),
-        input_placeholder(app.mode()),
+        &header_line(mode),
+        app.active_input_mut(),
+        input_placeholder(mode),
         frame,
     ) else {
         return;
@@ -49,13 +49,6 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
     };
     let items = app.list_items();
     render_picker_list(&items, app.list_state_mut(), list_area, frame);
-}
-
-const fn filter_input(app: &SessionPickerApp) -> &TextEditBuffer {
-    match app.mode() {
-        SessionPickerMode::Filter | SessionPickerMode::DeleteConfirm => app.filter(),
-        SessionPickerMode::Rename => app.rename(),
-    }
 }
 
 const fn input_placeholder(mode: SessionPickerMode) -> &'static str {

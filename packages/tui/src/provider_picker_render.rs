@@ -18,7 +18,7 @@ pub fn render_provider_picker(app: &mut ProviderPickerApp, frame: &mut Frame<'_>
             ),
             Span::raw("  Enter selects  Esc cancels"),
         ]),
-        app.filter(),
+        app.filter_mut(),
         "Filter providers",
         frame,
     ) else {

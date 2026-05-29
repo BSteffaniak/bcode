@@ -1,10 +1,10 @@
 //! TUI skill picker state.
 
 use bcode_skill_models::{SkillId, SkillSummary};
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
 
@@ -12,8 +12,8 @@ use super::filtered_list::FilteredListState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPickerApp {
     skills: Vec<SkillSummary>,
-    filter: TextEditBuffer,
-    argument: TextEditBuffer,
+    filter: TextInputState,
+    argument: TextInputState,
     list: FilteredListState,
     mode: SkillPickerMode,
 }
@@ -54,32 +54,26 @@ impl SkillPickerApp {
         let list = FilteredListState::new(skills.len());
         Self {
             skills,
-            filter: TextEditBuffer::new(),
-            argument: TextEditBuffer::new(),
+            filter: super::text_input_flow::empty_state(),
+            argument: super::text_input_flow::empty_state(),
             list,
             mode: SkillPickerMode::Filter,
         }
     }
 
-    /// Return filter input.
-    #[must_use]
-    pub const fn filter(&self) -> &TextEditBuffer {
-        &self.filter
-    }
-
     /// Return filter input mutably.
-    pub const fn filter_mut(&mut self) -> &mut TextEditBuffer {
+    pub const fn filter_mut(&mut self) -> &mut TextInputState {
         &mut self.filter
     }
 
     /// Return argument input.
     #[must_use]
-    pub const fn argument(&self) -> &TextEditBuffer {
+    pub const fn argument(&self) -> &TextInputState {
         &self.argument
     }
 
     /// Return argument input mutably.
-    pub const fn argument_mut(&mut self) -> &mut TextEditBuffer {
+    pub const fn argument_mut(&mut self) -> &mut TextInputState {
         &mut self.argument
     }
 
@@ -116,7 +110,7 @@ impl SkillPickerApp {
 
     /// Refresh filter.
     pub fn refresh_filter(&mut self) {
-        let query = self.filter.text().trim().to_ascii_lowercase();
+        let query = self.filter.buffer().text().trim().to_ascii_lowercase();
         let filtered_indices = self
             .skills
             .iter()

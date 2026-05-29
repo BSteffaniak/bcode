@@ -1,6 +1,5 @@
 //! TUI worktree picker rendering.
 
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::frame::Frame;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
@@ -15,7 +14,7 @@ pub fn render_picker(app: &mut WorktreePickerApp, frame: &mut Frame<'_>) {
     let Some((inner, list_y)) = render_picker_chrome(
         " Worktrees ",
         &header_line(),
-        filter_input(app),
+        app.filter_mut(),
         "Filter worktrees",
         frame,
     ) else {
@@ -33,10 +32,6 @@ pub fn render_picker(app: &mut WorktreePickerApp, frame: &mut Frame<'_>) {
     };
     let items = app.list_items();
     render_picker_list(&items, app.list_state_mut(), list_area, frame);
-}
-
-const fn filter_input(app: &WorktreePickerApp) -> &TextEditBuffer {
-    app.filter()
 }
 
 fn header_line() -> Line {

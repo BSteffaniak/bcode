@@ -56,6 +56,7 @@ pub(crate) mod temporal;
 pub(crate) mod terminal_events;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod text_input_flow;
 mod thinking_dialog;
 pub(crate) mod thinking_dialog_render;
 pub(crate) mod thinking_flow;

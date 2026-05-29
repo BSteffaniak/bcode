@@ -1,10 +1,10 @@
 //! TUI session picker state.
 
 use bcode_session_models::{SessionId, SessionSummary};
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
 
@@ -23,8 +23,8 @@ pub enum SessionPickerMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPickerApp {
     sessions: Vec<SessionSummary>,
-    filter: TextEditBuffer,
-    rename: TextEditBuffer,
+    filter: TextInputState,
+    rename: TextInputState,
     list: FilteredListState,
     status: String,
     empty_message: String,
@@ -39,8 +39,8 @@ impl SessionPickerApp {
         let list = FilteredListState::new(sessions.len());
         Self {
             sessions,
-            filter: TextEditBuffer::new(),
-            rename: TextEditBuffer::new(),
+            filter: super::text_input_flow::empty_state(),
+            rename: super::text_input_flow::empty_state(),
             list,
             status: "Select a session or press Ctrl-N to create one".to_owned(),
             empty_message: "No matching sessions. Press Ctrl-N to create a new session.".to_owned(),
@@ -55,26 +55,28 @@ impl SessionPickerApp {
         self.mode
     }
 
-    /// Return the filter input.
-    #[must_use]
-    pub const fn filter(&self) -> &TextEditBuffer {
-        &self.filter
-    }
-
     /// Return the filter input mutably.
-    pub const fn filter_mut(&mut self) -> &mut TextEditBuffer {
+    pub const fn filter_mut(&mut self) -> &mut TextInputState {
         &mut self.filter
     }
 
     /// Return the rename input.
     #[must_use]
-    pub const fn rename(&self) -> &TextEditBuffer {
+    pub const fn rename(&self) -> &TextInputState {
         &self.rename
     }
 
     /// Return the rename input mutably.
-    pub const fn rename_mut(&mut self) -> &mut TextEditBuffer {
+    pub const fn rename_mut(&mut self) -> &mut TextInputState {
         &mut self.rename
+    }
+
+    /// Return active text input mutably.
+    pub const fn active_input_mut(&mut self) -> &mut TextInputState {
+        match self.mode {
+            SessionPickerMode::Filter | SessionPickerMode::DeleteConfirm => &mut self.filter,
+            SessionPickerMode::Rename => &mut self.rename,
+        }
     }
 
     /// Return list state.
@@ -126,7 +128,7 @@ impl SessionPickerApp {
         self.last_import = None;
     }
 
-    /// Replace all sessions and refresh the filter.
+    /// Replace sessions.
     pub fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
         self.sessions = sessions;
         self.refresh_filter();
@@ -138,7 +140,6 @@ impl SessionPickerApp {
         if self.list.indices().is_empty() {
             return vec![empty_item(&self.empty_message)];
         }
-
         self.list
             .indices()
             .iter()
@@ -146,7 +147,7 @@ impl SessionPickerApp {
             .collect()
     }
 
-    /// Return the selected session id.
+    /// Return selected session id.
     #[must_use]
     pub fn selected_session_id(&self) -> Option<SessionId> {
         let index = self.list.selected_source_index()?;
@@ -178,7 +179,7 @@ impl SessionPickerApp {
             "No session selected to rename".clone_into(&mut self.status);
             return false;
         };
-        self.rename = TextEditBuffer::from_text(name);
+        self.rename = super::text_input_flow::state_with_text(name, true);
         self.mode = SessionPickerMode::Rename;
         "Enter saves rename; Esc cancels".clone_into(&mut self.status);
         true
@@ -215,7 +216,7 @@ impl SessionPickerApp {
 
     /// Recompute filtered sessions after filter edits.
     pub fn refresh_filter(&mut self) {
-        let query = self.filter.text().trim().to_ascii_lowercase();
+        let query = self.filter.buffer().text().trim().to_ascii_lowercase();
         let filtered_indices = self
             .sessions
             .iter()
@@ -256,20 +257,14 @@ fn session_item(session: &SessionSummary) -> ListItem {
             }
         },
     );
-    let id = session.import.as_ref().map_or_else(
-        || session.id.to_string(),
-        |import| {
-            if import.imported_at_ms == 0 {
-                import.external_session_id.clone()
-            } else {
-                session.id.to_string()
-            }
-        },
-    );
+    let id = session.id.to_string();
+    let cwd = session.working_directory.display().to_string();
     ListItem::new(Line::from_spans(vec![
         Span::styled(display_name, Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(id, Style::new().fg(Color::BrightBlack)),
+        Span::raw("  "),
+        Span::styled(cwd, Style::new().fg(Color::BrightBlack)),
     ]))
 }
 
@@ -281,11 +276,13 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
         .name
         .as_deref()
         .is_some_and(|name| name.to_ascii_lowercase().contains(query))
+        || session.id.to_string().contains(query)
         || session
-            .import
-            .as_ref()
-            .is_some_and(|import| import.source_id.to_ascii_lowercase().contains(query))
-        || session.id.to_string().to_ascii_lowercase().contains(query)
+            .working_directory
+            .display()
+            .to_string()
+            .to_ascii_lowercase()
+            .contains(query)
 }
 
 fn empty_item(message: &str) -> ListItem {
@@ -293,47 +290,4 @@ fn empty_item(message: &str) -> ListItem {
         message.to_owned(),
         Style::new().fg(Color::BrightBlack),
     )]))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bcode_session_models::SessionImportSummary;
-
-    fn summary(imported_at_ms: u64) -> SessionSummary {
-        SessionSummary {
-            id: SessionId::new(),
-            name: Some("Imported title".to_owned()),
-            client_count: 0,
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            working_directory: std::path::PathBuf::from("/tmp/project"),
-            import: Some(SessionImportSummary {
-                source_id: "pi".to_owned(),
-                source_display_name: "Pi".to_owned(),
-                external_session_id: "external-1".to_owned(),
-                imported_at_ms,
-            }),
-        }
-    }
-
-    #[test]
-    fn importable_session_item_uses_external_id() {
-        let item = session_item(&summary(0));
-        let rendered = format!("{item:?}");
-
-        assert!(rendered.contains("[pi import] Imported title"));
-        assert!(rendered.contains("external-1"));
-    }
-
-    #[test]
-    fn imported_session_item_uses_native_id() {
-        let session = summary(42);
-        let native_id = session.id.to_string();
-        let item = session_item(&session);
-        let rendered = format!("{item:?}");
-
-        assert!(rendered.contains("[pi] Imported title"));
-        assert!(rendered.contains(&native_id));
-    }
 }

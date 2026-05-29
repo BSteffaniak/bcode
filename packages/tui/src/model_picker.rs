@@ -1,10 +1,10 @@
 //! TUI model picker state.
 
 use bcode_model::ModelInfo;
-use bmux_text_edit::TextEditBuffer;
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
 
@@ -12,7 +12,7 @@ use super::filtered_list::FilteredListState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerApp {
     models: Vec<ModelInfo>,
-    filter: TextEditBuffer,
+    filter: TextInputState,
     list: FilteredListState,
     status: String,
 }
@@ -24,20 +24,14 @@ impl ModelPickerApp {
         let list = FilteredListState::new(models.len());
         Self {
             models,
-            filter: TextEditBuffer::new(),
+            filter: super::text_input_flow::empty_state(),
             list,
             status: status.into(),
         }
     }
 
-    /// Return filter input.
-    #[must_use]
-    pub const fn filter(&self) -> &TextEditBuffer {
-        &self.filter
-    }
-
     /// Return filter input mutably.
-    pub const fn filter_mut(&mut self) -> &mut TextEditBuffer {
+    pub const fn filter_mut(&mut self) -> &mut TextInputState {
         &mut self.filter
     }
 
@@ -74,7 +68,7 @@ impl ModelPickerApp {
 
     /// Refresh filter.
     pub fn refresh_filter(&mut self) {
-        let query = self.filter.text().trim().to_ascii_lowercase();
+        let query = self.filter.buffer().text().trim().to_ascii_lowercase();
         let filtered_indices = self
             .models
             .iter()

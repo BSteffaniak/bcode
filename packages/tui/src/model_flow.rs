@@ -6,14 +6,13 @@ use bcode_client::BcodeClient;
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 
 use super::helpers;
 use super::picker_mouse::picker_row_from_mouse;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::{
     TuiError, model_picker, model_picker_render, provider_picker, provider_picker_render,
-    session_flow::ActiveChat,
+    session_flow::ActiveChat, text_input_flow,
 };
 
 /// Show active model status in the transcript.
@@ -137,7 +136,7 @@ pub async fn pick_model_for_session<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
-                picker.filter_mut().insert_str(&text);
+                let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                 picker.refresh_filter();
             }
             Event::Key(stroke) => match stroke.key {
@@ -158,13 +157,9 @@ pub async fn pick_model_for_session<W: Write>(
                 KeyCode::Up => picker.select_previous(),
                 KeyCode::Down => picker.select_next(),
                 _ => {
-                    let outcome = helpers::handle_text_buffer_key(
-                        picker.filter_mut(),
-                        services.keymap,
-                        stroke,
-                        TextInputEnterBehavior::InsertNewline,
-                    );
-                    if outcome == TextInputKeyOutcome::Edited {
+                    if text_input_flow::handle_key(picker.filter_mut(), services.keymap, stroke)
+                        != bmux_tui_components::text_input::TextInputOutcome::Ignored
+                    {
                         picker.refresh_filter();
                     }
                 }
@@ -215,7 +210,7 @@ async fn pick_model_provider<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
-                picker.filter_mut().insert_str(&text);
+                let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                 picker.refresh_filter();
             }
             Event::Key(stroke) => match stroke.key {
@@ -224,13 +219,9 @@ async fn pick_model_provider<W: Write>(
                 KeyCode::Up => picker.select_previous(),
                 KeyCode::Down => picker.select_next(),
                 _ => {
-                    let outcome = helpers::handle_text_buffer_key(
-                        picker.filter_mut(),
-                        services.keymap,
-                        stroke,
-                        TextInputEnterBehavior::InsertNewline,
-                    );
-                    if outcome == TextInputKeyOutcome::Edited {
+                    if text_input_flow::handle_key(picker.filter_mut(), services.keymap, stroke)
+                        != bmux_tui_components::text_input::TextInputOutcome::Ignored
+                    {
                         picker.refresh_filter();
                     }
                 }

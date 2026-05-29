@@ -8,12 +8,13 @@ use bcode_skill_models::SkillId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
-use super::{TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render};
+use super::{
+    TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render, text_input_flow,
+};
 
 /// Pick and perform a skill action for the active session.
 pub async fn pick_skill_for_session<W: Write>(
@@ -40,10 +41,12 @@ pub async fn pick_skill_for_session<W: Write>(
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => match picker.mode() {
                 skill_picker::SkillPickerMode::Filter => {
-                    picker.filter_mut().insert_str(&text);
+                    let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                     picker.refresh_filter();
                 }
-                skill_picker::SkillPickerMode::Argument => picker.argument_mut().insert_str(&text),
+                skill_picker::SkillPickerMode::Argument => {
+                    let _ = text_input_flow::handle_paste(picker.argument_mut(), &text);
+                }
             },
             Event::Key(stroke) => {
                 match handle_skill_picker_key(&mut picker, services.keymap, stroke) {
@@ -183,13 +186,9 @@ fn handle_skill_filter_key(
             skill_picker::SkillPickerAction::Help,
         ),
         _ => {
-            let outcome = helpers::handle_text_buffer_key(
-                picker.filter_mut(),
-                keymap,
-                stroke,
-                TextInputEnterBehavior::InsertNewline,
-            );
-            if outcome == TextInputKeyOutcome::Edited {
+            if text_input_flow::handle_key(picker.filter_mut(), keymap, stroke)
+                != bmux_tui_components::text_input::TextInputOutcome::Ignored
+            {
                 picker.refresh_filter();
             }
             skill_picker::SkillPickerAction::Continue
@@ -281,16 +280,11 @@ fn handle_skill_argument_key(
             skill_picker::SkillPickerAction::Continue,
             |skill_id| skill_picker::SkillPickerAction::Invoke {
                 skill_id,
-                arguments: picker.argument().text().to_owned(),
+                arguments: picker.argument().buffer().text().to_owned(),
             },
         ),
         _ => {
-            let _outcome = helpers::handle_text_buffer_key(
-                picker.argument_mut(),
-                keymap,
-                stroke,
-                TextInputEnterBehavior::InsertNewline,
-            );
+            let _outcome = text_input_flow::handle_key(picker.argument_mut(), keymap, stroke);
             skill_picker::SkillPickerAction::Continue
         }
     }
