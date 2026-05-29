@@ -64,6 +64,9 @@ pub const OP_AGENT_SUSPEND: &str = "agent.suspend";
 /// Agent fire operation.
 pub const OP_AGENT_FIRE: &str = "agent.fire";
 
+/// Move one agent to a room operation.
+pub const OP_AGENT_MOVE: &str = "agent.move";
+
 /// Agent update contract operation.
 pub const OP_AGENT_UPDATE_CONTRACT: &str = "agent.update_contract";
 
@@ -226,6 +229,7 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         | OP_AGENT_HIRE
         | OP_AGENT_SUSPEND
         | OP_AGENT_FIRE
+        | OP_AGENT_MOVE
         | OP_AGENT_UPDATE_CONTRACT => invoke_agent_service(request),
         OP_INITIATIVE_CREATE => {
             service_initiative_create(request, &EventContext::from_request(request))
@@ -348,6 +352,7 @@ fn invoke_agent_service(request: &ServiceRequest) -> ServiceResponse {
         OP_AGENT_FIRE => {
             service_agent_employment(request, &EventContext::from_request(request), "fired")
         }
+        OP_AGENT_MOVE => service_agent_move(request, &EventContext::from_request(request)),
         OP_AGENT_UPDATE_CONTRACT => {
             service_agent_update_contract(request, &EventContext::from_request(request))
         }
@@ -418,6 +423,20 @@ impl EventContext {
             expected_latest: request.expected_latest_event_id.or(self.expected_latest),
         }
     }
+
+    fn merge_agent_move_request(&self, request: &AgentMoveRequest) -> Self {
+        Self {
+            correlation: request
+                .correlation_id
+                .clone()
+                .unwrap_or_else(|| self.correlation.clone()),
+            causation: request
+                .causation_id
+                .clone()
+                .unwrap_or_else(|| self.causation.clone()),
+            expected_latest: request.expected_latest_event_id.or(self.expected_latest),
+        }
+    }
 }
 
 /// Typed Blims IPC request envelope for future daemon/frontends.
@@ -447,6 +466,26 @@ pub struct AgentRequest {
     pub working_directory: PathBuf,
     /// Agent id.
     pub agent_id: String,
+    /// Optional correlation id for event-sourced commands.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// Optional causation id for event-sourced commands.
+    #[serde(default)]
+    pub causation_id: Option<String>,
+    /// Optional expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+}
+
+/// Request to move a Blims agent to a room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMoveRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Agent id.
+    pub agent_id: String,
+    /// Destination room id.
+    pub room_id: String,
     /// Optional correlation id for event-sourced commands.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -1969,6 +2008,18 @@ fn service_agent_employment(
     match set_agent_status(&request, &event_context, status) {
         Ok(agent) => json_response(&agent),
         Err(error) => ServiceResponse::error("agent_employment_failed", error.to_string()),
+    }
+}
+
+fn service_agent_move(request: &ServiceRequest, event_context: &EventContext) -> ServiceResponse {
+    let (request, event_context) =
+        match parse_service_command::<AgentMoveRequest>(request, event_context) {
+            Ok(parsed) => parsed,
+            Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+        };
+    match move_agent(&request, &event_context) {
+        Ok(agent) => json_response(&agent),
+        Err(error) => ServiceResponse::error("agent_move_failed", error.to_string()),
     }
 }
 
@@ -4333,6 +4384,57 @@ fn set_agent_status(
     })
 }
 
+fn move_agent(
+    request: &AgentMoveRequest,
+    event_context: &EventContext,
+) -> Result<AgentSnapshot, BlimsStateError> {
+    let agent = inspect_agent(&AgentRequest {
+        working_directory: request.working_directory.clone(),
+        agent_id: request.agent_id.clone(),
+        correlation_id: None,
+        causation_id: None,
+        expected_latest_event_id: None,
+    })?;
+    let room_id = request.room_id.trim().to_string();
+    if room_id.is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "room_id cannot be empty".to_string(),
+        ));
+    }
+    let agent_id = request.agent_id.clone();
+    let working_directory = request.working_directory.clone();
+    let event_context = event_context.merge_agent_move_request(request);
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            let room_exists = database
+                .select("world_rooms")
+                .columns(&["id"])
+                .filter(Box::new(where_eq("id", room_id.clone())))
+                .limit(1)
+                .execute_first(database)
+                .await?
+                .is_some();
+            if !room_exists {
+                return Err(BlimsStateError::InvalidRequest(format!(
+                    "unknown room: {room_id}"
+                )));
+            }
+            append_event(
+                database,
+                &event_context,
+                "agent.moved",
+                format!("Agent {agent_id} walked to {room_id}."),
+                &BlimsEventPayload::AgentMoved {
+                    agent_id,
+                    room_id: room_id.clone(),
+                },
+            )
+            .await?;
+            Ok::<_, BlimsStateError>(AgentSnapshot { room_id, ..agent })
+        })
+    })
+}
+
 fn update_agent_contract(
     request: &AgentContractUpdateRequest,
     event_context: &EventContext,
@@ -4527,11 +4629,13 @@ fn tick_decision(
     let seed = tick_seed
         .saturating_add(stable_i64(&agent.id))
         .saturating_add(i64::try_from(index).unwrap_or_default() * 17);
-    let room_id = if seed.rem_euclid(4) == 0 {
-        preferred_agent_room(agent, rooms, seed).map(|room| room.id.clone())
-    } else {
-        None
-    };
+    let room_id = preferred_agent_room(agent, rooms, seed).and_then(|room| {
+        if room.id == agent.room_id && rooms.len() > 1 {
+            fallback_agent_room(agent, rooms, seed).map(|fallback| fallback.id.clone())
+        } else {
+            Some(room.id.clone())
+        }
+    });
     AgentTickDecision {
         room_id,
         status: agent_activity(agent, seed).to_string(),
@@ -4562,6 +4666,21 @@ fn preferred_agent_room<'a>(
             let len = i64::try_from(rooms.len()).ok()?;
             rooms.get(usize::try_from(seed.rem_euclid(len)).ok()?)
         })
+}
+
+fn fallback_agent_room<'a>(
+    agent: &AgentRecord,
+    rooms: &'a [RoomRecord],
+    seed: i64,
+) -> Option<&'a RoomRecord> {
+    let choices = rooms
+        .iter()
+        .filter(|room| room.id != agent.room_id)
+        .collect::<Vec<_>>();
+    let len = i64::try_from(choices.len()).ok()?;
+    choices
+        .get(usize::try_from(seed.rem_euclid(len)).ok()?)
+        .copied()
 }
 
 fn agent_activity(agent: &AgentRecord, seed: i64) -> &'static str {

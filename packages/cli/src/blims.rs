@@ -12,8 +12,8 @@ use bmux_tui::prelude::{
 };
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -530,6 +530,13 @@ struct BlimsEventSummary {
     kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsWorldSelection {
+    world: BlimsWorldSnapshot,
+    report: BlimsMorningReport,
+    interactions: BlimsAvailableInteractions,
+}
+
 pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError> {
     ensure_server_running().await?;
     match command {
@@ -669,6 +676,13 @@ async fn enter_blims_office() -> Result<(), CliError> {
 }
 
 async fn run_blims_tui() -> Result<(), CliError> {
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        return Err(CliError::Blims(
+            "`bcode blims enter` needs an interactive terminal; stdout/stdin is not a TTY"
+                .to_string(),
+        ));
+    }
+
     let mut guard = BlimsTerminalGuard::enter()?;
     let mut terminal = Terminal::new(
         guard
@@ -765,7 +779,12 @@ impl BlimsTerminalGuard {
     fn enter() -> Result<Self, CliError> {
         let mut stdout = std::io::stdout();
         crossterm::terminal::enable_raw_mode()?;
-        if let Err(error) = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen) {
+        if let Err(error) = crossterm::execute!(
+            stdout,
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::terminal::DisableLineWrap,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        ) {
             let _ = crossterm::terminal::disable_raw_mode();
             return Err(error.into());
         }
@@ -789,7 +808,13 @@ impl BlimsTerminalGuard {
 
     fn leave_inner(&mut self) -> Result<(), CliError> {
         if let Some(stdout) = &mut self.stdout {
-            crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen)?;
+            crossterm::execute!(
+                stdout,
+                crossterm::style::ResetColor,
+                crossterm::cursor::Show,
+                crossterm::terminal::EnableLineWrap,
+                crossterm::terminal::LeaveAlternateScreen
+            )?;
             stdout.flush()?;
         }
         crossterm::terminal::disable_raw_mode()?;
@@ -828,7 +853,7 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
             if matches!(stroke.key, KeyCode::Escape | KeyCode::Char('q')) {
                 return Ok(true);
             }
-            if handle_blims_tui_picker_key(app, stroke.key).await? {
+            if handle_blims_tui_picker_key(app, stroke.key) {
                 return Ok(false);
             }
             match stroke.key {
@@ -895,21 +920,18 @@ async fn handle_blims_tui_conversation_key(
     Ok(true)
 }
 
-async fn handle_blims_tui_picker_key(
-    app: &mut BlimsTuiApp,
-    key: KeyCode,
-) -> Result<bool, CliError> {
+fn handle_blims_tui_picker_key(app: &mut BlimsTuiApp, key: KeyCode) -> bool {
     if !app.show_world_picker {
-        return Ok(false);
+        return false;
     }
     match key {
         KeyCode::Escape => app.show_world_picker = false,
         KeyCode::Up => app.select_previous_template(),
         KeyCode::Down => app.select_next_template(),
-        KeyCode::Enter => app.activate_selected_template().await?,
-        _ => return Ok(false),
+        KeyCode::Enter => app.activate_selected_template(),
+        _ => return false,
     }
-    Ok(true)
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -944,12 +966,14 @@ enum BlimsTuiMode {
 enum BlimsBackgroundJob {
     WorldTick(Receiver<Result<BlimsWorldSnapshot, CliError>>),
     PlayerRoomSync(Receiver<Result<BlimsWorldSnapshot, CliError>>),
+    WorldTemplateSelect(Receiver<Result<BlimsWorldSelection, CliError>>),
 }
 
 #[derive(Debug)]
 struct BlimsBackgroundJobs {
     world_tick: Option<BlimsBackgroundJob>,
     player_room_sync: Option<BlimsBackgroundJob>,
+    world_template_select: Option<BlimsBackgroundJob>,
 }
 
 impl BlimsBackgroundJobs {
@@ -957,6 +981,7 @@ impl BlimsBackgroundJobs {
         Self {
             world_tick: None,
             player_room_sync: None,
+            world_template_select: None,
         }
     }
 }
@@ -968,12 +993,13 @@ struct BlimsTuiApp {
     interactions: BlimsAvailableInteractions,
     geometry: BlimsWorldGeometry,
     templates: Vec<BlimsWorldTemplateSummary>,
-    agent_tiles: BTreeMap<String, BlimsTilePosition>,
+    agent_sprites: BTreeMap<String, BlimsAgentSpriteState>,
     live_log: Vec<String>,
     selected_template: usize,
     player_tile: BlimsTilePosition,
     selected_interaction: usize,
     pending_player_room_sync: Option<String>,
+    pending_world_template_name: Option<String>,
     last_world_tick: Instant,
     last_animation: Instant,
     tick_count: u64,
@@ -996,19 +1022,20 @@ impl BlimsTuiApp {
             .unwrap_or_default();
         let player_tile = player_tile_for_room(&world, &interactions.room_id);
         let geometry = BlimsWorldGeometry::from_world(&world);
-        let agent_tiles = initial_agent_tiles(&world);
+        let agent_sprites = initial_agent_sprites(&world, &geometry);
         Ok(Self {
             world,
             report,
             interactions,
             geometry,
             templates,
-            agent_tiles,
+            agent_sprites,
             live_log: vec!["Blims office is live.".to_string()],
             selected_template,
             player_tile,
             selected_interaction: 0,
             pending_player_room_sync: None,
+            pending_world_template_name: None,
             last_world_tick: Instant::now(),
             last_animation: Instant::now(),
             tick_count: 0,
@@ -1018,17 +1045,6 @@ impl BlimsTuiApp {
             show_help: false,
             status: "Welcome CEO — choose a world with w, move with arrows/h/l.".to_string(),
         })
-    }
-
-    async fn refresh(&mut self) -> Result<(), CliError> {
-        self.world = load_blims_world().await?;
-        self.geometry = BlimsWorldGeometry::from_world(&self.world);
-        self.report = load_blims_report().await?;
-        self.interactions = load_blims_interactions().await?;
-        self.sync_agent_targets();
-        self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
-        self.clamp_selected_interaction();
-        Ok(())
     }
 
     fn move_player_by(&mut self, dx: i64, dy: i64) {
@@ -1113,11 +1129,15 @@ impl BlimsTuiApp {
 
     fn should_world_tick(&self) -> bool {
         matches!(self.mode, BlimsTuiMode::Office)
+            && self.jobs.world_template_select.is_none()
             && self.last_world_tick.elapsed() >= Duration::from_millis(900)
     }
 
     fn schedule_background_jobs(&mut self) {
-        if self.should_world_tick() && self.jobs.world_tick.is_none() {
+        if self.should_world_tick()
+            && self.jobs.world_tick.is_none()
+            && self.pending_world_template_name.is_none()
+        {
             self.tick_count = self.tick_count.saturating_add(1);
             self.last_world_tick = Instant::now();
             let tick_count = self.tick_count;
@@ -1130,6 +1150,17 @@ impl BlimsTuiApp {
                 Some(BlimsBackgroundJob::PlayerRoomSync(spawn_blims_background(
                     move || Box::pin(async move { move_blims_player_blocking(&room_id).await }),
                 )));
+        }
+        if let Some(template_id) = self.pending_world_template_name.take() {
+            self.jobs.world_template_select = Some(BlimsBackgroundJob::WorldTemplateSelect(
+                spawn_blims_background(move || {
+                    Box::pin(async move {
+                        select_world_template_state(template_id)
+                            .await
+                            .map(|(selection, _)| selection)
+                    })
+                }),
+            ));
         }
     }
 
@@ -1177,6 +1208,36 @@ impl BlimsTuiApp {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        if let Some(BlimsBackgroundJob::WorldTemplateSelect(receiver)) =
+            &self.jobs.world_template_select
+        {
+            match receiver.try_recv() {
+                Ok(Ok(selection)) => {
+                    self.apply_world_snapshot(selection.world);
+                    self.report = selection.report;
+                    self.interactions = selection.interactions;
+                    self.player_tile =
+                        player_tile_for_room(&self.world, &self.interactions.room_id);
+                    self.clamp_selected_interaction();
+                    self.show_world_picker = false;
+                    self.status = format!("Selected {}", self.world.theme);
+                    self.jobs.world_template_select = None;
+                    self.last_world_tick = Instant::now();
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    self.status = format!("world select failed: {error}");
+                    self.jobs.world_template_select = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "world select worker disconnected".to_string();
+                    self.jobs.world_template_select = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         dirty
     }
 
@@ -1196,14 +1257,26 @@ impl BlimsTuiApp {
             .world
             .agents
             .iter()
-            .map(|agent| (agent.id.clone(), agent_tile(&self.world, agent)))
+            .map(|agent| {
+                (
+                    agent.id.clone(),
+                    agent_tile(&self.world, &self.geometry, agent),
+                )
+            })
             .collect::<Vec<_>>();
         for (agent_id, target) in targets {
-            let current = self.agent_tiles.entry(agent_id).or_insert(target);
-            let next = step_toward(*current, target);
-            if next != *current {
+            let sprite = self
+                .agent_sprites
+                .entry(agent_id)
+                .or_insert_with(|| BlimsAgentSpriteState::new(target));
+            if sprite.target != target {
+                sprite.target = target;
+                sprite.path.clear();
+            }
+            let next = self.geometry.next_walkable_step(sprite);
+            if next != sprite.position {
                 dirty = true;
-                *current = next;
+                sprite.position = next;
             }
         }
         self.last_animation = Instant::now();
@@ -1212,11 +1285,17 @@ impl BlimsTuiApp {
 
     fn sync_agent_targets(&mut self) {
         for agent in &self.world.agents {
-            self.agent_tiles
+            let target = agent_tile(&self.world, &self.geometry, agent);
+            let sprite = self
+                .agent_sprites
                 .entry(agent.id.clone())
-                .or_insert_with(|| agent_tile(&self.world, agent));
+                .or_insert_with(|| BlimsAgentSpriteState::new(target));
+            if sprite.target != target {
+                sprite.target = target;
+                sprite.path.clear();
+            }
         }
-        self.agent_tiles
+        self.agent_sprites
             .retain(|agent_id, _| self.world.agents.iter().any(|agent| agent.id == *agent_id));
     }
 
@@ -1262,18 +1341,14 @@ impl BlimsTuiApp {
         Ok(())
     }
 
-    async fn activate_selected_template(&mut self) -> Result<(), CliError> {
-        if !self.show_world_picker {
-            return Ok(());
+    fn activate_selected_template(&mut self) {
+        if !self.show_world_picker || self.jobs.world_template_select.is_some() {
+            return;
         }
         if let Some(template) = self.templates.get(self.selected_template) {
-            select_world_template(template.id.clone(), true).await?;
-            self.show_world_picker = false;
-            self.status = format!("Selected {}", template.name);
-            self.refresh().await?;
-            self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
+            self.pending_world_template_name = Some(template.id.clone());
+            self.status = format!("Switching office to {}…", template.name);
         }
-        Ok(())
     }
 
     const fn select_next_template(&mut self) {
@@ -1362,6 +1437,7 @@ async fn move_blims_player_blocking(room_id: &str) -> Result<BlimsWorldSnapshot,
 }
 
 async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot, CliError> {
+    let mut world = load_blims_world().await?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0_i64, |duration| {
@@ -1373,7 +1449,50 @@ async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot
         "now_ms": now_ms,
     });
     let response = call_blims_service("world.tick", serde_json::to_vec(&request)?).await?;
-    decode_blims_response::<BlimsWorldSnapshot>(response)
+    let tick_world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
+    if tick_world != world {
+        return Ok(tick_world);
+    }
+    let Some((agent_id, room_id)) = next_visible_agent_move(&world, tick_count) else {
+        return Ok(world);
+    };
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "agent_id": agent_id,
+        "room_id": room_id,
+        "correlation_id": format!("tui-visible-agent-move-{tick_count}"),
+        "causation_id": format!("tui-{tick_count}"),
+    });
+    let response = call_blims_service("agent.move", serde_json::to_vec(&request)?).await?;
+    let moved = decode_blims_response::<BlimsAgentSnapshot>(response)?;
+    if let Some(agent) = world.agents.iter_mut().find(|agent| agent.id == moved.id) {
+        *agent = moved;
+    }
+    Ok(world)
+}
+
+fn next_visible_agent_move(
+    world: &BlimsWorldSnapshot,
+    tick_count: u64,
+) -> Option<(String, String)> {
+    if world.agents.is_empty() || world.rooms.len() < 2 {
+        return None;
+    }
+    let agent_index = usize::try_from(tick_count).ok()? % world.agents.len();
+    let agent = world.agents.get(agent_index)?;
+    let candidate_rooms = world
+        .rooms
+        .iter()
+        .filter(|room| room.id != agent.room_id)
+        .collect::<Vec<_>>();
+    if candidate_rooms.is_empty() {
+        return None;
+    }
+    let room_index = usize::try_from(tick_count / 2).ok()? % candidate_rooms.len();
+    Some((
+        agent.id.clone(),
+        candidate_rooms.get(room_index)?.id.clone(),
+    ))
 }
 
 async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
@@ -1578,9 +1697,9 @@ fn tile_glyph(app: &BlimsTuiApp, tile: BlimsTilePosition) -> (&'static str, Styl
         );
     }
     if let Some(agent) = app.world.agents.iter().find(|agent| {
-        app.agent_tiles
+        app.agent_sprites
             .get(&agent.id)
-            .is_some_and(|position| *position == tile)
+            .is_some_and(|sprite| sprite.position == tile)
     }) {
         return (
             agent_sprite(agent),
@@ -2052,6 +2171,121 @@ impl BlimsWorldGeometry {
     fn is_walkable(&self, tile: BlimsTilePosition) -> bool {
         self.walkable.contains(&tile)
     }
+
+    fn next_walkable_step(&self, sprite: &mut BlimsAgentSpriteState) -> BlimsTilePosition {
+        if sprite.position == sprite.target {
+            sprite.path.clear();
+            return sprite.position;
+        }
+
+        if sprite
+            .path
+            .front()
+            .is_none_or(|step| *step != sprite.position)
+        {
+            sprite.path = self.path_between(sprite.position, sprite.target);
+        }
+
+        if sprite
+            .path
+            .front()
+            .is_some_and(|step| *step == sprite.position)
+        {
+            sprite.path.pop_front();
+        }
+
+        sprite.path.front().copied().unwrap_or(sprite.position)
+    }
+
+    fn path_between(
+        &self,
+        start: BlimsTilePosition,
+        target: BlimsTilePosition,
+    ) -> VecDeque<BlimsTilePosition> {
+        if start == target {
+            return VecDeque::from([start]);
+        }
+        let start = self.nearest_walkable_tile(start);
+        let target = self.nearest_walkable_tile(target);
+        let mut frontier = VecDeque::from([start]);
+        let mut previous = BTreeMap::from([(start, start)]);
+        while let Some(current) = frontier.pop_front() {
+            if current == target {
+                break;
+            }
+            for next in self.walkable_neighbors(current) {
+                if previous.contains_key(&next) {
+                    continue;
+                }
+                frontier.push_back(next);
+                previous.insert(next, current);
+            }
+        }
+        if !previous.contains_key(&target) {
+            return VecDeque::new();
+        }
+        let mut reversed = vec![target];
+        let mut current = target;
+        while current != start {
+            current = previous[&current];
+            reversed.push(current);
+        }
+        reversed.reverse();
+        reversed.into_iter().collect()
+    }
+
+    fn walkable_neighbors(
+        &self,
+        tile: BlimsTilePosition,
+    ) -> impl Iterator<Item = BlimsTilePosition> + '_ {
+        [
+            BlimsTilePosition {
+                x: tile.x,
+                y: tile.y - 1,
+            },
+            BlimsTilePosition {
+                x: tile.x + 1,
+                y: tile.y,
+            },
+            BlimsTilePosition {
+                x: tile.x,
+                y: tile.y + 1,
+            },
+            BlimsTilePosition {
+                x: tile.x - 1,
+                y: tile.y,
+            },
+        ]
+        .into_iter()
+        .filter(|candidate| self.is_walkable(*candidate))
+    }
+
+    fn nearest_walkable_tile(&self, tile: BlimsTilePosition) -> BlimsTilePosition {
+        if self.is_walkable(tile) {
+            return tile;
+        }
+        self.walkable
+            .iter()
+            .min_by_key(|candidate| manhattan_distance(**candidate, tile))
+            .copied()
+            .unwrap_or(tile)
+    }
+
+    fn nearest_walkable_tile_in_room(
+        &self,
+        tile: BlimsTilePosition,
+        room_id: &str,
+    ) -> BlimsTilePosition {
+        if self.tile_rooms.get(&tile).is_some_and(|id| id == room_id) {
+            return tile;
+        }
+        self.tile_rooms
+            .iter()
+            .filter(|(_, id)| id.as_str() == room_id)
+            .map(|(candidate, _)| *candidate)
+            .min_by_key(|candidate| manhattan_distance(*candidate, tile))
+            .unwrap_or_else(|| self.nearest_walkable_tile(tile))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2076,29 +2310,35 @@ impl BlimsViewport {
     }
 }
 
-fn initial_agent_tiles(world: &BlimsWorldSnapshot) -> BTreeMap<String, BlimsTilePosition> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsAgentSpriteState {
+    position: BlimsTilePosition,
+    target: BlimsTilePosition,
+    path: VecDeque<BlimsTilePosition>,
+}
+
+impl BlimsAgentSpriteState {
+    const fn new(position: BlimsTilePosition) -> Self {
+        Self {
+            position,
+            target: position,
+            path: VecDeque::new(),
+        }
+    }
+}
+
+fn initial_agent_sprites(
+    world: &BlimsWorldSnapshot,
+    geometry: &BlimsWorldGeometry,
+) -> BTreeMap<String, BlimsAgentSpriteState> {
     world
         .agents
         .iter()
-        .map(|agent| (agent.id.clone(), agent_tile(world, agent)))
+        .map(|agent| {
+            let position = agent_tile(world, geometry, agent);
+            (agent.id.clone(), BlimsAgentSpriteState::new(position))
+        })
         .collect()
-}
-
-fn step_toward(current: BlimsTilePosition, target: BlimsTilePosition) -> BlimsTilePosition {
-    if current == target {
-        return current;
-    }
-    if current.x == target.x {
-        BlimsTilePosition {
-            x: current.x,
-            y: current.y + (target.y - current.y).signum(),
-        }
-    } else {
-        BlimsTilePosition {
-            x: current.x + (target.x - current.x).signum(),
-            y: current.y,
-        }
-    }
 }
 
 fn room_tile_rect(room: &BlimsRoomSnapshot) -> BlimsTileRect {
@@ -2126,13 +2366,18 @@ fn player_tile_for_room(world: &BlimsWorldSnapshot, room_id: &str) -> BlimsTileP
         .map_or(BlimsTilePosition { x: 1, y: 1 }, room_anchor)
 }
 
-fn agent_tile(world: &BlimsWorldSnapshot, agent: &BlimsAgentSnapshot) -> BlimsTilePosition {
+fn agent_tile(
+    world: &BlimsWorldSnapshot,
+    geometry: &BlimsWorldGeometry,
+    agent: &BlimsAgentSnapshot,
+) -> BlimsTilePosition {
     let base = player_tile_for_room(world, &agent.room_id);
     let offset = stable_tile_offset(&agent.id);
-    BlimsTilePosition {
+    let preferred = BlimsTilePosition {
         x: base.x + offset.x,
         y: base.y + offset.y,
-    }
+    };
+    geometry.nearest_walkable_tile_in_room(preferred, &agent.room_id)
 }
 
 fn stable_tile_offset(id: &str) -> BlimsTilePosition {
@@ -2530,19 +2775,38 @@ async fn print_world_templates(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn select_world_template(template_id: String, json: bool) -> Result<(), CliError> {
+async fn select_world_template_state(
+    template_id: String,
+) -> Result<(BlimsWorldSelection, bcode_ipc::PluginServiceResponse), CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "template_id": template_id,
     });
     let response =
         call_blims_service("world.select_template", serde_json::to_vec(&request)?).await?;
+    let world = decode_blims_response::<BlimsWorldSnapshot>(response.clone())?;
+    let interactions = load_blims_interactions().await?;
+    let report = load_blims_report().await?;
+    Ok((
+        BlimsWorldSelection {
+            world,
+            report,
+            interactions,
+        },
+        response,
+    ))
+}
+
+async fn select_world_template(template_id: String, json: bool) -> Result<(), CliError> {
+    let (selection, response) = select_world_template_state(template_id).await?;
     if json {
         print_blims_service_response(response);
     } else {
-        let world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
-        println!("selected world: {} ({})", world.theme, world.template_id);
-        print_blims_world(&world);
+        println!(
+            "selected world: {} ({})",
+            selection.world.theme, selection.world.template_id
+        );
+        print_blims_world(&selection.world);
     }
     Ok(())
 }
