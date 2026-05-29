@@ -30,9 +30,17 @@ pub struct ActiveChat {
     pub event_sender: mpsc::UnboundedSender<BcodeEvent>,
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
     pub event_task: Option<JoinHandle<()>>,
-    pub session_open_task: Option<JoinHandle<SessionOpenResult>>,
-    pub status_hydration_task: Option<JoinHandle<StatusHydrationResult>>,
+    pub async_event_sender: mpsc::UnboundedSender<ChatAsyncEvent>,
+    pub async_event_receiver: mpsc::UnboundedReceiver<ChatAsyncEvent>,
+    pub session_open_task: Option<JoinHandle<()>>,
+    pub status_hydration_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
+}
+
+/// Async TUI work completion event.
+pub enum ChatAsyncEvent {
+    SessionOpened(SessionOpenResult),
+    StatusHydrated(StatusHydrationResult),
 }
 
 /// Result from asynchronously opening a session.
@@ -82,6 +90,7 @@ pub fn start_switch_session(
     chat.app.set_status("Opening session…".to_owned());
     let client = client.clone();
     let event_sender = chat.event_sender.clone();
+    let async_event_sender = chat.async_event_sender.clone();
     chat.session_open_task = Some(tokio::spawn(async move {
         let result = history_flow::attach_session_event_stream_with_limit(
             &client,
@@ -90,11 +99,11 @@ pub fn start_switch_session(
             initial_history_limit,
         )
         .await;
-        SessionOpenResult {
+        let _ = async_event_sender.send(ChatAsyncEvent::SessionOpened(SessionOpenResult {
             session_id: next_session_id,
             initial_history_limit,
             result,
-        }
+        }));
     }));
 }
 
@@ -142,6 +151,7 @@ pub fn start_status_hydration(client: &BcodeClient, chat: &mut ActiveChat, sessi
         hydration_task.abort();
     }
     let client = client.clone();
+    let async_event_sender = chat.async_event_sender.clone();
     chat.status_hydration_task = Some(tokio::spawn(async move {
         let model = client.session_model_status(session_id).await.ok();
         let (active_skill_count, runtime_work) = tokio::join!(
@@ -154,12 +164,12 @@ pub fn start_status_hydration(client: &BcodeClient, chat: &mut ActiveChat, sessi
             },
             async { client.list_runtime_work(session_id).await.ok() },
         );
-        StatusHydrationResult {
+        let _ = async_event_sender.send(ChatAsyncEvent::StatusHydrated(StatusHydrationResult {
             session_id,
             model,
             active_skill_count,
             runtime_work,
-        }
+        }));
     }));
 }
 

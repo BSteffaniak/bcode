@@ -645,12 +645,15 @@ fn draft_agent_selection_updates_header() {
 #[test]
 fn new_draft_preserves_selected_agent() {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (async_sender, async_receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         session_id: None,
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
+        async_event_sender: async_sender,
+        async_event_receiver: async_receiver,
         session_open_task: None,
         status_hydration_task: None,
         opening_session_id: None,

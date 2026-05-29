@@ -1,9 +1,6 @@
 //! Main chat event loop for the TUI.
 
-use std::future::Future;
 use std::io::Write;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
 use bcode_agent_profile::AgentInfo;
@@ -88,10 +85,6 @@ pub async fn run_with_client<W: Write>(
             }
         }
 
-        if complete_background_work(client, chat) {
-            needs_redraw = true;
-        }
-
         if chat.app.should_load_older_history() {
             history_flow::load_older_history(client, chat).await?;
             needs_redraw = true;
@@ -154,6 +147,10 @@ pub async fn run_with_client<W: Write>(
                     needs_redraw = event_invalidation.needs_render();
                 }
             }
+            ChatLoopEvent::Async(event) => {
+                handle_async_event(client, chat, event);
+                needs_redraw = true;
+            }
             ChatLoopEvent::TimedInvalidations(keys) => {
                 if chat
                     .app
@@ -171,6 +168,7 @@ pub async fn run_with_client<W: Write>(
 
 enum ChatLoopEvent {
     Terminal(Event),
+    Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
 }
 
@@ -188,7 +186,10 @@ async fn next_chat_loop_event(
         let delay = next_at.saturating_duration_since(now);
         return tokio::select! {
             biased;
-            () = background_work_ready(chat) => Ok(ChatLoopEvent::TimedInvalidations(Vec::new())),
+            async_event = chat.async_event_receiver.recv() => Ok(async_event.map_or_else(
+                || ChatLoopEvent::TimedInvalidations(Vec::new()),
+                |event| ChatLoopEvent::Async(Box::new(event)),
+            )),
             event = terminal_events.recv() => event.map(|event| {
                 event.map_or_else(
                     || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -202,7 +203,10 @@ async fn next_chat_loop_event(
     }
     tokio::select! {
         biased;
-        () = background_work_ready(chat) => Ok(ChatLoopEvent::TimedInvalidations(Vec::new())),
+        async_event = chat.async_event_receiver.recv() => Ok(async_event.map_or_else(
+            || ChatLoopEvent::TimedInvalidations(Vec::new()),
+            |event| ChatLoopEvent::Async(Box::new(event)),
+        )),
         event = terminal_events.recv() => event.map(|event| {
             event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -212,77 +216,23 @@ async fn next_chat_loop_event(
     }
 }
 
-fn complete_background_work(client: &BcodeClient, chat: &mut ActiveChat) -> bool {
-    let completed_open = if chat
-        .session_open_task
-        .as_ref()
-        .is_some_and(tokio::task::JoinHandle::is_finished)
-        && let Some(task) = chat.session_open_task.take()
-    {
-        match task.now_or_never_result() {
-            Ok(opened) => session_flow::complete_switch_session(client, chat, opened),
-            Err(error) => chat
-                .app
-                .set_status(format!("session open task failed: {error}")),
+fn handle_async_event(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    event: Box<session_flow::ChatAsyncEvent>,
+) {
+    match *event {
+        session_flow::ChatAsyncEvent::SessionOpened(opened) => {
+            chat.session_open_task = None;
+            session_flow::complete_switch_session(client, chat, opened);
         }
-        true
-    } else {
-        false
-    };
-    let completed_hydration = if chat
-        .status_hydration_task
-        .as_ref()
-        .is_some_and(tokio::task::JoinHandle::is_finished)
-        && let Some(task) = chat.status_hydration_task.take()
-    {
-        match task.now_or_never_result() {
-            Ok(hydrated) => session_flow::complete_status_hydration(chat, hydrated),
-            Err(error) => chat
-                .app
-                .set_status(format!("status hydration task failed: {error}")),
-        }
-        true
-    } else {
-        false
-    };
-    completed_open || completed_hydration
-}
-
-async fn background_work_ready(chat: &mut ActiveChat) {
-    let open_task = chat.session_open_task.as_mut();
-    let hydration_task = chat.status_hydration_task.as_mut();
-    match (open_task, hydration_task) {
-        (Some(open), Some(hydration)) => {
-            tokio::select! {
-                _ = open => {},
-                _ = hydration => {},
-            }
-        }
-        (Some(open), None) => {
-            let _ = open.await;
-        }
-        (None, Some(hydration)) => {
-            let _ = hydration.await;
-        }
-        (None, None) => std::future::pending::<()>().await,
-    }
-}
-
-trait FinishedJoinHandleExt<T> {
-    fn now_or_never_result(self) -> Result<T, TuiError>;
-}
-
-impl<T> FinishedJoinHandleExt<T> for tokio::task::JoinHandle<T> {
-    fn now_or_never_result(mut self) -> Result<T, TuiError> {
-        match Future::poll(
-            Pin::new(&mut self),
-            &mut Context::from_waker(std::task::Waker::noop()),
-        ) {
-            Poll::Ready(result) => result.map_err(TuiError::from),
-            Poll::Pending => Err(std::io::Error::other("background task was not ready").into()),
+        session_flow::ChatAsyncEvent::StatusHydrated(hydrated) => {
+            chat.status_hydration_task = None;
+            session_flow::complete_status_hydration(chat, hydrated);
         }
     }
 }
+
 fn refresh_invalidation_queue(chat: &ActiveChat, queue: &mut InvalidationQueue) {
     queue.replace(
         chat.app

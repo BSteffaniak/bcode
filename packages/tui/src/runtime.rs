@@ -23,6 +23,7 @@ pub async fn run_event_loop<W: Write>(
     let mouse_scroll_rows = config.tui.mouse.effective_scroll_rows();
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let (async_event_sender, async_event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
     app.apply_tui_config(config.tui);
     let mut chat = session_flow::ActiveChat {
@@ -31,6 +32,8 @@ pub async fn run_event_loop<W: Write>(
         event_sender,
         event_receiver,
         event_task: None,
+        async_event_sender,
+        async_event_receiver,
         session_open_task: None,
         status_hydration_task: None,
         opening_session_id: None,
