@@ -388,10 +388,6 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
 }
 
 async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return;
-    };
     let agents = match client.list_agents().await {
         Ok(agents) => agents,
         Err(error) => {
@@ -405,6 +401,11 @@ async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
     };
     let agent_id = agent.id.clone();
     let agent_name = agent.name.clone();
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_current_agent_id(agent_id);
+        chat.app.set_status(format!("agent set to {agent_name}"));
+        return;
+    };
     match client.set_session_agent(session_id, agent_id).await {
         Ok(()) => chat.app.set_status(format!("agent set to {agent_name}")),
         Err(error) => chat.app.set_status(format!("agent switch failed: {error}")),

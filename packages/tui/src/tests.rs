@@ -630,6 +630,36 @@ fn header_and_footer_include_model_agent_and_token_context() {
 }
 
 #[test]
+fn draft_agent_selection_updates_header() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    app.set_current_agent_id("plan");
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(buffer.row_symbols(0).unwrap().contains("agent: plan"));
+}
+
+#[test]
+fn new_draft_preserves_selected_agent() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(None, &[], &[], false),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+    };
+    chat.app.set_current_agent_id("plan");
+
+    super::session_flow::switch_to_draft_session(&mut chat);
+
+    assert_eq!(chat.app.current_agent_id(), "plan");
+}
+
+#[test]
 fn slash_pending_submission_clears_after_take() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     app.replace_composer_with("/plan");

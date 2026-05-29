@@ -45,6 +45,9 @@ fn is_draft_safe_slash_command(command: &str) -> bool {
         command,
         "sessions"
             | "new"
+            | "plan"
+            | "build"
+            | "agent"
             | "diff"
             | "worktree"
             | "worktrees"
@@ -65,6 +68,33 @@ fn has_known_slash_command(message: &str) -> bool {
     slash_command_name(message).is_some_and(is_slash_command_name)
 }
 
+fn apply_draft_agent_selection(chat: &mut ActiveChat, agent_id: String, agent_name: &str) {
+    chat.app.set_current_agent_id(agent_id);
+    chat.app.set_status(format!("agent set to {agent_name}"));
+}
+
+async fn open_thinking_settings(
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    session_id: Option<SessionId>,
+    focus: thinking_dialog::ThinkingDialogFocus,
+) -> Result<SubmitComposerOutcome, TuiError> {
+    let Some(session_id) = session_id else {
+        chat.app
+            .set_status("thinking settings require an active session".to_owned());
+        return Ok(None);
+    };
+    let status = services.client.session_model_status(session_id).await?;
+    chat.app.apply_model_status(status.clone());
+    chat.app
+        .set_status("thinking settings: enter apply, esc cancel".to_owned());
+    Ok(Some(thinking_dialog::ThinkingDialogState::new_focused(
+        chat.app.reasoning_visible(),
+        &status,
+        focus,
+    )))
+}
+
 async fn handle_slash_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
@@ -72,7 +102,14 @@ async fn handle_slash_command<W: Write>(
     session_id: Option<SessionId>,
     message: &str,
 ) -> Result<SubmitComposerOutcome, TuiError> {
-    match slash_commands::execute(services.client, session_id, message).await? {
+    match slash_commands::execute(
+        services.client,
+        session_id,
+        chat.app.current_agent_id(),
+        message,
+    )
+    .await?
+    {
         slash_commands::SlashCommandOutcome::Unknown(_command) => {}
         slash_commands::SlashCommandOutcome::Handled(status) => {
             chat.app.clear_pending_submission(message);
@@ -104,24 +141,18 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {
             chat.app.clear_pending_submission(message);
-            let Some(session_id) = session_id else {
-                chat.app
-                    .set_status("thinking settings require an active session".to_owned());
-                return Ok(None);
-            };
-            let status = services.client.session_model_status(session_id).await?;
-            chat.app.apply_model_status(status.clone());
-            chat.app
-                .set_status("thinking settings: enter apply, esc cancel".to_owned());
-            return Ok(Some(thinking_dialog::ThinkingDialogState::new_focused(
-                chat.app.reasoning_visible(),
-                &status,
-                focus,
-            )));
+            return open_thinking_settings(services, chat, session_id, focus).await;
         }
         slash_commands::SlashCommandOutcome::NewDraftSession => {
             chat.app.clear_pending_submission(message);
             session_flow::switch_to_draft_session(chat);
+        }
+        slash_commands::SlashCommandOutcome::DraftAgentSelected {
+            agent_id,
+            agent_name,
+        } => {
+            chat.app.clear_pending_submission(message);
+            apply_draft_agent_selection(chat, agent_id, &agent_name);
         }
         slash_commands::SlashCommandOutcome::PickSession => {
             chat.app.clear_pending_submission(message);

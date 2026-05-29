@@ -10,6 +10,11 @@ pub enum SlashCommandOutcome {
     Handled(String),
     /// Switch to a new unpersisted draft session.
     NewDraftSession,
+    /// Set the draft session agent locally.
+    DraftAgentSelected {
+        agent_id: String,
+        agent_name: String,
+    },
     /// Open the session picker.
     PickSession,
     /// Open model picker.
@@ -429,6 +434,48 @@ async fn cancel_runtime_command(
     }))
 }
 
+async fn handle_agent_command(
+    client: &BcodeClient,
+    session_id: Option<SessionId>,
+    current_agent_id: &str,
+    parts: &[&str],
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    let command = parts[0].trim_start_matches('/');
+    let agent_id = if command == "agent" {
+        let Some(agent_id) = parts.get(1) else {
+            return Ok(SlashCommandOutcome::Handled(format!(
+                "agent: {current_agent_id}"
+            )));
+        };
+        (*agent_id).to_owned()
+    } else {
+        command.to_owned()
+    };
+
+    if let Some(session_id) = session_id {
+        client
+            .set_session_agent(session_id, agent_id.clone())
+            .await?;
+        return Ok(SlashCommandOutcome::Handled(format!(
+            "agent set to {agent_id}"
+        )));
+    }
+
+    let agents = client.list_agents().await?;
+    let Some(agent) = agents
+        .iter()
+        .find(|agent| agent.id == agent_id || agent.aliases.iter().any(|alias| alias == &agent_id))
+    else {
+        return Ok(SlashCommandOutcome::Handled(format!(
+            "unknown agent profile: {agent_id}"
+        )));
+    };
+    Ok(SlashCommandOutcome::DraftAgentSelected {
+        agent_id: agent.id.clone(),
+        agent_name: agent.name.clone(),
+    })
+}
+
 /// Execute a slash command.
 ///
 /// # Errors
@@ -438,6 +485,7 @@ async fn cancel_runtime_command(
 pub async fn execute(
     client: &BcodeClient,
     session_id: Option<SessionId>,
+    current_agent_id: &str,
     message: &str,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     let parts = message.split_whitespace().collect::<Vec<_>>();
@@ -454,32 +502,8 @@ pub async fn execute(
             ))
         }),
         "new" => Ok(SlashCommandOutcome::NewDraftSession),
-        "plan" | "build" => {
-            let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::Handled(
-                    "agent selection requires an active session".to_owned(),
-                ));
-            };
-            client
-                .set_session_agent(session_id, command.to_owned())
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "agent set to {command}"
-            )))
-        }
-        "agent" if parts.len() > 1 => {
-            let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::Handled(
-                    "agent selection requires an active session".to_owned(),
-                ));
-            };
-            let agent_id = parts[1].to_owned();
-            client
-                .set_session_agent(session_id, agent_id.clone())
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "agent set to {agent_id}"
-            )))
+        "plan" | "build" | "agent" => {
+            handle_agent_command(client, session_id, current_agent_id, &parts).await
         }
         "compact" => {
             let Some(session_id) = session_id else {

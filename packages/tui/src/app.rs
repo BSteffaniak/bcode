@@ -201,6 +201,11 @@ impl BmuxApp {
         &self.current_agent_id
     }
 
+    /// Set the current agent id.
+    pub fn set_current_agent_id(&mut self, agent_id: impl Into<String>) {
+        self.current_agent_id = agent_id.into();
+    }
+
     /// Return the current thinking display label.
     #[must_use]
     pub fn thinking_label(&self) -> &str {
