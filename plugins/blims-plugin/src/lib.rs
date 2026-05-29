@@ -1095,6 +1095,24 @@ pub struct SchedulerTickReport {
     pub failed: Vec<BlimsOperationSummary>,
 }
 
+/// Prepared autonomous AI work request for execution adapters/frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedAiWorkItem {
+    /// Stable prepared work id.
+    pub id: String,
+    /// Related operation id.
+    pub operation_id: String,
+    /// Work kind.
+    pub kind: String,
+    /// Suggested agent id.
+    pub agent_id: String,
+    /// Optional task id.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Prompt text to send through Bcode AI/session orchestration.
+    pub prompt: String,
+}
+
 /// Dashboard read model shared by all frontends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardProjection {
@@ -2130,6 +2148,9 @@ enum BlimsEventPayload {
     AgentPlanningCycleRecorded {
         agent_id: String,
         rationale: String,
+    },
+    AiWorkPrepared {
+        work: PreparedAiWorkItem,
     },
     TaskWorkScheduled {
         task_id: String,
@@ -4812,6 +4833,7 @@ async fn apply_org_world_event_projection(
         | BlimsEventPayload::TaskCreated { .. }
         | BlimsEventPayload::TaskOutcomeRecorded { .. }
         | BlimsEventPayload::AgentPlanningCycleRecorded { .. }
+        | BlimsEventPayload::AiWorkPrepared { .. }
         | BlimsEventPayload::TaskWorkScheduled { .. }
         | BlimsEventPayload::ReportGenerated { .. }
         | BlimsEventPayload::ConversationRecorded { .. } => {}
@@ -6272,6 +6294,55 @@ fn build_agent_talk_prompt(
     })
 }
 
+fn autonomous_agent_planning_prompt(agent: &AgentRecord, data: &CompanyData) -> String {
+    let initiatives = data
+        .initiatives
+        .iter()
+        .map(|initiative| {
+            format!(
+                "* [{} priority {}] {} — {}",
+                initiative.status, initiative.priority, initiative.title, initiative.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tasks = data
+        .tasks
+        .iter()
+        .filter(|task| task.assigned_agent_id.is_empty() || task.assigned_agent_id == agent.id)
+        .map(|task| format!("* [{}] {} — {}", task.status, task.title, task.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let guidance = data
+        .guidance
+        .iter()
+        .filter(|item| item.active)
+        .map(|item| format!("* [{}] {}", item.strength, item.guidance))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are {}, a {} in Blims, a cozy autonomous AI company inside Bcode.\n\n\
+         Company mission: {}\nCulture: {}\n\nActive CEO guidance:\n{}\n\n\
+         Current initiatives:\n{}\n\nCandidate tasks for you:\n{}\n\n\
+         Think like a proactive teammate. Decide what you should do next, whether any initiative should be reprioritized, paused, split, or clarified, and what concrete artifact/proposal/task should be produced. Return concise JSON with fields: decision, rationale, suggested_commands, risks, questions_for_ceo.",
+        agent.name,
+        agent.role,
+        data.company.mission,
+        data.company.culture,
+        if guidance.is_empty() {
+            "* none"
+        } else {
+            &guidance
+        },
+        if initiatives.is_empty() {
+            "* none"
+        } else {
+            &initiatives
+        },
+        if tasks.is_empty() { "* none" } else { &tasks },
+    )
+}
+
 fn task_work_prompt_text(task: &TaskSummary, data: &CompanyData) -> String {
     let initiative = data
         .initiatives
@@ -6667,31 +6738,6 @@ async fn load_world_room_rows(database: &dyn Database) -> Result<Vec<Row>, Blims
         .await?)
 }
 
-async fn load_agent_record(
-    database: &dyn Database,
-    agent_id: &str,
-) -> Result<AgentRecord, BlimsStateError> {
-    database
-        .select("agents")
-        .columns(&[
-            "id",
-            "name",
-            "role",
-            "department_id",
-            "team_id",
-            "status",
-            "room_id",
-        ])
-        .filter(Box::new(where_eq("id", agent_id.to_string())))
-        .limit(1)
-        .execute_first(database)
-        .await?
-        .as_ref()
-        .map(agent_record)
-        .transpose()?
-        .ok_or(BlimsStateError::MissingColumn("agent"))
-}
-
 async fn load_agent_rows(database: &dyn Database) -> Result<Vec<Row>, BlimsStateError> {
     Ok(database
         .select("agents")
@@ -7075,9 +7121,14 @@ async fn record_agent_planning_cycle(
     agent_id: &str,
     event_context: &EventContext,
 ) -> Result<(), BlimsStateError> {
-    let agent = load_agent_record(database, agent_id).await?;
+    let data = load_company_data_from_database(database).await?;
+    let agent = data
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .ok_or_else(|| BlimsStateError::InvalidRequest(format!("unknown agent: {agent_id}")))?;
     let rationale = format!(
-        "{} reviewed company state and is looking for useful work aligned with their role: {}.",
+        "{} reviewed company state and is preparing an autonomous planning pass aligned with their role: {}.",
         agent.name, agent.role
     );
     append_event(
@@ -7086,9 +7137,29 @@ async fn record_agent_planning_cycle(
         "agent.planning_cycle_recorded",
         format!("Agent planning cycle recorded: {}", agent.id),
         &BlimsEventPayload::AgentPlanningCycleRecorded {
-            agent_id: agent.id,
+            agent_id: agent.id.clone(),
             rationale,
         },
+    )
+    .await?;
+    let work = PreparedAiWorkItem {
+        id: format!(
+            "ai-plan-{}-{}",
+            agent.id,
+            stable_slug(&event_context.correlation)
+        ),
+        operation_id: event_context.causation.clone(),
+        kind: "agent_planning".to_string(),
+        agent_id: agent.id.clone(),
+        task_id: None,
+        prompt: autonomous_agent_planning_prompt(agent, &data),
+    };
+    append_event(
+        database,
+        event_context,
+        "ai.work_prepared",
+        format!("AI planning work prepared for {}.", agent.name),
+        &BlimsEventPayload::AiWorkPrepared { work },
     )
     .await
 }
@@ -7098,7 +7169,13 @@ async fn record_scheduled_task_work(
     task_id: &str,
     event_context: &EventContext,
 ) -> Result<(), BlimsStateError> {
-    let task = load_task(database, task_id).await?;
+    let data = load_company_data_from_database(database).await?;
+    let task = data
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .cloned()
+        .ok_or_else(|| BlimsStateError::InvalidRequest(format!("unknown task: {task_id}")))?;
     let rationale = format!(
         "Scheduled autonomous work for task '{}' with assigned agent {}.",
         task.title, task.assigned_agent_id
@@ -7109,10 +7186,30 @@ async fn record_scheduled_task_work(
         "task.work_scheduled",
         format!("Task work scheduled: {}", task.id),
         &BlimsEventPayload::TaskWorkScheduled {
-            task_id: task.id,
-            agent_id: task.assigned_agent_id,
+            task_id: task.id.clone(),
+            agent_id: task.assigned_agent_id.clone(),
             rationale,
         },
+    )
+    .await?;
+    let work = PreparedAiWorkItem {
+        id: format!(
+            "ai-task-{}-{}",
+            task.id,
+            stable_slug(&event_context.correlation)
+        ),
+        operation_id: event_context.causation.clone(),
+        kind: "task_work".to_string(),
+        agent_id: task.assigned_agent_id.clone(),
+        task_id: Some(task.id.clone()),
+        prompt: task_work_prompt_text(&task, &data),
+    };
+    append_event(
+        database,
+        event_context,
+        "ai.work_prepared",
+        format!("AI task work prepared for {}.", task.id),
+        &BlimsEventPayload::AiWorkPrepared { work },
     )
     .await
 }
@@ -8021,6 +8118,7 @@ fn replay_event(
         BlimsEventPayload::AgentHired { .. }
         | BlimsEventPayload::AgentMoved { .. }
         | BlimsEventPayload::AgentPlanningCycleRecorded { .. }
+        | BlimsEventPayload::AiWorkPrepared { .. }
         | BlimsEventPayload::AgentStatsSet { .. }
         | BlimsEventPayload::AgentRelationshipSet { .. }
         | BlimsEventPayload::AgentMemoryRecorded { .. }
