@@ -651,6 +651,9 @@ fn new_draft_preserves_selected_agent() {
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
+        session_open_task: None,
+        status_hydration_task: None,
+        opening_session_id: None,
     };
     chat.app.set_current_agent_id("plan");
 

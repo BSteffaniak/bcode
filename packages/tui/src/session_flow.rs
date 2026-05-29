@@ -2,21 +2,22 @@
 
 use std::io::Write;
 
-use bcode_client::{BcodeClient, SessionList};
-use bcode_ipc::{Event as BcodeEvent, SessionCatalogSourceStatus, SessionCatalogStatus};
+use bcode_client::{AttachedSessionHistory, BcodeClient, SessionList};
+use bcode_ipc::{
+    Event as BcodeEvent, RuntimeWorkSnapshot, SessionCatalogSourceStatus, SessionCatalogStatus,
+};
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
-
-use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
-use super::picker_mouse::picker_row_from_mouse;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
 use super::helpers;
+use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
+use super::picker_mouse::picker_row_from_mouse;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::text_input_flow;
 use super::{TuiError, history_flow};
@@ -29,6 +30,161 @@ pub struct ActiveChat {
     pub event_sender: mpsc::UnboundedSender<BcodeEvent>,
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
     pub event_task: Option<JoinHandle<()>>,
+    pub session_open_task: Option<JoinHandle<SessionOpenResult>>,
+    pub status_hydration_task: Option<JoinHandle<StatusHydrationResult>>,
+    pub opening_session_id: Option<SessionId>,
+}
+
+/// Result from asynchronously opening a session.
+pub struct SessionOpenResult {
+    pub session_id: SessionId,
+    pub initial_history_limit: usize,
+    pub result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
+}
+
+/// Result from asynchronously hydrating non-critical session status.
+pub struct StatusHydrationResult {
+    pub session_id: SessionId,
+    pub model: Option<bcode_ipc::SessionModelStatus>,
+    pub active_skill_count: Option<usize>,
+    pub runtime_work: Option<Vec<RuntimeWorkSnapshot>>,
+}
+
+/// Compute a bounded initial raw event request from the visible transcript area.
+#[must_use]
+pub fn initial_history_event_limit(transcript_area: Rect) -> usize {
+    let visible_rows = usize::from(transcript_area.height.max(1));
+    visible_rows.saturating_mul(8).clamp(64, 256)
+}
+
+/// Start asynchronously opening a session without blocking the chat input loop.
+pub fn start_switch_session(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    next_session_id: SessionId,
+    initial_history_limit: usize,
+) {
+    if let Some(open_task) = chat.session_open_task.take() {
+        open_task.abort();
+    }
+    if let Some(hydration_task) = chat.status_hydration_task.take() {
+        hydration_task.abort();
+    }
+    if let Some(event_task) = chat.event_task.take() {
+        event_task.abort();
+    }
+    while chat.event_receiver.try_recv().is_ok() {}
+    let tui_config = chat.app.tui_config().clone();
+    chat.opening_session_id = Some(next_session_id);
+    chat.session_id = None;
+    chat.app = BmuxApp::new_with_history(Some(next_session_id), &[], &[], false);
+    chat.app.apply_tui_config(tui_config);
+    chat.app.set_status("Opening session…".to_owned());
+    let client = client.clone();
+    let event_sender = chat.event_sender.clone();
+    chat.session_open_task = Some(tokio::spawn(async move {
+        let result = history_flow::attach_session_event_stream_with_limit(
+            &client,
+            next_session_id,
+            event_sender,
+            initial_history_limit,
+        )
+        .await;
+        SessionOpenResult {
+            session_id: next_session_id,
+            initial_history_limit,
+            result,
+        }
+    }));
+}
+
+/// Apply a completed asynchronous session-open result.
+pub fn complete_switch_session(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    opened: SessionOpenResult,
+) {
+    if chat.opening_session_id != Some(opened.session_id) {
+        if let Ok((_, event_task)) = opened.result {
+            event_task.abort();
+        }
+        return;
+    }
+    chat.opening_session_id = None;
+    match opened.result {
+        Ok((attached, next_task)) => {
+            chat.event_task = Some(next_task);
+            chat.session_id = Some(opened.session_id);
+            let tui_config = chat.app.tui_config().clone();
+            let has_older_history = attached.history.len() >= opened.initial_history_limit;
+            chat.app = BmuxApp::new_with_history(
+                Some(opened.session_id),
+                &attached.history,
+                &attached.input_history,
+                has_older_history,
+            );
+            chat.app.apply_tui_config(tui_config);
+            chat.app.apply_session_summary(&attached.session);
+            chat.app.set_status("session opened".to_owned());
+            start_status_hydration(client, chat, opened.session_id);
+        }
+        Err(error) => {
+            chat.app.set_status(format!("session open failed: {error}"));
+            chat.app
+                .push_system_note(format!("session open failed: {error}"));
+        }
+    }
+}
+
+/// Start non-critical session status hydration in the background.
+pub fn start_status_hydration(client: &BcodeClient, chat: &mut ActiveChat, session_id: SessionId) {
+    if let Some(hydration_task) = chat.status_hydration_task.take() {
+        hydration_task.abort();
+    }
+    let client = client.clone();
+    chat.status_hydration_task = Some(tokio::spawn(async move {
+        let model = client.session_model_status(session_id).await.ok();
+        let (active_skill_count, runtime_work) = tokio::join!(
+            async {
+                client
+                    .active_skills(session_id)
+                    .await
+                    .ok()
+                    .map(|skills| skills.len())
+            },
+            async { client.list_runtime_work(session_id).await.ok() },
+        );
+        StatusHydrationResult {
+            session_id,
+            model,
+            active_skill_count,
+            runtime_work,
+        }
+    }));
+}
+
+/// Apply completed non-critical session status hydration.
+pub fn complete_status_hydration(chat: &mut ActiveChat, hydrated: StatusHydrationResult) {
+    if chat.session_id != Some(hydrated.session_id) {
+        return;
+    }
+    let model_text = hydrated.model.as_ref().map_or_else(
+        || "model unknown".to_owned(),
+        |status| {
+            let provider = status.provider_plugin_id.as_deref().unwrap_or("auto");
+            let model = status.model_id.as_deref().unwrap_or("default");
+            format!("{provider}/{model}")
+        },
+    );
+    if let Some(model) = hydrated.model {
+        chat.app.apply_model_status(model);
+    }
+    if let Some(work) = hydrated.runtime_work {
+        chat.app.apply_runtime_work_snapshots(&work);
+    }
+    let skill_count = hydrated.active_skill_count.unwrap_or(0);
+    chat.app
+        .set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
 
 /// Hydrate model and skill status for the active session.
@@ -57,7 +213,7 @@ pub async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
 }
 
 /// Switch the active chat to another session.
-pub async fn switch_session<W: Write>(
+pub fn switch_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     chat: &mut ActiveChat,
@@ -65,26 +221,12 @@ pub async fn switch_session<W: Write>(
 ) -> Result<(), TuiError> {
     chat.app.set_status("Opening session…".to_owned());
     terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
-    if let Some(event_task) = chat.event_task.take() {
-        event_task.abort();
-    }
-    while chat.event_receiver.try_recv().is_ok() {}
-    let (attached, next_task) = history_flow::attach_session_event_stream(
+    start_switch_session(
         client,
+        chat,
         next_session_id,
-        chat.event_sender.clone(),
-    )
-    .await?;
-    chat.event_task = Some(next_task);
-    chat.session_id = Some(next_session_id);
-    chat.app = BmuxApp::new_with_history(
-        Some(next_session_id),
-        &attached.history,
-        &attached.input_history,
-        attached.history.len() >= super::INITIAL_HISTORY_EVENT_LIMIT,
+        initial_history_event_limit(terminal.area()),
     );
-    chat.app.apply_session_summary(&attached.session);
-    hydrate_status(client, &mut chat.app).await;
     Ok(())
 }
 
@@ -93,7 +235,14 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
     }
+    if let Some(open_task) = chat.session_open_task.take() {
+        open_task.abort();
+    }
+    if let Some(hydration_task) = chat.status_hydration_task.take() {
+        hydration_task.abort();
+    }
     while chat.event_receiver.try_recv().is_ok() {}
+    chat.opening_session_id = None;
     chat.session_id = None;
     let tui_config = chat.app.tui_config().clone();
     let current_agent_id = chat.app.current_agent_id().to_owned();

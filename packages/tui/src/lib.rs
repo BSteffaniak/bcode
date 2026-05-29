@@ -78,8 +78,8 @@ use bmux_tui::crossterm::CrosstermTerminalGuard;
 use bmux_tui::terminal::Terminal;
 
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
-const OLDER_HISTORY_EVENT_LIMIT: usize = 500;
+const INITIAL_HISTORY_EVENT_LIMIT: usize = 256;
+const OLDER_HISTORY_EVENT_LIMIT: usize = 256;
 
 /// Errors returned by the TUI.
 #[derive(Debug, thiserror::Error)]

@@ -99,7 +99,7 @@ pub async fn create_for_current_session<W: Write>(
                             no_setup: false,
                         })
                         .await?;
-                    handle_created_worktree(io, services, chat, response, target).await?;
+                    handle_created_worktree(io, services, chat, response, target)?;
                     return Ok(());
                 }
                 KeyCode::Left
@@ -165,7 +165,7 @@ fn handle_dialog_mouse(
         .handle_mouse(dialog.name_mut(), mouse);
 }
 
-async fn handle_created_worktree<W: Write>(
+fn handle_created_worktree<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
@@ -195,7 +195,7 @@ async fn handle_created_worktree<W: Write>(
                 "Created worktree with new session\n* Path: {}\n* Session: {session_id}",
                 path.display()
             ));
-            session_flow::switch_session(io.terminal, services.client, chat, session_id).await?;
+            session_flow::switch_session(io.terminal, services.client, chat, session_id)?;
             chat.app
                 .set_status("created worktree and switched session".to_owned());
         }

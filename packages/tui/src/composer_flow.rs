@@ -163,8 +163,7 @@ async fn handle_slash_command<W: Write>(
                         services.client,
                         chat,
                         next_session_id,
-                    )
-                    .await?;
+                    )?;
                 }
                 session_flow::PickSessionOutcome::Draft => {
                     session_flow::switch_to_draft_session(chat);

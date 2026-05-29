@@ -61,6 +61,7 @@ pub struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
+    transcript_history: Vec<SessionEvent>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
     runtime_work: RuntimeWorkViewState,
@@ -125,6 +126,7 @@ impl BmuxApp {
             runtime_work: RuntimeWorkViewState::default(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
+            transcript_history: history.to_vec(),
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
             pending_assistant_stream_anchor: false,
@@ -552,6 +554,7 @@ impl BmuxApp {
     pub fn set_reasoning_visible(&mut self, visible: bool) {
         self.reasoning_visible = visible;
         self.refresh_thinking_label();
+        self.rebuild_transcript_from_history();
     }
 
     /// Apply configured thinking display visibility.
@@ -732,9 +735,17 @@ impl BmuxApp {
 
     /// Absorb replayed history events.
     pub fn absorb_history(&mut self, events: &[SessionEvent]) {
+        self.transcript_history.extend_from_slice(events);
         for event in events {
-            self.absorb_session_event(event);
+            self.absorb_session_event_without_history_record(event);
         }
+    }
+
+    fn rebuild_transcript_from_history(&mut self) {
+        self.transcript = transcript_items_from_events_with_reasoning(
+            &self.transcript_history,
+            self.reasoning_visible(),
+        );
     }
 
     /// Prepend older history and preserve the current viewport.
@@ -752,6 +763,7 @@ impl BmuxApp {
         });
         self.input_history.prepend_committed(input_messages);
 
+        self.transcript_history.splice(0..0, events.iter().cloned());
         let mut older =
             transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
         merge_transcript_boundary(&mut older, &mut self.transcript);
@@ -769,6 +781,14 @@ impl BmuxApp {
     /// Absorb one live session event.
     #[allow(clippy::too_many_lines)]
     pub fn absorb_session_event(&mut self, event: &SessionEvent) {
+        if event_affects_transcript_rows(event) {
+            self.transcript_history.push(event.clone());
+        }
+        self.absorb_session_event_without_history_record(event);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn absorb_session_event_without_history_record(&mut self, event: &SessionEvent) {
         let was_following = self.viewport.following();
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();

@@ -6,9 +6,7 @@ use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery, Session
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::{
-    INITIAL_HISTORY_EVENT_LIMIT, OLDER_HISTORY_EVENT_LIMIT, TuiError, session_flow::ActiveChat,
-};
+use super::{OLDER_HISTORY_EVENT_LIMIT, TuiError, session_flow::ActiveChat};
 
 /// Load the next older page of transcript history when available.
 pub async fn load_older_history(
@@ -51,9 +49,25 @@ pub async fn attach_session_event_stream(
     session_id: SessionId,
     event_sender: mpsc::UnboundedSender<BcodeEvent>,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
+    attach_session_event_stream_with_limit(
+        client,
+        session_id,
+        event_sender,
+        super::INITIAL_HISTORY_EVENT_LIMIT,
+    )
+    .await
+}
+
+/// Attach to a session with a bounded recent history limit and forward live events into the UI event channel.
+pub async fn attach_session_event_stream_with_limit(
+    client: &BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    limit: usize,
+) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
     let attached = connection
-        .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
+        .attach_session_recent_with_input_history(session_id, limit)
         .await?;
     let event_task = tokio::spawn(async move {
         loop {
