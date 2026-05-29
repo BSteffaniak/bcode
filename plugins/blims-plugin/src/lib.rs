@@ -214,6 +214,9 @@ pub const OP_PROJECTION_DASHBOARD_GET: &str = "projection.dashboard.get";
 /// World projection get operation.
 pub const OP_PROJECTION_WORLD_GET: &str = "projection.world.get";
 
+/// Pending AI work projection get operation.
+pub const OP_PROJECTION_AI_WORK_GET: &str = "projection.ai_work.get";
+
 /// Record task outcome operation.
 pub const OP_TASK_RECORD_OUTCOME: &str = "task.record_outcome";
 
@@ -344,6 +347,7 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_SCHEDULER_TICK => service_scheduler_tick(request),
         OP_PROJECTION_DASHBOARD_GET => service_projection_dashboard_get(request),
         OP_PROJECTION_WORLD_GET => service_projection_world_get(request),
+        OP_PROJECTION_AI_WORK_GET => service_projection_ai_work_get(request),
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
     }
 }
@@ -395,6 +399,16 @@ fn invoke_agent_service(request: &ServiceRequest) -> ServiceResponse {
         }
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims agent operation"),
     }
+}
+
+/// Request to list prepared AI work items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiWorkListRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Maximum number of work items to return.
+    #[serde(default = "default_ai_work_limit")]
+    pub limit: u64,
 }
 
 /// Request carrying the workspace root for repo-local Blims state.
@@ -2022,6 +2036,10 @@ const fn default_operation_limit() -> u64 {
     100
 }
 
+const fn default_ai_work_limit() -> u64 {
+    50
+}
+
 const fn default_operation_lease_ms() -> i64 {
     30_000
 }
@@ -3020,6 +3038,17 @@ fn service_projection_world_get(request: &ServiceRequest) -> ServiceResponse {
     match world_snapshot(&request.working_directory) {
         Ok(projection) => json_response(&projection),
         Err(error) => ServiceResponse::error("world_projection_failed", error.to_string()),
+    }
+}
+
+fn service_projection_ai_work_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<AiWorkListRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_prepared_ai_work(&request) {
+        Ok(work) => json_response(&work),
+        Err(error) => ServiceResponse::error("ai_work_projection_failed", error.to_string()),
     }
 }
 
@@ -7506,6 +7535,45 @@ fn current_time_ms() -> i64 {
         .map_or(0_i64, |duration| {
             i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
         })
+}
+
+fn list_prepared_ai_work(
+    request: &AiWorkListRequest,
+) -> Result<Vec<PreparedAiWorkItem>, BlimsStateError> {
+    let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let events = database
+                .select("events")
+                .columns(&[
+                    "id",
+                    "event_version",
+                    "company_id",
+                    "kind",
+                    "summary",
+                    "payload_json",
+                    "correlation_id",
+                    "causation_id",
+                ])
+                .filter(Box::new(where_eq("kind", "ai.work_prepared")))
+                .sort("id", SortDirection::Desc)
+                .limit(limit)
+                .execute(database)
+                .await?;
+            events
+                .iter()
+                .filter_map(|event| {
+                    let payload = event
+                        .get("payload_json")
+                        .and_then(|value| value.as_str().map(ToOwned::to_owned))?;
+                    match serde_json::from_str::<BlimsEventPayload>(&payload).ok()? {
+                        BlimsEventPayload::AiWorkPrepared { work } => Some(Ok(work)),
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
+    })
 }
 
 fn list_operations(

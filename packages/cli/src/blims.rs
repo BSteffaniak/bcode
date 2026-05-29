@@ -108,6 +108,10 @@ pub enum BlimsCommand {
     Talk {
         agent_id: String,
     },
+    AiWork {
+        #[command(subcommand)]
+        command: BlimsAiWorkCommand,
+    },
     Task {
         #[command(subcommand)]
         command: BlimsTaskCommand,
@@ -141,6 +145,19 @@ pub enum BlimsCommand {
         agent_id: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BlimsAiWorkCommand {
+    List {
+        #[arg(long, default_value_t = 25)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    Start {
+        work_id: String,
     },
 }
 
@@ -493,6 +510,16 @@ struct BlimsTaskWorkPrompt {
     prompt: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsPreparedAiWorkItem {
+    id: String,
+    operation_id: String,
+    kind: String,
+    agent_id: String,
+    task_id: Option<String>,
+    prompt: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BlimsWorkProposalSummary {
     id: String,
@@ -728,6 +755,7 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
         }
         BlimsCommand::Enter => enter_blims_office().await?,
         BlimsCommand::Talk { agent_id } => start_blims_agent_talk_cli(agent_id).await?,
+        BlimsCommand::AiWork { command } => handle_blims_ai_work_command(command).await?,
         BlimsCommand::Task { command } => handle_blims_task_command(command).await?,
         BlimsCommand::Artifact { command } => handle_blims_artifact_command(command).await?,
         BlimsCommand::Proposal { command } => handle_blims_proposal_command(command).await?,
@@ -3605,6 +3633,70 @@ async fn print_company_lifecycle_update(
         println!("state root: {}", status.state_root.display());
     }
     Ok(())
+}
+
+async fn handle_blims_ai_work_command(command: BlimsAiWorkCommand) -> Result<(), CliError> {
+    match command {
+        BlimsAiWorkCommand::List { limit, json } => print_blims_ai_work(limit, json).await,
+        BlimsAiWorkCommand::Start { work_id } => start_blims_prepared_ai_work(work_id).await,
+    }
+}
+
+async fn print_blims_ai_work(limit: u64, json: bool) -> Result<(), CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "limit": limit,
+    });
+    let response =
+        call_blims_service("projection.ai_work.get", serde_json::to_vec(&request)?).await?;
+    if json {
+        print_blims_service_response(response);
+    } else {
+        let work = decode_blims_response::<Vec<BlimsPreparedAiWorkItem>>(response)?;
+        if work.is_empty() {
+            println!("no prepared AI work yet");
+        }
+        for item in work {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                item.id,
+                item.kind,
+                item.agent_id,
+                item.task_id.unwrap_or_default(),
+                item.operation_id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn start_blims_prepared_ai_work(work_id: String) -> Result<(), CliError> {
+    let work = load_blims_prepared_ai_work(&work_id).await?;
+    let session = BcodeClient::default_endpoint()
+        .create_session(Some(format!("Blims AI work: {}", work.id)))
+        .await?;
+    BcodeClient::default_endpoint()
+        .send_user_message(session.id, work.prompt)
+        .await?;
+    println!("started AI work session: {}", session.id);
+    println!("work: {}", work.id);
+    println!("kind: {}", work.kind);
+    println!("agent: {}", work.agent_id);
+    attach_session(session.id).await?;
+    Ok(())
+}
+
+async fn load_blims_prepared_ai_work(work_id: &str) -> Result<BlimsPreparedAiWorkItem, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "limit": 250_u64,
+    });
+    let response =
+        call_blims_service("projection.ai_work.get", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<Vec<BlimsPreparedAiWorkItem>>(response)?
+        .into_iter()
+        .find(|work| work.id == work_id)
+        .ok_or_else(|| CliError::Blims(format!("unknown prepared AI work: {work_id}")))
 }
 
 async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliError> {
