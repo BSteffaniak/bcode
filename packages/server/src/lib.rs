@@ -131,12 +131,27 @@ pub struct ServerState {
     client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
     active_session_namespaces: Mutex<BTreeMap<SessionId, String>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
-    event_clients: Mutex<Vec<SharedWriter>>,
+    event_clients: Mutex<BTreeMap<ClientId, CatalogEventSubscription>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
     shutdown: broadcast::Sender<()>,
+}
+
+#[derive(Debug)]
+struct CatalogEventSubscription {
+    writer: SharedWriter,
+    last_sent_revision: Option<u64>,
+}
+
+impl CatalogEventSubscription {
+    const fn new(writer: SharedWriter) -> Self {
+        Self {
+            writer,
+            last_sent_revision: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -501,6 +516,11 @@ impl ServerState {
             .lock()
             .await
             .remove(&client_id);
+        self.unregister_catalog_event_client(client_id).await;
+    }
+
+    async fn close_client(&self, client_id: ClientId) {
+        self.unregister_client(client_id).await;
     }
 
     async fn register_message_accepted_client(&self, client_id: ClientId) {
@@ -660,8 +680,25 @@ impl ServerState {
         }
     }
 
-    async fn register_event_client(&self, writer: SharedWriter) {
-        self.event_clients.lock().await.push(writer);
+    async fn register_catalog_event_client(&self, client_id: ClientId, writer: SharedWriter) {
+        self.event_clients
+            .lock()
+            .await
+            .insert(client_id, CatalogEventSubscription::new(writer));
+    }
+
+    async fn unregister_catalog_event_client(&self, client_id: ClientId) {
+        self.event_clients.lock().await.remove(&client_id);
+    }
+
+    async fn unregister_catalog_event_clients(&self, client_ids: &[ClientId]) {
+        if client_ids.is_empty() {
+            return;
+        }
+        let mut event_clients = self.event_clients.lock().await;
+        for client_id in client_ids {
+            event_clients.remove(client_id);
+        }
     }
 
     fn start_catalog_event_forwarder(self: &Arc<Self>) {
@@ -684,8 +721,19 @@ impl ServerState {
         });
     }
 
-    async fn event_client_writers(&self) -> Vec<SharedWriter> {
-        self.event_clients.lock().await.clone()
+    async fn catalog_event_client_writers(&self) -> Vec<(ClientId, SharedWriter)> {
+        self.event_clients
+            .lock()
+            .await
+            .iter()
+            .map(|(client_id, subscription)| (*client_id, subscription.writer.clone()))
+            .collect()
+    }
+
+    async fn mark_catalog_event_sent(&self, client_id: ClientId, revision: u64) {
+        if let Some(subscription) = self.event_clients.lock().await.get_mut(&client_id) {
+            subscription.last_sent_revision = Some(revision);
+        }
     }
 
     fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
@@ -1129,7 +1177,7 @@ async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Resul
     state.register_client(client_id).await;
 
     let result = handle_registered_client(stream, &state, client_id).await;
-    state.unregister_client(client_id).await;
+    state.close_client(client_id).await;
     result
 }
 
@@ -1229,7 +1277,7 @@ async fn handle_request(
             handle_list_sessions(request_id, state, writer, &working_directory).await
         }
         Request::SubscribeCatalogUpdates => {
-            handle_subscribe_catalog_updates(request_id, state, writer).await
+            handle_subscribe_catalog_updates(request_id, client_id, state, writer).await
         }
         Request::ChangeSessionWorkingDirectory {
             session_id,
@@ -1670,10 +1718,13 @@ async fn handle_refresh_session_catalog(
 
 async fn handle_subscribe_catalog_updates(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    state.register_event_client(writer.clone()).await;
+    state
+        .register_catalog_event_client(client_id, writer.clone())
+        .await;
     send_response(
         writer,
         request_id,
@@ -7820,12 +7871,35 @@ async fn broadcast_catalog_update(state: &ServerState, revision: u64) {
             return;
         }
     };
-    for writer in state.event_client_writers().await {
+    let mut disconnected_clients = Vec::new();
+    for (client_id, writer) in state.catalog_event_client_writers().await {
         let mut writer = writer.lock().await;
         if let Err(error) = send_envelope(&mut *writer, &envelope).await {
-            eprintln!("failed to send catalog update event: {error}");
+            disconnected_clients.push(client_id);
+            if !is_expected_disconnect(&error) {
+                eprintln!("failed to send catalog update event to {client_id}: {error}");
+            }
+        } else {
+            state.mark_catalog_event_sent(client_id, revision).await;
         }
     }
+    state
+        .unregister_catalog_event_clients(&disconnected_clients)
+        .await;
+}
+
+fn is_expected_disconnect(error: &CodecError) -> bool {
+    matches!(
+        error,
+        CodecError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            )
+    )
 }
 
 fn forward_session_events(
