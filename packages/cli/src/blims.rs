@@ -530,6 +530,20 @@ struct BlimsEventSummary {
     kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsDashboardProjection {
+    initiatives: Vec<BlimsInitiativeSummary>,
+    tasks: Vec<BlimsTaskSummary>,
+    proposals: Vec<BlimsWorkProposalSummary>,
+    artifacts: Vec<BlimsArtifactSummary>,
+    guidance: Vec<BlimsGuidanceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsCommandSubmitResponse {
+    operation_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlimsWorldSelection {
     world: BlimsWorldSnapshot,
@@ -1054,6 +1068,7 @@ async fn handle_blims_tui_dashboard_key(
     match key {
         KeyCode::Escape | KeyCode::Char('d') => {
             app.mode = BlimsTuiMode::Office;
+            app.jobs.dashboard_load = None;
             app.status = "Returned to office.".to_string();
         }
         KeyCode::Char('r') => {
@@ -1535,26 +1550,32 @@ impl BlimsTuiApp {
     fn poll_dashboard_load_job(&mut self) -> bool {
         let mut dirty = false;
         if let Some(BlimsBackgroundJob::DashboardLoad(receiver)) = &self.jobs.dashboard_load {
+            if !matches!(self.mode, BlimsTuiMode::Dashboard(_)) {
+                self.jobs.dashboard_load = None;
+                return true;
+            }
             match receiver.try_recv() {
                 Ok(Ok(dashboard)) => {
-                    self.mode = BlimsTuiMode::Dashboard(dashboard);
-                    self.status = "CEO dashboard loaded.".to_string();
+                    if matches!(self.mode, BlimsTuiMode::Dashboard(_)) {
+                        self.mode = BlimsTuiMode::Dashboard(dashboard);
+                        self.status = "CEO dashboard loaded.".to_string();
+                    }
                     self.jobs.dashboard_load = None;
                     dirty = true;
                 }
                 Ok(Err(error)) => {
                     if let BlimsTuiMode::Dashboard(dashboard) = &mut self.mode {
                         dashboard.status = format!("dashboard load failed: {error}");
+                        self.status = format!("dashboard load failed: {error}");
                     }
-                    self.status = format!("dashboard load failed: {error}");
                     self.jobs.dashboard_load = None;
                     dirty = true;
                 }
                 Err(TryRecvError::Disconnected) => {
                     if let BlimsTuiMode::Dashboard(dashboard) = &mut self.mode {
                         dashboard.status = "dashboard loader disconnected".to_string();
+                        self.status = "dashboard loader disconnected".to_string();
                     }
-                    self.status = "dashboard loader disconnected".to_string();
                     self.jobs.dashboard_load = None;
                     dirty = true;
                 }
@@ -1755,24 +1776,35 @@ impl BlimsTuiApp {
 }
 
 async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
-    let initiatives_response =
-        call_blims_service("initiative.list", blims_workspace_payload()?).await?;
-    let tasks_response = call_blims_service("task.list", blims_workspace_payload()?).await?;
-    let proposals_response =
-        call_blims_service("proposal.list", blims_workspace_payload()?).await?;
-    let artifacts_response =
-        call_blims_service("artifact.list", blims_workspace_payload()?).await?;
-    let guidance_response = call_blims_service("guidance.list", blims_workspace_payload()?).await?;
+    let operation = submit_blims_command("refresh_dashboard").await?;
+    let response =
+        call_blims_service("projection.dashboard.get", blims_workspace_payload()?).await?;
+    let projection = decode_blims_response::<BlimsDashboardProjection>(response)?;
     Ok(BlimsCeoDashboardState {
-        initiatives: decode_blims_response::<Vec<BlimsInitiativeSummary>>(initiatives_response)?,
-        tasks: decode_blims_response::<Vec<BlimsTaskSummary>>(tasks_response)?,
-        proposals: decode_blims_response::<Vec<BlimsWorkProposalSummary>>(proposals_response)?,
-        artifacts: decode_blims_response::<Vec<BlimsArtifactSummary>>(artifacts_response)?,
-        guidance: decode_blims_response::<Vec<BlimsGuidanceSummary>>(guidance_response)?,
+        initiatives: projection.initiatives,
+        tasks: projection.tasks,
+        proposals: projection.proposals,
+        artifacts: projection.artifacts,
+        guidance: projection.guidance,
         selected_section: 0,
         selected_item: 0,
-        status: "CEO dashboard loaded.".to_string(),
+        status: format!("CEO dashboard loaded via {}.", operation.operation_id),
     })
+}
+
+async fn submit_blims_command(command_type: &str) -> Result<BlimsCommandSubmitResponse, CliError> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u128, |duration| duration.as_millis());
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "command_id": format!("tui-{command_type}-{now_ms}"),
+        "actor": "ceo",
+        "frontend_id": "tui",
+        "command": { "type": command_type },
+    });
+    let response = call_blims_service("command.submit", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<BlimsCommandSubmitResponse>(response)
 }
 
 async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {

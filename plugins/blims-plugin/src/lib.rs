@@ -187,6 +187,15 @@ pub const OP_EVENT_LIST: &str = "event.list";
 /// Event projection rebuild operation.
 pub const OP_EVENT_REBUILD_PROJECTIONS: &str = "event.rebuild_projections";
 
+/// Frontend-agnostic command submit operation.
+pub const OP_COMMAND_SUBMIT: &str = "command.submit";
+
+/// Operation list operation.
+pub const OP_OPERATION_LIST: &str = "operation.list";
+
+/// Dashboard projection get operation.
+pub const OP_PROJECTION_DASHBOARD_GET: &str = "projection.dashboard.get";
+
 /// Record task outcome operation.
 pub const OP_TASK_RECORD_OUTCOME: &str = "task.record_outcome";
 
@@ -307,6 +316,9 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_REPORT_AGENT => service_agent_report(request),
         OP_EVENT_LIST => service_event_list(request),
         OP_EVENT_REBUILD_PROJECTIONS => service_event_rebuild_projections(request),
+        OP_COMMAND_SUBMIT => service_command_submit(request),
+        OP_OPERATION_LIST => service_operation_list(request),
+        OP_PROJECTION_DASHBOARD_GET => service_projection_dashboard_get(request),
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
     }
 }
@@ -727,6 +739,202 @@ pub struct EventListRequest {
     /// Maximum number of events to return.
     #[serde(default = "default_event_limit")]
     pub limit: u64,
+}
+
+/// Frontend-neutral operation priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlimsOperationPriority {
+    /// CEO-visible interactions that should not wait behind simulation work.
+    Interactive,
+    /// Foreground work related to currently visible views.
+    Foreground,
+    /// Autonomous company simulation work.
+    Background,
+    /// Projection rebuilds and housekeeping.
+    Maintenance,
+}
+
+impl BlimsOperationPriority {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+impl std::fmt::Display for BlimsOperationPriority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Durable operation status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlimsOperationStatus {
+    /// Command was accepted but not yet started by a worker.
+    Queued,
+    /// Operation is actively being processed.
+    Running,
+    /// Operation completed and projections/events were updated.
+    Completed,
+    /// Operation failed and recorded an error.
+    Failed,
+    /// Operation was abandoned by the caller or scheduler.
+    Cancelled,
+}
+
+impl BlimsOperationStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for BlimsOperationStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Frontend-neutral Blims command payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BlimsCommand {
+    /// Refresh durable CEO dashboard projection data.
+    RefreshDashboard,
+    /// Record that a frontend opened a dashboard view.
+    OpenDashboardView,
+    /// Record that a frontend closed a dashboard view.
+    CloseDashboardView,
+}
+
+impl BlimsCommand {
+    const fn operation_kind(&self) -> &'static str {
+        match self {
+            Self::RefreshDashboard => "dashboard.refresh",
+            Self::OpenDashboardView => "dashboard.open_view",
+            Self::CloseDashboardView => "dashboard.close_view",
+        }
+    }
+
+    const fn priority(&self) -> BlimsOperationPriority {
+        match self {
+            Self::RefreshDashboard | Self::OpenDashboardView | Self::CloseDashboardView => {
+                BlimsOperationPriority::Interactive
+            }
+        }
+    }
+}
+
+/// Request to submit a frontend-neutral Blims command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSubmitRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Unique command id supplied by the caller.
+    pub command_id: String,
+    /// Actor issuing the command, such as `ceo` or an agent id.
+    pub actor: String,
+    /// Optional frontend id, such as `tui` or `web`.
+    #[serde(default)]
+    pub frontend_id: Option<String>,
+    /// Optional Bcode session id associated with the command.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Expected latest event id for optimistic concurrency.
+    #[serde(default)]
+    pub expected_latest_event_id: Option<i64>,
+    /// Typed command payload.
+    pub command: BlimsCommand,
+}
+
+impl CommandSubmitRequest {
+    fn event_context(&self) -> EventContext {
+        EventContext {
+            correlation: self.command_id.clone(),
+            causation: self
+                .session_id
+                .clone()
+                .unwrap_or_else(|| self.command_id.clone()),
+            expected_latest: self.expected_latest_event_id,
+        }
+    }
+}
+
+/// Command submission acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSubmitResponse {
+    /// Submitted command id.
+    pub command_id: String,
+    /// Durable operation id created for the command.
+    pub operation_id: String,
+    /// Current operation status.
+    pub status: BlimsOperationStatus,
+    /// Operation priority lane.
+    pub priority: BlimsOperationPriority,
+}
+
+/// Request to list durable operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationListRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Maximum number of operations to return.
+    #[serde(default = "default_operation_limit")]
+    pub limit: u64,
+}
+
+/// Durable operation summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlimsOperationSummary {
+    /// Durable operation id.
+    pub id: String,
+    /// Command id that created the operation.
+    pub command_id: String,
+    /// Actor that submitted the command.
+    pub actor: String,
+    /// Optional frontend id.
+    pub frontend_id: String,
+    /// Operation kind.
+    pub kind: String,
+    /// Priority lane.
+    pub priority: String,
+    /// Current operation status.
+    pub status: String,
+    /// Optional result event id.
+    pub result_event_id: Option<i64>,
+    /// Optional error text.
+    pub error: String,
+}
+
+/// Dashboard read model shared by all frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DashboardProjection {
+    /// Initiatives visible in CEO dashboard.
+    pub initiatives: Vec<InitiativeSummary>,
+    /// Tasks visible in CEO dashboard.
+    pub tasks: Vec<TaskSummary>,
+    /// Proposals awaiting or recording CEO attention.
+    pub proposals: Vec<WorkProposalSummary>,
+    /// Non-code artifacts visible in CEO dashboard.
+    pub artifacts: Vec<ArtifactSummary>,
+    /// Active and historic CEO guidance rows.
+    pub guidance: Vec<GuidanceSummary>,
+    /// Latest event id at projection read time.
+    pub latest_event_id: i64,
+    /// Latest dashboard refresh operation id if known.
+    #[serde(default)]
+    pub refreshed_by_operation_id: Option<String>,
 }
 
 /// Result from rebuilding current-state projections from events.
@@ -1614,6 +1822,10 @@ const fn default_event_limit() -> u64 {
     100
 }
 
+const fn default_operation_limit() -> u64 {
+    100
+}
+
 fn default_agent_room() -> String {
     "ceo-nook".to_string()
 }
@@ -1652,6 +1864,21 @@ impl<T> BlimsCommandEnvelope<T> {
 enum BlimsEventPayload {
     CompanyLifecycleSet {
         lifecycle_status: String,
+    },
+    CommandSubmitted {
+        command_id: String,
+        actor: String,
+        frontend_id: Option<String>,
+        kind: String,
+        priority: String,
+    },
+    OperationStatusSet {
+        operation_id: String,
+        status: String,
+        error: Option<String>,
+    },
+    DashboardProjectionRefreshed {
+        operation_id: String,
     },
     StarterOfficeSelected {
         template_id: String,
@@ -2475,6 +2702,39 @@ fn service_event_rebuild_projections(request: &ServiceRequest) -> ServiceRespons
     }
 }
 
+fn service_command_submit(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<CommandSubmitRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match submit_command(&request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("command_submit_failed", error.to_string()),
+    }
+}
+
+fn service_operation_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<OperationListRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_operations(&request) {
+        Ok(operations) => json_response(&operations),
+        Err(error) => ServiceResponse::error("operation_list_failed", error.to_string()),
+    }
+}
+
+fn service_projection_dashboard_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match dashboard_projection(&request.working_directory) {
+        Ok(projection) => json_response(&projection),
+        Err(error) => ServiceResponse::error("dashboard_projection_failed", error.to_string()),
+    }
+}
+
 fn company_status(working_directory: &Path) -> CompanyStatus {
     let paths = state_paths(working_directory);
     let lifecycle_status = paths.database_path.exists().then(|| {
@@ -2615,6 +2875,7 @@ async fn create_core_tables(
     database: &dyn Database,
 ) -> Result<(), switchy_database::DatabaseError> {
     create_base_tables(database).await?;
+    create_operation_tables(database).await?;
     create_org_tables(database).await?;
     create_world_tables(database).await?;
     create_work_tables(database).await
@@ -2658,6 +2919,27 @@ async fn create_base_tables(
         .column(text_column("causation_id"))
         .column(int_column("event_version"))
         .column(now_column("created_at"))
+        .primary_key("id")
+        .execute(database)
+        .await
+}
+
+async fn create_operation_tables(
+    database: &dyn Database,
+) -> Result<(), switchy_database::DatabaseError> {
+    create_table("operations")
+        .if_not_exists(true)
+        .column(text_column("id"))
+        .column(text_column("command_id"))
+        .column(text_column("actor"))
+        .column(text_column("frontend_id"))
+        .column(text_column("kind"))
+        .column(text_column("priority"))
+        .column(text_column("status"))
+        .column(int_column("result_event_id"))
+        .column(text_column("error"))
+        .column(now_column("created_at"))
+        .column(now_column("updated_at"))
         .primary_key("id")
         .execute(database)
         .await
@@ -3956,6 +4238,7 @@ async fn apply_event_projection(
     apply_org_world_event_projection(database, payload).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn apply_work_event_projection(
     database: &dyn Database,
     payload: &BlimsEventPayload,
@@ -3966,6 +4249,52 @@ async fn apply_work_event_projection(
                 .update("companies")
                 .value("lifecycle_status", lifecycle_status.clone())
                 .filter(Box::new(where_eq("id", "default")))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::CommandSubmitted {
+            command_id,
+            actor,
+            frontend_id,
+            kind,
+            priority,
+        } => {
+            let operation_id = format!("op-{command_id}");
+            upsert_operation(
+                database,
+                &OperationProjectionRecord {
+                    id: &operation_id,
+                    command_id,
+                    actor,
+                    frontend_id: frontend_id.as_deref().unwrap_or_default(),
+                    kind,
+                    priority,
+                    status: BlimsOperationStatus::Queued.as_str(),
+                    result_event_id: None,
+                    error: "",
+                },
+            )
+            .await?;
+        }
+        BlimsEventPayload::OperationStatusSet {
+            operation_id,
+            status,
+            error,
+        } => {
+            database
+                .update("operations")
+                .value("status", status.clone())
+                .value("error", error.clone().unwrap_or_default())
+                .filter(Box::new(where_eq("id", operation_id.clone())))
+                .execute(database)
+                .await?;
+        }
+        BlimsEventPayload::DashboardProjectionRefreshed { operation_id } => {
+            database
+                .update("operations")
+                .value("status", BlimsOperationStatus::Completed.as_str())
+                .value("error", "")
+                .filter(Box::new(where_eq("id", operation_id.clone())))
                 .execute(database)
                 .await?;
         }
@@ -4163,6 +4492,9 @@ async fn apply_org_world_event_projection(
                 .await?;
         }
         BlimsEventPayload::InitiativePlanImported { .. }
+        | BlimsEventPayload::CommandSubmitted { .. }
+        | BlimsEventPayload::OperationStatusSet { .. }
+        | BlimsEventPayload::DashboardProjectionRefreshed { .. }
         | BlimsEventPayload::CompanyLifecycleSet { .. }
         | BlimsEventPayload::InitiativeCreated { .. }
         | BlimsEventPayload::ProjectCreated { .. }
@@ -5024,18 +5356,20 @@ fn set_guidance(
 
 fn list_guidance(working_directory: &Path) -> Result<Vec<GuidanceSummary>, BlimsStateError> {
     with_database(working_directory, |database| {
-        Box::pin(async move {
-            database
-                .select("executive_guidance")
-                .columns(&["id", "guidance", "strength", "active"])
-                .sort("created_at", SortDirection::Desc)
-                .execute(database)
-                .await?
-                .iter()
-                .map(guidance_summary)
-                .collect()
-        })
+        Box::pin(async move { load_guidance(database).await })
     })
+}
+
+async fn load_guidance(database: &dyn Database) -> Result<Vec<GuidanceSummary>, BlimsStateError> {
+    database
+        .select("executive_guidance")
+        .columns(&["id", "guidance", "strength", "active"])
+        .sort("created_at", SortDirection::Desc)
+        .execute(database)
+        .await?
+        .iter()
+        .map(guidance_summary)
+        .collect()
 }
 
 fn list_events(request: &EventListRequest) -> Result<Vec<BlimsEventSummary>, BlimsStateError> {
@@ -5954,6 +6288,217 @@ async fn load_team_rows(database: &dyn Database) -> Result<Vec<Row>, BlimsStateE
         .await?)
 }
 
+fn submit_command(
+    request: &CommandSubmitRequest,
+) -> Result<CommandSubmitResponse, BlimsStateError> {
+    if request.command_id.trim().is_empty() {
+        return Err(BlimsStateError::InvalidCommandEnvelope(
+            "command_id cannot be empty".to_string(),
+        ));
+    }
+    if request.actor.trim().is_empty() {
+        return Err(BlimsStateError::InvalidCommandEnvelope(
+            "actor cannot be empty".to_string(),
+        ));
+    }
+    let request = request.clone();
+    let event_context = request.event_context();
+    let working_directory = request.working_directory.clone();
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            let operation_id = format!("op-{}", request.command_id);
+            let priority = request.command.priority();
+            append_event(
+                database,
+                &event_context,
+                "command.submitted",
+                format!("Command submitted: {}", request.command.operation_kind()),
+                &BlimsEventPayload::CommandSubmitted {
+                    command_id: request.command_id.clone(),
+                    actor: request.actor.clone(),
+                    frontend_id: request.frontend_id.clone(),
+                    kind: request.command.operation_kind().to_string(),
+                    priority: priority.to_string(),
+                },
+            )
+            .await?;
+            run_command_operation(database, &request, &operation_id).await?;
+            Ok(CommandSubmitResponse {
+                command_id: request.command_id,
+                operation_id,
+                status: BlimsOperationStatus::Completed,
+                priority,
+            })
+        })
+    })
+}
+
+async fn run_command_operation(
+    database: &dyn Database,
+    request: &CommandSubmitRequest,
+    operation_id: &str,
+) -> Result<(), BlimsStateError> {
+    let event_context = request.event_context();
+    append_event(
+        database,
+        &event_context,
+        "operation.status_set",
+        format!("Operation {operation_id} is running."),
+        &BlimsEventPayload::OperationStatusSet {
+            operation_id: operation_id.to_string(),
+            status: BlimsOperationStatus::Running.to_string(),
+            error: None,
+        },
+    )
+    .await?;
+    match request.command {
+        BlimsCommand::RefreshDashboard => {
+            refresh_dashboard_projection(database, operation_id).await?;
+            append_event(
+                database,
+                &event_context,
+                "dashboard.projection_refreshed",
+                "CEO dashboard projection refreshed.".to_string(),
+                &BlimsEventPayload::DashboardProjectionRefreshed {
+                    operation_id: operation_id.to_string(),
+                },
+            )
+            .await
+        }
+        BlimsCommand::OpenDashboardView | BlimsCommand::CloseDashboardView => {
+            append_event(
+                database,
+                &event_context,
+                "operation.status_set",
+                format!("Operation {operation_id} completed."),
+                &BlimsEventPayload::OperationStatusSet {
+                    operation_id: operation_id.to_string(),
+                    status: BlimsOperationStatus::Completed.to_string(),
+                    error: None,
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn refresh_dashboard_projection(
+    database: &dyn Database,
+    operation_id: &str,
+) -> Result<(), BlimsStateError> {
+    let _projection =
+        dashboard_projection_from_database(database, Some(operation_id.to_string())).await?;
+    Ok(())
+}
+
+fn dashboard_projection(working_directory: &Path) -> Result<DashboardProjection, BlimsStateError> {
+    with_database(working_directory, |database| {
+        Box::pin(async move { dashboard_projection_from_database(database, None).await })
+    })
+}
+
+async fn dashboard_projection_from_database(
+    database: &dyn Database,
+    refreshed_by_operation_id: Option<String>,
+) -> Result<DashboardProjection, BlimsStateError> {
+    Ok(DashboardProjection {
+        initiatives: load_initiatives(database).await?,
+        tasks: load_tasks(database).await?,
+        proposals: load_proposals(database).await?,
+        artifacts: load_artifacts(database).await?,
+        guidance: load_guidance(database).await?,
+        latest_event_id: latest_event_id(database).await?,
+        refreshed_by_operation_id,
+    })
+}
+
+fn list_operations(
+    request: &OperationListRequest,
+) -> Result<Vec<BlimsOperationSummary>, BlimsStateError> {
+    let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
+    let working_directory = request.working_directory.clone();
+    with_database(&working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .select("operations")
+                .columns(&[
+                    "id",
+                    "command_id",
+                    "actor",
+                    "frontend_id",
+                    "kind",
+                    "priority",
+                    "status",
+                    "result_event_id",
+                    "error",
+                ])
+                .sort("updated_at", SortDirection::Desc)
+                .limit(limit)
+                .execute(database)
+                .await?
+                .iter()
+                .map(operation_summary)
+                .collect()
+        })
+    })
+}
+
+struct OperationProjectionRecord<'a> {
+    id: &'a str,
+    command_id: &'a str,
+    actor: &'a str,
+    frontend_id: &'a str,
+    kind: &'a str,
+    priority: &'a str,
+    status: &'a str,
+    result_event_id: Option<i64>,
+    error: &'a str,
+}
+
+async fn upsert_operation(
+    database: &dyn Database,
+    record: &OperationProjectionRecord<'_>,
+) -> Result<(), BlimsStateError> {
+    let existing = database
+        .select("operations")
+        .columns(&["id"])
+        .filter(Box::new(where_eq("id", record.id)))
+        .limit(1)
+        .execute_first(database)
+        .await?;
+    if existing.is_some() {
+        database
+            .update("operations")
+            .value("status", record.status.to_string())
+            .value(
+                "result_event_id",
+                record.result_event_id.unwrap_or_default(),
+            )
+            .value("error", record.error.to_string())
+            .filter(Box::new(where_eq("id", record.id.to_string())))
+            .execute(database)
+            .await?;
+    } else {
+        database
+            .insert("operations")
+            .value("id", record.id.to_string())
+            .value("command_id", record.command_id.to_string())
+            .value("actor", record.actor.to_string())
+            .value("frontend_id", record.frontend_id.to_string())
+            .value("kind", record.kind.to_string())
+            .value("priority", record.priority.to_string())
+            .value("status", record.status.to_string())
+            .value(
+                "result_event_id",
+                record.result_event_id.unwrap_or_default(),
+            )
+            .value("error", record.error.to_string())
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn load_initiatives(
     database: &dyn Database,
 ) -> Result<Vec<InitiativeSummary>, BlimsStateError> {
@@ -6350,6 +6895,20 @@ fn guidance_summary(row: &Row) -> Result<GuidanceSummary, BlimsStateError> {
     })
 }
 
+fn operation_summary(row: &Row) -> Result<BlimsOperationSummary, BlimsStateError> {
+    Ok(BlimsOperationSummary {
+        id: required_text(row, "id")?,
+        command_id: required_text(row, "command_id")?,
+        actor: required_text(row, "actor")?,
+        frontend_id: required_text(row, "frontend_id")?,
+        kind: required_text(row, "kind")?,
+        priority: required_text(row, "priority")?,
+        status: required_text(row, "status")?,
+        result_event_id: row.get("result_event_id").and_then(|value| value.as_i64()),
+        error: required_text(row, "error")?,
+    })
+}
+
 fn event_summary(row: &Row) -> Result<BlimsEventSummary, BlimsStateError> {
     Ok(BlimsEventSummary {
         id: required_i64(row, "id")?,
@@ -6482,6 +7041,9 @@ fn replay_event(
             replay_agent_event(payload, state);
         }
         BlimsEventPayload::AgentContractUpdated { .. }
+        | BlimsEventPayload::CommandSubmitted { .. }
+        | BlimsEventPayload::DashboardProjectionRefreshed { .. }
+        | BlimsEventPayload::OperationStatusSet { .. }
         | BlimsEventPayload::StarterOfficeSelected { .. }
         | BlimsEventPayload::PlayerMoved { .. }
         | BlimsEventPayload::InitiativePlanImported { .. }
