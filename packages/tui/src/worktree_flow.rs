@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use super::runtime_context::{TuiIo, TuiServices};
 use bcode_client::BcodeClient;
 use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_text_edit::SelectionMode;
 use bmux_tui::event::{Event, FocusEvent, MouseEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::text_input::TextInputControl;
@@ -64,12 +65,6 @@ pub async fn create_for_current_session<W: Write>(
             Event::Key(stroke) => match stroke.key {
                 KeyCode::Escape => return Err(TuiError::Canceled),
                 KeyCode::Tab => dialog.focus_next(),
-                KeyCode::Left => {
-                    dialog.previous_choice();
-                }
-                KeyCode::Right => {
-                    dialog.next_choice();
-                }
                 KeyCode::Enter => {
                     let name = dialog.name_text();
                     if name.is_empty() {
@@ -107,9 +102,18 @@ pub async fn create_for_current_session<W: Write>(
                     handle_created_worktree(io, services, chat, response, target).await?;
                     return Ok(());
                 }
+                KeyCode::Left
+                    if dialog.focus() != worktree_create_dialog::WorktreeCreateFocus::Name =>
+                {
+                    dialog.previous_choice();
+                }
+                KeyCode::Right
+                    if dialog.focus() != worktree_create_dialog::WorktreeCreateFocus::Name =>
+                {
+                    dialog.next_choice();
+                }
                 _ if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name => {
-                    let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
-                        .handle_key(dialog.name_mut(), stroke);
+                    handle_dialog_name_key(&mut dialog, services.keymap, stroke);
                 }
                 _ => {}
             },
@@ -122,6 +126,32 @@ pub async fn create_for_current_session<W: Write>(
             }
         }
     }
+}
+
+fn handle_dialog_name_key(
+    dialog: &mut worktree_create_dialog::WorktreeCreateDialog,
+    keymap: &BmuxKeyMap,
+    stroke: KeyStroke,
+) {
+    if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
+        dialog
+            .name_mut()
+            .buffer_mut()
+            .move_cursor_with_selection(motion, SelectionMode::Extend);
+        dialog
+            .name_mut()
+            .sync_scroll_to_cursor(&worktree_create_dialog::name_input_policy());
+        return;
+    }
+    if let Some(command) = keymap.editor_command_for_key(stroke) {
+        dialog.name_mut().buffer_mut().apply_command(command);
+        dialog
+            .name_mut()
+            .sync_scroll_to_cursor(&worktree_create_dialog::name_input_policy());
+        return;
+    }
+    let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
+        .handle_key(dialog.name_mut(), stroke);
 }
 
 fn handle_dialog_mouse(
