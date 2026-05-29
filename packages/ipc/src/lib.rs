@@ -325,6 +325,13 @@ pub struct ServerStatus {
     /// Lightweight runtime metrics snapshot.
     #[serde(default)]
     pub metrics: MetricsSnapshot,
+    /// Rich dashboard-ready metrics report.
+    #[serde(default = "default_metrics_report_box")]
+    pub metrics_report: Box<bcode_metrics::MetricsReport>,
+}
+
+fn default_metrics_report_box() -> Box<bcode_metrics::MetricsReport> {
+    Box::default()
 }
 
 /// Server process identity and lifecycle metadata.

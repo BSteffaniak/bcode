@@ -392,6 +392,10 @@ enum ServerCommand {
     Metrics {
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        report: bool,
+        #[arg(long)]
+        dashboard: Option<PathBuf>,
     },
     Diagnose {
         #[arg(long)]
@@ -801,7 +805,11 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         }
         ServerCommand::Run => run_server_foreground().await?,
         ServerCommand::Status { verbose } => server_status(verbose).await?,
-        ServerCommand::Metrics { json } => server_metrics(json).await?,
+        ServerCommand::Metrics {
+            json,
+            report,
+            dashboard,
+        } => server_metrics(json, report, dashboard).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
         ServerCommand::Stop => server_stop().await?,
         ServerCommand::Cleanup => server_cleanup(false).await?,
@@ -2888,13 +2896,29 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn server_metrics(json: bool) -> Result<(), CliError> {
+async fn server_metrics(
+    json: bool,
+    report: bool,
+    dashboard: Option<PathBuf>,
+) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let status = client.server_status().await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&status.metrics)?);
+    if let Some(path) = dashboard {
+        let html = metrics_dashboard_html(&status.metrics_report)?;
+        std::fs::write(&path, html)?;
+        println!("metrics dashboard: {}", path.display());
+    } else if json || report {
+        if report {
+            println!("{}", serde_json::to_string_pretty(&status.metrics_report)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&status.metrics)?);
+        }
     } else {
         print_metrics_summary(&status.metrics);
+        println!(
+            "metric events: {} recent persisted samples",
+            status.metrics_report.events.len()
+        );
     }
     Ok(())
 }
@@ -3088,6 +3112,95 @@ fn print_server_diagnosis(diagnosis: &ServerDiagnosis) {
     }
     print_runtime_summary(&diagnosis.plugin_runtime, true);
     print_metrics_summary(&diagnosis.metrics);
+}
+
+fn metrics_dashboard_html(
+    report: &bcode_metrics::MetricsReport,
+) -> Result<String, serde_json::Error> {
+    let json = serde_json::to_string(report)?.replace("</", "<\\/");
+    Ok(format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bcode Metrics Dashboard</title>
+<style>
+:root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }}
+body {{ margin: 0; background: #0b1020; color: #e5ecff; }}
+header {{ padding: 24px; background: linear-gradient(135deg, #172554, #312e81); }}
+main {{ padding: 20px; display: grid; gap: 18px; }}
+.card {{ background: #111827; border: 1px solid #263244; border-radius: 14px; padding: 16px; box-shadow: 0 14px 32px #0006; }}
+.controls {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
+label {{ display: grid; gap: 6px; color: #bac7e5; font-size: 13px; }}
+input, select {{ background: #0b1220; color: #e5ecff; border: 1px solid #334155; border-radius: 8px; padding: 9px; }}
+.stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }}
+.stat {{ background: #0b1220; border: 1px solid #263244; border-radius: 10px; padding: 12px; }}
+.stat strong {{ display: block; font-size: 28px; }}
+svg {{ width: 100%; height: 260px; background: #08111f; border-radius: 10px; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+th, td {{ border-bottom: 1px solid #263244; padding: 8px; text-align: left; vertical-align: top; }}
+th {{ color: #93c5fd; cursor: pointer; position: sticky; top: 0; background: #111827; }}
+.badge {{ display: inline-block; padding: 2px 7px; border-radius: 999px; background: #1e3a8a; color: #bfdbfe; }}
+small {{ color: #94a3b8; }}
+</style>
+</head>
+<body>
+<header>
+<h1>Bcode Metrics Dashboard</h1>
+<small>Filters and sorting are persisted in the URL query string.</small>
+</header>
+<main>
+<section class="card controls">
+<label>Session IDs<input id="sessions" placeholder="comma-separated session ids"></label>
+<label>Event types<input id="eventTypes" placeholder="comma-separated event types"></label>
+<label>Metric names<input id="metrics" placeholder="comma-separated metric names"></label>
+<label>Kind<select id="kind"><option value="">all</option><option>counter</option><option>gauge</option><option>histogram</option><option>event</option></select></label>
+<label>Sort<select id="sort"><option value="time_desc">newest first</option><option value="time_asc">oldest first</option><option value="name_asc">name A-Z</option><option value="value_desc">value desc</option></select></label>
+<label>Search<input id="search" placeholder="text search"></label>
+</section>
+<section class="stats" id="stats"></section>
+<section class="card"><h2>Events over time</h2><svg id="timeline" viewBox="0 0 900 260" preserveAspectRatio="none"></svg></section>
+<section class="card"><h2>Event type breakdown</h2><svg id="breakdown" viewBox="0 0 900 260" preserveAspectRatio="none"></svg></section>
+<section class="card"><h2>Metrics</h2><div id="metricsTable"></div></section>
+<section class="card"><h2>Recent events</h2><div id="eventsTable"></div></section>
+</main>
+<script id="metrics-data" type="application/json">{json}</script>
+<script>
+const report = JSON.parse(document.getElementById('metrics-data').textContent);
+const params = new URLSearchParams(location.search);
+const ids = ['sessions','eventTypes','metrics','kind','sort','search'];
+for (const id of ids) {{ const el = document.getElementById(id); el.value = params.get(id) || ''; el.addEventListener('input', render); }}
+function list(id) {{ return document.getElementById(id).value.split(',').map(s => s.trim()).filter(Boolean); }}
+function save() {{ const p = new URLSearchParams(); for (const id of ids) {{ const v = document.getElementById(id).value; if (v) p.set(id, v); }} history.replaceState(null, '', location.pathname + (p.toString() ? '?' + p : '')); }}
+function filtered() {{
+  const sessions = new Set(list('sessions')); const types = new Set(list('eventTypes')); const metrics = new Set(list('metrics'));
+  const kind = document.getElementById('kind').value; const search = document.getElementById('search').value.toLowerCase();
+  let rows = report.events.filter(e => (!sessions.size || sessions.has(e.labels.session_id)) && (!types.size || types.has(e.labels.event_type)) && (!metrics.size || metrics.has(e.name)) && (!kind || e.kind === kind));
+  if (search) rows = rows.filter(e => JSON.stringify(e).toLowerCase().includes(search));
+  const sort = document.getElementById('sort').value;
+  rows.sort((a,b) => sort === 'time_asc' ? a.unix_ms - b.unix_ms : sort === 'name_asc' ? a.name.localeCompare(b.name) : sort === 'value_desc' ? b.value - a.value : b.unix_ms - a.unix_ms);
+  return rows;
+}}
+function esc(s) {{ return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
+function table(rows, cols) {{ return '<table><thead><tr>' + cols.map(c => '<th>' + esc(c[0]) + '</th>').join('') + '</tr></thead><tbody>' + rows.map(r => '<tr>' + cols.map(c => '<td>' + esc(c[1](r)) + '</td>').join('') + '</tr>').join('') + '</tbody></table>'; }}
+function drawBars(svg, entries, valueOf, labelOf) {{
+  const max = Math.max(1, ...entries.map(valueOf)); const w = 900 / Math.max(1, entries.length); svg.innerHTML = entries.map((e,i) => {{ const h = valueOf(e) / max * 210; return `<rect x="${{i*w+2}}" y="${{230-h}}" width="${{Math.max(2,w-4)}}" height="${{h}}" fill="#60a5fa"><title>${{labelOf(e)}}: ${{valueOf(e)}} </title></rect>`; }}).join('');
+}}
+function render() {{
+  save(); const events = filtered(); const sessions = new Set(events.map(e => e.labels.session_id).filter(Boolean)); const eventTypes = new Set(events.map(e => e.labels.event_type).filter(Boolean));
+  document.getElementById('stats').innerHTML = [`<div class="stat"><small>Events</small><strong>${{events.length}}</strong></div>`, `<div class="stat"><small>Sessions</small><strong>${{sessions.size}}</strong></div>`, `<div class="stat"><small>Event types</small><strong>${{eventTypes.size}}</strong></div>`, `<div class="stat"><small>Metrics</small><strong>${{Object.keys(report.descriptors).length}}</strong></div>`].join('');
+  const buckets = new Map(); for (const e of events) {{ const k = new Date(e.unix_ms).toISOString().slice(0,16); buckets.set(k, (buckets.get(k)||0)+1); }} drawBars(document.getElementById('timeline'), [...buckets], e => e[1], e => e[0]);
+  const types = new Map(); for (const e of events) {{ const k = e.labels.event_type || e.name; types.set(k, (types.get(k)||0)+1); }} drawBars(document.getElementById('breakdown'), [...types].sort((a,b)=>b[1]-a[1]).slice(0,40), e => e[1], e => e[0]);
+  const metricRows = Object.values(report.descriptors).map(d => ({{...d, counter: report.snapshot.counters[d.name], gauge: report.snapshot.gauges[d.name], histogram: report.snapshot.histograms[d.name]}}));
+  document.getElementById('metricsTable').innerHTML = table(metricRows, [['Name', r=>r.name], ['Kind', r=>r.kind], ['Unit', r=>r.unit||''], ['Value', r=>r.counter ?? r.gauge ?? (r.histogram ? `count=${{r.histogram.count}} avg=${{Math.round(r.histogram.sum/Math.max(1,r.histogram.count))}}` : '')], ['Labels', r=>(r.label_keys||[]).join(', ')]]);
+  document.getElementById('eventsTable').innerHTML = table(events.slice(0,500), [['Time', r=>new Date(r.unix_ms).toISOString()], ['Name', r=>r.name], ['Kind', r=>r.kind], ['Value', r=>r.value], ['Session', r=>r.labels.session_id||''], ['Event type', r=>r.labels.event_type||''], ['Labels', r=>JSON.stringify(r.labels)]]);
+}}
+render();
+</script>
+</body>
+</html>"##
+    ))
 }
 
 fn print_metrics_summary(metrics: &bcode_metrics::MetricsSnapshot) {

@@ -21,7 +21,7 @@ use bcode_ipc::{
     WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
     response_envelope, send_envelope,
 };
-use bcode_metrics::MetricsRegistry;
+use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
@@ -766,6 +766,7 @@ impl ServerState {
             plugin_runtime: self.plugins.executor_statuses(),
             daemon: self.daemon_status.clone(),
             metrics: self.metrics.snapshot(),
+            metrics_report: Box::new(self.metrics.report()),
         }
     }
 
@@ -1128,7 +1129,11 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     let daemon_status = daemon_status_from_record(&daemon_record);
     tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
     tracing::debug!(target: "bcode_server::startup", "initializing lazy session services");
-    let metrics = MetricsRegistry::default();
+    let metrics = MetricsRegistry::with_event_log(
+        bcode_config::default_state_dir()
+            .join("metrics")
+            .join("events.jsonl"),
+    );
     let sessions =
         SessionManager::persistent_lazy_with_metrics(default_session_store_dir(), metrics.clone());
     tracing::debug!(target: "bcode_server::startup", "lazy session services ready");
@@ -7953,6 +7958,9 @@ fn plugin_service_summaries(
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
+    state
+        .metrics
+        .record_event("session.event", 1, session_event_metric_labels(event));
     let payload = match serde_json::to_vec(event) {
         Ok(payload) => payload,
         Err(error) => {
@@ -7967,6 +7975,57 @@ async fn publish_session_event(state: &ServerState, event: &bcode_session_models
     match response {
         Ok(_) => {}
         Err(error) => eprintln!("failed to publish plugin session event: {error}"),
+    }
+}
+
+fn session_event_metric_labels(event: &bcode_session_models::SessionEvent) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("session_id".to_owned(), event.session_id.to_string());
+    labels.insert(
+        "event_type".to_owned(),
+        session_event_kind_name(&event.kind).to_owned(),
+    );
+    labels.insert("sequence".to_owned(), event.sequence.to_string());
+    labels
+}
+
+const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
+    match kind {
+        SessionEventKind::SessionCreated { .. } => "session_created",
+        SessionEventKind::ClientAttached { .. } => "client_attached",
+        SessionEventKind::ClientDetached { .. } => "client_detached",
+        SessionEventKind::UserMessage { .. } => "user_message",
+        SessionEventKind::AssistantDelta { .. } => "assistant_delta",
+        SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
+        SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::PermissionRequested { .. } => "permission_requested",
+        SessionEventKind::PermissionResolved { .. } => "permission_resolved",
+        SessionEventKind::ModelChanged { .. } => "model_changed",
+        SessionEventKind::SystemMessage { .. } => "system_message",
+        SessionEventKind::AgentChanged { .. } => "agent_changed",
+        SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
+        SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
+        SessionEventKind::ModelUsage { .. } => "model_usage",
+        SessionEventKind::ContextCompacted { .. } => "context_compacted",
+        SessionEventKind::SessionRenamed { .. } => "session_renamed",
+        SessionEventKind::TraceEvent { .. } => "trace_event",
+        SessionEventKind::SkillInvoked { .. } => "skill_invoked",
+        SessionEventKind::SkillSuggested { .. } => "skill_suggested",
+        SessionEventKind::SkillActivated { .. } => "skill_activated",
+        SessionEventKind::SkillDeactivated { .. } => "skill_deactivated",
+        SessionEventKind::SkillContextLoaded { .. } => "skill_context_loaded",
+        SessionEventKind::SkillInvocationFailed { .. } => "skill_invocation_failed",
+        SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
+        SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
+        SessionEventKind::RuntimeWorkStarted { .. } => "runtime_work_started",
+        SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
+        SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
+        SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
+        SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
+        SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
+        SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
+        SessionEventKind::SessionImported { .. } => "session_imported",
     }
 }
 
