@@ -141,16 +141,38 @@ pub struct ServerState {
 
 #[derive(Debug)]
 struct CatalogEventSubscription {
-    writer: SharedWriter,
+    sink: ClientEventSink,
     last_sent_revision: Option<u64>,
 }
 
 impl CatalogEventSubscription {
-    const fn new(writer: SharedWriter) -> Self {
+    const fn new(sink: ClientEventSink) -> Self {
         Self {
-            writer,
+            sink,
             last_sent_revision: None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClientEventSink {
+    client_id: ClientId,
+    writer: SharedWriter,
+}
+
+impl ClientEventSink {
+    const fn new(client_id: ClientId, writer: SharedWriter) -> Self {
+        Self { client_id, writer }
+    }
+
+    const fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    async fn send(&self, event: Event) -> Result<(), CodecError> {
+        let envelope = event_envelope(&event)?;
+        let mut writer = self.writer.lock().await;
+        send_envelope(&mut *writer, &envelope).await
     }
 }
 
@@ -681,10 +703,10 @@ impl ServerState {
     }
 
     async fn register_catalog_event_client(&self, client_id: ClientId, writer: SharedWriter) {
-        self.event_clients
-            .lock()
-            .await
-            .insert(client_id, CatalogEventSubscription::new(writer));
+        self.event_clients.lock().await.insert(
+            client_id,
+            CatalogEventSubscription::new(ClientEventSink::new(client_id, writer)),
+        );
     }
 
     async fn unregister_catalog_event_client(&self, client_id: ClientId) {
@@ -721,12 +743,12 @@ impl ServerState {
         });
     }
 
-    async fn catalog_event_client_writers(&self) -> Vec<(ClientId, SharedWriter)> {
+    async fn catalog_event_sinks(&self) -> Vec<ClientEventSink> {
         self.event_clients
             .lock()
             .await
-            .iter()
-            .map(|(client_id, subscription)| (*client_id, subscription.writer.clone()))
+            .values()
+            .map(|subscription| subscription.sink.clone())
             .collect()
     }
 
@@ -1416,7 +1438,7 @@ async fn handle_request(
             handle_runtime_work_history(request_id, state, writer, session_id, limit).await
         }
         Request::SubscribeRuntimeWork { session_id } => {
-            handle_subscribe_runtime_work(request_id, state, writer, session_id).await
+            handle_subscribe_runtime_work(request_id, client_id, state, writer, session_id).await
         }
         Request::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
@@ -2169,7 +2191,10 @@ async fn handle_attach_session(
                 }),
             )
             .await?;
-            forward_session_events(writer.clone(), attachment.events);
+            forward_session_events(
+                ClientEventSink::new(client_id, writer.clone()),
+                attachment.events,
+            );
             Ok(())
         }
         Err(error) => {
@@ -2232,10 +2257,13 @@ async fn handle_attach_session_recent(
     {
         Ok(attachment) => {
             finish_attach_session_recent_success(
-                request_id,
+                AttachRecentSuccessContext {
+                    request_id,
+                    writer,
+                    client_id,
+                    attached_session,
+                },
                 state,
-                writer,
-                attached_session,
                 session_id,
                 attachment,
                 AttachRecentTimings {
@@ -2276,11 +2304,16 @@ struct AttachRecentTimings {
     attach_started_at: Instant,
 }
 
-async fn finish_attach_session_recent_success(
+struct AttachRecentSuccessContext<'a> {
     request_id: u64,
+    writer: &'a SharedWriter,
+    client_id: ClientId,
+    attached_session: &'a mut Option<SessionId>,
+}
+
+async fn finish_attach_session_recent_success(
+    context: AttachRecentSuccessContext<'_>,
     state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    attached_session: &mut Option<SessionId>,
     session_id: SessionId,
     attachment: bcode_session::SessionAttachment,
     timings: AttachRecentTimings,
@@ -2303,7 +2336,7 @@ async fn finish_attach_session_recent_success(
         "server.attach_recent.restore_active_skills_duration_ms",
         elapsed_ms(restore_started_at),
     );
-    *attached_session = Some(session_id);
+    *context.attached_session = Some(session_id);
     let publish_started_at = Instant::now();
     publish_session_event(state, &attachment.attached_event).await;
     state.metrics.record_histogram(
@@ -2331,8 +2364,8 @@ async fn finish_attach_session_recent_success(
     );
     let send_started_at = Instant::now();
     send_response(
-        writer,
-        request_id,
+        context.writer,
+        context.request_id,
         Response::Ok(ResponsePayload::Attached {
             session_id,
             session: attachment.session,
@@ -2350,7 +2383,10 @@ async fn finish_attach_session_recent_success(
         "server.attach_recent.total_duration_ms",
         elapsed_ms(timings.total_started_at),
     );
-    forward_session_events(writer.clone(), attachment.events);
+    forward_session_events(
+        ClientEventSink::new(context.client_id, context.writer.clone()),
+        attachment.events,
+    );
     Ok(())
 }
 
@@ -3325,6 +3361,7 @@ async fn handle_runtime_work_history(
 
 async fn handle_subscribe_runtime_work(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
@@ -3333,7 +3370,10 @@ async fn handle_subscribe_runtime_work(
         .sessions
         .attach_session_recent(session_id, ClientId::new(), 1)
         .await?;
-    forward_runtime_work_events(writer.clone(), attachment.events);
+    forward_runtime_work_events(
+        ClientEventSink::new(client_id, writer.clone()),
+        attachment.events,
+    );
     send_response(
         writer,
         request_id,
@@ -7864,17 +7904,11 @@ async fn publish_session_event(state: &ServerState, event: &bcode_session_models
 }
 
 async fn broadcast_catalog_update(state: &ServerState, revision: u64) {
-    let envelope = match event_envelope(&Event::SessionCatalogUpdated { revision }) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            eprintln!("failed to encode catalog update event: {error}");
-            return;
-        }
-    };
+    let event = Event::SessionCatalogUpdated { revision };
     let mut disconnected_clients = Vec::new();
-    for (client_id, writer) in state.catalog_event_client_writers().await {
-        let mut writer = writer.lock().await;
-        if let Err(error) = send_envelope(&mut *writer, &envelope).await {
+    for sink in state.catalog_event_sinks().await {
+        let client_id = sink.client_id();
+        if let Err(error) = sink.send(event.clone()).await {
             disconnected_clients.push(client_id);
             if !is_expected_disconnect(&error) {
                 eprintln!("failed to send catalog update event to {client_id}: {error}");
@@ -7903,21 +7937,18 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
 }
 
 fn forward_session_events(
-    writer: SharedWriter,
+    sink: ClientEventSink,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
 ) {
     tokio::spawn(async move {
         while let Ok(event) = events.recv().await {
-            let envelope = match event_envelope(&Event::Session(event)) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    eprintln!("failed to encode session event: {error}");
-                    break;
+            if let Err(error) = sink.send(Event::Session(event)).await {
+                if !is_expected_disconnect(&error) {
+                    eprintln!(
+                        "failed to send session event to {}: {error}",
+                        sink.client_id()
+                    );
                 }
-            };
-            let mut writer = writer.lock().await;
-            if let Err(error) = send_envelope(&mut *writer, &envelope).await {
-                eprintln!("failed to send session event: {error}");
                 break;
             }
         }
@@ -7925,7 +7956,7 @@ fn forward_session_events(
 }
 
 fn forward_runtime_work_events(
-    writer: SharedWriter,
+    sink: ClientEventSink,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
 ) {
     tokio::spawn(async move {
@@ -7939,16 +7970,13 @@ fn forward_runtime_work_events(
             ) {
                 continue;
             }
-            let envelope = match event_envelope(&Event::RuntimeWork(event)) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    eprintln!("failed to encode runtime work event: {error}");
-                    break;
+            if let Err(error) = sink.send(Event::RuntimeWork(event)).await {
+                if !is_expected_disconnect(&error) {
+                    eprintln!(
+                        "failed to send runtime work event to {}: {error}",
+                        sink.client_id()
+                    );
                 }
-            };
-            let mut writer = writer.lock().await;
-            if let Err(error) = send_envelope(&mut *writer, &envelope).await {
-                eprintln!("failed to send runtime work event: {error}");
                 break;
             }
         }
