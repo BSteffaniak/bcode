@@ -7,9 +7,8 @@ use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCrea
 use bmux_keyboard::KeyCode;
 use bmux_tui::layout::centered;
 use bmux_tui::prelude::{
-    Border, Color, Constraint, CrosstermTerminalGuard, Direction, Event, Frame, Insets, Line,
-    Modifier, Panel, Point, Rect, Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget,
-    poll_event, split,
+    Border, Color, Constraint, Direction, Event, Frame, Insets, Line, Modifier, Panel, Point, Rect,
+    Size, Span, Style, Terminal, Text, TextBlock, TextWrap, Widget, event_from_crossterm, split,
 };
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Subcommand)]
@@ -669,34 +669,74 @@ async fn enter_blims_office() -> Result<(), CliError> {
 }
 
 async fn run_blims_tui() -> Result<(), CliError> {
-    let mut app = BlimsTuiApp::load().await?;
-    if should_show_world_picker().await? {
-        app.show_world_picker = true;
-    }
-    let stdout = std::io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let mut guard = BlimsTerminalGuard::enter()?;
     let mut terminal = Terminal::new(
         guard
             .writer_mut()
             .ok_or_else(|| std::io::Error::other("terminal guard writer unavailable"))?,
         blims_terminal_area()?,
     );
+    terminal.draw(render_blims_loading)?;
+    let mut app = BlimsTuiApp::load().await?;
+    if should_show_world_picker().await? {
+        app.show_world_picker = true;
+    }
     terminal.draw(|frame| app.render(frame))?;
     loop {
-        if let Some(event) = poll_event(Duration::from_millis(120))?
-            && handle_blims_tui_event(&mut app, event).await?
-        {
+        let mut dirty = false;
+        let mut should_quit = false;
+        while let Some(event) = blims_poll_event(Duration::from_millis(0))? {
+            dirty = true;
+            if handle_blims_tui_event(&mut app, event).await? {
+                should_quit = true;
+                break;
+            }
+        }
+        if should_quit {
             break;
         }
-        app.animate_agents();
-        if app.should_world_tick() {
-            app.tick_world().await?;
+        if let Some(event) = blims_poll_event(Duration::from_millis(16))? {
+            dirty = true;
+            if handle_blims_tui_event(&mut app, event).await? {
+                break;
+            }
         }
+        dirty |= app.poll_background_jobs();
+        dirty |= app.animate_agents();
+        app.schedule_background_jobs();
         terminal.resize(blims_terminal_area()?);
-        terminal.draw(|frame| app.render(frame))?;
+        if dirty {
+            terminal.draw(|frame| app.render(frame))?;
+        }
     }
     let _stdout = guard.leave()?;
     Ok(())
+}
+
+fn render_blims_loading(frame: &mut Frame<'_>) {
+    let area = frame.area();
+    frame.fill(area, " ", Style::new().bg(Color::Rgb(12, 10, 18)));
+    let modal = centered(area, Size::new(52, 7));
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightMagenta)))
+        .title(" Blims ")
+        .background(Style::new().bg(Color::Rgb(19, 16, 30)));
+    panel.render(modal, frame);
+    TextBlock::new(Text::from_lines(vec![
+        Line::from_spans(vec![Span::styled(
+            "✨ Opening the office…",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw("Loading world, agents, and reports."),
+    ]))
+    .style(
+        Style::new()
+            .bg(Color::Rgb(19, 16, 30))
+            .fg(Color::BrightWhite),
+    )
+    .render(panel.inner_area(modal).inset(Insets::all(1)), frame);
 }
 
 async fn should_show_world_picker() -> Result<bool, CliError> {
@@ -714,6 +754,62 @@ async fn should_show_world_picker() -> Result<bool, CliError> {
 fn blims_terminal_area() -> Result<Rect, CliError> {
     let (width, height) = crossterm::terminal::size()?;
     Ok(Rect::new(0, 0, width, height))
+}
+
+struct BlimsTerminalGuard {
+    stdout: Option<std::io::Stdout>,
+    active: bool,
+}
+
+impl BlimsTerminalGuard {
+    fn enter() -> Result<Self, CliError> {
+        let mut stdout = std::io::stdout();
+        crossterm::terminal::enable_raw_mode()?;
+        if let Err(error) = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(error.into());
+        }
+        Ok(Self {
+            stdout: Some(stdout),
+            active: true,
+        })
+    }
+
+    const fn writer_mut(&mut self) -> Option<&mut std::io::Stdout> {
+        self.stdout.as_mut()
+    }
+
+    fn leave(mut self) -> Result<std::io::Stdout, CliError> {
+        self.leave_inner()?;
+        self.active = false;
+        self.stdout
+            .take()
+            .ok_or_else(|| CliError::Blims("Blims terminal writer already taken".to_string()))
+    }
+
+    fn leave_inner(&mut self) -> Result<(), CliError> {
+        if let Some(stdout) = &mut self.stdout {
+            crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen)?;
+            stdout.flush()?;
+        }
+        crossterm::terminal::disable_raw_mode()?;
+        Ok(())
+    }
+}
+
+impl Drop for BlimsTerminalGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.leave_inner();
+        }
+    }
+}
+
+fn blims_poll_event(timeout: Duration) -> Result<Option<Event>, CliError> {
+    if !crossterm::event::poll(timeout)? {
+        return Ok(None);
+    }
+    Ok(event_from_crossterm(crossterm::event::read()?))
 }
 
 async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<bool, CliError> {
@@ -752,10 +848,10 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
                         .unwrap_or(app.selected_interaction);
                     app.activate_selected_interaction().await?;
                 }
-                KeyCode::Char('h') | KeyCode::Left => app.move_player_by(-1, 0).await?,
-                KeyCode::Char('l') | KeyCode::Right => app.move_player_by(1, 0).await?,
-                KeyCode::Char('k') | KeyCode::Up => app.move_player_by(0, -1).await?,
-                KeyCode::Char('j') | KeyCode::Down => app.move_player_by(0, 1).await?,
+                KeyCode::Char('h') | KeyCode::Left => app.move_player_by(-1, 0),
+                KeyCode::Char('l') | KeyCode::Right => app.move_player_by(1, 0),
+                KeyCode::Char('k') | KeyCode::Up => app.move_player_by(0, -1),
+                KeyCode::Char('j') | KeyCode::Down => app.move_player_by(0, 1),
                 KeyCode::Char('H') => app.move_previous().await?,
                 KeyCode::Char('L') => app.move_next().await?,
                 _ => {}
@@ -845,19 +941,43 @@ enum BlimsTuiMode {
 }
 
 #[derive(Debug)]
+enum BlimsBackgroundJob {
+    WorldTick(Receiver<Result<BlimsWorldSnapshot, CliError>>),
+    PlayerRoomSync(Receiver<Result<BlimsWorldSnapshot, CliError>>),
+}
+
+#[derive(Debug)]
+struct BlimsBackgroundJobs {
+    world_tick: Option<BlimsBackgroundJob>,
+    player_room_sync: Option<BlimsBackgroundJob>,
+}
+
+impl BlimsBackgroundJobs {
+    const fn new() -> Self {
+        Self {
+            world_tick: None,
+            player_room_sync: None,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct BlimsTuiApp {
     world: BlimsWorldSnapshot,
     report: BlimsMorningReport,
     interactions: BlimsAvailableInteractions,
+    geometry: BlimsWorldGeometry,
     templates: Vec<BlimsWorldTemplateSummary>,
     agent_tiles: BTreeMap<String, BlimsTilePosition>,
     live_log: Vec<String>,
     selected_template: usize,
     player_tile: BlimsTilePosition,
     selected_interaction: usize,
+    pending_player_room_sync: Option<String>,
     last_world_tick: Instant,
     last_animation: Instant,
     tick_count: u64,
+    jobs: BlimsBackgroundJobs,
     mode: BlimsTuiMode,
     show_world_picker: bool,
     show_help: bool,
@@ -875,20 +995,24 @@ impl BlimsTuiApp {
             .position(|template| template.id == world.template_id)
             .unwrap_or_default();
         let player_tile = player_tile_for_room(&world, &interactions.room_id);
+        let geometry = BlimsWorldGeometry::from_world(&world);
         let agent_tiles = initial_agent_tiles(&world);
         Ok(Self {
             world,
             report,
             interactions,
+            geometry,
             templates,
             agent_tiles,
             live_log: vec!["Blims office is live.".to_string()],
             selected_template,
             player_tile,
             selected_interaction: 0,
+            pending_player_room_sync: None,
             last_world_tick: Instant::now(),
             last_animation: Instant::now(),
             tick_count: 0,
+            jobs: BlimsBackgroundJobs::new(),
             mode: BlimsTuiMode::Office,
             show_world_picker: false,
             show_help: false,
@@ -898,6 +1022,7 @@ impl BlimsTuiApp {
 
     async fn refresh(&mut self) -> Result<(), CliError> {
         self.world = load_blims_world().await?;
+        self.geometry = BlimsWorldGeometry::from_world(&self.world);
         self.report = load_blims_report().await?;
         self.interactions = load_blims_interactions().await?;
         self.sync_agent_targets();
@@ -906,25 +1031,24 @@ impl BlimsTuiApp {
         Ok(())
     }
 
-    async fn move_player_by(&mut self, dx: i64, dy: i64) -> Result<(), CliError> {
+    fn move_player_by(&mut self, dx: i64, dy: i64) {
         let next = BlimsTilePosition {
             x: self.player_tile.x + dx,
             y: self.player_tile.y + dy,
         };
-        if !is_walkable_tile(&self.world, next) {
+        if !self.geometry.is_walkable(next) {
             self.status = "Bump — office wall.".to_string();
-            return Ok(());
+            return;
         }
         self.player_tile = next;
-        if let Some(room_id) = room_id_at_tile(&self.world, next)
+        if let Some(room_id) = self.geometry.room_id_at(next)
             && room_id != self.interactions.room_id
         {
-            self.world = move_blims_player(&room_id).await?;
-            self.interactions = load_blims_interactions().await?;
+            self.interactions.room_id.clone_from(&room_id);
+            self.pending_player_room_sync = Some(room_id);
             self.clamp_selected_interaction();
             self.status = format!("Entered {}", self.current_room_name());
         }
-        Ok(())
     }
 
     async fn activate_selected_interaction(&mut self) -> Result<(), CliError> {
@@ -988,29 +1112,86 @@ impl BlimsTuiApp {
     }
 
     fn should_world_tick(&self) -> bool {
-        self.last_world_tick.elapsed() >= Duration::from_millis(1_800)
+        matches!(self.mode, BlimsTuiMode::Office)
+            && self.last_world_tick.elapsed() >= Duration::from_millis(900)
     }
 
-    async fn tick_world(&mut self) -> Result<(), CliError> {
-        if !matches!(self.mode, BlimsTuiMode::Office) {
+    fn schedule_background_jobs(&mut self) {
+        if self.should_world_tick() && self.jobs.world_tick.is_none() {
+            self.tick_count = self.tick_count.saturating_add(1);
             self.last_world_tick = Instant::now();
-            return Ok(());
+            let tick_count = self.tick_count;
+            self.jobs.world_tick = Some(BlimsBackgroundJob::WorldTick(spawn_blims_background(
+                move || Box::pin(tick_blims_world_blocking(tick_count)),
+            )));
         }
-        self.tick_count = self.tick_count.saturating_add(1);
-        let previous = self.world.clone();
-        self.world = tick_blims_world(self.tick_count).await?;
-        self.interactions = load_blims_interactions().await?;
-        self.record_world_changes(&previous);
+        if let Some(room_id) = self.pending_player_room_sync.take() {
+            self.jobs.player_room_sync =
+                Some(BlimsBackgroundJob::PlayerRoomSync(spawn_blims_background(
+                    move || Box::pin(async move { move_blims_player_blocking(&room_id).await }),
+                )));
+        }
+    }
+
+    fn poll_background_jobs(&mut self) -> bool {
+        let mut dirty = false;
+        if let Some(BlimsBackgroundJob::WorldTick(receiver)) = &self.jobs.world_tick {
+            match receiver.try_recv() {
+                Ok(Ok(world)) => {
+                    let previous = self.world.clone();
+                    self.apply_world_snapshot(world);
+                    self.record_world_changes(&previous);
+                    self.jobs.world_tick = None;
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    self.status = format!("world tick failed: {error}");
+                    self.jobs.world_tick = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "world tick worker disconnected".to_string();
+                    self.jobs.world_tick = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(BlimsBackgroundJob::PlayerRoomSync(receiver)) = &self.jobs.player_room_sync {
+            match receiver.try_recv() {
+                Ok(Ok(world)) => {
+                    self.apply_world_snapshot(world);
+                    self.jobs.player_room_sync = None;
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    self.status = format!("room sync failed: {error}");
+                    self.jobs.player_room_sync = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "room sync worker disconnected".to_string();
+                    self.jobs.player_room_sync = None;
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        dirty
+    }
+
+    fn apply_world_snapshot(&mut self, world: BlimsWorldSnapshot) {
+        self.world = world;
+        self.geometry = BlimsWorldGeometry::from_world(&self.world);
         self.sync_agent_targets();
         self.clamp_selected_interaction();
-        self.last_world_tick = Instant::now();
-        Ok(())
     }
 
-    fn animate_agents(&mut self) {
-        if self.last_animation.elapsed() < Duration::from_millis(120) {
-            return;
+    fn animate_agents(&mut self) -> bool {
+        if self.last_animation.elapsed() < Duration::from_millis(48) {
+            return false;
         }
+        let mut dirty = false;
         let targets = self
             .world
             .agents
@@ -1019,9 +1200,14 @@ impl BlimsTuiApp {
             .collect::<Vec<_>>();
         for (agent_id, target) in targets {
             let current = self.agent_tiles.entry(agent_id).or_insert(target);
-            *current = step_toward(*current, target);
+            let next = step_toward(*current, target);
+            if next != *current {
+                dirty = true;
+                *current = next;
+            }
         }
         self.last_animation = Instant::now();
+        dirty
     }
 
     fn sync_agent_targets(&mut self) {
@@ -1058,7 +1244,7 @@ impl BlimsTuiApp {
 
     async fn move_next(&mut self) -> Result<(), CliError> {
         let next = next_room_id(&self.world, &self.interactions.room_id);
-        self.world = move_blims_player(&next).await?;
+        self.world = move_blims_player_blocking(&next).await?;
         self.interactions = load_blims_interactions().await?;
         self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
         self.clamp_selected_interaction();
@@ -1068,7 +1254,7 @@ impl BlimsTuiApp {
 
     async fn move_previous(&mut self) -> Result<(), CliError> {
         let previous = previous_room_id(&self.world, &self.interactions.room_id);
-        self.world = move_blims_player(&previous).await?;
+        self.world = move_blims_player_blocking(&previous).await?;
         self.interactions = load_blims_interactions().await?;
         self.player_tile = player_tile_for_room(&self.world, &self.interactions.room_id);
         self.clamp_selected_interaction();
@@ -1166,7 +1352,7 @@ async fn load_blims_interactions() -> Result<BlimsAvailableInteractions, CliErro
     decode_blims_response::<BlimsAvailableInteractions>(response)
 }
 
-async fn move_blims_player(room_id: &str) -> Result<BlimsWorldSnapshot, CliError> {
+async fn move_blims_player_blocking(room_id: &str) -> Result<BlimsWorldSnapshot, CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "room_id": room_id,
@@ -1175,7 +1361,7 @@ async fn move_blims_player(room_id: &str) -> Result<BlimsWorldSnapshot, CliError
     decode_blims_response::<BlimsWorldSnapshot>(response)
 }
 
-async fn tick_blims_world(tick_count: u64) -> Result<BlimsWorldSnapshot, CliError> {
+async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot, CliError> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0_i64, |duration| {
@@ -1198,6 +1384,23 @@ async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
 async fn load_world_templates() -> Result<Vec<BlimsWorldTemplateSummary>, CliError> {
     let response = call_blims_service("world.template_list", blims_workspace_payload()?).await?;
     decode_blims_response::<Vec<BlimsWorldTemplateSummary>>(response)
+}
+
+fn spawn_blims_background<T>(
+    operation: impl FnOnce() -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T, CliError>> + Send>,
+    > + Send
+    + 'static,
+) -> Receiver<Result<T, CliError>>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    tokio::spawn(async move {
+        let result = operation().await;
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 async fn refresh_conversation_transcript(
@@ -1347,7 +1550,7 @@ fn render_pixel_world(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let viewport = BlimsViewport::for_area(&app.world, app.player_tile, area);
+    let viewport = BlimsViewport::for_area(&app.geometry, app.player_tile, area);
     for screen_y in 0..area.height {
         for screen_x in 0..area.width {
             let tile = BlimsTilePosition {
@@ -1387,7 +1590,7 @@ fn tile_glyph(app: &BlimsTuiApp, tile: BlimsTilePosition) -> (&'static str, Styl
                 .add_modifier(Modifier::BOLD),
         );
     }
-    let Some(room) = room_at_tile(&app.world, tile) else {
+    let Some(room) = app.geometry.room_at(&app.world, tile) else {
         return (
             " ",
             Style::new()
@@ -1407,7 +1610,7 @@ fn tile_glyph(app: &BlimsTuiApp, tile: BlimsTilePosition) -> (&'static str, Styl
             Style::new().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
         );
     }
-    if corridor_tiles(&app.world).contains(&tile) {
+    if app.geometry.corridors.contains(&tile) {
         return (
             "░",
             Style::new()
@@ -1800,15 +2003,66 @@ impl BlimsTileRect {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsWorldGeometry {
+    corridors: BTreeSet<BlimsTilePosition>,
+    walkable: BTreeSet<BlimsTilePosition>,
+    tile_rooms: BTreeMap<BlimsTilePosition, String>,
+    world_width: i64,
+    world_height: i64,
+}
+
+impl BlimsWorldGeometry {
+    fn from_world(world: &BlimsWorldSnapshot) -> Self {
+        let corridors = corridor_tiles(world);
+        let mut walkable = corridors.clone();
+        let mut tile_rooms = BTreeMap::new();
+        for room in &world.rooms {
+            let rect = room_tile_rect(room);
+            for y in rect.y..=rect.bottom() {
+                for x in rect.x..=rect.right() {
+                    let tile = BlimsTilePosition { x, y };
+                    walkable.insert(tile);
+                    tile_rooms.insert(tile, room.id.clone());
+                }
+            }
+        }
+        Self {
+            corridors,
+            walkable,
+            tile_rooms,
+            world_width: world_tile_width(world),
+            world_height: world_tile_height(world),
+        }
+    }
+
+    fn room_at<'a>(
+        &self,
+        world: &'a BlimsWorldSnapshot,
+        tile: BlimsTilePosition,
+    ) -> Option<&'a BlimsRoomSnapshot> {
+        let room_id = self.tile_rooms.get(&tile)?;
+        world.rooms.iter().find(|room| room.id == *room_id)
+    }
+
+    fn room_id_at(&self, tile: BlimsTilePosition) -> Option<String> {
+        self.tile_rooms.get(&tile).cloned()
+    }
+
+    fn is_walkable(&self, tile: BlimsTilePosition) -> bool {
+        self.walkable.contains(&tile)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BlimsViewport {
     origin: BlimsTilePosition,
 }
 
 impl BlimsViewport {
-    fn for_area(world: &BlimsWorldSnapshot, player: BlimsTilePosition, area: Rect) -> Self {
-        let world_width = world_tile_width(world);
-        let world_height = world_tile_height(world);
+    fn for_area(geometry: &BlimsWorldGeometry, player: BlimsTilePosition, area: Rect) -> Self {
+        let world_width = geometry.world_width;
+        let world_height = geometry.world_height;
         let visible_width = i64::from(area.width).max(1);
         let visible_height = i64::from(area.height).max(1);
         let max_x = (world_width - visible_width).max(0);
@@ -1892,17 +2146,6 @@ fn stable_tile_offset(id: &str) -> BlimsTilePosition {
     }
 }
 
-fn room_at_tile(world: &BlimsWorldSnapshot, tile: BlimsTilePosition) -> Option<&BlimsRoomSnapshot> {
-    world
-        .rooms
-        .iter()
-        .find(|room| room_tile_rect(room).contains(tile))
-}
-
-fn room_id_at_tile(world: &BlimsWorldSnapshot, tile: BlimsTilePosition) -> Option<String> {
-    room_at_tile(world, tile).map(|room| room.id.clone())
-}
-
 fn is_near_current_room(
     world: &BlimsWorldSnapshot,
     player: BlimsTilePosition,
@@ -1917,10 +2160,6 @@ fn is_near_current_room(
 
 const fn manhattan_distance(a: BlimsTilePosition, b: BlimsTilePosition) -> i64 {
     (a.x - b.x).abs() + (a.y - b.y).abs()
-}
-
-fn is_walkable_tile(world: &BlimsWorldSnapshot, tile: BlimsTilePosition) -> bool {
-    room_at_tile(world, tile).is_some() || corridor_tiles(world).contains(&tile)
 }
 
 fn corridor_tiles(world: &BlimsWorldSnapshot) -> BTreeSet<BlimsTilePosition> {
