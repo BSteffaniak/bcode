@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use bcode_agent_profile::AgentInfo;
+use bcode_client::AttachedSessionHistory;
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionSummary,
     SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
@@ -663,6 +664,91 @@ fn new_draft_preserves_selected_agent() {
     super::session_flow::switch_to_draft_session(&mut chat);
 
     assert_eq!(chat.app.current_agent_id(), "plan");
+}
+
+#[tokio::test]
+async fn async_session_open_preserves_typed_draft() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (async_sender, async_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        async_event_sender: async_sender,
+        async_event_receiver: async_receiver,
+        session_open_task: None,
+        status_hydration_task: None,
+        opening_session_id: Some(session_id),
+    };
+    chat.app.replace_composer_with("draft while opening");
+    let (_event_sender, event_receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
+    let attached = AttachedSessionHistory {
+        session: session_summary(session_id),
+        history: vec![event(
+            session_id,
+            1,
+            SessionEventKind::AssistantMessage {
+                text: "previous answer".to_owned(),
+            },
+        )],
+        input_history: vec![SessionInputHistoryEntry {
+            sequence: 1,
+            text: "previous prompt".to_owned(),
+        }],
+        import_warnings: Vec::new(),
+    };
+
+    super::session_flow::complete_switch_session(
+        &bcode_client::BcodeClient::default_endpoint(),
+        &mut chat,
+        super::session_flow::SessionOpenResult {
+            session_id,
+            initial_history_limit: 64,
+            result: Ok((
+                attached,
+                tokio::spawn(async move {
+                    drop(event_receiver);
+                }),
+            )),
+        },
+    );
+
+    assert_eq!(chat.app.composer().text(), "draft while opening");
+}
+
+#[tokio::test]
+async fn async_session_open_initial_state_preserves_existing_draft() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (async_sender, async_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(None, &[], &[], false),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        async_event_sender: async_sender,
+        async_event_receiver: async_receiver,
+        session_open_task: None,
+        status_hydration_task: None,
+        opening_session_id: None,
+    };
+    chat.app.replace_composer_with("draft before opening");
+
+    super::session_flow::start_switch_session(
+        &bcode_client::BcodeClient::default_endpoint(),
+        &mut chat,
+        session_id,
+        64,
+    );
+    if let Some(open_task) = chat.session_open_task.take() {
+        open_task.abort();
+    }
+
+    assert_eq!(chat.app.composer().text(), "draft before opening");
 }
 
 #[test]
@@ -1930,6 +2016,18 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
             },
         ),
     ]
+}
+
+fn session_summary(session_id: SessionId) -> SessionSummary {
+    SessionSummary {
+        id: session_id,
+        name: Some("Opened session".to_owned()),
+        client_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        working_directory: "/tmp/bcode-tui-test".into(),
+        import: None,
+    }
 }
 
 fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {

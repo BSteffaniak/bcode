@@ -83,10 +83,14 @@ pub fn start_switch_session(
     }
     while chat.event_receiver.try_recv().is_ok() {}
     let tui_config = chat.app.tui_config().clone();
+    let draft_text = chat.app.composer().text().to_owned();
     chat.opening_session_id = Some(next_session_id);
     chat.session_id = None;
     chat.app = BmuxApp::new_with_history(Some(next_session_id), &[], &[], false);
     chat.app.apply_tui_config(tui_config);
+    if !draft_text.is_empty() {
+        chat.app.replace_composer_with(&draft_text);
+    }
     chat.app.set_status("Opening session…".to_owned());
     let client = client.clone();
     let event_sender = chat.event_sender.clone();
@@ -122,6 +126,7 @@ pub fn complete_switch_session(
     chat.opening_session_id = None;
     match opened.result {
         Ok((attached, next_task)) => {
+            let draft_text = chat.app.composer().text().to_owned();
             chat.event_task = Some(next_task);
             chat.session_id = Some(opened.session_id);
             let tui_config = chat.app.tui_config().clone();
@@ -133,6 +138,9 @@ pub fn complete_switch_session(
                 has_older_history,
             );
             chat.app.apply_tui_config(tui_config);
+            if !draft_text.is_empty() {
+                chat.app.replace_composer_with(&draft_text);
+            }
             chat.app.apply_session_summary(&attached.session);
             chat.app.set_status("session opened".to_owned());
             start_status_hydration(client, chat, opened.session_id);

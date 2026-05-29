@@ -43,7 +43,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use store_executor::{PersistedSessionMetadata, SessionStoreExecutor};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -330,20 +330,62 @@ impl SessionEventStore {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionStoreError> {
+        let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
+        let index_timer = self.metrics.timer();
         let index = self.ensure_fresh_index(session_id)?;
+        self.metrics.record_histogram(
+            "session.store.history_page.ensure_fresh_index_duration_ms",
+            index_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.history_page.index_event_count",
+            usize_to_u64(index.event_count),
+        );
+        let entries_timer = self.metrics.timer();
         let entries = match index::read_entries(&self.root, session_id) {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
+                self.metrics
+                    .increment_counter("session.store.history_page.index_rebuild_total");
                 let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
                 index::read_entries(&self.root, session_id)?
             }
         };
+        self.metrics.record_histogram(
+            "session.store.history_page.read_entries_duration_ms",
+            entries_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.history_page.read_entry_count",
+            usize_to_u64(entries.len()),
+        );
         let limit = query.limit.max(1);
+        let select_timer = self.metrics.timer();
         let (page_entries, mut has_more) = select_history_page_entries(entries, query, limit);
+        self.metrics.record_histogram(
+            "session.store.history_page.select_entries_duration_ms",
+            select_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.history_page.selected_entry_count",
+            usize_to_u64(page_entries.len()),
+        );
+        let events_timer = self.metrics.timer();
         let mut events = read_indexed_events(&event_path, &page_entries);
+        self.metrics.record_histogram(
+            "session.store.history_page.read_indexed_events_duration_ms",
+            events_timer.elapsed_ms(),
+        );
         if events.is_err() {
+            self.metrics
+                .increment_counter("session.store.history_page.read_indexed_events_error_total");
+            let rebuild_timer = self.metrics.timer();
             let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
+            self.metrics.record_histogram(
+                "session.store.history_page.rebuild_after_read_error_duration_ms",
+                rebuild_timer.elapsed_ms(),
+            );
             let rebuilt_index = self.ensure_fresh_index(session_id)?;
             let rebuilt_entries = index::read_entries(&self.root, session_id)?;
             if rebuilt_entries.len() != rebuilt_index.event_count {
@@ -357,6 +399,10 @@ impl SessionEventStore {
             events = read_indexed_events(&event_path, &rebuilt_page_entries);
         }
         let events = events?;
+        self.metrics.record_histogram(
+            "session.store.history_page.result_event_count",
+            usize_to_u64(events.len()),
+        );
         let next_cursor = if has_more {
             events.last().map(|event| SessionHistoryCursor {
                 sequence: match query.direction {
@@ -367,6 +413,10 @@ impl SessionEventStore {
         } else {
             None
         };
+        self.metrics.record_histogram(
+            "session.store.history_page.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
         Ok(SessionHistoryPage {
             session_id,
             events,
@@ -379,30 +429,85 @@ impl SessionEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
+        let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
+        let index_timer = self.metrics.timer();
         let index =
             if let Some(index) = index::load_fresh_index(&self.root, session_id, &event_path)? {
                 index
             } else {
+                self.metrics
+                    .increment_counter("session.store.input_history.index_rebuild_total");
                 let (index, events) = index::rebuild_index(&self.root, session_id, &event_path)?;
                 let Some(index) = index else {
-                    return Ok(input_history_from_events(&events));
+                    let input_history = input_history_from_events(&events);
+                    self.metrics.record_histogram(
+                        "session.store.input_history.entry_count",
+                        usize_to_u64(input_history.len()),
+                    );
+                    self.metrics.record_histogram(
+                        "session.store.input_history.total_duration_ms",
+                        total_timer.elapsed_ms(),
+                    );
+                    return Ok(input_history);
                 };
                 index
             };
+        self.metrics.record_histogram(
+            "session.store.input_history.load_index_duration_ms",
+            index_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.input_history.index_event_count",
+            usize_to_u64(index.event_count),
+        );
+        let entries_timer = self.metrics.timer();
         let entries = match index::read_entries(&self.root, session_id) {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
+                self.metrics
+                    .increment_counter("session.store.input_history.index_rebuild_total");
                 let (_, events) = index::rebuild_index(&self.root, session_id, &event_path)?;
-                return Ok(input_history_from_events(&events));
+                let input_history = input_history_from_events(&events);
+                self.metrics.record_histogram(
+                    "session.store.input_history.rebuild_fallback_entry_count",
+                    usize_to_u64(input_history.len()),
+                );
+                self.metrics.record_histogram(
+                    "session.store.input_history.total_duration_ms",
+                    total_timer.elapsed_ms(),
+                );
+                return Ok(input_history);
             }
         };
+        self.metrics.record_histogram(
+            "session.store.input_history.read_entries_duration_ms",
+            entries_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.input_history.read_entry_count",
+            usize_to_u64(entries.len()),
+        );
         let mut input_history = Vec::new();
+        let filter_timer = self.metrics.timer();
         let user_message_entries = entries
             .into_iter()
             .filter(|entry| entry.kind == "user_message")
             .collect::<Vec<_>>();
+        self.metrics.record_histogram(
+            "session.store.input_history.filter_user_messages_duration_ms",
+            filter_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.input_history.user_message_entry_count",
+            usize_to_u64(user_message_entries.len()),
+        );
+        let events_timer = self.metrics.timer();
         let events = read_indexed_events(&event_path, &user_message_entries)?;
+        self.metrics.record_histogram(
+            "session.store.input_history.read_indexed_events_duration_ms",
+            events_timer.elapsed_ms(),
+        );
         for event in events {
             if let SessionEventKind::UserMessage { text, .. } = event.kind {
                 input_history.push(SessionInputHistoryEntry {
@@ -411,6 +516,14 @@ impl SessionEventStore {
                 });
             }
         }
+        self.metrics.record_histogram(
+            "session.store.input_history.entry_count",
+            usize_to_u64(input_history.len()),
+        );
+        self.metrics.record_histogram(
+            "session.store.input_history.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
         Ok(input_history)
     }
 
@@ -1145,6 +1258,7 @@ pub struct SessionManager {
     activity_clock_ms: AtomicU64,
     catalog_status_tx: watch::Sender<CatalogLoadStatus>,
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
+    metrics: MetricsRegistry,
 }
 
 #[derive(Debug, Default)]
@@ -1218,6 +1332,7 @@ impl Default for SessionManager {
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
             catalog_status_tx,
             catalog_status_rx,
+            metrics: MetricsRegistry::default(),
         }
     }
 }
@@ -1269,6 +1384,7 @@ impl SessionManager {
         catalog_loaded: bool,
     ) -> Self {
         let executor = SessionStoreExecutor::new(store);
+        let metrics = executor.metrics();
         let catalog_status = if catalog_loaded {
             CatalogLoadStatus::Loaded
         } else {
@@ -1293,6 +1409,7 @@ impl SessionManager {
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
             catalog_status_tx,
             catalog_status_rx,
+            metrics,
         }
     }
 
@@ -1308,20 +1425,43 @@ impl SessionManager {
     }
 
     async fn ensure_session_loaded(&self, session_id: SessionId) -> Result<(), SessionError> {
+        let total_timer = self.metrics.timer();
         if self.inner.lock().await.sessions.contains_key(&session_id) {
+            self.metrics.record_histogram(
+                "session.manager.ensure_loaded.cached_total_duration_ms",
+                total_timer.elapsed_ms(),
+            );
             return Ok(());
         }
         let Some(store) = &self.store else {
             return Err(SessionError::NotFound(session_id));
         };
+        let load_timer = self.metrics.timer();
         let Some(state) = store.load_session(session_id).await? else {
+            self.metrics.record_histogram(
+                "session.manager.ensure_loaded.total_duration_ms",
+                total_timer.elapsed_ms(),
+            );
             return Err(SessionError::NotFound(session_id));
         };
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.load_session_duration_ms",
+            load_timer.elapsed_ms(),
+        );
+        let insert_timer = self.metrics.timer();
         let mut inner = self.inner.lock().await;
         inner
             .sessions
             .entry(session_id)
             .or_insert_with(|| SessionHandle::new(state, self.store.clone()));
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.insert_duration_ms",
+            insert_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
         Ok(())
     }
 
@@ -1397,31 +1537,76 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<(), SessionError> {
+        let total_timer = self.metrics.timer();
         self.ensure_session_loaded(session_id).await?;
+        let access_timer = self.metrics.timer();
         let should_migrate = {
             let handle = self.session_handle(session_id).await?;
             match handle.access_status().await? {
                 SessionAccessStatus::ReadWrite => false,
                 SessionAccessStatus::ReadOnlyMigrationRequired => true,
                 status => {
+                    self.metrics.record_histogram(
+                        "session.manager.migrate_if_required.access_check_duration_ms",
+                        access_timer.elapsed_ms(),
+                    );
+                    self.metrics.record_histogram(
+                        "session.manager.migrate_if_required.total_duration_ms",
+                        total_timer.elapsed_ms(),
+                    );
                     return Err(SessionError::NotWritable { session_id, status });
                 }
             }
         };
+        self.metrics.record_histogram(
+            "session.manager.migrate_if_required.access_check_duration_ms",
+            access_timer.elapsed_ms(),
+        );
         if !should_migrate {
+            self.metrics
+                .increment_counter("session.manager.migrate_if_required.not_required_total");
+            self.metrics.record_histogram(
+                "session.manager.migrate_if_required.total_duration_ms",
+                total_timer.elapsed_ms(),
+            );
             return Ok(());
         }
+        self.metrics
+            .increment_counter("session.manager.migrate_if_required.required_total");
         let Some(store) = &self.store else {
+            self.metrics.record_histogram(
+                "session.manager.migrate_if_required.total_duration_ms",
+                total_timer.elapsed_ms(),
+            );
             return Ok(());
         };
+        let migrate_timer = self.metrics.timer();
         store.migrate_event_log_to_current(session_id).await?;
+        self.metrics.record_histogram(
+            "session.manager.migrate_if_required.migrate_duration_ms",
+            migrate_timer.elapsed_ms(),
+        );
+        let index_timer = self.metrics.timer();
         let index = store.ensure_fresh_index(session_id).await?;
+        self.metrics.record_histogram(
+            "session.manager.migrate_if_required.ensure_index_duration_ms",
+            index_timer.elapsed_ms(),
+        );
         let handle = self.session_handle(session_id).await?;
         let clients = handle.client_ids().await?;
         let mut state = SessionState::from_index(index);
         state.clients = clients;
         state.summary.client_count = state.clients.len();
+        let replace_timer = self.metrics.timer();
         handle.replace_state(state).await?;
+        self.metrics.record_histogram(
+            "session.manager.migrate_if_required.replace_state_duration_ms",
+            replace_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.manager.migrate_if_required.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
         Ok(())
     }
 
@@ -1797,13 +1982,34 @@ impl SessionManager {
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<SessionAttachment, SessionError> {
+        let total_timer = self.metrics.timer();
+        let migrate_timer = self.metrics.timer();
         self.migrate_session_to_current_if_required(session_id)
             .await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_full.migrate_if_required_duration_ms",
+            migrate_timer.elapsed_ms(),
+        );
+        let handle_timer = self.metrics.timer();
         let handle = self.session_handle(session_id).await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_full.handle_duration_ms",
+            handle_timer.elapsed_ms(),
+        );
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        handle
+        let attach_timer = self.metrics.timer();
+        let result = handle
             .attach(client_id, AttachMode::Full, activity_timestamp_ms)
-            .await
+            .await;
+        self.metrics.record_histogram(
+            "session.manager.attach_full.actor_attach_duration_ms",
+            attach_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.manager.attach_full.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
+        result
     }
 
     /// Attach a client and return only the most recent replayable history events.
@@ -1821,17 +2027,50 @@ impl SessionManager {
         client_id: ClientId,
         limit: usize,
     ) -> Result<SessionAttachment, SessionError> {
+        let total_timer = self.metrics.timer();
+        self.metrics
+            .record_histogram("session.manager.attach_recent.limit", usize_to_u64(limit));
+        let migrate_timer = self.metrics.timer();
         self.migrate_session_to_current_if_required(session_id)
             .await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_recent.migrate_if_required_duration_ms",
+            migrate_timer.elapsed_ms(),
+        );
+        let handle_timer = self.metrics.timer();
         let handle = self.session_handle(session_id).await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_recent.handle_duration_ms",
+            handle_timer.elapsed_ms(),
+        );
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        handle
+        let attach_timer = self.metrics.timer();
+        let result = handle
             .attach(
                 client_id,
                 AttachMode::Recent { limit },
                 activity_timestamp_ms,
             )
-            .await
+            .await;
+        self.metrics.record_histogram(
+            "session.manager.attach_recent.actor_attach_duration_ms",
+            attach_timer.elapsed_ms(),
+        );
+        if let Ok(attachment) = &result {
+            self.metrics.record_histogram(
+                "session.manager.attach_recent.history_event_count",
+                usize_to_u64(attachment.history.len()),
+            );
+            self.metrics.record_histogram(
+                "session.manager.attach_recent.input_history_entry_count",
+                usize_to_u64(attachment.input_history.len()),
+            );
+        }
+        self.metrics.record_histogram(
+            "session.manager.attach_recent.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
+        result
     }
 
     /// Detach a client from a session if it is currently attached.
@@ -2609,6 +2848,14 @@ fn current_unix_millis() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn normalize_session_name(name: Option<String>) -> Option<String> {

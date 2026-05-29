@@ -2145,43 +2145,63 @@ async fn handle_attach_session_recent(
     session_id: SessionId,
     limit: usize,
 ) -> Result<(), ServerError> {
+    let total_started_at = Instant::now();
+    state
+        .metrics
+        .increment_counter("server.attach_recent.total");
+    state
+        .metrics
+        .record_histogram("server.attach_recent.limit", usize_to_u64(limit));
+    let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
         .try_activate_session_namespace(session_id, client_namespace)
         .await
     {
+        state.metrics.record_histogram(
+            "server.attach_recent.namespace_activation_duration_ms",
+            elapsed_ms(namespace_started_at),
+        );
+        state.metrics.record_histogram(
+            "server.attach_recent.total_duration_ms",
+            elapsed_ms(total_started_at),
+        );
         return send_incompatible_active_session_response(writer, request_id, &active_namespace)
             .await;
     }
+    state.metrics.record_histogram(
+        "server.attach_recent.namespace_activation_duration_ms",
+        elapsed_ms(namespace_started_at),
+    );
+    let attach_started_at = Instant::now();
     match state
         .sessions
         .attach_session_recent(session_id, client_id, limit)
         .await
     {
         Ok(attachment) => {
-            restore_active_skills_from_history(&attachment.history, state, session_id).await;
-            *attached_session = Some(session_id);
-            publish_session_event(state, &attachment.attached_event).await;
-            state
-                .session_catalog
-                .upsert_native_session(attachment.session.clone())
-                .await;
-            send_response(
-                writer,
+            finish_attach_session_recent_success(
                 request_id,
-                Response::Ok(ResponsePayload::Attached {
-                    session_id,
-                    session: attachment.session,
-                    history: compact_attach_history(attachment.history),
-                    input_history: attachment.input_history,
-                    import_warnings: Vec::new(),
-                }),
+                state,
+                writer,
+                attached_session,
+                session_id,
+                attachment,
+                AttachRecentTimings {
+                    total_started_at,
+                    attach_started_at,
+                },
             )
-            .await?;
-            forward_session_events(writer.clone(), attachment.events);
-            Ok(())
+            .await
         }
         Err(error) => {
+            state.metrics.record_histogram(
+                "server.attach_recent.session_attach_duration_ms",
+                elapsed_ms(attach_started_at),
+            );
+            state
+                .metrics
+                .increment_counter("server.attach_recent.error_total");
             send_response(
                 writer,
                 request_id,
@@ -2191,9 +2211,96 @@ async fn handle_attach_session_recent(
             state
                 .deactivate_session_namespace_if_inactive(session_id)
                 .await;
+            state.metrics.record_histogram(
+                "server.attach_recent.total_duration_ms",
+                elapsed_ms(total_started_at),
+            );
             Ok(())
         }
     }
+}
+
+struct AttachRecentTimings {
+    total_started_at: Instant,
+    attach_started_at: Instant,
+}
+
+async fn finish_attach_session_recent_success(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    attached_session: &mut Option<SessionId>,
+    session_id: SessionId,
+    attachment: bcode_session::SessionAttachment,
+    timings: AttachRecentTimings,
+) -> Result<(), ServerError> {
+    state.metrics.record_histogram(
+        "server.attach_recent.session_attach_duration_ms",
+        elapsed_ms(timings.attach_started_at),
+    );
+    state.metrics.record_histogram(
+        "server.attach_recent.history_event_count",
+        usize_to_u64(attachment.history.len()),
+    );
+    state.metrics.record_histogram(
+        "server.attach_recent.input_history_entry_count",
+        usize_to_u64(attachment.input_history.len()),
+    );
+    let restore_started_at = Instant::now();
+    restore_active_skills_from_history(&attachment.history, state, session_id).await;
+    state.metrics.record_histogram(
+        "server.attach_recent.restore_active_skills_duration_ms",
+        elapsed_ms(restore_started_at),
+    );
+    *attached_session = Some(session_id);
+    let publish_started_at = Instant::now();
+    publish_session_event(state, &attachment.attached_event).await;
+    state.metrics.record_histogram(
+        "server.attach_recent.publish_attached_event_duration_ms",
+        elapsed_ms(publish_started_at),
+    );
+    let catalog_started_at = Instant::now();
+    state
+        .session_catalog
+        .upsert_native_session(attachment.session.clone())
+        .await;
+    state.metrics.record_histogram(
+        "server.attach_recent.catalog_upsert_duration_ms",
+        elapsed_ms(catalog_started_at),
+    );
+    let compact_started_at = Instant::now();
+    let compacted_history = compact_attach_history(attachment.history);
+    state.metrics.record_histogram(
+        "server.attach_recent.compact_history_duration_ms",
+        elapsed_ms(compact_started_at),
+    );
+    state.metrics.record_histogram(
+        "server.attach_recent.compacted_history_event_count",
+        usize_to_u64(compacted_history.len()),
+    );
+    let send_started_at = Instant::now();
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::Attached {
+            session_id,
+            session: attachment.session,
+            history: compacted_history,
+            input_history: attachment.input_history,
+            import_warnings: Vec::new(),
+        }),
+    )
+    .await?;
+    state.metrics.record_histogram(
+        "server.attach_recent.response_send_duration_ms",
+        elapsed_ms(send_started_at),
+    );
+    state.metrics.record_histogram(
+        "server.attach_recent.total_duration_ms",
+        elapsed_ms(timings.total_started_at),
+    );
+    forward_session_events(writer.clone(), attachment.events);
+    Ok(())
 }
 
 async fn enqueue_session_command(
@@ -2221,6 +2328,10 @@ async fn enqueue_session_command(
 
 fn usize_to_u32_saturating(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 async fn session_runtime_handle(

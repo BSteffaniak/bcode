@@ -70,17 +70,9 @@ pub async fn attach_session_event_stream_with_limit(
         .attach_session_recent_with_input_history(session_id, limit)
         .await?;
     let event_task = tokio::spawn(async move {
-        loop {
-            match connection.recv_event().await {
-                Ok(event) => {
-                    if event_sender.send(event).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    eprintln!("BMUX TUI event stream ended: {error}");
-                    break;
-                }
+        while let Ok(event) = connection.recv_event().await {
+            if event_sender.send(event).is_err() {
+                break;
             }
         }
     });

@@ -97,13 +97,21 @@ impl SessionHandle {
         mode: AttachMode,
         activity_timestamp_ms: u64,
     ) -> Result<SessionAttachment, SessionError> {
-        self.send(|reply| SessionCommand::Attach {
-            client_id,
-            mode,
-            activity_timestamp_ms,
-            reply,
-        })
-        .await?
+        let (reply, receiver) = oneshot::channel();
+        let queued_at = Instant::now();
+        self.commands
+            .send(SessionCommand::Attach {
+                client_id,
+                mode,
+                activity_timestamp_ms,
+                queued_at,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?;
+        receiver
+            .await
+            .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?
     }
 
     pub async fn detach(
@@ -211,6 +219,7 @@ enum SessionCommand {
         client_id: ClientId,
         mode: AttachMode,
         activity_timestamp_ms: u64,
+        queued_at: Instant,
         reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
     },
     Detach {
@@ -279,9 +288,13 @@ impl SessionActor {
                     client_id,
                     mode,
                     activity_timestamp_ms,
+                    queued_at,
                     reply,
                 } => {
-                    let _ = reply.send(self.attach(client_id, mode, activity_timestamp_ms).await);
+                    let _ = reply.send(
+                        self.attach(client_id, mode, activity_timestamp_ms, queued_at)
+                            .await,
+                    );
                 }
                 SessionCommand::Detach {
                     client_id,
@@ -357,7 +370,12 @@ impl SessionActor {
         let mut event = self.state.build_next_event(kind)?;
         event.provenance = provenance;
         if let Some(store) = &self.store {
+            let append_started_at = Instant::now();
             store.append_event_frame(event.clone()).await?;
+            store.metrics().record_histogram(
+                "session.actor.append_event.append_frame_duration_ms",
+                elapsed_ms(append_started_at),
+            );
         }
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
@@ -365,11 +383,20 @@ impl SessionActor {
         if let Some(store) = &self.store {
             self.state.index_status = SessionIndexStatusKind::Stale;
             let metadata = PersistedSessionMetadata::from_state(&self.state);
+            let write_index_started_at = Instant::now();
             match store.write_metadata_index(metadata).await {
                 Ok(()) => {
+                    store.metrics().record_histogram(
+                        "session.actor.append_event.write_metadata_index_duration_ms",
+                        elapsed_ms(write_index_started_at),
+                    );
                     self.state.index_status = SessionIndexStatusKind::Current;
                 }
                 Err(error) => {
+                    store.metrics().record_histogram(
+                        "session.actor.append_event.write_metadata_index_duration_ms",
+                        elapsed_ms(write_index_started_at),
+                    );
                     eprintln!(
                         "failed to update session index for {}: {error}",
                         self.state.summary.id
@@ -416,11 +443,33 @@ impl SessionActor {
         client_id: ClientId,
         mode: AttachMode,
         activity_timestamp_ms: u64,
+        queued_at: Instant,
     ) -> Result<SessionAttachment, SessionError> {
+        let total_started_at = Instant::now();
+        let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
+        if let Some(metrics) = &metrics {
+            metrics.increment_counter("session.actor.attach.total");
+            metrics.record_histogram(
+                "session.actor.attach.queue_wait_duration_ms",
+                elapsed_ms(queued_at),
+            );
+        }
+        let writable_started_at = Instant::now();
         self.state.ensure_writable()?;
+        if let Some(metrics) = &metrics {
+            metrics.record_histogram(
+                "session.actor.attach.ensure_writable_duration_ms",
+                elapsed_ms(writable_started_at),
+            );
+        }
+        let history_started_at = Instant::now();
         let history = match mode {
             AttachMode::Full => self.history().await?,
             AttachMode::Recent { limit } => {
+                if let Some(metrics) = &metrics {
+                    metrics
+                        .record_histogram("session.actor.attach.recent_limit", usize_to_u64(limit));
+                }
                 self.history_page(SessionHistoryQuery {
                     cursor: None,
                     limit,
@@ -430,10 +479,39 @@ impl SessionActor {
                 .events
             }
         };
+        if let Some(metrics) = &metrics {
+            metrics.record_histogram(
+                "session.actor.attach.history_duration_ms",
+                elapsed_ms(history_started_at),
+            );
+            metrics.record_histogram(
+                "session.actor.attach.history_event_count",
+                usize_to_u64(history.len()),
+            );
+        }
+        let input_history_started_at = Instant::now();
         let input_history = self.input_history().await?;
+        if let Some(metrics) = &metrics {
+            metrics.record_histogram(
+                "session.actor.attach.input_history_duration_ms",
+                elapsed_ms(input_history_started_at),
+            );
+            metrics.record_histogram(
+                "session.actor.attach.input_history_entry_count",
+                usize_to_u64(input_history.len()),
+            );
+        }
+        let subscribe_started_at = Instant::now();
         self.state.clients.insert(client_id);
         self.state.summary.client_count = self.state.clients.len();
         let events = self.state.sender.subscribe();
+        if let Some(metrics) = &metrics {
+            metrics.record_histogram(
+                "session.actor.attach.subscribe_duration_ms",
+                elapsed_ms(subscribe_started_at),
+            );
+        }
+        let append_started_at = Instant::now();
         let attached_event = self
             .append_event(
                 SessionEventKind::ClientAttached { client_id },
@@ -442,6 +520,16 @@ impl SessionActor {
             )
             .await?;
         let session = self.state.summary();
+        if let Some(metrics) = &metrics {
+            metrics.record_histogram(
+                "session.actor.attach.append_client_attached_duration_ms",
+                elapsed_ms(append_started_at),
+            );
+            metrics.record_histogram(
+                "session.actor.attach.total_duration_ms",
+                elapsed_ms(total_started_at),
+            );
+        }
         Ok(SessionAttachment {
             session,
             history,
