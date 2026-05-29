@@ -1042,8 +1042,16 @@ async fn handle_blims_tui_conversation_key(
                 conversation.status = "Type a message first.".to_string();
             } else {
                 BcodeClient::default_endpoint()
-                    .send_user_message(conversation.handle.session, text)
+                    .send_user_message(conversation.handle.session, text.clone())
                     .await?;
+                let _operation = submit_blims_command(&serde_json::json!({
+                    "type": "record_conversation_message",
+                    "conversation_id": conversation.handle.conversation_ref,
+                    "agent_id": conversation.handle.agent_id,
+                    "speaker": "ceo",
+                    "message": text,
+                }))
+                .await?;
                 conversation.input.clear();
                 conversation.status = "Message sent.".to_string();
                 refresh_conversation_transcript(conversation).await?;
@@ -3188,14 +3196,14 @@ async fn record_blims_conversation(
     prompt: &BlimsAgentTalkPrompt,
     session_id: &SessionId,
 ) -> Result<(), CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
+    let _operation = submit_blims_command(&serde_json::json!({
+        "type": "open_agent_conversation",
         "conversation_id": prompt.conversation_id,
         "agent_id": prompt.agent_id,
         "session_id": session_id.to_string(),
         "summary": "Bcode conversation session opened from Blims office.",
-    });
-    call_blims_service("agent.record_conversation", serde_json::to_vec(&request)?).await?;
+    }))
+    .await?;
     Ok(())
 }
 

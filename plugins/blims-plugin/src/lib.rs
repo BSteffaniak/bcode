@@ -846,6 +846,26 @@ pub enum BlimsCommand {
         /// New artifact status.
         status: String,
     },
+    OpenAgentConversation {
+        /// Agent id.
+        agent_id: String,
+        /// Blims conversation id.
+        conversation_id: String,
+        /// Bcode session id.
+        session_id: String,
+        /// Conversation summary.
+        summary: String,
+    },
+    RecordConversationMessage {
+        /// Blims conversation id.
+        conversation_id: String,
+        /// Agent id.
+        agent_id: String,
+        /// Speaker id or role.
+        speaker: String,
+        /// Message text.
+        message: String,
+    },
     /// Record that a frontend opened a dashboard view.
     OpenDashboardView,
     /// Record that a frontend closed a dashboard view.
@@ -861,6 +881,8 @@ impl BlimsCommand {
             Self::SelectWorldTemplate { .. } => "world.select_template",
             Self::SetProposalStatus { .. } => "proposal.status_set",
             Self::SetArtifactStatus { .. } => "artifact.status_set",
+            Self::OpenAgentConversation { .. } => "conversation.open",
+            Self::RecordConversationMessage { .. } => "conversation.message_record",
             Self::OpenDashboardView => "dashboard.open_view",
             Self::CloseDashboardView => "dashboard.close_view",
         }
@@ -873,6 +895,8 @@ impl BlimsCommand {
             | Self::SelectWorldTemplate { .. }
             | Self::SetProposalStatus { .. }
             | Self::SetArtifactStatus { .. }
+            | Self::OpenAgentConversation { .. }
+            | Self::RecordConversationMessage { .. }
             | Self::OpenDashboardView
             | Self::CloseDashboardView => BlimsOperationPriority::Interactive,
             Self::TickWorld { .. } => BlimsOperationPriority::Background,
@@ -1978,6 +2002,12 @@ enum BlimsEventPayload {
     },
     ConversationRecorded {
         conversation: ConversationRecord,
+    },
+    ConversationMessageRecorded {
+        conversation_id: String,
+        agent_id: String,
+        speaker: String,
+        message: String,
     },
     AgentHired {
         agent: AgentSnapshot,
@@ -4428,6 +4458,20 @@ async fn apply_work_event_projection(
         BlimsEventPayload::ConversationRecorded { conversation } => {
             replace_one_conversation_projection(database, conversation).await?;
         }
+        BlimsEventPayload::ConversationMessageRecorded {
+            conversation_id,
+            agent_id,
+            ..
+        } => {
+            let conversation = ConversationRecord {
+                id: conversation_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: String::new(),
+                status: "open".to_string(),
+                summary: "Conversation message recorded.".to_string(),
+            };
+            replace_one_conversation_projection(database, &conversation).await?;
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -4547,6 +4591,7 @@ async fn apply_org_world_event_projection(
                 .await?;
         }
         BlimsEventPayload::InitiativePlanImported { .. }
+        | BlimsEventPayload::ConversationMessageRecorded { .. }
         | BlimsEventPayload::CommandSubmitted { .. }
         | BlimsEventPayload::OperationStatusSet { .. }
         | BlimsEventPayload::DashboardProjectionRefreshed { .. }
@@ -4684,29 +4729,80 @@ fn record_conversation(
     request: &ConversationRecordRequest,
     event_context: &EventContext,
 ) -> Result<ConversationRecord, BlimsStateError> {
-    let conversation = ConversationRecord {
-        id: request.conversation_id.clone(),
-        agent_id: request.agent_id.clone(),
-        session_id: request.session_id.clone(),
-        status: "open".to_string(),
-        summary: request.summary.clone(),
-    };
+    let conversation_id = request.conversation_id.clone();
+    let agent_id = request.agent_id.clone();
+    let session_id = request.session_id.clone();
+    let summary = request.summary.clone();
     let event_context = event_context.clone();
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
-            append_event(
+            record_conversation_in_database(
                 database,
+                &conversation_id,
+                &agent_id,
+                &session_id,
+                &summary,
                 &event_context,
-                "conversation.recorded",
-                format!("Conversation recorded: {}", conversation.id),
-                &BlimsEventPayload::ConversationRecorded {
-                    conversation: conversation.clone(),
-                },
             )
-            .await?;
-            Ok::<_, BlimsStateError>(conversation)
+            .await
         })
     })
+}
+
+async fn record_conversation_in_database(
+    database: &dyn Database,
+    conversation_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    summary: &str,
+    event_context: &EventContext,
+) -> Result<ConversationRecord, BlimsStateError> {
+    let conversation = ConversationRecord {
+        id: conversation_id.to_string(),
+        agent_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+        status: "open".to_string(),
+        summary: summary.to_string(),
+    };
+    append_event(
+        database,
+        event_context,
+        "conversation.recorded",
+        format!("Conversation recorded: {}", conversation.id),
+        &BlimsEventPayload::ConversationRecorded {
+            conversation: conversation.clone(),
+        },
+    )
+    .await?;
+    Ok(conversation)
+}
+
+async fn record_conversation_message_in_database(
+    database: &dyn Database,
+    conversation_id: &str,
+    agent_id: &str,
+    speaker: &str,
+    message: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    if message.trim().is_empty() {
+        return Err(BlimsStateError::InvalidRequest(
+            "conversation message cannot be empty".to_string(),
+        ));
+    }
+    append_event(
+        database,
+        event_context,
+        "conversation.message_recorded",
+        format!("Conversation message recorded for {agent_id}."),
+        &BlimsEventPayload::ConversationMessageRecorded {
+            conversation_id: conversation_id.to_string(),
+            agent_id: agent_id.to_string(),
+            speaker: speaker.to_string(),
+            message: message.to_string(),
+        },
+    )
+    .await
 }
 
 fn hire_agent(
@@ -6504,6 +6600,40 @@ async fn run_command_operation(
             set_artifact_status_in_database(database, artifact_id, status, &event_context).await?;
             complete_operation(database, &event_context, operation_id).await
         }
+        BlimsCommand::OpenAgentConversation {
+            agent_id,
+            conversation_id,
+            session_id,
+            summary,
+        } => {
+            record_conversation_in_database(
+                database,
+                conversation_id,
+                agent_id,
+                session_id,
+                summary,
+                &event_context,
+            )
+            .await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
+        BlimsCommand::RecordConversationMessage {
+            conversation_id,
+            agent_id,
+            speaker,
+            message,
+        } => {
+            record_conversation_message_in_database(
+                database,
+                conversation_id,
+                agent_id,
+                speaker,
+                message,
+                &event_context,
+            )
+            .await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
         BlimsCommand::OpenDashboardView | BlimsCommand::CloseDashboardView => {
             complete_operation(database, &event_context, operation_id).await
         }
@@ -7195,6 +7325,7 @@ fn replay_event(
         | BlimsEventPayload::PlayerMoved { .. }
         | BlimsEventPayload::InitiativePlanImported { .. }
         | BlimsEventPayload::ReportGenerated { .. }
+        | BlimsEventPayload::ConversationMessageRecorded { .. }
         | BlimsEventPayload::ConversationRecorded { .. } => {}
         BlimsEventPayload::DepartmentCreated { .. }
         | BlimsEventPayload::TeamCreated { .. }
