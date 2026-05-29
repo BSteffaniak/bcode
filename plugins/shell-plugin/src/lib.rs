@@ -4,6 +4,10 @@
 
 //! Bundled shell execution tool plugin for Bcode.
 
+use bcode_config::{
+    ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode, default_config_paths_from,
+    load_config_from_paths,
+};
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
@@ -15,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -239,6 +244,109 @@ struct LimitedOutput {
     truncated: bool,
 }
 
+fn resolve_effective_cwd(
+    arguments: &ShellRunArguments,
+    session_cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    arguments.cwd.as_deref().map_or_else(
+        || session_cwd.map(Path::to_path_buf),
+        |cwd| {
+            if cwd.is_absolute() {
+                Some(cwd.to_path_buf())
+            } else {
+                session_cwd
+                    .map(|base| base.join(cwd))
+                    .or_else(|| Some(cwd.to_path_buf()))
+            }
+        },
+    )
+}
+
+fn shell_env_config(cwd: Option<&Path>) -> Result<ShellToolEnvConfig, String> {
+    let paths = cwd.map_or_else(
+        bcode_config::default_config_paths,
+        default_config_paths_from,
+    );
+    load_config_from_paths(&paths)
+        .map(|config| config.tools.shell.env)
+        .map_err(|error| error.to_string())
+}
+
+fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        let envrc = current.join(".envrc");
+        if envrc.exists() {
+            return Some(envrc);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn direnv_available() -> bool {
+    Command::new("direnv")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<bool, String> {
+    match config.mode {
+        ShellToolEnvMode::Inherit => Ok(false),
+        ShellToolEnvMode::Direnv => {
+            if direnv_available() {
+                Ok(true)
+            } else {
+                Err("shell env mode is direnv, but `direnv` is not available on PATH".to_owned())
+            }
+        }
+        ShellToolEnvMode::Auto => {
+            let Some(cwd) = cwd else {
+                return Ok(false);
+            };
+            let Some(envrc) = direnv_file_for(cwd) else {
+                return Ok(false);
+            };
+            if direnv_available() {
+                Ok(true)
+            } else if config.auto_fallback == ShellToolEnvAutoFallback::Inherit {
+                Ok(false)
+            } else {
+                Err(format!(
+                    "found {}, but `direnv` is not available on PATH; install direnv or set `[tools.shell.env] auto_fallback = \"inherit\"`",
+                    envrc.display()
+                ))
+            }
+        }
+    }
+}
+
+fn shell_program_and_args(
+    command: &str,
+    cwd: Option<&Path>,
+    env_config: ShellToolEnvConfig,
+) -> Result<(String, Vec<String>), String> {
+    if should_use_direnv(cwd, env_config)? {
+        let cwd = cwd.ok_or_else(|| "direnv shell mode requires a working directory".to_owned())?;
+        Ok((
+            "direnv".to_owned(),
+            vec![
+                "exec".to_owned(),
+                cwd.display().to_string(),
+                shell_program().to_owned(),
+                "-c".to_owned(),
+                command.to_owned(),
+            ],
+        ))
+    } else {
+        Ok((shell_program().to_owned(), shell_args(command)))
+    }
+}
+
 fn run_terminal_shell_command(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
@@ -265,50 +373,22 @@ fn run_terminal_shell_command(
     }
 }
 
-fn run_terminal_shell_command_inner(
-    events: ServiceEventEmitter,
+#[derive(Debug, Clone, Copy)]
+struct TerminalShellStatus {
+    exit_code: i32,
+    success: bool,
+    timed_out: bool,
+    cancelled: bool,
+}
+
+fn wait_for_terminal_shell_status(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
-    tool_call_id: &str,
-    arguments: &ShellRunArguments,
-    session_cwd: Option<&Path>,
     cancellation_path: Option<&Path>,
-) -> Result<ToolInvocationResponse, String> {
-    let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-    let columns = arguments.terminal_columns();
-    let rows = arguments.terminal_rows();
-    let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system
-        .openpty(portable_pty::PtySize {
-            rows,
-            cols: columns,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|error| error.to_string())?;
-
-    let mut command = portable_pty::CommandBuilder::new("sh");
-    command.arg("-c");
-    command.arg(&arguments.command);
-    if let Some(cwd) = arguments.cwd.as_deref().or(session_cwd) {
-        command.cwd(cwd);
-    }
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
-
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| error.to_string())?;
-    drop(pair.slave);
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|error| error.to_string())?;
-    let reader_thread = std::thread::spawn({
-        let tool_call_id = tool_call_id.to_owned();
-        move || read_limited_streaming(&mut reader, events, &tool_call_id, ToolOutputStream::Pty)
-    });
-
+    timeout: Duration,
+    tool_call_id: &str,
+    events: ServiceEventEmitter,
+) -> Result<TerminalShellStatus, String> {
     let started = Instant::now();
     let mut timed_out = false;
     let mut cancelled = false;
@@ -340,14 +420,26 @@ fn run_terminal_shell_command_inner(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    drop(pair.master);
-    let output = join_reader(reader_thread)?;
-    let inline_output = limit_terminal_inline_output(&output);
-    let terminal_output = TerminalCommandOutput {
-        mode: "terminal",
-        exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
+    Ok(TerminalShellStatus {
+        exit_code: i32::try_from(status.exit_code()).unwrap_or(i32::MAX),
+        success: status.success(),
         timed_out,
         cancelled,
+    })
+}
+
+fn encode_terminal_output(
+    status: TerminalShellStatus,
+    output: &LimitedOutput,
+    columns: u16,
+    rows: u16,
+) -> Result<(String, String), String> {
+    let inline_output = limit_terminal_inline_output(output);
+    let terminal_output = TerminalCommandOutput {
+        mode: "terminal",
+        exit_code: Some(status.exit_code),
+        timed_out: status.timed_out,
+        cancelled: status.cancelled,
         output: inline_output.text,
         output_truncated: inline_output.truncated,
         output_bytes: u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX),
@@ -357,10 +449,10 @@ fn run_terminal_shell_command_inner(
     };
     let full_terminal_output = TerminalCommandOutput {
         mode: "terminal",
-        exit_code: Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
-        timed_out,
-        cancelled,
-        output: output.text,
+        exit_code: Some(status.exit_code),
+        timed_out: status.timed_out,
+        cancelled: status.cancelled,
+        output: output.text.clone(),
         output_truncated: output.truncated,
         output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
         retained_output_bytes: u64::try_from(output.retained_bytes).unwrap_or(u64::MAX),
@@ -370,9 +462,71 @@ fn run_terminal_shell_command_inner(
     let encoded = serde_json::to_string(&terminal_output).map_err(|error| error.to_string())?;
     let full_encoded =
         serde_json::to_string(&full_terminal_output).map_err(|error| error.to_string())?;
+    Ok((encoded, full_encoded))
+}
+
+fn run_terminal_shell_command_inner(
+    events: ServiceEventEmitter,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    tool_call_id: &str,
+    arguments: &ShellRunArguments,
+    session_cwd: Option<&Path>,
+    cancellation_path: Option<&Path>,
+) -> Result<ToolInvocationResponse, String> {
+    let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+    let cwd = resolve_effective_cwd(arguments, session_cwd);
+    let env_config = shell_env_config(cwd.as_deref())?;
+    let columns = arguments.terminal_columns();
+    let rows = arguments.terminal_rows();
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows,
+            cols: columns,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| error.to_string())?;
+
+    let (program, args) = shell_program_and_args(&arguments.command, cwd.as_deref(), env_config)?;
+    let mut command = portable_pty::CommandBuilder::new(program);
+    for arg in args {
+        command.arg(arg);
+    }
+    if let Some(cwd) = cwd.as_deref() {
+        command.cwd(cwd);
+    }
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| error.to_string())?;
+    drop(pair.slave);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| error.to_string())?;
+    let reader_thread = std::thread::spawn({
+        let tool_call_id = tool_call_id.to_owned();
+        move || read_limited_streaming(&mut reader, events, &tool_call_id, ToolOutputStream::Pty)
+    });
+
+    let status = wait_for_terminal_shell_status(
+        &mut child,
+        cancellation,
+        cancellation_path,
+        timeout,
+        tool_call_id,
+        events,
+    )?;
+    drop(pair.master);
+    let output = join_reader(reader_thread)?;
+    let (encoded, full_encoded) = encode_terminal_output(status, &output, columns, rows)?;
     Ok(ToolInvocationResponse {
         output: encoded,
-        is_error: timed_out || cancelled || !status.success(),
+        is_error: status.timed_out || status.cancelled || !status.success,
         content: Vec::new(),
         full_output: Some(full_encoded),
     })
@@ -408,11 +562,9 @@ fn run_shell_command(
     cancellation_path: Option<&std::path::Path>,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-    let cwd = arguments
-        .cwd
-        .as_deref()
-        .or(session_cwd)
-        .map(Path::to_path_buf);
+    let cwd = resolve_effective_cwd(arguments, session_cwd);
+    let env_config = shell_env_config(cwd.as_deref())?;
+    let (program, args) = shell_program_and_args(&arguments.command, cwd.as_deref(), env_config)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -448,8 +600,8 @@ fn run_shell_command(
             let result = runtime
                 .run_process_streaming(
                     ProcessExecutionRequest {
-                        program: shell_program().to_string(),
-                        args: shell_args(&arguments.command),
+                        program,
+                        args,
                         cwd,
                         timeout: Some(timeout),
                         max_output_bytes: MAX_OUTPUT_BYTES,

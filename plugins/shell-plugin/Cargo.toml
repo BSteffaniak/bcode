@@ -14,6 +14,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bcode_config       = { workspace = true }
 bcode_plugin_sdk   = { workspace = true }
 bcode_tool         = { workspace = true }
 bcode_tool_runtime = { workspace = true }

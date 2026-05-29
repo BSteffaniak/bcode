@@ -143,6 +143,8 @@ pub struct BcodeConfig {
     pub session_import: SessionImportConfig,
     #[serde(default)]
     pub worktree: WorktreeConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
     #[serde(default = "empty_toml_table")]
     pub web_search: toml::Value,
 }
@@ -160,6 +162,7 @@ impl Default for BcodeConfig {
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
             worktree: WorktreeConfig::default(),
+            tools: ToolsConfig::default(),
             web_search: empty_toml_table(),
         }
     }
@@ -1022,7 +1025,66 @@ impl Default for TuiThinkingConfig {
     }
 }
 
-/// Rendering mode for provider-exposed reasoning / thinking.
+/// Tool execution configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolsConfig {
+    /// Shell tool configuration.
+    #[serde(default)]
+    pub shell: ShellToolConfig,
+}
+
+/// Shell tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ShellToolConfig {
+    /// Environment resolution configuration for shell commands.
+    #[serde(default)]
+    pub env: ShellToolEnvConfig,
+}
+
+/// Shell tool environment resolution configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellToolEnvConfig {
+    /// Environment resolver mode.
+    #[serde(default)]
+    pub mode: ShellToolEnvMode,
+    /// Fallback behavior when `auto` detects an environment manager but cannot apply it.
+    #[serde(default)]
+    pub auto_fallback: ShellToolEnvAutoFallback,
+}
+
+impl Default for ShellToolEnvConfig {
+    fn default() -> Self {
+        Self {
+            mode: ShellToolEnvMode::Auto,
+            auto_fallback: ShellToolEnvAutoFallback::Error,
+        }
+    }
+}
+
+/// Shell tool environment resolver mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellToolEnvMode {
+    /// Automatically detect project environment managers.
+    #[default]
+    Auto,
+    /// Inherit the daemon process environment.
+    Inherit,
+    /// Use direnv when running shell commands.
+    Direnv,
+}
+
+/// Shell tool auto environment fallback behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellToolEnvAutoFallback {
+    /// Return an actionable error when auto-detected environment setup cannot run.
+    #[default]
+    Error,
+    /// Fall back to the daemon process environment.
+    Inherit,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiThinkingMode {
