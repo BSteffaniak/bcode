@@ -579,7 +579,7 @@ pub async fn handle_blims_command(command: BlimsCommand) -> Result<(), CliError>
             select_world_template(template_id, json).await?;
         }
         BlimsCommand::Enter => enter_blims_office().await?,
-        BlimsCommand::Talk { agent_id } => start_blims_agent_talk(agent_id).await?,
+        BlimsCommand::Talk { agent_id } => start_blims_agent_talk_cli(agent_id).await?,
         BlimsCommand::Task { command } => handle_blims_task_command(command).await?,
         BlimsCommand::Artifact { command } => handle_blims_artifact_command(command).await?,
         BlimsCommand::Proposal { command } => handle_blims_proposal_command(command).await?,
@@ -726,6 +726,9 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
             );
         }
         Event::Key(stroke) => {
+            if handle_blims_tui_conversation_key(app, stroke.key).await? {
+                return Ok(false);
+            }
             if matches!(stroke.key, KeyCode::Escape | KeyCode::Char('q')) {
                 return Ok(true);
             }
@@ -762,6 +765,40 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
     Ok(false)
 }
 
+async fn handle_blims_tui_conversation_key(
+    app: &mut BlimsTuiApp,
+    key: KeyCode,
+) -> Result<bool, CliError> {
+    let BlimsTuiMode::Conversation(conversation) = &mut app.mode else {
+        return Ok(false);
+    };
+    match key {
+        KeyCode::Escape => {
+            app.mode = BlimsTuiMode::Office;
+            app.status = "Returned to office.".to_string();
+        }
+        KeyCode::Enter => {
+            let text = conversation.input.trim().to_string();
+            if text.is_empty() {
+                conversation.status = "Type a message first.".to_string();
+            } else {
+                BcodeClient::default_endpoint()
+                    .send_user_message(conversation.handle.session, text)
+                    .await?;
+                conversation.input.clear();
+                conversation.status = "Message sent.".to_string();
+                refresh_conversation_transcript(conversation).await?;
+            }
+        }
+        KeyCode::Backspace => {
+            conversation.input.pop();
+        }
+        KeyCode::Char(value) => conversation.input.push(value),
+        _ => {}
+    }
+    Ok(true)
+}
+
 async fn handle_blims_tui_picker_key(
     app: &mut BlimsTuiApp,
     key: KeyCode,
@@ -779,6 +816,34 @@ async fn handle_blims_tui_picker_key(
     Ok(true)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsConversationHandle {
+    agent_id: String,
+    conversation_ref: String,
+    session: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsConversationLine {
+    speaker: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsConversationState {
+    handle: BlimsConversationHandle,
+    agent_name: String,
+    input: String,
+    transcript: Vec<BlimsConversationLine>,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlimsTuiMode {
+    Office,
+    Conversation(BlimsConversationState),
+}
+
 #[derive(Debug)]
 struct BlimsTuiApp {
     world: BlimsWorldSnapshot,
@@ -793,6 +858,7 @@ struct BlimsTuiApp {
     last_world_tick: Instant,
     last_animation: Instant,
     tick_count: u64,
+    mode: BlimsTuiMode,
     show_world_picker: bool,
     show_help: bool,
     status: String,
@@ -823,6 +889,7 @@ impl BlimsTuiApp {
             last_world_tick: Instant::now(),
             last_animation: Instant::now(),
             tick_count: 0,
+            mode: BlimsTuiMode::Office,
             show_world_picker: false,
             show_help: false,
             status: "Welcome CEO — choose a world with w, move with arrows/h/l.".to_string(),
@@ -870,11 +937,30 @@ impl BlimsTuiApp {
             return Ok(());
         };
         if let Some(agent_id) = interaction.command.strip_prefix("ai ") {
-            start_blims_agent_talk(agent_id.to_string()).await?;
-            self.refresh().await?;
+            self.open_agent_conversation(agent_id.to_string()).await?;
         } else {
             self.status = format!("{} — `{}`", interaction.label, interaction.command);
         }
+        Ok(())
+    }
+
+    async fn open_agent_conversation(&mut self, agent_id: String) -> Result<(), CliError> {
+        let handle = create_blims_agent_conversation(agent_id.clone()).await?;
+        let agent_name = self
+            .world
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .map_or_else(|| agent_id.clone(), |agent| agent.name.clone());
+        let mut conversation = BlimsConversationState {
+            handle,
+            agent_name,
+            input: String::new(),
+            transcript: Vec::new(),
+            status: "Conversation opened.".to_string(),
+        };
+        refresh_conversation_transcript(&mut conversation).await?;
+        self.mode = BlimsTuiMode::Conversation(conversation);
         Ok(())
     }
 
@@ -906,6 +992,10 @@ impl BlimsTuiApp {
     }
 
     async fn tick_world(&mut self) -> Result<(), CliError> {
+        if !matches!(self.mode, BlimsTuiMode::Office) {
+            self.last_world_tick = Instant::now();
+            return Ok(());
+        }
         self.tick_count = self.tick_count.saturating_add(1);
         let previous = self.world.clone();
         self.world = tick_blims_world(self.tick_count).await?;
@@ -1059,6 +1149,9 @@ impl BlimsTuiApp {
         if self.show_help {
             render_blims_help_modal(area, frame);
         }
+        if let BlimsTuiMode::Conversation(conversation) = &self.mode {
+            render_conversation_modal(conversation, area, frame);
+        }
     }
 }
 
@@ -1105,6 +1198,52 @@ async fn load_blims_report() -> Result<BlimsMorningReport, CliError> {
 async fn load_world_templates() -> Result<Vec<BlimsWorldTemplateSummary>, CliError> {
     let response = call_blims_service("world.template_list", blims_workspace_payload()?).await?;
     decode_blims_response::<Vec<BlimsWorldTemplateSummary>>(response)
+}
+
+async fn refresh_conversation_transcript(
+    conversation: &mut BlimsConversationState,
+) -> Result<(), CliError> {
+    let events = BcodeClient::default_endpoint()
+        .session_history(conversation.handle.session)
+        .await?;
+    conversation.transcript = events
+        .into_iter()
+        .filter_map(conversation_line_from_session_event)
+        .collect();
+    Ok(())
+}
+
+fn conversation_line_from_session_event(
+    event: bcode_session_models::SessionEvent,
+) -> Option<BlimsConversationLine> {
+    match event.kind {
+        bcode_session_models::SessionEventKind::UserMessage { text, .. } => {
+            Some(BlimsConversationLine {
+                speaker: "CEO".to_string(),
+                text,
+            })
+        }
+        bcode_session_models::SessionEventKind::AssistantMessage { text }
+        | bcode_session_models::SessionEventKind::AssistantDelta { text } => {
+            Some(BlimsConversationLine {
+                speaker: "Agent".to_string(),
+                text,
+            })
+        }
+        bcode_session_models::SessionEventKind::ToolCallRequested { tool_name, .. } => {
+            Some(BlimsConversationLine {
+                speaker: "Tool".to_string(),
+                text: format!("requested {tool_name}"),
+            })
+        }
+        bcode_session_models::SessionEventKind::ToolCallFinished {
+            result, is_error, ..
+        } => Some(BlimsConversationLine {
+            speaker: if is_error { "Tool error" } else { "Tool" }.to_string(),
+            text: result,
+        }),
+        _ => None,
+    }
 }
 
 fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -1165,12 +1304,12 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         ),
         Span::raw(" talk  "),
         Span::styled(
-            "tab",
+            "esc",
             Style::new()
                 .fg(Color::BrightYellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" target  "),
+        Span::raw(" back  "),
         Span::styled(
             "w",
             Style::new()
@@ -1524,6 +1663,75 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
+fn render_conversation_modal(
+    conversation: &BlimsConversationState,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let modal = centered(area, Size::new(86, 24));
+    let panel = Panel::new()
+        .border(Border::rounded().style(Style::new().fg(Color::BrightMagenta)))
+        .title(format!(" Talking with {} ", conversation.agent_name))
+        .background(Style::new().bg(Color::Rgb(18, 14, 28)));
+    panel.render(modal, frame);
+    let inner = panel.inner_area(modal).inset(Insets::all(1));
+    let rows = split(
+        inner,
+        Direction::Vertical,
+        &[
+            Constraint::Min(8),
+            Constraint::Length(4),
+            Constraint::Length(2),
+        ],
+    );
+    if rows.len() != 3 {
+        return;
+    }
+    let mut lines = Vec::new();
+    for line in conversation.transcript.iter().rev().take(12).rev() {
+        lines.push(Line::from_spans(vec![
+            Span::styled(
+                format!("{}: ", line.speaker),
+                Style::new()
+                    .fg(Color::BrightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(line.text.clone()),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw("Conversation is starting…"));
+    }
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(18, 14, 28)).fg(Color::White))
+        .render(rows[0], frame);
+    TextBlock::new(Text::from_lines(vec![
+        Line::from_spans(vec![
+            Span::styled("You: ", Style::new().fg(Color::BrightCyan)),
+            Span::raw(conversation.input.clone()),
+        ]),
+        Line::raw(conversation.status.clone()),
+    ]))
+    .wrap(TextWrap::Character)
+    .style(
+        Style::new()
+            .bg(Color::Rgb(24, 18, 36))
+            .fg(Color::BrightWhite),
+    )
+    .render(rows[1], frame);
+    frame.write_line_with_fallback_style(
+        rows[2],
+        &Line::raw(format!(
+            "Enter sends · Esc returns to office · session {}",
+            conversation.handle.session
+        )),
+        Style::new()
+            .bg(Color::Rgb(18, 14, 28))
+            .fg(Color::BrightBlack),
+    );
+}
+
 fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
     let modal = centered(area, Size::new(70, 10));
     let panel = Panel::new()
@@ -1534,7 +1742,7 @@ fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
     let text = Text::from_lines(vec![
         Line::raw("arrows/hjkl walk one tile around the top-down office"),
         Line::raw("e/enter uses the selected nearby interaction"),
-        Line::raw("t talks to a nearby agent; tab cycles interactions"),
+        Line::raw("t opens native in-game coworker chat; tab cycles interactions"),
         Line::raw("w opens starter office picker; escape closes modals"),
         Line::raw("r refreshes the morning report"),
         Line::raw("?/q toggle help / exit the office"),
@@ -1762,28 +1970,45 @@ fn room_bg(room: &BlimsRoomSnapshot) -> Color {
     }
 }
 
-async fn start_blims_agent_talk(agent_id: String) -> Result<(), CliError> {
+async fn start_blims_agent_talk_cli(agent_id: String) -> Result<(), CliError> {
+    let handle = create_blims_agent_conversation(agent_id).await?;
+    println!(
+        "AI chat session with {}: {}",
+        handle.agent_id, handle.session
+    );
+    println!("Attaching now. Press Ctrl-C to return to the Blims office.");
+    attach_session(handle.session).await?;
+    Ok(())
+}
+
+async fn create_blims_agent_conversation(
+    agent_id: String,
+) -> Result<BlimsConversationHandle, CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "agent_id": agent_id,
     });
     let response = call_blims_service("agent.talk_prompt", serde_json::to_vec(&request)?).await?;
     let prompt = decode_blims_response::<BlimsAgentTalkPrompt>(response)?;
-    start_agent_talk_session(prompt).await
+    let session = create_agent_talk_session(&prompt).await?;
+    Ok(BlimsConversationHandle {
+        agent_id: prompt.agent_id,
+        conversation_ref: prompt.conversation_id,
+        session: session.id,
+    })
 }
 
-async fn start_agent_talk_session(prompt: BlimsAgentTalkPrompt) -> Result<(), CliError> {
+async fn create_agent_talk_session(
+    prompt: &BlimsAgentTalkPrompt,
+) -> Result<bcode_session_models::SessionSummary, CliError> {
     let session = BcodeClient::default_endpoint()
         .create_session(Some(format!("Blims talk: {}", prompt.agent_id)))
         .await?;
     BcodeClient::default_endpoint()
         .send_user_message(session.id, prompt.prompt.clone())
         .await?;
-    record_blims_conversation(&prompt, &session.id).await?;
-    println!("AI chat session with {}: {}", prompt.agent_id, session.id);
-    println!("Attaching now. Press Ctrl-C to return to the Blims office.");
-    attach_session(session.id).await?;
-    Ok(())
+    record_blims_conversation(prompt, &session.id).await?;
+    Ok(session)
 }
 
 async fn record_blims_conversation(
