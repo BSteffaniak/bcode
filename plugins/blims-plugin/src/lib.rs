@@ -196,6 +196,9 @@ pub const OP_OPERATION_LIST: &str = "operation.list";
 /// Dashboard projection get operation.
 pub const OP_PROJECTION_DASHBOARD_GET: &str = "projection.dashboard.get";
 
+/// World projection get operation.
+pub const OP_PROJECTION_WORLD_GET: &str = "projection.world.get";
+
 /// Record task outcome operation.
 pub const OP_TASK_RECORD_OUTCOME: &str = "task.record_outcome";
 
@@ -319,6 +322,7 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_COMMAND_SUBMIT => service_command_submit(request),
         OP_OPERATION_LIST => service_operation_list(request),
         OP_PROJECTION_DASHBOARD_GET => service_projection_dashboard_get(request),
+        OP_PROJECTION_WORLD_GET => service_projection_world_get(request),
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
     }
 }
@@ -812,6 +816,20 @@ impl std::fmt::Display for BlimsOperationStatus {
 pub enum BlimsCommand {
     /// Refresh durable CEO dashboard projection data.
     RefreshDashboard,
+    /// Move the CEO/player avatar to a room.
+    MovePlayer {
+        /// Destination room id.
+        room_id: String,
+    },
+    /// Advance lightweight company/world simulation.
+    TickWorld {
+        /// Caller tick id for deterministic event correlation.
+        #[serde(default)]
+        tick_id: Option<String>,
+        /// Optional wall-clock milliseconds supplied by the frontend/daemon.
+        #[serde(default)]
+        now_ms: Option<i64>,
+    },
     /// Record that a frontend opened a dashboard view.
     OpenDashboardView,
     /// Record that a frontend closed a dashboard view.
@@ -822,6 +840,8 @@ impl BlimsCommand {
     const fn operation_kind(&self) -> &'static str {
         match self {
             Self::RefreshDashboard => "dashboard.refresh",
+            Self::MovePlayer { .. } => "world.move_player",
+            Self::TickWorld { .. } => "world.tick",
             Self::OpenDashboardView => "dashboard.open_view",
             Self::CloseDashboardView => "dashboard.close_view",
         }
@@ -829,9 +849,11 @@ impl BlimsCommand {
 
     const fn priority(&self) -> BlimsOperationPriority {
         match self {
-            Self::RefreshDashboard | Self::OpenDashboardView | Self::CloseDashboardView => {
-                BlimsOperationPriority::Interactive
-            }
+            Self::RefreshDashboard
+            | Self::MovePlayer { .. }
+            | Self::OpenDashboardView
+            | Self::CloseDashboardView => BlimsOperationPriority::Interactive,
+            Self::TickWorld { .. } => BlimsOperationPriority::Background,
         }
     }
 }
@@ -2732,6 +2754,17 @@ fn service_projection_dashboard_get(request: &ServiceRequest) -> ServiceResponse
     match dashboard_projection(&request.working_directory) {
         Ok(projection) => json_response(&projection),
         Err(error) => ServiceResponse::error("dashboard_projection_failed", error.to_string()),
+    }
+}
+
+fn service_projection_world_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match world_snapshot(&request.working_directory) {
+        Ok(projection) => json_response(&projection),
+        Err(error) => ServiceResponse::error("world_projection_failed", error.to_string()),
     }
 }
 
@@ -4856,39 +4889,48 @@ fn move_player(
     event_context: &EventContext,
 ) -> Result<WorldSnapshot, BlimsStateError> {
     let room_id = request.room_id.trim().to_string();
+    let event_context = event_context.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            move_player_in_database(database, &room_id, &event_context).await?;
+            let data = load_company_data_from_database(database).await?;
+            Ok(world_snapshot_from_data(data))
+        })
+    })
+}
+
+async fn move_player_in_database(
+    database: &dyn Database,
+    room_id: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    let room_id = room_id.trim().to_string();
     if room_id.is_empty() {
         return Err(BlimsStateError::InvalidRequest(
             "room_id cannot be empty".to_string(),
         ));
     }
-    let event_context = event_context.clone();
-    with_database(&request.working_directory, move |database| {
-        Box::pin(async move {
-            let room_exists = database
-                .select("world_rooms")
-                .columns(&["id"])
-                .filter(Box::new(where_eq("id", room_id.clone())))
-                .limit(1)
-                .execute_first(database)
-                .await?
-                .is_some();
-            if !room_exists {
-                return Err(BlimsStateError::InvalidRequest(format!(
-                    "unknown room: {room_id}"
-                )));
-            }
-            append_event(
-                database,
-                &event_context,
-                "player.moved",
-                format!("CEO moved to room {room_id}."),
-                &BlimsEventPayload::PlayerMoved { room_id },
-            )
-            .await?;
-            let data = load_company_data_from_database(database).await?;
-            Ok(world_snapshot_from_data(data))
-        })
-    })
+    let room_exists = database
+        .select("world_rooms")
+        .columns(&["id"])
+        .filter(Box::new(where_eq("id", room_id.clone())))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .is_some();
+    if !room_exists {
+        return Err(BlimsStateError::InvalidRequest(format!(
+            "unknown room: {room_id}"
+        )));
+    }
+    append_event(
+        database,
+        event_context,
+        "player.moved",
+        format!("CEO moved to room {room_id}."),
+        &BlimsEventPayload::PlayerMoved { room_id },
+    )
+    .await
 }
 
 fn tick_world(
@@ -4896,54 +4938,63 @@ fn tick_world(
     event_context: &EventContext,
 ) -> Result<WorldSnapshot, BlimsStateError> {
     let event_context = event_context.merge_world_tick_request(request);
-    let tick_seed = request
-        .now_ms
-        .unwrap_or_default()
-        .saturating_add(stable_i64(request.tick_id.as_deref().unwrap_or("tick")));
+    let tick_id = request.tick_id.clone();
+    let now_ms = request.now_ms;
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
-            let data = load_company_data_from_database(database).await?;
-            if data.company.lifecycle_status != "running" {
-                return Ok(world_snapshot_from_data(data));
-            }
-            if data.rooms.is_empty() || data.agents.is_empty() {
-                return Ok(world_snapshot_from_data(data));
-            }
-            for (index, agent) in data.agents.iter().enumerate() {
-                let decision = tick_decision(tick_seed, index, agent, &data.rooms);
-                if let Some(room_id) = decision.room_id
-                    && room_id != agent.room_id
-                {
-                    append_event(
-                        database,
-                        &event_context,
-                        "agent.moved",
-                        format!("{} walked to {room_id}.", agent.name),
-                        &BlimsEventPayload::AgentMoved {
-                            agent_id: agent.id.clone(),
-                            room_id,
-                        },
-                    )
-                    .await?;
-                }
-                if decision.status != agent.status {
-                    append_event(
-                        database,
-                        &event_context,
-                        "agent.status_set",
-                        format!("{} is now {}.", agent.name, decision.status),
-                        &BlimsEventPayload::AgentStatusSet {
-                            agent_id: agent.id.clone(),
-                            status: decision.status,
-                        },
-                    )
-                    .await?;
-                }
-            }
+            tick_world_in_database(database, tick_id.as_deref(), now_ms, &event_context).await?;
             let data = load_company_data_from_database(database).await?;
             Ok(world_snapshot_from_data(data))
         })
     })
+}
+
+async fn tick_world_in_database(
+    database: &dyn Database,
+    tick_id: Option<&str>,
+    now_ms: Option<i64>,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    let tick_seed = now_ms
+        .unwrap_or_default()
+        .saturating_add(stable_i64(tick_id.unwrap_or("tick")));
+    let data = load_company_data_from_database(database).await?;
+    if data.company.lifecycle_status != "running" || data.rooms.is_empty() || data.agents.is_empty()
+    {
+        return Ok(());
+    }
+    for (index, agent) in data.agents.iter().enumerate() {
+        let decision = tick_decision(tick_seed, index, agent, &data.rooms);
+        if let Some(room_id) = decision.room_id
+            && room_id != agent.room_id
+        {
+            append_event(
+                database,
+                event_context,
+                "agent.moved",
+                format!("{} walked to {room_id}.", agent.name),
+                &BlimsEventPayload::AgentMoved {
+                    agent_id: agent.id.clone(),
+                    room_id,
+                },
+            )
+            .await?;
+        }
+        if decision.status != agent.status {
+            append_event(
+                database,
+                event_context,
+                "agent.status_set",
+                format!("{} is now {}.", agent.name, decision.status),
+                &BlimsEventPayload::AgentStatusSet {
+                    agent_id: agent.id.clone(),
+                    status: decision.status,
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6351,7 +6402,7 @@ async fn run_command_operation(
         },
     )
     .await?;
-    match request.command {
+    match &request.command {
         BlimsCommand::RefreshDashboard => {
             refresh_dashboard_projection(database, operation_id).await?;
             append_event(
@@ -6365,19 +6416,16 @@ async fn run_command_operation(
             )
             .await
         }
+        BlimsCommand::MovePlayer { room_id } => {
+            move_player_in_database(database, room_id, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
+        BlimsCommand::TickWorld { tick_id, now_ms } => {
+            tick_world_in_database(database, tick_id.as_deref(), *now_ms, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
         BlimsCommand::OpenDashboardView | BlimsCommand::CloseDashboardView => {
-            append_event(
-                database,
-                &event_context,
-                "operation.status_set",
-                format!("Operation {operation_id} completed."),
-                &BlimsEventPayload::OperationStatusSet {
-                    operation_id: operation_id.to_string(),
-                    status: BlimsOperationStatus::Completed.to_string(),
-                    error: None,
-                },
-            )
-            .await
+            complete_operation(database, &event_context, operation_id).await
         }
     }
 }
@@ -6389,6 +6437,25 @@ async fn refresh_dashboard_projection(
     let _projection =
         dashboard_projection_from_database(database, Some(operation_id.to_string())).await?;
     Ok(())
+}
+
+async fn complete_operation(
+    database: &dyn Database,
+    event_context: &EventContext,
+    operation_id: &str,
+) -> Result<(), BlimsStateError> {
+    append_event(
+        database,
+        event_context,
+        "operation.status_set",
+        format!("Operation {operation_id} completed."),
+        &BlimsEventPayload::OperationStatusSet {
+            operation_id: operation_id.to_string(),
+            status: BlimsOperationStatus::Completed.to_string(),
+            error: None,
+        },
+    )
+    .await
 }
 
 fn dashboard_projection(working_directory: &Path) -> Result<DashboardProjection, BlimsStateError> {

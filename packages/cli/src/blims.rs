@@ -1776,7 +1776,8 @@ impl BlimsTuiApp {
 }
 
 async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
-    let operation = submit_blims_command("refresh_dashboard").await?;
+    let operation =
+        submit_blims_command(serde_json::json!({ "type": "refresh_dashboard" })).await?;
     let response =
         call_blims_service("projection.dashboard.get", blims_workspace_payload()?).await?;
     let projection = decode_blims_response::<BlimsDashboardProjection>(response)?;
@@ -1792,7 +1793,13 @@ async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
     })
 }
 
-async fn submit_blims_command(command_type: &str) -> Result<BlimsCommandSubmitResponse, CliError> {
+async fn submit_blims_command(
+    command: serde_json::Value,
+) -> Result<BlimsCommandSubmitResponse, CliError> {
+    let command_type = command
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("command");
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0_u128, |duration| duration.as_millis());
@@ -1801,14 +1808,14 @@ async fn submit_blims_command(command_type: &str) -> Result<BlimsCommandSubmitRe
         "command_id": format!("tui-{command_type}-{now_ms}"),
         "actor": "ceo",
         "frontend_id": "tui",
-        "command": { "type": command_type },
+        "command": command,
     });
     let response = call_blims_service("command.submit", serde_json::to_vec(&request)?).await?;
     decode_blims_response::<BlimsCommandSubmitResponse>(response)
 }
 
 async fn load_blims_world() -> Result<BlimsWorldSnapshot, CliError> {
-    let response = call_blims_service("world.snapshot", blims_workspace_payload()?).await?;
+    let response = call_blims_service("projection.world.get", blims_workspace_payload()?).await?;
     decode_blims_response::<BlimsWorldSnapshot>(response)
 }
 
@@ -1819,12 +1826,12 @@ async fn load_blims_interactions() -> Result<BlimsAvailableInteractions, CliErro
 }
 
 async fn move_blims_player_blocking(room_id: &str) -> Result<BlimsWorldSnapshot, CliError> {
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
+    let _operation = submit_blims_command(serde_json::json!({
+        "type": "move_player",
         "room_id": room_id,
-    });
-    let response = call_blims_service("world.move_player", serde_json::to_vec(&request)?).await?;
-    decode_blims_response::<BlimsWorldSnapshot>(response)
+    }))
+    .await?;
+    load_blims_world().await
 }
 
 async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot, CliError> {
@@ -1834,13 +1841,13 @@ async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot
         .map_or(0_i64, |duration| {
             i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
         });
-    let request = serde_json::json!({
-        "working_directory": std::env::current_dir()?,
+    let _operation = submit_blims_command(serde_json::json!({
+        "type": "tick_world",
         "tick_id": format!("tui-{tick_count}"),
         "now_ms": now_ms,
-    });
-    let response = call_blims_service("world.tick", serde_json::to_vec(&request)?).await?;
-    let tick_world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
+    }))
+    .await?;
+    let tick_world = load_blims_world().await?;
     if tick_world != world {
         return Ok(tick_world);
     }
