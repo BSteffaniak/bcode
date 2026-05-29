@@ -202,6 +202,12 @@ pub const OP_OPERATION_COMPLETE: &str = "operation.complete";
 /// Operation fail operation.
 pub const OP_OPERATION_FAIL: &str = "operation.fail";
 
+/// Run a claimed operation operation.
+pub const OP_OPERATION_RUN_CLAIMED: &str = "operation.run_claimed";
+
+/// Scheduler tick operation.
+pub const OP_SCHEDULER_TICK: &str = "scheduler.tick";
+
 /// Dashboard projection get operation.
 pub const OP_PROJECTION_DASHBOARD_GET: &str = "projection.dashboard.get";
 
@@ -237,6 +243,7 @@ impl RustPlugin for BlimsPlugin {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
     match request.operation.as_str() {
         OP_COMPANY_STATUS | OP_COMPANY_CREATE | OP_COMPANY_LOAD | OP_COMPANY_PAUSE
@@ -333,6 +340,8 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_OPERATION_CLAIM_NEXT => service_operation_claim_next(request),
         OP_OPERATION_COMPLETE => service_operation_complete(request),
         OP_OPERATION_FAIL => service_operation_fail(request),
+        OP_OPERATION_RUN_CLAIMED => service_operation_run_claimed(request),
+        OP_SCHEDULER_TICK => service_scheduler_tick(request),
         OP_PROJECTION_DASHBOARD_GET => service_projection_dashboard_get(request),
         OP_PROJECTION_WORLD_GET => service_projection_world_get(request),
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
@@ -878,6 +887,22 @@ pub enum BlimsCommand {
         /// Message text.
         message: String,
     },
+    ScheduleCompanyTick {
+        /// Caller tick id for deterministic event correlation.
+        #[serde(default)]
+        tick_id: Option<String>,
+        /// Optional wall-clock milliseconds supplied by the daemon.
+        #[serde(default)]
+        now_ms: Option<i64>,
+    },
+    ScheduleAgentPlanning {
+        /// Agent id.
+        agent_id: String,
+    },
+    ScheduleTaskWork {
+        /// Task id.
+        task_id: String,
+    },
     /// Record that a frontend opened a dashboard view.
     OpenDashboardView,
     /// Record that a frontend closed a dashboard view.
@@ -895,6 +920,9 @@ impl BlimsCommand {
             Self::SetArtifactStatus { .. } => "artifact.status_set",
             Self::OpenAgentConversation { .. } => "conversation.open",
             Self::RecordConversationMessage { .. } => "conversation.message_record",
+            Self::ScheduleCompanyTick { .. } => "company.tick.scheduled",
+            Self::ScheduleAgentPlanning { .. } => "agent.planning.scheduled",
+            Self::ScheduleTaskWork { .. } => "task.work.scheduled",
             Self::OpenDashboardView => "dashboard.open_view",
             Self::CloseDashboardView => "dashboard.close_view",
         }
@@ -911,7 +939,10 @@ impl BlimsCommand {
             | Self::RecordConversationMessage { .. }
             | Self::OpenDashboardView
             | Self::CloseDashboardView => BlimsOperationPriority::Interactive,
-            Self::TickWorld { .. } => BlimsOperationPriority::Background,
+            Self::TickWorld { .. }
+            | Self::ScheduleCompanyTick { .. }
+            | Self::ScheduleAgentPlanning { .. }
+            | Self::ScheduleTaskWork { .. } => BlimsOperationPriority::Background,
         }
     }
 }
@@ -1027,6 +1058,41 @@ pub struct OperationFailRequest {
     pub operation_id: String,
     /// Error text.
     pub error: String,
+}
+
+/// Request to run a claimed operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationRunClaimedRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Durable operation id.
+    pub operation_id: String,
+}
+
+/// Request to let the scheduler claim and run a bounded batch of work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerTickRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Worker id.
+    pub worker_id: String,
+    /// Maximum operations to claim and run.
+    #[serde(default = "default_scheduler_tick_limit")]
+    pub limit: u64,
+    /// Lease duration in milliseconds.
+    #[serde(default = "default_operation_lease_ms")]
+    pub lease_ms: i64,
+}
+
+/// Scheduler tick response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerTickReport {
+    /// Operations claimed by this tick.
+    pub claimed: Vec<BlimsOperationSummary>,
+    /// Operations completed by this tick.
+    pub completed: Vec<BlimsOperationSummary>,
+    /// Operations failed by this tick.
+    pub failed: Vec<BlimsOperationSummary>,
 }
 
 /// Dashboard read model shared by all frontends.
@@ -1942,6 +2008,10 @@ const fn default_operation_lease_ms() -> i64 {
     30_000
 }
 
+const fn default_scheduler_tick_limit() -> u64 {
+    1
+}
+
 fn default_agent_room() -> String {
     "ceo-nook".to_string()
 }
@@ -2056,6 +2126,15 @@ enum BlimsEventPayload {
         agent_id: String,
         speaker: String,
         message: String,
+    },
+    AgentPlanningCycleRecorded {
+        agent_id: String,
+        rationale: String,
+    },
+    TaskWorkScheduled {
+        task_id: String,
+        agent_id: String,
+        rationale: String,
     },
     AgentHired {
         agent: AgentSnapshot,
@@ -2876,6 +2955,28 @@ fn service_operation_fail(request: &ServiceRequest) -> ServiceResponse {
     match fail_claimed_operation(&request) {
         Ok(operation) => json_response(&operation),
         Err(error) => ServiceResponse::error("operation_fail_failed", error.to_string()),
+    }
+}
+
+fn service_operation_run_claimed(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<OperationRunClaimedRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match run_claimed_operation(&request) {
+        Ok(operation) => json_response(&operation),
+        Err(error) => ServiceResponse::error("operation_run_claimed_failed", error.to_string()),
+    }
+}
+
+fn service_scheduler_tick(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<SchedulerTickRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match scheduler_tick(&request) {
+        Ok(report) => json_response(&report),
+        Err(error) => ServiceResponse::error("scheduler_tick_failed", error.to_string()),
     }
 }
 
@@ -4710,6 +4811,8 @@ async fn apply_org_world_event_projection(
         | BlimsEventPayload::ArtifactStatusSet { .. }
         | BlimsEventPayload::TaskCreated { .. }
         | BlimsEventPayload::TaskOutcomeRecorded { .. }
+        | BlimsEventPayload::AgentPlanningCycleRecorded { .. }
+        | BlimsEventPayload::TaskWorkScheduled { .. }
         | BlimsEventPayload::ReportGenerated { .. }
         | BlimsEventPayload::ConversationRecorded { .. } => {}
     }
@@ -6564,6 +6667,31 @@ async fn load_world_room_rows(database: &dyn Database) -> Result<Vec<Row>, Blims
         .await?)
 }
 
+async fn load_agent_record(
+    database: &dyn Database,
+    agent_id: &str,
+) -> Result<AgentRecord, BlimsStateError> {
+    database
+        .select("agents")
+        .columns(&[
+            "id",
+            "name",
+            "role",
+            "department_id",
+            "team_id",
+            "status",
+            "room_id",
+        ])
+        .filter(Box::new(where_eq("id", agent_id.to_string())))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .as_ref()
+        .map(agent_record)
+        .transpose()?
+        .ok_or(BlimsStateError::MissingColumn("agent"))
+}
+
 async fn load_agent_rows(database: &dyn Database) -> Result<Vec<Row>, BlimsStateError> {
     Ok(database
         .select("agents")
@@ -6644,6 +6772,7 @@ fn submit_command(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_command_operation(
     database: &dyn Database,
     request: &CommandSubmitRequest,
@@ -6664,25 +6793,20 @@ async fn run_command_operation(
     .await?;
     match &request.command {
         BlimsCommand::RefreshDashboard => {
-            refresh_dashboard_projection(database, operation_id).await?;
-            append_event(
-                database,
-                &event_context,
-                "dashboard.projection_refreshed",
-                "CEO dashboard projection refreshed.".to_string(),
-                &BlimsEventPayload::DashboardProjectionRefreshed {
-                    operation_id: operation_id.to_string(),
-                },
-            )
-            .await
+            run_refresh_dashboard_command(database, operation_id, &event_context).await
         }
         BlimsCommand::MovePlayer { room_id } => {
-            move_player_in_database(database, room_id, &event_context).await?;
-            complete_operation(database, &event_context, operation_id).await
+            run_move_player_command(database, room_id, operation_id, &event_context).await
         }
         BlimsCommand::TickWorld { tick_id, now_ms } => {
-            tick_world_in_database(database, tick_id.as_deref(), *now_ms, &event_context).await?;
-            complete_operation(database, &event_context, operation_id).await
+            run_tick_world_command(
+                database,
+                tick_id.as_deref(),
+                *now_ms,
+                operation_id,
+                &event_context,
+            )
+            .await
         }
         BlimsCommand::SelectWorldTemplate { template_id } => {
             select_world_template_in_database(database, template_id, &event_context).await?;
@@ -6736,10 +6860,61 @@ async fn run_command_operation(
             .await?;
             complete_operation(database, &event_context, operation_id).await
         }
+        BlimsCommand::ScheduleCompanyTick { tick_id, now_ms } => {
+            tick_world_in_database(database, tick_id.as_deref(), *now_ms, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
+        BlimsCommand::ScheduleAgentPlanning { agent_id } => {
+            record_agent_planning_cycle(database, agent_id, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
+        BlimsCommand::ScheduleTaskWork { task_id } => {
+            record_scheduled_task_work(database, task_id, &event_context).await?;
+            complete_operation(database, &event_context, operation_id).await
+        }
         BlimsCommand::OpenDashboardView | BlimsCommand::CloseDashboardView => {
             complete_operation(database, &event_context, operation_id).await
         }
     }
+}
+
+async fn run_refresh_dashboard_command(
+    database: &dyn Database,
+    operation_id: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    refresh_dashboard_projection(database, operation_id).await?;
+    append_event(
+        database,
+        event_context,
+        "dashboard.projection_refreshed",
+        "CEO dashboard projection refreshed.".to_string(),
+        &BlimsEventPayload::DashboardProjectionRefreshed {
+            operation_id: operation_id.to_string(),
+        },
+    )
+    .await
+}
+
+async fn run_move_player_command(
+    database: &dyn Database,
+    room_id: &str,
+    operation_id: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    move_player_in_database(database, room_id, event_context).await?;
+    complete_operation(database, event_context, operation_id).await
+}
+
+async fn run_tick_world_command(
+    database: &dyn Database,
+    tick_id: Option<&str>,
+    now_ms: Option<i64>,
+    operation_id: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    tick_world_in_database(database, tick_id, now_ms, event_context).await?;
+    complete_operation(database, event_context, operation_id).await
 }
 
 async fn refresh_dashboard_projection(
@@ -6789,6 +6964,157 @@ async fn dashboard_projection_from_database(
         latest_event_id: latest_event_id(database).await?,
         refreshed_by_operation_id,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn scheduler_tick(request: &SchedulerTickRequest) -> Result<SchedulerTickReport, BlimsStateError> {
+    let mut report = SchedulerTickReport {
+        claimed: Vec::new(),
+        completed: Vec::new(),
+        failed: Vec::new(),
+    };
+    let limit = request.limit.min(25);
+    for _ in 0..limit {
+        let claim = OperationClaimNextRequest {
+            working_directory: request.working_directory.clone(),
+            worker_id: request.worker_id.clone(),
+            lease_ms: request.lease_ms,
+        };
+        let Some(operation) = claim_next_operation(&claim)? else {
+            break;
+        };
+        report.claimed.push(operation.clone());
+        let run_request = OperationRunClaimedRequest {
+            working_directory: request.working_directory.clone(),
+            operation_id: operation.id,
+        };
+        match run_claimed_operation(&run_request) {
+            Ok(completed) => report.completed.push(completed),
+            Err(error) => {
+                let fail_request = OperationFailRequest {
+                    working_directory: request.working_directory.clone(),
+                    operation_id: run_request.operation_id,
+                    error: error.to_string(),
+                };
+                report.failed.push(fail_claimed_operation(&fail_request)?);
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn run_claimed_operation(
+    request: &OperationRunClaimedRequest,
+) -> Result<BlimsOperationSummary, BlimsStateError> {
+    let request = request.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let operation = load_operation(database, &request.operation_id).await?;
+            if operation.status != BlimsOperationStatus::Running.as_str() {
+                return Err(BlimsStateError::InvalidRequest(format!(
+                    "operation {} is not running",
+                    operation.id
+                )));
+            }
+            let event_context = EventContext {
+                correlation: operation.command_id.clone(),
+                causation: operation.id.clone(),
+                expected_latest: None,
+            };
+            run_operation_kind(database, &operation, &event_context).await?;
+            complete_operation(database, &event_context, &operation.id).await?;
+            delete_operation_lease(database, &operation.id).await?;
+            finish_latest_operation_attempt(
+                database,
+                &operation.id,
+                BlimsOperationStatus::Completed.as_str(),
+                "",
+                current_time_ms(),
+            )
+            .await?;
+            load_operation(database, &operation.id).await
+        })
+    })
+}
+
+async fn run_operation_kind(
+    database: &dyn Database,
+    operation: &BlimsOperationSummary,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    match operation.kind.as_str() {
+        "company.tick.scheduled" => {
+            tick_world_in_database(
+                database,
+                Some(&operation.command_id),
+                Some(current_time_ms()),
+                event_context,
+            )
+            .await
+        }
+        "agent.planning.scheduled" => {
+            let agent_id = operation
+                .command_id
+                .strip_prefix("agent-planning-")
+                .unwrap_or(&operation.actor);
+            record_agent_planning_cycle(database, agent_id, event_context).await
+        }
+        "task.work.scheduled" => {
+            let task_id = operation
+                .command_id
+                .strip_prefix("task-work-")
+                .unwrap_or("");
+            record_scheduled_task_work(database, task_id, event_context).await
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn record_agent_planning_cycle(
+    database: &dyn Database,
+    agent_id: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    let agent = load_agent_record(database, agent_id).await?;
+    let rationale = format!(
+        "{} reviewed company state and is looking for useful work aligned with their role: {}.",
+        agent.name, agent.role
+    );
+    append_event(
+        database,
+        event_context,
+        "agent.planning_cycle_recorded",
+        format!("Agent planning cycle recorded: {}", agent.id),
+        &BlimsEventPayload::AgentPlanningCycleRecorded {
+            agent_id: agent.id,
+            rationale,
+        },
+    )
+    .await
+}
+
+async fn record_scheduled_task_work(
+    database: &dyn Database,
+    task_id: &str,
+    event_context: &EventContext,
+) -> Result<(), BlimsStateError> {
+    let task = load_task(database, task_id).await?;
+    let rationale = format!(
+        "Scheduled autonomous work for task '{}' with assigned agent {}.",
+        task.title, task.assigned_agent_id
+    );
+    append_event(
+        database,
+        event_context,
+        "task.work_scheduled",
+        format!("Task work scheduled: {}", task.id),
+        &BlimsEventPayload::TaskWorkScheduled {
+            task_id: task.id,
+            agent_id: task.assigned_agent_id,
+            rationale,
+        },
+    )
+    .await
 }
 
 fn claim_next_operation(
@@ -7694,6 +8020,7 @@ fn replay_event(
         }
         BlimsEventPayload::AgentHired { .. }
         | BlimsEventPayload::AgentMoved { .. }
+        | BlimsEventPayload::AgentPlanningCycleRecorded { .. }
         | BlimsEventPayload::AgentStatsSet { .. }
         | BlimsEventPayload::AgentRelationshipSet { .. }
         | BlimsEventPayload::AgentMemoryRecorded { .. }
@@ -7709,6 +8036,7 @@ fn replay_event(
         | BlimsEventPayload::OperationStatusSet { .. }
         | BlimsEventPayload::StarterOfficeSelected { .. }
         | BlimsEventPayload::PlayerMoved { .. }
+        | BlimsEventPayload::TaskWorkScheduled { .. }
         | BlimsEventPayload::InitiativePlanImported { .. }
         | BlimsEventPayload::ReportGenerated { .. }
         | BlimsEventPayload::ConversationMessageRecorded { .. }
