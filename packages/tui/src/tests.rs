@@ -1659,6 +1659,7 @@ fn appended_rows_consume_virtual_space_until_following_catches_up() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     assert_eq!(app.bottom_overscroll(), 4);
+    app.expire_manual_transcript_scroll_for_test();
 
     app.absorb_session_event(&event(
         session_id,
@@ -1706,6 +1707,7 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
     render::render(&mut app, &mut frame);
 
     assert!(app.scroll_transcript_down(4));
+    app.expire_manual_transcript_scroll_for_test();
     app.absorb_session_event(&event(
         session_id,
         1,
@@ -1719,6 +1721,67 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
 
     assert!(app.bottom_overscroll() < 4);
     assert_ne!(output_line_y(&buffer, "Bcode …"), Some(1));
+}
+
+#[test]
+fn manual_scroll_grace_prevents_virtual_space_catch_up() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        0,
+        SessionEventKind::AssistantMessage {
+            text: "message".to_owned(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(app.scroll_transcript_down(4));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::AssistantMessage {
+            text: "new one".to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(app.bottom_overscroll(), 4);
+}
+
+#[test]
+fn manual_scroll_grace_prevents_stream_top_anchor() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        0,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "prompt".to_owned(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(app.scroll_transcript_down(4));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::AssistantDelta {
+            text: "first line".to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(app.bottom_overscroll(), 4);
 }
 
 #[test]

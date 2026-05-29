@@ -122,6 +122,7 @@ impl TranscriptViewport {
         max_offset: usize,
         max_bottom_overscroll: usize,
         total_rows: usize,
+        manual_scroll_active: bool,
         older_history: &mut OlderHistoryState,
     ) {
         let previous_max = self.max_offset;
@@ -129,7 +130,11 @@ impl TranscriptViewport {
         self.previous_total_rows = total_rows;
         self.max_offset = max_offset;
         self.max_bottom_overscroll = max_bottom_overscroll;
-        if self.offset == 0 && self.bottom_overscroll > 0 && appended_rows > 0 {
+        if !manual_scroll_active
+            && self.offset == 0
+            && self.bottom_overscroll > 0
+            && appended_rows > 0
+        {
             self.bottom_overscroll = self.bottom_overscroll.saturating_sub(appended_rows);
         }
         if let Some(requested_rows) = older_history.take_reveal_request() {

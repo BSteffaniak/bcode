@@ -1,7 +1,7 @@
 //! TUI app state.
 
 use std::collections::BTreeMap;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
 use bcode_session_models::{
@@ -42,6 +42,8 @@ use super::transcript::{
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_viewport::TranscriptViewport;
 
+const MANUAL_TRANSCRIPT_SCROLL_GRACE: Duration = Duration::from_millis(450);
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmuxApp {
@@ -69,6 +71,7 @@ pub struct BmuxApp {
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
     viewport: TranscriptViewport,
+    manual_transcript_scroll_until: Option<Instant>,
     pending_assistant_stream_anchor: bool,
     older_history: OlderHistoryState,
     activity: ActivityState,
@@ -129,6 +132,7 @@ impl BmuxApp {
             transcript_history: Vec::new(),
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
+            manual_transcript_scroll_until: None,
             pending_assistant_stream_anchor: false,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
@@ -687,17 +691,34 @@ impl BmuxApp {
 
     /// Scroll transcript up by rendered rows.
     pub fn scroll_transcript_up(&mut self, rows: usize) -> bool {
+        self.mark_manual_transcript_scroll();
         self.viewport.scroll_up(rows, &mut self.older_history)
     }
 
     /// Scroll transcript down by rendered rows.
     pub fn scroll_transcript_down(&mut self, rows: usize) -> bool {
+        self.mark_manual_transcript_scroll();
         self.viewport.scroll_down(rows)
     }
 
     /// Pin transcript to the newest rows.
     pub const fn scroll_transcript_to_bottom(&mut self) -> bool {
+        self.manual_transcript_scroll_until = None;
         self.viewport.scroll_to_bottom(&mut self.older_history)
+    }
+
+    fn mark_manual_transcript_scroll(&mut self) {
+        self.manual_transcript_scroll_until = Some(Instant::now() + MANUAL_TRANSCRIPT_SCROLL_GRACE);
+    }
+
+    #[cfg(test)]
+    pub const fn expire_manual_transcript_scroll_for_test(&mut self) {
+        self.manual_transcript_scroll_until = None;
+    }
+
+    fn manual_transcript_scroll_active(&self) -> bool {
+        self.manual_transcript_scroll_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     /// Sync cached rendered transcript scroll bounds from the latest frame.
@@ -711,13 +732,14 @@ impl BmuxApp {
             max_scroll_offset,
             max_bottom_overscroll,
             total_rows,
+            self.manual_transcript_scroll_active(),
             &mut self.older_history,
         );
     }
 
     /// Resolve deferred live-stream top anchoring against the latest cached layout.
     pub fn sync_transcript_stream_anchor(&mut self) {
-        if !self.pending_assistant_stream_anchor {
+        if !self.pending_assistant_stream_anchor || self.manual_transcript_scroll_active() {
             return;
         }
         if let Some(index) = self
