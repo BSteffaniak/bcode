@@ -193,6 +193,15 @@ pub const OP_COMMAND_SUBMIT: &str = "command.submit";
 /// Operation list operation.
 pub const OP_OPERATION_LIST: &str = "operation.list";
 
+/// Operation claim-next operation.
+pub const OP_OPERATION_CLAIM_NEXT: &str = "operation.claim_next";
+
+/// Operation complete operation.
+pub const OP_OPERATION_COMPLETE: &str = "operation.complete";
+
+/// Operation fail operation.
+pub const OP_OPERATION_FAIL: &str = "operation.fail";
+
 /// Dashboard projection get operation.
 pub const OP_PROJECTION_DASHBOARD_GET: &str = "projection.dashboard.get";
 
@@ -321,6 +330,9 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_EVENT_REBUILD_PROJECTIONS => service_event_rebuild_projections(request),
         OP_COMMAND_SUBMIT => service_command_submit(request),
         OP_OPERATION_LIST => service_operation_list(request),
+        OP_OPERATION_CLAIM_NEXT => service_operation_claim_next(request),
+        OP_OPERATION_COMPLETE => service_operation_complete(request),
+        OP_OPERATION_FAIL => service_operation_fail(request),
         OP_PROJECTION_DASHBOARD_GET => service_projection_dashboard_get(request),
         OP_PROJECTION_WORLD_GET => service_projection_world_get(request),
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
@@ -982,6 +994,38 @@ pub struct BlimsOperationSummary {
     /// Optional result event id.
     pub result_event_id: Option<i64>,
     /// Optional error text.
+    pub error: String,
+}
+
+/// Request to claim the next queued operation for a worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationClaimNextRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Worker id claiming the operation.
+    pub worker_id: String,
+    /// Lease duration in milliseconds.
+    #[serde(default = "default_operation_lease_ms")]
+    pub lease_ms: i64,
+}
+
+/// Request to complete an operation by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationCompleteRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Durable operation id.
+    pub operation_id: String,
+}
+
+/// Request to fail an operation by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationFailRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Durable operation id.
+    pub operation_id: String,
+    /// Error text.
     pub error: String,
 }
 
@@ -1894,6 +1938,10 @@ const fn default_operation_limit() -> u64 {
     100
 }
 
+const fn default_operation_lease_ms() -> i64 {
+    30_000
+}
+
 fn default_agent_room() -> String {
     "ceo-nook".to_string()
 }
@@ -2798,6 +2846,39 @@ fn service_operation_list(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn service_operation_claim_next(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<OperationClaimNextRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match claim_next_operation(&request) {
+        Ok(operation) => json_response(&operation),
+        Err(error) => ServiceResponse::error("operation_claim_next_failed", error.to_string()),
+    }
+}
+
+fn service_operation_complete(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<OperationCompleteRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match complete_claimed_operation(&request) {
+        Ok(operation) => json_response(&operation),
+        Err(error) => ServiceResponse::error("operation_complete_failed", error.to_string()),
+    }
+}
+
+fn service_operation_fail(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<OperationFailRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match fail_claimed_operation(&request) {
+        Ok(operation) => json_response(&operation),
+        Err(error) => ServiceResponse::error("operation_fail_failed", error.to_string()),
+    }
+}
+
 fn service_projection_dashboard_get(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<WorkspaceRequest>() {
         Ok(request) => request,
@@ -3025,6 +3106,27 @@ async fn create_operation_tables(
         .column(text_column("error"))
         .column(now_column("created_at"))
         .column(now_column("updated_at"))
+        .primary_key("id")
+        .execute(database)
+        .await?;
+    create_table("operation_leases")
+        .if_not_exists(true)
+        .column(text_column("operation_id"))
+        .column(text_column("worker_id"))
+        .column(int_column("lease_expires_at_ms"))
+        .column(int_column("heartbeat_at_ms"))
+        .primary_key("operation_id")
+        .execute(database)
+        .await?;
+    create_table("operation_attempts")
+        .if_not_exists(true)
+        .column(auto_id_column("id"))
+        .column(text_column("operation_id"))
+        .column(text_column("worker_id"))
+        .column(text_column("status"))
+        .column(text_column("error"))
+        .column(int_column("started_at_ms"))
+        .column(int_column("finished_at_ms"))
         .primary_key("id")
         .execute(database)
         .await
@@ -6689,6 +6791,300 @@ async fn dashboard_projection_from_database(
     })
 }
 
+fn claim_next_operation(
+    request: &OperationClaimNextRequest,
+) -> Result<Option<BlimsOperationSummary>, BlimsStateError> {
+    let request = request.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let now_ms = current_time_ms();
+            let Some(operation) = load_claimable_operation(database, now_ms).await? else {
+                return Ok(None);
+            };
+            let lease_expires_at_ms = now_ms.saturating_add(request.lease_ms.max(1));
+            upsert_operation_lease(
+                database,
+                &operation.id,
+                &request.worker_id,
+                lease_expires_at_ms,
+                now_ms,
+            )
+            .await?;
+            insert_operation_attempt(
+                database,
+                &operation.id,
+                &request.worker_id,
+                BlimsOperationStatus::Running.as_str(),
+                "",
+                now_ms,
+                0,
+            )
+            .await?;
+            database
+                .update("operations")
+                .value("status", BlimsOperationStatus::Running.as_str())
+                .value("error", "")
+                .filter(Box::new(where_eq("id", operation.id.clone())))
+                .execute(database)
+                .await?;
+            load_operation(database, &operation.id).await.map(Some)
+        })
+    })
+}
+
+fn complete_claimed_operation(
+    request: &OperationCompleteRequest,
+) -> Result<BlimsOperationSummary, BlimsStateError> {
+    let request = request.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .update("operations")
+                .value("status", BlimsOperationStatus::Completed.as_str())
+                .value("error", "")
+                .filter(Box::new(where_eq("id", request.operation_id.clone())))
+                .execute(database)
+                .await?;
+            delete_operation_lease(database, &request.operation_id).await?;
+            finish_latest_operation_attempt(
+                database,
+                &request.operation_id,
+                BlimsOperationStatus::Completed.as_str(),
+                "",
+                current_time_ms(),
+            )
+            .await?;
+            load_operation(database, &request.operation_id).await
+        })
+    })
+}
+
+fn fail_claimed_operation(
+    request: &OperationFailRequest,
+) -> Result<BlimsOperationSummary, BlimsStateError> {
+    let request = request.clone();
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            database
+                .update("operations")
+                .value("status", BlimsOperationStatus::Failed.as_str())
+                .value("error", request.error.clone())
+                .filter(Box::new(where_eq("id", request.operation_id.clone())))
+                .execute(database)
+                .await?;
+            delete_operation_lease(database, &request.operation_id).await?;
+            finish_latest_operation_attempt(
+                database,
+                &request.operation_id,
+                BlimsOperationStatus::Failed.as_str(),
+                &request.error,
+                current_time_ms(),
+            )
+            .await?;
+            load_operation(database, &request.operation_id).await
+        })
+    })
+}
+
+async fn load_claimable_operation(
+    database: &dyn Database,
+    now_ms: i64,
+) -> Result<Option<BlimsOperationSummary>, BlimsStateError> {
+    let operations = database
+        .select("operations")
+        .columns(&operation_columns())
+        .execute(database)
+        .await?
+        .iter()
+        .map(operation_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    let leases = database
+        .select("operation_leases")
+        .columns(&["operation_id", "lease_expires_at_ms"])
+        .execute(database)
+        .await?;
+    Ok(operations
+        .into_iter()
+        .filter(|operation| operation_is_claimable(operation, &leases, now_ms))
+        .min_by_key(operation_claim_sort_key))
+}
+
+fn operation_is_claimable(operation: &BlimsOperationSummary, leases: &[Row], now_ms: i64) -> bool {
+    if operation.status != BlimsOperationStatus::Queued.as_str()
+        && operation.status != BlimsOperationStatus::Running.as_str()
+    {
+        return false;
+    }
+    let lease_expires_at_ms = leases
+        .iter()
+        .find(|lease| {
+            lease
+                .get("operation_id")
+                .is_some_and(|value| value.as_str().is_some_and(|id| id == operation.id))
+        })
+        .and_then(|lease| lease.get("lease_expires_at_ms"))
+        .and_then(|value| value.as_i64());
+    operation.status == BlimsOperationStatus::Queued.as_str()
+        || lease_expires_at_ms.is_some_and(|expires_at| expires_at <= now_ms)
+}
+
+fn operation_claim_sort_key(operation: &BlimsOperationSummary) -> (i64, String) {
+    (
+        operation_priority_rank(&operation.priority),
+        operation.id.clone(),
+    )
+}
+
+#[allow(clippy::missing_const_for_fn)]
+fn operation_priority_rank(priority: &str) -> i64 {
+    match priority {
+        "interactive" => 0,
+        "foreground" => 1,
+        "background" => 2,
+        "maintenance" => 3,
+        _ => 9,
+    }
+}
+
+async fn load_operation(
+    database: &dyn Database,
+    operation_id: &str,
+) -> Result<BlimsOperationSummary, BlimsStateError> {
+    database
+        .select("operations")
+        .columns(&operation_columns())
+        .filter(Box::new(where_eq("id", operation_id.to_string())))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .as_ref()
+        .map(operation_summary)
+        .transpose()?
+        .ok_or(BlimsStateError::MissingColumn("operation"))
+}
+
+const fn operation_columns() -> [&'static str; 9] {
+    [
+        "id",
+        "command_id",
+        "actor",
+        "frontend_id",
+        "kind",
+        "priority",
+        "status",
+        "result_event_id",
+        "error",
+    ]
+}
+
+async fn upsert_operation_lease(
+    database: &dyn Database,
+    operation_id: &str,
+    worker_id: &str,
+    lease_expires_at_ms: i64,
+    heartbeat_at_ms: i64,
+) -> Result<(), BlimsStateError> {
+    let existing = database
+        .select("operation_leases")
+        .columns(&["operation_id"])
+        .filter(Box::new(where_eq("operation_id", operation_id.to_string())))
+        .limit(1)
+        .execute_first(database)
+        .await?;
+    if existing.is_some() {
+        database
+            .update("operation_leases")
+            .value("worker_id", worker_id.to_string())
+            .value("lease_expires_at_ms", lease_expires_at_ms)
+            .value("heartbeat_at_ms", heartbeat_at_ms)
+            .filter(Box::new(where_eq("operation_id", operation_id.to_string())))
+            .execute(database)
+            .await?;
+    } else {
+        database
+            .insert("operation_leases")
+            .value("operation_id", operation_id.to_string())
+            .value("worker_id", worker_id.to_string())
+            .value("lease_expires_at_ms", lease_expires_at_ms)
+            .value("heartbeat_at_ms", heartbeat_at_ms)
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn delete_operation_lease(
+    database: &dyn Database,
+    operation_id: &str,
+) -> Result<(), BlimsStateError> {
+    database
+        .delete("operation_leases")
+        .filter(Box::new(where_eq("operation_id", operation_id.to_string())))
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn insert_operation_attempt(
+    database: &dyn Database,
+    operation_id: &str,
+    worker_id: &str,
+    status: &str,
+    error: &str,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+) -> Result<(), BlimsStateError> {
+    database
+        .insert("operation_attempts")
+        .value("operation_id", operation_id.to_string())
+        .value("worker_id", worker_id.to_string())
+        .value("status", status.to_string())
+        .value("error", error.to_string())
+        .value("started_at_ms", started_at_ms)
+        .value("finished_at_ms", finished_at_ms)
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn finish_latest_operation_attempt(
+    database: &dyn Database,
+    operation_id: &str,
+    status: &str,
+    error: &str,
+    finished_at_ms: i64,
+) -> Result<(), BlimsStateError> {
+    let latest = database
+        .select("operation_attempts")
+        .columns(&["id"])
+        .filter(Box::new(where_eq("operation_id", operation_id.to_string())))
+        .sort("id", SortDirection::Desc)
+        .limit(1)
+        .execute_first(database)
+        .await?;
+    if let Some(row) = latest
+        && let Some(id) = row.get("id").and_then(|value| value.as_i64())
+    {
+        database
+            .update("operation_attempts")
+            .value("status", status.to_string())
+            .value("error", error.to_string())
+            .value("finished_at_ms", finished_at_ms)
+            .filter(Box::new(where_eq("id", id)))
+            .execute(database)
+            .await?;
+    }
+    Ok(())
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 fn list_operations(
     request: &OperationListRequest,
 ) -> Result<Vec<BlimsOperationSummary>, BlimsStateError> {
@@ -6698,17 +7094,7 @@ fn list_operations(
         Box::pin(async move {
             database
                 .select("operations")
-                .columns(&[
-                    "id",
-                    "command_id",
-                    "actor",
-                    "frontend_id",
-                    "kind",
-                    "priority",
-                    "status",
-                    "result_event_id",
-                    "error",
-                ])
+                .columns(&operation_columns())
                 .sort("updated_at", SortDirection::Desc)
                 .limit(limit)
                 .execute(database)
