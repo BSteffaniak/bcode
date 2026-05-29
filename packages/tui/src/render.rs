@@ -70,6 +70,7 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
         max_transcript_scroll_offset(app, transcript_area),
         max_transcript_bottom_overscroll(transcript_area),
         app.transcript_layout().total_rows(),
+        transcript_area.height,
     );
     app.sync_transcript_stream_anchor();
     render_body(app, body, frame);

@@ -11,6 +11,7 @@ pub struct TranscriptViewport {
     max_bottom_overscroll: usize,
     anchor_top_row: Option<usize>,
     previous_total_rows: usize,
+    viewport_height: u16,
     preserve_max_offset: Option<usize>,
 }
 
@@ -41,10 +42,10 @@ impl TranscriptViewport {
     }
 
     /// Follow live transcript output from a stable top row.
-    pub const fn follow_anchor(&mut self, top_row: usize) {
+    pub fn follow_anchor(&mut self, top_row: usize) {
         self.offset = 0;
         self.bottom_overscroll = 0;
-        self.anchor_top_row = Some(top_row);
+        self.anchor_top_row = Some(top_row.min(self.previous_total_rows));
     }
 
     /// Return the top-origin row to render for the current viewport.
@@ -66,7 +67,7 @@ impl TranscriptViewport {
             return false;
         }
         let previous = *self;
-        self.anchor_top_row = None;
+        self.materialize_anchor_position();
         if self.bottom_overscroll > 0 {
             let consumed = rows.min(self.bottom_overscroll);
             self.bottom_overscroll = self.bottom_overscroll.saturating_sub(consumed);
@@ -91,7 +92,7 @@ impl TranscriptViewport {
             return false;
         }
         let previous = *self;
-        self.anchor_top_row = None;
+        self.materialize_anchor_position();
         if self.offset > 0 {
             self.offset = self.offset.saturating_sub(rows);
         } else {
@@ -122,12 +123,14 @@ impl TranscriptViewport {
         max_offset: usize,
         max_bottom_overscroll: usize,
         total_rows: usize,
+        viewport_height: u16,
         manual_scroll_active: bool,
         older_history: &mut OlderHistoryState,
     ) {
         let previous_max = self.max_offset;
         let appended_rows = total_rows.saturating_sub(self.previous_total_rows);
         self.previous_total_rows = total_rows;
+        self.viewport_height = viewport_height;
         self.max_offset = max_offset;
         self.max_bottom_overscroll = max_bottom_overscroll;
         if !manual_scroll_active
@@ -150,6 +153,25 @@ impl TranscriptViewport {
         }
         self.offset = self.offset.min(self.max_offset);
         self.bottom_overscroll = self.bottom_overscroll.min(self.max_bottom_overscroll);
+    }
+
+    fn materialize_anchor_position(&mut self) {
+        let Some(anchor_top_row) = self.anchor_top_row.take() else {
+            return;
+        };
+        let end_row = anchor_top_row.saturating_add(usize::from(self.viewport_height));
+        if end_row > self.previous_total_rows {
+            self.offset = 0;
+            self.bottom_overscroll = end_row
+                .saturating_sub(self.previous_total_rows)
+                .min(self.max_bottom_overscroll);
+        } else {
+            self.offset = self
+                .previous_total_rows
+                .saturating_sub(end_row)
+                .min(self.max_offset);
+            self.bottom_overscroll = 0;
+        }
     }
 }
 

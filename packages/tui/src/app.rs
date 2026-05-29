@@ -727,11 +727,13 @@ impl BmuxApp {
         max_scroll_offset: usize,
         max_bottom_overscroll: usize,
         total_rows: usize,
+        viewport_height: u16,
     ) {
         self.viewport.sync_max(
             max_scroll_offset,
             max_bottom_overscroll,
             total_rows,
+            viewport_height,
             self.manual_transcript_scroll_active(),
             &mut self.older_history,
         );

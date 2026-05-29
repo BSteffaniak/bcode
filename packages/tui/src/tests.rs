@@ -1827,6 +1827,45 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
 }
 
 #[test]
+fn manual_scroll_from_stream_anchor_preserves_visual_position() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        0,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "prompt".to_owned(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::AssistantDelta {
+            text: "first\nsecond\nthird\nfourth\nfifth\nsixth".to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let anchored_y = output_line_y(&buffer, "Bcode …").expect("streaming heading is visible");
+
+    assert!(app.scroll_transcript_up(1));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(
+        output_line_y(&buffer, "Bcode …"),
+        Some(anchored_y.saturating_add(1))
+    );
+}
+
+#[test]
 fn streaming_assistant_response_does_not_anchor_when_scrolled_up() {
     let session_id = SessionId::new();
     let history = (0..20)
