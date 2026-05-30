@@ -229,6 +229,41 @@ impl SessionStoreExecutor {
         .await?
     }
 
+    pub async fn read_session_events_range(
+        &self,
+        session_id: SessionId,
+        start_sequence: u64,
+        end_sequence: u64,
+        max_events: usize,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let queued_at = Instant::now();
+        let store = self.store.clone();
+        spawn_blocking(move || {
+            store.metrics.record_histogram(
+                "session.store.event_range.blocking_queue_wait_duration_ms",
+                elapsed_ms(queued_at),
+            );
+            let timer = store.metrics.timer();
+            let result = store.read_session_events_range(
+                session_id,
+                start_sequence,
+                end_sequence,
+                max_events,
+            );
+            if let Ok(events) = &result {
+                store.metrics.record_histogram(
+                    "session.store.event_range.result_event_count",
+                    usize_to_u64(events.len()),
+                );
+            }
+            store
+                .metrics
+                .record_histogram("session.store.event_range.duration_ms", timer.elapsed_ms());
+            result
+        })
+        .await?
+    }
+
     pub async fn read_session_input_history(
         &self,
         session_id: SessionId,

@@ -159,6 +159,21 @@ impl SessionHandle {
             .await?
     }
 
+    pub async fn events_range(
+        &self,
+        start_sequence: u64,
+        end_sequence: u64,
+        max_events: usize,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.send(|reply| SessionCommand::EventsRange {
+            start_sequence,
+            end_sequence,
+            max_events,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn input_history(&self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
         self.send(SessionCommand::InputHistory).await?
     }
@@ -248,6 +263,12 @@ enum SessionCommand {
         request: ProjectionWindowRequest,
         reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
     },
+    EventsRange {
+        start_sequence: u64,
+        end_sequence: u64,
+        max_events: usize,
+        reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
+    },
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     CurrentModelSelection(oneshot::Sender<Option<(String, String)>>),
@@ -274,100 +295,130 @@ struct SessionActor {
 impl SessionActor {
     async fn run(mut self) {
         while let Some(command) = self.commands.recv().await {
-            match command {
-                SessionCommand::AppendEvent {
-                    kind,
-                    provenance,
-                    activity_timestamp_ms,
-                    reply,
-                } => {
-                    let _ = reply.send(
-                        self.append_event(kind, provenance, activity_timestamp_ms)
-                            .await,
-                    );
-                }
-                SessionCommand::AppendUserMessage {
-                    client_id,
-                    text,
-                    activity_timestamp_ms,
-                    reply,
-                } => {
-                    let _ = reply.send(
-                        self.append_user_message(client_id, text, activity_timestamp_ms)
-                            .await,
-                    );
-                }
-                SessionCommand::Attach {
-                    client_id,
-                    mode,
-                    activity_timestamp_ms,
-                    queued_at,
-                    reply,
-                } => {
-                    let _ = reply.send(
-                        self.attach(client_id, mode, activity_timestamp_ms, queued_at)
-                            .await,
-                    );
-                }
-                SessionCommand::Detach {
-                    client_id,
-                    activity_timestamp_ms,
-                    reply,
-                } => {
-                    let _ = reply.send(self.detach(client_id, activity_timestamp_ms).await);
-                }
-                SessionCommand::Summary(reply) => {
-                    let _ = reply.send(self.state.summary());
-                }
-                SessionCommand::WorkingDirectory(reply) => {
-                    let _ = reply.send(self.state.working_directory.clone());
-                }
-                SessionCommand::AccessStatus(reply) => {
-                    let _ = reply.send(self.state.access_status);
-                }
-                SessionCommand::History(reply) => {
-                    let _ = reply.send(self.history().await);
-                }
-                SessionCommand::HistoryPage { query, reply } => {
-                    let _ = reply.send(self.history_page(query).await);
-                }
-                SessionCommand::ProjectionWindow { request, reply } => {
-                    let _ = reply.send(self.projection_window(request).await);
-                }
-                SessionCommand::InputHistory(reply) => {
-                    let _ = reply.send(self.input_history().await);
-                }
-                SessionCommand::ModelContextEvents(reply) => {
-                    let _ = reply.send(self.model_context_events().await);
-                }
-                SessionCommand::CurrentModelSelection(reply) => {
-                    let _ = reply.send(
-                        self.state
-                            .current_provider
-                            .clone()
-                            .zip(self.state.current_model.clone()),
-                    );
-                }
-                SessionCommand::CurrentAgentSelection(reply) => {
-                    let _ = reply.send(self.state.current_agent.clone());
-                }
-                SessionCommand::PublishTransient { kind, reply } => {
-                    let _ = reply.send(self.publish_transient_event(kind));
-                }
-                SessionCommand::ClientIds(reply) => {
-                    let _ = reply.send(self.state.clients.clone());
-                }
-                SessionCommand::ReplaceState { state, reply } => {
-                    self.state = *state;
-                    self.refresh_snapshot();
-                    let _ = reply.send(());
-                }
-                SessionCommand::Shutdown(reply) => {
-                    let _ = reply.send(());
-                    break;
-                }
+            if self.handle_command(command).await {
+                break;
             }
         }
+    }
+
+    async fn handle_command(&mut self, command: SessionCommand) -> bool {
+        match command {
+            SessionCommand::AppendEvent {
+                kind,
+                provenance,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.append_event(kind, provenance, activity_timestamp_ms)
+                        .await,
+                );
+            }
+            SessionCommand::AppendUserMessage {
+                client_id,
+                text,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.append_user_message(client_id, text, activity_timestamp_ms)
+                        .await,
+                );
+            }
+            SessionCommand::Attach {
+                client_id,
+                mode,
+                activity_timestamp_ms,
+                queued_at,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.attach(client_id, mode, activity_timestamp_ms, queued_at)
+                        .await,
+                );
+            }
+            command => return self.handle_read_command(command).await,
+        }
+        false
+    }
+
+    async fn handle_read_command(&mut self, command: SessionCommand) -> bool {
+        match command {
+            SessionCommand::AppendEvent { .. }
+            | SessionCommand::AppendUserMessage { .. }
+            | SessionCommand::Attach { .. } => {
+                unreachable!("write commands are handled before read commands")
+            }
+            SessionCommand::Detach {
+                client_id,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(self.detach(client_id, activity_timestamp_ms).await);
+            }
+            SessionCommand::Summary(reply) => {
+                let _ = reply.send(self.state.summary());
+            }
+            SessionCommand::WorkingDirectory(reply) => {
+                let _ = reply.send(self.state.working_directory.clone());
+            }
+            SessionCommand::AccessStatus(reply) => {
+                let _ = reply.send(self.state.access_status);
+            }
+            SessionCommand::History(reply) => {
+                let _ = reply.send(self.history().await);
+            }
+            SessionCommand::HistoryPage { query, reply } => {
+                let _ = reply.send(self.history_page(query).await);
+            }
+            SessionCommand::ProjectionWindow { request, reply } => {
+                let _ = reply.send(self.projection_window(request).await);
+            }
+            SessionCommand::EventsRange {
+                start_sequence,
+                end_sequence,
+                max_events,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.events_range(start_sequence, end_sequence, max_events)
+                        .await,
+                );
+            }
+            SessionCommand::InputHistory(reply) => {
+                let _ = reply.send(self.input_history().await);
+            }
+            SessionCommand::ModelContextEvents(reply) => {
+                let _ = reply.send(self.model_context_events().await);
+            }
+            SessionCommand::CurrentModelSelection(reply) => {
+                let _ = reply.send(
+                    self.state
+                        .current_provider
+                        .clone()
+                        .zip(self.state.current_model.clone()),
+                );
+            }
+            SessionCommand::CurrentAgentSelection(reply) => {
+                let _ = reply.send(self.state.current_agent.clone());
+            }
+            SessionCommand::PublishTransient { kind, reply } => {
+                let _ = reply.send(self.publish_transient_event(kind));
+            }
+            SessionCommand::ClientIds(reply) => {
+                let _ = reply.send(self.state.clients.clone());
+            }
+            SessionCommand::ReplaceState { state, reply } => {
+                self.state = *state;
+                self.refresh_snapshot();
+                let _ = reply.send(());
+            }
+            SessionCommand::Shutdown(reply) => {
+                let _ = reply.send(());
+                return true;
+            }
+        }
+        false
     }
 
     fn refresh_snapshot(&self) {
@@ -654,6 +705,34 @@ impl SessionActor {
         Ok(window)
     }
 
+    async fn events_range(
+        &self,
+        start_sequence: u64,
+        end_sequence: u64,
+        max_events: usize,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        if let Some(events) = &self.state.events {
+            return Ok(select_event_range_from_events(
+                events,
+                start_sequence,
+                end_sequence,
+                max_events,
+            ));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(self.state.summary.id))?;
+        Ok(store
+            .read_session_events_range(
+                self.state.summary.id,
+                start_sequence,
+                end_sequence,
+                max_events,
+            )
+            .await?)
+    }
+
     async fn input_history(&self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
         if let Some(events) = &self.state.events {
             return Ok(input_history_from_events(events));
@@ -703,6 +782,23 @@ impl SessionActor {
         let _ = self.state.sender.send(event.clone());
         Some(event)
     }
+}
+
+fn select_event_range_from_events(
+    events: &[SessionEvent],
+    start_sequence: u64,
+    end_sequence: u64,
+    max_events: usize,
+) -> Vec<SessionEvent> {
+    if start_sequence > end_sequence || max_events == 0 {
+        return Vec::new();
+    }
+    events
+        .iter()
+        .filter(|event| event.sequence >= start_sequence && event.sequence <= end_sequence)
+        .take(max_events)
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

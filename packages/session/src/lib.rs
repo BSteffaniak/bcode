@@ -305,6 +305,63 @@ impl SessionEventStore {
         Ok(reader::read_events(&path)?.events)
     }
 
+    fn read_session_events_range(
+        &self,
+        session_id: SessionId,
+        start_sequence: u64,
+        end_sequence: u64,
+        max_events: usize,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let total_timer = self.metrics.timer();
+        let event_path = self.event_path(session_id);
+        let index_timer = self.metrics.timer();
+        let index = self.ensure_fresh_index(session_id)?;
+        self.metrics.record_histogram(
+            "session.store.event_range.ensure_fresh_index_duration_ms",
+            index_timer.elapsed_ms(),
+        );
+        let entries_timer = self.metrics.timer();
+        let entries = match index::read_entries(&self.root, session_id) {
+            Ok(entries) if entries.len() == index.event_count => entries,
+            _ => {
+                self.metrics
+                    .increment_counter("session.store.event_range.index_rebuild_total");
+                let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
+                index::read_entries(&self.root, session_id)?
+            }
+        };
+        self.metrics.record_histogram(
+            "session.store.event_range.read_entries_duration_ms",
+            entries_timer.elapsed_ms(),
+        );
+        let select_timer = self.metrics.timer();
+        let selected_entries =
+            select_event_range_entries(entries, start_sequence, end_sequence, max_events);
+        self.metrics.record_histogram(
+            "session.store.event_range.select_entries_duration_ms",
+            select_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.event_range.selected_entry_count",
+            usize_to_u64(selected_entries.len()),
+        );
+        let events_timer = self.metrics.timer();
+        let events = read_indexed_events(&event_path, &selected_entries)?;
+        self.metrics.record_histogram(
+            "session.store.event_range.read_indexed_events_duration_ms",
+            events_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.store.event_range.event_count",
+            usize_to_u64(events.len()),
+        );
+        self.metrics.record_histogram(
+            "session.store.event_range.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
+        Ok(events)
+    }
+
     fn inspect_access_status(
         &self,
         session_id: SessionId,
@@ -1254,6 +1311,23 @@ fn read_indexed_events(
     reader::read_events_at_offsets(event_path, &offsets)
 }
 
+fn select_event_range_entries(
+    mut entries: Vec<index::SessionIndexEntry>,
+    start_sequence: u64,
+    end_sequence: u64,
+    max_events: usize,
+) -> Vec<index::SessionIndexEntry> {
+    if start_sequence > end_sequence || max_events == 0 {
+        return Vec::new();
+    }
+    entries.sort_by_key(|entry| entry.sequence);
+    entries
+        .into_iter()
+        .filter(|entry| entry.sequence >= start_sequence && entry.sequence <= end_sequence)
+        .take(max_events)
+        .collect()
+}
+
 /// In-memory session manager with optional append-only persistence.
 #[derive(Debug)]
 pub struct SessionManager {
@@ -1943,6 +2017,24 @@ impl SessionManager {
         handle.projection_window(request).await
     }
 
+    /// Return source events in an inclusive sequence range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn session_events_range(
+        &self,
+        session_id: SessionId,
+        start_sequence: u64,
+        end_sequence: u64,
+        max_events: usize,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle
+            .events_range(start_sequence, end_sequence, max_events)
+            .await
+    }
+
     /// Return user-submitted prompts for input-history navigation.
     ///
     /// # Errors
@@ -2138,16 +2230,13 @@ impl SessionManager {
         );
         let history = if let Some(range) = projection_window.source_range {
             handle
-                .history_page(SessionHistoryQuery {
-                    cursor: Some(SessionHistoryCursor {
-                        sequence: range.start_sequence,
-                    }),
-                    limit: usize::try_from(range.end_sequence - range.start_sequence + 1)
+                .events_range(
+                    range.start_sequence,
+                    range.end_sequence,
+                    usize::try_from(range.end_sequence - range.start_sequence + 1)
                         .unwrap_or(usize::MAX),
-                    direction: SessionHistoryDirection::Forward,
-                })
+                )
                 .await?
-                .events
         } else {
             Vec::new()
         };
@@ -4110,6 +4199,85 @@ mod tests {
             .expect("imported event should exist");
 
         assert_eq!(imported.provenance.as_ref(), Some(&provenance));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn restored_session_events_range_reads_inclusive_sequences_from_disk_index() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("range".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        for index in 0..5 {
+            manager
+                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
+                .await
+                .expect("message should append");
+        }
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let events = restored
+            .session_events_range(session.id, 2, 4, 8)
+            .await
+            .expect("events range should load");
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(matches!(
+            &events[0].kind,
+            SessionEventKind::UserMessage { text, .. } if text == "message 1"
+        ));
+        assert!(matches!(
+            &events[2].kind,
+            SessionEventKind::UserMessage { text, .. } if text == "message 3"
+        ));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn restored_session_events_range_respects_max_events_and_empty_ranges() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("range-limit".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        for index in 0..5 {
+            manager
+                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
+                .await
+                .expect("message should append");
+        }
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let limited = restored
+            .session_events_range(session.id, 1, 5, 2)
+            .await
+            .expect("events range should load");
+        let empty = restored
+            .session_events_range(session.id, 5, 1, 8)
+            .await
+            .expect("empty reversed range should load");
+
+        assert_eq!(limited.len(), 2);
+        assert_eq!(
+            limited
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(empty.is_empty());
+
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
