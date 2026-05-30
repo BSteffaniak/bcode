@@ -1847,6 +1847,61 @@ fn cleared_submission_does_not_anchor() {
 }
 
 #[test]
+fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
+    let session_id = SessionId::new();
+    let history = (0..12)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.replace_composer_with("new prompt");
+    app.stage_submission();
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+
+    app.absorb_session_event(&event(
+        session_id,
+        12,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "new prompt".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        13,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "tool-1".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(rendered_text(&buffer).contains("shell.run"));
+    assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
+}
+
+#[test]
 fn streaming_assistant_response_anchors_at_top_when_following() {
     let session_id = SessionId::new();
     let history = [event(

@@ -116,7 +116,7 @@ pub struct BmuxApp {
     viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
-    pending_user_message_anchor: bool,
+    submitted_user_message_following: SubmittedUserMessageFollowing,
     pending_assistant_stream_anchor: bool,
     older_history: OlderHistoryState,
     activity: ActivityState,
@@ -125,6 +125,14 @@ pub struct BmuxApp {
     tui_config: TuiConfig,
     exit: ExitState,
     cursor: CursorBlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SubmittedUserMessageFollowing {
+    #[default]
+    Idle,
+    PendingAnchor,
+    Anchored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +187,7 @@ impl BmuxApp {
             viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
             transcript_scroll_animation: None,
-            pending_user_message_anchor: false,
+            submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             pending_assistant_stream_anchor: false,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
@@ -648,7 +656,11 @@ impl BmuxApp {
     /// Store the current composer text as a pending submission and clear input.
     pub fn stage_submission(&mut self) {
         let text = self.composer.buffer().text().to_owned();
-        self.pending_user_message_anchor = !text.trim().is_empty();
+        self.submitted_user_message_following = if text.trim().is_empty() {
+            SubmittedUserMessageFollowing::Idle
+        } else {
+            SubmittedUserMessageFollowing::PendingAnchor
+        };
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
         self.composer.buffer_mut().clear();
@@ -663,7 +675,7 @@ impl BmuxApp {
     pub fn clear_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
-        self.pending_user_message_anchor = false;
+        self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
     }
 
     /// Mark the oldest pending submission as queued by the server.
@@ -684,7 +696,7 @@ impl BmuxApp {
     pub fn restore_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
-        self.pending_user_message_anchor = false;
+        self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
     }
@@ -760,10 +772,12 @@ impl BmuxApp {
     pub const fn scroll_transcript_to_bottom(&mut self) -> bool {
         self.transcript_scroll_animation = None;
         self.manual_transcript_scroll_until = None;
+        self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.viewport.scroll_to_bottom(&mut self.older_history)
     }
 
     fn cancel_transcript_scroll_animation_for_manual_scroll(&mut self) {
+        self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         let Some(animation) = self.transcript_scroll_animation.take() else {
             return;
         };
@@ -819,10 +833,10 @@ impl BmuxApp {
         if self.manual_transcript_scroll_active() || self.transcript_scroll_animation.is_some() {
             return;
         }
-        if self.pending_user_message_anchor {
+        if self.submitted_user_message_following == SubmittedUserMessageFollowing::PendingAnchor {
             if let Some(top_row) = self.latest_user_message_start_row() {
+                self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
                 self.start_transcript_scroll_animation(top_row);
-                self.pending_user_message_anchor = false;
             }
             return;
         }
@@ -923,9 +937,18 @@ impl BmuxApp {
 
     #[allow(clippy::too_many_lines)]
     fn absorb_session_event_without_history_record(&mut self, event: &SessionEvent) {
+        if self.submitted_user_message_following == SubmittedUserMessageFollowing::Anchored
+            && !matches!(&event.kind, SessionEventKind::UserMessage { .. })
+            && event_affects_transcript_rows(event)
+            && !self.manual_transcript_scroll_active()
+        {
+            self.viewport.scroll_to_bottom(&mut self.older_history);
+            self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+        }
         let was_following = self.viewport.following()
             && self.transcript_scroll_animation.is_none()
-            && !self.pending_user_message_anchor
+            && self.submitted_user_message_following
+                != SubmittedUserMessageFollowing::PendingAnchor
             && !self.pending_assistant_stream_anchor;
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();
