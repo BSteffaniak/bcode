@@ -12,6 +12,7 @@ mod actor;
 pub(crate) mod event_migration;
 pub(crate) mod index;
 pub mod migration;
+pub mod projection;
 pub(crate) mod reader;
 mod store_executor;
 
