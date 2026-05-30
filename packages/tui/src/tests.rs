@@ -6,8 +6,9 @@ use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
 use bcode_config::TuiThinkingConfig;
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionSummary,
-    SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
+    ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    SessionProjectionKind, SessionSummary, SessionTokenUsage, ToolInvocationStreamEvent,
+    ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -886,6 +887,17 @@ fn history_rebuild_does_not_duplicate_initial_history() {
     assert_eq!(user_items[0].text(), "first");
     assert_eq!(assistant_items.len(), 1);
     assert_eq!(assistant_items[0].text(), "second");
+}
+
+#[test]
+fn initial_transcript_window_request_uses_viewport_targets() {
+    let request = super::history_flow::initial_transcript_window_request(Rect::new(0, 0, 100, 20));
+
+    assert_eq!(request.projection, SessionProjectionKind::Transcript);
+    assert_eq!(request.target.width_columns, Some(100));
+    assert_eq!(request.target.min_items, Some(12));
+    assert_eq!(request.target.min_estimated_rows, Some(40));
+    assert_eq!(request.limits.max_events_scanned, 2_048);
 }
 
 #[test]

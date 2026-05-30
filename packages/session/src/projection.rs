@@ -526,6 +526,113 @@ mod tests {
     }
 
     #[test]
+    fn min_estimated_rows_pulls_short_older_messages() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "a".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "b".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "c".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::AssistantMessage {
+                    text: "d".to_owned(),
+                },
+            ),
+        ];
+
+        let window = projection_window_from_events(
+            &events,
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: None,
+                    min_estimated_rows: Some(3),
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("latest transcript windows are supported");
+
+        assert_eq!(window.transcript_items.len(), 3);
+        assert_eq!(window.source_range.expect("source range").start_sequence, 2);
+    }
+
+    #[test]
+    fn latest_projection_window_respects_byte_cap() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "older".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "newer".to_owned(),
+                },
+            ),
+        ];
+
+        let window = projection_window_from_events(
+            &events,
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(2),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 5,
+                },
+            },
+        )
+        .expect("latest transcript windows are supported");
+
+        assert_eq!(window.transcript_items.len(), 1);
+        assert_eq!(window.source_range.expect("source range").start_sequence, 2);
+    }
+
+    #[test]
     fn latest_projection_window_respects_scan_cap() {
         let session_id = SessionId::new();
         let events = vec![
