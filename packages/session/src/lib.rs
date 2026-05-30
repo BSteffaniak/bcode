@@ -4233,6 +4233,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_session_projection_window_returns_selected_source_history() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("projection attach".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "older".to_owned())
+            .await
+            .expect("message should append");
+        manager
+            .append_assistant_message(session.id, "older answer".to_owned())
+            .await
+            .expect("message should append");
+        manager
+            .append_user_message(session.id, ClientId::new(), "newer".to_owned())
+            .await
+            .expect("message should append");
+        manager
+            .append_assistant_delta(session.id, "partial".to_owned())
+            .await
+            .expect("delta should append");
+        manager
+            .append_assistant_message(session.id, "newer answer".to_owned())
+            .await
+            .expect("message should append");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let attached = restored
+            .attach_session_projection_window(
+                session.id,
+                ClientId::new(),
+                ProjectionWindowRequest {
+                    projection: SessionProjectionKind::Transcript,
+                    anchor: ProjectionWindowAnchor::Latest,
+                    direction: ProjectionWindowDirection::Backward,
+                    target: ProjectionWindowTarget {
+                        min_items: Some(2),
+                        min_estimated_rows: None,
+                        min_bytes: None,
+                        width_columns: Some(80),
+                    },
+                    limits: ProjectionWindowLimits {
+                        max_items: 8,
+                        max_events_scanned: 64,
+                        max_bytes: 4096,
+                    },
+                },
+            )
+            .await
+            .expect("projection attach should succeed");
+
+        assert_eq!(attached.projection_window.transcript_items.len(), 2);
+        assert_eq!(
+            attached
+                .attachment
+                .history
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert!(matches!(
+            &attached.attachment.history[0].kind,
+            SessionEventKind::UserMessage { text, .. } if text == "newer"
+        ));
+        assert!(matches!(
+            &attached.attachment.history[2].kind,
+            SessionEventKind::AssistantMessage { text } if text == "newer answer"
+        ));
+        assert_eq!(
+            attached.attachment.session.name.as_deref(),
+            Some("projection attach")
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn projection_window_falls_back_when_index_has_no_transcript_entries() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
