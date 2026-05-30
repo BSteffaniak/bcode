@@ -418,13 +418,6 @@ pub fn inspect_index(
     };
     let file = fingerprint(event_path)?;
     if index.session_id == session_id && index.file == file {
-        if index.transcript_projection.is_empty() && index.event_count > 0 {
-            return Ok(SessionIndexStatus::Stale {
-                found_version: Some(version.index_version),
-                current_version: SESSION_INDEX_VERSION,
-                reason: "transcript projection metadata is missing".to_string(),
-            });
-        }
         Ok(SessionIndexStatus::Current(Box::new(index)))
     } else {
         Ok(SessionIndexStatus::Stale {
