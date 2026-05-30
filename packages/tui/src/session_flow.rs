@@ -46,7 +46,7 @@ pub enum ChatAsyncEvent {
 /// Result from asynchronously opening a session.
 pub struct SessionOpenResult {
     pub session_id: SessionId,
-    pub initial_history_limit: usize,
+    pub has_older_history: bool,
     pub result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
 }
 
@@ -58,11 +58,12 @@ pub struct StatusHydrationResult {
     pub runtime_work: Option<Vec<RuntimeWorkSnapshot>>,
 }
 
-/// Compute a bounded initial raw event request from the visible transcript area.
+/// Compute the semantic initial transcript-window request from the visible transcript area.
 #[must_use]
-pub fn initial_history_event_limit(transcript_area: Rect) -> usize {
-    let visible_rows = usize::from(transcript_area.height.max(1));
-    visible_rows.saturating_mul(8).clamp(64, 256)
+pub fn initial_transcript_window_request(
+    transcript_area: Rect,
+) -> bcode_session_models::ProjectionWindowRequest {
+    history_flow::initial_transcript_window_request(transcript_area)
 }
 
 /// Start asynchronously opening a session without blocking the chat input loop.
@@ -70,7 +71,7 @@ pub fn start_switch_session(
     client: &BcodeClient,
     chat: &mut ActiveChat,
     next_session_id: SessionId,
-    initial_history_limit: usize,
+    initial_window_request: bcode_session_models::ProjectionWindowRequest,
 ) {
     if let Some(open_task) = chat.session_open_task.take() {
         open_task.abort();
@@ -96,16 +97,16 @@ pub fn start_switch_session(
     let event_sender = chat.event_sender.clone();
     let async_event_sender = chat.async_event_sender.clone();
     chat.session_open_task = Some(tokio::spawn(async move {
-        let result = history_flow::attach_session_event_stream_with_limit(
+        let result = history_flow::attach_session_event_stream_with_window_request(
             &client,
             next_session_id,
             event_sender,
-            initial_history_limit,
+            initial_window_request,
         )
         .await;
         let _ = async_event_sender.send(ChatAsyncEvent::SessionOpened(SessionOpenResult {
             session_id: next_session_id,
-            initial_history_limit,
+            has_older_history: true,
             result,
         }));
     }));
@@ -130,7 +131,7 @@ pub fn complete_switch_session(
             chat.event_task = Some(next_task);
             chat.session_id = Some(opened.session_id);
             let tui_config = chat.app.tui_config().clone();
-            let has_older_history = attached.history.len() >= opened.initial_history_limit;
+            let has_older_history = opened.has_older_history;
             chat.app = BmuxApp::new_with_history(
                 Some(opened.session_id),
                 &attached.history,
@@ -243,7 +244,10 @@ pub fn switch_session<W: Write>(
         client,
         chat,
         next_session_id,
-        initial_history_event_limit(terminal.area()),
+        initial_transcript_window_request(super::render::transcript_area_for_frame(
+            &chat.app,
+            terminal.area(),
+        )),
     );
     Ok(())
 }

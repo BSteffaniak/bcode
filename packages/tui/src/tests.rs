@@ -707,7 +707,7 @@ async fn async_session_open_preserves_typed_draft() {
         &mut chat,
         super::session_flow::SessionOpenResult {
             session_id,
-            initial_history_limit: 64,
+            has_older_history: true,
             result: Ok((
                 attached,
                 tokio::spawn(async move {
@@ -743,7 +743,7 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
         &bcode_client::BcodeClient::default_endpoint(),
         &mut chat,
         session_id,
-        64,
+        super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24)),
     );
     if let Some(open_task) = chat.session_open_task.take() {
         open_task.abort();

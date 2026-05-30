@@ -2,11 +2,47 @@
 
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
-use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery, SessionId};
+use bcode_session_models::{
+    ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
+    ProjectionWindowRequest, ProjectionWindowTarget, SessionHistoryDirection, SessionHistoryQuery,
+    SessionId, SessionProjectionKind,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::{OLDER_HISTORY_EVENT_LIMIT, TuiError, session_flow::ActiveChat};
+
+const INITIAL_TRANSCRIPT_OVERSCAN_VIEWPORTS: usize = 2;
+const INITIAL_TRANSCRIPT_MIN_ITEMS: usize = 12;
+const INITIAL_TRANSCRIPT_MAX_ITEMS: usize = 64;
+const INITIAL_TRANSCRIPT_MAX_EVENTS_SCANNED: usize = 2_048;
+const INITIAL_TRANSCRIPT_MAX_BYTES: usize = 512 * 1024;
+
+/// Build the projection-window request used for initial session attach.
+#[must_use]
+pub fn initial_transcript_window_request(
+    transcript_area: bmux_tui::geometry::Rect,
+) -> ProjectionWindowRequest {
+    let viewport_rows = usize::from(transcript_area.height.max(1));
+    ProjectionWindowRequest {
+        projection: SessionProjectionKind::Transcript,
+        anchor: ProjectionWindowAnchor::Latest,
+        direction: ProjectionWindowDirection::Backward,
+        target: ProjectionWindowTarget {
+            min_items: Some(INITIAL_TRANSCRIPT_MIN_ITEMS),
+            min_estimated_rows: Some(
+                viewport_rows.saturating_mul(INITIAL_TRANSCRIPT_OVERSCAN_VIEWPORTS),
+            ),
+            min_bytes: None,
+            width_columns: Some(transcript_area.width.max(1)),
+        },
+        limits: ProjectionWindowLimits {
+            max_items: INITIAL_TRANSCRIPT_MAX_ITEMS,
+            max_events_scanned: INITIAL_TRANSCRIPT_MAX_EVENTS_SCANNED,
+            max_bytes: INITIAL_TRANSCRIPT_MAX_BYTES,
+        },
+    }
+}
 
 /// Load the next older page of transcript history when available.
 pub async fn load_older_history(
@@ -49,16 +85,17 @@ pub async fn attach_session_event_stream(
     session_id: SessionId,
     event_sender: mpsc::UnboundedSender<BcodeEvent>,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
-    attach_session_event_stream_with_limit(
+    attach_session_event_stream_with_window_request(
         client,
         session_id,
         event_sender,
-        super::INITIAL_HISTORY_EVENT_LIMIT,
+        initial_transcript_window_request(bmux_tui::geometry::Rect::new(0, 0, 80, 24)),
     )
     .await
 }
 
 /// Attach to a session with a bounded recent history limit and forward live events into the UI event channel.
+#[allow(dead_code)]
 pub async fn attach_session_event_stream_with_limit(
     client: &BcodeClient,
     session_id: SessionId,
@@ -68,6 +105,27 @@ pub async fn attach_session_event_stream_with_limit(
     let mut connection = client.connect("bcode-tui-bmux").await?;
     let attached = connection
         .attach_session_recent_with_input_history(session_id, limit)
+        .await?;
+    let event_task = tokio::spawn(async move {
+        while let Ok(event) = connection.recv_event().await {
+            if event_sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    Ok((attached, event_task))
+}
+
+/// Attach to a session with a semantic projection-window request and forward live events into the UI event channel.
+pub async fn attach_session_event_stream_with_window_request(
+    client: &BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    request: ProjectionWindowRequest,
+) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
+    let mut connection = client.connect("bcode-tui-bmux").await?;
+    let attached = connection
+        .attach_session_projection_window_with_input_history(session_id, request)
         .await?;
     let event_task = tokio::spawn(async move {
         while let Ok(event) = connection.recv_event().await {

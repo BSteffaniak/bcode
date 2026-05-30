@@ -39,12 +39,10 @@ pub async fn run_event_loop<W: Write>(
         opening_session_id: None,
     };
     if let Some(session_id) = session_id {
-        session_flow::start_switch_session(
-            &client,
-            &mut chat,
-            session_id,
-            session_flow::initial_history_event_limit(terminal.area()),
+        let initial_window_request = session_flow::initial_transcript_window_request(
+            super::render::transcript_area_for_frame(&chat.app, terminal.area()),
         );
+        session_flow::start_switch_session(&client, &mut chat, session_id, initial_window_request);
     } else {
         chat.app
             .set_status("New draft session; send a message to save it".to_owned());

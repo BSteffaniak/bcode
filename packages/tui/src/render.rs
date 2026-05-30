@@ -43,6 +43,19 @@ const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
+/// Compute the transcript area for a full terminal frame.
+#[must_use]
+pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
+    if area.is_empty() {
+        return area;
+    }
+    let composer_height = composer_height(app, area);
+    let composer_y = area.bottom().saturating_sub(composer_height);
+    let body_height = composer_y.saturating_sub(area.y.saturating_add(2));
+    let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
+    transcript_area_for_body(app, body)
+}
+
 /// Render one TUI frame.
 pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let area = frame.area();
