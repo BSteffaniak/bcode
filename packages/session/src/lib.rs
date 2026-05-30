@@ -788,13 +788,20 @@ impl SessionEventStore {
             total_metered_tokens: metadata.total_metered_tokens,
             min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            transcript_projection: existing_index.as_ref().map_or_else(Vec::new, |index| {
-                if metadata.event_count == index.event_count {
-                    index.transcript_projection.clone()
-                } else {
-                    Vec::new()
-                }
-            }),
+            transcript_projection: existing_index.as_ref().map_or_else(
+                || {
+                    self.rebuild_transcript_projection_for_index(metadata.summary.id)
+                        .unwrap_or_default()
+                },
+                |existing_index| {
+                    if metadata.event_count == existing_index.event_count {
+                        existing_index.transcript_projection.clone()
+                    } else {
+                        self.rebuild_transcript_projection_for_index(metadata.summary.id)
+                            .unwrap_or_default()
+                    }
+                },
+            ),
             issues: metadata.index_issues.clone(),
         };
         let timer = self.metrics.timer();
@@ -808,6 +815,32 @@ impl SessionEventStore {
                 .increment_counter("session.metadata_index.write_error_total");
         }
         result
+    }
+
+    fn rebuild_transcript_projection_for_index(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<index::TranscriptProjectionIndexEntry>, SessionStoreError> {
+        let event_path = self.event_path(session_id);
+        let events = self.read_session_events(session_id)?;
+        let items = projection::build_transcript_projection(&events, None);
+        let entries = items
+            .iter()
+            .map(index::TranscriptProjectionIndexEntry::from_item)
+            .collect::<Vec<_>>();
+        self.metrics.record_histogram(
+            "session.metadata_index.transcript_projection_rebuild_event_count",
+            usize_to_u64(events.len()),
+        );
+        self.metrics.record_histogram(
+            "session.metadata_index.transcript_projection_rebuild_item_count",
+            usize_to_u64(entries.len()),
+        );
+        self.metrics.record_histogram(
+            "session.metadata_index.transcript_projection_rebuild_event_file_bytes",
+            fs::metadata(event_path).map_or(0, |metadata| metadata.len()),
+        );
+        Ok(entries)
     }
 
     /// Repair a session log by backing up and truncating an unreadable tail.
@@ -4237,7 +4270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_write_after_append_clears_stale_transcript_projection_entries() {
+    async fn metadata_write_after_append_refreshes_transcript_projection_entries() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -4270,7 +4303,7 @@ mod tests {
                 .expect("index should load")
                 .expect("index should exist");
 
-        assert!(after_append.transcript_projection.is_empty());
+        assert_eq!(after_append.transcript_projection.len(), 2);
         assert_eq!(after_append.event_count, rebuilt.event_count + 1);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
