@@ -508,6 +508,63 @@ mod tests {
     }
 
     #[test]
+    fn latest_projection_window_from_index_entries_estimates_rows_from_request_width() {
+        let entries = vec![index_entry(
+            1,
+            TranscriptProjectionItemKind::AssistantMessage,
+            100,
+        )];
+
+        let narrow = projection_window_from_index_entries(
+            &entries,
+            Some(1),
+            Some(1),
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(1),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(20),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("index-backed latest transcript windows are supported");
+        let wide = projection_window_from_index_entries(
+            &entries,
+            Some(1),
+            Some(1),
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(1),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(100),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("index-backed latest transcript windows are supported");
+
+        assert_eq!(narrow.transcript_items[0].estimated_rows, Some(6));
+        assert_eq!(wide.transcript_items[0].estimated_rows, Some(2));
+    }
+
+    #[test]
     fn latest_projection_window_from_index_entries_respects_byte_cap() {
         let entries = vec![
             index_entry(1, TranscriptProjectionItemKind::UserMessage, 5),
