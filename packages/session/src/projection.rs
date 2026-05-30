@@ -4,6 +4,49 @@ use bcode_session_models::{
     TranscriptProjectionItem, TranscriptProjectionItemKind,
 };
 
+pub(crate) fn projection_window_from_index_entries(
+    entries: &[crate::index::TranscriptProjectionIndexEntry],
+    first_event_sequence: Option<u64>,
+    last_event_sequence: Option<u64>,
+    request: &ProjectionWindowRequest,
+) -> Option<ProjectionWindow> {
+    if request.projection != SessionProjectionKind::Transcript
+        || request.anchor != ProjectionWindowAnchor::Latest
+        || request.direction != ProjectionWindowDirection::Backward
+    {
+        return None;
+    }
+
+    let items = entries
+        .iter()
+        .map(|entry| TranscriptProjectionItem {
+            kind: entry.kind,
+            source_range: entry.source_range,
+            estimated_rows: estimate_rows(entry.content_bytes, request.target.width_columns),
+            content_bytes: entry.content_bytes,
+        })
+        .collect::<Vec<_>>();
+    let selected_items = select_latest_items(&items, request);
+    let source_range = source_range_for_items(&selected_items);
+    let scanned_events = source_range.map_or(0, |range| {
+        usize::try_from(range.end_sequence - range.start_sequence + 1).unwrap_or(usize::MAX)
+    });
+    let has_older = source_range.is_some_and(|range| {
+        first_event_sequence.is_some_and(|first| first < range.start_sequence)
+    });
+    let has_newer = source_range
+        .is_some_and(|range| last_event_sequence.is_some_and(|last| last > range.end_sequence));
+
+    Some(ProjectionWindow {
+        projection: request.projection,
+        transcript_items: selected_items,
+        source_range,
+        has_older,
+        has_newer,
+        scanned_events,
+    })
+}
+
 /// Select a bounded projection window from chronological session events.
 ///
 /// Returns `None` for unsupported projections, anchors, or directions.
@@ -336,6 +379,78 @@ mod tests {
         ProjectionWindowRequest, ProjectionWindowTarget, SessionId, ToolInvocationStreamEvent,
         ToolOutputStream,
     };
+
+    #[test]
+    fn latest_projection_window_from_index_entries_satisfies_targets() {
+        let entries = vec![
+            index_entry(1, TranscriptProjectionItemKind::UserMessage, 5),
+            index_entry(2, TranscriptProjectionItemKind::AssistantMessage, 5),
+            index_entry(3, TranscriptProjectionItemKind::UserMessage, 5),
+            index_entry(4, TranscriptProjectionItemKind::AssistantMessage, 5),
+        ];
+
+        let window = projection_window_from_index_entries(
+            &entries,
+            Some(1),
+            Some(4),
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(3),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("index-backed latest transcript windows are supported");
+
+        assert_eq!(window.transcript_items.len(), 3);
+        assert_eq!(window.source_range.expect("source range").start_sequence, 2);
+        assert!(window.has_older);
+        assert!(!window.has_newer);
+    }
+
+    #[test]
+    fn latest_projection_window_from_index_entries_respects_byte_cap() {
+        let entries = vec![
+            index_entry(1, TranscriptProjectionItemKind::UserMessage, 5),
+            index_entry(2, TranscriptProjectionItemKind::AssistantMessage, 5),
+        ];
+
+        let window = projection_window_from_index_entries(
+            &entries,
+            Some(1),
+            Some(2),
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(2),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 5,
+                },
+            },
+        )
+        .expect("index-backed latest transcript windows are supported");
+
+        assert_eq!(window.transcript_items.len(), 1);
+        assert_eq!(window.source_range.expect("source range").start_sequence, 2);
+    }
 
     #[test]
     fn assistant_deltas_finish_as_one_projection_item() {
@@ -677,6 +792,22 @@ mod tests {
         assert_eq!(window.scanned_events, 1);
         assert_eq!(window.transcript_items.len(), 1);
         assert!(window.has_older);
+    }
+
+    fn index_entry(
+        sequence: u64,
+        kind: TranscriptProjectionItemKind,
+        content_bytes: usize,
+    ) -> crate::index::TranscriptProjectionIndexEntry {
+        crate::index::TranscriptProjectionIndexEntry {
+            projection_item_id: format!("transcript:{sequence}:{sequence}"),
+            kind,
+            source_range: ProjectionSourceRange {
+                start_sequence: sequence,
+                end_sequence: sequence,
+            },
+            content_bytes,
+        }
     }
 
     fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {

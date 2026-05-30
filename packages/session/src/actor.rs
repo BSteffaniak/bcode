@@ -159,6 +159,14 @@ impl SessionHandle {
             .await?
     }
 
+    pub async fn projection_window_from_index(
+        &self,
+        request: ProjectionWindowRequest,
+    ) -> Result<ProjectionWindow, SessionError> {
+        self.send(|reply| SessionCommand::ProjectionWindowFromIndex { request, reply })
+            .await?
+    }
+
     pub async fn events_range(
         &self,
         start_sequence: u64,
@@ -260,6 +268,10 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<SessionHistoryPage, SessionError>>,
     },
     ProjectionWindow {
+        request: ProjectionWindowRequest,
+        reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
+    },
+    ProjectionWindowFromIndex {
         request: ProjectionWindowRequest,
         reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
     },
@@ -373,6 +385,9 @@ impl SessionActor {
             }
             SessionCommand::ProjectionWindow { request, reply } => {
                 let _ = reply.send(self.projection_window(request).await);
+            }
+            SessionCommand::ProjectionWindowFromIndex { request, reply } => {
+                let _ = reply.send(self.projection_window_from_index(request).await);
             }
             SessionCommand::EventsRange {
                 start_sequence,
@@ -703,6 +718,27 @@ impl SessionActor {
             );
         }
         Ok(window)
+    }
+
+    async fn projection_window_from_index(
+        &self,
+        request: ProjectionWindowRequest,
+    ) -> Result<ProjectionWindow, SessionError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::UnsupportedProjectionWindow)?;
+        let index = store.ensure_fresh_index(self.state.summary.id).await?;
+        if index.transcript_projection.is_empty() {
+            return Err(SessionError::UnsupportedProjectionWindow);
+        }
+        crate::projection::projection_window_from_index_entries(
+            &index.transcript_projection,
+            Some(0),
+            index.next_sequence.checked_sub(1),
+            &request,
+        )
+        .ok_or(SessionError::UnsupportedProjectionWindow)
     }
 
     async fn events_range(

@@ -2017,7 +2017,13 @@ impl SessionManager {
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
         let handle = self.session_handle(session_id).await?;
-        handle.projection_window(request).await
+        match handle.projection_window_from_index(request.clone()).await {
+            Ok(window) => Ok(window),
+            Err(SessionError::UnsupportedProjectionWindow) => {
+                handle.projection_window(request).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Return source events in an inclusive sequence range.
@@ -2226,7 +2232,13 @@ impl SessionManager {
             handle_timer.elapsed_ms(),
         );
         let projection_timer = self.metrics.timer();
-        let projection_window = handle.projection_window(request).await?;
+        let projection_window = match handle.projection_window_from_index(request.clone()).await {
+            Ok(window) => window,
+            Err(SessionError::UnsupportedProjectionWindow) => {
+                handle.projection_window(request).await?
+            }
+            Err(error) => return Err(error),
+        };
         self.metrics.record_histogram(
             "session.manager.attach_projection_window.projection_query_duration_ms",
             projection_timer.elapsed_ms(),
