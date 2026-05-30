@@ -216,6 +216,155 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
+/// Product-facing derived view over a session event log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionProjectionKind {
+    /// Conversation transcript intended for chat-oriented presentation.
+    Transcript,
+    /// Model-context view used for prompt/context inspection.
+    ModelContext,
+    /// User input history view.
+    InputHistory,
+    /// Runtime-work lifecycle view.
+    RuntimeWork,
+    /// Tool invocation timeline view.
+    ToolTimeline,
+    /// Audit-oriented chronological event view.
+    AuditLog,
+}
+
+/// Stable source-event range covered by a projection item or window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionSourceRange {
+    /// First source event sequence included in the range.
+    pub start_sequence: u64,
+    /// Last source event sequence included in the range.
+    pub end_sequence: u64,
+}
+
+/// Anchor point for a projection window query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionWindowAnchor {
+    /// Start from the latest available projection content.
+    Latest,
+    /// Start before the item that covers the given source event sequence.
+    BeforeSequence(u64),
+    /// Start after the item that covers the given source event sequence.
+    AfterSequence(u64),
+    /// Center the window around the item that covers the given source event sequence.
+    AroundSequence(u64),
+}
+
+/// Direction used when extending a projection window from its anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionWindowDirection {
+    /// Select older content first.
+    Backward,
+    /// Select newer content first.
+    Forward,
+}
+
+/// Semantic target for a projection window query.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionWindowTarget {
+    /// Minimum number of projection items to include when available.
+    #[serde(default)]
+    pub min_items: Option<usize>,
+    /// Minimum estimated display rows to include when available.
+    #[serde(default)]
+    pub min_estimated_rows: Option<usize>,
+    /// Minimum content bytes to include when available.
+    #[serde(default)]
+    pub min_bytes: Option<usize>,
+    /// Width used by row estimation, when the caller has one.
+    #[serde(default)]
+    pub width_columns: Option<u16>,
+}
+
+/// Safety limits for bounded projection window queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionWindowLimits {
+    /// Maximum projection items to return.
+    pub max_items: usize,
+    /// Maximum source events to scan while trying to satisfy the target.
+    pub max_events_scanned: usize,
+    /// Maximum content bytes to return.
+    pub max_bytes: usize,
+}
+
+/// Request for a semantic window over a session projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionWindowRequest {
+    /// Projection to query.
+    pub projection: SessionProjectionKind,
+    /// Anchor from which the window is selected.
+    pub anchor: ProjectionWindowAnchor,
+    /// Direction to extend the window from the anchor.
+    pub direction: ProjectionWindowDirection,
+    /// Desired semantic window size.
+    pub target: ProjectionWindowTarget,
+    /// Hard safety limits for the query.
+    pub limits: ProjectionWindowLimits,
+}
+
+/// Semantic category for an item in the transcript projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptProjectionItemKind {
+    /// User-authored message.
+    UserMessage,
+    /// Assistant-authored message.
+    AssistantMessage,
+    /// Assistant reasoning content.
+    Reasoning,
+    /// Tool invocation or tool output content.
+    ToolInvocation,
+    /// Permission request or resolution content.
+    Permission,
+    /// Context compaction marker or summary.
+    ContextCompaction,
+    /// Working-directory change marker.
+    WorkingDirectoryChange,
+    /// Other transcript-visible event group.
+    Other,
+}
+
+/// Transcript projection item metadata returned by projection window queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptProjectionItem {
+    /// Semantic item category.
+    pub kind: TranscriptProjectionItemKind,
+    /// Source events covered by this item.
+    pub source_range: ProjectionSourceRange,
+    /// Estimated display rows for this item at the requested width.
+    #[serde(default)]
+    pub estimated_rows: Option<usize>,
+    /// Approximate content byte count represented by this item.
+    pub content_bytes: usize,
+}
+
+/// Result of a projection window query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionWindow {
+    /// Projection that produced the window.
+    pub projection: SessionProjectionKind,
+    /// Transcript items selected for the window.
+    #[serde(default)]
+    pub transcript_items: Vec<TranscriptProjectionItem>,
+    /// Source range covered by the selected window.
+    #[serde(default)]
+    pub source_range: Option<ProjectionSourceRange>,
+    /// Whether older projection content exists before this window.
+    pub has_older: bool,
+    /// Whether newer projection content exists after this window.
+    pub has_newer: bool,
+    /// Number of source events scanned to build this window.
+    pub scanned_events: usize,
+}
+
 /// Incremental event emitted while a tool invocation is running.
 ///
 /// This enum is persisted inside [`SessionEventKind`]. Keep the default
