@@ -1,7 +1,8 @@
 use crate::reader::{SessionReadIssue, SessionReadIssueKind, SessionReadReport};
 use crate::{SessionState, SessionStoreError};
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionId, SessionImportSummary, SessionSummary,
+    ProjectionSourceRange, SessionEvent, SessionEventKind, SessionId, SessionImportSummary,
+    SessionSummary, TranscriptProjectionItemKind,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -9,7 +10,7 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-pub const SESSION_INDEX_VERSION: u16 = 6;
+pub const SESSION_INDEX_VERSION: u16 = 7;
 pub const SESSION_ENTRY_INDEX_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,7 +42,17 @@ pub struct SessionIndex {
     pub total_metered_tokens: u64,
     pub min_event_schema_version: Option<u16>,
     pub max_event_schema_version: Option<u16>,
+    #[serde(default)]
+    pub transcript_projection: Vec<TranscriptProjectionIndexEntry>,
     pub issues: Vec<SessionIndexIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptProjectionIndexEntry {
+    pub projection_item_id: String,
+    pub kind: TranscriptProjectionItemKind,
+    pub source_range: ProjectionSourceRange,
+    pub content_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +121,78 @@ pub struct SessionIndexHealth {
     pub stale: bool,
 }
 
+#[derive(Default)]
+struct SessionIndexBuilder {
+    name: Option<String>,
+    working_directory: Option<PathBuf>,
+    next_sequence: u64,
+    has_user_message: bool,
+    current_provider: Option<String>,
+    current_model: Option<String>,
+    current_agent: Option<String>,
+    latest_compaction_sequence: Option<u64>,
+    total_metered_tokens: u64,
+    import: Option<SessionImportSummary>,
+}
+
+impl SessionIndexBuilder {
+    fn apply_event(&mut self, event: &SessionEvent) {
+        self.next_sequence = self.next_sequence.max(event.sequence.saturating_add(1));
+        match &event.kind {
+            SessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            } => {
+                self.name.clone_from(name);
+                self.working_directory = Some(working_directory.clone());
+            }
+            SessionEventKind::WorkingDirectoryChanged {
+                new_working_directory,
+                ..
+            } => {
+                self.working_directory = Some(new_working_directory.clone());
+            }
+            SessionEventKind::SessionRenamed { name } => {
+                self.name.clone_from(name);
+            }
+            SessionEventKind::UserMessage { .. } => self.has_user_message = true,
+            SessionEventKind::ModelChanged { provider, model } => {
+                self.current_provider = Some(provider.clone());
+                self.current_model = Some(model.clone());
+            }
+            SessionEventKind::AgentChanged { agent_id } => {
+                self.current_agent = Some(agent_id.clone());
+            }
+            SessionEventKind::ContextCompacted {
+                compacted_through_sequence,
+                ..
+            } => {
+                self.latest_compaction_sequence = Some(*compacted_through_sequence);
+            }
+            SessionEventKind::ModelUsage { usage, .. } => {
+                if let Some(total) = usage.metered_total_tokens() {
+                    self.total_metered_tokens =
+                        self.total_metered_tokens.saturating_add(u64::from(total));
+                }
+            }
+            SessionEventKind::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            } => {
+                self.import = Some(SessionImportSummary {
+                    source_id: source_id.clone(),
+                    source_display_name: source_display_name.clone(),
+                    external_session_id: external_session_id.clone(),
+                    imported_at_ms: *imported_at_ms,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 impl EventFileFingerprint {
     #[must_use]
     pub const fn modified_at_ms(&self) -> u64 {
@@ -133,71 +216,9 @@ impl SessionIndex {
         file: EventFileFingerprint,
         report: &SessionReadReport,
     ) -> Option<Self> {
-        let mut name = None;
-        let mut working_directory = None;
-        let mut next_sequence = 0_u64;
-        let mut has_user_message = false;
-        let mut current_provider = None;
-        let mut current_model = None;
-        let mut current_agent = None;
-        let mut latest_compaction_sequence = None;
-        let mut total_metered_tokens = 0_u64;
-        let mut import = None;
-
+        let mut builder = SessionIndexBuilder::default();
         for event in &report.events {
-            next_sequence = next_sequence.max(event.sequence.saturating_add(1));
-            match &event.kind {
-                SessionEventKind::SessionCreated {
-                    name: event_name,
-                    working_directory: event_working_directory,
-                } => {
-                    name.clone_from(event_name);
-                    working_directory = Some(event_working_directory.clone());
-                }
-                SessionEventKind::WorkingDirectoryChanged {
-                    new_working_directory,
-                    ..
-                } => {
-                    working_directory = Some(new_working_directory.clone());
-                }
-                SessionEventKind::SessionRenamed { name: event_name } => {
-                    name.clone_from(event_name);
-                }
-                SessionEventKind::UserMessage { .. } => has_user_message = true,
-                SessionEventKind::ModelChanged { provider, model } => {
-                    current_provider = Some(provider.clone());
-                    current_model = Some(model.clone());
-                }
-                SessionEventKind::AgentChanged { agent_id } => {
-                    current_agent = Some(agent_id.clone());
-                }
-                SessionEventKind::ContextCompacted {
-                    compacted_through_sequence,
-                    ..
-                } => {
-                    latest_compaction_sequence = Some(*compacted_through_sequence);
-                }
-                SessionEventKind::ModelUsage { usage, .. } => {
-                    if let Some(total) = usage.metered_total_tokens() {
-                        total_metered_tokens =
-                            total_metered_tokens.saturating_add(u64::from(total));
-                    }
-                }
-                SessionEventKind::SessionImported {
-                    source_id,
-                    source_display_name,
-                    external_session_id,
-                    imported_at_ms,
-                } => {
-                    import = Some(SessionImportSummary {
-                        source_id: source_id.clone(),
-                        source_display_name: source_display_name.clone(),
-                        external_session_id: external_session_id.clone(),
-                        imported_at_ms: *imported_at_ms,
-                    });
-                }
-                _ => {}
-            }
+            builder.apply_event(event);
         }
 
         if report.events.is_empty() {
@@ -206,7 +227,7 @@ impl SessionIndex {
 
         let created_at_ms = file.created_at_ms();
         let updated_at_ms = file.modified_at_ms();
-        let working_directory = working_directory?;
+        let working_directory = builder.working_directory?;
 
         Some(Self {
             index_version: SESSION_INDEX_VERSION,
@@ -214,27 +235,28 @@ impl SessionIndex {
             file,
             summary: SessionSummary {
                 id: session_id,
-                name,
+                name: builder.name,
                 client_count: 0,
                 created_at_ms,
                 updated_at_ms,
                 working_directory: working_directory.clone(),
-                import,
+                import: builder.import,
             },
             working_directory,
-            next_sequence,
+            next_sequence: builder.next_sequence,
             event_count: report.events.len(),
             created_at_ms,
             updated_at_ms,
-            has_user_message,
+            has_user_message: builder.has_user_message,
             last_good_offset: report.last_good_offset,
-            current_provider,
-            current_model,
-            current_agent,
-            latest_compaction_sequence,
-            total_metered_tokens,
+            current_provider: builder.current_provider,
+            current_model: builder.current_model,
+            current_agent: builder.current_agent,
+            latest_compaction_sequence: builder.latest_compaction_sequence,
+            total_metered_tokens: builder.total_metered_tokens,
             min_event_schema_version: report.min_schema_version,
             max_event_schema_version: report.max_schema_version,
+            transcript_projection: transcript_projection_from_events(&report.events),
             issues: report.issues.iter().map(SessionIndexIssue::from).collect(),
         })
     }
@@ -262,6 +284,30 @@ impl SessionIndex {
             stale,
         }
     }
+}
+
+impl TranscriptProjectionIndexEntry {
+    #[must_use]
+    pub fn from_item(item: &bcode_session_models::TranscriptProjectionItem) -> Self {
+        Self {
+            projection_item_id: format!(
+                "transcript:{}:{}",
+                item.source_range.start_sequence, item.source_range.end_sequence
+            ),
+            kind: item.kind,
+            source_range: item.source_range,
+            content_bytes: item.content_bytes,
+        }
+    }
+}
+
+fn transcript_projection_from_events(
+    events: &[SessionEvent],
+) -> Vec<TranscriptProjectionIndexEntry> {
+    crate::projection::build_transcript_projection(events, None)
+        .iter()
+        .map(TranscriptProjectionIndexEntry::from_item)
+        .collect()
 }
 
 impl From<&SessionReadIssue> for SessionIndexIssue {
@@ -372,6 +418,13 @@ pub fn inspect_index(
     };
     let file = fingerprint(event_path)?;
     if index.session_id == session_id && index.file == file {
+        if index.transcript_projection.is_empty() && index.event_count > 0 {
+            return Ok(SessionIndexStatus::Stale {
+                found_version: Some(version.index_version),
+                current_version: SESSION_INDEX_VERSION,
+                reason: "transcript projection metadata is missing".to_string(),
+            });
+        }
         Ok(SessionIndexStatus::Current(Box::new(index)))
     } else {
         Ok(SessionIndexStatus::Stale {

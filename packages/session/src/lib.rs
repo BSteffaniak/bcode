@@ -788,6 +788,9 @@ impl SessionEventStore {
             total_metered_tokens: metadata.total_metered_tokens,
             min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            transcript_projection: existing_index
+                .as_ref()
+                .map_or_else(Vec::new, |index| index.transcript_projection.clone()),
             issues: metadata.index_issues.clone(),
         };
         let timer = self.metrics.timer();
@@ -4199,6 +4202,57 @@ mod tests {
             .expect("imported event should exist");
 
         assert_eq!(imported.provenance.as_ref(), Some(&provenance));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn rebuilt_index_persists_transcript_projection_entries() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("projection-index".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "question".to_owned())
+            .await
+            .expect("message should append");
+        manager
+            .append_assistant_delta(session.id, "partial".to_owned())
+            .await
+            .expect("delta should append");
+        manager
+            .append_assistant_message(session.id, "answer".to_owned())
+            .await
+            .expect("message should append");
+
+        let store = super::SessionEventStore::new(&root);
+        store
+            .reindex_session(session.id)
+            .expect("session should reindex");
+        let index =
+            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
+                .expect("index should load")
+                .expect("index should exist");
+
+        assert_eq!(index.transcript_projection.len(), 2);
+        assert_eq!(
+            index.transcript_projection[0].kind,
+            bcode_session_models::TranscriptProjectionItemKind::UserMessage
+        );
+        assert_eq!(
+            index.transcript_projection[1].kind,
+            bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
+        );
+        assert_eq!(
+            index.transcript_projection[1].source_range.start_sequence,
+            2
+        );
+        assert_eq!(index.transcript_projection[1].source_range.end_sequence, 3);
+
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
