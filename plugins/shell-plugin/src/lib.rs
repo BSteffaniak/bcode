@@ -5,8 +5,8 @@
 //! Bundled shell execution tool plugin for Bcode.
 
 use bcode_config::{
-    ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode, default_config_paths_from,
-    load_config_from_paths,
+    ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
+    default_config_paths_from, load_config_from_paths,
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -25,9 +25,8 @@ use std::time::{Duration, Instant};
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
-const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
-const MAX_INLINE_STREAM_OUTPUT_BYTES: usize = 16 * 1024;
 
 /// Bundled shell plugin.
 #[derive(Default)]
@@ -263,14 +262,18 @@ fn resolve_effective_cwd(
     )
 }
 
-fn shell_env_config(cwd: Option<&Path>) -> Result<ShellToolEnvConfig, String> {
+fn shell_config(cwd: Option<&Path>) -> Result<ShellToolConfig, String> {
     let paths = cwd.map_or_else(
         bcode_config::default_config_paths,
         default_config_paths_from,
     );
     load_config_from_paths(&paths)
-        .map(|config| config.tools.shell.env)
+        .map(|config| config.tools.shell)
         .map_err(|error| error.to_string())
+}
+
+fn shell_env_config(cwd: Option<&Path>) -> Result<ShellToolEnvConfig, String> {
+    shell_config(cwd).map(|config| config.env)
 }
 
 fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
@@ -556,19 +559,21 @@ const fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
 
 fn build_process_tool_response(
     result: &bcode_tool_runtime::ProcessExecutionResult,
+    max_output_bytes: usize,
+    inline_output_bytes: usize,
 ) -> ToolInvocationResponse {
     let stdout = limit_output_bytes_with_truncation(
         &result.stdout.bytes,
-        MAX_OUTPUT_BYTES,
+        max_output_bytes,
         result.stdout.truncated,
     );
     let stderr = limit_output_bytes_with_truncation(
         &result.stderr.bytes,
-        MAX_OUTPUT_BYTES,
+        max_output_bytes,
         result.stderr.truncated,
     );
-    let inline_stdout = limit_inline_stream_output(&stdout, MAX_INLINE_STREAM_OUTPUT_BYTES);
-    let inline_stderr = limit_inline_stream_output(&stderr, MAX_INLINE_STREAM_OUTPUT_BYTES);
+    let inline_stdout = limit_inline_stream_output(&stdout, inline_output_bytes);
+    let inline_stderr = limit_inline_stream_output(&stderr, inline_output_bytes);
     let output = format_command_output(
         result.exit_code,
         result.timed_out,
@@ -603,7 +608,10 @@ fn run_shell_command(
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let cwd = resolve_effective_cwd(arguments, session_cwd);
-    let env_config = shell_env_config(cwd.as_deref())?;
+    let config = shell_config(cwd.as_deref())?;
+    let env_config = config.env;
+    let max_output_bytes = config.max_output_bytes;
+    let inline_output_bytes = config.inline_output_bytes;
     let (program, args) = shell_program_and_args(&arguments.command, cwd.as_deref(), env_config)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -644,7 +652,7 @@ fn run_shell_command(
                         args,
                         cwd,
                         timeout: Some(timeout),
-                        max_output_bytes: MAX_OUTPUT_BYTES,
+                        max_output_bytes,
                     },
                     move |event| {
                         let stream = match event.stream {
@@ -675,7 +683,11 @@ fn run_shell_command(
         })
         .map_err(|error| error.to_string())?;
 
-    Ok(build_process_tool_response(&result))
+    Ok(build_process_tool_response(
+        &result,
+        max_output_bytes,
+        inline_output_bytes,
+    ))
 }
 
 #[cfg(unix)]
@@ -718,7 +730,7 @@ where
             break;
         }
         sequence = sequence.saturating_add(1);
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let remaining = DEFAULT_MAX_OUTPUT_BYTES.saturating_sub(bytes.len());
         if remaining == 0 {
             continue;
         }
@@ -726,7 +738,7 @@ where
         emit_tool_output_delta(events, tool_call_id, stream, sequence, &buffer[..retained]);
         bytes.extend_from_slice(&buffer[..retained]);
     }
-    Ok(limit_output_bytes(&bytes, MAX_OUTPUT_BYTES))
+    Ok(limit_output_bytes(&bytes, DEFAULT_MAX_OUTPUT_BYTES))
 }
 
 fn emit_tool_output_delta(
@@ -839,7 +851,7 @@ fn format_stream_output(stream: &str, output: &LimitedOutput) -> String {
         return output.text.clone();
     }
     let omitted = output.original_bytes.saturating_sub(output.retained_bytes);
-    let capture_note = if output.truncated && output.original_bytes >= MAX_OUTPUT_BYTES {
+    let capture_note = if output.truncated && output.original_bytes >= DEFAULT_MAX_OUTPUT_BYTES {
         " Process output may have exceeded Bcode's capture limit."
     } else {
         ""
@@ -977,8 +989,8 @@ mod tests {
 
     #[test]
     fn terminal_output_json_stays_valid_when_output_is_truncated() {
-        let bytes = vec![b'x'; MAX_OUTPUT_BYTES + 1];
-        let output = limit_output_bytes(&bytes, MAX_OUTPUT_BYTES);
+        let bytes = vec![b'x'; DEFAULT_MAX_OUTPUT_BYTES + 1];
+        let output = limit_output_bytes(&bytes, DEFAULT_MAX_OUTPUT_BYTES);
         let terminal_output = TerminalCommandOutput {
             mode: "terminal",
             exit_code: Some(0),

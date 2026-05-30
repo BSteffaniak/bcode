@@ -31,6 +31,8 @@ const MAX_RUST_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const TERMINATION_GRACE_MS: u64 = 500;
 const DEFAULT_READ_MAX_LINES: usize = 1_000;
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
+const DEFAULT_ARTIFACT_READ_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_ARTIFACT_GREP_MAX_MATCHES: usize = 100;
 
 /// Bundled filesystem plugin.
 #[derive(Default)]
@@ -218,6 +220,63 @@ struct GrepResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ArtifactMetadataRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactMetadataResponse {
+    path: String,
+    exists: bool,
+    kind: String,
+    byte_len: Option<u64>,
+    content_type: Option<String>,
+    complete: Option<bool>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactReadRequest {
+    path: PathBuf,
+    #[serde(default)]
+    offset_bytes: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    from_end: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactReadResponse {
+    path: String,
+    offset_bytes: u64,
+    returned_bytes: usize,
+    total_bytes: u64,
+    from_end: bool,
+    truncated: bool,
+    contents: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactGrepRequest {
+    path: PathBuf,
+    pattern: String,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default)]
+    max_matches: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactGrepResponse {
+    path: String,
+    matches: Vec<GrepMatch>,
+    total_bytes: u64,
+    partial: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct StatRequest {
     path: PathBuf,
 }
@@ -273,6 +332,9 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
             find_tool_definition(),
             grep_tool_definition(),
             stat_tool_definition(),
+            artifact_metadata_tool_definition(),
+            artifact_read_tool_definition(),
+            artifact_grep_tool_definition(),
         ],
     })
 }
@@ -417,6 +479,59 @@ fn stat_tool_definition() -> ToolDefinition {
     }
 }
 
+fn artifact_metadata_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "artifact.metadata".to_string(),
+        description: "Read metadata for a saved tool-output artifact or trace blob".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": { "path": { "type": "string" } }
+        }),
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
+    }
+}
+
+fn artifact_read_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "artifact.read".to_string(),
+        description: "Read a bounded UTF-8 slice from a saved tool-output artifact. Supports byte offsets and tail reads without loading the whole artifact into model context.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "offset_bytes": { "type": "integer", "minimum": 0, "description": "0-indexed byte offset to start reading from" },
+                "max_bytes": { "type": "integer", "minimum": 1, "description": "Maximum bytes to return" },
+                "from_end": { "type": "boolean", "description": "Read the last max_bytes bytes of the artifact" }
+            }
+        }),
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
+    }
+}
+
+fn artifact_grep_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "artifact.grep".to_string(),
+        description: "Search a saved UTF-8 tool-output artifact for a literal text pattern"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "pattern"],
+            "properties": {
+                "path": { "type": "string" },
+                "pattern": { "type": "string" },
+                "ignore_case": { "type": "boolean" },
+                "max_matches": { "type": "integer", "minimum": 1 }
+            }
+        }),
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
+    }
+}
+
 fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
     let request = match request.payload_json::<ToolInvocationRequest>() {
@@ -459,6 +574,9 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             &request.tool_call_id,
         ),
         "filesystem.stat" => tool_stat(request.arguments, cwd.as_deref()),
+        "artifact.metadata" => tool_artifact_metadata(request.arguments, cwd.as_deref()),
+        "artifact.read" => tool_artifact_read(request.arguments, cwd.as_deref()),
+        "artifact.grep" => tool_artifact_grep(request.arguments, cwd.as_deref()),
         _ => ToolInvocationResponse {
             output: format!("unknown filesystem tool: {}", request.name),
             is_error: true,
@@ -536,6 +654,177 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
         content: Vec::new(),
         full_output: None,
     }
+}
+
+fn tool_artifact_metadata(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<ArtifactMetadataRequest>(arguments) {
+        Ok(request) => {
+            let path = resolve_session_path(cwd, &request.path);
+            json_tool_response(serde_json::to_value(artifact_metadata_response(&path)))
+        }
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn artifact_metadata_response(path: &Path) -> ArtifactMetadataResponse {
+    match std::fs::metadata(path) {
+        Ok(metadata) => ArtifactMetadataResponse {
+            path: path.display().to_string(),
+            exists: true,
+            kind: metadata_kind(&metadata),
+            byte_len: Some(metadata.len()),
+            content_type: artifact_content_type(path),
+            complete: Some(true),
+            message: Some(
+                "Artifact byte length reflects retained bytes on disk; upstream tool capture may have been bounded."
+                    .to_string(),
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ArtifactMetadataResponse {
+            path: path.display().to_string(),
+            exists: false,
+            kind: "missing".to_string(),
+            byte_len: None,
+            content_type: None,
+            complete: None,
+            message: Some(error.to_string()),
+        },
+        Err(error) => ArtifactMetadataResponse {
+            path: path.display().to_string(),
+            exists: false,
+            kind: "error".to_string(),
+            byte_len: None,
+            content_type: None,
+            complete: None,
+            message: Some(error.to_string()),
+        },
+    }
+}
+
+fn tool_artifact_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+    match serde_json::from_value::<ArtifactReadRequest>(arguments) {
+        Ok(request) => match read_artifact(&resolve_session_path(cwd, &request.path), &request) {
+            Ok(response) => json_tool_response(serde_json::to_value(response)),
+            Err(error) => ToolInvocationResponse {
+                output: error,
+                is_error: true,
+                content: Vec::new(),
+                full_output: None,
+            },
+        },
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn read_artifact(
+    path: &Path,
+    request: &ArtifactReadRequest,
+) -> Result<ArtifactReadResponse, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let total_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let max_bytes = request.max_bytes.unwrap_or(DEFAULT_ARTIFACT_READ_MAX_BYTES);
+    let requested_offset = if request.from_end {
+        bytes.len().saturating_sub(max_bytes)
+    } else {
+        usize::try_from(request.offset_bytes.unwrap_or(0)).unwrap_or(usize::MAX)
+    };
+    let offset = requested_offset.min(bytes.len());
+    let end = offset.saturating_add(max_bytes).min(bytes.len());
+    let start = utf8_boundary_at_or_after_bytes(&bytes, offset);
+    let end = utf8_boundary_at_or_before_bytes(&bytes, end);
+    let contents = std::str::from_utf8(&bytes[start..end])
+        .map_err(|error| format!("artifact slice is not valid UTF-8: {error}"))?
+        .to_string();
+    Ok(ArtifactReadResponse {
+        path: path.display().to_string(),
+        offset_bytes: u64::try_from(start).unwrap_or(u64::MAX),
+        returned_bytes: end.saturating_sub(start),
+        total_bytes,
+        from_end: request.from_end,
+        truncated: start > 0 || end < bytes.len(),
+        contents,
+    })
+}
+
+fn tool_artifact_grep(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+    match serde_json::from_value::<ArtifactGrepRequest>(arguments) {
+        Ok(request) => match grep_artifact(&resolve_session_path(cwd, &request.path), &request) {
+            Ok(response) => json_tool_response(serde_json::to_value(response)),
+            Err(error) => ToolInvocationResponse {
+                output: error,
+                is_error: true,
+                content: Vec::new(),
+                full_output: None,
+            },
+        },
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn grep_artifact(
+    path: &Path,
+    request: &ArtifactGrepRequest,
+) -> Result<ArtifactGrepResponse, String> {
+    let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let pattern = if request.ignore_case {
+        request.pattern.to_lowercase()
+    } else {
+        request.pattern.clone()
+    };
+    let max_matches = request
+        .max_matches
+        .unwrap_or(DEFAULT_ARTIFACT_GREP_MAX_MATCHES);
+    let mut matches = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let haystack = if request.ignore_case {
+            line.to_lowercase()
+        } else {
+            line.to_string()
+        };
+        if haystack.contains(&pattern) {
+            matches.push(GrepMatch {
+                path: path.display().to_string(),
+                line_number: index.saturating_add(1),
+                line: line.to_string(),
+            });
+            if matches.len() >= max_matches {
+                break;
+            }
+        }
+    }
+    let partial = matches.len() >= max_matches;
+    Ok(ArtifactGrepResponse {
+        path: path.display().to_string(),
+        matches,
+        total_bytes: u64::try_from(contents.len()).unwrap_or(u64::MAX),
+        partial,
+        message: partial.then(|| "maximum match count reached".to_string()),
+    })
+}
+
+fn artifact_content_type(path: &Path) -> Option<String> {
+    match path.extension().and_then(std::ffi::OsStr::to_str) {
+        Some("json") => Some("application/json".to_string()),
+        Some("txt") => Some("text/plain".to_string()),
+        _ => None,
+    }
+}
+
+fn utf8_boundary_at_or_after_bytes(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && std::str::from_utf8(&bytes[..index]).is_err() {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn utf8_boundary_at_or_before_bytes(bytes: &[u8], mut index: usize) -> usize {
+    while index > 0 && std::str::from_utf8(&bytes[..index]).is_err() {
+        index = index.saturating_sub(1);
+    }
+    index
 }
 
 fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationResponse {
@@ -1510,17 +1799,21 @@ fn join_reader(
         .map_err(|_| std::io::Error::other("output reader thread panicked"))?
 }
 
+fn metadata_kind(metadata: &std::fs::Metadata) -> String {
+    if metadata.is_dir() {
+        "directory".to_string()
+    } else if metadata.is_file() {
+        "file".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
 fn stat_path(request: &StatRequest) -> Result<StatResponse, std::io::Error> {
     match std::fs::metadata(&request.path) {
         Ok(metadata) => Ok(StatResponse {
             exists: true,
-            kind: if metadata.is_dir() {
-                "directory".to_string()
-            } else if metadata.is_file() {
-                "file".to_string()
-            } else {
-                "other".to_string()
-            },
+            kind: metadata_kind(&metadata),
             len: metadata.is_file().then_some(metadata.len()),
         }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(StatResponse {
@@ -1750,6 +2043,52 @@ mod tests {
         assert!(!response.is_error);
         assert!(response.output.starts_with("two\nthree"));
         assert!(response.output.contains("Use offset=4 to continue"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_read_can_return_tail_without_full_read() {
+        let root = temp_dir("artifact-read-tail");
+        let file = root.join("artifact.txt");
+        std::fs::write(&file, "head-middle-tail").expect("write artifact");
+
+        let response = read_artifact(
+            &file,
+            &ArtifactReadRequest {
+                path: file.clone(),
+                offset_bytes: None,
+                max_bytes: Some(4),
+                from_end: true,
+            },
+        )
+        .expect("read artifact tail");
+
+        assert_eq!(response.contents, "tail");
+        assert_eq!(response.total_bytes, 16);
+        assert!(response.truncated);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_grep_searches_literal_matches() {
+        let root = temp_dir("artifact-grep");
+        let file = root.join("artifact.txt");
+        std::fs::write(&file, "alpha\nbeta\nALPHA\n").expect("write artifact");
+
+        let response = grep_artifact(
+            &file,
+            &ArtifactGrepRequest {
+                path: file.clone(),
+                pattern: "alpha".to_string(),
+                ignore_case: true,
+                max_matches: Some(10),
+            },
+        )
+        .expect("grep artifact");
+
+        assert_eq!(response.matches.len(), 2);
+        assert_eq!(response.matches[0].line_number, 1);
+        assert_eq!(response.matches[1].line_number, 3);
         let _ = std::fs::remove_dir_all(root);
     }
 

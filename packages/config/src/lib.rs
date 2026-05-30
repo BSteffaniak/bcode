@@ -1034,11 +1034,35 @@ pub struct ToolsConfig {
 }
 
 /// Shell tool configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellToolConfig {
     /// Environment resolution configuration for shell commands.
     #[serde(default)]
     pub env: ShellToolEnvConfig,
+    /// Maximum bytes retained per stdout/stderr stream from non-terminal shell commands.
+    #[serde(default = "default_shell_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Maximum bytes included inline per stdout/stderr stream in model-visible shell results.
+    #[serde(default = "default_shell_inline_output_bytes")]
+    pub inline_output_bytes: usize,
+}
+
+impl Default for ShellToolConfig {
+    fn default() -> Self {
+        Self {
+            env: ShellToolEnvConfig::default(),
+            max_output_bytes: default_shell_max_output_bytes(),
+            inline_output_bytes: default_shell_inline_output_bytes(),
+        }
+    }
+}
+
+const fn default_shell_max_output_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+const fn default_shell_inline_output_bytes() -> usize {
+    16 * 1024
 }
 
 /// Shell tool environment resolution configuration.

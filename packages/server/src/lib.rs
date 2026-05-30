@@ -454,6 +454,11 @@ impl TraceStore {
             content_type: content_type.to_string(),
             byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             redaction: TraceRedaction::Automatic,
+            completeness: if max_bytes > 0 && bytes.len() >= max_bytes {
+                bcode_session_models::TraceBlobCompleteness::Truncated
+            } else {
+                bcode_session_models::TraceBlobCompleteness::Complete
+            },
         })
     }
 }
@@ -6337,7 +6342,7 @@ fn project_tool_result_for_model_context(
         |path| path.display().to_string(),
     );
     let footer = format!(
-        "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Full retained output saved at: {path}. Use targeted inspection such as filesystem.grep, filesystem.read with offset/limit, or shell head/tail/sed on that path. Avoid reading the whole file unless necessary.]\n\n",
+        "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Full retained output saved at: {path}. Prefer artifact.metadata, artifact.grep, or artifact.read with max_bytes/from_end for saved tool-output artifacts; filesystem.grep or filesystem.read with offset/limit also work for regular files. Avoid reading the whole file unless necessary.]\n\n",
         result.len()
     );
     if max_context_chars == 0 {
@@ -9142,7 +9147,7 @@ mod tests {
         assert!(truncated.chars().count() <= 1_000);
         assert!(truncated.starts_with('a'));
         assert!(truncated.contains("tool output truncated"));
-        assert!(truncated.contains("targeted inspection"));
+        assert!(truncated.contains("artifact.read"));
         assert!(truncated.contains("/tmp/full-output.txt"));
         assert!(truncated.ends_with("necessary.]\n\n") || truncated.contains('z'));
         assert!(truncated.contains('z'));

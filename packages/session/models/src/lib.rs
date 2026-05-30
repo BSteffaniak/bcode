@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 19;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 20;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -501,6 +501,21 @@ pub struct TraceBlobRef {
     pub content_type: String,
     pub byte_len: u64,
     pub redaction: TraceRedaction,
+    #[serde(default)]
+    pub completeness: TraceBlobCompleteness,
+}
+
+/// Whether a trace blob represents complete or bounded retained content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceBlobCompleteness {
+    /// The blob is the complete payload supplied to the trace store.
+    #[default]
+    Complete,
+    /// The blob contains retained content, but the upstream tool or trace writer may have bounded it.
+    Retained,
+    /// The blob was truncated while being written by the trace store.
+    Truncated,
 }
 
 /// Redaction status for a trace blob.
