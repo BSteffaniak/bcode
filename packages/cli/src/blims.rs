@@ -520,6 +520,24 @@ struct BlimsPreparedAiWorkItem {
     prompt: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsActivityItem {
+    title: String,
+    body: String,
+    actor_id: String,
+    severity: String,
+    action_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BlimsCeoInboxItem {
+    title: String,
+    summary: String,
+    priority: i64,
+    actor_id: String,
+    action_label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BlimsWorkProposalSummary {
     id: String,
@@ -1209,9 +1227,16 @@ enum BlimsTuiMode {
     Dashboard(BlimsCeoDashboardState),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlimsWorldTickResult {
+    world: BlimsWorldSnapshot,
+    activity: Vec<BlimsActivityItem>,
+    inbox: Vec<BlimsCeoInboxItem>,
+}
+
 #[derive(Debug)]
 enum BlimsBackgroundJob {
-    WorldTick(Receiver<Result<BlimsWorldSnapshot, CliError>>),
+    WorldTick(Receiver<Result<BlimsWorldTickResult, CliError>>),
     PlayerRoomSync(Receiver<Result<BlimsWorldSnapshot, CliError>>),
     WorldTemplateSelect(Receiver<Result<BlimsWorldSelection, CliError>>),
     DashboardLoad(Receiver<Result<BlimsCeoDashboardState, CliError>>),
@@ -1245,6 +1270,8 @@ struct BlimsTuiApp {
     templates: Vec<BlimsWorldTemplateSummary>,
     agent_sprites: BTreeMap<String, BlimsAgentSpriteState>,
     live_log: Vec<String>,
+    activity: Vec<BlimsActivityItem>,
+    inbox: Vec<BlimsCeoInboxItem>,
     selected_template: usize,
     player_tile: BlimsTilePosition,
     selected_interaction: usize,
@@ -1281,6 +1308,8 @@ impl BlimsTuiApp {
             templates,
             agent_sprites,
             live_log: vec!["Blims office is live.".to_string()],
+            activity: load_blims_activity().await.unwrap_or_default(),
+            inbox: load_blims_inbox().await.unwrap_or_default(),
             selected_template,
             player_tile,
             selected_interaction: 0,
@@ -1492,17 +1521,20 @@ impl BlimsTuiApp {
         let active_conversation_agent_id = self.active_conversation_agent_id();
         if let Some(BlimsBackgroundJob::WorldTick(receiver)) = &self.jobs.world_tick {
             match receiver.try_recv() {
-                Ok(Ok(mut world)) => {
+                Ok(Ok(mut result)) => {
+                    let world = &mut result.world;
                     if let Some(agent_id) = &active_conversation_agent_id {
                         keep_conversation_agent_in_place(
                             &self.world,
-                            &mut world,
+                            world,
                             &mut self.agent_sprites,
                             agent_id,
                         );
                     }
                     let previous = self.world.clone();
-                    self.apply_world_snapshot(world);
+                    self.apply_world_snapshot(result.world);
+                    self.activity = result.activity;
+                    self.inbox = result.inbox;
                     self.record_world_changes(&previous);
                     self.jobs.world_tick = None;
                     dirty = true;
@@ -1869,6 +1901,26 @@ async fn load_blims_interactions() -> Result<BlimsAvailableInteractions, CliErro
     decode_blims_response::<BlimsAvailableInteractions>(response)
 }
 
+async fn load_blims_activity() -> Result<Vec<BlimsActivityItem>, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "limit": 12_u64,
+    });
+    let response =
+        call_blims_service("projection.activity.get", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<Vec<BlimsActivityItem>>(response)
+}
+
+async fn load_blims_inbox() -> Result<Vec<BlimsCeoInboxItem>, CliError> {
+    let request = serde_json::json!({
+        "working_directory": std::env::current_dir()?,
+        "limit": 12_u64,
+    });
+    let response =
+        call_blims_service("projection.ceo_inbox.get", serde_json::to_vec(&request)?).await?;
+    decode_blims_response::<Vec<BlimsCeoInboxItem>>(response)
+}
+
 async fn move_blims_player_blocking(room_id: &str) -> Result<BlimsWorldSnapshot, CliError> {
     let _operation = submit_blims_command(&serde_json::json!({
         "type": "move_player",
@@ -1878,7 +1930,7 @@ async fn move_blims_player_blocking(room_id: &str) -> Result<BlimsWorldSnapshot,
     load_blims_world().await
 }
 
-async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot, CliError> {
+async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldTickResult, CliError> {
     let mut world = load_blims_world().await?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1893,10 +1945,18 @@ async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot
     .await?;
     let tick_world = load_blims_world().await?;
     if tick_world != world {
-        return Ok(tick_world);
+        return Ok(BlimsWorldTickResult {
+            world: tick_world,
+            activity: load_blims_activity().await.unwrap_or_default(),
+            inbox: load_blims_inbox().await.unwrap_or_default(),
+        });
     }
     let Some((agent_id, room_id)) = next_visible_agent_move(&world, tick_count) else {
-        return Ok(world);
+        return Ok(BlimsWorldTickResult {
+            world,
+            activity: load_blims_activity().await.unwrap_or_default(),
+            inbox: load_blims_inbox().await.unwrap_or_default(),
+        });
     };
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
@@ -1910,7 +1970,11 @@ async fn tick_blims_world_blocking(tick_count: u64) -> Result<BlimsWorldSnapshot
     if let Some(agent) = world.agents.iter_mut().find(|agent| agent.id == moved.id) {
         *agent = moved;
     }
-    Ok(world)
+    Ok(BlimsWorldTickResult {
+        world,
+        activity: load_blims_activity().await.unwrap_or_default(),
+        inbox: load_blims_inbox().await.unwrap_or_default(),
+    })
 }
 
 fn next_visible_agent_move(
@@ -2214,19 +2278,21 @@ fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         inner,
         Direction::Vertical,
         &[
-            Constraint::Length(8),
+            Constraint::Length(6),
             Constraint::Min(6),
-            Constraint::Length(8),
             Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(6),
         ],
     );
-    if rows.len() != 4 {
+    if rows.len() != 5 {
         return;
     }
     render_current_room_panel(app, rows[0], frame);
-    render_report_panel(app, rows[1], frame);
-    render_interactions_panel(app, rows[2], frame);
-    render_live_log_panel(app, rows[3], frame);
+    render_activity_panel(app, rows[1], frame);
+    render_inbox_panel(app, rows[2], frame);
+    render_interactions_panel(app, rows[3], frame);
+    render_live_log_panel(app, rows[4], frame);
 }
 
 fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2270,20 +2336,55 @@ fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
         .render(area, frame);
 }
 
-fn render_report_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_activity_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
-        app.report.title.clone(),
+        "🏢 Company pulse",
         Style::new()
             .fg(Color::BrightCyan)
             .add_modifier(Modifier::BOLD),
     )])];
-    lines.extend(
-        app.report
-            .bullets
-            .iter()
-            .take(6)
-            .map(|bullet| Line::raw(format!("• {bullet}"))),
-    );
+    if app.activity.is_empty() {
+        lines.push(Line::raw("No visible company activity yet."));
+    } else {
+        lines.extend(app.activity.iter().take(6).map(|item| {
+            let marker = if item.severity == "attention" {
+                "!"
+            } else {
+                "•"
+            };
+            let actor = if item.actor_id.is_empty() {
+                String::new()
+            } else {
+                format!("{}: ", item.actor_id)
+            };
+            Line::raw(format!("{marker} {actor}{}", item.title))
+        }));
+    }
+    TextBlock::new(Text::from_lines(lines))
+        .wrap(TextWrap::Character)
+        .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))
+        .render(area, frame);
+}
+
+fn render_inbox_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+    let mut lines = vec![Line::from_spans(vec![Span::styled(
+        "📬 CEO inbox",
+        Style::new()
+            .fg(Color::BrightYellow)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    if app.inbox.is_empty() {
+        lines.push(Line::raw("Nothing needs CEO attention."));
+    } else {
+        lines.extend(app.inbox.iter().take(5).map(|item| {
+            let actor = if item.actor_id.is_empty() {
+                String::new()
+            } else {
+                format!("{} · ", item.actor_id)
+            };
+            Line::raw(format!("{}{}", actor, item.title))
+        }));
+    }
     TextBlock::new(Text::from_lines(lines))
         .wrap(TextWrap::Character)
         .style(Style::new().bg(Color::Rgb(13, 20, 18)).fg(Color::White))

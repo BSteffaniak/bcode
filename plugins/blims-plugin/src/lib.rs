@@ -217,6 +217,12 @@ pub const OP_PROJECTION_WORLD_GET: &str = "projection.world.get";
 /// Pending AI work projection get operation.
 pub const OP_PROJECTION_AI_WORK_GET: &str = "projection.ai_work.get";
 
+/// Company activity projection get operation.
+pub const OP_PROJECTION_ACTIVITY_GET: &str = "projection.activity.get";
+
+/// CEO inbox projection get operation.
+pub const OP_PROJECTION_CEO_INBOX_GET: &str = "projection.ceo_inbox.get";
+
 /// Record task outcome operation.
 pub const OP_TASK_RECORD_OUTCOME: &str = "task.record_outcome";
 
@@ -348,6 +354,8 @@ fn invoke_blims_service(request: &ServiceRequest) -> ServiceResponse {
         OP_PROJECTION_DASHBOARD_GET => service_projection_dashboard_get(request),
         OP_PROJECTION_WORLD_GET => service_projection_world_get(request),
         OP_PROJECTION_AI_WORK_GET => service_projection_ai_work_get(request),
+        OP_PROJECTION_ACTIVITY_GET => service_projection_activity_get(request),
+        OP_PROJECTION_CEO_INBOX_GET => service_projection_ceo_inbox_get(request),
         _ => ServiceResponse::error("unsupported_operation", "unsupported Blims operation"),
     }
 }
@@ -408,6 +416,26 @@ pub struct AiWorkListRequest {
     pub working_directory: PathBuf,
     /// Maximum number of work items to return.
     #[serde(default = "default_ai_work_limit")]
+    pub limit: u64,
+}
+
+/// Request to list company activity items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityListRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Maximum number of activity items to return.
+    #[serde(default = "default_activity_limit")]
+    pub limit: u64,
+}
+
+/// Request to list CEO inbox items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeoInboxRequest {
+    /// Workspace or repository directory.
+    pub working_directory: PathBuf,
+    /// Maximum number of inbox items to return.
+    #[serde(default = "default_inbox_limit")]
     pub limit: u64,
 }
 
@@ -1125,6 +1153,50 @@ pub struct PreparedAiWorkItem {
     pub task_id: Option<String>,
     /// Prompt text to send through Bcode AI/session orchestration.
     pub prompt: String,
+}
+
+/// Friendly company activity item for frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityItem {
+    /// Activity id.
+    pub id: String,
+    /// Source event id.
+    pub event_id: i64,
+    /// Activity kind.
+    pub kind: String,
+    /// Short title.
+    pub title: String,
+    /// Human-friendly body.
+    pub body: String,
+    /// Optional actor/agent id.
+    pub actor_id: String,
+    /// Optional room id.
+    pub room_id: String,
+    /// Severity label.
+    pub severity: String,
+    /// Suggested action hint.
+    pub action_hint: String,
+}
+
+/// User-facing CEO inbox item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeoInboxItem {
+    /// Inbox item id.
+    pub id: String,
+    /// Inbox kind.
+    pub kind: String,
+    /// Title.
+    pub title: String,
+    /// Summary.
+    pub summary: String,
+    /// Priority. Lower is more urgent.
+    pub priority: i64,
+    /// Optional actor/agent id.
+    pub actor_id: String,
+    /// User-friendly action label.
+    pub action_label: String,
+    /// Suggested command/action token.
+    pub action_command: String,
 }
 
 /// Dashboard read model shared by all frontends.
@@ -2038,6 +2110,14 @@ const fn default_operation_limit() -> u64 {
 
 const fn default_ai_work_limit() -> u64 {
     50
+}
+
+const fn default_activity_limit() -> u64 {
+    12
+}
+
+const fn default_inbox_limit() -> u64 {
+    12
 }
 
 const fn default_operation_lease_ms() -> i64 {
@@ -3049,6 +3129,28 @@ fn service_projection_ai_work_get(request: &ServiceRequest) -> ServiceResponse {
     match list_prepared_ai_work(&request) {
         Ok(work) => json_response(&work),
         Err(error) => ServiceResponse::error("ai_work_projection_failed", error.to_string()),
+    }
+}
+
+fn service_projection_activity_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ActivityListRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_activity_items(&request) {
+        Ok(items) => json_response(&items),
+        Err(error) => ServiceResponse::error("activity_projection_failed", error.to_string()),
+    }
+}
+
+fn service_projection_ceo_inbox_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<CeoInboxRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match list_ceo_inbox_items(&request) {
+        Ok(items) => json_response(&items),
+        Err(error) => ServiceResponse::error("ceo_inbox_projection_failed", error.to_string()),
     }
 }
 
@@ -7537,13 +7639,175 @@ fn current_time_ms() -> i64 {
         })
 }
 
-fn list_prepared_ai_work(
-    request: &AiWorkListRequest,
-) -> Result<Vec<PreparedAiWorkItem>, BlimsStateError> {
+fn activity_item(row: &Row) -> Result<ActivityItem, BlimsStateError> {
+    let event = event_summary(row)?;
+    let payload = serde_json::from_str::<BlimsEventPayload>(&event.payload_json).ok();
+    let (actor_id, room_id, severity, action_hint) = activity_metadata(&event, payload.as_ref());
+    Ok(ActivityItem {
+        id: format!("activity-{}", event.id),
+        event_id: event.id,
+        kind: event.kind,
+        title: event.summary,
+        body: activity_body(payload.as_ref()),
+        actor_id,
+        room_id,
+        severity,
+        action_hint,
+    })
+}
+
+fn activity_metadata(
+    event: &BlimsEventSummary,
+    payload: Option<&BlimsEventPayload>,
+) -> (String, String, String, String) {
+    match payload {
+        Some(BlimsEventPayload::AgentMoved { agent_id, room_id }) => (
+            agent_id.clone(),
+            room_id.clone(),
+            "info".to_string(),
+            "Walk over and talk".to_string(),
+        ),
+        Some(
+            BlimsEventPayload::AgentStatusSet { agent_id, .. }
+            | BlimsEventPayload::AgentPlanningCycleRecorded { agent_id, .. },
+        ) => (
+            agent_id.clone(),
+            String::new(),
+            "info".to_string(),
+            "Ask status".to_string(),
+        ),
+        Some(BlimsEventPayload::AiWorkPrepared { work }) => (
+            work.agent_id.clone(),
+            String::new(),
+            "attention".to_string(),
+            format!("Start AI work {}", work.id),
+        ),
+        Some(BlimsEventPayload::ProposalRegistered { proposal }) => (
+            proposal.agent_id.clone(),
+            String::new(),
+            "attention".to_string(),
+            "Review proposal".to_string(),
+        ),
+        Some(BlimsEventPayload::ArtifactCreated { artifact }) => (
+            String::new(),
+            String::new(),
+            "attention".to_string(),
+            format!("Review artifact {}", artifact.id),
+        ),
+        _ => (
+            String::new(),
+            String::new(),
+            if event.kind.contains("failed") {
+                "warning"
+            } else {
+                "info"
+            }
+            .to_string(),
+            String::new(),
+        ),
+    }
+}
+
+fn activity_body(payload: Option<&BlimsEventPayload>) -> String {
+    match payload {
+        Some(BlimsEventPayload::AiWorkPrepared { work }) => {
+            format!("{} has {} work ready.", work.agent_id, work.kind)
+        }
+        Some(BlimsEventPayload::TaskWorkScheduled {
+            task_id, agent_id, ..
+        }) => {
+            format!("{agent_id} is queued to work on {task_id}.")
+        }
+        Some(BlimsEventPayload::AgentPlanningCycleRecorded { rationale, .. }) => rationale.clone(),
+        Some(BlimsEventPayload::ConversationMessageRecorded {
+            speaker, message, ..
+        }) => {
+            format!("{speaker}: {message}")
+        }
+        _ => String::new(),
+    }
+}
+
+fn proposal_inbox_item(proposal: WorkProposalSummary) -> Option<CeoInboxItem> {
+    matches!(proposal.status.as_str(), "draft" | "ready" | "pending").then(|| CeoInboxItem {
+        id: proposal.id.clone(),
+        kind: "proposal".to_string(),
+        title: format!("Review proposal {}", proposal.id),
+        summary: proposal.summary,
+        priority: 20,
+        actor_id: proposal.agent_id,
+        action_label: "Open dashboard".to_string(),
+        action_command: format!("proposal.review:{}", proposal.id),
+    })
+}
+
+fn artifact_inbox_item(artifact: ArtifactSummary) -> Option<CeoInboxItem> {
+    matches!(artifact.status.as_str(), "draft" | "ready" | "pending").then(|| CeoInboxItem {
+        id: artifact.id.clone(),
+        kind: "artifact".to_string(),
+        title: format!("Review artifact {}", artifact.id),
+        summary: artifact.title,
+        priority: 30,
+        actor_id: String::new(),
+        action_label: "Open dashboard".to_string(),
+        action_command: format!("artifact.review:{}", artifact.id),
+    })
+}
+
+fn ai_work_inbox_item(work: PreparedAiWorkItem) -> CeoInboxItem {
+    CeoInboxItem {
+        id: work.id.clone(),
+        kind: "ai_work".to_string(),
+        title: format!("Start {} work", work.kind),
+        summary: work.task_id.as_ref().map_or_else(
+            || format!("{} has planning work ready", work.agent_id),
+            |task_id| format!("{} is ready to work on {task_id}", work.agent_id),
+        ),
+        priority: 10,
+        actor_id: work.agent_id,
+        action_label: "Start AI work".to_string(),
+        action_command: format!("ai_work.start:{}", work.id),
+    }
+}
+
+async fn load_failed_operation_inbox_items(
+    database: &dyn Database,
+) -> Result<Vec<CeoInboxItem>, BlimsStateError> {
+    Ok(database
+        .select("operations")
+        .columns(&operation_columns())
+        .filter(Box::new(where_eq(
+            "status",
+            BlimsOperationStatus::Failed.as_str(),
+        )))
+        .sort("updated_at", SortDirection::Desc)
+        .limit(10)
+        .execute(database)
+        .await?
+        .iter()
+        .map(operation_summary)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|operation| CeoInboxItem {
+            id: operation.id.clone(),
+            kind: "operation_failed".to_string(),
+            title: format!("Operation failed: {}", operation.kind),
+            summary: operation.error,
+            priority: 5,
+            actor_id: operation.actor,
+            action_label: "Inspect operations".to_string(),
+            action_command: format!("operation.inspect:{}", operation.id),
+        })
+        .collect())
+}
+
+fn list_activity_items(
+    request: &ActivityListRequest,
+) -> Result<Vec<ActivityItem>, BlimsStateError> {
     let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
     with_database(&request.working_directory, move |database| {
         Box::pin(async move {
-            let events = database
+            database
                 .select("events")
                 .columns(&[
                     "id",
@@ -7555,25 +7819,81 @@ fn list_prepared_ai_work(
                     "correlation_id",
                     "causation_id",
                 ])
-                .filter(Box::new(where_eq("kind", "ai.work_prepared")))
                 .sort("id", SortDirection::Desc)
                 .limit(limit)
                 .execute(database)
-                .await?;
-            events
+                .await?
                 .iter()
-                .filter_map(|event| {
-                    let payload = event
-                        .get("payload_json")
-                        .and_then(|value| value.as_str().map(ToOwned::to_owned))?;
-                    match serde_json::from_str::<BlimsEventPayload>(&payload).ok()? {
-                        BlimsEventPayload::AiWorkPrepared { work } => Some(Ok(work)),
-                        _ => None,
-                    }
-                })
+                .map(activity_item)
                 .collect()
         })
     })
+}
+
+fn list_ceo_inbox_items(request: &CeoInboxRequest) -> Result<Vec<CeoInboxItem>, BlimsStateError> {
+    let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move {
+            let mut items = Vec::new();
+            items.extend(
+                load_proposals(database)
+                    .await?
+                    .into_iter()
+                    .filter_map(proposal_inbox_item),
+            );
+            items.extend(
+                load_artifacts(database)
+                    .await?
+                    .into_iter()
+                    .filter_map(artifact_inbox_item),
+            );
+            items.extend(
+                list_prepared_ai_work_from_database(database, limit)
+                    .await?
+                    .into_iter()
+                    .map(ai_work_inbox_item),
+            );
+            items.extend(load_failed_operation_inbox_items(database).await?);
+            items.sort_by_key(|item| (item.priority, item.id.clone()));
+            items.truncate(limit);
+            Ok(items)
+        })
+    })
+}
+
+fn list_prepared_ai_work(
+    request: &AiWorkListRequest,
+) -> Result<Vec<PreparedAiWorkItem>, BlimsStateError> {
+    let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
+    with_database(&request.working_directory, move |database| {
+        Box::pin(async move { list_prepared_ai_work_from_database(database, limit).await })
+    })
+}
+
+async fn list_prepared_ai_work_from_database(
+    database: &dyn Database,
+    limit: usize,
+) -> Result<Vec<PreparedAiWorkItem>, BlimsStateError> {
+    let events = database
+        .select("events")
+        .columns(&["payload_json"])
+        .filter(Box::new(where_eq("kind", "ai.work_prepared")))
+        .sort("id", SortDirection::Desc)
+        .limit(limit)
+        .execute(database)
+        .await?;
+    events
+        .iter()
+        .filter_map(|event| {
+            let payload = event
+                .get("payload_json")
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))?;
+            match serde_json::from_str::<BlimsEventPayload>(&payload).ok()? {
+                BlimsEventPayload::AiWorkPrepared { work } => Some(Ok(work)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn list_operations(
