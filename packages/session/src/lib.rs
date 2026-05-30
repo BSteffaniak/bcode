@@ -2018,8 +2018,14 @@ impl SessionManager {
     ) -> Result<ProjectionWindow, SessionError> {
         let handle = self.session_handle(session_id).await?;
         match handle.projection_window_from_index(request.clone()).await {
-            Ok(window) => Ok(window),
+            Ok(window) => {
+                self.metrics
+                    .increment_counter("session.manager.projection_window.fast_path_total");
+                Ok(window)
+            }
             Err(SessionError::UnsupportedProjectionWindow) => {
+                self.metrics
+                    .increment_counter("session.manager.projection_window.fallback_total");
                 handle.projection_window(request).await
             }
             Err(error) => Err(error),
@@ -2233,8 +2239,14 @@ impl SessionManager {
         );
         let projection_timer = self.metrics.timer();
         let projection_window = match handle.projection_window_from_index(request.clone()).await {
-            Ok(window) => window,
+            Ok(window) => {
+                self.metrics
+                    .increment_counter("session.manager.attach_projection_window.fast_path_total");
+                window
+            }
             Err(SessionError::UnsupportedProjectionWindow) => {
+                self.metrics
+                    .increment_counter("session.manager.attach_projection_window.fallback_total");
                 handle.projection_window(request).await?
             }
             Err(error) => return Err(error),
@@ -3138,10 +3150,13 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 mod tests {
     use super::{SessionAccessStatus, SessionManager, access_status_from_report, reader};
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
-        RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
-        SessionHistoryDirection, SessionHistoryQuery, SessionTraceEvent, SessionTracePayload,
-        SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowAnchor,
+        ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
+        ProjectionWindowTarget, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkKind,
+        RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
+        SessionHistoryDirection, SessionHistoryQuery, SessionProjectionKind, SessionTraceEvent,
+        SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream,
+        TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -4214,6 +4229,47 @@ mod tests {
             .expect("imported event should exist");
 
         assert_eq!(imported.provenance.as_ref(), Some(&provenance));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn projection_window_falls_back_when_index_has_no_transcript_entries() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("empty projection".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+
+        let window = manager
+            .session_projection_window(
+                session.id,
+                ProjectionWindowRequest {
+                    projection: SessionProjectionKind::Transcript,
+                    anchor: ProjectionWindowAnchor::Latest,
+                    direction: ProjectionWindowDirection::Backward,
+                    target: ProjectionWindowTarget {
+                        min_items: Some(1),
+                        min_estimated_rows: None,
+                        min_bytes: None,
+                        width_columns: Some(80),
+                    },
+                    limits: ProjectionWindowLimits {
+                        max_items: 8,
+                        max_events_scanned: 64,
+                        max_bytes: 4096,
+                    },
+                },
+            )
+            .await
+            .expect("fallback projection window should succeed");
+
+        assert!(window.transcript_items.is_empty());
+        assert_eq!(window.source_range, None);
+
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
