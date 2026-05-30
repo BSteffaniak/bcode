@@ -151,6 +151,14 @@ impl SessionHandle {
             .await?
     }
 
+    pub async fn projection_window(
+        &self,
+        request: ProjectionWindowRequest,
+    ) -> Result<ProjectionWindow, SessionError> {
+        self.send(|reply| SessionCommand::ProjectionWindow { request, reply })
+            .await?
+    }
+
     pub async fn input_history(&self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
         self.send(SessionCommand::InputHistory).await?
     }
@@ -235,6 +243,10 @@ enum SessionCommand {
         query: SessionHistoryQuery,
         reply: oneshot::Sender<Result<SessionHistoryPage, SessionError>>,
     },
+    ProjectionWindow {
+        request: ProjectionWindowRequest,
+        reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
+    },
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     CurrentModelSelection(oneshot::Sender<Option<(String, String)>>),
@@ -317,6 +329,9 @@ impl SessionActor {
                 }
                 SessionCommand::HistoryPage { query, reply } => {
                     let _ = reply.send(self.history_page(query).await);
+                }
+                SessionCommand::ProjectionWindow { request, reply } => {
+                    let _ = reply.send(self.projection_window(request).await);
                 }
                 SessionCommand::InputHistory(reply) => {
                     let _ = reply.send(self.input_history().await);
@@ -594,6 +609,15 @@ impl SessionActor {
             self.refresh_snapshot();
         }
         Ok(page)
+    }
+
+    async fn projection_window(
+        &self,
+        request: ProjectionWindowRequest,
+    ) -> Result<ProjectionWindow, SessionError> {
+        let events = self.history().await?;
+        crate::projection::projection_window_from_events(&events, &request)
+            .ok_or(SessionError::UnsupportedProjectionWindow)
     }
 
     async fn input_history(&self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {

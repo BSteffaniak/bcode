@@ -1,7 +1,48 @@
 use bcode_session_models::{
-    ProjectionSourceRange, SessionEvent, SessionEventKind, TranscriptProjectionItem,
-    TranscriptProjectionItemKind,
+    ProjectionSourceRange, ProjectionWindow, ProjectionWindowAnchor, ProjectionWindowDirection,
+    ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionProjectionKind,
+    TranscriptProjectionItem, TranscriptProjectionItemKind,
 };
+
+/// Select a bounded projection window from chronological session events.
+///
+/// Returns `None` for unsupported projections, anchors, or directions.
+#[must_use]
+pub fn projection_window_from_events(
+    events: &[SessionEvent],
+    request: &ProjectionWindowRequest,
+) -> Option<ProjectionWindow> {
+    if request.projection != SessionProjectionKind::Transcript
+        || request.anchor != ProjectionWindowAnchor::Latest
+        || request.direction != ProjectionWindowDirection::Backward
+    {
+        return None;
+    }
+
+    let scan_start = events
+        .len()
+        .saturating_sub(request.limits.max_events_scanned);
+    let scanned_events = events.len().saturating_sub(scan_start);
+    let scanned = &events[scan_start..];
+    let items = build_transcript_projection(scanned, request.target.width_columns);
+    let selected_items = select_latest_items(&items, request);
+    let source_range = source_range_for_items(&selected_items);
+    let has_older = source_range.is_some_and(|range| {
+        events
+            .first()
+            .is_some_and(|first| first.sequence < range.start_sequence)
+    });
+    let has_newer = false;
+
+    Some(ProjectionWindow {
+        projection: request.projection,
+        transcript_items: selected_items,
+        source_range,
+        has_older,
+        has_newer,
+        scanned_events,
+    })
+}
 
 /// Build first-pass transcript projection metadata from chronological session events.
 #[must_use]
@@ -14,6 +55,66 @@ pub fn build_transcript_projection(
         builder.apply(event);
     }
     builder.finish()
+}
+
+fn select_latest_items(
+    items: &[TranscriptProjectionItem],
+    request: &ProjectionWindowRequest,
+) -> Vec<TranscriptProjectionItem> {
+    let mut selected = Vec::new();
+    let mut selected_rows = 0usize;
+    let mut selected_bytes = 0usize;
+
+    for item in items.iter().rev() {
+        if selected.len() >= request.limits.max_items {
+            break;
+        }
+        if selected_bytes.saturating_add(item.content_bytes) > request.limits.max_bytes
+            && !selected.is_empty()
+        {
+            break;
+        }
+
+        selected_rows = selected_rows.saturating_add(item.estimated_rows.unwrap_or(1));
+        selected_bytes = selected_bytes.saturating_add(item.content_bytes);
+        selected.push(item.clone());
+
+        if target_satisfied(
+            selected.len(),
+            selected_rows,
+            selected_bytes,
+            request.target.min_items,
+            request.target.min_estimated_rows,
+            request.target.min_bytes,
+        ) {
+            break;
+        }
+    }
+
+    selected.reverse();
+    selected
+}
+
+fn target_satisfied(
+    selected_items: usize,
+    selected_rows: usize,
+    selected_bytes: usize,
+    min_items: Option<usize>,
+    min_estimated_rows: Option<usize>,
+    min_bytes: Option<usize>,
+) -> bool {
+    min_items.is_none_or(|minimum| selected_items >= minimum)
+        && min_estimated_rows.is_none_or(|minimum| selected_rows >= minimum)
+        && min_bytes.is_none_or(|minimum| selected_bytes >= minimum)
+}
+
+fn source_range_for_items(items: &[TranscriptProjectionItem]) -> Option<ProjectionSourceRange> {
+    let first = items.first()?;
+    let last = items.last()?;
+    Some(ProjectionSourceRange {
+        start_sequence: first.source_range.start_sequence,
+        end_sequence: last.source_range.end_sequence,
+    })
 }
 
 struct TranscriptProjectionBuilder {
@@ -231,7 +332,8 @@ fn estimate_rows(content_bytes: usize, width_columns: Option<u16>) -> Option<usi
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionId, ToolInvocationStreamEvent,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowLimits,
+        ProjectionWindowRequest, ProjectionWindowTarget, SessionId, ToolInvocationStreamEvent,
         ToolOutputStream,
     };
 
@@ -338,6 +440,136 @@ mod tests {
         assert_eq!(items[1].source_range.start_sequence, 2);
         assert_eq!(items[0].estimated_rows, Some(3));
         assert_eq!(items[1].estimated_rows, Some(2));
+    }
+
+    #[test]
+    fn latest_projection_window_satisfies_item_target_after_compaction() {
+        let session_id = SessionId::new();
+        let mut events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "older".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "reply".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "newer".to_owned(),
+                },
+            ),
+        ];
+        events.extend((4..20).map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantDelta {
+                    text: "x".to_owned(),
+                },
+            )
+        }));
+        events.push(event(
+            session_id,
+            20,
+            SessionEventKind::AssistantMessage {
+                text: "streamed final".to_owned(),
+            },
+        ));
+
+        let window = projection_window_from_events(
+            &events,
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(4),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("latest transcript windows are supported");
+
+        assert_eq!(window.transcript_items.len(), 4);
+        assert_eq!(
+            window
+                .transcript_items
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                TranscriptProjectionItemKind::UserMessage,
+                TranscriptProjectionItemKind::AssistantMessage,
+                TranscriptProjectionItemKind::UserMessage,
+                TranscriptProjectionItemKind::AssistantMessage,
+            ]
+        );
+        assert_eq!(window.source_range.expect("source range").start_sequence, 1);
+    }
+
+    #[test]
+    fn latest_projection_window_respects_scan_cap() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "older".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "newer".to_owned(),
+                },
+            ),
+        ];
+
+        let window = projection_window_from_events(
+            &events,
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(2),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 1,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("latest transcript windows are supported");
+
+        assert_eq!(window.scanned_events, 1);
+        assert_eq!(window.transcript_items.len(), 1);
+        assert!(window.has_older);
     }
 
     fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {

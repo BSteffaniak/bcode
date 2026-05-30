@@ -29,10 +29,11 @@ pub use migration::{
 use actor::{AttachMode, SessionHandle};
 use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, SessionEvent,
-    SessionEventKind, SessionEventProvenance, SessionHistoryCursor, SessionHistoryDirection,
-    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
-    SessionInputHistoryEntry, SessionSummary, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
+    ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
+    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
+    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTokenUsage,
+    SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -64,6 +65,8 @@ pub enum SessionError {
     ConnectedClients(SessionId),
     #[error("session is being deleted: {0}")]
     Deleting(SessionId),
+    #[error("unsupported session projection window request")]
+    UnsupportedProjectionWindow,
     #[error("session is not writable: {session_id} ({status:?})")]
     NotWritable {
         session_id: SessionId,
@@ -1915,6 +1918,22 @@ impl SessionManager {
     ) -> Result<SessionHistoryPage, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.history_page(query).await
+    }
+
+    /// Return a semantic projection window for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    /// Returns [`SessionError::UnsupportedProjectionWindow`] when the request shape is not supported
+    /// by the first-pass projection implementation.
+    pub async fn session_projection_window(
+        &self,
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    ) -> Result<ProjectionWindow, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.projection_window(request).await
     }
 
     /// Return user-submitted prompts for input-history navigation.
