@@ -48,6 +48,28 @@ impl TranscriptViewport {
         self.anchor_top_row = Some(top_row.min(self.previous_total_rows));
     }
 
+    /// Materialize a top-origin viewport row into normal scroll state.
+    pub fn materialize_top_row(&mut self, top_row: usize) {
+        self.anchor_top_row = Some(top_row.min(self.previous_total_rows));
+        self.materialize_anchor_position();
+    }
+
+    /// Start following live output from an animated top-row transition.
+    #[must_use]
+    pub fn start_follow_anchor_animation(
+        &mut self,
+        target_top_row: usize,
+    ) -> Option<(usize, usize)> {
+        let target_top_row = target_top_row.min(self.previous_total_rows);
+        let start_top_row = self.top_row(self.previous_total_rows, self.viewport_height);
+        if start_top_row == target_top_row {
+            self.follow_anchor(target_top_row);
+            None
+        } else {
+            Some((start_top_row, target_top_row))
+        }
+    }
+
     /// Return the top-origin row to render for the current viewport.
     #[must_use]
     pub fn top_row(&self, total_rows: usize, viewport_height: u16) -> usize {

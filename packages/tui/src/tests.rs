@@ -1852,17 +1852,12 @@ fn manual_scroll_from_stream_anchor_preserves_visual_position() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
-    let anchored_y = output_line_y(&buffer, "Bcode …").expect("streaming heading is visible");
-
-    assert!(app.scroll_transcript_up(1));
+    assert!(app.scroll_transcript_up(3));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(
-        output_line_y(&buffer, "Bcode …"),
-        Some(anchored_y.saturating_add(1))
-    );
+    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(4));
 }
 
 #[test]

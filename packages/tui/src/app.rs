@@ -43,6 +43,49 @@ use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_viewport::TranscriptViewport;
 
 const MANUAL_TRANSCRIPT_SCROLL_GRACE: Duration = Duration::from_millis(450);
+const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
+const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptScrollAnimation {
+    start_top_row: usize,
+    target_top_row: usize,
+    started_at: Instant,
+    duration: Duration,
+}
+
+impl TranscriptScrollAnimation {
+    const fn new(start_top_row: usize, target_top_row: usize, started_at: Instant) -> Self {
+        Self {
+            start_top_row,
+            target_top_row,
+            started_at,
+            duration: TRANSCRIPT_SCROLL_ANIMATION_DURATION,
+        }
+    }
+
+    fn top_row_at(self, now: Instant) -> usize {
+        let duration_ms = self.duration.as_millis().max(1);
+        let elapsed_ms = now
+            .saturating_duration_since(self.started_at)
+            .as_millis()
+            .min(duration_ms);
+        let remaining_ms = duration_ms.saturating_sub(elapsed_ms);
+        let denominator = duration_ms.saturating_pow(3);
+        let numerator = denominator.saturating_sub(remaining_ms.saturating_pow(3));
+        let start = i128::try_from(self.start_top_row).unwrap_or(i128::MAX);
+        let target = i128::try_from(self.target_top_row).unwrap_or(i128::MAX);
+        let delta = target.saturating_sub(start);
+        let eased_delta = delta.saturating_mul(i128::try_from(numerator).unwrap_or(i128::MAX))
+            / i128::try_from(denominator).unwrap_or(1);
+        usize::try_from(start.saturating_add(eased_delta).max(0)).unwrap_or(usize::MAX)
+    }
+
+    fn finished(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= self.duration
+    }
+}
 
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +115,7 @@ pub struct BmuxApp {
     transcript_layout: TranscriptLayoutCache,
     viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
+    transcript_scroll_animation: Option<TranscriptScrollAnimation>,
     pending_assistant_stream_anchor: bool,
     older_history: OlderHistoryState,
     activity: ActivityState,
@@ -133,6 +177,7 @@ impl BmuxApp {
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
+            transcript_scroll_animation: None,
             pending_assistant_stream_anchor: false,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
@@ -482,6 +527,9 @@ impl BmuxApp {
     /// Return the transcript row that should render at the top of the viewport.
     #[must_use]
     pub fn transcript_top_row(&self, viewport_height: u16) -> usize {
+        if let Some(animation) = self.transcript_scroll_animation {
+            return animation.top_row_at(Instant::now());
+        }
         self.viewport
             .top_row(self.transcript_layout.total_rows(), viewport_height)
     }
@@ -691,20 +739,31 @@ impl BmuxApp {
 
     /// Scroll transcript up by rendered rows.
     pub fn scroll_transcript_up(&mut self, rows: usize) -> bool {
+        self.cancel_transcript_scroll_animation_for_manual_scroll();
         self.mark_manual_transcript_scroll();
         self.viewport.scroll_up(rows, &mut self.older_history)
     }
 
     /// Scroll transcript down by rendered rows.
     pub fn scroll_transcript_down(&mut self, rows: usize) -> bool {
+        self.cancel_transcript_scroll_animation_for_manual_scroll();
         self.mark_manual_transcript_scroll();
         self.viewport.scroll_down(rows)
     }
 
     /// Pin transcript to the newest rows.
     pub const fn scroll_transcript_to_bottom(&mut self) -> bool {
+        self.transcript_scroll_animation = None;
         self.manual_transcript_scroll_until = None;
         self.viewport.scroll_to_bottom(&mut self.older_history)
+    }
+
+    fn cancel_transcript_scroll_animation_for_manual_scroll(&mut self) {
+        let Some(animation) = self.transcript_scroll_animation.take() else {
+            return;
+        };
+        let top_row = animation.top_row_at(Instant::now());
+        self.viewport.materialize_top_row(top_row);
     }
 
     fn mark_manual_transcript_scroll(&mut self) {
@@ -729,6 +788,17 @@ impl BmuxApp {
         total_rows: usize,
         viewport_height: u16,
     ) {
+        let now = Instant::now();
+        if let Some(animation) = self.transcript_scroll_animation {
+            let top_row = animation.top_row_at(now);
+            if animation.finished(now) {
+                self.transcript_scroll_animation = None;
+                self.viewport.follow_anchor(animation.target_top_row);
+            } else {
+                self.viewport.materialize_top_row(top_row);
+                self.transcript_scroll_animation = Some(animation);
+            }
+        }
         self.viewport.sync_max(
             max_scroll_offset,
             max_bottom_overscroll,
@@ -741,7 +811,10 @@ impl BmuxApp {
 
     /// Resolve deferred live-stream top anchoring against the latest cached layout.
     pub fn sync_transcript_stream_anchor(&mut self) {
-        if !self.pending_assistant_stream_anchor || self.manual_transcript_scroll_active() {
+        if !self.pending_assistant_stream_anchor
+            || self.manual_transcript_scroll_active()
+            || self.transcript_scroll_animation.is_some()
+        {
             return;
         }
         if let Some(index) = self
@@ -752,7 +825,15 @@ impl BmuxApp {
                 .transcript_layout
                 .entry_start_row(VisibleTranscriptSource::Transcript, index)
         {
-            self.viewport.follow_anchor(top_row);
+            if let Some((start_top_row, target_top_row)) =
+                self.viewport.start_follow_anchor_animation(top_row)
+            {
+                self.transcript_scroll_animation = Some(TranscriptScrollAnimation::new(
+                    start_top_row,
+                    target_top_row,
+                    Instant::now(),
+                ));
+            }
             self.pending_assistant_stream_anchor = false;
         }
     }
@@ -813,7 +894,9 @@ impl BmuxApp {
 
     #[allow(clippy::too_many_lines)]
     fn absorb_session_event_without_history_record(&mut self, event: &SessionEvent) {
-        let was_following = self.viewport.following();
+        let was_following = self.viewport.following()
+            && self.transcript_scroll_animation.is_none()
+            && !self.pending_assistant_stream_anchor;
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();
         }
@@ -970,6 +1053,12 @@ impl BmuxApp {
         now_system: SystemTime,
     ) -> Vec<InvalidationRequest> {
         let mut requests = vec![self.cursor.invalidation_request()];
+        if self.transcript_scroll_animation.is_some() {
+            requests.push(InvalidationRequest::new(
+                InvalidationKey::new(TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY),
+                now + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
+            ));
+        }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
         requests
     }
@@ -983,12 +1072,29 @@ impl BmuxApp {
         keys.iter().fold(UiInvalidation::None, |invalidation, key| {
             if self.cursor.handle_invalidation(key, now) {
                 invalidation.merge(UiInvalidation::Paint)
+            } else if is_transcript_scroll_animation_invalidation(key) {
+                if self.handle_transcript_scroll_animation(now) {
+                    invalidation.merge(UiInvalidation::Layout)
+                } else {
+                    invalidation
+                }
             } else if is_tool_elapsed_invalidation(key) {
                 invalidation.merge(UiInvalidation::Layout)
             } else {
                 invalidation
             }
         })
+    }
+
+    fn handle_transcript_scroll_animation(&mut self, now: Instant) -> bool {
+        let Some(animation) = self.transcript_scroll_animation else {
+            return false;
+        };
+        if animation.finished(now) {
+            self.transcript_scroll_animation = None;
+            self.viewport.follow_anchor(animation.target_top_row);
+        }
+        true
     }
 
     /// Return whether the TUI should exit.
@@ -1745,6 +1851,10 @@ fn tool_elapsed_invalidation_key(tool_call_id: &str) -> InvalidationKey {
 
 fn is_tool_elapsed_invalidation(key: &InvalidationKey) -> bool {
     key.as_str().starts_with(TOOL_ELAPSED_INVALIDATION_PREFIX)
+}
+
+fn is_transcript_scroll_animation_invalidation(key: &InvalidationKey) -> bool {
+    key.as_str() == TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY
 }
 
 fn normalized_tool_name(tool_name: &str) -> String {
