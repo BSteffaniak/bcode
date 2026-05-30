@@ -23,6 +23,11 @@ pub enum SlashCommandOutcome {
     OpenWorktreeCreateDialog,
     /// Open skill picker.
     PickSkill,
+    /// Invoke a skill after creating an active session if needed.
+    InvokeSkill {
+        skill_id: bcode_skill_models::SkillId,
+        arguments: String,
+    },
     /// Open thinking settings dialog.
     OpenThinkingSettings(super::thinking_dialog::ThinkingDialogFocus),
     /// Toggle diff panel.
@@ -572,11 +577,22 @@ pub async fn execute(
         "worktree" | "worktrees" => worktree_command(client, session_id, &parts).await,
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" => {
-            let Some(session_id) = session_id else {
-                if let Some(skill_id) = parts.get(1) {
+            if parts.get(1) == Some(&"describe") {
+                if let Some(skill_id) = parts.get(2) {
                     return describe_skill(client, skill_id).await;
                 }
-                return Ok(SlashCommandOutcome::PickSkill);
+                return Ok(SlashCommandOutcome::Handled(
+                    "usage: /skill describe <skill-id>".to_owned(),
+                ));
+            }
+            let Some(session_id) = session_id else {
+                let Some(skill) = parts.get(1) else {
+                    return Ok(SlashCommandOutcome::PickSkill);
+                };
+                return Ok(SlashCommandOutcome::InvokeSkill {
+                    skill_id: bcode_skill_models::SkillId::new(*skill),
+                    arguments: parts.iter().skip(2).copied().collect::<Vec<_>>().join(" "),
+                });
             };
             skill_command(client, session_id, &parts).await
         }

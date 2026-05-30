@@ -13,7 +13,8 @@ use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::{
-    TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render, text_input_flow,
+    TuiError, session_flow, session_flow::ActiveChat, skill_picker, skill_picker_render,
+    text_input_flow,
 };
 
 /// Pick and perform a skill action for the active session.
@@ -63,7 +64,9 @@ pub async fn pick_skill_for_session<W: Write>(
                         return Ok(());
                     }
                     skill_picker::SkillPickerAction::Activate(skill_id) => {
-                        if let Err(error) = activate_skill(services.client, chat, skill_id).await {
+                        if let Err(error) =
+                            activate_skill(io, services.client, chat, skill_id).await
+                        {
                             helpers::report_client_error(
                                 &mut chat.app,
                                 "skill activation failed",
@@ -73,7 +76,8 @@ pub async fn pick_skill_for_session<W: Write>(
                         return Ok(());
                     }
                     skill_picker::SkillPickerAction::Deactivate(skill_id) => {
-                        if let Err(error) = deactivate_skill(services.client, chat, skill_id).await
+                        if let Err(error) =
+                            deactivate_skill(io, services.client, chat, skill_id).await
                         {
                             helpers::report_client_error(
                                 &mut chat.app,
@@ -88,7 +92,7 @@ pub async fn pick_skill_for_session<W: Write>(
                         arguments,
                     } => {
                         if let Err(error) =
-                            invoke_skill(services.client, chat, skill_id, arguments).await
+                            invoke_skill_for_session(io, services, chat, skill_id, arguments).await
                         {
                             helpers::report_client_error(
                                 &mut chat.app,
@@ -312,29 +316,33 @@ async fn describe_skill(
     Ok(())
 }
 
-async fn activate_skill(
+async fn active_or_persisted_session_id<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+) -> Result<bcode_session_models::SessionId, TuiError> {
+    session_flow::persist_draft_session(io.terminal, client, chat).await
+}
+
+async fn activate_skill<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     skill_id: SkillId,
 ) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
+    let session_id = active_or_persisted_session_id(io, client, chat).await?;
     client.activate_skill(session_id, skill_id.clone()).await?;
     chat.app.set_status(format!("activated skill {skill_id}"));
     Ok(())
 }
 
-async fn deactivate_skill(
+async fn deactivate_skill<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
     client: &BcodeClient,
     chat: &mut ActiveChat,
     skill_id: SkillId,
 ) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
+    let session_id = active_or_persisted_session_id(io, client, chat).await?;
     client
         .deactivate_skill(session_id, skill_id.clone())
         .await?;
@@ -342,22 +350,22 @@ async fn deactivate_skill(
     Ok(())
 }
 
-async fn invoke_skill(
-    client: &BcodeClient,
+/// Invoke a skill for the active session, creating a draft session first when needed.
+pub async fn invoke_skill_for_session<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     skill_id: SkillId,
     arguments: String,
 ) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
+    let session_id = active_or_persisted_session_id(io, services.client, chat).await?;
     let display_text = if arguments.trim().is_empty() {
         format!("Invoke skill {skill_id}")
     } else {
         format!("Invoke skill {skill_id}: {arguments}")
     };
-    let acceptance = client
+    let acceptance = services
+        .client
         .invoke_skill(session_id, skill_id.clone(), arguments, display_text)
         .await?;
     chat.app.set_status(if acceptance.queued {

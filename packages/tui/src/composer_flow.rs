@@ -178,6 +178,13 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             skill_flow::pick_skill_for_session(io, services, chat).await?;
         }
+        slash_commands::SlashCommandOutcome::InvokeSkill {
+            skill_id,
+            arguments,
+        } => {
+            chat.app.clear_pending_submission(message);
+            skill_flow::invoke_skill_for_session(io, services, chat, skill_id, arguments).await?;
+        }
         slash_commands::SlashCommandOutcome::OpenWorktreeCreateDialog => {
             chat.app.clear_pending_submission(message);
             worktree_flow::create_for_current_session(io, services, chat).await?;
