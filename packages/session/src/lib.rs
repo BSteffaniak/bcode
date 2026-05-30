@@ -788,9 +788,13 @@ impl SessionEventStore {
             total_metered_tokens: metadata.total_metered_tokens,
             min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            transcript_projection: existing_index
-                .as_ref()
-                .map_or_else(Vec::new, |index| index.transcript_projection.clone()),
+            transcript_projection: existing_index.as_ref().map_or_else(Vec::new, |index| {
+                if metadata.event_count == index.event_count {
+                    index.transcript_projection.clone()
+                } else {
+                    Vec::new()
+                }
+            }),
             issues: metadata.index_issues.clone(),
         };
         let timer = self.metrics.timer();
@@ -4229,6 +4233,46 @@ mod tests {
             .expect("imported event should exist");
 
         assert_eq!(imported.provenance.as_ref(), Some(&provenance));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn metadata_write_after_append_clears_stale_transcript_projection_entries() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("projection stale".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first".to_owned())
+            .await
+            .expect("message should append");
+        let store = super::SessionEventStore::new(&root);
+        store
+            .reindex_session(session.id)
+            .expect("session should reindex");
+        let rebuilt =
+            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
+                .expect("index should load")
+                .expect("index should exist");
+        assert!(!rebuilt.transcript_projection.is_empty());
+
+        manager
+            .append_user_message(session.id, ClientId::new(), "second".to_owned())
+            .await
+            .expect("message should append");
+        let after_append =
+            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
+                .expect("index should load")
+                .expect("index should exist");
+
+        assert!(after_append.transcript_projection.is_empty());
+        assert_eq!(after_append.event_count, rebuilt.event_count + 1);
+
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
