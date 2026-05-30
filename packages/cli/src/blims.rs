@@ -531,11 +531,14 @@ struct BlimsActivityItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BlimsCeoInboxItem {
+    id: String,
+    kind: String,
     title: String,
     summary: String,
     priority: i64,
     actor_id: String,
     action_label: String,
+    action_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1054,8 +1057,10 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
                     app.report = load_blims_report().await?;
                     app.status = "Morning report refreshed.".to_string();
                 }
-                KeyCode::Char('e') | KeyCode::Enter => app.activate_selected_interaction().await?,
+                KeyCode::Char('e') | KeyCode::Enter => app.activate_primary_action().await?,
                 KeyCode::Tab => app.select_next_interaction(),
+                KeyCode::Char('n') => app.select_next_inbox_item(),
+                KeyCode::Char('N') => app.select_previous_inbox_item(),
                 KeyCode::Char('t') => app.open_nearest_agent_conversation().await?,
                 KeyCode::Char('h') | KeyCode::Left => app.move_player_by(-1, 0),
                 KeyCode::Char('l') | KeyCode::Right => app.move_player_by(1, 0),
@@ -1272,6 +1277,7 @@ struct BlimsTuiApp {
     live_log: Vec<String>,
     activity: Vec<BlimsActivityItem>,
     inbox: Vec<BlimsCeoInboxItem>,
+    selected_inbox_item: usize,
     selected_template: usize,
     player_tile: BlimsTilePosition,
     selected_interaction: usize,
@@ -1310,6 +1316,7 @@ impl BlimsTuiApp {
             live_log: vec!["Blims office is live.".to_string()],
             activity: load_blims_activity().await.unwrap_or_default(),
             inbox: load_blims_inbox().await.unwrap_or_default(),
+            selected_inbox_item: 0,
             selected_template,
             player_tile,
             selected_interaction: 0,
@@ -1344,6 +1351,39 @@ impl BlimsTuiApp {
             self.clamp_selected_interaction();
             self.status = format!("Entered {}", self.current_room_name());
         }
+    }
+
+    async fn activate_primary_action(&mut self) -> Result<(), CliError> {
+        if self.activate_selected_inbox_item().await? {
+            return Ok(());
+        }
+        self.activate_selected_interaction().await
+    }
+
+    async fn activate_selected_inbox_item(&mut self) -> Result<bool, CliError> {
+        let Some(item) = self.inbox.get(self.selected_inbox_item).cloned() else {
+            return Ok(false);
+        };
+        if let Some(work_id) = item.action_command.strip_prefix("ai_work.start:") {
+            self.status = format!("Starting AI work {work_id}…");
+            start_blims_prepared_ai_work_detached(work_id.to_string()).await?;
+            self.status = format!("Started AI work: {}", item.title);
+            self.inbox = load_blims_inbox().await.unwrap_or_default();
+            self.activity = load_blims_activity().await.unwrap_or_default();
+            self.clamp_selected_inbox_item();
+            return Ok(true);
+        }
+        if item.action_command.starts_with("proposal.review:")
+            || item.action_command.starts_with("artifact.review:")
+        {
+            self.open_ceo_dashboard();
+            return Ok(true);
+        }
+        if !item.actor_id.is_empty() {
+            self.open_agent_conversation(item.actor_id).await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn activate_selected_interaction(&mut self) -> Result<(), CliError> {
@@ -1435,6 +1475,31 @@ impl BlimsTuiApp {
         let count = self.nearby_interactions().len();
         if count > 0 {
             self.selected_interaction = (self.selected_interaction + 1) % count;
+        }
+    }
+
+    fn select_next_inbox_item(&mut self) {
+        if !self.inbox.is_empty() {
+            self.selected_inbox_item = (self.selected_inbox_item + 1) % self.inbox.len();
+            self.status = format!("Inbox: {}", self.inbox[self.selected_inbox_item].title);
+        }
+    }
+
+    fn select_previous_inbox_item(&mut self) {
+        if !self.inbox.is_empty() {
+            self.selected_inbox_item = self
+                .selected_inbox_item
+                .checked_sub(1)
+                .unwrap_or_else(|| self.inbox.len().saturating_sub(1));
+            self.status = format!("Inbox: {}", self.inbox[self.selected_inbox_item].title);
+        }
+    }
+
+    const fn clamp_selected_inbox_item(&mut self) {
+        if self.inbox.is_empty() {
+            self.selected_inbox_item = 0;
+        } else if self.selected_inbox_item >= self.inbox.len() {
+            self.selected_inbox_item = self.inbox.len() - 1;
         }
     }
 
@@ -2123,7 +2188,14 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
                 .fg(Color::BrightYellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" use  "),
+        Span::raw(" act  "),
+        Span::styled(
+            "n/N",
+            Style::new()
+                .fg(Color::BrightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" inbox  "),
         Span::styled(
             "t",
             Style::new()
@@ -2190,6 +2262,71 @@ fn render_pixel_world(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
             );
         }
     }
+    render_agent_thought_bubbles(app, area, &viewport, frame);
+}
+
+fn render_agent_thought_bubbles(
+    app: &BlimsTuiApp,
+    area: Rect,
+    viewport: &BlimsViewport,
+    frame: &mut Frame<'_>,
+) {
+    for agent in &app.world.agents {
+        let Some(sprite) = app.agent_sprites.get(&agent.id) else {
+            continue;
+        };
+        let Some(message) = agent_activity_bubble(app, &agent.id) else {
+            continue;
+        };
+        let screen_x = sprite.position.x - viewport.origin.x + 1;
+        let screen_y = sprite.position.y - viewport.origin.y - 1;
+        if screen_x < 0 || screen_y < 0 {
+            continue;
+        }
+        let Ok(screen_x) = u16::try_from(screen_x) else {
+            continue;
+        };
+        let Ok(screen_y) = u16::try_from(screen_y) else {
+            continue;
+        };
+        if screen_x >= area.width || screen_y >= area.height {
+            continue;
+        }
+        let text = format!("“{}”", truncate_chars(&message, 20));
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                area.x + screen_x,
+                area.y + screen_y,
+                area.width - screen_x,
+                1,
+            ),
+            &Line::raw(text),
+            Style::new()
+                .fg(Color::BrightYellow)
+                .bg(Color::Rgb(8, 18, 24)),
+        );
+    }
+}
+
+fn agent_activity_bubble(app: &BlimsTuiApp, agent_id: &str) -> Option<String> {
+    app.inbox
+        .iter()
+        .find(|item| item.actor_id == agent_id)
+        .map(|item| item.action_label.clone())
+        .or_else(|| {
+            app.activity
+                .iter()
+                .find(|item| item.actor_id == agent_id && !item.action_hint.is_empty())
+                .map(|item| item.action_hint.clone())
+        })
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push('…');
+    }
+    output
 }
 
 fn tile_glyph(app: &BlimsTuiApp, tile: BlimsTilePosition) -> (&'static str, Style) {
@@ -2376,13 +2513,18 @@ fn render_inbox_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     if app.inbox.is_empty() {
         lines.push(Line::raw("Nothing needs CEO attention."));
     } else {
-        lines.extend(app.inbox.iter().take(5).map(|item| {
+        lines.extend(app.inbox.iter().take(5).enumerate().map(|(index, item)| {
             let actor = if item.actor_id.is_empty() {
                 String::new()
             } else {
                 format!("{} · ", item.actor_id)
             };
-            Line::raw(format!("{}{}", actor, item.title))
+            let prefix = if index == app.selected_inbox_item {
+                "▶ "
+            } else {
+                "  "
+            };
+            Line::raw(format!("{prefix}{}{}", actor, item.title))
         }));
     }
     TextBlock::new(Text::from_lines(lines))
@@ -3772,19 +3914,37 @@ async fn print_blims_ai_work(limit: u64, json: bool) -> Result<(), CliError> {
 }
 
 async fn start_blims_prepared_ai_work(work_id: String) -> Result<(), CliError> {
-    let work = load_blims_prepared_ai_work(&work_id).await?;
-    let session = BcodeClient::default_endpoint()
-        .create_session(Some(format!("Blims AI work: {}", work.id)))
-        .await?;
-    BcodeClient::default_endpoint()
-        .send_user_message(session.id, work.prompt)
-        .await?;
+    let (work, session) = create_blims_prepared_ai_work_session(&work_id).await?;
     println!("started AI work session: {}", session.id);
     println!("work: {}", work.id);
     println!("kind: {}", work.kind);
     println!("agent: {}", work.agent_id);
     attach_session(session.id).await?;
     Ok(())
+}
+
+async fn start_blims_prepared_ai_work_detached(work_id: String) -> Result<(), CliError> {
+    let (_work, _session) = create_blims_prepared_ai_work_session(&work_id).await?;
+    Ok(())
+}
+
+async fn create_blims_prepared_ai_work_session(
+    work_id: &str,
+) -> Result<
+    (
+        BlimsPreparedAiWorkItem,
+        bcode_session_models::SessionSummary,
+    ),
+    CliError,
+> {
+    let work = load_blims_prepared_ai_work(work_id).await?;
+    let session = BcodeClient::default_endpoint()
+        .create_session(Some(format!("Blims AI work: {}", work.id)))
+        .await?;
+    BcodeClient::default_endpoint()
+        .send_user_message(session.id, work.prompt.clone())
+        .await?;
+    Ok((work, session))
 }
 
 async fn load_blims_prepared_ai_work(work_id: &str) -> Result<BlimsPreparedAiWorkItem, CliError> {
