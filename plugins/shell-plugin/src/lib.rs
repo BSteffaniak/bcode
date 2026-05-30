@@ -27,6 +27,7 @@ const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
+const MAX_INLINE_STREAM_OUTPUT_BYTES: usize = 16 * 1024;
 
 /// Bundled shell plugin.
 #[derive(Default)]
@@ -553,6 +554,45 @@ const fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
     index
 }
 
+fn build_process_tool_response(
+    result: &bcode_tool_runtime::ProcessExecutionResult,
+) -> ToolInvocationResponse {
+    let stdout = limit_output_bytes_with_truncation(
+        &result.stdout.bytes,
+        MAX_OUTPUT_BYTES,
+        result.stdout.truncated,
+    );
+    let stderr = limit_output_bytes_with_truncation(
+        &result.stderr.bytes,
+        MAX_OUTPUT_BYTES,
+        result.stderr.truncated,
+    );
+    let inline_stdout = limit_inline_stream_output(&stdout, MAX_INLINE_STREAM_OUTPUT_BYTES);
+    let inline_stderr = limit_inline_stream_output(&stderr, MAX_INLINE_STREAM_OUTPUT_BYTES);
+    let output = format_command_output(
+        result.exit_code,
+        result.timed_out,
+        result.cancelled,
+        &inline_stdout,
+        &inline_stderr,
+    );
+    let full_output = format_command_output(
+        result.exit_code,
+        result.timed_out,
+        result.cancelled,
+        &stdout,
+        &stderr,
+    );
+    ToolInvocationResponse {
+        output,
+        is_error: result.timed_out
+            || result.cancelled
+            || result.exit_code.is_none_or(|code| code != 0),
+        content: Vec::new(),
+        full_output: Some(full_output),
+    }
+}
+
 fn run_shell_command(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
@@ -635,23 +675,7 @@ fn run_shell_command(
         })
         .map_err(|error| error.to_string())?;
 
-    let stdout = limit_output_bytes(&result.stdout, MAX_OUTPUT_BYTES);
-    let stderr = limit_output_bytes(&result.stderr, MAX_OUTPUT_BYTES);
-    let output = format_command_output(
-        result.exit_code,
-        result.timed_out,
-        result.cancelled,
-        &stdout.text,
-        &stderr.text,
-    );
-    Ok(ToolInvocationResponse {
-        output,
-        is_error: result.timed_out
-            || result.cancelled
-            || result.exit_code.is_none_or(|code| code != 0),
-        content: Vec::new(),
-        full_output: None,
-    })
+    Ok(build_process_tool_response(&result))
 }
 
 #[cfg(unix)]
@@ -747,6 +771,14 @@ fn emit_tool_stream_event(events: ServiceEventEmitter, event: &ToolInvocationStr
 }
 
 fn limit_output_bytes(bytes: &[u8], max_bytes: usize) -> LimitedOutput {
+    limit_output_bytes_with_truncation(bytes, max_bytes, false)
+}
+
+fn limit_output_bytes_with_truncation(
+    bytes: &[u8],
+    max_bytes: usize,
+    already_truncated: bool,
+) -> LimitedOutput {
     let original_bytes = bytes.len();
     let retained_len = valid_utf8_prefix_len(bytes, max_bytes.min(original_bytes));
     let text = String::from_utf8_lossy(&bytes[..retained_len]).into_owned();
@@ -754,7 +786,20 @@ fn limit_output_bytes(bytes: &[u8], max_bytes: usize) -> LimitedOutput {
         text,
         original_bytes,
         retained_bytes: retained_len,
-        truncated: retained_len < original_bytes,
+        truncated: already_truncated || retained_len < original_bytes,
+    }
+}
+
+fn limit_inline_stream_output(output: &LimitedOutput, max_bytes: usize) -> LimitedOutput {
+    let bytes = output.text.as_bytes();
+    let limit = max_bytes.min(bytes.len());
+    let start = utf8_boundary_at_or_after(&output.text, bytes.len().saturating_sub(limit));
+    let text = output.text[start..].to_owned();
+    LimitedOutput {
+        text,
+        original_bytes: output.original_bytes,
+        retained_bytes: bytes.len().saturating_sub(start),
+        truncated: output.truncated || start > 0,
     }
 }
 
@@ -778,12 +823,30 @@ fn format_command_output(
     exit_code: Option<i32>,
     timed_out: bool,
     cancelled: bool,
-    stdout: &str,
-    stderr: &str,
+    stdout: &LimitedOutput,
+    stderr: &LimitedOutput,
 ) -> String {
     let exit_code = exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string());
     format!(
-        "exit_code: {exit_code}\ntimed_out: {timed_out}\ncancelled: {cancelled}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "exit_code: {exit_code}\ntimed_out: {timed_out}\ncancelled: {cancelled}\nstdout:\n{}\nstderr:\n{}",
+        format_stream_output("stdout", stdout),
+        format_stream_output("stderr", stderr),
+    )
+}
+
+fn format_stream_output(stream: &str, output: &LimitedOutput) -> String {
+    if !output.truncated {
+        return output.text.clone();
+    }
+    let omitted = output.original_bytes.saturating_sub(output.retained_bytes);
+    let capture_note = if output.truncated && output.original_bytes >= MAX_OUTPUT_BYTES {
+        " Process output may have exceeded Bcode's capture limit."
+    } else {
+        ""
+    };
+    format!(
+        "[{stream} truncated: omitted {omitted} bytes; showing last {} of {} retained bytes.{capture_note}]\n{}",
+        output.retained_bytes, output.original_bytes, output.text
     )
 }
 
@@ -844,6 +907,39 @@ mod tests {
         assert_eq!(output.original_bytes, 5);
         assert_eq!(output.retained_bytes, 3);
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn inline_stream_output_keeps_tail_when_truncated() {
+        let output = limit_output_bytes(b"head-middle-tail", 16);
+        let inline = limit_inline_stream_output(&output, 4);
+
+        assert_eq!(inline.text, "tail");
+        assert_eq!(inline.original_bytes, 16);
+        assert_eq!(inline.retained_bytes, 4);
+        assert!(inline.truncated);
+    }
+
+    #[test]
+    fn command_output_marks_truncated_streams() {
+        let stdout = LimitedOutput {
+            text: "tail".to_string(),
+            original_bytes: 16,
+            retained_bytes: 4,
+            truncated: true,
+        };
+        let stderr = LimitedOutput {
+            text: String::new(),
+            original_bytes: 0,
+            retained_bytes: 0,
+            truncated: false,
+        };
+
+        let output = format_command_output(Some(0), false, false, &stdout, &stderr);
+
+        assert!(output.contains("stdout truncated"));
+        assert!(output.contains("showing last 4 of 16 retained bytes"));
+        assert!(output.contains("tail"));
     }
 
     #[test]

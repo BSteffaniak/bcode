@@ -39,6 +39,13 @@ pub struct ProcessExecutionRequest {
     pub max_output_bytes: usize,
 }
 
+/// Captured process output stream bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessCapturedOutput {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
 /// Managed process execution result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessExecutionResult {
@@ -46,8 +53,8 @@ pub struct ProcessExecutionResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cancelled: bool,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    pub stdout: ProcessCapturedOutput,
+    pub stderr: ProcessCapturedOutput,
 }
 
 /// Incremental process output event.
@@ -295,13 +302,13 @@ async fn run_process_inner(
     ));
     let (status, timed_out, cancelled) =
         wait_for_process(&mut child, request.timeout, cancel).await?;
-    let stdout = if timed_out {
-        Vec::new()
+    let (stdout, stdout_truncated) = if timed_out {
+        (Vec::new(), false)
     } else {
         stdout_task.await??
     };
-    let stderr = if timed_out {
-        Vec::new()
+    let (stderr, stderr_truncated) = if timed_out {
+        (Vec::new(), false)
     } else {
         stderr_task.await??
     };
@@ -310,8 +317,14 @@ async fn run_process_inner(
         exit_code: status.code(),
         timed_out,
         cancelled,
-        stdout,
-        stderr,
+        stdout: ProcessCapturedOutput {
+            bytes: stdout,
+            truncated: stdout_truncated,
+        },
+        stderr: ProcessCapturedOutput {
+            bytes: stderr,
+            truncated: stderr_truncated,
+        },
     })
 }
 
@@ -413,11 +426,12 @@ async fn read_limited(
     reader: Option<impl tokio::io::AsyncRead + Unpin>,
     max_bytes: usize,
     on_output: Arc<std::sync::Mutex<impl FnMut(ProcessOutputEvent)>>,
-) -> Result<Vec<u8>, std::io::Error> {
+) -> Result<(Vec<u8>, bool), std::io::Error> {
     let Some(mut reader) = reader else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let mut output = Vec::new();
+    let mut truncated = false;
     let mut buffer = [0_u8; 4096];
     let mut sequence = 0_u64;
     loop {
@@ -436,11 +450,15 @@ async fn read_limited(
         }
         let remaining = max_bytes.saturating_sub(output.len());
         if remaining == 0 {
+            truncated = true;
             continue;
+        }
+        if read > remaining {
+            truncated = true;
         }
         output.extend_from_slice(&buffer[..read.min(remaining)]);
     }
-    Ok(output)
+    Ok((output, truncated))
 }
 
 #[cfg(test)]
@@ -480,7 +498,9 @@ mod tests {
             })
             .await
             .expect("process returns output");
-        assert_eq!(result.stdout, b"abc");
-        assert_eq!(result.stderr, b"");
+        assert_eq!(result.stdout.bytes, b"abc");
+        assert!(result.stdout.truncated);
+        assert_eq!(result.stderr.bytes, b"");
+        assert!(!result.stderr.truncated);
     }
 }

@@ -6336,22 +6336,35 @@ fn project_tool_result_for_model_context(
         || "the session trace blob store".to_string(),
         |path| path.display().to_string(),
     );
-    let marker = format!(
-        "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Full output saved at: {path}. Use filesystem.read on that path if more context is needed.]\n\n",
+    let footer = format!(
+        "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Full retained output saved at: {path}. Use targeted inspection such as filesystem.grep, filesystem.read with offset/limit, or shell head/tail/sed on that path. Avoid reading the whole file unless necessary.]\n\n",
         result.len()
     );
     if max_context_chars == 0 {
-        return marker.trim().to_string();
+        return footer.trim().to_string();
     }
 
-    let marker_chars = marker.chars().count();
-    if marker_chars >= max_context_chars {
-        return marker.chars().take(max_context_chars).collect();
+    let omitted_chars = char_count.saturating_sub(max_context_chars);
+    let omission_marker =
+        format!("\n\n[... omitted {omitted_chars} chars from tool output ...]\n\n");
+    let fixed_chars = omission_marker.chars().count() + footer.chars().count();
+    if fixed_chars >= max_context_chars {
+        return footer.chars().take(max_context_chars).collect();
     }
-    let head_chars = max_context_chars.saturating_sub(marker_chars);
-    let mut output = result.chars().take(head_chars).collect::<String>();
-    output.push_str(&marker);
-    output
+
+    let budget = max_context_chars.saturating_sub(fixed_chars);
+    let head_chars = budget / 2;
+    let tail_chars = budget.saturating_sub(head_chars);
+    let head = result.chars().take(head_chars).collect::<String>();
+    let tail = result
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}{omission_marker}{tail}{footer}")
 }
 
 fn trace_blob_read_path(blob: &TraceBlobRef) -> PathBuf {
@@ -8775,7 +8788,7 @@ mod tests {
                 1,
                 SessionEventKind::ToolCallFinished {
                     tool_call_id: "call-1".to_string(),
-                    result: format!("{}tail", "x".repeat(4_000)),
+                    result: format!("{}middle{}", "x".repeat(2_000), "y".repeat(2_000)),
                     is_error: false,
                     output: None,
                 },
@@ -8791,7 +8804,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         assert!(text.contains("tool output truncated"));
-        assert!(!text.contains("tail"));
+        assert!(!text.contains("middle"));
         assert!(text.chars().count() < 1_200);
     }
 
@@ -9129,8 +9142,10 @@ mod tests {
         assert!(truncated.chars().count() <= 1_000);
         assert!(truncated.starts_with('a'));
         assert!(truncated.contains("tool output truncated"));
+        assert!(truncated.contains("targeted inspection"));
         assert!(truncated.contains("/tmp/full-output.txt"));
-        assert!(!truncated.ends_with('z'));
+        assert!(truncated.ends_with("necessary.]\n\n") || truncated.contains('z'));
+        assert!(truncated.contains('z'));
     }
 
     #[tokio::test]
