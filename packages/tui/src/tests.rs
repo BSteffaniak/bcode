@@ -1,6 +1,6 @@
 //! TUI tests.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
@@ -1782,6 +1782,68 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
     render::render(&mut app, &mut frame);
 
     assert_eq!(app.bottom_overscroll(), 4);
+}
+
+#[test]
+fn submitted_user_message_anchors_at_top() {
+    let session_id = SessionId::new();
+    let history = (0..12)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.replace_composer_with("new prompt");
+    app.stage_submission();
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+}
+
+#[test]
+fn cleared_submission_does_not_anchor() {
+    let session_id = SessionId::new();
+    let history = (0..12)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.replace_composer_with("/help");
+    app.stage_submission();
+    let slash = app.take_pending_submission();
+    app.clear_pending_submission(&slash);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_ne!(output_line_y(&buffer, "message 11"), Some(1));
 }
 
 #[test]

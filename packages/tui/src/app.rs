@@ -116,6 +116,7 @@ pub struct BmuxApp {
     viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
+    pending_user_message_anchor: bool,
     pending_assistant_stream_anchor: bool,
     older_history: OlderHistoryState,
     activity: ActivityState,
@@ -178,6 +179,7 @@ impl BmuxApp {
             viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
             transcript_scroll_animation: None,
+            pending_user_message_anchor: false,
             pending_assistant_stream_anchor: false,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
@@ -646,6 +648,7 @@ impl BmuxApp {
     /// Store the current composer text as a pending submission and clear input.
     pub fn stage_submission(&mut self) {
         let text = self.composer.buffer().text().to_owned();
+        self.pending_user_message_anchor = !text.trim().is_empty();
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
         self.composer.buffer_mut().clear();
@@ -660,6 +663,7 @@ impl BmuxApp {
     pub fn clear_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
+        self.pending_user_message_anchor = false;
     }
 
     /// Mark the oldest pending submission as queued by the server.
@@ -680,6 +684,7 @@ impl BmuxApp {
     pub fn restore_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
+        self.pending_user_message_anchor = false;
         self.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
     }
@@ -809,33 +814,57 @@ impl BmuxApp {
         );
     }
 
-    /// Resolve deferred live-stream top anchoring against the latest cached layout.
-    pub fn sync_transcript_stream_anchor(&mut self) {
-        if !self.pending_assistant_stream_anchor
-            || self.manual_transcript_scroll_active()
-            || self.transcript_scroll_animation.is_some()
-        {
+    /// Resolve deferred user-message and live-stream top anchoring against the latest cached layout.
+    pub fn sync_transcript_anchor_requests(&mut self) {
+        if self.manual_transcript_scroll_active() || self.transcript_scroll_animation.is_some() {
             return;
         }
-        if let Some(index) = self
-            .transcript
-            .iter()
-            .rposition(|item| item.role() == "Assistant" && item.streaming())
+        if self.pending_user_message_anchor {
+            if let Some(top_row) = self.latest_user_message_start_row() {
+                self.start_transcript_scroll_animation(top_row);
+                self.pending_user_message_anchor = false;
+            }
+            return;
+        }
+        if self.pending_assistant_stream_anchor
+            && let Some(index) = self
+                .transcript
+                .iter()
+                .rposition(|item| item.role() == "Assistant" && item.streaming())
             && let Some(top_row) = self
                 .transcript_layout
                 .entry_start_row(VisibleTranscriptSource::Transcript, index)
         {
-            if let Some((start_top_row, target_top_row)) =
-                self.viewport.start_follow_anchor_animation(top_row)
-            {
-                self.transcript_scroll_animation = Some(TranscriptScrollAnimation::new(
-                    start_top_row,
-                    target_top_row,
-                    Instant::now(),
-                ));
-            }
+            self.start_transcript_scroll_animation(top_row);
             self.pending_assistant_stream_anchor = false;
         }
+    }
+
+    fn start_transcript_scroll_animation(&mut self, top_row: usize) {
+        if let Some((start_top_row, target_top_row)) =
+            self.viewport.start_follow_anchor_animation(top_row)
+        {
+            self.transcript_scroll_animation = Some(TranscriptScrollAnimation::new(
+                start_top_row,
+                target_top_row,
+                Instant::now(),
+            ));
+        }
+    }
+
+    fn latest_user_message_start_row(&self) -> Option<usize> {
+        if !self.pending_submissions().is_empty() {
+            return self.transcript_layout.entry_start_row(
+                VisibleTranscriptSource::Pending,
+                self.pending_submissions().len().saturating_sub(1),
+            );
+        }
+        let index = self
+            .transcript
+            .iter()
+            .rposition(|item| item.role() == "You")?;
+        self.transcript_layout
+            .entry_start_row(VisibleTranscriptSource::Transcript, index)
     }
 
     /// Absorb replayed history events.
@@ -896,6 +925,7 @@ impl BmuxApp {
     fn absorb_session_event_without_history_record(&mut self, event: &SessionEvent) {
         let was_following = self.viewport.following()
             && self.transcript_scroll_animation.is_none()
+            && !self.pending_user_message_anchor
             && !self.pending_assistant_stream_anchor;
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();

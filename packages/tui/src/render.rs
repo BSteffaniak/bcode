@@ -72,7 +72,7 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
         app.transcript_layout().total_rows(),
         transcript_area.height,
     );
-    app.sync_transcript_stream_anchor();
+    app.sync_transcript_anchor_requests();
     render_body(app, body, frame);
 
     let status = Rect::new(
