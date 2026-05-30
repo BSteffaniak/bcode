@@ -1,8 +1,9 @@
 use bcode_session_models::{
     ProjectionSourceRange, ProjectionWindow, ProjectionWindowAnchor, ProjectionWindowDirection,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionProjectionKind,
-    TranscriptProjectionItem, TranscriptProjectionItemKind,
+    ToolInvocationStreamEvent, TranscriptProjectionItem, TranscriptProjectionItemKind,
 };
+use std::collections::BTreeMap;
 
 pub(crate) fn projection_window_from_index_entries(
     entries: &[crate::index::TranscriptProjectionIndexEntry],
@@ -165,6 +166,7 @@ struct TranscriptProjectionBuilder {
     width_columns: Option<u16>,
     assistant_stream: Option<PendingStream>,
     reasoning_stream: Option<PendingStream>,
+    tool_invocations: BTreeMap<String, PendingToolInvocation>,
 }
 
 impl TranscriptProjectionBuilder {
@@ -174,6 +176,7 @@ impl TranscriptProjectionBuilder {
             width_columns,
             assistant_stream: None,
             reasoning_stream: None,
+            tool_invocations: BTreeMap::new(),
         }
     }
 
@@ -191,6 +194,26 @@ impl TranscriptProjectionBuilder {
             SessionEventKind::AssistantReasoningMessage { text } => {
                 self.finish_stream(TranscriptProjectionItemKind::Reasoning, event, text);
             }
+            SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                arguments_json,
+                ..
+            } => {
+                self.flush_streams();
+                self.start_tool_invocation(tool_call_id, event.sequence, arguments_json.len());
+            }
+            SessionEventKind::ToolInvocationStream { event: stream } => {
+                self.flush_streams();
+                self.apply_tool_stream(event.sequence, stream);
+            }
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                ..
+            } => {
+                self.flush_streams();
+                self.finish_tool_invocation(tool_call_id, event.sequence, result.len());
+            }
             _ => {
                 self.flush_streams();
                 if let Some((kind, bytes)) = non_streaming_item(event) {
@@ -202,6 +225,7 @@ impl TranscriptProjectionBuilder {
 
     fn finish(mut self) -> Vec<TranscriptProjectionItem> {
         self.flush_streams();
+        self.flush_tool_invocations();
         self.items
     }
 
@@ -258,6 +282,71 @@ impl TranscriptProjectionBuilder {
         );
     }
 
+    fn start_tool_invocation(&mut self, tool_call_id: &str, sequence: u64, content_bytes: usize) {
+        self.tool_invocations.insert(
+            tool_call_id.to_owned(),
+            PendingToolInvocation {
+                start_sequence: sequence,
+                end_sequence: sequence,
+                content_bytes,
+                saw_stream_output: false,
+            },
+        );
+    }
+
+    fn apply_tool_stream(&mut self, sequence: u64, event: &ToolInvocationStreamEvent) {
+        let tool_call_id = tool_stream_tool_call_id(event);
+        let invocation = self
+            .tool_invocations
+            .entry(tool_call_id.to_owned())
+            .or_insert(PendingToolInvocation {
+                start_sequence: sequence,
+                end_sequence: sequence,
+                content_bytes: 0,
+                saw_stream_output: false,
+            });
+        invocation.end_sequence = sequence;
+        invocation.content_bytes = invocation
+            .content_bytes
+            .saturating_add(tool_stream_content_bytes(event));
+        if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
+            invocation.saw_stream_output = true;
+        }
+    }
+
+    fn finish_tool_invocation(&mut self, tool_call_id: &str, sequence: u64, result_bytes: usize) {
+        if let Some(mut invocation) = self.tool_invocations.remove(tool_call_id) {
+            invocation.end_sequence = sequence;
+            if !invocation.saw_stream_output {
+                invocation.content_bytes = invocation.content_bytes.saturating_add(result_bytes);
+            }
+            self.push_tool_invocation_item(invocation);
+            return;
+        }
+        self.push_item(
+            TranscriptProjectionItemKind::ToolInvocation,
+            sequence,
+            sequence,
+            result_bytes,
+        );
+    }
+
+    fn flush_tool_invocations(&mut self) {
+        let invocations = std::mem::take(&mut self.tool_invocations);
+        for invocation in invocations.into_values() {
+            self.push_tool_invocation_item(invocation);
+        }
+    }
+
+    fn push_tool_invocation_item(&mut self, invocation: PendingToolInvocation) {
+        self.push_item(
+            TranscriptProjectionItemKind::ToolInvocation,
+            invocation.start_sequence,
+            invocation.end_sequence,
+            invocation.content_bytes,
+        );
+    }
+
     fn push_item(
         &mut self,
         kind: TranscriptProjectionItemKind,
@@ -303,22 +392,19 @@ struct PendingStream {
     content_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingToolInvocation {
+    start_sequence: u64,
+    end_sequence: u64,
+    content_bytes: usize,
+    saw_stream_output: bool,
+}
+
 fn non_streaming_item(event: &SessionEvent) -> Option<(TranscriptProjectionItemKind, usize)> {
     match &event.kind {
         SessionEventKind::UserMessage { text, .. } | SessionEventKind::SystemMessage { text } => {
             Some((TranscriptProjectionItemKind::UserMessage, text.len()))
         }
-        SessionEventKind::ToolCallRequested { arguments_json, .. } => Some((
-            TranscriptProjectionItemKind::ToolInvocation,
-            arguments_json.len(),
-        )),
-        SessionEventKind::ToolCallFinished { result, .. } => {
-            Some((TranscriptProjectionItemKind::ToolInvocation, result.len()))
-        }
-        SessionEventKind::ToolInvocationStream { event } => Some((
-            TranscriptProjectionItemKind::ToolInvocation,
-            tool_stream_content_bytes(event),
-        )),
         SessionEventKind::PermissionRequested { arguments_json, .. } => Some((
             TranscriptProjectionItemKind::Permission,
             arguments_json.len(),
@@ -348,18 +434,21 @@ fn non_streaming_item(event: &SessionEvent) -> Option<(TranscriptProjectionItemK
     }
 }
 
-const fn tool_stream_content_bytes(
-    event: &bcode_session_models::ToolInvocationStreamEvent,
-) -> usize {
+fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
     match event {
-        bcode_session_models::ToolInvocationStreamEvent::Started { tool_name, .. } => {
-            tool_name.len()
-        }
-        bcode_session_models::ToolInvocationStreamEvent::OutputDelta { text, .. }
-        | bcode_session_models::ToolInvocationStreamEvent::Status { message: text, .. } => {
-            text.len()
-        }
-        bcode_session_models::ToolInvocationStreamEvent::Finished { .. } => 0,
+        ToolInvocationStreamEvent::Started { tool_call_id, .. }
+        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
+    }
+}
+
+const fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
+    match event {
+        ToolInvocationStreamEvent::Started { tool_name, .. } => tool_name.len(),
+        ToolInvocationStreamEvent::OutputDelta { text, .. }
+        | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
+        ToolInvocationStreamEvent::Finished { .. } => 0,
     }
 }
 
@@ -517,6 +606,101 @@ mod tests {
         assert_eq!(items[0].source_range.start_sequence, 1);
         assert_eq!(items[0].source_range.end_sequence, 2);
         assert_eq!(items[0].content_bytes, 5);
+    }
+
+    #[test]
+    fn streamed_tool_invocation_groups_source_range_and_avoids_final_double_count() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "tool".to_owned(),
+                    tool_name: "shell".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::Started {
+                        tool_call_id: "tool".to_owned(),
+                        tool_name: "shell".to_owned(),
+                        terminal: false,
+                        columns: None,
+                        rows: None,
+                        started_at_ms: None,
+                    },
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "tool".to_owned(),
+                        stream: ToolOutputStream::Stdout,
+                        sequence: 1,
+                        text: "output".to_owned(),
+                        byte_len: 6,
+                    },
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "tool".to_owned(),
+                    result: "final result".to_owned(),
+                    is_error: false,
+                    output: None,
+                },
+            ),
+        ];
+
+        let items = build_transcript_projection(&events, Some(80));
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, TranscriptProjectionItemKind::ToolInvocation);
+        assert_eq!(items[0].source_range.start_sequence, 1);
+        assert_eq!(items[0].source_range.end_sequence, 4);
+        assert_eq!(items[0].content_bytes, 13);
+    }
+
+    #[test]
+    fn non_streamed_tool_invocation_groups_request_and_result() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "tool".to_owned(),
+                    tool_name: "read".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "tool".to_owned(),
+                    result: "result".to_owned(),
+                    is_error: false,
+                    output: None,
+                },
+            ),
+        ];
+
+        let items = build_transcript_projection(&events, Some(80));
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, TranscriptProjectionItemKind::ToolInvocation);
+        assert_eq!(items[0].source_range.start_sequence, 1);
+        assert_eq!(items[0].source_range.end_sequence, 2);
+        assert_eq!(items[0].content_bytes, 8);
     }
 
     #[test]
