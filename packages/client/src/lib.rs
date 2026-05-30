@@ -14,8 +14,9 @@ use bcode_ipc::{
     decode, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
-    ClientId, RuntimeWorkId, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
+    ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
+    SessionEventKind, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
+    SessionSummary,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::BTreeMap;
@@ -1490,6 +1491,39 @@ impl ClientConnection {
     ) -> Result<AttachedSessionHistory, ClientError> {
         match self
             .send_request(Request::AttachSessionRecent { session_id, limit })
+            .await?
+        {
+            ResponsePayload::Attached {
+                history,
+                input_history,
+                import_warnings,
+                session,
+                ..
+            } => Ok(AttachedSessionHistory {
+                session,
+                history,
+                input_history,
+                import_warnings,
+            }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Attach to a session and return a projection-sized history window plus input-history entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn attach_session_projection_window_with_input_history(
+        &mut self,
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    ) -> Result<AttachedSessionHistory, ClientError> {
+        match self
+            .send_request(Request::AttachSessionProjectionWindow {
+                session_id,
+                request,
+            })
             .await?
         {
             ResponsePayload::Attached {

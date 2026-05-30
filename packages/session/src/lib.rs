@@ -1327,6 +1327,13 @@ pub struct SessionAttachment {
     pub events: broadcast::Receiver<SessionEvent>,
 }
 
+/// Active session attachment plus projection-window metadata.
+#[derive(Debug)]
+pub struct SessionProjectionWindowAttachment {
+    pub attachment: SessionAttachment,
+    pub projection_window: ProjectionWindow,
+}
+
 impl Default for SessionManager {
     fn default() -> Self {
         let (catalog_status_tx, catalog_status_rx) = watch::channel(CatalogLoadStatus::Loaded);
@@ -2091,6 +2098,89 @@ impl SessionManager {
             total_timer.elapsed_ms(),
         );
         result
+    }
+
+    /// Attach a client and return replayable history covering a projection window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// * the session does not exist
+    /// * required session event migration fails
+    /// * the projection request is not supported
+    /// * the client-attached event cannot be persisted
+    pub async fn attach_session_projection_window(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        request: ProjectionWindowRequest,
+    ) -> Result<SessionProjectionWindowAttachment, SessionError> {
+        let total_timer = self.metrics.timer();
+        let migrate_timer = self.metrics.timer();
+        self.migrate_session_to_current_if_required(session_id)
+            .await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_projection_window.migrate_if_required_duration_ms",
+            migrate_timer.elapsed_ms(),
+        );
+        let handle_timer = self.metrics.timer();
+        let handle = self.session_handle(session_id).await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_projection_window.handle_duration_ms",
+            handle_timer.elapsed_ms(),
+        );
+        let projection_timer = self.metrics.timer();
+        let projection_window = handle.projection_window(request).await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_projection_window.projection_query_duration_ms",
+            projection_timer.elapsed_ms(),
+        );
+        let history = if let Some(range) = projection_window.source_range {
+            handle
+                .history_page(SessionHistoryQuery {
+                    cursor: Some(SessionHistoryCursor {
+                        sequence: range.start_sequence,
+                    }),
+                    limit: usize::try_from(range.end_sequence - range.start_sequence + 1)
+                        .unwrap_or(usize::MAX),
+                    direction: SessionHistoryDirection::Forward,
+                })
+                .await?
+                .events
+        } else {
+            Vec::new()
+        };
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
+        let attach_timer = self.metrics.timer();
+        let mut attachment = handle
+            .attach(
+                client_id,
+                AttachMode::ProjectionWindow { history },
+                activity_timestamp_ms,
+            )
+            .await?;
+        self.metrics.record_histogram(
+            "session.manager.attach_projection_window.actor_attach_duration_ms",
+            attach_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.manager.attach_projection_window.history_event_count",
+            usize_to_u64(attachment.history.len()),
+        );
+        self.metrics.record_histogram(
+            "session.manager.attach_projection_window.input_history_entry_count",
+            usize_to_u64(attachment.input_history.len()),
+        );
+        self.metrics.record_histogram(
+            "session.manager.attach_projection_window.total_duration_ms",
+            total_timer.elapsed_ms(),
+        );
+        attachment.history.shrink_to_fit();
+        Ok(SessionProjectionWindowAttachment {
+            attachment,
+            projection_window,
+        })
     }
 
     /// Detach a client from a session if it is currently attached.

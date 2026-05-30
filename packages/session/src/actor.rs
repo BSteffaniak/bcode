@@ -204,10 +204,11 @@ impl SessionHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum AttachMode {
     Full,
     Recent { limit: usize },
+    ProjectionWindow { history: Vec<SessionEvent> },
 }
 
 enum SessionCommand {
@@ -493,6 +494,7 @@ impl SessionActor {
                 .await?
                 .events
             }
+            AttachMode::ProjectionWindow { history } => history,
         };
         if let Some(metrics) = &metrics {
             metrics.record_histogram(

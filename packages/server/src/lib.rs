@@ -1429,6 +1429,22 @@ async fn handle_request(
             )
             .await
         }
+        Request::AttachSessionProjectionWindow {
+            session_id,
+            request,
+        } => {
+            let session_id = session_import::resolve_attach_session_id(state, session_id).await;
+            handle_attach_session_projection_window(
+                request_id,
+                client_id,
+                state,
+                writer,
+                attached_session,
+                session_id,
+                request,
+            )
+            .await
+        }
         Request::ImportExternalSession {
             source_id,
             external_session_id,
@@ -2367,6 +2383,187 @@ async fn handle_attach_session_recent(
             Ok(())
         }
     }
+}
+
+async fn handle_attach_session_projection_window(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    attached_session: &mut Option<SessionId>,
+    session_id: SessionId,
+    request: bcode_session_models::ProjectionWindowRequest,
+) -> Result<(), ServerError> {
+    let total_started_at = Instant::now();
+    state
+        .metrics
+        .increment_counter("server.attach_projection_window.total");
+    let namespace_started_at = Instant::now();
+    let client_namespace = state.client_session_namespace(client_id).await;
+    if let Err(active_namespace) = state
+        .try_activate_session_namespace(session_id, client_namespace)
+        .await
+    {
+        state.metrics.record_histogram(
+            "server.attach_projection_window.namespace_activation_duration_ms",
+            elapsed_ms(namespace_started_at),
+        );
+        state.metrics.record_histogram(
+            "server.attach_projection_window.total_duration_ms",
+            elapsed_ms(total_started_at),
+        );
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
+    state.metrics.record_histogram(
+        "server.attach_projection_window.namespace_activation_duration_ms",
+        elapsed_ms(namespace_started_at),
+    );
+    let attach_started_at = Instant::now();
+    match state
+        .sessions
+        .attach_session_projection_window(session_id, client_id, request)
+        .await
+    {
+        Ok(window_attachment) => {
+            finish_attach_session_projection_window_success(
+                AttachProjectionWindowSuccessContext {
+                    request_id,
+                    writer,
+                    client_id,
+                    attached_session,
+                },
+                state,
+                session_id,
+                window_attachment,
+                AttachRecentTimings {
+                    total_started_at,
+                    attach_started_at,
+                },
+            )
+            .await
+        }
+        Err(error) => {
+            state.metrics.record_histogram(
+                "server.attach_projection_window.session_attach_duration_ms",
+                elapsed_ms(attach_started_at),
+            );
+            state
+                .metrics
+                .increment_counter("server.attach_projection_window.error_total");
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+            )
+            .await?;
+            state
+                .deactivate_session_namespace_if_inactive(session_id)
+                .await;
+            state.metrics.record_histogram(
+                "server.attach_projection_window.total_duration_ms",
+                elapsed_ms(total_started_at),
+            );
+            Ok(())
+        }
+    }
+}
+
+struct AttachProjectionWindowSuccessContext<'a> {
+    request_id: u64,
+    writer: &'a SharedWriter,
+    client_id: ClientId,
+    attached_session: &'a mut Option<SessionId>,
+}
+
+async fn finish_attach_session_projection_window_success(
+    context: AttachProjectionWindowSuccessContext<'_>,
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    window_attachment: bcode_session::SessionProjectionWindowAttachment,
+    timings: AttachRecentTimings,
+) -> Result<(), ServerError> {
+    let attachment = window_attachment.attachment;
+    state.metrics.record_histogram(
+        "server.attach_projection_window.session_attach_duration_ms",
+        elapsed_ms(timings.attach_started_at),
+    );
+    state.metrics.record_histogram(
+        "server.attach_projection_window.history_event_count",
+        usize_to_u64(attachment.history.len()),
+    );
+    state.metrics.record_histogram(
+        "server.attach_projection_window.input_history_entry_count",
+        usize_to_u64(attachment.input_history.len()),
+    );
+    state.metrics.record_histogram(
+        "server.attach_projection_window.projection_item_count",
+        usize_to_u64(window_attachment.projection_window.transcript_items.len()),
+    );
+    let restore_started_at = Instant::now();
+    restore_active_skills_from_history(&attachment.history, state, session_id).await;
+    state.metrics.record_histogram(
+        "server.attach_projection_window.restore_active_skills_duration_ms",
+        elapsed_ms(restore_started_at),
+    );
+    *context.attached_session = Some(session_id);
+    state
+        .attach_client_session(context.client_id, session_id)
+        .await;
+    let publish_started_at = Instant::now();
+    publish_session_event(state, &attachment.attached_event).await;
+    state.metrics.record_histogram(
+        "server.attach_projection_window.publish_attached_event_duration_ms",
+        elapsed_ms(publish_started_at),
+    );
+    let catalog_started_at = Instant::now();
+    state
+        .session_catalog
+        .upsert_native_session(attachment.session.clone())
+        .await;
+    state.metrics.record_histogram(
+        "server.attach_projection_window.catalog_upsert_duration_ms",
+        elapsed_ms(catalog_started_at),
+    );
+    let compact_started_at = Instant::now();
+    let compacted_history = compact_attach_history(attachment.history);
+    state.metrics.record_histogram(
+        "server.attach_projection_window.compact_history_duration_ms",
+        elapsed_ms(compact_started_at),
+    );
+    state.metrics.record_histogram(
+        "server.attach_projection_window.compacted_history_event_count",
+        usize_to_u64(compacted_history.len()),
+    );
+    let send_started_at = Instant::now();
+    send_response(
+        context.writer,
+        context.request_id,
+        Response::Ok(ResponsePayload::Attached {
+            session_id,
+            session: attachment.session,
+            history: compacted_history,
+            input_history: attachment.input_history,
+            import_warnings: Vec::new(),
+        }),
+    )
+    .await?;
+    state.metrics.record_histogram(
+        "server.attach_projection_window.response_send_duration_ms",
+        elapsed_ms(send_started_at),
+    );
+    state.metrics.record_histogram(
+        "server.attach_projection_window.total_duration_ms",
+        elapsed_ms(timings.total_started_at),
+    );
+    let handle = forward_session_events(
+        ClientEventSink::new(context.client_id, context.writer.clone()),
+        attachment.events,
+    );
+    state
+        .register_client_forwarder(context.client_id, handle)
+        .await;
+    Ok(())
 }
 
 struct AttachRecentTimings {

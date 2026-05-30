@@ -7,8 +7,9 @@
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 use bcode_session_models::{
-    ClientId, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
+    ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
+    SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
+    SessionSummary,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -252,6 +253,10 @@ pub enum Request {
         session_id: SessionId,
     },
     SubscribeCatalogUpdates,
+    AttachSessionProjectionWindow {
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    },
 }
 
 /// Server stop request policy.
