@@ -889,6 +889,67 @@ fn history_rebuild_does_not_duplicate_initial_history() {
 }
 
 #[test]
+fn live_event_overlapping_initial_history_is_ignored() {
+    let session_id = SessionId::new();
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "question".to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "answer".to_owned(),
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+    app.absorb_session_event(&history[1]);
+
+    let assistant_items = app
+        .transcript()
+        .iter()
+        .filter(|item| item.role() == "Assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_items.len(), 1);
+    assert_eq!(assistant_items[0].text(), "answer");
+}
+
+#[test]
+fn newer_live_event_after_initial_history_is_absorbed() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "question".to_owned(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::AssistantMessage {
+            text: "answer".to_owned(),
+        },
+    ));
+
+    assert!(
+        app.transcript()
+            .iter()
+            .any(|item| item.role() == "Assistant" && item.text() == "answer")
+    );
+}
+
+#[test]
 fn prepended_history_coalesces_assistant_deltas() {
     let session_id = SessionId::new();
     let newer = [event(

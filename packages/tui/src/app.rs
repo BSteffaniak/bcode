@@ -107,6 +107,7 @@ pub struct BmuxApp {
     input_history: InputHistory,
     transcript: Vec<TranscriptItem>,
     transcript_history: Vec<SessionEvent>,
+    latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
     runtime_work: RuntimeWorkViewState,
@@ -177,12 +178,13 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: Vec::new(),
+            transcript_history: Vec::new(),
+            latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
             runtime_work: RuntimeWorkViewState::default(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
-            transcript_history: Vec::new(),
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
@@ -883,6 +885,7 @@ impl BmuxApp {
 
     /// Absorb replayed history events.
     pub fn absorb_history(&mut self, events: &[SessionEvent]) {
+        self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_history.extend_from_slice(events);
         for event in events {
             self.absorb_session_event_without_history_record(event);
@@ -912,6 +915,9 @@ impl BmuxApp {
         self.input_history.prepend_committed(input_messages);
 
         self.transcript_history.splice(0..0, events.iter().cloned());
+        if self.latest_history_sequence.is_none() {
+            self.latest_history_sequence = events.last().map(|event| event.sequence);
+        }
         let mut older =
             transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
         merge_transcript_boundary(&mut older, &mut self.transcript);
@@ -929,6 +935,13 @@ impl BmuxApp {
     /// Absorb one live session event.
     #[allow(clippy::too_many_lines)]
     pub fn absorb_session_event(&mut self, event: &SessionEvent) {
+        if event_affects_transcript_rows(event)
+            && self
+                .latest_history_sequence
+                .is_some_and(|sequence| event.sequence <= sequence)
+        {
+            return;
+        }
         if event_affects_transcript_rows(event) {
             self.transcript_history.push(event.clone());
         }
