@@ -3199,9 +3199,9 @@ mod tests {
         ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
         ProjectionWindowTarget, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkKind,
         RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
-        SessionHistoryDirection, SessionHistoryQuery, SessionProjectionKind, SessionTraceEvent,
-        SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream,
-        TraceBlobRef,
+        SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionProjectionKind,
+        SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
+        ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -4761,6 +4761,60 @@ mod tests {
             restored_sessions[0].name.as_deref(),
             Some("Fix session selection UX")
         );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn legacy_unnamed_session_index_derives_title_from_first_prompt() {
+        let root = unique_temp_dir();
+        let session_id = SessionId::new();
+        let store = super::SessionEventStore::new(&root);
+        std::fs::create_dir_all(&root).expect("session root should create");
+        let event_path = root.join(format!("{session_id}.events"));
+        let events = [
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::SessionCreated {
+                    name: None,
+                    working_directory: test_working_directory(),
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ClientAttached {
+                    client_id: ClientId::new(),
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "# Recover old title\n\nbody".to_string(),
+                },
+            },
+        ];
+        let mut file = std::fs::File::create(&event_path).expect("event file should create");
+        for event in events {
+            super::write_event_frame(&mut file, &event).expect("event should write");
+        }
+
+        store
+            .doctor_session_with_fix(session_id, true)
+            .expect("doctor should rebuild")
+            .expect("session should exist");
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let sessions = restored.list_sessions(&test_working_directory()).await;
+        assert_eq!(sessions[0].name.as_deref(), Some("Recover old title"));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

@@ -124,6 +124,8 @@ pub struct SessionIndexHealth {
 #[derive(Default)]
 struct SessionIndexBuilder {
     name: Option<String>,
+    suppress_derived_name: bool,
+    first_user_message: Option<String>,
     working_directory: Option<PathBuf>,
     next_sequence: u64,
     has_user_message: bool,
@@ -154,8 +156,14 @@ impl SessionIndexBuilder {
             }
             SessionEventKind::SessionRenamed { name } => {
                 self.name.clone_from(name);
+                self.suppress_derived_name = name.is_none();
             }
-            SessionEventKind::UserMessage { .. } => self.has_user_message = true,
+            SessionEventKind::UserMessage { text, .. } => {
+                self.has_user_message = true;
+                if self.first_user_message.is_none() {
+                    self.first_user_message = Some(text.clone());
+                }
+            }
             SessionEventKind::ModelChanged { provider, model } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
@@ -228,6 +236,16 @@ impl SessionIndex {
         let created_at_ms = file.created_at_ms();
         let updated_at_ms = file.modified_at_ms();
         let working_directory = builder.working_directory?;
+        let name = builder.name.or_else(|| {
+            (!builder.suppress_derived_name)
+                .then(|| {
+                    builder
+                        .first_user_message
+                        .as_deref()
+                        .map(crate::title_from_first_prompt)
+                })
+                .flatten()
+        });
 
         Some(Self {
             index_version: SESSION_INDEX_VERSION,
@@ -235,7 +253,7 @@ impl SessionIndex {
             file,
             summary: SessionSummary {
                 id: session_id,
-                name: builder.name,
+                name,
                 client_count: 0,
                 created_at_ms,
                 updated_at_ms,
