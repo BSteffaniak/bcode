@@ -142,6 +142,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub session_import: SessionImportConfig,
     #[serde(default)]
+    pub daemon: DaemonConfig,
+    #[serde(default)]
     pub worktree: WorktreeConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
@@ -161,6 +163,7 @@ impl Default for BcodeConfig {
             skills: SkillsConfig::default(),
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
+            daemon: DaemonConfig::default(),
             worktree: WorktreeConfig::default(),
             tools: ToolsConfig::default(),
             web_search: empty_toml_table(),
@@ -850,6 +853,30 @@ impl Default for SessionImportConfig {
             opencode: OpenCodeSessionImportConfig::default(),
         }
     }
+}
+
+/// Daemon lifecycle configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Shut down background daemon processes after they have been idle.
+    #[serde(default = "default_true")]
+    pub idle_shutdown: bool,
+    /// Idle grace period in seconds before a background daemon exits.
+    #[serde(default = "default_daemon_idle_shutdown_after_secs")]
+    pub idle_shutdown_after_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_shutdown: true,
+            idle_shutdown_after_secs: default_daemon_idle_shutdown_after_secs(),
+        }
+    }
+}
+
+const fn default_daemon_idle_shutdown_after_secs() -> u64 {
+    15 * 60
 }
 
 /// Pi session import configuration.

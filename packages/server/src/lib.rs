@@ -138,6 +138,7 @@ pub struct ServerState {
     client_forwarders: Mutex<BTreeMap<ClientId, Vec<JoinHandle<()>>>>,
     event_clients: Mutex<BTreeMap<ClientId, CatalogEventSubscription>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
+    idle_shutdown_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
@@ -538,6 +539,7 @@ impl ServerState {
             client_forwarders: Mutex::default(),
             event_clients: Mutex::default(),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
+            idle_shutdown_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
             metrics: init.metrics,
@@ -812,6 +814,44 @@ impl ServerState {
                 }
                 let revision = *revisions.borrow_and_update();
                 broadcast_catalog_update(&state, revision).await;
+            }
+        });
+    }
+
+    fn start_idle_shutdown_watcher(self: &Arc<Self>, idle_after: Duration) {
+        if idle_after.is_zero()
+            || self
+                .idle_shutdown_started
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut idle_since: Option<Instant> = None;
+            let check_interval = idle_after.min(Duration::from_secs(30));
+            let mut shutdown = state.subscribe_shutdown();
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(check_interval) => {}
+                    _ = shutdown.recv() => break,
+                }
+                if let Some(blocker) = state.idle_shutdown_blocker().await {
+                    if idle_since.take().is_some() {
+                        tracing::debug!(target: "bcode_server::idle_shutdown", blocker, "daemon no longer idle; idle shutdown timer reset");
+                    }
+                    continue;
+                }
+                let now = Instant::now();
+                let since = idle_since.get_or_insert_with(|| {
+                    tracing::info!(target: "bcode_server::idle_shutdown", idle_after_secs = idle_after.as_secs(), "daemon idle; idle shutdown timer started");
+                    now
+                });
+                if now.duration_since(*since) >= idle_after {
+                    tracing::info!(target: "bcode_server::idle_shutdown", idle_after_secs = idle_after.as_secs(), "daemon idle timeout reached; shutting down");
+                    state.request_shutdown();
+                    break;
+                }
             }
         });
     }
@@ -1189,6 +1229,11 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         },
     ));
     state.start_catalog_event_forwarder();
+    if config.daemon.idle_shutdown {
+        state.start_idle_shutdown_watcher(Duration::from_secs(
+            config.daemon.idle_shutdown_after_secs,
+        ));
+    }
     recover_abandoned_runtime_work(&state).await?;
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
