@@ -813,11 +813,12 @@ impl SessionActor {
             .as_ref()
             .ok_or(SessionError::UnsupportedProjectionWindow)?;
         let index = store.ensure_fresh_index(self.state.summary.id).await?;
-        if index.transcript_projection.is_empty() {
+        let transcript_index = store.ensure_transcript_index(self.state.summary.id).await?;
+        if transcript_index.spans.is_empty() {
             return Err(SessionError::UnsupportedProjectionWindow);
         }
         crate::projection::projection_window_from_index_entries(
-            &index.transcript_projection,
+            &transcript_index.spans,
             Some(0),
             index.next_sequence.checked_sub(1),
             &request,

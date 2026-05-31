@@ -128,6 +128,30 @@ impl SessionStoreExecutor {
         .await?
     }
 
+    pub async fn ensure_transcript_index(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::derived::TranscriptIndex, SessionStoreError> {
+        let queued_at = Instant::now();
+        let store = self.store.clone();
+        spawn_blocking(move || {
+            store.metrics.record_histogram(
+                "session.store.ensure_transcript_index.blocking_queue_wait_duration_ms",
+                elapsed_ms(queued_at),
+            );
+            let timer = store.metrics.timer();
+            let event_path = store.event_path(session_id);
+            let result =
+                crate::derived::ensure_transcript_index(&store.root, session_id, &event_path);
+            store.metrics.record_histogram(
+                "session.store.ensure_transcript_index.duration_ms",
+                timer.elapsed_ms(),
+            );
+            result
+        })
+        .await?
+    }
+
     pub async fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let store = self.store.clone();
         spawn_blocking(move || store.delete(session_id)).await?

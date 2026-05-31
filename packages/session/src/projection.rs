@@ -18,7 +18,7 @@ pub(crate) fn projection_window_from_index_entries(
         return None;
     }
 
-    let items = entries
+    let mut spans = entries
         .iter()
         .map(|entry| TranscriptProjectionItem {
             kind: entry.kind,
@@ -27,7 +27,13 @@ pub(crate) fn projection_window_from_index_entries(
             content_bytes: entry.content_bytes,
         })
         .collect::<Vec<_>>();
-    let selected_items = select_latest_items(&items, request);
+    spans.sort_by_key(|item| {
+        (
+            item.source_range.start_sequence,
+            item.source_range.end_sequence,
+        )
+    });
+    let selected_items = select_latest_items(&spans, request);
     let source_range = source_range_for_items(&selected_items);
     let scanned_events = source_range.map_or(0, |range| {
         usize::try_from(range.end_sequence - range.start_sequence + 1).unwrap_or(usize::MAX)
@@ -226,6 +232,12 @@ impl TranscriptProjectionBuilder {
     fn finish(mut self) -> Vec<TranscriptProjectionItem> {
         self.flush_streams();
         self.flush_tool_invocations();
+        self.items.sort_by_key(|item| {
+            (
+                item.source_range.start_sequence,
+                item.source_range.end_sequence,
+            )
+        });
         self.items
     }
 
@@ -332,8 +344,11 @@ impl TranscriptProjectionBuilder {
     }
 
     fn flush_tool_invocations(&mut self) {
-        let invocations = std::mem::take(&mut self.tool_invocations);
-        for invocation in invocations.into_values() {
+        let mut invocations = std::mem::take(&mut self.tool_invocations)
+            .into_values()
+            .collect::<Vec<_>>();
+        invocations.sort_by_key(|invocation| (invocation.start_sequence, invocation.end_sequence));
+        for invocation in invocations {
             self.push_tool_invocation_item(invocation);
         }
     }
@@ -505,6 +520,45 @@ mod tests {
         assert_eq!(window.source_range.expect("source range").start_sequence, 2);
         assert!(window.has_older);
         assert!(!window.has_newer);
+    }
+
+    #[test]
+    fn latest_projection_window_from_index_entries_sorts_legacy_unsorted_entries() {
+        let entries = vec![
+            index_entry(10, TranscriptProjectionItemKind::ToolInvocation, 5),
+            index_entry(2, TranscriptProjectionItemKind::UserMessage, 5),
+            index_entry(20, TranscriptProjectionItemKind::AssistantMessage, 5),
+        ];
+
+        let window = projection_window_from_index_entries(
+            &entries,
+            Some(2),
+            Some(20),
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(2),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 8,
+                    max_events_scanned: 64,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("index-backed latest transcript windows are supported");
+
+        assert_eq!(window.transcript_items.len(), 2);
+        assert_eq!(
+            window.source_range.expect("source range").start_sequence,
+            10
+        );
+        assert_eq!(window.source_range.expect("source range").end_sequence, 20);
     }
 
     #[test]
@@ -1033,6 +1087,46 @@ mod tests {
         assert_eq!(window.scanned_events, 1);
         assert_eq!(window.transcript_items.len(), 1);
         assert!(window.has_older);
+    }
+
+    #[test]
+    fn transcript_projection_sorts_unfinished_tool_invocations_by_source_sequence() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "z".to_owned(),
+                    tool_name: "late".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "a".to_owned(),
+                    tool_name: "early".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::AssistantMessage {
+                    text: "done".to_owned(),
+                },
+            ),
+        ];
+
+        let items = build_transcript_projection(&events, None);
+        let ranges = items
+            .iter()
+            .map(|item| item.source_range.start_sequence)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ranges, vec![1, 2, 3]);
     }
 
     fn index_entry(

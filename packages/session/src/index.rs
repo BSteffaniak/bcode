@@ -274,7 +274,7 @@ impl SessionIndex {
             total_metered_tokens: builder.total_metered_tokens,
             min_event_schema_version: report.min_schema_version,
             max_event_schema_version: report.max_schema_version,
-            transcript_projection: transcript_projection_from_events(&report.events),
+            transcript_projection: Vec::new(),
             issues: report.issues.iter().map(SessionIndexIssue::from).collect(),
         })
     }
@@ -317,15 +317,6 @@ impl TranscriptProjectionIndexEntry {
             content_bytes: item.content_bytes,
         }
     }
-}
-
-fn transcript_projection_from_events(
-    events: &[SessionEvent],
-) -> Vec<TranscriptProjectionIndexEntry> {
-    crate::projection::build_transcript_projection(events, None)
-        .iter()
-        .map(TranscriptProjectionIndexEntry::from_item)
-        .collect()
 }
 
 impl From<&SessionReadIssue> for SessionIndexIssue {
@@ -523,10 +514,14 @@ pub fn rebuild_index(
 ) -> Result<(Option<SessionIndex>, Vec<SessionEvent>), SessionStoreError> {
     let report = crate::reader::read_events(event_path)?;
     let file = fingerprint(event_path)?;
-    let index = SessionIndex::from_report(session_id, file, &report);
+    let index = SessionIndex::from_report(session_id, file.clone(), &report);
     if let Some(index) = &index {
         write_index(root, index)?;
         write_entries(root, session_id, &report.entries)?;
+        crate::derived::write_transcript_index(
+            root,
+            &crate::derived::TranscriptIndex::from_events(session_id, file, &report.events),
+        )?;
     }
     Ok((index, report.events))
 }

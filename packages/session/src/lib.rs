@@ -9,6 +9,7 @@
 //! Session lifecycle, attachment management, and append-only event history.
 
 mod actor;
+pub(crate) mod derived;
 pub(crate) mod event_migration;
 pub(crate) mod index;
 pub mod migration;
@@ -796,24 +797,13 @@ impl SessionEventStore {
             total_metered_tokens: metadata.total_metered_tokens,
             min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            transcript_projection: existing_index.as_ref().map_or_else(
-                || {
-                    self.rebuild_transcript_projection_for_index(metadata.summary.id)
-                        .unwrap_or_default()
-                },
-                |existing_index| {
-                    if metadata.event_count == existing_index.event_count {
-                        existing_index.transcript_projection.clone()
-                    } else {
-                        self.rebuild_transcript_projection_for_index(metadata.summary.id)
-                            .unwrap_or_default()
-                    }
-                },
-            ),
+            transcript_projection: Vec::new(),
             issues: metadata.index_issues.clone(),
         };
         let timer = self.metrics.timer();
-        let result = index::write_index(&self.root, &index);
+        let result = index::write_index(&self.root, &index).and_then(|()| {
+            derived::rebuild_transcript_index(&self.root, metadata.summary.id, &path).map(|_| ())
+        });
         self.metrics.record_histogram(
             "session.metadata_index.write_duration_ms",
             timer.elapsed_ms(),
@@ -823,32 +813,6 @@ impl SessionEventStore {
                 .increment_counter("session.metadata_index.write_error_total");
         }
         result
-    }
-
-    fn rebuild_transcript_projection_for_index(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<index::TranscriptProjectionIndexEntry>, SessionStoreError> {
-        let event_path = self.event_path(session_id);
-        let events = self.read_session_events(session_id)?;
-        let items = projection::build_transcript_projection(&events, None);
-        let entries = items
-            .iter()
-            .map(index::TranscriptProjectionIndexEntry::from_item)
-            .collect::<Vec<_>>();
-        self.metrics.record_histogram(
-            "session.metadata_index.transcript_projection_rebuild_event_count",
-            usize_to_u64(events.len()),
-        );
-        self.metrics.record_histogram(
-            "session.metadata_index.transcript_projection_rebuild_item_count",
-            usize_to_u64(entries.len()),
-        );
-        self.metrics.record_histogram(
-            "session.metadata_index.transcript_projection_rebuild_event_file_bytes",
-            fs::metadata(event_path).map_or(0, |metadata| metadata.len()),
-        );
-        Ok(entries)
     }
 
     /// Repair a session log by backing up and truncating an unreadable tail.
@@ -3250,7 +3214,7 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionAccessStatus, SessionManager, access_status_from_report, reader};
+    use super::{SessionAccessStatus, SessionManager, access_status_from_report, derived, reader};
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowAnchor,
         ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
@@ -4355,22 +4319,25 @@ mod tests {
             .reindex_session(session.id)
             .expect("session should reindex");
         let rebuilt =
-            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
-                .expect("index should load")
-                .expect("index should exist");
-        assert!(!rebuilt.transcript_projection.is_empty());
+            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
+                .expect("transcript index should load");
+        assert!(!rebuilt.spans.is_empty());
 
         manager
             .append_user_message(session.id, ClientId::new(), "second".to_owned())
             .await
             .expect("message should append");
         let after_append =
+            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
+                .expect("transcript index should load");
+        let metadata =
             super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
-                .expect("index should load")
-                .expect("index should exist");
+                .expect("metadata index should load")
+                .expect("metadata index should exist");
 
-        assert_eq!(after_append.transcript_projection.len(), 2);
+        assert_eq!(after_append.spans.len(), 2);
         assert_eq!(after_append.event_count, rebuilt.event_count + 1);
+        assert!(metadata.transcript_projection.is_empty());
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -4527,25 +4494,26 @@ mod tests {
         store
             .reindex_session(session.id)
             .expect("session should reindex");
-        let index =
+        let metadata =
             super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
-                .expect("index should load")
-                .expect("index should exist");
+                .expect("metadata index should load")
+                .expect("metadata index should exist");
+        let transcript_index =
+            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
+                .expect("transcript index should load");
 
-        assert_eq!(index.transcript_projection.len(), 2);
+        assert!(metadata.transcript_projection.is_empty());
+        assert_eq!(transcript_index.spans.len(), 2);
         assert_eq!(
-            index.transcript_projection[0].kind,
+            transcript_index.spans[0].kind,
             bcode_session_models::TranscriptProjectionItemKind::UserMessage
         );
         assert_eq!(
-            index.transcript_projection[1].kind,
+            transcript_index.spans[1].kind,
             bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
         );
-        assert_eq!(
-            index.transcript_projection[1].source_range.start_sequence,
-            2
-        );
-        assert_eq!(index.transcript_projection[1].source_range.end_sequence, 3);
+        assert_eq!(transcript_index.spans[1].source_range.start_sequence, 2);
+        assert_eq!(transcript_index.spans[1].source_range.end_sequence, 3);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
