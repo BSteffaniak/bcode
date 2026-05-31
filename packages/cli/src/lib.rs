@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::TcpListener;
@@ -145,7 +146,9 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             SessionCommand::Repair {
                 session_id,
                 from_backup,
-            } => session_repair(session_id, from_backup)?,
+                from_migration_backups,
+                dry_run,
+            } => session_repair(session_id, from_backup, from_migration_backups, dry_run)?,
         },
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
@@ -543,9 +546,13 @@ enum SessionCommand {
         session_id: Option<SessionId>,
     },
     Repair {
-        session_id: SessionId,
+        session_id: Option<SessionId>,
         #[arg(long)]
         from_backup: Option<PathBuf>,
+        #[arg(long)]
+        from_migration_backups: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -4167,9 +4174,34 @@ fn session_reindex(session_id: Option<SessionId>) -> Result<(), CliError> {
     Ok(())
 }
 
-fn session_repair(session_id: SessionId, from_backup: Option<PathBuf>) -> Result<(), CliError> {
+fn session_repair(
+    session_id: Option<SessionId>,
+    from_backup: Option<PathBuf>,
+    from_migration_backups: bool,
+    dry_run: bool,
+) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    if from_migration_backups {
+        if session_id.is_some() || from_backup.is_some() {
+            return Err(CliError::LoginProfile(
+                "--from-migration-backups cannot be combined with a session id or --from-backup"
+                    .to_string(),
+            ));
+        }
+        return session_repair_from_migration_backups(&store, dry_run);
+    }
+
+    let Some(session_id) = session_id else {
+        return Err(CliError::LoginProfile(
+            "session repair requires a session id unless --from-migration-backups is used"
+                .to_string(),
+        ));
+    };
     if let Some(backup_path) = from_backup {
+        if dry_run {
+            println!("would restore {session_id} from {}", backup_path.display());
+            return Ok(());
+        }
         let previous = store.restore_session_from_backup(session_id, &backup_path)?;
         println!(
             "restored {session_id} from {}; previous canonical log backed up at {}",
@@ -4186,6 +4218,189 @@ fn session_repair(session_id: SessionId, from_backup: Option<PathBuf>) -> Result
         None => println!("{session_id} has no unreadable tail; index rebuilt"),
     }
     Ok(())
+}
+
+fn session_repair_from_migration_backups(
+    store: &bcode_session::SessionEventStore,
+    dry_run: bool,
+) -> Result<(), CliError> {
+    let candidates = migration_backup_candidates(store)?;
+    let mut restored = 0usize;
+    let mut planned = 0usize;
+    let mut skipped = 0usize;
+    if candidates.is_empty() {
+        println!("no migration backups found");
+        return Ok(());
+    }
+    for candidate in candidates.into_values() {
+        match evaluate_migration_backup_candidate(store, &candidate)? {
+            MigrationBackupDecision::Restore { reason } => {
+                if dry_run {
+                    planned = planned.saturating_add(1);
+                    println!(
+                        "would restore {} from {}: {reason}",
+                        candidate.session_id,
+                        candidate.backup_path.display()
+                    );
+                } else {
+                    let previous = store.restore_session_from_backup(
+                        candidate.session_id,
+                        &candidate.backup_path,
+                    )?;
+                    restored = restored.saturating_add(1);
+                    println!(
+                        "restored {} from {}; previous canonical log backed up at {} ({reason})",
+                        candidate.session_id,
+                        candidate.backup_path.display(),
+                        previous.display()
+                    );
+                }
+            }
+            MigrationBackupDecision::Skip { reason } => {
+                skipped = skipped.saturating_add(1);
+                println!("skipped {}: {reason}", candidate.session_id);
+            }
+        }
+    }
+    if dry_run {
+        println!("migration backup repair dry-run: {planned} would restore, {skipped} skipped");
+    } else {
+        println!("migration backup repair: {restored} restored, {skipped} skipped");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MigrationBackupManifestCli {
+    created_at_ms: u64,
+    domain: String,
+    files: Vec<MigrationBackupFileCli>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MigrationBackupFileCli {
+    session_id: SessionId,
+    backup: String,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationBackupCandidate {
+    session_id: SessionId,
+    created_at_ms: u64,
+    backup_path: PathBuf,
+}
+
+enum MigrationBackupDecision {
+    Restore { reason: String },
+    Skip { reason: String },
+}
+
+fn migration_backup_candidates(
+    store: &bcode_session::SessionEventStore,
+) -> Result<BTreeMap<SessionId, MigrationBackupCandidate>, CliError> {
+    let backup_root = default_session_store_dir().join("backups");
+    let mut candidates = BTreeMap::new();
+    collect_migration_backup_candidates(store, &backup_root, &mut candidates)?;
+    Ok(candidates)
+}
+
+fn collect_migration_backup_candidates(
+    store: &bcode_session::SessionEventStore,
+    dir: &Path,
+    candidates: &mut BTreeMap<SessionId, MigrationBackupCandidate>,
+) -> Result<(), CliError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_migration_backup_candidates(store, &path, candidates)?;
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) != Some("manifest.json") {
+            continue;
+        }
+        let manifest: MigrationBackupManifestCli = serde_json::from_slice(&std::fs::read(&path)?)?;
+        if manifest.domain != "sessions/events" {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        for file in manifest.files {
+            let backup_path = parent.join(&file.backup);
+            if !backup_path.exists() || !store.event_path(file.session_id).exists() {
+                continue;
+            }
+            let candidate = MigrationBackupCandidate {
+                session_id: file.session_id,
+                created_at_ms: manifest.created_at_ms,
+                backup_path,
+            };
+            candidates
+                .entry(file.session_id)
+                .and_modify(|existing| {
+                    if candidate.created_at_ms > existing.created_at_ms {
+                        *existing = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_migration_backup_candidate(
+    store: &bcode_session::SessionEventStore,
+    candidate: &MigrationBackupCandidate,
+) -> Result<MigrationBackupDecision, CliError> {
+    let current_path = store.event_path(candidate.session_id);
+    let current = std::fs::metadata(&current_path)?;
+    let backup = std::fs::metadata(&candidate.backup_path)?;
+    if backup.len() <= current.len() {
+        return Ok(MigrationBackupDecision::Skip {
+            reason: format!(
+                "current log is not smaller than backup (current={} bytes, backup={} bytes)",
+                current.len(),
+                backup.len()
+            ),
+        });
+    }
+    let lost_bytes = backup.len().saturating_sub(current.len());
+    let significant_loss = lost_bytes >= 64 * 1024
+        || backup
+            .len()
+            .checked_div(10)
+            .is_some_and(|threshold| lost_bytes >= threshold);
+    if !significant_loss {
+        return Ok(MigrationBackupDecision::Skip {
+            reason: format!("size difference is too small ({lost_bytes} bytes)"),
+        });
+    }
+    if current_modified_after_backup(&current, candidate.created_at_ms) {
+        return Ok(MigrationBackupDecision::Skip {
+            reason:
+                "current log was modified after the migration backup; restore manually if needed"
+                    .to_string(),
+        });
+    }
+    Ok(MigrationBackupDecision::Restore {
+        reason: format!("backup is {lost_bytes} bytes larger than current log"),
+    })
+}
+
+fn current_modified_after_backup(metadata: &std::fs::Metadata, backup_created_at_ms: u64) -> bool {
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+        return true;
+    };
+    let modified_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    modified_ms > backup_created_at_ms.saturating_add(1_000)
 }
 
 fn default_session_store_dir() -> PathBuf {

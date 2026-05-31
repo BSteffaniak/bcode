@@ -684,9 +684,13 @@ impl SessionActor {
         self.state.summary.client_count = self.state.clients.len();
         self.refresh_snapshot();
         let events = self.state.sender.subscribe();
-        let attached_event = self
-            .state
-            .build_next_event(SessionEventKind::ClientAttached { client_id })?;
+        let attached_event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: self.state.next_sequence,
+            session_id: self.state.summary.id,
+            provenance: None,
+            kind: SessionEventKind::ClientAttached { client_id },
+        };
         Ok(SessionAttachment {
             session: self.state.summary(),
             history,

@@ -1359,7 +1359,8 @@ impl SessionEventStore {
         }
     }
 
-    pub(crate) fn event_path(&self, session_id: SessionId) -> PathBuf {
+    #[must_use]
+    pub fn event_path(&self, session_id: SessionId) -> PathBuf {
         self.root.join(format!("{session_id}.events"))
     }
 
@@ -1550,7 +1551,6 @@ impl SessionManager {
         metrics: MetricsRegistry,
     ) -> Result<Self, SessionStoreError> {
         let store = SessionEventStore::with_metrics(root, metrics);
-        store.migrate_all_event_logs_to_current()?;
         let sessions = store.load_sessions()?;
         Ok(Self::from_store(store, sessions, true))
     }
@@ -4129,7 +4129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_session_recent_lazy_migrates_old_schema_sessions() {
+    async fn attach_session_recent_reads_old_schema_sessions_without_migrating() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("session dir should create");
         let session_id = bcode_session_models::SessionId::new();
@@ -4154,24 +4154,24 @@ mod tests {
                 .session_access_status(session_id)
                 .await
                 .expect("status should load"),
-            super::SessionAccessStatus::ReadWrite
+            super::SessionAccessStatus::ReadOnlyMigrationRequired
         );
         let attachment = manager
             .attach_session_recent(session_id, ClientId::new(), 10)
             .await
-            .expect("old session should migrate lazily on attach");
+            .expect("old session should attach read-only");
         assert!(
             attachment
                 .history
                 .iter()
-                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION)
+                .any(|event| { event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1 })
         );
         assert_eq!(
             manager
                 .session_access_status(session_id)
                 .await
-                .expect("status should update"),
-            super::SessionAccessStatus::ReadWrite
+                .expect("status should remain read-only"),
+            super::SessionAccessStatus::ReadOnlyMigrationRequired
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
