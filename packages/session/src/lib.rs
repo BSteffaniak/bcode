@@ -204,12 +204,29 @@ impl SessionEventStore {
                 continue;
             }
             let session_id = parse_session_file_name(&path)?;
-            if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
-                sessions.insert(session_id, index.into_state());
+            if let Some(state) = self.load_session_metadata(session_id, &path)? {
+                sessions.insert(session_id, state);
             }
         }
 
         Ok(sessions)
+    }
+
+    fn load_session_metadata(
+        &self,
+        session_id: SessionId,
+        path: &Path,
+    ) -> Result<Option<SessionState>, SessionStoreError> {
+        if let Some(index) = index::load_fresh_index(&self.root, session_id, path)? {
+            return Ok(Some(index.into_state()));
+        }
+        let Some(index) = index::rebuild_index_metadata(&self.root, session_id, path)? else {
+            return Ok(None);
+        };
+        let mut state = index.into_state();
+        state.index_status = SessionIndexStatusKind::Stale;
+        state.access_status = self.inspect_access_status(session_id)?;
+        Ok(Some(state))
     }
 
     fn load_sessions(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
@@ -243,16 +260,7 @@ impl SessionEventStore {
         if !path.exists() {
             return Ok(None);
         }
-        if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
-            return Ok(Some(index.into_state()));
-        }
-        let Some(index) = index::rebuild_index_metadata(&self.root, session_id, &path)? else {
-            return Ok(None);
-        };
-        let mut state = index.into_state();
-        state.index_status = SessionIndexStatusKind::Stale;
-        state.access_status = self.inspect_access_status(session_id)?;
-        Ok(Some(state))
+        self.load_session_metadata(session_id, &path)
     }
 
     fn append(&self, event: &SessionEvent) -> Result<index::SessionIndexEntry, SessionStoreError> {
@@ -4956,6 +4964,54 @@ mod tests {
         let sessions = restored.cached_sessions(&test_working_directory()).await;
         assert_eq!(sessions.len(), 1);
         assert!(restored.catalog_loaded());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn lazy_catalog_includes_sessions_with_stale_indexes() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("stale catalog".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        manager
+            .append_user_message(session.id, ClientId::new(), "wake index".to_string())
+            .await
+            .expect("message should append");
+        let index_path = root
+            .join("index")
+            .join(format!("{}.index.json", session.id));
+        std::fs::remove_file(&index_path).expect("index should remove");
+
+        let restored = SessionManager::persistent_lazy(&root);
+        restored
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog load should complete");
+        let sessions = restored.cached_sessions(&test_working_directory()).await;
+        let restored_session = sessions
+            .iter()
+            .find(|candidate| candidate.id == session.id)
+            .expect("stale-index session should appear in catalog");
+        assert_eq!(restored_session.name.as_deref(), Some("stale catalog"));
+
+        restored
+            .ensure_session_current(session.id)
+            .await
+            .expect("stale-index session should migrate successfully");
+        let summary = restored
+            .session_summary(session.id)
+            .await
+            .expect("session should remain loadable after migration check");
+        assert_eq!(summary.name.as_deref(), Some("stale catalog"));
+        let health = super::SessionEventStore::new(&root)
+            .doctor_session_with_fix(session.id, true)
+            .expect("doctor should inspect")
+            .expect("session should exist");
+        assert!(health.stale);
+        assert!(index_path.exists());
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
