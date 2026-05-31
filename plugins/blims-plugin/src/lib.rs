@@ -9913,9 +9913,10 @@ mod tests {
             },
         };
 
-        let bytes = bmux_codec::to_vec(&request).expect("protocol request should encode");
+        let bytes =
+            bmux_codec::to_positional_vec(&request).expect("protocol request should encode");
         let decoded: BlimsProtocolRequest<WorkspaceRequest> =
-            bmux_codec::from_bytes(&bytes).expect("protocol request should decode");
+            bmux_codec::from_positional_bytes(&bytes).expect("protocol request should decode");
 
         assert_eq!(decoded, request);
     }

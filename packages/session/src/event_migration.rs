@@ -310,6 +310,7 @@ impl SessionEventStore {
         }
         if report.min_schema_version == Some(target_schema)
             && report.max_schema_version == Some(target_schema)
+            && !report.needs_encoding_migration
         {
             return Ok(SessionMigrationReport {
                 domain: "sessions/events",
@@ -371,6 +372,7 @@ impl SessionEventStore {
         if validation.events.len() != migrated_count
             || validation.min_schema_version != Some(target_schema)
             || validation.max_schema_version != Some(target_schema)
+            || validation.needs_encoding_migration
             || !validation.issues.is_empty()
             || validation
                 .events

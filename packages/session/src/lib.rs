@@ -51,8 +51,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::spawn_blocking;
 
-const FRAME_V2_MAGIC: &[u8; 4] = b"BSE2";
-const FRAME_V2_VERSION: u16 = 2;
+const FRAME_V3_MAGIC: &[u8; 4] = b"BSE3";
+const FRAME_V3_VERSION: u16 = 3;
 
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
@@ -164,8 +164,8 @@ fn write_event_frame(file: &mut fs::File, event: &SessionEvent) -> Result<u64, S
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| SessionStoreError::FrameTooLarge(payload.len()))?;
     let checksum = Sha256::digest(&payload);
-    file.write_all(FRAME_V2_MAGIC)?;
-    file.write_all(&FRAME_V2_VERSION.to_le_bytes())?;
+    file.write_all(FRAME_V3_MAGIC)?;
+    file.write_all(&FRAME_V3_VERSION.to_le_bytes())?;
     file.write_all(&CURRENT_SESSION_EVENT_SCHEMA_VERSION.to_le_bytes())?;
     file.write_all(&payload_len.to_le_bytes())?;
     file.write_all(&checksum)?;
@@ -3111,11 +3111,16 @@ fn history_page_from_events(
 }
 
 fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAccessStatus {
-    access_status_from_schema_versions(
+    let status = access_status_from_schema_versions(
         report.min_schema_version,
         report.max_schema_version,
         report.issues.iter().any(read_issue_blocks_access),
-    )
+    );
+    if report.needs_encoding_migration && status == SessionAccessStatus::ReadWrite {
+        SessionAccessStatus::ReadOnlyMigrationRequired
+    } else {
+        status
+    }
 }
 
 fn access_status_from_index(
@@ -3665,9 +3670,9 @@ mod tests {
             arguments: None,
         };
 
-        let bytes = bmux_codec::to_vec(&old_payload).expect("old payload should encode");
+        let bytes = bmux_codec::to_positional_vec(&old_payload).expect("old payload should encode");
         let decoded: SessionTracePayload =
-            bmux_codec::from_bytes(&bytes).expect("old payload should decode");
+            bmux_codec::from_positional_bytes(&bytes).expect("old payload should decode");
 
         assert!(matches!(
             decoded,
@@ -3691,6 +3696,7 @@ mod tests {
             }],
             min_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             max_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            needs_encoding_migration: false,
         };
 
         assert_eq!(
@@ -4857,8 +4863,20 @@ mod tests {
         ];
         let mut file = std::fs::File::create(&event_path).expect("event file should create");
         for event in events {
-            super::write_event_frame(&mut file, &event).expect("event should write");
+            write_legacy_event_payload(&mut file, &event);
         }
+
+        assert_eq!(
+            store
+                .inspect_access_status(session_id)
+                .expect("legacy encoding access should inspect"),
+            SessionAccessStatus::ReadOnlyMigrationRequired
+        );
+        store
+            .migrate_event_log_to_current(session_id)
+            .expect("encoding migration should rewrite stable frames");
+        let report = reader::read_events(&event_path).expect("migrated events should read");
+        assert!(!report.needs_encoding_migration);
 
         store
             .doctor_session_with_fix(session_id, true)
@@ -5780,7 +5798,7 @@ mod tests {
     }
 
     fn encoded_variant_tag(value: &impl Serialize) -> u32 {
-        let bytes = bmux_codec::to_vec(value).expect("value should encode");
+        let bytes = bmux_codec::to_positional_vec(value).expect("value should encode");
         let (tag, _) = bmux_codec::varint::decode_u32(&bytes).expect("variant tag should decode");
         tag
     }
@@ -5867,7 +5885,7 @@ mod tests {
     }
 
     fn write_legacy_event_payload(file: &mut std::fs::File, event: &SessionEvent) {
-        let payload = bmux_codec::to_vec(event).expect("legacy event should encode");
+        let payload = bmux_codec::to_positional_vec(event).expect("legacy event should encode");
         file.write_all(
             &u32::try_from(payload.len())
                 .expect("payload should fit")

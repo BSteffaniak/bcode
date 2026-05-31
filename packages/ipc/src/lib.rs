@@ -665,7 +665,7 @@ pub enum CodecError {
 ///
 /// Returns an error when serialization fails.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
-    bmux_codec::to_vec(value).map_err(CodecError::Serialize)
+    bmux_codec::to_positional_vec(value).map_err(CodecError::Serialize)
 }
 
 /// Decode a deserializable value with the Bcode wire codec.
@@ -674,7 +674,7 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
 ///
 /// Returns an error when deserialization fails.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
-    bmux_codec::from_bytes(bytes).map_err(CodecError::Deserialize)
+    bmux_codec::from_positional_bytes(bytes).map_err(CodecError::Deserialize)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

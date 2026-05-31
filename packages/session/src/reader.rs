@@ -14,6 +14,8 @@ use std::path::Path;
 const FRAME_LEN_BYTES: usize = 4;
 const FRAME_V2_MAGIC: &[u8; 4] = b"BSE2";
 const FRAME_V2_VERSION: u16 = 2;
+const FRAME_V3_MAGIC: &[u8; 4] = b"BSE3";
+const FRAME_V3_VERSION: u16 = 3;
 const FRAME_V2_HEADER_REST_BYTES: usize = 40;
 const FRAME_V2_HEADER_BYTES: usize = FRAME_LEN_BYTES + FRAME_V2_HEADER_REST_BYTES;
 const MAX_SESSION_EVENT_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -40,6 +42,7 @@ pub struct SessionReadReport {
     pub issues: Vec<SessionReadIssue>,
     pub min_schema_version: Option<u16>,
     pub max_schema_version: Option<u16>,
+    pub needs_encoding_migration: bool,
 }
 
 pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> {
@@ -49,15 +52,18 @@ pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> 
     let mut issues = Vec::new();
     let mut offset = 0_u64;
     let mut last_good_offset = 0_u64;
+    let mut needs_encoding_migration = false;
 
     loop {
         let frame_offset = offset;
-        let Some(payload) =
-            read_next_frame_payload(&mut file, &mut offset, frame_offset, &mut issues)?
+        let Some(frame) = read_next_frame(&mut file, &mut offset, frame_offset, &mut issues)?
         else {
             break;
         };
-        match decode_session_event(&payload) {
+        if frame.encoding == SessionEventFrameEncoding::Positional {
+            needs_encoding_migration = true;
+        }
+        match decode_session_event(&frame.payload, frame.encoding) {
             Ok(event) => {
                 let frame_len = offset.saturating_sub(frame_offset);
                 entries.push(SessionIndexEntry::from_event(
@@ -86,6 +92,7 @@ pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> 
         issues,
         min_schema_version,
         max_schema_version,
+        needs_encoding_migration,
     })
 }
 
@@ -105,18 +112,42 @@ pub fn read_events_at_offsets(
         .iter()
         .map(|offset| {
             file.seek(SeekFrom::Start(*offset))?;
-            let payload = read_frame_payload_at_current_offset(&mut file)?;
-            decode_session_event(&payload).map_err(SessionStoreError::Decode)
+            let frame = read_frame_at_current_offset(&mut file)?;
+            decode_session_event(&frame.payload, frame.encoding).map_err(SessionStoreError::Decode)
         })
         .collect()
 }
 
-fn decode_session_event(payload: &[u8]) -> Result<SessionEvent, bmux_codec::Error> {
-    match bmux_codec::from_bytes(payload) {
-        Ok(event) => Ok(event),
-        Err(primary) => bmux_codec::from_bytes::<BadReasoningOrderSessionEvent>(payload)
-            .map(Into::into)
-            .map_err(|_| primary),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEventFrameEncoding {
+    Stable,
+    Positional,
+}
+
+struct SessionEventFrame {
+    payload: Vec<u8>,
+    encoding: SessionEventFrameEncoding,
+}
+
+fn decode_session_event(
+    payload: &[u8],
+    encoding: SessionEventFrameEncoding,
+) -> Result<SessionEvent, bmux_codec::Error> {
+    match encoding {
+        SessionEventFrameEncoding::Stable => match bmux_codec::from_bytes(payload) {
+            Ok(event) => Ok(event),
+            Err(primary) => bmux_codec::from_bytes::<BadReasoningOrderSessionEvent>(payload)
+                .map(Into::into)
+                .map_err(|_| primary),
+        },
+        SessionEventFrameEncoding::Positional => match bmux_codec::from_positional_bytes(payload) {
+            Ok(event) => Ok(event),
+            Err(primary) => {
+                bmux_codec::from_positional_bytes::<BadReasoningOrderSessionEvent>(payload)
+                    .map(Into::into)
+                    .map_err(|_| primary)
+            }
+        },
     }
 }
 
@@ -427,12 +458,12 @@ impl From<BadReasoningOrderSessionEventKind> for SessionEventKind {
     }
 }
 
-fn read_next_frame_payload(
+fn read_next_frame(
     file: &mut File,
     offset: &mut u64,
     frame_offset: u64,
     issues: &mut Vec<SessionReadIssue>,
-) -> Result<Option<Vec<u8>>, SessionStoreError> {
+) -> Result<Option<SessionEventFrame>, SessionStoreError> {
     let mut first_bytes = [0_u8; FRAME_LEN_BYTES];
     let mut bytes_read = 0_usize;
     while bytes_read < FRAME_LEN_BYTES {
@@ -451,7 +482,24 @@ fn read_next_frame_payload(
     }
 
     if &first_bytes == FRAME_V2_MAGIC {
-        return read_v2_frame_payload(file, offset, frame_offset, issues);
+        return read_versioned_frame_payload(
+            file,
+            offset,
+            frame_offset,
+            issues,
+            FRAME_V2_VERSION,
+            SessionEventFrameEncoding::Positional,
+        );
+    }
+    if &first_bytes == FRAME_V3_MAGIC {
+        return read_versioned_frame_payload(
+            file,
+            offset,
+            frame_offset,
+            issues,
+            FRAME_V3_VERSION,
+            SessionEventFrameEncoding::Stable,
+        );
     }
 
     let payload_len = u32::from_le_bytes(first_bytes) as usize;
@@ -464,30 +512,30 @@ fn read_next_frame_payload(
         });
         return Ok(None);
     }
-    read_frame_payload(file, payload_len, offset, frame_offset, issues)
+    read_frame_payload(file, payload_len, offset, frame_offset, issues).map(|payload| {
+        payload.map(|payload| SessionEventFrame {
+            payload,
+            encoding: SessionEventFrameEncoding::Positional,
+        })
+    })
 }
 
-fn read_frame_payload_at_current_offset(file: &mut File) -> Result<Vec<u8>, SessionStoreError> {
+fn read_frame_at_current_offset(file: &mut File) -> Result<SessionEventFrame, SessionStoreError> {
     let mut first_bytes = [0_u8; FRAME_LEN_BYTES];
     file.read_exact(&mut first_bytes)?;
     if &first_bytes == FRAME_V2_MAGIC {
-        let mut rest = [0_u8; FRAME_V2_HEADER_REST_BYTES];
-        file.read_exact(&mut rest)?;
-        let frame_version = u16::from_le_bytes([rest[0], rest[1]]);
-        let payload_len = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
-        if frame_version != FRAME_V2_VERSION {
-            return Err(SessionStoreError::UnsupportedFrameVersion(frame_version));
-        }
-        if payload_len > MAX_SESSION_EVENT_FRAME_BYTES {
-            return Err(SessionStoreError::FrameTooLarge(payload_len));
-        }
-        let mut payload = vec![0_u8; payload_len];
-        file.read_exact(&mut payload)?;
-        let checksum = Sha256::digest(&payload);
-        if checksum.as_slice() != &rest[8..40] {
-            return Err(SessionStoreError::ChecksumMismatch);
-        }
-        return Ok(payload);
+        return read_versioned_frame_at_current_offset(
+            file,
+            FRAME_V2_VERSION,
+            SessionEventFrameEncoding::Positional,
+        );
+    }
+    if &first_bytes == FRAME_V3_MAGIC {
+        return read_versioned_frame_at_current_offset(
+            file,
+            FRAME_V3_VERSION,
+            SessionEventFrameEncoding::Stable,
+        );
     }
 
     let payload_len = u32::from_le_bytes(first_bytes) as usize;
@@ -496,15 +544,44 @@ fn read_frame_payload_at_current_offset(file: &mut File) -> Result<Vec<u8>, Sess
     }
     let mut payload = vec![0_u8; payload_len];
     file.read_exact(&mut payload)?;
-    Ok(payload)
+    Ok(SessionEventFrame {
+        payload,
+        encoding: SessionEventFrameEncoding::Positional,
+    })
 }
 
-fn read_v2_frame_payload(
+fn read_versioned_frame_at_current_offset(
+    file: &mut File,
+    expected_frame_version: u16,
+    encoding: SessionEventFrameEncoding,
+) -> Result<SessionEventFrame, SessionStoreError> {
+    let mut rest = [0_u8; FRAME_V2_HEADER_REST_BYTES];
+    file.read_exact(&mut rest)?;
+    let frame_version = u16::from_le_bytes([rest[0], rest[1]]);
+    let payload_len = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+    if frame_version != expected_frame_version {
+        return Err(SessionStoreError::UnsupportedFrameVersion(frame_version));
+    }
+    if payload_len > MAX_SESSION_EVENT_FRAME_BYTES {
+        return Err(SessionStoreError::FrameTooLarge(payload_len));
+    }
+    let mut payload = vec![0_u8; payload_len];
+    file.read_exact(&mut payload)?;
+    let checksum = Sha256::digest(&payload);
+    if checksum.as_slice() != &rest[8..40] {
+        return Err(SessionStoreError::ChecksumMismatch);
+    }
+    Ok(SessionEventFrame { payload, encoding })
+}
+
+fn read_versioned_frame_payload(
     file: &mut File,
     offset: &mut u64,
     frame_offset: u64,
     issues: &mut Vec<SessionReadIssue>,
-) -> Result<Option<Vec<u8>>, SessionStoreError> {
+    expected_frame_version: u16,
+    encoding: SessionEventFrameEncoding,
+) -> Result<Option<SessionEventFrame>, SessionStoreError> {
     let mut rest = [0_u8; FRAME_V2_HEADER_REST_BYTES];
     let mut bytes_read = 0_usize;
     while bytes_read < FRAME_V2_HEADER_REST_BYTES {
@@ -524,7 +601,7 @@ fn read_v2_frame_payload(
     }
 
     let frame_version = u16::from_le_bytes([rest[0], rest[1]]);
-    if frame_version != FRAME_V2_VERSION {
+    if frame_version != expected_frame_version {
         issues.push(SessionReadIssue {
             offset: frame_offset,
             kind: SessionReadIssueKind::Decode {
@@ -556,7 +633,7 @@ fn read_v2_frame_payload(
         });
         return Ok(None);
     }
-    Ok(Some(payload))
+    Ok(Some(SessionEventFrame { payload, encoding }))
 }
 
 fn read_frame_payload(
@@ -641,7 +718,7 @@ mod tests {
                 text: "hello".to_string(),
             },
         };
-        let payload = bmux_codec::to_vec(&bad_order_event).expect("event should encode");
+        let payload = bmux_codec::to_positional_vec(&bad_order_event).expect("event should encode");
         {
             let mut file = std::fs::File::create(&path).expect("event log should create");
             file.write_all(
@@ -655,6 +732,7 @@ mod tests {
 
         let report = read_events(&path).expect("bad order event should read");
         assert!(report.issues.is_empty());
+        assert!(report.needs_encoding_migration);
         assert_eq!(report.events.len(), 1);
         assert!(matches!(
             &report.events[0].kind,
