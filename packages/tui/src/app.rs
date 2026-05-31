@@ -1075,7 +1075,11 @@ impl BmuxApp {
                     self.finish_streaming_item("Reasoning", text);
                 }
             }
-            SessionEventKind::SessionCreated { name, .. } => self.session_title.clone_from(name),
+            SessionEventKind::SessionCreated { name, .. } => {
+                if name.is_some() {
+                    self.session_title.clone_from(name);
+                }
+            }
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent_id.clone_from(agent_id);
             }

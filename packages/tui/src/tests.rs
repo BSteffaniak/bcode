@@ -7,8 +7,8 @@ use bcode_client::AttachedSessionHistory;
 use bcode_config::TuiThinkingConfig;
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
-    SessionProjectionKind, SessionSummary, SessionTokenUsage, ToolInvocationStreamEvent,
-    ToolOutputStream,
+    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -526,6 +526,9 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
     app.apply_session_summary(&SessionSummary {
         id: session_id,
         name: Some("Canonical title".to_owned()),
+        explicit_name: Some("Canonical title".to_owned()),
+        derived_title: None,
+        title_source: SessionTitleSource::Explicit,
         client_count: 1,
         created_at_ms: 1,
         updated_at_ms: 2,
@@ -548,6 +551,9 @@ fn live_session_rename_overrides_attach_summary_title() {
     app.apply_session_summary(&SessionSummary {
         id: session_id,
         name: Some("Old title".to_owned()),
+        explicit_name: Some("Old title".to_owned()),
+        derived_title: None,
+        title_source: SessionTitleSource::Explicit,
         client_count: 1,
         created_at_ms: 1,
         updated_at_ms: 2,
@@ -2351,6 +2357,9 @@ fn session_summary(session_id: SessionId) -> SessionSummary {
     SessionSummary {
         id: session_id,
         name: Some("Opened session".to_owned()),
+        explicit_name: Some("Opened session".to_owned()),
+        derived_title: None,
+        title_source: SessionTitleSource::Explicit,
         client_count: 1,
         created_at_ms: 1,
         updated_at_ms: 2,

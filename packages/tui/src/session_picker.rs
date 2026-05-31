@@ -242,11 +242,7 @@ impl SessionPickerApp {
 }
 
 fn session_item(session: &SessionSummary) -> ListItem {
-    let name = session
-        .name
-        .as_deref()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("untitled");
+    let name = session.display_title();
     let display_name = session.import.as_ref().map_or_else(
         || name.to_owned(),
         |import| {
@@ -272,10 +268,7 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    session
-        .name
-        .as_deref()
-        .is_some_and(|name| name.to_ascii_lowercase().contains(query))
+    session.display_title().to_ascii_lowercase().contains(query)
         || session.id.to_string().contains(query)
         || session
             .working_directory

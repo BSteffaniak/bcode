@@ -1123,6 +1123,9 @@ mod tests {
         let summary = SessionSummary {
             id: session_id,
             name: Some("Canonical title".to_owned()),
+            explicit_name: Some("Canonical title".to_owned()),
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::Explicit,
             client_count: 1,
             created_at_ms: 10,
             updated_at_ms: 20,

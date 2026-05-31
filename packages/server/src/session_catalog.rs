@@ -3,7 +3,7 @@
 use crate::ServerState;
 use bcode_ipc::{SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session_import::ImportableSessionStatus;
-use bcode_session_models::{SessionId, SessionImportSummary, SessionSummary};
+use bcode_session_models::{SessionId, SessionImportSummary, SessionSummary, SessionTitleSource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -574,7 +574,10 @@ fn importable_to_summary(
     );
     SessionSummary {
         id,
-        name,
+        name: name.clone(),
+        explicit_name: name,
+        derived_title: None,
+        title_source: SessionTitleSource::Imported,
         client_count: 0,
         created_at_ms: summary.created_at_ms.unwrap_or(0),
         updated_at_ms: summary.updated_at_ms.or(summary.created_at_ms).unwrap_or(0),

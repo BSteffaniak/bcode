@@ -2,7 +2,7 @@ use crate::reader::{SessionReadIssue, SessionReadIssueKind, SessionReadReport};
 use crate::{SessionState, SessionStoreError};
 use bcode_session_models::{
     ProjectionSourceRange, SessionEvent, SessionEventKind, SessionId, SessionImportSummary,
-    SessionSummary, TranscriptProjectionItemKind,
+    SessionSummary, SessionTitleSource, TranscriptProjectionItemKind,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -146,6 +146,7 @@ impl SessionIndexBuilder {
                 working_directory,
             } => {
                 self.name.clone_from(name);
+                self.suppress_derived_name = false;
                 self.working_directory = Some(working_directory.clone());
             }
             SessionEventKind::WorkingDirectoryChanged {
@@ -195,6 +196,9 @@ impl SessionIndexBuilder {
                     external_session_id: external_session_id.clone(),
                     imported_at_ms: *imported_at_ms,
                 });
+                if self.first_user_message.is_none() && self.name.is_none() {
+                    self.first_user_message = Some(external_session_id.clone());
+                }
             }
             _ => {}
         }
@@ -236,7 +240,13 @@ impl SessionIndex {
         let created_at_ms = file.created_at_ms();
         let updated_at_ms = file.modified_at_ms();
         let working_directory = builder.working_directory?;
-        let name = builder.name.or_else(|| {
+        let explicit_name = builder.name.clone();
+        let derived_title = if builder.import.is_some()
+            && builder.name.is_none()
+            && builder.first_user_message.is_some()
+        {
+            builder.first_user_message.clone()
+        } else {
             (!builder.suppress_derived_name)
                 .then(|| {
                     builder
@@ -245,7 +255,17 @@ impl SessionIndex {
                         .map(crate::title_from_first_prompt)
                 })
                 .flatten()
-        });
+        };
+        let name = explicit_name.clone().or_else(|| derived_title.clone());
+        let title_source = if explicit_name.is_some() {
+            SessionTitleSource::Explicit
+        } else if derived_title.is_some() && builder.import.is_some() && !builder.has_user_message {
+            SessionTitleSource::Imported
+        } else if derived_title.is_some() {
+            SessionTitleSource::FirstUserMessage
+        } else {
+            SessionTitleSource::EmptyDraft
+        };
 
         Some(Self {
             index_version: SESSION_INDEX_VERSION,
@@ -254,6 +274,9 @@ impl SessionIndex {
             summary: SessionSummary {
                 id: session_id,
                 name,
+                explicit_name,
+                derived_title,
+                title_source,
                 client_count: 0,
                 created_at_ms,
                 updated_at_ms,

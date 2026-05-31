@@ -33,8 +33,8 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
     SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
-    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTokenUsage,
-    SessionTraceEvent, TraceBlobRef,
+    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
+    SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -502,99 +502,24 @@ impl SessionEventStore {
         let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
         let index_timer = self.metrics.timer();
-        let index =
-            if let Some(index) = index::load_fresh_index(&self.root, session_id, &event_path)? {
-                index
-            } else {
-                self.metrics
-                    .increment_counter("session.store.input_history.index_rebuild_total");
-                let (index, events) = index::rebuild_index(&self.root, session_id, &event_path)?;
-                let Some(index) = index else {
-                    let input_history = input_history_from_events(&events);
-                    self.metrics.record_histogram(
-                        "session.store.input_history.entry_count",
-                        usize_to_u64(input_history.len()),
-                    );
-                    self.metrics.record_histogram(
-                        "session.store.input_history.total_duration_ms",
-                        total_timer.elapsed_ms(),
-                    );
-                    return Ok(input_history);
-                };
-                index
-            };
+        let input_index = derived::ensure_input_history_index(&self.root, session_id, &event_path)?;
         self.metrics.record_histogram(
             "session.store.input_history.load_index_duration_ms",
             index_timer.elapsed_ms(),
         );
         self.metrics.record_histogram(
             "session.store.input_history.index_event_count",
-            usize_to_u64(index.event_count),
+            usize_to_u64(input_index.event_count),
         );
-        let entries_timer = self.metrics.timer();
-        let entries = match index::read_entries(&self.root, session_id) {
-            Ok(entries) if entries.len() == index.event_count => entries,
-            _ => {
-                self.metrics
-                    .increment_counter("session.store.input_history.index_rebuild_total");
-                let (_, events) = index::rebuild_index(&self.root, session_id, &event_path)?;
-                let input_history = input_history_from_events(&events);
-                self.metrics.record_histogram(
-                    "session.store.input_history.rebuild_fallback_entry_count",
-                    usize_to_u64(input_history.len()),
-                );
-                self.metrics.record_histogram(
-                    "session.store.input_history.total_duration_ms",
-                    total_timer.elapsed_ms(),
-                );
-                return Ok(input_history);
-            }
-        };
-        self.metrics.record_histogram(
-            "session.store.input_history.read_entries_duration_ms",
-            entries_timer.elapsed_ms(),
-        );
-        self.metrics.record_histogram(
-            "session.store.input_history.read_entry_count",
-            usize_to_u64(entries.len()),
-        );
-        let mut input_history = Vec::new();
-        let filter_timer = self.metrics.timer();
-        let user_message_entries = entries
-            .into_iter()
-            .filter(|entry| entry.kind == "user_message")
-            .collect::<Vec<_>>();
-        self.metrics.record_histogram(
-            "session.store.input_history.filter_user_messages_duration_ms",
-            filter_timer.elapsed_ms(),
-        );
-        self.metrics.record_histogram(
-            "session.store.input_history.user_message_entry_count",
-            usize_to_u64(user_message_entries.len()),
-        );
-        let events_timer = self.metrics.timer();
-        let events = read_indexed_events(&event_path, &user_message_entries)?;
-        self.metrics.record_histogram(
-            "session.store.input_history.read_indexed_events_duration_ms",
-            events_timer.elapsed_ms(),
-        );
-        for event in events {
-            if let SessionEventKind::UserMessage { text, .. } = event.kind {
-                input_history.push(SessionInputHistoryEntry {
-                    sequence: event.sequence,
-                    text,
-                });
-            }
-        }
         self.metrics.record_histogram(
             "session.store.input_history.entry_count",
-            usize_to_u64(input_history.len()),
+            usize_to_u64(input_index.entries.len()),
         );
         self.metrics.record_histogram(
             "session.store.input_history.total_duration_ms",
             total_timer.elapsed_ms(),
         );
-        Ok(input_history)
+        Ok(input_index.entries)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -802,7 +727,12 @@ impl SessionEventStore {
         };
         let timer = self.metrics.timer();
         let result = index::write_index(&self.root, &index).and_then(|()| {
-            derived::rebuild_transcript_index(&self.root, metadata.summary.id, &path).map(|_| ())
+            derived::rebuild_transcript_index(&self.root, metadata.summary.id, &path).and_then(
+                |_| {
+                    derived::rebuild_input_history_index(&self.root, metadata.summary.id, &path)
+                        .map(|_| ())
+                },
+            )
         });
         self.metrics.record_histogram(
             "session.metadata_index.write_duration_ms",
@@ -873,6 +803,8 @@ impl SessionEventStore {
     pub fn reindex_session(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let path = self.event_path(session_id);
         let _ = index::rebuild_index(&self.root, session_id, &path)?;
+        let _ = derived::rebuild_transcript_index(&self.root, session_id, &path)?;
+        let _ = derived::rebuild_input_history_index(&self.root, session_id, &path)?;
         Ok(())
     }
 
@@ -1770,6 +1702,13 @@ impl SessionManager {
         let summary = SessionSummary {
             id,
             name: name.clone(),
+            explicit_name: name.clone(),
+            derived_title: None,
+            title_source: if name.is_some() {
+                SessionTitleSource::Explicit
+            } else {
+                SessionTitleSource::EmptyDraft
+            },
             client_count: 0,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -2846,7 +2785,14 @@ impl SessionState {
     }
 
     fn summary(&self) -> SessionSummary {
-        self.summary.clone()
+        let mut summary = self.summary.clone();
+        if summary.name.is_none() {
+            summary.name = summary
+                .explicit_name
+                .clone()
+                .or_else(|| summary.derived_title.clone());
+        }
+        summary
     }
 
     const fn ensure_writable(&self) -> Result<(), SessionError> {
@@ -2890,6 +2836,14 @@ impl SessionState {
         match &event.kind {
             SessionEventKind::SessionRenamed { name } => {
                 self.summary.name.clone_from(name);
+                self.summary.explicit_name.clone_from(name);
+                if name.is_some() {
+                    self.summary.title_source = SessionTitleSource::Explicit;
+                } else if self.summary.derived_title.is_some() {
+                    self.summary.title_source = SessionTitleSource::FirstUserMessage;
+                } else {
+                    self.summary.title_source = SessionTitleSource::EmptyDraft;
+                }
             }
             SessionEventKind::SessionImported {
                 source_id,
@@ -2903,8 +2857,22 @@ impl SessionState {
                     external_session_id: external_session_id.clone(),
                     imported_at_ms: *imported_at_ms,
                 });
+                if self.summary.explicit_name.is_none() && self.summary.derived_title.is_none() {
+                    self.summary.derived_title = Some(external_session_id.clone());
+                    self.summary.name.clone_from(&self.summary.derived_title);
+                    self.summary.title_source = SessionTitleSource::Imported;
+                }
             }
-            SessionEventKind::UserMessage { .. } => self.has_user_message = true,
+            SessionEventKind::UserMessage { text, .. } => {
+                self.has_user_message = true;
+                if self.summary.derived_title.is_none() {
+                    self.summary.derived_title = Some(title_from_first_prompt(text));
+                    if self.summary.explicit_name.is_none() {
+                        self.summary.name.clone_from(&self.summary.derived_title);
+                        self.summary.title_source = SessionTitleSource::FirstUserMessage;
+                    }
+                }
+            }
             SessionEventKind::WorkingDirectoryChanged {
                 new_working_directory,
                 ..

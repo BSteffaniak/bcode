@@ -73,11 +73,32 @@ impl Display for ClientId {
     }
 }
 
+/// Source used to determine a session's display title.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTitleSource {
+    /// No user-visible title is available.
+    #[default]
+    EmptyDraft,
+    /// Title was explicitly set by creation or rename.
+    Explicit,
+    /// Title was derived from the first user prompt.
+    FirstUserMessage,
+    /// Title came from an external imported session.
+    Imported,
+}
+
 /// Session summary used by list/select flows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: SessionId,
     pub name: Option<String>,
+    #[serde(default)]
+    pub explicit_name: Option<String>,
+    #[serde(default)]
+    pub derived_title: Option<String>,
+    #[serde(default)]
+    pub title_source: SessionTitleSource,
     pub client_count: usize,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -85,6 +106,18 @@ pub struct SessionSummary {
     pub working_directory: PathBuf,
     #[serde(default)]
     pub import: Option<SessionImportSummary>,
+}
+
+impl SessionSummary {
+    /// Return the best user-visible title for this session.
+    #[must_use]
+    pub fn display_title(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.explicit_name.as_deref())
+            .or(self.derived_title.as_deref())
+            .unwrap_or("empty draft")
+    }
 }
 
 /// Display/provenance metadata for imported sessions.

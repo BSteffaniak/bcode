@@ -2905,8 +2905,12 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
     }
     println!("log: {}", daemon_log_path().display());
     for session in status.sessions {
-        let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
-        println!("{}	{}	{} clients", name, session.id, session.client_count);
+        println!(
+            "{}\t{}\t{} clients",
+            session.display_title(),
+            session.id,
+            session.client_count
+        );
     }
     Ok(())
 }
@@ -3677,8 +3681,12 @@ async fn list_sessions() -> Result<(), CliError> {
         return Ok(());
     }
     for session in sessions {
-        let name = session.name.unwrap_or_else(|| "<unnamed>".to_string());
-        println!("{}\t{}\t{} clients", name, session.id, session.client_count);
+        println!(
+            "{}\t{}\t{} clients",
+            session.display_title(),
+            session.id,
+            session.client_count
+        );
     }
     Ok(())
 }
@@ -3686,22 +3694,14 @@ async fn list_sessions() -> Result<(), CliError> {
 async fn rename_session(session_id: SessionId, name: String) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let session = client.rename_session(session_id, Some(name)).await?;
-    println!(
-        "renamed {} to {}",
-        session.id,
-        session.name.unwrap_or_else(|| "<unnamed>".to_string())
-    );
+    println!("renamed {} to {}", session.id, session.display_title());
     Ok(())
 }
 
 async fn delete_session(session_id: SessionId) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let session = client.delete_session(session_id).await?;
-    println!(
-        "deleted {} ({})",
-        session.name.unwrap_or_else(|| "<unnamed>".to_string()),
-        session.id
-    );
+    println!("deleted {} ({})", session.display_title(), session.id);
     Ok(())
 }
 
