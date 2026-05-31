@@ -136,8 +136,9 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             SessionCommand::Doctor {
                 session_id,
                 fix,
+                force,
                 json,
-            } => session_doctor(session_id, fix, json)?,
+            } => session_doctor(session_id, fix, force, json)?,
             SessionCommand::Migrate { command } => handle_session_migrate_command(command)?,
             SessionCommand::Import { command } => handle_session_import_command(command).await?,
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
@@ -522,6 +523,8 @@ enum SessionCommand {
         session_id: Option<SessionId>,
         #[arg(long)]
         fix: bool,
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
@@ -3869,15 +3872,20 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
     }
 }
 
-fn session_doctor(session_id: Option<SessionId>, fix: bool, json: bool) -> Result<(), CliError> {
+fn session_doctor(
+    session_id: Option<SessionId>,
+    fix: bool,
+    force: bool,
+    json: bool,
+) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
     let health = if let Some(session_id) = session_id {
         store
-            .doctor_session_with_fix(session_id, fix)?
+            .doctor_session_with_options(session_id, fix, force)?
             .into_iter()
             .collect()
     } else {
-        store.doctor_all_with_fix(fix)?
+        store.doctor_all_with_options(fix, force)?
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&health)?);

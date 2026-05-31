@@ -930,22 +930,43 @@ impl SessionEventStore {
         session_id: SessionId,
         fix: bool,
     ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
+        self.doctor_session_with_options(session_id, fix, false)
+    }
+
+    /// Return index health for one persisted session with explicit rebuild behavior.
+    ///
+    /// When `force` is true the index is rebuilt even if the existing index is
+    /// fresh. This lets metadata-only derivation changes (for example legacy
+    /// title recovery) be applied without requiring an event-file change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session event file or index cannot be read.
+    pub fn doctor_session_with_options(
+        &self,
+        session_id: SessionId,
+        fix: bool,
+        force: bool,
+    ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
         let path = self.event_path(session_id);
         if !path.exists() {
             return Ok(None);
+        }
+        if fix && force {
+            let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
+            return Ok(index.map(|index| index.health(true)));
         }
         if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
             return Ok(Some(index.health(false)));
         }
         if fix {
             let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
-            Ok(index.map(|index| index.health(true)))
-        } else {
-            Ok(
-                index::rebuild_index_metadata(&self.root, session_id, &path)?
-                    .map(|index| index.health(true)),
-            )
+            return Ok(index.map(|index| index.health(true)));
         }
+        Ok(
+            index::rebuild_index_metadata(&self.root, session_id, &path)?
+                .map(|index| index.health(true)),
+        )
     }
 
     /// Return index health for every persisted session.
@@ -966,6 +987,19 @@ impl SessionEventStore {
         &self,
         fix: bool,
     ) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
+        self.doctor_all_with_options(fix, false)
+    }
+
+    /// Return index health for every persisted session with explicit rebuild behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session directory or an index file cannot be read.
+    pub fn doctor_all_with_options(
+        &self,
+        fix: bool,
+        force: bool,
+    ) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
         let mut health = Vec::new();
         if !self.root.exists() {
             return Ok(health);
@@ -976,7 +1010,7 @@ impl SessionEventStore {
                 continue;
             }
             let session_id = parse_session_file_name(&path)?;
-            if let Some(item) = self.doctor_session_with_fix(session_id, fix)? {
+            if let Some(item) = self.doctor_session_with_options(session_id, fix, force)? {
                 health.push(item);
             }
         }
