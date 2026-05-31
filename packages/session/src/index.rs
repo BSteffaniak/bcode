@@ -42,8 +42,6 @@ pub struct SessionIndex {
     pub total_metered_tokens: u64,
     pub min_event_schema_version: Option<u16>,
     pub max_event_schema_version: Option<u16>,
-    #[serde(default)]
-    pub transcript_projection: Vec<TranscriptProjectionIndexEntry>,
     pub issues: Vec<SessionIndexIssue>,
 }
 
@@ -119,6 +117,7 @@ pub struct SessionIndexHealth {
     pub last_good_offset: u64,
     pub issue_count: usize,
     pub stale: bool,
+    pub derived: Vec<crate::derived::DerivedIndexHealth>,
 }
 
 #[derive(Default)]
@@ -297,7 +296,6 @@ impl SessionIndex {
             total_metered_tokens: builder.total_metered_tokens,
             min_event_schema_version: report.min_schema_version,
             max_event_schema_version: report.max_schema_version,
-            transcript_projection: Vec::new(),
             issues: report.issues.iter().map(SessionIndexIssue::from).collect(),
         })
     }
@@ -316,13 +314,18 @@ impl SessionIndex {
         SessionState::from_index(self)
     }
 
-    pub const fn health(&self, stale: bool) -> SessionIndexHealth {
+    pub const fn health(
+        &self,
+        stale: bool,
+        derived: Vec<crate::derived::DerivedIndexHealth>,
+    ) -> SessionIndexHealth {
         SessionIndexHealth {
             session_id: self.session_id,
             event_count: self.event_count,
             last_good_offset: self.last_good_offset,
             issue_count: self.issues.len(),
             stale,
+            derived,
         }
     }
 }

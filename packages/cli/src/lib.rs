@@ -3940,7 +3940,7 @@ fn session_doctor(
 }
 
 fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
-    let state = if item.issue_count == 0 {
+    let state = if item.issue_count == 0 && item.derived.iter().all(|index| index.fresh) {
         "ok"
     } else {
         "degraded"
@@ -3955,6 +3955,25 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
         item.last_good_offset,
         item.issue_count
     );
+    for derived in &item.derived {
+        let state = if derived.fresh { "fresh" } else { "stale" };
+        let rebuilt = if derived.rebuilt { ",rebuilt" } else { "" };
+        println!(
+            "  derived:{}\t{}{rebuilt}\tevents={}\titems={}{}",
+            derived.kind.id(),
+            state,
+            derived
+                .event_count
+                .map_or_else(|| "?".to_owned(), |count| count.to_string()),
+            derived
+                .item_count
+                .map_or_else(|| "?".to_owned(), |count| count.to_string()),
+            derived
+                .issue
+                .as_ref()
+                .map_or_else(String::new, |issue| format!("\tissue={issue}"))
+        );
+    }
 }
 
 fn handle_migrate_command(command: MigrateCommand) -> Result<(), CliError> {

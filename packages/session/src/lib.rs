@@ -722,17 +722,11 @@ impl SessionEventStore {
             total_metered_tokens: metadata.total_metered_tokens,
             min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
             max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            transcript_projection: Vec::new(),
             issues: metadata.index_issues.clone(),
         };
         let timer = self.metrics.timer();
         let result = index::write_index(&self.root, &index).and_then(|()| {
-            derived::rebuild_transcript_index(&self.root, metadata.summary.id, &path).and_then(
-                |_| {
-                    derived::rebuild_input_history_index(&self.root, metadata.summary.id, &path)
-                        .map(|_| ())
-                },
-            )
+            derived::rebuild_all(&self.root, metadata.summary.id, &path).map(|_| ())
         });
         self.metrics.record_histogram(
             "session.metadata_index.write_duration_ms",
@@ -803,8 +797,7 @@ impl SessionEventStore {
     pub fn reindex_session(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let path = self.event_path(session_id);
         let _ = index::rebuild_index(&self.root, session_id, &path)?;
-        let _ = derived::rebuild_transcript_index(&self.root, session_id, &path)?;
-        let _ = derived::rebuild_input_history_index(&self.root, session_id, &path)?;
+        let _ = derived::rebuild_all(&self.root, session_id, &path)?;
         Ok(())
     }
 
@@ -876,18 +869,22 @@ impl SessionEventStore {
         }
         if fix && force {
             let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
-            return Ok(index.map(|index| index.health(true)));
+            let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
+            return Ok(index.map(|index| index.health(true, derived)));
         }
         if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
-            return Ok(Some(index.health(false)));
+            let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
+            return Ok(Some(index.health(false, derived)));
         }
         if fix {
             let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
-            return Ok(index.map(|index| index.health(true)));
+            let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
+            return Ok(index.map(|index| index.health(true, derived)));
         }
+        let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
         Ok(
             index::rebuild_index_metadata(&self.root, session_id, &path)?
-                .map(|index| index.health(true)),
+                .map(|index| index.health(true, derived)),
         )
     }
 
@@ -4305,7 +4302,7 @@ mod tests {
 
         assert_eq!(after_append.spans.len(), 2);
         assert_eq!(after_append.event_count, rebuilt.event_count + 1);
-        assert!(metadata.transcript_projection.is_empty());
+        assert_eq!(metadata.event_count, after_append.event_count);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -4470,7 +4467,7 @@ mod tests {
             derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
                 .expect("transcript index should load");
 
-        assert!(metadata.transcript_projection.is_empty());
+        assert_eq!(metadata.event_count, transcript_index.event_count);
         assert_eq!(transcript_index.spans.len(), 2);
         assert_eq!(
             transcript_index.spans[0].kind,
