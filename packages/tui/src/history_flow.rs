@@ -9,6 +9,7 @@ use bcode_session_models::{
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 
 use super::{OLDER_HISTORY_EVENT_LIMIT, TuiError, session_flow::ActiveChat};
 
@@ -17,6 +18,8 @@ const INITIAL_TRANSCRIPT_MIN_ITEMS: usize = 12;
 const INITIAL_TRANSCRIPT_MAX_ITEMS: usize = 64;
 const INITIAL_TRANSCRIPT_MAX_EVENTS_SCANNED: usize = 2_048;
 const INITIAL_TRANSCRIPT_MAX_BYTES: usize = 512 * 1024;
+const EVENT_STREAM_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const EVENT_STREAM_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Build the projection-window request used for initial session attach.
 #[must_use]
@@ -106,13 +109,13 @@ pub async fn attach_session_event_stream_with_limit(
     let attached = connection
         .attach_session_recent_with_input_history(session_id, limit)
         .await?;
-    let event_task = tokio::spawn(async move {
-        while let Ok(event) = connection.recv_event().await {
-            if event_sender.send(event).is_err() {
-                break;
-            }
-        }
-    });
+    let event_task = spawn_reconnecting_recent_event_stream(
+        client.clone(),
+        session_id,
+        event_sender,
+        limit,
+        connection,
+    );
     Ok((attached, event_task))
 }
 
@@ -125,14 +128,113 @@ pub async fn attach_session_event_stream_with_window_request(
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
     let attached = connection
-        .attach_session_projection_window_with_input_history(session_id, request)
+        .attach_session_projection_window_with_input_history(session_id, request.clone())
         .await?;
-    let event_task = tokio::spawn(async move {
+    let event_task = spawn_reconnecting_window_event_stream(
+        client.clone(),
+        session_id,
+        event_sender,
+        request,
+        connection,
+    );
+    Ok((attached, event_task))
+}
+
+fn spawn_reconnecting_recent_event_stream(
+    client: BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    limit: usize,
+    connection: bcode_client::ClientConnection,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        reconnecting_event_stream(
+            client,
+            session_id,
+            event_sender,
+            connection,
+            move |connection, session_id| {
+                Box::pin(async move {
+                    connection
+                        .attach_session_recent_with_input_history(session_id, limit)
+                        .await
+                        .map(|_| ())
+                })
+            },
+        )
+        .await;
+    })
+}
+
+fn spawn_reconnecting_window_event_stream(
+    client: BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    request: ProjectionWindowRequest,
+    connection: bcode_client::ClientConnection,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        reconnecting_event_stream(
+            client,
+            session_id,
+            event_sender,
+            connection,
+            move |connection, session_id| {
+                let request = request.clone();
+                Box::pin(async move {
+                    connection
+                        .attach_session_projection_window_with_input_history(session_id, request)
+                        .await
+                        .map(|_| ())
+                })
+            },
+        )
+        .await;
+    })
+}
+
+async fn reconnecting_event_stream<F>(
+    client: BcodeClient,
+    session_id: SessionId,
+    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    mut connection: bcode_client::ClientConnection,
+    attach: F,
+) where
+    F: for<'a> Fn(
+            &'a mut bcode_client::ClientConnection,
+            SessionId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), bcode_client::ClientError>> + Send + 'a,
+            >,
+        > + Send
+        + 'static,
+{
+    let mut reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
+    loop {
         while let Ok(event) = connection.recv_event().await {
+            reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
             if event_sender.send(event).is_err() {
+                return;
+            }
+        }
+
+        loop {
+            if event_sender.is_closed() {
+                return;
+            }
+            sleep(reconnect_delay).await;
+            reconnect_delay =
+                (reconnect_delay.saturating_mul(2)).min(EVENT_STREAM_RECONNECT_MAX_DELAY);
+
+            let Ok(mut next_connection) = client.connect("bcode-tui-bmux").await else {
+                continue;
+            };
+            if attach(&mut next_connection, session_id).await.is_ok() {
+                connection = next_connection;
+                reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
                 break;
             }
         }
-    });
-    Ok((attached, event_task))
+    }
 }
