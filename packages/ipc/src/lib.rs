@@ -19,12 +19,44 @@ pub use bcode_worktree_models::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub use bmux_ipc::IpcEndpoint;
-pub use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
+pub use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
+
+/// Local IPC listener that avoids unlinking live Unix socket endpoints.
+#[derive(Debug)]
+pub struct LocalIpcListener {
+    inner: bmux_ipc::transport::LocalIpcListener,
+}
+
+impl LocalIpcListener {
+    /// Bind a local listener for the provided endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint is unsupported on this platform, the
+    /// endpoint appears to already have a live listener, stale endpoint cleanup
+    /// fails, or the listener cannot be created.
+    pub fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
+        prepare_endpoint_for_bind(endpoint)?;
+        Ok(Self {
+            inner: bmux_ipc::transport::LocalIpcListener::bind(endpoint)?,
+        })
+    }
+
+    /// Accept an incoming local connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when accepting fails.
+    pub async fn accept(&self) -> Result<LocalIpcStream, IpcTransportError> {
+        self.inner.accept().await
+    }
+}
 
 const FRAME_LEN_BYTES: usize = 4;
 
@@ -921,6 +953,55 @@ pub fn current_working_directory() -> PathBuf {
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn prepare_endpoint_for_bind(endpoint: &IpcEndpoint) -> Result<(), IpcTransportError> {
+    #[cfg(unix)]
+    if let Some(path) = unix_socket_path(endpoint) {
+        prepare_unix_socket_path_for_bind(&path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_unix_socket_path_for_bind(path: &Path) -> Result<(), IpcTransportError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_stream) => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "refusing to replace live IPC socket {}; another bcode daemon is listening",
+                path.display()
+            ),
+        )
+        .into()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn unix_socket_path(endpoint: &IpcEndpoint) -> Option<PathBuf> {
+    let debug = format!("{endpoint:?}");
+    let marker = "UnixSocket(";
+    let start = debug.find(marker)? + marker.len();
+    let rest = &debug[start..];
+    let end = rest.rfind(')')?;
+    let path = rest[..end].trim().trim_matches('"');
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// Return the daemon namespace for this build and IPC protocol version.

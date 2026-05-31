@@ -2723,7 +2723,7 @@ async fn run_server_foreground() -> Result<(), CliError> {
 
 async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    cleanup_old_daemons(false).await;
+    cleanup_stale_daemon_records().await;
     if server_ping_ready(&client).await {
         if !quiet {
             println!("server already running");
@@ -3295,12 +3295,25 @@ async fn server_cleanup(stop_current: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn cleanup_old_daemons(verbose: bool) {
-    let _ = tokio::time::timeout(
-        Duration::from_millis(1_000),
-        cleanup_daemons(false, verbose),
-    )
-    .await;
+async fn cleanup_stale_daemon_records() {
+    let _ = tokio::time::timeout(Duration::from_millis(1_000), remove_stale_daemon_records()).await;
+}
+
+async fn remove_stale_daemon_records() {
+    let state_dir = bcode_config::default_state_dir();
+    for (path, record) in bcode_daemon_lifecycle::read_records(&state_dir) {
+        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
+            continue;
+        };
+        let client = BcodeClient::new(endpoint);
+        let status = tokio::time::timeout(Duration::from_millis(250), client.server_status()).await;
+        if matches!(status, Ok(Ok(status)) if daemon_status_matches(&record, &status.daemon)) {
+            continue;
+        }
+        if bcode_daemon_lifecycle::remove_record_path(&path).is_ok() {
+            remove_stale_socket(&record);
+        }
+    }
 }
 
 #[derive(Debug, Default)]

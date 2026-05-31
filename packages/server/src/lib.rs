@@ -1210,7 +1210,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
     state.plugins.deactivate_all().await?;
     if let Some(path) = &state.daemon_record_path {
-        bcode_daemon_lifecycle::remove_record_path(path)?;
+        bcode_daemon_lifecycle::remove_record_if_instance(path, &state.daemon_status.instance_id)?;
     }
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
     Ok(())

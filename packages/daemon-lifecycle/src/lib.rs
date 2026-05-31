@@ -227,6 +227,33 @@ pub fn remove_record_path(path: &Path) -> Result<(), DaemonLifecycleError> {
     }
 }
 
+/// Remove a daemon registry record when it still belongs to the provided instance.
+///
+/// # Errors
+///
+/// Returns an error when reading or removing the registry file fails for reasons
+/// other than not found.
+pub fn remove_record_if_instance(
+    path: &Path,
+    instance_id: &str,
+) -> Result<(), DaemonLifecycleError> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DaemonLifecycleError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let record = serde_json::from_slice::<DaemonRecord>(&contents)?;
+    if record.instance_id == instance_id {
+        remove_record_path(path)?;
+    }
+    Ok(())
+}
+
 /// Return Unix time in milliseconds.
 ///
 /// # Errors
