@@ -142,7 +142,10 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             SessionCommand::Migrate { command } => handle_session_migrate_command(command)?,
             SessionCommand::Import { command } => handle_session_import_command(command).await?,
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
-            SessionCommand::Repair { session_id } => session_repair(session_id)?,
+            SessionCommand::Repair {
+                session_id,
+                from_backup,
+            } => session_repair(session_id, from_backup)?,
         },
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
@@ -541,6 +544,8 @@ enum SessionCommand {
     },
     Repair {
         session_id: SessionId,
+        #[arg(long)]
+        from_backup: Option<PathBuf>,
     },
 }
 
@@ -4162,8 +4167,17 @@ fn session_reindex(session_id: Option<SessionId>) -> Result<(), CliError> {
     Ok(())
 }
 
-fn session_repair(session_id: SessionId) -> Result<(), CliError> {
+fn session_repair(session_id: SessionId, from_backup: Option<PathBuf>) -> Result<(), CliError> {
     let store = bcode_session::SessionEventStore::new(default_session_store_dir());
+    if let Some(backup_path) = from_backup {
+        let previous = store.restore_session_from_backup(session_id, &backup_path)?;
+        println!(
+            "restored {session_id} from {}; previous canonical log backed up at {}",
+            backup_path.display(),
+            previous.display()
+        );
+        return Ok(());
+    }
     match store.repair_session_tail(session_id)? {
         Some(backup) => println!(
             "repaired {session_id}; original backed up at {}",

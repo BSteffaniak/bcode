@@ -114,6 +114,19 @@ impl SessionHandle {
             .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?
     }
 
+    pub async fn read_only_attach(
+        &self,
+        client_id: ClientId,
+        mode: AttachMode,
+    ) -> Result<SessionAttachment, SessionError> {
+        self.send(|reply| SessionCommand::ReadOnlyAttach {
+            client_id,
+            mode,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn detach(
         &self,
         client_id: ClientId,
@@ -133,6 +146,11 @@ impl SessionHandle {
 
     pub async fn working_directory(&self) -> Result<PathBuf, SessionError> {
         self.send(SessionCommand::WorkingDirectory).await
+    }
+
+    pub async fn requires_migration_for_write(&self) -> Result<bool, SessionError> {
+        self.send(|reply| SessionCommand::RequiresMigrationForWrite { reply })
+            .await?
     }
 
     pub async fn access_status(&self) -> Result<SessionAccessStatus, SessionError> {
@@ -254,6 +272,11 @@ enum SessionCommand {
         queued_at: Instant,
         reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
     },
+    ReadOnlyAttach {
+        client_id: ClientId,
+        mode: AttachMode,
+        reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
+    },
     Detach {
         client_id: ClientId,
         activity_timestamp_ms: u64,
@@ -261,6 +284,9 @@ enum SessionCommand {
     },
     Summary(oneshot::Sender<SessionSummary>),
     WorkingDirectory(oneshot::Sender<PathBuf>),
+    RequiresMigrationForWrite {
+        reply: oneshot::Sender<Result<bool, SessionError>>,
+    },
     AccessStatus(oneshot::Sender<SessionAccessStatus>),
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     HistoryPage {
@@ -361,6 +387,13 @@ impl SessionActor {
             | SessionCommand::Attach { .. } => {
                 unreachable!("write commands are handled before read commands")
             }
+            SessionCommand::ReadOnlyAttach {
+                client_id,
+                mode,
+                reply,
+            } => {
+                let _ = reply.send(self.read_only_attach(client_id, mode).await);
+            }
             SessionCommand::Detach {
                 client_id,
                 activity_timestamp_ms,
@@ -373,6 +406,12 @@ impl SessionActor {
             }
             SessionCommand::WorkingDirectory(reply) => {
                 let _ = reply.send(self.state.working_directory.clone());
+            }
+            SessionCommand::RequiresMigrationForWrite { reply } => {
+                let _ = reply.send(
+                    self.state
+                        .requires_migration_for_write(self.state.summary.id),
+                );
             }
             SessionCommand::AccessStatus(reply) => {
                 let _ = reply.send(self.state.access_status);
@@ -622,12 +661,53 @@ impl SessionActor {
         })
     }
 
+    async fn read_only_attach(
+        &mut self,
+        client_id: ClientId,
+        mode: AttachMode,
+    ) -> Result<SessionAttachment, SessionError> {
+        let history = match mode {
+            AttachMode::Full => self.history().await?,
+            AttachMode::Recent { limit } => {
+                self.history_page(SessionHistoryQuery {
+                    cursor: None,
+                    limit,
+                    direction: SessionHistoryDirection::Backward,
+                })
+                .await?
+                .events
+            }
+            AttachMode::ProjectionWindow { history } => history,
+        };
+        let input_history = self.input_history().await?;
+        self.state.clients.insert(client_id);
+        self.state.summary.client_count = self.state.clients.len();
+        self.refresh_snapshot();
+        let events = self.state.sender.subscribe();
+        let attached_event = self
+            .state
+            .build_next_event(SessionEventKind::ClientAttached { client_id })?;
+        Ok(SessionAttachment {
+            session: self.state.summary(),
+            history,
+            input_history,
+            attached_event,
+            events,
+        })
+    }
+
     async fn detach(
         &mut self,
         client_id: ClientId,
         activity_timestamp_ms: u64,
     ) -> Result<Option<SessionEvent>, SessionError> {
-        self.state.ensure_writable()?;
+        if !self.state.access_status.writable() {
+            if self.state.clients.remove(&client_id) {
+                self.state.summary.client_count = self.state.clients.len();
+                self.refresh_snapshot();
+            }
+            return Ok(None);
+        }
         if self.state.clients.remove(&client_id) {
             self.state.summary.client_count = self.state.clients.len();
             return Ok(Some(

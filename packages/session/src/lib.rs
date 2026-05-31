@@ -875,6 +875,32 @@ impl SessionEventStore {
         Ok(Some(backup))
     }
 
+    /// Restore a session's canonical event log from a migration backup and rebuild its index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backup, event file, or rebuilt index cannot be read or written.
+    pub fn restore_session_from_backup(
+        &self,
+        session_id: SessionId,
+        backup_path: &Path,
+    ) -> Result<PathBuf, SessionStoreError> {
+        let path = self.event_path(session_id);
+        if !backup_path.exists() {
+            return Err(SessionStoreError::InvalidSessionId(format!(
+                "backup does not exist: {}",
+                backup_path.display()
+            )));
+        }
+        let restore_backup = corrupt_backup_path(&path);
+        if path.exists() {
+            fs::copy(&path, &restore_backup)?;
+        }
+        fs::copy(backup_path, &path)?;
+        self.reindex_session(session_id)?;
+        Ok(restore_backup)
+    }
+
     /// Rebuild the sidecar index for one session from its canonical event log.
     ///
     /// # Errors
@@ -1709,21 +1735,7 @@ impl SessionManager {
         let access_timer = self.metrics.timer();
         let should_migrate = {
             let handle = self.session_handle(session_id).await?;
-            match handle.access_status().await? {
-                SessionAccessStatus::ReadWrite => false,
-                SessionAccessStatus::ReadOnlyMigrationRequired => true,
-                status => {
-                    self.metrics.record_histogram(
-                        "session.manager.migrate_if_required.access_check_duration_ms",
-                        access_timer.elapsed_ms(),
-                    );
-                    self.metrics.record_histogram(
-                        "session.manager.migrate_if_required.total_duration_ms",
-                        total_timer.elapsed_ms(),
-                    );
-                    return Err(SessionError::NotWritable { session_id, status });
-                }
-            }
+            handle.requires_migration_for_write().await?
         };
         self.metrics.record_histogram(
             "session.manager.migrate_if_required.access_check_duration_ms",
@@ -2196,13 +2208,6 @@ impl SessionManager {
         client_id: ClientId,
     ) -> Result<SessionAttachment, SessionError> {
         let total_timer = self.metrics.timer();
-        let migrate_timer = self.metrics.timer();
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
-        self.metrics.record_histogram(
-            "session.manager.attach_full.migrate_if_required_duration_ms",
-            migrate_timer.elapsed_ms(),
-        );
         let handle_timer = self.metrics.timer();
         let handle = self.session_handle(session_id).await?;
         self.metrics.record_histogram(
@@ -2211,9 +2216,13 @@ impl SessionManager {
         );
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let result = handle
-            .attach(client_id, AttachMode::Full, activity_timestamp_ms)
-            .await;
+        let result = if handle.requires_migration_for_write().await? {
+            handle.read_only_attach(client_id, AttachMode::Full).await
+        } else {
+            handle
+                .attach(client_id, AttachMode::Full, activity_timestamp_ms)
+                .await
+        };
         self.metrics.record_histogram(
             "session.manager.attach_full.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -2243,13 +2252,6 @@ impl SessionManager {
         let total_timer = self.metrics.timer();
         self.metrics
             .record_histogram("session.manager.attach_recent.limit", usize_to_u64(limit));
-        let migrate_timer = self.metrics.timer();
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
-        self.metrics.record_histogram(
-            "session.manager.attach_recent.migrate_if_required_duration_ms",
-            migrate_timer.elapsed_ms(),
-        );
         let handle_timer = self.metrics.timer();
         let handle = self.session_handle(session_id).await?;
         self.metrics.record_histogram(
@@ -2258,13 +2260,19 @@ impl SessionManager {
         );
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let result = handle
-            .attach(
-                client_id,
-                AttachMode::Recent { limit },
-                activity_timestamp_ms,
-            )
-            .await;
+        let result = if handle.requires_migration_for_write().await? {
+            handle
+                .read_only_attach(client_id, AttachMode::Recent { limit })
+                .await
+        } else {
+            handle
+                .attach(
+                    client_id,
+                    AttachMode::Recent { limit },
+                    activity_timestamp_ms,
+                )
+                .await
+        };
         self.metrics.record_histogram(
             "session.manager.attach_recent.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -2303,13 +2311,6 @@ impl SessionManager {
         request: ProjectionWindowRequest,
     ) -> Result<SessionProjectionWindowAttachment, SessionError> {
         let total_timer = self.metrics.timer();
-        let migrate_timer = self.metrics.timer();
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
-        self.metrics.record_histogram(
-            "session.manager.attach_projection_window.migrate_if_required_duration_ms",
-            migrate_timer.elapsed_ms(),
-        );
         let handle_timer = self.metrics.timer();
         let handle = self.session_handle(session_id).await?;
         self.metrics.record_histogram(
@@ -2348,13 +2349,19 @@ impl SessionManager {
         };
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let mut attachment = handle
-            .attach(
-                client_id,
-                AttachMode::ProjectionWindow { history },
-                activity_timestamp_ms,
-            )
-            .await?;
+        let mut attachment = if handle.requires_migration_for_write().await? {
+            handle
+                .read_only_attach(client_id, AttachMode::ProjectionWindow { history })
+                .await?
+        } else {
+            handle
+                .attach(
+                    client_id,
+                    AttachMode::ProjectionWindow { history },
+                    activity_timestamp_ms,
+                )
+                .await?
+        };
         self.metrics.record_histogram(
             "session.manager.attach_projection_window.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -2886,6 +2893,17 @@ impl SessionState {
                 session_id: self.summary.id,
                 status: self.access_status,
             })
+        }
+    }
+
+    const fn requires_migration_for_write(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, SessionError> {
+        match self.access_status {
+            SessionAccessStatus::ReadWrite => Ok(false),
+            SessionAccessStatus::ReadOnlyMigrationRequired => Ok(true),
+            status => Err(SessionError::NotWritable { session_id, status }),
         }
     }
 
