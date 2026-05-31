@@ -3940,7 +3940,9 @@ fn session_doctor(
 }
 
 fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
-    let state = if item.issue_count == 0 && item.derived.iter().all(|index| index.fresh) {
+    let derived_ok =
+        item.derived.manifest.fresh && item.derived.indexes.iter().all(|index| index.fresh);
+    let state = if item.issue_count == 0 && derived_ok {
         "ok"
     } else {
         "degraded"
@@ -3955,7 +3957,26 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
         item.last_good_offset,
         item.issue_count
     );
-    for derived in &item.derived {
+    let manifest_state = if item.derived.manifest.fresh {
+        "fresh"
+    } else {
+        "stale"
+    };
+    let manifest_rebuilt = if item.derived.manifest.rebuilt {
+        ",rebuilt"
+    } else {
+        ""
+    };
+    println!(
+        "  derived:manifest\t{}{manifest_rebuilt}{}",
+        manifest_state,
+        item.derived
+            .manifest
+            .issue
+            .as_ref()
+            .map_or_else(String::new, |issue| format!("\tissue={issue}"))
+    );
+    for derived in &item.derived.indexes {
         let state = if derived.fresh { "fresh" } else { "stale" };
         let rebuilt = if derived.rebuilt { ",rebuilt" } else { "" };
         println!(

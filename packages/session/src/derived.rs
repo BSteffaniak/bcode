@@ -61,6 +61,26 @@ pub struct DerivedIndexHealth {
     pub issue: Option<String>,
 }
 
+/// Health for the derived-index manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedManifestHealth {
+    /// Whether the manifest exists and validates against the event log and registered indexes.
+    pub fresh: bool,
+    /// Whether the manifest was rebuilt during health checking.
+    pub rebuilt: bool,
+    /// Human-readable issue when stale, missing, or invalid.
+    pub issue: Option<String>,
+}
+
+/// Health for all derived indexes of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedHealth {
+    /// Manifest health.
+    pub manifest: DerivedManifestHealth,
+    /// Registered derived-index health entries.
+    pub indexes: Vec<DerivedIndexHealth>,
+}
+
 /// Current derived-index manifest format version.
 pub const DERIVED_INDEX_MANIFEST_VERSION: u16 = 1;
 
@@ -235,6 +255,24 @@ pub enum DerivedIndexInvalid {
     Fingerprint,
     /// Entries are not sorted chronologically.
     Unsorted { previous_end: u64, next_start: u64 },
+    /// Manifest is missing a required derived index.
+    MissingManifestEntry { id: String },
+    /// Manifest contains an unknown derived index.
+    UnknownManifestEntry { id: String },
+    /// Manifest points at the wrong derived-index path.
+    ManifestPath {
+        id: String,
+        found: String,
+        expected: String,
+    },
+    /// Manifest entry version does not match the registered index version.
+    ManifestEntryVersion {
+        id: String,
+        found: u16,
+        current: u16,
+    },
+    /// Manifest entry counts do not match the derived sidecar.
+    ManifestEntryCount { id: String },
 }
 
 fn validate_header(
@@ -308,13 +346,53 @@ pub fn health_all(
     event_path: &Path,
     fix: bool,
     force: bool,
-) -> Result<Vec<DerivedIndexHealth>, SessionStoreError> {
+) -> Result<DerivedHealth, SessionStoreError> {
     if force && fix {
         let manifest = rebuild_all(root, session_id, event_path)?;
         return Ok(health_from_manifest(&manifest, true));
     }
     let file = index::fingerprint(event_path)?;
-    let transcript = match load_transcript_index(root, session_id, &file) {
+    match validate_all(root, session_id, &file) {
+        Ok(manifest) => Ok(health_from_manifest(&manifest, false)),
+        Err(issue) if fix => {
+            let manifest = rebuild_all(root, session_id, event_path)?;
+            let mut health = health_from_manifest(&manifest, true);
+            health.manifest.issue = Some(issue);
+            Ok(health)
+        }
+        Err(issue) => Ok(DerivedHealth {
+            manifest: DerivedManifestHealth {
+                fresh: false,
+                rebuilt: false,
+                issue: Some(issue),
+            },
+            indexes: index_health_without_manifest(root, session_id, &file),
+        }),
+    }
+}
+
+fn validate_all(
+    root: &Path,
+    session_id: SessionId,
+    file: &EventFileFingerprint,
+) -> Result<DerivedIndexManifest, String> {
+    let manifest = load_manifest(root, session_id).map_err(|error| format!("{error:?}"))?;
+    validate_manifest(root, &manifest, session_id, file).map_err(|error| format!("{error:?}"))?;
+    let transcript = load_transcript_index(root, session_id, file)
+        .map_err(|error| format!("transcript: {error:?}"))?;
+    let input_history = load_input_history_index(root, session_id, file)
+        .map_err(|error| format!("input_history: {error:?}"))?;
+    validate_manifest_counts(&manifest, &transcript, &input_history)
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(manifest)
+}
+
+fn index_health_without_manifest(
+    root: &Path,
+    session_id: SessionId,
+    file: &EventFileFingerprint,
+) -> Vec<DerivedIndexHealth> {
+    let transcript = match load_transcript_index(root, session_id, file) {
         Ok(index) => DerivedIndexHealth {
             kind: DerivedIndexKind::Transcript,
             fresh: true,
@@ -323,17 +401,6 @@ pub fn health_all(
             item_count: Some(index.spans.len()),
             issue: None,
         },
-        Err(error) if fix => {
-            let index = rebuild_transcript_index(root, session_id, event_path)?;
-            DerivedIndexHealth {
-                kind: DerivedIndexKind::Transcript,
-                fresh: true,
-                rebuilt: true,
-                event_count: Some(index.event_count),
-                item_count: Some(index.spans.len()),
-                issue: Some(issue_for_load_error(&error)),
-            }
-        }
         Err(error) => DerivedIndexHealth {
             kind: DerivedIndexKind::Transcript,
             fresh: false,
@@ -343,7 +410,7 @@ pub fn health_all(
             issue: Some(issue_for_load_error(&error)),
         },
     };
-    let input_history = match load_input_history_index(root, session_id, &file) {
+    let input_history = match load_input_history_index(root, session_id, file) {
         Ok(index) => DerivedIndexHealth {
             kind: DerivedIndexKind::InputHistory,
             fresh: true,
@@ -352,17 +419,6 @@ pub fn health_all(
             item_count: Some(index.entries.len()),
             issue: None,
         },
-        Err(error) if fix => {
-            let index = rebuild_input_history_index(root, session_id, event_path)?;
-            DerivedIndexHealth {
-                kind: DerivedIndexKind::InputHistory,
-                fresh: true,
-                rebuilt: true,
-                event_count: Some(index.event_count),
-                item_count: Some(index.entries.len()),
-                issue: Some(issue_for_load_error(&error)),
-            }
-        }
         Err(error) => DerivedIndexHealth {
             kind: DerivedIndexKind::InputHistory,
             fresh: false,
@@ -372,11 +428,7 @@ pub fn health_all(
             issue: Some(issue_for_load_error(&error)),
         },
     };
-    if fix && (transcript.rebuilt || input_history.rebuilt) {
-        let _manifest = rebuild_all(root, session_id, event_path)?;
-        return health_all(root, session_id, event_path, false, false);
-    }
-    Ok(vec![transcript, input_history])
+    vec![transcript, input_history]
 }
 
 pub fn ensure_input_history_index(
@@ -559,26 +611,169 @@ fn persist_manifest(root: &Path, manifest: &DerivedIndexManifest) -> Result<(), 
     fs::rename(&tmp_path, &path).map_err(SessionStoreError::Io)
 }
 
-fn health_from_manifest(manifest: &DerivedIndexManifest, rebuilt: bool) -> Vec<DerivedIndexHealth> {
-    manifest
+#[derive(Debug)]
+enum ManifestLoadError {
+    NotFound,
+    Store,
+}
+
+fn load_manifest(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<DerivedIndexManifest, ManifestLoadError> {
+    let path = manifest_path(root, session_id);
+    let file = File::open(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ManifestLoadError::NotFound
+        } else {
+            ManifestLoadError::Store
+        }
+    })?;
+    serde_json::from_reader(file)
+        .map_err(SessionStoreError::Index)
+        .map_err(|_error| ManifestLoadError::Store)
+}
+
+fn validate_manifest(
+    root: &Path,
+    manifest: &DerivedIndexManifest,
+    session_id: SessionId,
+    file: &EventFileFingerprint,
+) -> Result<(), DerivedIndexInvalid> {
+    validate_header(
+        manifest.manifest_version,
+        DERIVED_INDEX_MANIFEST_VERSION,
+        manifest.session_id,
+        session_id,
+        &manifest.file,
+        file,
+    )?;
+    validate_manifest_entry(
+        root,
+        session_id,
+        manifest,
+        DerivedIndexKind::Transcript,
+        "transcript.jsonl",
+    )?;
+    validate_manifest_entry(
+        root,
+        session_id,
+        manifest,
+        DerivedIndexKind::InputHistory,
+        "input_history.jsonl",
+    )?;
+    for entry in &manifest.indexes {
+        if entry.id != DerivedIndexKind::Transcript.id()
+            && entry.id != DerivedIndexKind::InputHistory.id()
+        {
+            return Err(DerivedIndexInvalid::UnknownManifestEntry {
+                id: entry.id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_entry(
+    root: &Path,
+    session_id: SessionId,
+    manifest: &DerivedIndexManifest,
+    kind: DerivedIndexKind,
+    expected_path: &str,
+) -> Result<(), DerivedIndexInvalid> {
+    let Some(entry) = manifest.indexes.iter().find(|entry| entry.id == kind.id()) else {
+        return Err(DerivedIndexInvalid::MissingManifestEntry {
+            id: kind.id().to_owned(),
+        });
+    };
+    if entry.version != kind.current_version() {
+        return Err(DerivedIndexInvalid::ManifestEntryVersion {
+            id: entry.id.clone(),
+            found: entry.version,
+            current: kind.current_version(),
+        });
+    }
+    if entry.path != expected_path {
+        return Err(DerivedIndexInvalid::ManifestPath {
+            id: entry.id.clone(),
+            found: entry.path.clone(),
+            expected: expected_path.to_owned(),
+        });
+    }
+    if !session_index_dir(root, session_id)
+        .join(&entry.path)
+        .exists()
+    {
+        return Err(DerivedIndexInvalid::MissingManifestEntry {
+            id: entry.id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_manifest_counts(
+    manifest: &DerivedIndexManifest,
+    transcript: &TranscriptIndex,
+    input_history: &InputHistoryIndex,
+) -> Result<(), DerivedIndexInvalid> {
+    let transcript_entry = manifest
         .indexes
         .iter()
-        .filter_map(|entry| {
-            let kind = match entry.id.as_str() {
-                "transcript" => DerivedIndexKind::Transcript,
-                "input_history" => DerivedIndexKind::InputHistory,
-                _ => return None,
-            };
-            Some(DerivedIndexHealth {
-                kind,
-                fresh: true,
-                rebuilt,
-                event_count: Some(entry.event_count),
-                item_count: Some(entry.item_count),
-                issue: None,
+        .find(|entry| entry.id == DerivedIndexKind::Transcript.id())
+        .ok_or_else(|| DerivedIndexInvalid::MissingManifestEntry {
+            id: DerivedIndexKind::Transcript.id().to_owned(),
+        })?;
+    if transcript_entry.event_count != transcript.event_count
+        || transcript_entry.item_count != transcript.spans.len()
+    {
+        return Err(DerivedIndexInvalid::ManifestEntryCount {
+            id: transcript_entry.id.clone(),
+        });
+    }
+    let input_entry = manifest
+        .indexes
+        .iter()
+        .find(|entry| entry.id == DerivedIndexKind::InputHistory.id())
+        .ok_or_else(|| DerivedIndexInvalid::MissingManifestEntry {
+            id: DerivedIndexKind::InputHistory.id().to_owned(),
+        })?;
+    if input_entry.event_count != input_history.event_count
+        || input_entry.item_count != input_history.entries.len()
+    {
+        return Err(DerivedIndexInvalid::ManifestEntryCount {
+            id: input_entry.id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn health_from_manifest(manifest: &DerivedIndexManifest, rebuilt: bool) -> DerivedHealth {
+    DerivedHealth {
+        manifest: DerivedManifestHealth {
+            fresh: true,
+            rebuilt,
+            issue: None,
+        },
+        indexes: manifest
+            .indexes
+            .iter()
+            .filter_map(|entry| {
+                let kind = match entry.id.as_str() {
+                    "transcript" => DerivedIndexKind::Transcript,
+                    "input_history" => DerivedIndexKind::InputHistory,
+                    _ => return None,
+                };
+                Some(DerivedIndexHealth {
+                    kind,
+                    fresh: true,
+                    rebuilt,
+                    event_count: Some(entry.event_count),
+                    item_count: Some(entry.item_count),
+                    issue: None,
+                })
             })
-        })
-        .collect()
+            .collect(),
+    }
 }
 
 fn issue_for_load_error(error: &impl std::fmt::Debug) -> String {

@@ -10,7 +10,7 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-pub const SESSION_INDEX_VERSION: u16 = 7;
+pub const SESSION_INDEX_VERSION: u16 = 8;
 pub const SESSION_ENTRY_INDEX_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +117,7 @@ pub struct SessionIndexHealth {
     pub last_good_offset: u64,
     pub issue_count: usize,
     pub stale: bool,
-    pub derived: Vec<crate::derived::DerivedIndexHealth>,
+    pub derived: crate::derived::DerivedHealth,
 }
 
 #[derive(Default)]
@@ -317,7 +317,7 @@ impl SessionIndex {
     pub const fn health(
         &self,
         stale: bool,
-        derived: Vec<crate::derived::DerivedIndexHealth>,
+        derived: crate::derived::DerivedHealth,
     ) -> SessionIndexHealth {
         SessionIndexHealth {
             session_id: self.session_id,
