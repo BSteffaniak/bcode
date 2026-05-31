@@ -3302,6 +3302,9 @@ async fn cleanup_stale_daemon_records() {
 async fn remove_stale_daemon_records() {
     let state_dir = bcode_config::default_state_dir();
     for (path, record) in bcode_daemon_lifecycle::read_records(&state_dir) {
+        if record.is_current_namespace() {
+            continue;
+        }
         let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
             continue;
         };
@@ -3407,18 +3410,28 @@ fn daemon_status_matches(
 fn remove_stale_socket(record: &bcode_daemon_lifecycle::DaemonRecord) {
     #[cfg(unix)]
     if let bcode_daemon_lifecycle::DaemonEndpointRecord::UnixSocket { path } = &record.endpoint
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.starts_with("bcode-")
-                    && Path::new(name)
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("sock"))
-            })
+        && is_bcode_socket_path(path)
+        && !unix_socket_has_listener(path)
     {
         let _ = std::fs::remove_file(path);
     }
+}
+
+#[cfg(unix)]
+fn is_bcode_socket_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("bcode-")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("sock"))
+        })
+}
+
+#[cfg(unix)]
+fn unix_socket_has_listener(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 async fn server_stop() -> Result<(), CliError> {
