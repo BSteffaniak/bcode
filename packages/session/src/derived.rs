@@ -1,9 +1,13 @@
 //! Derived session index files and validation.
 
+use crate::SessionStoreError;
 use crate::index::{self, EventFileFingerprint};
-use crate::{SessionStoreError, projection};
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry};
+use bcode_session_models::{
+    ProjectionSourceRange, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    ToolInvocationStreamEvent, TranscriptProjectionItemKind,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -82,7 +86,42 @@ pub struct DerivedHealth {
 }
 
 /// Current derived-index manifest format version.
-pub const DERIVED_INDEX_MANIFEST_VERSION: u16 = 1;
+pub const DERIVED_INDEX_MANIFEST_VERSION: u16 = 2;
+
+/// Canonical event-log position through which a derived index has projected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedSourceCheckpoint {
+    /// Number of canonical events projected.
+    pub event_count: usize,
+    /// Byte offset immediately after the last projected event frame.
+    pub end_offset: u64,
+    /// Sequence number of the last projected event, if any.
+    pub last_sequence: Option<u64>,
+}
+
+/// Transcript-specific state needed to resume projection without rescanning history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptProjectorState {
+    assistant: Option<PendingStreamState>,
+    reasoning: Option<PendingStreamState>,
+    tools: BTreeMap<String, PendingToolState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingStreamState {
+    kind: TranscriptProjectionItemKind,
+    start_sequence: u64,
+    end_sequence: u64,
+    content_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingToolState {
+    start_sequence: u64,
+    end_sequence: u64,
+    content_bytes: usize,
+    saw_stream_output: bool,
+}
 
 /// Manifest describing derived indexes available for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,8 +145,11 @@ pub struct DerivedIndexManifestEntry {
     pub version: u16,
     /// Relative path under the per-session derived-index directory.
     pub path: String,
-    /// Number of source events covered by the index.
-    pub event_count: usize,
+    /// Canonical source checkpoint this index has projected through.
+    pub checkpoint: DerivedSourceCheckpoint,
+    /// Transcript projector state for resumable transcript indexes.
+    #[serde(default)]
+    pub transcript_state: Option<TranscriptProjectorState>,
     /// Number of derived records in the index.
     pub item_count: usize,
 }
@@ -122,6 +164,10 @@ pub struct InputHistoryIndex {
     pub file: EventFileFingerprint,
     /// Number of decoded events observed while building.
     pub event_count: usize,
+    /// Byte offset immediately after the last projected event frame.
+    pub end_offset: u64,
+    /// Last projected event sequence, if any.
+    pub last_sequence: Option<u64>,
     /// User-submitted prompts in chronological order.
     pub entries: Vec<SessionInputHistoryEntry>,
 }
@@ -131,7 +177,7 @@ impl InputHistoryIndex {
     #[must_use]
     pub fn from_events(
         session_id: SessionId,
-        file: EventFileFingerprint,
+        file: &EventFileFingerprint,
         events: &[SessionEvent],
     ) -> Self {
         let mut entries: Vec<_> = events
@@ -151,8 +197,10 @@ impl InputHistoryIndex {
         Self {
             index_version: INPUT_HISTORY_INDEX_VERSION,
             session_id,
-            file,
+            file: file.clone(),
             event_count: events.len(),
+            end_offset: file.len,
+            last_sequence: events.last().map(|event| event.sequence),
             entries,
         }
     }
@@ -196,6 +244,12 @@ pub struct TranscriptIndex {
     pub file: EventFileFingerprint,
     /// Number of decoded events observed while building.
     pub event_count: usize,
+    /// Byte offset immediately after the last projected event frame.
+    pub end_offset: u64,
+    /// Last projected event sequence, if any.
+    pub last_sequence: Option<u64>,
+    /// Resumable projection state.
+    pub projector_state: TranscriptProjectorState,
     /// Projection spans, sorted by source range.
     pub spans: Vec<index::TranscriptProjectionIndexEntry>,
 }
@@ -205,19 +259,19 @@ impl TranscriptIndex {
     #[must_use]
     pub fn from_events(
         session_id: SessionId,
-        file: EventFileFingerprint,
+        file: &EventFileFingerprint,
         events: &[SessionEvent],
     ) -> Self {
-        let mut spans = projection::build_transcript_projection(events, None)
-            .iter()
-            .map(index::TranscriptProjectionIndexEntry::from_item)
-            .collect::<Vec<_>>();
+        let (mut spans, projector_state) = project_transcript_events(events, None);
         spans.sort_by_key(|span| span.source_range.start_sequence);
         Self {
             index_version: TRANSCRIPT_INDEX_VERSION,
             session_id,
-            file,
+            file: file.clone(),
             event_count: events.len(),
+            end_offset: file.len,
+            last_sequence: events.last().map(|event| event.sequence),
+            projector_state,
             spans,
         }
     }
@@ -293,7 +347,11 @@ fn validate_header(
         });
     }
     if let Some((found_file, expected_file)) = fingerprint
-        && found_file != expected_file
+        && (found_file.modified_unix_secs != expected_file.modified_unix_secs
+            || found_file.modified_nanos != expected_file.modified_nanos
+            || found_file.created_unix_secs != expected_file.created_unix_secs
+            || found_file.created_nanos != expected_file.created_nanos
+            || found_file.len > expected_file.len)
     {
         return Err(DerivedIndexInvalid::Fingerprint);
     }
@@ -331,8 +389,8 @@ pub fn rebuild_all(
 ) -> Result<DerivedIndexManifest, SessionStoreError> {
     let report = crate::reader::read_events(event_path)?;
     let file = index::fingerprint(event_path)?;
-    let transcript_index = TranscriptIndex::from_events(session_id, file.clone(), &report.events);
-    let input_index = InputHistoryIndex::from_events(session_id, file.clone(), &report.events);
+    let transcript_index = TranscriptIndex::from_events(session_id, &file, &report.events);
+    let input_index = InputHistoryIndex::from_events(session_id, &file, &report.events);
     write_transcript_index(root, &transcript_index)?;
     write_input_history_index(root, &input_index)?;
     remove_legacy_derived_state(root, session_id)?;
@@ -379,7 +437,7 @@ fn validate_all(
     let manifest = load_manifest(root, session_id).map_err(|error| format!("{error:?}"))?;
     validate_manifest(root, &manifest, session_id, Some(file))
         .map_err(|error| format!("{error:?}"))?;
-    if !manifest_covers_file_len(&manifest, file.len) {
+    if !manifest_is_current(&manifest, file.len) {
         return Err("derived manifest is stale".to_owned());
     }
     load_indexes_from_manifest(root, session_id, &manifest)
@@ -436,17 +494,7 @@ pub fn ensure_input_history_index(
     session_id: SessionId,
     event_path: &Path,
 ) -> Result<InputHistoryIndex, SessionStoreError> {
-    let file = index::fingerprint(event_path)?;
-    if let Ok(manifest) = load_manifest(root, session_id)
-        && validate_manifest(root, &manifest, session_id, Some(&file)).is_ok()
-        && let Ok((_transcript, input_history)) =
-            load_indexes_from_manifest(root, session_id, &manifest)
-        && manifest_covers_file_len(&manifest, file.len)
-    {
-        return Ok(input_history);
-    }
-
-    let manifest = rebuild_all(root, session_id, event_path)?;
+    let manifest = ensure_indexes_current(root, session_id, event_path)?;
     let (_transcript, input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(input_history)
 }
@@ -457,23 +505,406 @@ pub fn ensure_transcript_index(
     session_id: SessionId,
     event_path: &Path,
 ) -> Result<TranscriptIndex, SessionStoreError> {
-    let file = index::fingerprint(event_path)?;
-    if let Ok(manifest) = load_manifest(root, session_id)
-        && validate_manifest(root, &manifest, session_id, Some(&file)).is_ok()
-        && let Ok((transcript, _input_history)) =
-            load_indexes_from_manifest(root, session_id, &manifest)
-        && manifest_covers_file_len(&manifest, file.len)
-    {
-        return Ok(transcript);
-    }
-
-    let manifest = rebuild_all(root, session_id, event_path)?;
+    let manifest = ensure_indexes_current(root, session_id, event_path)?;
     let (transcript, _input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(transcript)
 }
 
-const fn manifest_covers_file_len(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
-    manifest.file.len == file_len
+fn ensure_indexes_current(
+    root: &Path,
+    session_id: SessionId,
+    event_path: &Path,
+) -> Result<DerivedIndexManifest, SessionStoreError> {
+    let current_file = index::fingerprint(event_path)?;
+    let manifest = match load_manifest(root, session_id) {
+        Ok(manifest) => manifest,
+        Err(_error) => return rebuild_all(root, session_id, event_path),
+    };
+    if validate_manifest(root, &manifest, session_id, Some(&current_file)).is_err() {
+        return rebuild_all(root, session_id, event_path);
+    }
+    let (mut transcript, mut input_history) =
+        match load_indexes_from_manifest(root, session_id, &manifest) {
+            Ok(indexes) => indexes,
+            Err(_error) => return rebuild_all(root, session_id, event_path),
+        };
+    if manifest_is_current(&manifest, current_file.len) {
+        return Ok(manifest);
+    }
+    if !can_resume_manifest(&manifest, current_file.len) {
+        return rebuild_all(root, session_id, event_path);
+    }
+    let checkpoint = common_checkpoint(&manifest).ok_or_else(|| {
+        SessionStoreError::InvalidSessionId("derived indexes have divergent checkpoints".to_owned())
+    })?;
+    let tail = read_tail_events(event_path, checkpoint.end_offset)?;
+    let end_offset = current_file.len;
+    let event_count = checkpoint.event_count.saturating_add(tail.len());
+    let last_sequence = tail
+        .last()
+        .map_or(checkpoint.last_sequence, |event| Some(event.sequence));
+    transcript.apply_events(&tail);
+    input_history.apply_events(&tail);
+    transcript.file = current_file.clone();
+    transcript.event_count = event_count;
+    transcript.end_offset = end_offset;
+    transcript.last_sequence = last_sequence;
+    input_history.file = current_file.clone();
+    input_history.event_count = event_count;
+    input_history.end_offset = end_offset;
+    input_history.last_sequence = last_sequence;
+    write_transcript_index(root, &transcript)?;
+    write_input_history_index(root, &input_history)?;
+    write_manifest(root, session_id, current_file, &transcript, &input_history)
+}
+
+fn manifest_is_current(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
+    manifest
+        .indexes
+        .iter()
+        .all(|entry| entry.checkpoint.end_offset == file_len)
+}
+
+impl InputHistoryIndex {
+    fn apply_events(&mut self, events: &[SessionEvent]) {
+        self.entries.extend(events.iter().filter_map(|event| {
+            if let SessionEventKind::UserMessage { text, .. } = &event.kind {
+                Some(SessionInputHistoryEntry {
+                    sequence: event.sequence,
+                    text: text.clone(),
+                })
+            } else {
+                None
+            }
+        }));
+    }
+}
+
+impl TranscriptIndex {
+    fn apply_events(&mut self, events: &[SessionEvent]) {
+        let (mut spans, state) =
+            project_transcript_events(events, Some(self.projector_state.clone()));
+        self.spans.append(&mut spans);
+        self.spans
+            .sort_by_key(|span| span.source_range.start_sequence);
+        self.projector_state = state;
+    }
+}
+
+fn can_resume_manifest(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
+    manifest
+        .indexes
+        .iter()
+        .all(|entry| entry.checkpoint.end_offset <= file_len)
+}
+
+fn common_checkpoint(manifest: &DerivedIndexManifest) -> Option<DerivedSourceCheckpoint> {
+    let transcript = manifest_entry(manifest, DerivedIndexKind::Transcript).ok()?;
+    let input = manifest_entry(manifest, DerivedIndexKind::InputHistory).ok()?;
+    if transcript.checkpoint == input.checkpoint {
+        Some(transcript.checkpoint.clone())
+    } else {
+        None
+    }
+}
+
+fn read_tail_events(
+    event_path: &Path,
+    offset: u64,
+) -> Result<Vec<SessionEvent>, SessionStoreError> {
+    let report = crate::reader::read_events(event_path)?;
+    let events = report
+        .events
+        .into_iter()
+        .zip(report.entries)
+        .filter_map(|(event, entry)| (entry.offset >= offset).then_some(event))
+        .collect();
+    Ok(events)
+}
+
+fn project_transcript_events(
+    events: &[SessionEvent],
+    initial_state: Option<TranscriptProjectorState>,
+) -> (
+    Vec<index::TranscriptProjectionIndexEntry>,
+    TranscriptProjectorState,
+) {
+    let mut projector = TranscriptIncrementalProjector::new(initial_state.unwrap_or_default());
+    for event in events {
+        projector.apply(event);
+    }
+    projector.finish_batch()
+}
+
+struct TranscriptIncrementalProjector {
+    state: TranscriptProjectorState,
+    spans: Vec<index::TranscriptProjectionIndexEntry>,
+}
+
+impl TranscriptIncrementalProjector {
+    const fn new(state: TranscriptProjectorState) -> Self {
+        Self {
+            state,
+            spans: Vec::new(),
+        }
+    }
+
+    fn apply(&mut self, event: &SessionEvent) {
+        match &event.kind {
+            SessionEventKind::AssistantDelta { text } => {
+                self.push_stream_delta(
+                    TranscriptProjectionItemKind::AssistantMessage,
+                    event.sequence,
+                    text.len(),
+                );
+            }
+            SessionEventKind::AssistantMessage { text } => {
+                self.finish_stream(
+                    TranscriptProjectionItemKind::AssistantMessage,
+                    event.sequence,
+                    text.len(),
+                );
+            }
+            SessionEventKind::AssistantReasoningDelta { text } => {
+                self.push_stream_delta(
+                    TranscriptProjectionItemKind::Reasoning,
+                    event.sequence,
+                    text.len(),
+                );
+            }
+            SessionEventKind::AssistantReasoningMessage { text } => {
+                self.finish_stream(
+                    TranscriptProjectionItemKind::Reasoning,
+                    event.sequence,
+                    text.len(),
+                );
+            }
+            SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                arguments_json,
+                ..
+            } => {
+                self.flush_streams();
+                self.state.tools.insert(
+                    tool_call_id.clone(),
+                    PendingToolState {
+                        start_sequence: event.sequence,
+                        end_sequence: event.sequence,
+                        content_bytes: arguments_json.len(),
+                        saw_stream_output: false,
+                    },
+                );
+            }
+            SessionEventKind::ToolInvocationStream { event: stream } => {
+                self.flush_streams();
+                self.apply_tool_stream(event.sequence, stream);
+            }
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                ..
+            } => {
+                self.flush_streams();
+                self.finish_tool_invocation(tool_call_id, event.sequence, result.len());
+            }
+            _ => {
+                self.flush_streams();
+                if let Some((kind, bytes)) = non_streaming_transcript_item(event) {
+                    self.push_span(kind, event.sequence, event.sequence, bytes);
+                }
+            }
+        }
+    }
+
+    fn finish_batch(
+        mut self,
+    ) -> (
+        Vec<index::TranscriptProjectionIndexEntry>,
+        TranscriptProjectorState,
+    ) {
+        self.flush_streams();
+        self.spans.sort_by_key(|span| {
+            (
+                span.source_range.start_sequence,
+                span.source_range.end_sequence,
+            )
+        });
+        (self.spans, self.state)
+    }
+
+    fn push_stream_delta(
+        &mut self,
+        kind: TranscriptProjectionItemKind,
+        sequence: u64,
+        bytes: usize,
+    ) {
+        let slot = self.pending_stream_slot(kind);
+        if let Some(stream) = slot {
+            stream.end_sequence = sequence;
+            stream.content_bytes = stream.content_bytes.saturating_add(bytes);
+        } else {
+            *self.pending_stream_slot(kind) = Some(PendingStreamState {
+                kind,
+                start_sequence: sequence,
+                end_sequence: sequence,
+                content_bytes: bytes,
+            });
+        }
+    }
+
+    fn finish_stream(&mut self, kind: TranscriptProjectionItemKind, sequence: u64, bytes: usize) {
+        let start_sequence = self
+            .pending_stream_slot(kind)
+            .take()
+            .map_or(sequence, |stream| stream.start_sequence);
+        self.push_span(kind, start_sequence, sequence, bytes);
+    }
+
+    fn flush_streams(&mut self) {
+        let assistant = self.state.assistant.take();
+        let reasoning = self.state.reasoning.take();
+        if let Some(stream) = assistant {
+            self.push_span(
+                stream.kind,
+                stream.start_sequence,
+                stream.end_sequence,
+                stream.content_bytes,
+            );
+        }
+        if let Some(stream) = reasoning {
+            self.push_span(
+                stream.kind,
+                stream.start_sequence,
+                stream.end_sequence,
+                stream.content_bytes,
+            );
+        }
+    }
+
+    fn apply_tool_stream(&mut self, sequence: u64, event: &ToolInvocationStreamEvent) {
+        let tool_call_id = tool_stream_tool_call_id(event).to_owned();
+        let content_bytes = tool_stream_content_bytes(event);
+        let entry = self
+            .state
+            .tools
+            .entry(tool_call_id)
+            .or_insert(PendingToolState {
+                start_sequence: sequence,
+                end_sequence: sequence,
+                content_bytes: 0,
+                saw_stream_output: false,
+            });
+        entry.end_sequence = sequence;
+        entry.content_bytes = entry.content_bytes.saturating_add(content_bytes);
+        if !matches!(event, ToolInvocationStreamEvent::Started { .. }) {
+            entry.saw_stream_output = true;
+        }
+    }
+
+    fn finish_tool_invocation(&mut self, tool_call_id: &str, sequence: u64, result_bytes: usize) {
+        if let Some(mut invocation) = self.state.tools.remove(tool_call_id) {
+            invocation.end_sequence = sequence;
+            if !invocation.saw_stream_output {
+                invocation.content_bytes = invocation.content_bytes.saturating_add(result_bytes);
+            }
+            self.push_span(
+                TranscriptProjectionItemKind::ToolInvocation,
+                invocation.start_sequence,
+                invocation.end_sequence,
+                invocation.content_bytes,
+            );
+        } else {
+            self.push_span(
+                TranscriptProjectionItemKind::ToolInvocation,
+                sequence,
+                sequence,
+                result_bytes,
+            );
+        }
+    }
+
+    fn push_span(
+        &mut self,
+        kind: TranscriptProjectionItemKind,
+        start_sequence: u64,
+        end_sequence: u64,
+        content_bytes: usize,
+    ) {
+        self.spans.push(index::TranscriptProjectionIndexEntry {
+            projection_item_id: format!("transcript:{start_sequence}:{end_sequence}"),
+            kind,
+            source_range: ProjectionSourceRange {
+                start_sequence,
+                end_sequence,
+            },
+            content_bytes,
+        });
+    }
+
+    fn pending_stream_slot(
+        &mut self,
+        kind: TranscriptProjectionItemKind,
+    ) -> &mut Option<PendingStreamState> {
+        match kind {
+            TranscriptProjectionItemKind::AssistantMessage => &mut self.state.assistant,
+            TranscriptProjectionItemKind::Reasoning => &mut self.state.reasoning,
+            _ => unreachable!("only streaming transcript item kinds have pending slots"),
+        }
+    }
+}
+
+fn non_streaming_transcript_item(
+    event: &SessionEvent,
+) -> Option<(TranscriptProjectionItemKind, usize)> {
+    match &event.kind {
+        SessionEventKind::UserMessage { text, .. } | SessionEventKind::SystemMessage { text } => {
+            Some((TranscriptProjectionItemKind::UserMessage, text.len()))
+        }
+        SessionEventKind::PermissionRequested { arguments_json, .. } => Some((
+            TranscriptProjectionItemKind::Permission,
+            arguments_json.len(),
+        )),
+        SessionEventKind::PermissionResolved { .. } => {
+            Some((TranscriptProjectionItemKind::Permission, 0))
+        }
+        SessionEventKind::ContextCompacted { summary, .. } => Some((
+            TranscriptProjectionItemKind::ContextCompaction,
+            summary.len(),
+        )),
+        SessionEventKind::WorkingDirectoryChanged {
+            old_working_directory,
+            new_working_directory,
+        } => Some((
+            TranscriptProjectionItemKind::WorkingDirectoryChange,
+            old_working_directory.as_os_str().len() + new_working_directory.as_os_str().len(),
+        )),
+        SessionEventKind::SkillInvoked { arguments, .. } => {
+            Some((TranscriptProjectionItemKind::Other, arguments.len()))
+        }
+        SessionEventKind::SkillInvocationFailed { error, .. } => {
+            Some((TranscriptProjectionItemKind::Other, error.len()))
+        }
+        SessionEventKind::ModelUsage { .. } => Some((TranscriptProjectionItemKind::Other, 0)),
+        _ => None,
+    }
+}
+
+fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
+    match event {
+        ToolInvocationStreamEvent::Started { tool_call_id, .. }
+        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
+    }
+}
+
+const fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
+    match event {
+        ToolInvocationStreamEvent::Started { tool_name, .. } => tool_name.len(),
+        ToolInvocationStreamEvent::OutputDelta { text, .. }
+        | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
+        ToolInvocationStreamEvent::Finished { .. } => 0,
+    }
 }
 
 fn remove_legacy_derived_state(
@@ -567,20 +998,38 @@ pub fn write_manifest(
                 id: DerivedIndexKind::Transcript.id().to_owned(),
                 version: DerivedIndexKind::Transcript.current_version(),
                 path: "transcript.jsonl".to_owned(),
-                event_count: transcript_index.event_count,
+                checkpoint: checkpoint_from_transcript(transcript_index),
+                transcript_state: Some(transcript_index.projector_state.clone()),
                 item_count: transcript_index.spans.len(),
             },
             DerivedIndexManifestEntry {
                 id: DerivedIndexKind::InputHistory.id().to_owned(),
                 version: DerivedIndexKind::InputHistory.current_version(),
                 path: "input_history.jsonl".to_owned(),
-                event_count: input_index.event_count,
+                checkpoint: checkpoint_from_input_history(input_index),
+                transcript_state: None,
                 item_count: input_index.entries.len(),
             },
         ],
     };
     persist_manifest(root, &manifest)?;
     Ok(manifest)
+}
+
+const fn checkpoint_from_transcript(index: &TranscriptIndex) -> DerivedSourceCheckpoint {
+    DerivedSourceCheckpoint {
+        event_count: index.event_count,
+        end_offset: index.end_offset,
+        last_sequence: index.last_sequence,
+    }
+}
+
+const fn checkpoint_from_input_history(index: &InputHistoryIndex) -> DerivedSourceCheckpoint {
+    DerivedSourceCheckpoint {
+        event_count: index.event_count,
+        end_offset: index.end_offset,
+        last_sequence: index.last_sequence,
+    }
 }
 
 fn persist_manifest(root: &Path, manifest: &DerivedIndexManifest) -> Result<(), SessionStoreError> {
@@ -699,7 +1148,9 @@ fn validate_manifest_counts(
     input_history: &InputHistoryIndex,
 ) -> Result<(), DerivedIndexInvalid> {
     let transcript_entry = manifest_entry(manifest, DerivedIndexKind::Transcript)?;
-    if transcript_entry.event_count != transcript.event_count
+    if transcript_entry.checkpoint.event_count != transcript.event_count
+        || transcript_entry.checkpoint.end_offset != transcript.end_offset
+        || transcript_entry.checkpoint.last_sequence != transcript.last_sequence
         || transcript_entry.item_count != transcript.spans.len()
     {
         return Err(DerivedIndexInvalid::ManifestEntryCount {
@@ -707,7 +1158,9 @@ fn validate_manifest_counts(
         });
     }
     let input_entry = manifest_entry(manifest, DerivedIndexKind::InputHistory)?;
-    if input_entry.event_count != input_history.event_count
+    if input_entry.checkpoint.event_count != input_history.event_count
+        || input_entry.checkpoint.end_offset != input_history.end_offset
+        || input_entry.checkpoint.last_sequence != input_history.last_sequence
         || input_entry.item_count != input_history.entries.len()
     {
         return Err(DerivedIndexInvalid::ManifestEntryCount {
@@ -756,8 +1209,16 @@ fn apply_manifest_metadata(
         .map_err(|error| invalid_to_store(&error))?;
     let input_entry = manifest_entry(manifest, DerivedIndexKind::InputHistory)
         .map_err(|error| invalid_to_store(&error))?;
-    transcript.event_count = transcript_entry.event_count;
-    input_history.event_count = input_entry.event_count;
+    transcript.event_count = transcript_entry.checkpoint.event_count;
+    transcript.end_offset = transcript_entry.checkpoint.end_offset;
+    transcript.last_sequence = transcript_entry.checkpoint.last_sequence;
+    transcript.projector_state = transcript_entry
+        .transcript_state
+        .clone()
+        .unwrap_or_default();
+    input_history.event_count = input_entry.checkpoint.event_count;
+    input_history.end_offset = input_entry.checkpoint.end_offset;
+    input_history.last_sequence = input_entry.checkpoint.last_sequence;
     transcript.file = manifest.file.clone();
     input_history.file = manifest.file.clone();
     Ok(())
@@ -787,7 +1248,7 @@ fn health_from_manifest(manifest: &DerivedIndexManifest, rebuilt: bool) -> Deriv
                     kind,
                     fresh: true,
                     rebuilt,
-                    event_count: Some(entry.event_count),
+                    event_count: Some(entry.checkpoint.event_count),
                     item_count: Some(entry.item_count),
                     issue: None,
                 })
@@ -859,6 +1320,8 @@ fn load_input_history_index_inner(
         session_id: header.session_id,
         file: header.file,
         event_count: header.event_count,
+        end_offset: header.end_offset,
+        last_sequence: header.last_sequence,
         entries,
     };
     input_index
@@ -902,6 +1365,9 @@ fn load_transcript_index_inner(
         session_id: header.session_id,
         file: header.file,
         event_count: header.event_count,
+        end_offset: header.end_offset,
+        last_sequence: header.last_sequence,
+        projector_state: header.projector_state,
         spans,
     };
     transcript_index
@@ -935,6 +1401,9 @@ struct TranscriptIndexHeader {
     session_id: SessionId,
     file: EventFileFingerprint,
     event_count: usize,
+    end_offset: u64,
+    last_sequence: Option<u64>,
+    projector_state: TranscriptProjectorState,
 }
 
 impl From<&TranscriptIndex> for TranscriptIndexHeader {
@@ -944,6 +1413,9 @@ impl From<&TranscriptIndex> for TranscriptIndexHeader {
             session_id: value.session_id,
             file: value.file.clone(),
             event_count: value.event_count,
+            end_offset: value.end_offset,
+            last_sequence: value.last_sequence,
+            projector_state: value.projector_state.clone(),
         }
     }
 }
@@ -954,6 +1426,8 @@ struct InputHistoryIndexHeader {
     session_id: SessionId,
     file: EventFileFingerprint,
     event_count: usize,
+    end_offset: u64,
+    last_sequence: Option<u64>,
 }
 
 impl From<&InputHistoryIndex> for InputHistoryIndexHeader {
@@ -963,6 +1437,8 @@ impl From<&InputHistoryIndex> for InputHistoryIndexHeader {
             session_id: value.session_id,
             file: value.file.clone(),
             event_count: value.event_count,
+            end_offset: value.end_offset,
+            last_sequence: value.last_sequence,
         }
     }
 }

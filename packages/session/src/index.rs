@@ -330,21 +330,6 @@ impl SessionIndex {
     }
 }
 
-impl TranscriptProjectionIndexEntry {
-    #[must_use]
-    pub fn from_item(item: &bcode_session_models::TranscriptProjectionItem) -> Self {
-        Self {
-            projection_item_id: format!(
-                "transcript:{}:{}",
-                item.source_range.start_sequence, item.source_range.end_sequence
-            ),
-            kind: item.kind,
-            source_range: item.source_range,
-            content_bytes: item.content_bytes,
-        }
-    }
-}
-
 impl From<&SessionReadIssue> for SessionIndexIssue {
     fn from(value: &SessionReadIssue) -> Self {
         Self {

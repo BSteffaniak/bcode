@@ -361,7 +361,7 @@ impl SessionEventStore {
             events_timer.elapsed_ms(),
         );
         self.metrics.record_histogram(
-            "session.store.event_range.event_count",
+            "session.store.event_range.checkpoint.event_count",
             usize_to_u64(events.len()),
         );
         self.metrics.record_histogram(
@@ -4357,12 +4357,12 @@ mod tests {
         )
         .expect("manifest should decode");
         assert_eq!(
-            manifest_before.indexes[0].event_count,
-            manifest_after.indexes[0].event_count
+            manifest_before.indexes[0].checkpoint.event_count,
+            manifest_after.indexes[0].checkpoint.event_count
         );
         assert_eq!(
-            manifest_before.indexes[1].event_count,
-            manifest_after.indexes[1].event_count
+            manifest_before.indexes[1].checkpoint.event_count,
+            manifest_after.indexes[1].checkpoint.event_count
         );
         assert_eq!(
             manifest_before.indexes[0].item_count,
@@ -4382,11 +4382,11 @@ mod tests {
         assert_eq!(metadata.event_count, transcript_index.event_count);
         assert_eq!(
             metadata.event_count,
-            manifest_rebuilt.indexes[0].event_count
+            manifest_rebuilt.indexes[0].checkpoint.event_count
         );
         assert_eq!(
             metadata.event_count,
-            manifest_rebuilt.indexes[1].event_count
+            manifest_rebuilt.indexes[1].checkpoint.event_count
         );
         assert_eq!(
             manifest_before.indexes[0].item_count,
