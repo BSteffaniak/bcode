@@ -711,15 +711,22 @@ impl SessionEventStore {
             Err(_error) => {
                 self.metrics
                     .increment_counter("session.store.input_history.ensure_error_total");
+                let stale_entries =
+                    derived::load_stale_input_history_entries(&self.root, session_id)
+                        .unwrap_or_default();
                 self.metrics.record_histogram(
                     "session.store.input_history.load_index_duration_ms",
                     index_timer.elapsed_ms(),
                 );
                 self.metrics.record_histogram(
+                    "session.store.input_history.entry_count",
+                    usize_to_u64(stale_entries.len()),
+                );
+                self.metrics.record_histogram(
                     "session.store.input_history.total_duration_ms",
                     total_timer.elapsed_ms(),
                 );
-                return Vec::new();
+                return stale_entries;
             }
         };
         self.metrics.record_histogram(

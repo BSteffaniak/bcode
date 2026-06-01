@@ -534,6 +534,14 @@ fn index_health_without_manifest(
     vec![transcript, input_history]
 }
 
+pub fn load_stale_input_history_entries(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
+    let index = load_input_history_index_lenient(root, session_id).map_err(load_error_to_store)?;
+    Ok(index.entries)
+}
+
 pub fn ensure_input_history_index(
     root: &Path,
     session_id: SessionId,
