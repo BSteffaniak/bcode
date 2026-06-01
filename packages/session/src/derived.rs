@@ -534,6 +534,54 @@ fn index_health_without_manifest(
     vec![transcript, input_history]
 }
 
+/// Incrementally advance all derived indexes for one newly-appended event.
+///
+/// This is a normal append-path update only. It refuses to rebuild or catch up stale/missing
+/// derived state; explicit repair/reindex paths own full replay behavior.
+pub fn append_event_to_indexes(
+    root: &Path,
+    session_id: SessionId,
+    event_path: &Path,
+    entry: &index::SessionIndexEntry,
+    event: &SessionEvent,
+) -> Result<DerivedIndexManifest, SessionStoreError> {
+    let manifest = load_manifest(root, session_id).map_err(|_error| {
+        SessionStoreError::InvalidSessionId(
+            "derived manifest missing; explicit repair is required".to_owned(),
+        )
+    })?;
+    validate_manifest(root, &manifest, session_id).map_err(|error| invalid_to_store(&error))?;
+    if manifest.indexes.iter().any(|manifest_entry| {
+        manifest_entry.checkpoint.end_offset != entry.offset
+            || manifest_entry.checkpoint.event_count
+                != usize::try_from(event.sequence).unwrap_or(usize::MAX)
+            || manifest_entry.checkpoint.last_sequence != event.sequence.checked_sub(1)
+    }) {
+        return Err(SessionStoreError::InvalidSessionId(
+            "derived manifest is not at the append checkpoint; explicit repair is required"
+                .to_owned(),
+        ));
+    }
+
+    let (mut transcript, mut input_history) =
+        load_indexes_from_manifest(root, session_id, &manifest)?;
+    let file = index::fingerprint(event_path)?;
+    let events = std::slice::from_ref(event);
+    let new_spans = transcript.apply_events(events);
+    let new_entries = input_history.apply_events(events);
+    transcript.file = file.clone();
+    transcript.event_count = transcript.event_count.saturating_add(1);
+    transcript.end_offset = entry.offset.saturating_add(entry.frame_len);
+    transcript.last_sequence = Some(event.sequence);
+    input_history.file = file.clone();
+    input_history.event_count = input_history.event_count.saturating_add(1);
+    input_history.end_offset = entry.offset.saturating_add(entry.frame_len);
+    input_history.last_sequence = Some(event.sequence);
+    append_transcript_spans(root, session_id, &new_spans)?;
+    append_input_history_entries(root, session_id, &new_entries)?;
+    write_manifest(root, session_id, file, &transcript, &input_history)
+}
+
 pub fn load_stale_input_history_entries(
     root: &Path,
     session_id: SessionId,

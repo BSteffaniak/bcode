@@ -440,6 +440,22 @@ impl SessionEventStore {
                 issues: Vec::new(),
             };
             let _ = derived::initialize_empty_after_session_created(&self.root, &index);
+        } else {
+            let derived_timer = self.metrics.timer();
+            if let Err(error) =
+                derived::append_event_to_indexes(&self.root, event.session_id, &path, &entry, event)
+            {
+                self.metrics
+                    .increment_counter("session.derived_index.append_error_total");
+                eprintln!(
+                    "failed to update derived session indexes for {}: {error}",
+                    event.session_id
+                );
+            }
+            self.metrics.record_histogram(
+                "session.derived_index.append_duration_ms",
+                derived_timer.elapsed_ms(),
+            );
         }
         self.metrics.record_histogram(
             "session.event_log.append_duration_ms",
