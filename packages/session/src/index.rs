@@ -122,22 +122,22 @@ pub struct SessionIndexHealth {
 
 #[derive(Default)]
 struct SessionIndexBuilder {
-    name: Option<String>,
-    suppress_derived_name: bool,
-    first_user_message: Option<String>,
-    working_directory: Option<PathBuf>,
+    pub name: Option<String>,
+    pub suppress_derived_name: bool,
+    pub first_user_message: Option<String>,
+    pub working_directory: Option<PathBuf>,
     next_sequence: u64,
-    has_user_message: bool,
+    pub has_user_message: bool,
     current_provider: Option<String>,
     current_model: Option<String>,
     current_agent: Option<String>,
     latest_compaction_sequence: Option<u64>,
     total_metered_tokens: u64,
-    import: Option<SessionImportSummary>,
+    pub import: Option<SessionImportSummary>,
 }
 
 impl SessionIndexBuilder {
-    fn apply_event(&mut self, event: &SessionEvent) {
+    pub fn apply_event(&mut self, event: &SessionEvent) {
         self.next_sequence = self.next_sequence.max(event.sequence.saturating_add(1));
         match &event.kind {
             SessionEventKind::SessionCreated {
@@ -448,6 +448,104 @@ pub fn inspect_index(
     }
 }
 
+pub fn catalog_state_from_first_entry(
+    session_id: SessionId,
+    file: &EventFileFingerprint,
+    entries: &[SessionIndexEntry],
+    first_event: &SessionEvent,
+) -> Option<SessionState> {
+    let mut builder = SessionIndexBuilder::default();
+    builder.apply_event(first_event);
+    let working_directory = builder.working_directory.clone()?;
+    let explicit_name = builder.name.clone();
+    let derived_title = if builder.import.is_some()
+        && builder.name.is_none()
+        && builder.first_user_message.is_some()
+    {
+        builder.first_user_message.clone()
+    } else {
+        (!builder.suppress_derived_name)
+            .then(|| {
+                builder
+                    .first_user_message
+                    .as_deref()
+                    .map(crate::title_from_first_prompt)
+            })
+            .flatten()
+    };
+    let name = explicit_name.clone().or_else(|| derived_title.clone());
+    let title_source = if explicit_name.is_some() {
+        SessionTitleSource::Explicit
+    } else if derived_title.is_some() && builder.import.is_some() && !builder.has_user_message {
+        SessionTitleSource::Imported
+    } else if derived_title.is_some() {
+        SessionTitleSource::FirstUserMessage
+    } else {
+        SessionTitleSource::EmptyDraft
+    };
+    let summary = SessionSummary {
+        id: session_id,
+        name,
+        explicit_name,
+        derived_title,
+        title_source,
+        client_count: 0,
+        created_at_ms: file.created_at_ms(),
+        updated_at_ms: file.modified_at_ms(),
+        working_directory: working_directory.clone(),
+        import: builder.import,
+    };
+    Some(SessionState {
+        summary,
+        working_directory,
+        clients: std::collections::BTreeSet::new(),
+        events: None,
+        next_sequence: entries
+            .last()
+            .map_or(0, |entry| entry.sequence.saturating_add(1)),
+        event_count: entries.len(),
+        has_user_message: entries.iter().any(|entry| entry.kind == "user_message"),
+        current_provider: None,
+        current_model: None,
+        current_agent: None,
+        latest_compaction_sequence: None,
+        total_metered_tokens: 0,
+        index_issues: Vec::new(),
+        index_status: crate::SessionIndexStatusKind::Stale,
+        access_status: crate::SessionAccessStatus::ReadWrite,
+        sender: tokio::sync::broadcast::channel(512).0,
+    })
+}
+
+pub fn load_index_metadata(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<Option<SessionIndex>, SessionStoreError> {
+    let path = index_path(root, session_id);
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SessionStoreError::Io(error)),
+    };
+    let version =
+        serde_json::from_str::<RawIndexVersion>(&contents).map_err(SessionStoreError::Index)?;
+    if version.index_version != SESSION_INDEX_VERSION {
+        return Ok(None);
+    }
+    if let Some(index_session_id) = version.session_id
+        && index_session_id != session_id
+    {
+        return Ok(None);
+    }
+    let index =
+        serde_json::from_str::<SessionIndex>(&contents).map_err(SessionStoreError::Index)?;
+    if index.session_id == session_id {
+        Ok(Some(index))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn write_index(root: &Path, index: &SessionIndex) -> Result<(), SessionStoreError> {
     let path = index_path(root, index.session_id);
     if let Some(parent) = path.parent() {
@@ -546,7 +644,7 @@ pub fn rebuild_index_metadata(
     ))
 }
 
-const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
+pub const fn event_kind_tag(kind: &SessionEventKind) -> &'static str {
     match kind {
         SessionEventKind::SessionCreated { .. } => "session_created",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",

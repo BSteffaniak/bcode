@@ -221,12 +221,79 @@ impl SessionEventStore {
         if let Some(index) = index::load_fresh_index(&self.root, session_id, path)? {
             return Ok(Some(index.into_state()));
         }
-        let Some(index) = index::rebuild_index_metadata(&self.root, session_id, path)? else {
+        let event_path = self.event_path(session_id);
+        if let Ok(index) = self.ensure_fresh_index(session_id) {
+            return Ok(Some(index.into_state()));
+        }
+        let Ok(entries) = index::read_entries(&self.root, session_id) else {
+            return self.synthesize_initial_index_from_first_event(session_id, path);
+        };
+        let Some(first_entry) = entries.first() else {
             return Ok(None);
         };
-        let mut state = index.into_state();
-        state.index_status = SessionIndexStatusKind::Stale;
-        state.access_status = self.inspect_access_status(session_id)?;
+        if first_entry.sequence != 0 || first_entry.kind != "session_created" {
+            return Ok(None);
+        }
+        let first_event = reader::read_event_at(path, first_entry.offset)?;
+        let file = index::fingerprint(&event_path)?;
+        Ok(index::catalog_state_from_first_entry(
+            session_id,
+            &file,
+            &entries,
+            &first_event,
+        ))
+    }
+
+    fn synthesize_initial_index_from_first_event(
+        &self,
+        session_id: SessionId,
+        path: &Path,
+    ) -> Result<Option<SessionState>, SessionStoreError> {
+        let first_event = reader::read_event_at(path, 0)?;
+        let event_path = self.event_path(session_id);
+        let file = index::fingerprint(&event_path)?;
+        let entry = index::SessionIndexEntry::from_event(&first_event, 0, file.len);
+        if first_event.sequence != 0 || entry.kind != "session_created" {
+            return Ok(None);
+        }
+        index::write_entries(&self.root, session_id, std::slice::from_ref(&entry))?;
+        let Some(mut state) = index::catalog_state_from_first_entry(
+            session_id,
+            &file,
+            std::slice::from_ref(&entry),
+            &first_event,
+        ) else {
+            return Ok(None);
+        };
+        state.access_status = access_status_from_schema_versions(
+            Some(first_event.schema_version),
+            Some(first_event.schema_version),
+            false,
+        );
+        index::write_index(
+            &self.root,
+            &index::SessionIndex {
+                index_version: index::SESSION_INDEX_VERSION,
+                session_id,
+                file: file.clone(),
+                summary: state.summary(),
+                working_directory: state.working_directory.clone(),
+                next_sequence: state.next_sequence,
+                event_count: state.event_count,
+                created_at_ms: state.summary.created_at_ms,
+                updated_at_ms: state.summary.updated_at_ms,
+                has_user_message: state.has_user_message,
+                last_good_offset: file.len,
+                current_provider: state.current_provider.clone(),
+                current_model: state.current_model.clone(),
+                current_agent: state.current_agent.clone(),
+                latest_compaction_sequence: state.latest_compaction_sequence,
+                total_metered_tokens: state.total_metered_tokens,
+                min_event_schema_version: Some(first_event.schema_version),
+                max_event_schema_version: Some(first_event.schema_version),
+                issues: Vec::new(),
+            },
+        )?;
         Ok(Some(state))
     }
 
@@ -408,28 +475,88 @@ impl SessionEventStore {
         Ok(events)
     }
 
-    fn inspect_access_status(
-        &self,
-        session_id: SessionId,
-    ) -> Result<SessionAccessStatus, SessionStoreError> {
-        let path = self.event_path(session_id);
-        let report = reader::read_events(&path)?;
-        Ok(access_status_from_report(&report))
-    }
-
     fn ensure_fresh_index(
         &self,
         session_id: SessionId,
     ) -> Result<index::SessionIndex, SessionStoreError> {
         let event_path = self.event_path(session_id);
-        match index::load_fresh_index(&self.root, session_id, &event_path)? {
-            Some(index) => Ok(index),
-            None => index::rebuild_index(&self.root, session_id, &event_path)?
-                .0
-                .ok_or_else(|| {
-                    SessionStoreError::InvalidSessionId(format!("empty session log: {session_id}"))
-                }),
+        if let Some(index) = index::load_fresh_index(&self.root, session_id, &event_path)? {
+            return Ok(index);
         }
+        self.catch_up_metadata_index_from_entries(session_id)
+    }
+
+    fn catch_up_metadata_index_from_entries(
+        &self,
+        session_id: SessionId,
+    ) -> Result<index::SessionIndex, SessionStoreError> {
+        let event_path = self.event_path(session_id);
+        let mut index = index::load_index_metadata(&self.root, session_id)?.ok_or_else(|| {
+            SessionStoreError::InvalidSessionId(
+                "session metadata index is missing; run session repair".to_owned(),
+            )
+        })?;
+        let entries = index::read_entries(&self.root, session_id).map_err(|_error| {
+            SessionStoreError::InvalidSessionId(
+                "session entry index is missing; run session repair".to_owned(),
+            )
+        })?;
+        if entries.len() < index.event_count {
+            return Err(SessionStoreError::InvalidSessionId(
+                "session entry index is behind metadata; run session repair".to_owned(),
+            ));
+        }
+        let append_entries = entries
+            .iter()
+            .skip(index.event_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        if append_entries.is_empty() {
+            return Err(SessionStoreError::InvalidSessionId(
+                "session metadata index is stale but has no entry-index tail; run session repair"
+                    .to_owned(),
+            ));
+        }
+        let tail_events = read_indexed_events(&event_path, &append_entries)?;
+        let mut state = SessionState::from_index(index.clone());
+        for event in tail_events {
+            if event.sequence != state.next_sequence {
+                return Err(SessionStoreError::InvalidSessionId(
+                    "session entry index has non-contiguous metadata tail; run session repair"
+                        .to_owned(),
+                ));
+            }
+            let activity_timestamp_ms = index.file.modified_at_ms();
+            state.apply_persisted_event(event, activity_timestamp_ms);
+        }
+        let file = index::fingerprint(&event_path)?;
+        index = index::SessionIndex {
+            index_version: index::SESSION_INDEX_VERSION,
+            session_id,
+            file: file.clone(),
+            summary: state.summary(),
+            working_directory: state.working_directory,
+            next_sequence: state.next_sequence,
+            event_count: state.event_count,
+            created_at_ms: state.summary.created_at_ms,
+            updated_at_ms: file.modified_at_ms(),
+            has_user_message: state.has_user_message,
+            last_good_offset: append_entries
+                .last()
+                .map_or(index.last_good_offset, |entry| {
+                    entry.offset.saturating_add(entry.frame_len)
+                }),
+            current_provider: state.current_provider,
+            current_model: state.current_model,
+            current_agent: state.current_agent,
+            latest_compaction_sequence: state.latest_compaction_sequence,
+            total_metered_tokens: state.total_metered_tokens,
+            min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            issues: state.index_issues,
+        };
+        index::write_index(&self.root, &index)?;
+        Ok(index)
     }
 
     fn read_session_history_page(
@@ -565,19 +692,7 @@ impl SessionEventStore {
         let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
         let index_timer = self.metrics.timer();
-        let index = if let Some(index) =
-            index::load_fresh_index(&self.root, session_id, &event_path)?
-        {
-            index
-        } else {
-            self.metrics
-                .increment_counter("session.model_context_events.index_rebuild_total");
-            index::rebuild_index(&self.root, session_id, &event_path)?
-                .0
-                .ok_or_else(|| {
-                    SessionStoreError::InvalidSessionId(format!("empty session log: {session_id}"))
-                })?
-        };
+        let index = self.ensure_fresh_index(session_id)?;
         self.metrics.record_histogram(
             "session.model_context_events.load_index_duration_ms",
             index_timer.elapsed_ms(),
@@ -587,15 +702,14 @@ impl SessionEventStore {
             index.event_count as u64,
         );
         let read_entries_timer = self.metrics.timer();
-        let mut refreshed_index = None;
         let mut entries = match index::read_entries(&self.root, session_id) {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
                 self.metrics
-                    .increment_counter("session.model_context_events.entries_rebuild_total");
-                let (rebuilt_index, _) = index::rebuild_index(&self.root, session_id, &event_path)?;
-                refreshed_index = rebuilt_index;
-                index::read_entries(&self.root, session_id)?
+                    .increment_counter("session.model_context_events.index_unavailable_total");
+                return Err(SessionStoreError::InvalidSessionId(
+                    "model context requires repaired primary entry index".to_owned(),
+                ));
             }
         };
         self.metrics.record_histogram(
@@ -710,7 +824,7 @@ impl SessionEventStore {
         );
         Ok(ModelContextEventsRead {
             events,
-            refreshed_index,
+            refreshed_index: None,
         })
     }
 
@@ -3017,6 +3131,7 @@ fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEve
         .collect()
 }
 
+#[cfg(test)]
 fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAccessStatus {
     let status = access_status_from_schema_versions(
         report.min_schema_version,
@@ -4964,9 +5079,9 @@ mod tests {
         }
 
         assert_eq!(
-            store
-                .inspect_access_status(session_id)
-                .expect("legacy encoding access should inspect"),
+            access_status_from_report(
+                &reader::read_events(&event_path).expect("legacy encoding should read")
+            ),
             SessionAccessStatus::ReadOnlyMigrationRequired
         );
         store
@@ -5238,7 +5353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_restore_defers_stale_index_rebuild_until_access() {
+    async fn persistent_restore_defers_stale_index_repair_until_explicit_reindex() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -5270,8 +5385,11 @@ mod tests {
                 },
             )
             .await
-            .expect("history page should rebuild lazily");
-        assert!(index_path.exists());
+            .expect_err("history page should require explicit repair for missing metadata index");
+        assert!(
+            !index_path.exists(),
+            "history page should not rebuild missing indexes implicitly"
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
