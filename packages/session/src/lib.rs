@@ -54,6 +54,8 @@ use tokio::task::spawn_blocking;
 
 const FRAME_V3_MAGIC: &[u8; 4] = b"BSE3";
 const FRAME_V3_VERSION: u16 = 3;
+const MAX_INLINE_METADATA_CATCH_UP_EVENTS: usize = 4096;
+const MAX_INLINE_METADATA_CATCH_UP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
@@ -237,9 +239,6 @@ impl SessionEventStore {
             return Ok(Some(index.into_state()));
         }
         let event_path = self.event_path(session_id);
-        if let Ok(index) = self.ensure_fresh_index(session_id) {
-            return Ok(Some(index.into_state()));
-        }
         let Ok(entries) = index::read_entries(&self.root, session_id) else {
             return self.synthesize_initial_index_from_first_event(session_id, path);
         };
@@ -551,6 +550,24 @@ impl SessionEventStore {
             .skip(index.event_count)
             .cloned()
             .collect::<Vec<_>>();
+        if append_entries.len() > MAX_INLINE_METADATA_CATCH_UP_EVENTS {
+            return Err(SessionStoreError::InvalidSessionId(
+                "session metadata index tail has too many events for normal access; run session repair/reindex"
+                    .to_owned(),
+            ));
+        }
+        if let (Some(first), Some(last)) = (append_entries.first(), append_entries.last()) {
+            let tail_bytes = last
+                .offset
+                .saturating_add(last.frame_len)
+                .saturating_sub(first.offset);
+            if tail_bytes > MAX_INLINE_METADATA_CATCH_UP_BYTES {
+                return Err(SessionStoreError::InvalidSessionId(
+                    "session metadata index tail is too large for normal access; run session repair/reindex"
+                        .to_owned(),
+                ));
+            }
+        }
         if append_entries.is_empty() {
             return Err(SessionStoreError::InvalidSessionId(
                 "session metadata index is stale but has no entry-index tail; run session repair"
@@ -2233,19 +2250,40 @@ impl SessionManager {
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
         let handle = self.session_handle(session_id).await?;
-        match handle.projection_window_from_index(request.clone()).await {
+        let projection_window = match handle.projection_window_from_index(request.clone()).await {
             Ok(window) => {
                 self.metrics
                     .increment_counter("session.manager.projection_window.fast_path_total");
                 Ok(window)
             }
-            Err(SessionError::UnsupportedProjectionWindow) => {
+            Err(_error) => {
                 self.metrics
                     .increment_counter("session.manager.projection_window.fallback_total");
-                handle.projection_window(request).await
+                self.projection_window_from_recent_history(session_id, request)
+                    .await
             }
-            Err(error) => Err(error),
-        }
+        }?;
+        Ok(projection_window)
+    }
+
+    async fn projection_window_from_recent_history(
+        &self,
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    ) -> Result<ProjectionWindow, SessionError> {
+        let limit = request.limits.max_events_scanned.max(1);
+        let page = self
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await?;
+        crate::projection::projection_window_from_events(&page.events, &request)
+            .ok_or(SessionError::UnsupportedProjectionWindow)
     }
 
     /// Return source events in an inclusive sequence range.
@@ -2449,12 +2487,12 @@ impl SessionManager {
                     .increment_counter("session.manager.attach_projection_window.fast_path_total");
                 window
             }
-            Err(SessionError::UnsupportedProjectionWindow) => {
+            Err(_error) => {
                 self.metrics
                     .increment_counter("session.manager.attach_projection_window.fallback_total");
-                handle.projection_window(request).await?
+                self.projection_window_from_recent_history(session_id, request)
+                    .await?
             }
-            Err(error) => return Err(error),
         };
         self.metrics.record_histogram(
             "session.manager.attach_projection_window.projection_query_duration_ms",

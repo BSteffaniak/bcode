@@ -161,14 +161,6 @@ impl SessionHandle {
         self.send(SessionCommand::History).await?
     }
 
-    pub async fn projection_window(
-        &self,
-        request: ProjectionWindowRequest,
-    ) -> Result<ProjectionWindow, SessionError> {
-        self.send(|reply| SessionCommand::ProjectionWindow { request, reply })
-            .await?
-    }
-
     pub async fn projection_window_from_index(
         &self,
         request: ProjectionWindowRequest,
@@ -281,10 +273,6 @@ enum SessionCommand {
     },
     AccessStatus(oneshot::Sender<SessionAccessStatus>),
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
-    ProjectionWindow {
-        request: ProjectionWindowRequest,
-        reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
-    },
     ProjectionWindowFromIndex {
         request: ProjectionWindowRequest,
         reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
@@ -406,9 +394,6 @@ impl SessionActor {
             }
             SessionCommand::History(reply) => {
                 let _ = reply.send(self.history().await);
-            }
-            SessionCommand::ProjectionWindow { request, reply } => {
-                let _ = reply.send(self.projection_window(request).await);
             }
             SessionCommand::ProjectionWindowFromIndex { request, reply } => {
                 let _ = reply.send(self.projection_window_from_index(request).await);
@@ -737,47 +722,6 @@ impl SessionActor {
             .as_ref()
             .ok_or(SessionError::NotFound(self.state.summary.id))?;
         Ok(store.read_session_events(self.state.summary.id).await?)
-    }
-
-    async fn projection_window(
-        &self,
-        request: ProjectionWindowRequest,
-    ) -> Result<ProjectionWindow, SessionError> {
-        let started_at = Instant::now();
-        let events = self.history().await?;
-        let window = crate::projection::projection_window_from_events(&events, &request)
-            .ok_or(SessionError::UnsupportedProjectionWindow)?;
-        if let Some(metrics) = self.store.as_ref().map(SessionStoreExecutor::metrics) {
-            metrics.record_histogram(
-                "session.actor.projection_window.duration_ms",
-                elapsed_ms(started_at),
-            );
-            metrics.record_histogram(
-                "session.actor.projection_window.scanned_event_count",
-                usize_to_u64(window.scanned_events),
-            );
-            metrics.record_histogram(
-                "session.actor.projection_window.selected_item_count",
-                usize_to_u64(window.transcript_items.len()),
-            );
-            metrics.record_histogram(
-                "session.actor.projection_window.selected_event_count",
-                window
-                    .source_range
-                    .map_or(0, |range| range.end_sequence - range.start_sequence + 1),
-            );
-            metrics.record_histogram(
-                "session.actor.projection_window.estimated_row_count",
-                usize_to_u64(
-                    window
-                        .transcript_items
-                        .iter()
-                        .map(|item| item.estimated_rows.unwrap_or(1))
-                        .sum(),
-                ),
-            );
-        }
-        Ok(window)
     }
 
     async fn projection_window_from_index(

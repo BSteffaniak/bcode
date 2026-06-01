@@ -18,6 +18,12 @@ pub const TRANSCRIPT_INDEX_VERSION: u16 = 1;
 /// Current durable input history index format version.
 pub const INPUT_HISTORY_INDEX_VERSION: u16 = 1;
 
+/// Maximum derived-index tail bytes normal attach/read paths will catch up inline.
+const MAX_INLINE_DERIVED_CATCH_UP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Maximum derived-index tail events normal attach/read paths will catch up inline.
+const MAX_INLINE_DERIVED_CATCH_UP_EVENTS: usize = 4096;
+
 /// Derived index owned by the session store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -597,7 +603,20 @@ fn catch_up_manifest(
         .map_err(|error| invalid_to_store(&error))?
         .checkpoint
         .clone();
+    let tail_len = current_file.len.saturating_sub(checkpoint.end_offset);
+    if tail_len > MAX_INLINE_DERIVED_CATCH_UP_BYTES {
+        return Err(SessionStoreError::InvalidSessionId(
+            "derived index tail is too large for normal attach; run session repair/reindex"
+                .to_owned(),
+        ));
+    }
     let tail = read_tail_events(event_path, checkpoint.end_offset)?;
+    if tail.len() > MAX_INLINE_DERIVED_CATCH_UP_EVENTS {
+        return Err(SessionStoreError::InvalidSessionId(
+            "derived index tail has too many events for normal attach; run session repair/reindex"
+                .to_owned(),
+        ));
+    }
     let end_offset = current_file.len;
     let event_count = checkpoint.event_count.saturating_add(tail.len());
     let last_sequence = tail
