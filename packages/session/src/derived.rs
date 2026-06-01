@@ -335,6 +335,7 @@ pub fn rebuild_all(
     let input_index = InputHistoryIndex::from_events(session_id, file.clone(), &report.events);
     write_transcript_index(root, &transcript_index)?;
     write_input_history_index(root, &input_index)?;
+    remove_legacy_derived_state(root, session_id)?;
     write_manifest(root, session_id, file, &transcript_index, &input_index)
 }
 
@@ -473,6 +474,21 @@ pub fn ensure_transcript_index(
 
 const fn manifest_covers_file_len(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
     manifest.file.len == file_len
+}
+
+fn remove_legacy_derived_state(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<(), SessionStoreError> {
+    for file_name in ["dirty.json", "transcript_state.json"] {
+        let path = session_index_dir(root, session_id).join(file_name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        }
+    }
+    Ok(())
 }
 
 fn load_input_history_index_lenient(
