@@ -105,6 +105,15 @@ Every Rust crate should include these crate-level attributes unless there is a d
 - Error documentation should clearly list error conditions.
 - Use asterisks (`*`) for Rustdoc bullet lists.
 
+## Session Persistence Architecture
+
+- Follow [`docs/session-persistence-architecture.md`](docs/session-persistence-architecture.md) for session store changes.
+- Catalog discovery must be best-effort, bounded, and non-mutating for damaged sessions.
+- Catalog code may do first-event discovery for display metadata, but must not write partial indexes for logs with unknown tails.
+- Normal catalog/open/attach/history/model-context paths must not full-replay event logs or run repair rebuilds.
+- Full replay/rebuild behavior belongs behind explicit repair, doctor, reindex, or migration commands.
+- Missing, stale, corrupt, or inconsistent indexes should surface degraded or repair-required state unless they can be caught up incrementally from trustworthy sidecars.
+
 ## Plugin Architecture Expectations
 
 - Initial plugin runtime is native Rust dynamic libraries.
@@ -123,6 +132,7 @@ Minimum expected validation once Rust crates exist:
 - `cargo fmt`
 - `cargo check --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
+- `scripts/check-session-architecture.sh` for session persistence changes
 - relevant `cargo test` commands for changed packages
 - relevant plugin rebuild/check commands when plugin crates exist
 
