@@ -204,9 +204,24 @@ impl SessionEventStore {
             if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
                 continue;
             }
-            let session_id = parse_session_file_name(&path)?;
-            if let Some(state) = self.load_session_metadata(session_id, &path)? {
-                sessions.insert(session_id, state);
+            let session_id = match parse_session_file_name(&path) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    eprintln!(
+                        "skipping unreadable session event file {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            match self.load_session_metadata(session_id, &path) {
+                Ok(Some(state)) => {
+                    sessions.insert(session_id, state);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("skipping unreadable session {session_id}: {error}");
+                }
             }
         }
 
@@ -229,12 +244,17 @@ impl SessionEventStore {
             return self.synthesize_initial_index_from_first_event(session_id, path);
         };
         let Some(first_entry) = entries.first() else {
+            return self.synthesize_initial_index_from_first_event(session_id, path);
+        };
+        if first_entry.sequence != 0
+            || first_entry.kind != "session_created"
+            || first_entry.offset != 0
+        {
+            return self.synthesize_initial_index_from_first_event(session_id, path);
+        }
+        let Some((first_event, _frame_len)) = reader::read_first_event_lenient(path)? else {
             return Ok(None);
         };
-        if first_entry.sequence != 0 || first_entry.kind != "session_created" {
-            return Ok(None);
-        }
-        let first_event = reader::read_event_at(path, first_entry.offset)?;
         let file = index::fingerprint(&event_path)?;
         Ok(index::catalog_state_from_first_entry(
             session_id,
@@ -249,14 +269,15 @@ impl SessionEventStore {
         session_id: SessionId,
         path: &Path,
     ) -> Result<Option<SessionState>, SessionStoreError> {
-        let first_event = reader::read_event_at(path, 0)?;
+        let Some((first_event, frame_len)) = reader::read_first_event_lenient(path)? else {
+            return Ok(None);
+        };
         let event_path = self.event_path(session_id);
         let file = index::fingerprint(&event_path)?;
-        let entry = index::SessionIndexEntry::from_event(&first_event, 0, file.len);
+        let entry = index::SessionIndexEntry::from_event(&first_event, 0, frame_len);
         if first_event.sequence != 0 || entry.kind != "session_created" {
             return Ok(None);
         }
-        index::write_entries(&self.root, session_id, std::slice::from_ref(&entry))?;
         let Some(mut state) = index::catalog_state_from_first_entry(
             session_id,
             &file,
@@ -265,35 +286,39 @@ impl SessionEventStore {
         ) else {
             return Ok(None);
         };
+        let has_unindexed_tail = frame_len < file.len;
         state.access_status = access_status_from_schema_versions(
             Some(first_event.schema_version),
             Some(first_event.schema_version),
-            false,
+            has_unindexed_tail,
         );
-        index::write_index(
-            &self.root,
-            &index::SessionIndex {
-                index_version: index::SESSION_INDEX_VERSION,
-                session_id,
-                file: file.clone(),
-                summary: state.summary(),
-                working_directory: state.working_directory.clone(),
-                next_sequence: state.next_sequence,
-                event_count: state.event_count,
-                created_at_ms: state.summary.created_at_ms,
-                updated_at_ms: state.summary.updated_at_ms,
-                has_user_message: state.has_user_message,
-                last_good_offset: file.len,
-                current_provider: state.current_provider.clone(),
-                current_model: state.current_model.clone(),
-                current_agent: state.current_agent.clone(),
-                latest_compaction_sequence: state.latest_compaction_sequence,
-                total_metered_tokens: state.total_metered_tokens,
-                min_event_schema_version: Some(first_event.schema_version),
-                max_event_schema_version: Some(first_event.schema_version),
-                issues: Vec::new(),
-            },
-        )?;
+        if !has_unindexed_tail {
+            index::write_entries(&self.root, session_id, std::slice::from_ref(&entry))?;
+            index::write_index(
+                &self.root,
+                &index::SessionIndex {
+                    index_version: index::SESSION_INDEX_VERSION,
+                    session_id,
+                    file,
+                    summary: state.summary(),
+                    working_directory: state.working_directory.clone(),
+                    next_sequence: state.next_sequence,
+                    event_count: state.event_count,
+                    created_at_ms: state.summary.created_at_ms,
+                    updated_at_ms: state.summary.updated_at_ms,
+                    has_user_message: state.has_user_message,
+                    last_good_offset: frame_len,
+                    current_provider: state.current_provider.clone(),
+                    current_model: state.current_model.clone(),
+                    current_agent: state.current_agent.clone(),
+                    latest_compaction_sequence: state.latest_compaction_sequence,
+                    total_metered_tokens: state.total_metered_tokens,
+                    min_event_schema_version: Some(first_event.schema_version),
+                    max_event_schema_version: Some(first_event.schema_version),
+                    issues: Vec::new(),
+                },
+            )?;
+        }
         Ok(Some(state))
     }
 
@@ -308,12 +333,27 @@ impl SessionEventStore {
             if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
                 continue;
             }
-            let session_id = parse_session_file_name(&path)?;
+            let session_id = match parse_session_file_name(&path) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    eprintln!(
+                        "skipping unreadable session event file {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
             if sessions.contains_key(&session_id) {
                 continue;
             }
-            if let Some(state) = self.load_session(session_id)? {
-                sessions.insert(session_id, state);
+            match self.load_session(session_id) {
+                Ok(Some(state)) => {
+                    sessions.insert(session_id, state);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("skipping unreadable session {session_id}: {error}");
+                }
             }
         }
 
@@ -3272,7 +3312,9 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionAccessStatus, SessionManager, access_status_from_report, derived, reader};
+    use super::{
+        SessionAccessStatus, SessionManager, access_status_from_report, derived, index, reader,
+    };
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowAnchor,
         ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
@@ -5348,6 +5390,109 @@ mod tests {
             .expect("session should exist");
         assert!(health.stale);
         assert!(index_path.exists());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn lazy_catalog_skips_unreadable_session_without_failing() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let good = manager
+            .create_session(Some("good".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let bad_id = SessionId::new();
+        let bad_path = root.join(format!("{bad_id}.events"));
+        std::fs::File::create(&bad_path)
+            .expect("bad event file should create")
+            .write_all(&[1_u8])
+            .expect("bad event file should write");
+
+        let restored = SessionManager::persistent_lazy(&root);
+        restored
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog load should tolerate one unreadable session");
+        let sessions = restored.cached_sessions(&test_working_directory()).await;
+        assert!(sessions.iter().any(|session| session.id == good.id));
+        assert!(!sessions.iter().any(|session| session.id == bad_id));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn lazy_catalog_tolerates_bad_entry_index_first_offset() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("bad entry".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        manager
+            .append_user_message(session.id, ClientId::new(), "hello".to_string())
+            .await
+            .expect("message should append");
+        let mut entries = index::read_entries(&root, session.id).expect("entries should read");
+        entries[0].offset = 1;
+        index::write_entries(&root, session.id, &entries).expect("entries should rewrite");
+        let index_path = index::index_path(&root, session.id);
+        std::fs::remove_file(&index_path).expect("metadata index should remove");
+
+        let restored = SessionManager::persistent_lazy(&root);
+        restored
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog load should tolerate bad entry offset");
+        let sessions = restored.cached_sessions(&test_working_directory()).await;
+        let restored_session = sessions
+            .iter()
+            .find(|candidate| candidate.id == session.id)
+            .expect("session should remain discoverable from first event");
+        assert_eq!(restored_session.name.as_deref(), Some("bad entry"));
+        assert!(
+            !index_path.exists(),
+            "catalog load should not repair indexes"
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn lazy_catalog_missing_indexes_does_not_write_partial_repair() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("missing indexes".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        manager
+            .append_user_message(session.id, ClientId::new(), "hello".to_string())
+            .await
+            .expect("message should append");
+        let index_path = index::index_path(&root, session.id);
+        let entries_path = index::entries_path(&root, session.id);
+        std::fs::remove_file(&index_path).expect("metadata index should remove");
+        std::fs::remove_file(&entries_path).expect("entry index should remove");
+
+        let restored = SessionManager::persistent_lazy(&root);
+        restored
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog load should synthesize read-only metadata");
+        let sessions = restored.cached_sessions(&test_working_directory()).await;
+        assert!(sessions.iter().any(|candidate| candidate.id == session.id));
+        assert!(
+            !index_path.exists(),
+            "catalog load should not write metadata"
+        );
+        assert!(
+            !entries_path.exists(),
+            "catalog load should not write entries"
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

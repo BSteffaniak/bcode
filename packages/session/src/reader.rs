@@ -158,6 +158,21 @@ pub fn read_event_at(path: &Path, offset: u64) -> Result<SessionEvent, SessionSt
         .ok_or_else(|| SessionStoreError::InvalidSessionId(format!("no event at offset {offset}")))
 }
 
+pub fn read_first_event_lenient(
+    path: &Path,
+) -> Result<Option<(SessionEvent, u64)>, SessionStoreError> {
+    let mut file = File::open(path)?;
+    let mut issues = Vec::new();
+    let mut offset = 0_u64;
+    let Some(frame) = read_next_frame(&mut file, &mut offset, 0, &mut issues)? else {
+        return Ok(None);
+    };
+    match decode_session_event(&frame.payload, frame.encoding) {
+        Ok(event) => Ok(Some((event, offset))),
+        Err(_error) => Ok(None),
+    }
+}
+
 pub fn read_events_at_offsets(
     path: &Path,
     offsets: &[u64],
