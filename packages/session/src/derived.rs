@@ -553,20 +553,68 @@ pub fn append_event_to_indexes(
     validate_manifest(root, &manifest, session_id).map_err(|error| invalid_to_store(&error))?;
     validate_manifest_at_append_checkpoint(&manifest, entry, event)?;
 
-    let (mut transcript, mut input_history) =
-        load_indexes_from_manifest(root, session_id, &manifest)?;
+    let mut manifest = manifest;
     let file = index::fingerprint(event_path)?;
     let end_offset = entry.offset.saturating_add(entry.frame_len);
 
-    {
-        let mut appenders = registered_append_indexes(&mut transcript, &mut input_history);
-        for appender in &mut appenders {
-            appender.append_event(root, session_id, event)?;
-            appender.advance_checkpoint(file.clone(), end_offset, event);
-        }
-    }
+    append_transcript_event_from_manifest(root, session_id, &mut manifest, event)?;
+    append_input_history_event_from_manifest(root, session_id, &mut manifest, event)?;
+    advance_manifest_checkpoints(&mut manifest, file, end_offset, event);
+    persist_manifest(root, &manifest)?;
+    Ok(manifest)
+}
 
-    write_manifest(root, session_id, file, &transcript, &input_history)
+fn append_transcript_event_from_manifest(
+    root: &Path,
+    session_id: SessionId,
+    manifest: &mut DerivedIndexManifest,
+    event: &SessionEvent,
+) -> Result<(), SessionStoreError> {
+    let entry = manifest_entry_mut(manifest, DerivedIndexKind::Transcript)
+        .map_err(|error| invalid_to_store(&error))?;
+    let initial_state = entry.transcript_state.clone().unwrap_or_default();
+    let (spans, state) =
+        project_transcript_events_incremental(std::slice::from_ref(event), Some(initial_state));
+    append_transcript_spans(root, session_id, &spans)?;
+    entry.item_count = entry.item_count.saturating_add(spans.len());
+    entry.transcript_state = Some(state);
+    Ok(())
+}
+
+fn append_input_history_event_from_manifest(
+    root: &Path,
+    session_id: SessionId,
+    manifest: &mut DerivedIndexManifest,
+    event: &SessionEvent,
+) -> Result<(), SessionStoreError> {
+    let entry = manifest_entry_mut(manifest, DerivedIndexKind::InputHistory)
+        .map_err(|error| invalid_to_store(&error))?;
+    let new_entry = match &event.kind {
+        SessionEventKind::UserMessage { text, .. } => Some(SessionInputHistoryEntry {
+            sequence: event.sequence,
+            text: text.clone(),
+        }),
+        _ => None,
+    };
+    if let Some(new_entry) = new_entry {
+        append_input_history_entries(root, session_id, std::slice::from_ref(&new_entry))?;
+        entry.item_count = entry.item_count.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn advance_manifest_checkpoints(
+    manifest: &mut DerivedIndexManifest,
+    file: EventFileFingerprint,
+    end_offset: u64,
+    event: &SessionEvent,
+) {
+    manifest.file = file;
+    for entry in &mut manifest.indexes {
+        entry.checkpoint.event_count = entry.checkpoint.event_count.saturating_add(1);
+        entry.checkpoint.end_offset = end_offset;
+        entry.checkpoint.last_sequence = Some(event.sequence);
+    }
 }
 
 fn validate_manifest_at_append_checkpoint(
@@ -586,77 +634,6 @@ fn validate_manifest_at_append_checkpoint(
         ));
     }
     Ok(())
-}
-
-trait DerivedAppendIndex {
-    fn append_event(
-        &mut self,
-        root: &Path,
-        session_id: SessionId,
-        event: &SessionEvent,
-    ) -> Result<(), SessionStoreError>;
-
-    fn advance_checkpoint(
-        &mut self,
-        file: EventFileFingerprint,
-        end_offset: u64,
-        event: &SessionEvent,
-    );
-}
-
-fn registered_append_indexes<'a>(
-    transcript: &'a mut TranscriptIndex,
-    input_history: &'a mut InputHistoryIndex,
-) -> Vec<&'a mut dyn DerivedAppendIndex> {
-    vec![transcript, input_history]
-}
-
-impl DerivedAppendIndex for TranscriptIndex {
-    fn append_event(
-        &mut self,
-        root: &Path,
-        session_id: SessionId,
-        event: &SessionEvent,
-    ) -> Result<(), SessionStoreError> {
-        let new_spans = self.apply_appended_event(event);
-        append_transcript_spans(root, session_id, &new_spans)
-    }
-
-    fn advance_checkpoint(
-        &mut self,
-        file: EventFileFingerprint,
-        end_offset: u64,
-        event: &SessionEvent,
-    ) {
-        self.file = file;
-        self.event_count = self.event_count.saturating_add(1);
-        self.end_offset = end_offset;
-        self.last_sequence = Some(event.sequence);
-    }
-}
-
-impl DerivedAppendIndex for InputHistoryIndex {
-    fn append_event(
-        &mut self,
-        root: &Path,
-        session_id: SessionId,
-        event: &SessionEvent,
-    ) -> Result<(), SessionStoreError> {
-        let new_entries = self.apply_events(std::slice::from_ref(event));
-        append_input_history_entries(root, session_id, &new_entries)
-    }
-
-    fn advance_checkpoint(
-        &mut self,
-        file: EventFileFingerprint,
-        end_offset: u64,
-        event: &SessionEvent,
-    ) {
-        self.file = file;
-        self.event_count = self.event_count.saturating_add(1);
-        self.end_offset = end_offset;
-        self.last_sequence = Some(event.sequence);
-    }
 }
 
 pub fn load_stale_input_history_entries(
@@ -826,22 +803,6 @@ impl TranscriptIndex {
     ) -> Vec<index::TranscriptProjectionIndexEntry> {
         let (mut spans, state) =
             project_transcript_events(events, Some(self.projector_state.clone()));
-        let new_spans = spans.clone();
-        self.spans.append(&mut spans);
-        self.spans
-            .sort_by_key(|span| span.source_range.start_sequence);
-        self.projector_state = state;
-        new_spans
-    }
-
-    fn apply_appended_event(
-        &mut self,
-        event: &SessionEvent,
-    ) -> Vec<index::TranscriptProjectionIndexEntry> {
-        let (mut spans, state) = project_transcript_events_incremental(
-            std::slice::from_ref(event),
-            Some(self.projector_state.clone()),
-        );
         let new_spans = spans.clone();
         self.spans.append(&mut spans);
         self.spans
@@ -1501,6 +1462,19 @@ fn validate_manifest_counts(
         });
     }
     Ok(())
+}
+
+fn manifest_entry_mut(
+    manifest: &mut DerivedIndexManifest,
+    kind: DerivedIndexKind,
+) -> Result<&mut DerivedIndexManifestEntry, DerivedIndexInvalid> {
+    manifest
+        .indexes
+        .iter_mut()
+        .find(|entry| entry.id == kind.id())
+        .ok_or_else(|| DerivedIndexInvalid::MissingManifestEntry {
+            id: kind.id().to_owned(),
+        })
 }
 
 fn manifest_entry(
