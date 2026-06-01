@@ -28,7 +28,7 @@ pub use migration::{
 };
 
 use actor::{AttachMode, SessionHandle};
-use bcode_metrics::MetricsRegistry;
+use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
@@ -726,12 +726,38 @@ impl SessionEventStore {
             issues: metadata.index_issues.clone(),
         };
         let timer = self.metrics.timer();
+        let mut derived_outcome = None;
         let result = index::write_index(&self.root, &index).and_then(|()| {
-            appended_event.map_or_else(
-                || Ok(()),
-                |event| derived::append_event(&self.root, event, file, metadata.event_count),
-            )
+            if let Some(event) = appended_event {
+                let derived_timer = self.metrics.timer();
+                let result = derived::append_event(&self.root, event, file, metadata.event_count);
+                self.metrics.record_histogram(
+                    "session.derived.append.duration_ms",
+                    derived_timer.elapsed_ms(),
+                );
+                if let Ok(outcome) = &result {
+                    derived_outcome = Some(outcome.metric_label());
+                    if matches!(outcome, derived::DerivedAppendOutcome::MarkedDirty) {
+                        self.metrics
+                            .increment_counter("session.derived.append.dirty_total");
+                    }
+                } else {
+                    derived_outcome = Some("error");
+                    self.metrics
+                        .increment_counter("session.derived.append.error_total");
+                }
+                result.map(|_| ())
+            } else {
+                derived_outcome = Some("skipped");
+                Ok(())
+            }
         });
+        if let Some(outcome) = derived_outcome {
+            let mut derived_labels = MetricLabels::new();
+            derived_labels.insert("outcome".to_owned(), outcome.to_owned());
+            self.metrics
+                .record_event("session.derived.append", 1, derived_labels);
+        }
         self.metrics.record_histogram(
             "session.metadata_index.write_duration_ms",
             timer.elapsed_ms(),

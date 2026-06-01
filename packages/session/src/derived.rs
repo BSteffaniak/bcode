@@ -584,18 +584,36 @@ pub fn ensure_transcript_index(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedAppendOutcome {
+    Initialized,
+    Updated,
+    MarkedDirty,
+}
+
+impl DerivedAppendOutcome {
+    #[must_use]
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Initialized => "initialized",
+            Self::Updated => "updated",
+            Self::MarkedDirty => "marked_dirty",
+        }
+    }
+}
+
 /// Incrementally maintain derived indexes after one appended event.
 pub fn append_event(
     root: &Path,
     event: &SessionEvent,
     file: EventFileFingerprint,
     event_count: usize,
-) -> Result<(), SessionStoreError> {
+) -> Result<DerivedAppendOutcome, SessionStoreError> {
     let manifest = match load_manifest(root, event.session_id) {
         Ok(manifest) => manifest,
         Err(_error) if event_count == 1 => {
             initialize_from_first_event(root, event, file)?;
-            return Ok(());
+            return Ok(DerivedAppendOutcome::Initialized);
         }
         Err(error) => {
             mark_dirty(
@@ -603,7 +621,7 @@ pub fn append_event(
                 event.session_id,
                 format!("missing derived manifest: {error:?}"),
             )?;
-            return Ok(());
+            return Ok(DerivedAppendOutcome::MarkedDirty);
         }
     };
     let previous_event_count = event_count.saturating_sub(1);
@@ -615,7 +633,7 @@ pub fn append_event(
             event.session_id,
             "derived manifest does not match append predecessor".to_owned(),
         )?;
-        return Ok(());
+        return Ok(DerivedAppendOutcome::MarkedDirty);
     }
 
     let (mut transcript, mut input) =
@@ -627,7 +645,7 @@ pub fn append_event(
                     event.session_id,
                     format!("derived sidecar load failed: {error}"),
                 )?;
-                return Ok(());
+                return Ok(DerivedAppendOutcome::MarkedDirty);
             }
         };
 
@@ -648,9 +666,9 @@ pub fn append_event(
     input.event_count = event_count;
     transcript.file = file.clone();
     input.file = file.clone();
-    write_manifest(root, event.session_id, file, &transcript, &input).map(|_| ())
+    write_manifest(root, event.session_id, file, &transcript, &input)
+        .map(|_| DerivedAppendOutcome::Updated)
 }
-
 fn initialize_from_first_event(
     root: &Path,
     event: &SessionEvent,
