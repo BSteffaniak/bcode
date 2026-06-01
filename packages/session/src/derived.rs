@@ -551,6 +551,29 @@ pub fn append_event_to_indexes(
         )
     })?;
     validate_manifest(root, &manifest, session_id).map_err(|error| invalid_to_store(&error))?;
+    validate_manifest_at_append_checkpoint(&manifest, entry, event)?;
+
+    let (mut transcript, mut input_history) =
+        load_indexes_from_manifest(root, session_id, &manifest)?;
+    let file = index::fingerprint(event_path)?;
+    let end_offset = entry.offset.saturating_add(entry.frame_len);
+
+    {
+        let mut appenders = registered_append_indexes(&mut transcript, &mut input_history);
+        for appender in &mut appenders {
+            appender.append_event(root, session_id, event)?;
+            appender.advance_checkpoint(file.clone(), end_offset, event);
+        }
+    }
+
+    write_manifest(root, session_id, file, &transcript, &input_history)
+}
+
+fn validate_manifest_at_append_checkpoint(
+    manifest: &DerivedIndexManifest,
+    entry: &index::SessionIndexEntry,
+    event: &SessionEvent,
+) -> Result<(), SessionStoreError> {
     if manifest.indexes.iter().any(|manifest_entry| {
         manifest_entry.checkpoint.end_offset != entry.offset
             || manifest_entry.checkpoint.event_count
@@ -562,23 +585,78 @@ pub fn append_event_to_indexes(
                 .to_owned(),
         ));
     }
+    Ok(())
+}
 
-    let (mut transcript, mut input_history) =
-        load_indexes_from_manifest(root, session_id, &manifest)?;
-    let file = index::fingerprint(event_path)?;
-    let new_spans = transcript.apply_appended_event(event);
-    let new_entries = input_history.apply_events(std::slice::from_ref(event));
-    transcript.file = file.clone();
-    transcript.event_count = transcript.event_count.saturating_add(1);
-    transcript.end_offset = entry.offset.saturating_add(entry.frame_len);
-    transcript.last_sequence = Some(event.sequence);
-    input_history.file = file.clone();
-    input_history.event_count = input_history.event_count.saturating_add(1);
-    input_history.end_offset = entry.offset.saturating_add(entry.frame_len);
-    input_history.last_sequence = Some(event.sequence);
-    append_transcript_spans(root, session_id, &new_spans)?;
-    append_input_history_entries(root, session_id, &new_entries)?;
-    write_manifest(root, session_id, file, &transcript, &input_history)
+trait DerivedAppendIndex {
+    fn append_event(
+        &mut self,
+        root: &Path,
+        session_id: SessionId,
+        event: &SessionEvent,
+    ) -> Result<(), SessionStoreError>;
+
+    fn advance_checkpoint(
+        &mut self,
+        file: EventFileFingerprint,
+        end_offset: u64,
+        event: &SessionEvent,
+    );
+}
+
+fn registered_append_indexes<'a>(
+    transcript: &'a mut TranscriptIndex,
+    input_history: &'a mut InputHistoryIndex,
+) -> Vec<&'a mut dyn DerivedAppendIndex> {
+    vec![transcript, input_history]
+}
+
+impl DerivedAppendIndex for TranscriptIndex {
+    fn append_event(
+        &mut self,
+        root: &Path,
+        session_id: SessionId,
+        event: &SessionEvent,
+    ) -> Result<(), SessionStoreError> {
+        let new_spans = self.apply_appended_event(event);
+        append_transcript_spans(root, session_id, &new_spans)
+    }
+
+    fn advance_checkpoint(
+        &mut self,
+        file: EventFileFingerprint,
+        end_offset: u64,
+        event: &SessionEvent,
+    ) {
+        self.file = file;
+        self.event_count = self.event_count.saturating_add(1);
+        self.end_offset = end_offset;
+        self.last_sequence = Some(event.sequence);
+    }
+}
+
+impl DerivedAppendIndex for InputHistoryIndex {
+    fn append_event(
+        &mut self,
+        root: &Path,
+        session_id: SessionId,
+        event: &SessionEvent,
+    ) -> Result<(), SessionStoreError> {
+        let new_entries = self.apply_events(std::slice::from_ref(event));
+        append_input_history_entries(root, session_id, &new_entries)
+    }
+
+    fn advance_checkpoint(
+        &mut self,
+        file: EventFileFingerprint,
+        end_offset: u64,
+        event: &SessionEvent,
+    ) {
+        self.file = file;
+        self.event_count = self.event_count.saturating_add(1);
+        self.end_offset = end_offset;
+        self.last_sequence = Some(event.sequence);
+    }
 }
 
 pub fn load_stale_input_history_entries(
