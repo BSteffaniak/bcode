@@ -612,14 +612,13 @@ fn read_tail_events(
     event_path: &Path,
     offset: u64,
 ) -> Result<Vec<SessionEvent>, SessionStoreError> {
-    let report = crate::reader::read_events(event_path)?;
-    let events = report
-        .events
-        .into_iter()
-        .zip(report.entries)
-        .filter_map(|(event, entry)| (entry.offset >= offset).then_some(event))
-        .collect();
-    Ok(events)
+    let report = crate::reader::read_events_from_offset(event_path, offset)?;
+    if !report.issues.is_empty() {
+        return Err(SessionStoreError::InvalidSessionId(
+            "derived catch-up tail read encountered an unreadable event frame".to_owned(),
+        ));
+    }
+    Ok(report.events)
 }
 
 fn project_transcript_events(
