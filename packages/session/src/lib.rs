@@ -4385,6 +4385,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_does_not_fail_when_input_history_index_is_degraded() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("degraded input history".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "hello".to_owned())
+            .await
+            .expect("message should append");
+        let store = super::SessionEventStore::new(&root);
+        store
+            .reindex_session(session.id)
+            .expect("session should reindex");
+        std::fs::remove_file(derived::input_history_index_path(&root, session.id))
+            .expect("input history sidecar should remove");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let attachment = restored
+            .attach_session_recent(session.id, ClientId::new(), 16)
+            .await
+            .expect("attach should tolerate degraded input history");
+
+        assert!(attachment.input_history.is_empty());
+        assert!(
+            derived::ensure_input_history_index(&root, session.id, &store.event_path(session.id))
+                .expect("degraded input history should return fallback")
+                .entries
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn streaming_deltas_update_pending_state_without_rewriting_transcript_index() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");

@@ -543,9 +543,19 @@ pub fn ensure_input_history_index(
         session_id,
         "input-history derived index is missing or stale".to_owned(),
     )?;
-    Err(SessionStoreError::InvalidSessionId(
-        "input-history derived index requires reindex".to_owned(),
-    ))
+    match load_input_history_index_lenient(root, session_id) {
+        Ok(mut input_history) => {
+            input_history.file = file;
+            Ok(input_history)
+        }
+        Err(_error) => Ok(InputHistoryIndex {
+            index_version: INPUT_HISTORY_INDEX_VERSION,
+            session_id,
+            file,
+            event_count: 0,
+            entries: Vec::new(),
+        }),
+    }
 }
 
 /// Load a fresh transcript index, rebuilding when it is absent or stale.
