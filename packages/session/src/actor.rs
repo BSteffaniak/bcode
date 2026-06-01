@@ -505,10 +505,7 @@ impl SessionActor {
             self.state.index_status = SessionIndexStatusKind::Stale;
             let metadata = PersistedSessionMetadata::from_state(&self.state);
             let write_index_started_at = Instant::now();
-            match store
-                .write_metadata_index(metadata, Some(event.clone()))
-                .await
-            {
+            match store.write_metadata_index(metadata).await {
                 Ok(()) => {
                     store.metrics().record_histogram(
                         "session.actor.append_event.write_metadata_index_duration_ms",

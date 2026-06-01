@@ -28,7 +28,7 @@ pub use migration::{
 };
 
 use actor::{AttachMode, SessionHandle};
-use bcode_metrics::{MetricLabels, MetricsRegistry};
+use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
@@ -682,7 +682,6 @@ impl SessionEventStore {
     fn write_metadata_index(
         &self,
         metadata: &PersistedSessionMetadata,
-        appended_event: Option<&SessionEvent>,
     ) -> Result<(), SessionStoreError> {
         let path = self.event_path(metadata.summary.id);
         let existing_index = index::load_fresh_index(&self.root, metadata.summary.id, &path)?;
@@ -705,7 +704,7 @@ impl SessionEventStore {
             index_version: index::SESSION_INDEX_VERSION,
             session_id: metadata.summary.id,
             last_good_offset: file.len,
-            file: file.clone(),
+            file,
             summary: SessionSummary {
                 client_count: 0,
                 ..metadata.summary.clone()
@@ -726,38 +725,7 @@ impl SessionEventStore {
             issues: metadata.index_issues.clone(),
         };
         let timer = self.metrics.timer();
-        let mut derived_outcome = None;
-        let result = index::write_index(&self.root, &index).and_then(|()| {
-            if let Some(event) = appended_event {
-                let derived_timer = self.metrics.timer();
-                let result = derived::append_event(&self.root, event, file, metadata.event_count);
-                self.metrics.record_histogram(
-                    "session.derived.append.duration_ms",
-                    derived_timer.elapsed_ms(),
-                );
-                if let Ok(outcome) = &result {
-                    derived_outcome = Some(outcome.metric_label());
-                    if matches!(outcome, derived::DerivedAppendOutcome::MarkedDirty) {
-                        self.metrics
-                            .increment_counter("session.derived.append.dirty_total");
-                    }
-                } else {
-                    derived_outcome = Some("error");
-                    self.metrics
-                        .increment_counter("session.derived.append.error_total");
-                }
-                result.map(|_| ())
-            } else {
-                derived_outcome = Some("skipped");
-                Ok(())
-            }
-        });
-        if let Some(outcome) = derived_outcome {
-            let mut derived_labels = MetricLabels::new();
-            derived_labels.insert("outcome".to_owned(), outcome.to_owned());
-            self.metrics
-                .record_event("session.derived.append", 1, derived_labels);
-        }
+        let result = index::write_index(&self.root, &index);
         self.metrics.record_histogram(
             "session.metadata_index.write_duration_ms",
             timer.elapsed_ms(),
@@ -4337,7 +4305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_write_for_transcript_invisible_event_only_advances_manifest() {
+    async fn invisible_event_leaves_derived_manifest_stale_until_read() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -4388,8 +4356,14 @@ mod tests {
             &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
         )
         .expect("manifest should decode");
-        assert_eq!(metadata.event_count, manifest_after.indexes[0].event_count);
-        assert_eq!(metadata.event_count, manifest_after.indexes[1].event_count);
+        assert_eq!(
+            manifest_before.indexes[0].event_count,
+            manifest_after.indexes[0].event_count
+        );
+        assert_eq!(
+            manifest_before.indexes[1].event_count,
+            manifest_after.indexes[1].event_count
+        );
         assert_eq!(
             manifest_before.indexes[0].item_count,
             manifest_after.indexes[0].item_count
@@ -4400,8 +4374,20 @@ mod tests {
         );
         let transcript_index =
             derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should load");
+                .expect("transcript index should rebuild when stale");
+        let manifest_rebuilt: derived::DerivedIndexManifest = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should decode");
         assert_eq!(metadata.event_count, transcript_index.event_count);
+        assert_eq!(
+            metadata.event_count,
+            manifest_rebuilt.indexes[0].event_count
+        );
+        assert_eq!(
+            metadata.event_count,
+            manifest_rebuilt.indexes[1].event_count
+        );
         assert_eq!(
             manifest_before.indexes[0].item_count,
             transcript_index.spans.len()
@@ -4438,19 +4424,21 @@ mod tests {
             .await
             .expect("attach should tolerate degraded input history");
 
-        assert!(attachment.input_history.is_empty());
-        assert!(
+        assert_eq!(attachment.input_history.len(), 1);
+        assert_eq!(attachment.input_history[0].text, "hello");
+        assert_eq!(
             derived::ensure_input_history_index(&root, session.id, &store.event_path(session.id))
-                .expect("degraded input history should return fallback")
+                .expect("degraded input history should rebuild")
                 .entries
-                .is_empty()
+                .len(),
+            1
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
     #[tokio::test]
-    async fn streaming_deltas_update_pending_state_without_rewriting_transcript_index() {
+    async fn streaming_deltas_do_not_rewrite_transcript_index() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -4482,33 +4470,23 @@ mod tests {
             transcript_before,
             std::fs::read_to_string(&transcript_path).expect("transcript index should read")
         );
-        let with_pending =
+        let rebuilt =
             derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should load");
-        let pending = with_pending
+                .expect("transcript index should rebuild");
+        let assistant = rebuilt
             .spans
             .last()
-            .expect("pending assistant span should be overlaid");
-        assert_eq!(
-            pending.kind,
-            bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
-        );
-        assert_eq!(pending.content_bytes, "partial response".len());
-
-        manager
-            .append_assistant_message(session.id, "partial response".to_owned())
-            .await
-            .expect("message should append");
-        let finalized =
-            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should load");
-        let assistant = finalized
-            .spans
-            .last()
-            .expect("assistant span should be finalized");
+            .expect("assistant span should be rebuilt from canonical events");
         assert_eq!(
             assistant.kind,
             bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
+        );
+        assert!(
+            !std::path::Path::new(&root)
+                .join("index")
+                .join(session.id.to_string())
+                .join("dirty.json")
+                .exists()
         );
         assert_eq!(assistant.content_bytes, "partial response".len());
         assert!(assistant.source_range.start_sequence < assistant.source_range.end_sequence);

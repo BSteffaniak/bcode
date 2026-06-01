@@ -179,7 +179,6 @@ impl SessionStoreExecutor {
     pub async fn write_metadata_index(
         &self,
         metadata: PersistedSessionMetadata,
-        appended_event: Option<SessionEvent>,
     ) -> Result<(), SessionStoreError> {
         let queued_at = Instant::now();
         let store = self.store.clone();
@@ -189,7 +188,7 @@ impl SessionStoreExecutor {
                 elapsed_ms(queued_at),
             );
             let timer = store.metrics.timer();
-            let result = store.write_metadata_index(&metadata, appended_event.as_ref());
+            let result = store.write_metadata_index(&metadata);
             store.metrics.record_histogram(
                 "session.store.write_metadata_index.duration_ms",
                 timer.elapsed_ms(),

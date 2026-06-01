@@ -2,12 +2,8 @@
 
 use crate::index::{self, EventFileFingerprint};
 use crate::{SessionStoreError, projection};
-use bcode_session_models::{
-    ProjectionSourceRange, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
-    ToolInvocationStreamEvent, TranscriptProjectionItemKind,
-};
+use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -117,97 +113,12 @@ pub struct DerivedIndexManifestEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TranscriptPendingState {
-    session_id: SessionId,
-    assistant: Option<PendingStreamState>,
-    reasoning: Option<PendingStreamState>,
-    tools: BTreeMap<String, PendingToolState>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingStreamState {
-    start_sequence: u64,
-    end_sequence: u64,
-    content_bytes: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingToolState {
-    start_sequence: u64,
-    end_sequence: u64,
-    content_bytes: usize,
-    saw_stream_output: bool,
-}
-
-impl TranscriptPendingState {
-    const fn empty(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            assistant: None,
-            reasoning: None,
-            tools: BTreeMap::new(),
-        }
-    }
-
-    fn pending_spans(&self) -> Vec<index::TranscriptProjectionIndexEntry> {
-        let mut spans = Vec::new();
-        if let Some(stream) = &self.assistant {
-            spans.push(stream.to_span(TranscriptProjectionItemKind::AssistantMessage));
-        }
-        if let Some(stream) = &self.reasoning {
-            spans.push(stream.to_span(TranscriptProjectionItemKind::Reasoning));
-        }
-        spans.extend(self.tools.values().map(PendingToolState::to_span));
-        spans.sort_by_key(|span| {
-            (
-                span.source_range.start_sequence,
-                span.source_range.end_sequence,
-            )
-        });
-        spans
-    }
-}
-
-impl PendingStreamState {
-    fn to_span(&self, kind: TranscriptProjectionItemKind) -> index::TranscriptProjectionIndexEntry {
-        transcript_span_range(
-            self.start_sequence,
-            self.end_sequence,
-            kind,
-            self.content_bytes,
-        )
-    }
-}
-
-impl PendingToolState {
-    fn to_span(&self) -> index::TranscriptProjectionIndexEntry {
-        transcript_span_range(
-            self.start_sequence,
-            self.end_sequence,
-            TranscriptProjectionItemKind::ToolInvocation,
-            self.content_bytes,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct DerivedDirtyMarker {
-    session_id: SessionId,
-    reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputHistoryIndex {
     /// Index format version.
     pub index_version: u16,
     /// Indexed session id.
     pub session_id: SessionId,
-    /// Event-file fingerprint this index was built from when fully rebuilt.
-    ///
-    /// Incremental appends may advance `event_count` without rewriting this
-    /// fingerprint; freshness is enforced by the primary metadata index and
-    /// manifest for hot paths, while doctor/reindex rewrites a fully fresh
-    /// fingerprint.
+    /// Event-file fingerprint this index was built from.
     pub file: EventFileFingerprint,
     /// Number of decoded events observed while building.
     pub event_count: usize,
@@ -412,14 +323,6 @@ pub fn input_history_index_path(root: &Path, session_id: SessionId) -> PathBuf {
     session_index_dir(root, session_id).join("input_history.jsonl")
 }
 
-fn transcript_state_path(root: &Path, session_id: SessionId) -> PathBuf {
-    session_index_dir(root, session_id).join("transcript_state.json")
-}
-
-fn dirty_marker_path(root: &Path, session_id: SessionId) -> PathBuf {
-    session_index_dir(root, session_id).join("dirty.json")
-}
-
 /// Rebuild all registered derived indexes for a session.
 pub fn rebuild_all(
     root: &Path,
@@ -475,6 +378,9 @@ fn validate_all(
     let manifest = load_manifest(root, session_id).map_err(|error| format!("{error:?}"))?;
     validate_manifest(root, &manifest, session_id, Some(file))
         .map_err(|error| format!("{error:?}"))?;
+    if !manifest_covers_file_len(&manifest, file.len) {
+        return Err("derived manifest is stale".to_owned());
+    }
     load_indexes_from_manifest(root, session_id, &manifest)
         .map_err(|error| format!("derived sidecars: {error}"))?;
     Ok(manifest)
@@ -534,28 +440,14 @@ pub fn ensure_input_history_index(
         && validate_manifest(root, &manifest, session_id, Some(&file)).is_ok()
         && let Ok((_transcript, input_history)) =
             load_indexes_from_manifest(root, session_id, &manifest)
+        && manifest_covers_file_len(&manifest, file.len)
     {
         return Ok(input_history);
     }
 
-    mark_dirty(
-        root,
-        session_id,
-        "input-history derived index is missing or stale".to_owned(),
-    )?;
-    match load_input_history_index_lenient(root, session_id) {
-        Ok(mut input_history) => {
-            input_history.file = file;
-            Ok(input_history)
-        }
-        Err(_error) => Ok(InputHistoryIndex {
-            index_version: INPUT_HISTORY_INDEX_VERSION,
-            session_id,
-            file,
-            event_count: 0,
-            entries: Vec::new(),
-        }),
-    }
+    let manifest = rebuild_all(root, session_id, event_path)?;
+    let (_transcript, input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
+    Ok(input_history)
 }
 
 /// Load a fresh transcript index, rebuilding when it is absent or stale.
@@ -567,449 +459,20 @@ pub fn ensure_transcript_index(
     let file = index::fingerprint(event_path)?;
     if let Ok(manifest) = load_manifest(root, session_id)
         && validate_manifest(root, &manifest, session_id, Some(&file)).is_ok()
-        && let Ok((mut transcript, _input_history)) =
+        && let Ok((transcript, _input_history)) =
             load_indexes_from_manifest(root, session_id, &manifest)
+        && manifest_covers_file_len(&manifest, file.len)
     {
-        overlay_pending_transcript_state(root, &mut transcript)?;
         return Ok(transcript);
     }
 
-    mark_dirty(
-        root,
-        session_id,
-        "transcript derived index is missing or stale".to_owned(),
-    )?;
-    Err(SessionStoreError::InvalidSessionId(
-        "transcript derived index requires reindex".to_owned(),
-    ))
+    let manifest = rebuild_all(root, session_id, event_path)?;
+    let (transcript, _input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
+    Ok(transcript)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DerivedAppendOutcome {
-    Initialized,
-    Updated,
-    MarkedDirty,
-}
-
-impl DerivedAppendOutcome {
-    #[must_use]
-    pub const fn metric_label(self) -> &'static str {
-        match self {
-            Self::Initialized => "initialized",
-            Self::Updated => "updated",
-            Self::MarkedDirty => "marked_dirty",
-        }
-    }
-}
-
-/// Incrementally maintain derived indexes after one appended event.
-pub fn append_event(
-    root: &Path,
-    event: &SessionEvent,
-    file: EventFileFingerprint,
-    event_count: usize,
-) -> Result<DerivedAppendOutcome, SessionStoreError> {
-    let manifest = match load_manifest(root, event.session_id) {
-        Ok(manifest) => manifest,
-        Err(_error) if event_count == 1 => {
-            initialize_from_first_event(root, event, file)?;
-            return Ok(DerivedAppendOutcome::Initialized);
-        }
-        Err(error) => {
-            mark_dirty(
-                root,
-                event.session_id,
-                format!("missing derived manifest: {error:?}"),
-            )?;
-            return Ok(DerivedAppendOutcome::MarkedDirty);
-        }
-    };
-    let previous_event_count = event_count.saturating_sub(1);
-    if validate_manifest(root, &manifest, event.session_id, None).is_err()
-        || !manifest_covers_event_count(&manifest, previous_event_count)
-    {
-        mark_dirty(
-            root,
-            event.session_id,
-            "derived manifest does not match append predecessor".to_owned(),
-        )?;
-        return Ok(DerivedAppendOutcome::MarkedDirty);
-    }
-
-    let (mut transcript, mut input) =
-        match load_indexes_from_manifest(root, event.session_id, &manifest) {
-            Ok(indexes) => indexes,
-            Err(error) => {
-                mark_dirty(
-                    root,
-                    event.session_id,
-                    format!("derived sidecar load failed: {error}"),
-                )?;
-                return Ok(DerivedAppendOutcome::MarkedDirty);
-            }
-        };
-
-    if event_affects_transcript(event) {
-        apply_transcript_append(root, &mut transcript, event)?;
-    }
-    if let SessionEventKind::UserMessage { text, .. } = &event.kind {
-        append_input_history_entry(
-            root,
-            &mut input,
-            SessionInputHistoryEntry {
-                sequence: event.sequence,
-                text: text.clone(),
-            },
-        )?;
-    }
-    transcript.event_count = event_count;
-    input.event_count = event_count;
-    transcript.file = file.clone();
-    input.file = file.clone();
-    write_manifest(root, event.session_id, file, &transcript, &input)
-        .map(|_| DerivedAppendOutcome::Updated)
-}
-fn initialize_from_first_event(
-    root: &Path,
-    event: &SessionEvent,
-    file: EventFileFingerprint,
-) -> Result<(), SessionStoreError> {
-    let events = std::slice::from_ref(event);
-    let transcript = TranscriptIndex::from_events(event.session_id, file.clone(), events);
-    let input = InputHistoryIndex::from_events(event.session_id, file.clone(), events);
-    write_transcript_index(root, &transcript)?;
-    write_input_history_index(root, &input)?;
-    write_manifest(root, event.session_id, file, &transcript, &input).map(|_| ())
-}
-
-fn event_affects_transcript(event: &SessionEvent) -> bool {
-    matches!(
-        &event.kind,
-        SessionEventKind::AssistantDelta { .. }
-            | SessionEventKind::AssistantMessage { .. }
-            | SessionEventKind::AssistantReasoningDelta { .. }
-            | SessionEventKind::AssistantReasoningMessage { .. }
-            | SessionEventKind::ToolCallRequested { .. }
-            | SessionEventKind::ToolInvocationStream { .. }
-            | SessionEventKind::ToolCallFinished { .. }
-    ) || non_streaming_transcript_item(event).is_some()
-}
-
-fn manifest_covers_event_count(manifest: &DerivedIndexManifest, event_count: usize) -> bool {
-    manifest
-        .indexes
-        .iter()
-        .all(|entry| entry.event_count == event_count)
-}
-
-fn apply_transcript_append(
-    root: &Path,
-    index: &mut TranscriptIndex,
-    event: &SessionEvent,
-) -> Result<(), SessionStoreError> {
-    let mut state = load_transcript_state(root, event.session_id)?;
-    let state_changed = match &event.kind {
-        SessionEventKind::AssistantDelta { text } => {
-            update_pending_stream(&mut state.assistant, event.sequence, text.len());
-            true
-        }
-        SessionEventKind::AssistantMessage { text } => {
-            finalize_pending_stream(
-                root,
-                index,
-                &mut state.assistant,
-                event.sequence,
-                TranscriptProjectionItemKind::AssistantMessage,
-                text.len(),
-            )?;
-            true
-        }
-        SessionEventKind::AssistantReasoningDelta { text } => {
-            update_pending_stream(&mut state.reasoning, event.sequence, text.len());
-            true
-        }
-        SessionEventKind::AssistantReasoningMessage { text } => {
-            finalize_pending_stream(
-                root,
-                index,
-                &mut state.reasoning,
-                event.sequence,
-                TranscriptProjectionItemKind::Reasoning,
-                text.len(),
-            )?;
-            true
-        }
-        SessionEventKind::ToolCallRequested {
-            tool_call_id,
-            arguments_json,
-            ..
-        } => {
-            state.tools.insert(
-                tool_call_id.clone(),
-                PendingToolState {
-                    start_sequence: event.sequence,
-                    end_sequence: event.sequence,
-                    content_bytes: arguments_json.len(),
-                    saw_stream_output: false,
-                },
-            );
-            true
-        }
-        SessionEventKind::ToolInvocationStream { event: stream } => {
-            update_pending_tool_stream(&mut state, event.sequence, stream);
-            true
-        }
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result,
-            ..
-        } => {
-            finalize_pending_tool(
-                root,
-                index,
-                &mut state,
-                tool_call_id,
-                event.sequence,
-                result.len(),
-            )?;
-            true
-        }
-        _ => {
-            if let Some((kind, content_bytes)) = non_streaming_transcript_item(event) {
-                append_transcript_span(
-                    root,
-                    index,
-                    transcript_span(event.sequence, kind, content_bytes),
-                )?;
-            }
-            false
-        }
-    };
-    if state_changed {
-        persist_transcript_state(root, &state)?;
-    }
-    Ok(())
-}
-
-fn finalize_pending_stream(
-    root: &Path,
-    index: &mut TranscriptIndex,
-    stream: &mut Option<PendingStreamState>,
-    sequence: u64,
-    kind: TranscriptProjectionItemKind,
-    content_bytes: usize,
-) -> Result<(), SessionStoreError> {
-    let start_sequence = stream
-        .take()
-        .map_or(sequence, |stream| stream.start_sequence);
-    append_transcript_span(
-        root,
-        index,
-        transcript_span_range(start_sequence, sequence, kind, content_bytes),
-    )
-}
-
-fn update_pending_tool_stream(
-    state: &mut TranscriptPendingState,
-    sequence: u64,
-    stream: &ToolInvocationStreamEvent,
-) {
-    let tool_call_id = tool_stream_tool_call_id(stream).to_owned();
-    let tool = state.tools.entry(tool_call_id).or_insert(PendingToolState {
-        start_sequence: sequence,
-        end_sequence: sequence,
-        content_bytes: 0,
-        saw_stream_output: false,
-    });
-    tool.end_sequence = sequence;
-    tool.content_bytes = tool
-        .content_bytes
-        .saturating_add(tool_stream_content_bytes(stream));
-    if matches!(stream, ToolInvocationStreamEvent::OutputDelta { .. }) {
-        tool.saw_stream_output = true;
-    }
-}
-
-fn finalize_pending_tool(
-    root: &Path,
-    index: &mut TranscriptIndex,
-    state: &mut TranscriptPendingState,
-    tool_call_id: &str,
-    sequence: u64,
-    result_bytes: usize,
-) -> Result<(), SessionStoreError> {
-    let mut tool = state
-        .tools
-        .remove(tool_call_id)
-        .unwrap_or(PendingToolState {
-            start_sequence: sequence,
-            end_sequence: sequence,
-            content_bytes: 0,
-            saw_stream_output: false,
-        });
-    tool.end_sequence = sequence;
-    if !tool.saw_stream_output {
-        tool.content_bytes = tool.content_bytes.saturating_add(result_bytes);
-    }
-    append_transcript_span(root, index, tool.to_span())
-}
-
-const fn update_pending_stream(
-    stream: &mut Option<PendingStreamState>,
-    sequence: u64,
-    content_bytes: usize,
-) {
-    if let Some(stream) = stream {
-        stream.end_sequence = sequence;
-        stream.content_bytes = stream.content_bytes.saturating_add(content_bytes);
-    } else {
-        *stream = Some(PendingStreamState {
-            start_sequence: sequence,
-            end_sequence: sequence,
-            content_bytes,
-        });
-    }
-}
-
-fn non_streaming_transcript_item(
-    event: &SessionEvent,
-) -> Option<(TranscriptProjectionItemKind, usize)> {
-    match &event.kind {
-        SessionEventKind::UserMessage { text, .. } | SessionEventKind::SystemMessage { text } => {
-            Some((TranscriptProjectionItemKind::UserMessage, text.len()))
-        }
-        SessionEventKind::PermissionRequested { arguments_json, .. } => Some((
-            TranscriptProjectionItemKind::Permission,
-            arguments_json.len(),
-        )),
-        SessionEventKind::PermissionResolved { .. } => {
-            Some((TranscriptProjectionItemKind::Permission, 0))
-        }
-        SessionEventKind::ContextCompacted { summary, .. } => Some((
-            TranscriptProjectionItemKind::ContextCompaction,
-            summary.len(),
-        )),
-        SessionEventKind::WorkingDirectoryChanged {
-            old_working_directory,
-            new_working_directory,
-        } => Some((
-            TranscriptProjectionItemKind::WorkingDirectoryChange,
-            old_working_directory.as_os_str().len() + new_working_directory.as_os_str().len(),
-        )),
-        SessionEventKind::SkillInvoked { arguments, .. } => {
-            Some((TranscriptProjectionItemKind::Other, arguments.len()))
-        }
-        SessionEventKind::SkillInvocationFailed { error, .. } => {
-            Some((TranscriptProjectionItemKind::Other, error.len()))
-        }
-        SessionEventKind::ModelUsage { .. } => Some((TranscriptProjectionItemKind::Other, 0)),
-        _ => None,
-    }
-}
-
-fn transcript_span(
-    sequence: u64,
-    kind: TranscriptProjectionItemKind,
-    content_bytes: usize,
-) -> index::TranscriptProjectionIndexEntry {
-    transcript_span_range(sequence, sequence, kind, content_bytes)
-}
-
-fn transcript_span_range(
-    start_sequence: u64,
-    end_sequence: u64,
-    kind: TranscriptProjectionItemKind,
-    content_bytes: usize,
-) -> index::TranscriptProjectionIndexEntry {
-    index::TranscriptProjectionIndexEntry {
-        projection_item_id: format!("transcript:{start_sequence}:{end_sequence}"),
-        kind,
-        source_range: ProjectionSourceRange {
-            start_sequence,
-            end_sequence,
-        },
-        content_bytes,
-    }
-}
-
-fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
-    match event {
-        ToolInvocationStreamEvent::Started { tool_call_id, .. }
-        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
-    }
-}
-
-const fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
-    match event {
-        ToolInvocationStreamEvent::Started { tool_name, .. } => tool_name.len(),
-        ToolInvocationStreamEvent::OutputDelta { text, .. }
-        | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
-        ToolInvocationStreamEvent::Finished { .. } => 0,
-    }
-}
-
-fn overlay_pending_transcript_state(
-    root: &Path,
-    index: &mut TranscriptIndex,
-) -> Result<(), SessionStoreError> {
-    let state = load_transcript_state(root, index.session_id)?;
-    index.spans.extend(state.pending_spans());
-    index.spans.sort_by_key(|span| {
-        (
-            span.source_range.start_sequence,
-            span.source_range.end_sequence,
-        )
-    });
-    Ok(())
-}
-
-fn load_transcript_state(
-    root: &Path,
-    session_id: SessionId,
-) -> Result<TranscriptPendingState, SessionStoreError> {
-    let path = transcript_state_path(root, session_id);
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(TranscriptPendingState::empty(session_id));
-        }
-        Err(error) => return Err(SessionStoreError::Io(error)),
-    };
-    let state: TranscriptPendingState =
-        serde_json::from_reader(file).map_err(SessionStoreError::Index)?;
-    if state.session_id == session_id {
-        Ok(state)
-    } else {
-        Ok(TranscriptPendingState::empty(session_id))
-    }
-}
-
-fn persist_transcript_state(
-    root: &Path,
-    state: &TranscriptPendingState,
-) -> Result<(), SessionStoreError> {
-    let path = transcript_state_path(root, state.session_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(SessionStoreError::Io)?;
-    }
-    let tmp_path = path.with_extension("json.tmp");
-    let file = File::create(&tmp_path).map_err(SessionStoreError::Io)?;
-    serde_json::to_writer_pretty(file, state).map_err(SessionStoreError::Index)?;
-    fs::rename(&tmp_path, &path).map_err(SessionStoreError::Io)
-}
-
-fn mark_dirty(root: &Path, session_id: SessionId, reason: String) -> Result<(), SessionStoreError> {
-    let path = dirty_marker_path(root, session_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(SessionStoreError::Io)?;
-    }
-    let tmp_path = path.with_extension("json.tmp");
-    let file = File::create(&tmp_path).map_err(SessionStoreError::Io)?;
-    serde_json::to_writer_pretty(file, &DerivedDirtyMarker { session_id, reason })
-        .map_err(SessionStoreError::Index)?;
-    fs::rename(&tmp_path, &path).map_err(SessionStoreError::Io)
+const fn manifest_covers_file_len(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
+    manifest.file.len == file_len
 }
 
 fn load_input_history_index_lenient(
@@ -1024,42 +487,6 @@ fn load_transcript_index_lenient(
     session_id: SessionId,
 ) -> Result<TranscriptIndex, TranscriptIndexLoadError> {
     load_transcript_index_inner(root, session_id, None)
-}
-
-fn append_input_history_entry(
-    root: &Path,
-    index: &mut InputHistoryIndex,
-    entry: SessionInputHistoryEntry,
-) -> Result<(), SessionStoreError> {
-    let path = input_history_index_path(root, index.session_id);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(SessionStoreError::Io)?;
-    serde_json::to_writer(&mut file, &entry).map_err(SessionStoreError::Index)?;
-    writeln!(file).map_err(SessionStoreError::Io)?;
-    file.flush().map_err(SessionStoreError::Io)?;
-    index.entries.push(entry);
-    Ok(())
-}
-
-fn append_transcript_span(
-    root: &Path,
-    index: &mut TranscriptIndex,
-    span: index::TranscriptProjectionIndexEntry,
-) -> Result<(), SessionStoreError> {
-    let path = transcript_index_path(root, index.session_id);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(SessionStoreError::Io)?;
-    serde_json::to_writer(&mut file, &span).map_err(SessionStoreError::Index)?;
-    writeln!(file).map_err(SessionStoreError::Io)?;
-    file.flush().map_err(SessionStoreError::Io)?;
-    index.spans.push(span);
-    Ok(())
 }
 
 pub fn write_input_history_index(
