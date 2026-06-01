@@ -505,7 +505,10 @@ impl SessionActor {
             self.state.index_status = SessionIndexStatusKind::Stale;
             let metadata = PersistedSessionMetadata::from_state(&self.state);
             let write_index_started_at = Instant::now();
-            match store.write_metadata_index(metadata).await {
+            match store
+                .write_metadata_index(metadata, Some(event.clone()))
+                .await
+            {
                 Ok(()) => {
                     store.metrics().record_histogram(
                         "session.actor.append_event.write_metadata_index_duration_ms",
@@ -813,7 +816,10 @@ impl SessionActor {
             .as_ref()
             .ok_or(SessionError::UnsupportedProjectionWindow)?;
         let index = store.ensure_fresh_index(self.state.summary.id).await?;
-        let transcript_index = store.ensure_transcript_index(self.state.summary.id).await?;
+        let transcript_index = store
+            .ensure_transcript_index(self.state.summary.id)
+            .await
+            .map_err(|_error| SessionError::UnsupportedProjectionWindow)?;
         if transcript_index.spans.is_empty() {
             return Err(SessionError::UnsupportedProjectionWindow);
         }

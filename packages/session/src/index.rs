@@ -540,14 +540,11 @@ pub fn rebuild_index(
 ) -> Result<(Option<SessionIndex>, Vec<SessionEvent>), SessionStoreError> {
     let report = crate::reader::read_events(event_path)?;
     let file = fingerprint(event_path)?;
-    let index = SessionIndex::from_report(session_id, file.clone(), &report);
+    let index = SessionIndex::from_report(session_id, file, &report);
     if let Some(index) = &index {
         write_index(root, index)?;
         write_entries(root, session_id, &report.entries)?;
-        crate::derived::write_transcript_index(
-            root,
-            &crate::derived::TranscriptIndex::from_events(session_id, file, &report.events),
-        )?;
+        crate::derived::rebuild_all(root, session_id, event_path)?;
     }
     Ok((index, report.events))
 }

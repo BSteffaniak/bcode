@@ -682,6 +682,7 @@ impl SessionEventStore {
     fn write_metadata_index(
         &self,
         metadata: &PersistedSessionMetadata,
+        appended_event: Option<&SessionEvent>,
     ) -> Result<(), SessionStoreError> {
         let path = self.event_path(metadata.summary.id);
         let existing_index = index::load_fresh_index(&self.root, metadata.summary.id, &path)?;
@@ -704,7 +705,7 @@ impl SessionEventStore {
             index_version: index::SESSION_INDEX_VERSION,
             session_id: metadata.summary.id,
             last_good_offset: file.len,
-            file,
+            file: file.clone(),
             summary: SessionSummary {
                 client_count: 0,
                 ..metadata.summary.clone()
@@ -726,7 +727,10 @@ impl SessionEventStore {
         };
         let timer = self.metrics.timer();
         let result = index::write_index(&self.root, &index).and_then(|()| {
-            derived::rebuild_all(&self.root, metadata.summary.id, &path).map(|_| ())
+            appended_event.map_or_else(
+                || Ok(()),
+                |event| derived::append_event(&self.root, event, file, metadata.event_count),
+            )
         });
         self.metrics.record_histogram(
             "session.metadata_index.write_duration_ms",
@@ -797,7 +801,6 @@ impl SessionEventStore {
     pub fn reindex_session(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let path = self.event_path(session_id);
         let _ = index::rebuild_index(&self.root, session_id, &path)?;
-        let _ = derived::rebuild_all(&self.root, session_id, &path)?;
         Ok(())
     }
 
@@ -4303,6 +4306,147 @@ mod tests {
         assert_eq!(after_append.spans.len(), 2);
         assert_eq!(after_append.event_count, rebuilt.event_count + 1);
         assert_eq!(metadata.event_count, after_append.event_count);
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn metadata_write_for_transcript_invisible_event_only_advances_manifest() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("projection invisible".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first".to_owned())
+            .await
+            .expect("message should append");
+        let store = super::SessionEventStore::new(&root);
+        store
+            .reindex_session(session.id)
+            .expect("session should reindex");
+        let transcript_path = derived::transcript_index_path(&root, session.id);
+        let input_history_path = derived::input_history_index_path(&root, session.id);
+        let manifest_path = derived::manifest_path(&root, session.id);
+        let transcript_before =
+            std::fs::read_to_string(&transcript_path).expect("transcript index should read");
+        let input_history_before =
+            std::fs::read_to_string(&input_history_path).expect("input history index should read");
+        let manifest_before: derived::DerivedIndexManifest = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should decode");
+
+        manager
+            .append_agent_changed(session.id, "build".to_owned())
+            .await
+            .expect("agent change should append");
+
+        assert_eq!(
+            transcript_before,
+            std::fs::read_to_string(&transcript_path).expect("transcript index should read")
+        );
+        assert_eq!(
+            input_history_before,
+            std::fs::read_to_string(&input_history_path).expect("input history index should read")
+        );
+        let metadata =
+            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
+                .expect("metadata index should load")
+                .expect("metadata index should exist");
+        let manifest_after: derived::DerivedIndexManifest = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should decode");
+        assert_eq!(metadata.event_count, manifest_after.indexes[0].event_count);
+        assert_eq!(metadata.event_count, manifest_after.indexes[1].event_count);
+        assert_eq!(
+            manifest_before.indexes[0].item_count,
+            manifest_after.indexes[0].item_count
+        );
+        assert_eq!(
+            manifest_before.indexes[1].item_count,
+            manifest_after.indexes[1].item_count
+        );
+        let transcript_index =
+            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
+                .expect("transcript index should load");
+        assert_eq!(metadata.event_count, transcript_index.event_count);
+        assert_eq!(
+            manifest_before.indexes[0].item_count,
+            transcript_index.spans.len()
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn streaming_deltas_update_pending_state_without_rewriting_transcript_index() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("streaming".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first".to_owned())
+            .await
+            .expect("message should append");
+        let store = super::SessionEventStore::new(&root);
+        store
+            .reindex_session(session.id)
+            .expect("session should reindex");
+        let transcript_path = derived::transcript_index_path(&root, session.id);
+        let transcript_before =
+            std::fs::read_to_string(&transcript_path).expect("transcript index should read");
+
+        manager
+            .append_assistant_delta(session.id, "partial".to_owned())
+            .await
+            .expect("delta should append");
+        manager
+            .append_assistant_delta(session.id, " response".to_owned())
+            .await
+            .expect("delta should append");
+
+        assert_eq!(
+            transcript_before,
+            std::fs::read_to_string(&transcript_path).expect("transcript index should read")
+        );
+        let with_pending =
+            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
+                .expect("transcript index should load");
+        let pending = with_pending
+            .spans
+            .last()
+            .expect("pending assistant span should be overlaid");
+        assert_eq!(
+            pending.kind,
+            bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
+        );
+        assert_eq!(pending.content_bytes, "partial response".len());
+
+        manager
+            .append_assistant_message(session.id, "partial response".to_owned())
+            .await
+            .expect("message should append");
+        let finalized =
+            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
+                .expect("transcript index should load");
+        let assistant = finalized
+            .spans
+            .last()
+            .expect("assistant span should be finalized");
+        assert_eq!(
+            assistant.kind,
+            bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
+        );
+        assert_eq!(assistant.content_bytes, "partial response".len());
+        assert!(assistant.source_range.start_sequence < assistant.source_range.end_sequence);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
