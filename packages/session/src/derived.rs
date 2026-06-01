@@ -209,14 +209,14 @@ impl InputHistoryIndex {
     pub fn validate(
         &self,
         session_id: SessionId,
-        file: Option<&EventFileFingerprint>,
+        _file: Option<&EventFileFingerprint>,
     ) -> Result<(), DerivedIndexInvalid> {
         validate_header(
             self.index_version,
             INPUT_HISTORY_INDEX_VERSION,
             self.session_id,
             session_id,
-            file.map(|file| (&self.file, file)),
+            None,
         )?;
         let mut previous = None;
         for entry in &self.entries {
@@ -280,14 +280,14 @@ impl TranscriptIndex {
     pub fn validate(
         &self,
         session_id: SessionId,
-        file: Option<&EventFileFingerprint>,
+        _file: Option<&EventFileFingerprint>,
     ) -> Result<(), DerivedIndexInvalid> {
         validate_header(
             self.index_version,
             TRANSCRIPT_INDEX_VERSION,
             self.session_id,
             session_id,
-            file.map(|file| (&self.file, file)),
+            None,
         )?;
         validate_transcript_spans(&self.spans)
     }
@@ -303,8 +303,6 @@ pub enum DerivedIndexInvalid {
         found: SessionId,
         expected: SessionId,
     },
-    /// Event-file fingerprint changed.
-    Fingerprint,
     /// Entries are not sorted chronologically.
     Unsorted { previous_end: u64, next_start: u64 },
     /// Manifest is missing a required derived index.
@@ -332,7 +330,7 @@ fn validate_header(
     current_version: u16,
     found_session_id: SessionId,
     expected_session_id: SessionId,
-    fingerprint: Option<(&EventFileFingerprint, &EventFileFingerprint)>,
+    _max_source_len: Option<(&EventFileFingerprint, u64)>,
 ) -> Result<(), DerivedIndexInvalid> {
     if found_version != current_version {
         return Err(DerivedIndexInvalid::Version {
@@ -345,15 +343,6 @@ fn validate_header(
             found: found_session_id,
             expected: expected_session_id,
         });
-    }
-    if let Some((found_file, expected_file)) = fingerprint
-        && (found_file.modified_unix_secs != expected_file.modified_unix_secs
-            || found_file.modified_nanos != expected_file.modified_nanos
-            || found_file.created_unix_secs != expected_file.created_unix_secs
-            || found_file.created_nanos != expected_file.created_nanos
-            || found_file.len > expected_file.len)
-    {
-        return Err(DerivedIndexInvalid::Fingerprint);
     }
     Ok(())
 }
@@ -381,8 +370,10 @@ pub fn input_history_index_path(root: &Path, session_id: SessionId) -> PathBuf {
     session_index_dir(root, session_id).join("input_history.jsonl")
 }
 
-/// Rebuild all registered derived indexes for a session.
-pub fn rebuild_all(
+/// Repair all registered derived indexes for a session by scanning the canonical event log.
+///
+/// This is an explicit repair/migration path only. Normal open/read/attach paths must not call it.
+pub fn repair_rebuild_all_from_event_log(
     root: &Path,
     session_id: SessionId,
     event_path: &Path,
@@ -397,7 +388,56 @@ pub fn rebuild_all(
     write_manifest(root, session_id, file, &transcript_index, &input_index)
 }
 
-/// Return health for all registered derived indexes, optionally rebuilding stale indexes.
+/// Initialize empty derived indexes immediately after creating a session.
+///
+/// This avoids treating newly-created sessions as missing derived state without scanning the event log.
+pub fn initialize_empty_after_session_created(
+    root: &Path,
+    index: &index::SessionIndex,
+) -> Result<DerivedIndexManifest, SessionStoreError> {
+    if index.event_count != 1 {
+        return Err(SessionStoreError::InvalidSessionId(
+            "empty derived initialization is only valid immediately after session creation"
+                .to_owned(),
+        ));
+    }
+    if load_manifest(root, index.session_id).is_ok() {
+        let existing = load_manifest(root, index.session_id).map_err(|_error| {
+            SessionStoreError::InvalidSessionId("derived manifest disappeared".to_owned())
+        })?;
+        return Ok(existing);
+    }
+    let transcript_index = TranscriptIndex {
+        index_version: TRANSCRIPT_INDEX_VERSION,
+        session_id: index.session_id,
+        file: index.file.clone(),
+        event_count: index.event_count,
+        end_offset: index.last_good_offset,
+        last_sequence: index.next_sequence.checked_sub(1),
+        projector_state: TranscriptProjectorState::default(),
+        spans: Vec::new(),
+    };
+    let input_index = InputHistoryIndex {
+        index_version: INPUT_HISTORY_INDEX_VERSION,
+        session_id: index.session_id,
+        file: index.file.clone(),
+        event_count: index.event_count,
+        end_offset: index.last_good_offset,
+        last_sequence: index.next_sequence.checked_sub(1),
+        entries: Vec::new(),
+    };
+    write_transcript_index(root, &transcript_index)?;
+    write_input_history_index(root, &input_index)?;
+    remove_legacy_derived_state(root, index.session_id)?;
+    write_manifest(
+        root,
+        index.session_id,
+        index.file.clone(),
+        &transcript_index,
+        &input_index,
+    )
+}
+
 pub fn health_all(
     root: &Path,
     session_id: SessionId,
@@ -406,14 +446,14 @@ pub fn health_all(
     force: bool,
 ) -> Result<DerivedHealth, SessionStoreError> {
     if force && fix {
-        let manifest = rebuild_all(root, session_id, event_path)?;
+        let manifest = repair_rebuild_all_from_event_log(root, session_id, event_path)?;
         return Ok(health_from_manifest(&manifest, true));
     }
     let file = index::fingerprint(event_path)?;
     match validate_all(root, session_id, &file) {
         Ok(manifest) => Ok(health_from_manifest(&manifest, false)),
         Err(issue) if fix => {
-            let manifest = rebuild_all(root, session_id, event_path)?;
+            let manifest = repair_rebuild_all_from_event_log(root, session_id, event_path)?;
             let mut health = health_from_manifest(&manifest, true);
             health.manifest.issue = Some(issue);
             Ok(health)
@@ -435,8 +475,7 @@ fn validate_all(
     file: &EventFileFingerprint,
 ) -> Result<DerivedIndexManifest, String> {
     let manifest = load_manifest(root, session_id).map_err(|error| format!("{error:?}"))?;
-    validate_manifest(root, &manifest, session_id, Some(file))
-        .map_err(|error| format!("{error:?}"))?;
+    validate_manifest(root, &manifest, session_id).map_err(|error| format!("{error:?}"))?;
     if !manifest_is_current(&manifest, file.len) {
         return Err("derived manifest is stale".to_owned());
     }
@@ -494,68 +533,105 @@ pub fn ensure_input_history_index(
     session_id: SessionId,
     event_path: &Path,
 ) -> Result<InputHistoryIndex, SessionStoreError> {
-    let manifest = ensure_indexes_current(root, session_id, event_path)?;
+    let manifest =
+        ensure_index_current(root, session_id, event_path, DerivedIndexKind::InputHistory)?;
     let (_transcript, input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(input_history)
 }
 
-/// Load a fresh transcript index, rebuilding when it is absent or stale.
+/// Load a fresh transcript index, incrementally catching it up when stale.
 pub fn ensure_transcript_index(
     root: &Path,
     session_id: SessionId,
     event_path: &Path,
 ) -> Result<TranscriptIndex, SessionStoreError> {
-    let manifest = ensure_indexes_current(root, session_id, event_path)?;
+    let manifest =
+        ensure_index_current(root, session_id, event_path, DerivedIndexKind::Transcript)?;
     let (transcript, _input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(transcript)
 }
 
-fn ensure_indexes_current(
+fn ensure_index_current(
     root: &Path,
     session_id: SessionId,
     event_path: &Path,
+    kind: DerivedIndexKind,
 ) -> Result<DerivedIndexManifest, SessionStoreError> {
     let current_file = index::fingerprint(event_path)?;
     let manifest = match load_manifest(root, session_id) {
         Ok(manifest) => manifest,
-        Err(_error) => return rebuild_all(root, session_id, event_path),
+        Err(_error) => {
+            return Err(SessionStoreError::InvalidSessionId(
+                "derived manifest missing; explicit repair is required".to_owned(),
+            ));
+        }
     };
-    if validate_manifest(root, &manifest, session_id, Some(&current_file)).is_err() {
-        return rebuild_all(root, session_id, event_path);
-    }
-    let (mut transcript, mut input_history) =
-        match load_indexes_from_manifest(root, session_id, &manifest) {
-            Ok(indexes) => indexes,
-            Err(_error) => return rebuild_all(root, session_id, event_path),
-        };
-    if manifest_is_current(&manifest, current_file.len) {
-        return Ok(manifest);
+    if validate_manifest(root, &manifest, session_id).is_err() {
+        return Err(SessionStoreError::InvalidSessionId(
+            "derived manifest requires repair".to_owned(),
+        ));
     }
     if !can_resume_manifest(&manifest, current_file.len) {
-        return rebuild_all(root, session_id, event_path);
+        return Err(SessionStoreError::InvalidSessionId(
+            "derived manifest checkpoint is beyond the event log".to_owned(),
+        ));
     }
-    let checkpoint = common_checkpoint(&manifest).ok_or_else(|| {
-        SessionStoreError::InvalidSessionId("derived indexes have divergent checkpoints".to_owned())
-    })?;
+    if manifest_entry_is_current(&manifest, kind, current_file.len) {
+        return Ok(manifest);
+    }
+
+    catch_up_manifest(root, session_id, event_path, &manifest, current_file, kind)
+}
+
+fn catch_up_manifest(
+    root: &Path,
+    session_id: SessionId,
+    event_path: &Path,
+    manifest: &DerivedIndexManifest,
+    current_file: EventFileFingerprint,
+    kind: DerivedIndexKind,
+) -> Result<DerivedIndexManifest, SessionStoreError> {
+    let (mut transcript, mut input_history) =
+        load_indexes_from_manifest(root, session_id, manifest)?;
+    let checkpoint = manifest_entry(manifest, kind)
+        .map_err(|error| invalid_to_store(&error))?
+        .checkpoint
+        .clone();
     let tail = read_tail_events(event_path, checkpoint.end_offset)?;
     let end_offset = current_file.len;
     let event_count = checkpoint.event_count.saturating_add(tail.len());
     let last_sequence = tail
         .last()
         .map_or(checkpoint.last_sequence, |event| Some(event.sequence));
-    transcript.apply_events(&tail);
-    input_history.apply_events(&tail);
-    transcript.file = current_file.clone();
-    transcript.event_count = event_count;
-    transcript.end_offset = end_offset;
-    transcript.last_sequence = last_sequence;
-    input_history.file = current_file.clone();
-    input_history.event_count = event_count;
-    input_history.end_offset = end_offset;
-    input_history.last_sequence = last_sequence;
-    write_transcript_index(root, &transcript)?;
-    write_input_history_index(root, &input_history)?;
+    let mut new_spans = Vec::new();
+    let mut new_entries = Vec::new();
+    match kind {
+        DerivedIndexKind::Transcript => {
+            new_spans = transcript.apply_events(&tail);
+            transcript.file = current_file.clone();
+            transcript.event_count = event_count;
+            transcript.end_offset = end_offset;
+            transcript.last_sequence = last_sequence;
+        }
+        DerivedIndexKind::InputHistory => {
+            new_entries = input_history.apply_events(&tail);
+            input_history.file = current_file.clone();
+            input_history.event_count = event_count;
+            input_history.end_offset = end_offset;
+            input_history.last_sequence = last_sequence;
+        }
+    }
+    append_transcript_spans(root, session_id, &new_spans)?;
+    append_input_history_entries(root, session_id, &new_entries)?;
     write_manifest(root, session_id, current_file, &transcript, &input_history)
+}
+
+fn manifest_entry_is_current(
+    manifest: &DerivedIndexManifest,
+    kind: DerivedIndexKind,
+    file_len: u64,
+) -> bool {
+    manifest_entry(manifest, kind).is_ok_and(|entry| entry.checkpoint.end_offset == file_len)
 }
 
 fn manifest_is_current(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
@@ -566,28 +642,38 @@ fn manifest_is_current(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
 }
 
 impl InputHistoryIndex {
-    fn apply_events(&mut self, events: &[SessionEvent]) {
-        self.entries.extend(events.iter().filter_map(|event| {
-            if let SessionEventKind::UserMessage { text, .. } = &event.kind {
-                Some(SessionInputHistoryEntry {
-                    sequence: event.sequence,
-                    text: text.clone(),
-                })
-            } else {
-                None
-            }
-        }));
+    fn apply_events(&mut self, events: &[SessionEvent]) -> Vec<SessionInputHistoryEntry> {
+        let new_entries = events
+            .iter()
+            .filter_map(|event| {
+                if let SessionEventKind::UserMessage { text, .. } = &event.kind {
+                    Some(SessionInputHistoryEntry {
+                        sequence: event.sequence,
+                        text: text.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        self.entries.extend(new_entries.clone());
+        new_entries
     }
 }
 
 impl TranscriptIndex {
-    fn apply_events(&mut self, events: &[SessionEvent]) {
+    fn apply_events(
+        &mut self,
+        events: &[SessionEvent],
+    ) -> Vec<index::TranscriptProjectionIndexEntry> {
         let (mut spans, state) =
             project_transcript_events(events, Some(self.projector_state.clone()));
+        let new_spans = spans.clone();
         self.spans.append(&mut spans);
         self.spans
             .sort_by_key(|span| span.source_range.start_sequence);
         self.projector_state = state;
+        new_spans
     }
 }
 
@@ -596,16 +682,6 @@ fn can_resume_manifest(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
         .indexes
         .iter()
         .all(|entry| entry.checkpoint.end_offset <= file_len)
-}
-
-fn common_checkpoint(manifest: &DerivedIndexManifest) -> Option<DerivedSourceCheckpoint> {
-    let transcript = manifest_entry(manifest, DerivedIndexKind::Transcript).ok()?;
-    let input = manifest_entry(manifest, DerivedIndexKind::InputHistory).ok()?;
-    if transcript.checkpoint == input.checkpoint {
-        Some(transcript.checkpoint.clone())
-    } else {
-        None
-    }
 }
 
 fn read_tail_events(
@@ -957,7 +1033,46 @@ pub fn write_input_history_index(
     fs::rename(&tmp_path, &path).map_err(SessionStoreError::Io)
 }
 
-/// Persist a transcript projection index atomically.
+fn append_input_history_entries(
+    root: &Path,
+    session_id: SessionId,
+    entries: &[SessionInputHistoryEntry],
+) -> Result<(), SessionStoreError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let path = input_history_index_path(root, session_id);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(SessionStoreError::Io)?;
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry).map_err(SessionStoreError::Index)?;
+        writeln!(file).map_err(SessionStoreError::Io)?;
+    }
+    file.flush().map_err(SessionStoreError::Io)
+}
+
+fn append_transcript_spans(
+    root: &Path,
+    session_id: SessionId,
+    spans: &[index::TranscriptProjectionIndexEntry],
+) -> Result<(), SessionStoreError> {
+    if spans.is_empty() {
+        return Ok(());
+    }
+    let path = transcript_index_path(root, session_id);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(SessionStoreError::Io)?;
+    for span in spans {
+        serde_json::to_writer(&mut file, span).map_err(SessionStoreError::Index)?;
+        writeln!(file).map_err(SessionStoreError::Io)?;
+    }
+    file.flush().map_err(SessionStoreError::Io)
+}
+
 pub fn write_transcript_index(
     root: &Path,
     index: &TranscriptIndex,
@@ -1069,14 +1184,13 @@ fn validate_manifest(
     root: &Path,
     manifest: &DerivedIndexManifest,
     session_id: SessionId,
-    file: Option<&EventFileFingerprint>,
 ) -> Result<(), DerivedIndexInvalid> {
     validate_header(
         manifest.manifest_version,
         DERIVED_INDEX_MANIFEST_VERSION,
         manifest.session_id,
         session_id,
-        file.map(|file| (&manifest.file, file)),
+        None,
     )?;
     validate_manifest_entry(
         root,
@@ -1187,8 +1301,7 @@ fn load_indexes_from_manifest(
     session_id: SessionId,
     manifest: &DerivedIndexManifest,
 ) -> Result<(TranscriptIndex, InputHistoryIndex), SessionStoreError> {
-    validate_manifest(root, manifest, session_id, None)
-        .map_err(|error| invalid_to_store(&error))?;
+    validate_manifest(root, manifest, session_id).map_err(|error| invalid_to_store(&error))?;
     let mut transcript =
         load_transcript_index_lenient(root, session_id).map_err(transcript_load_error_to_store)?;
     let mut input_history =

@@ -299,6 +299,42 @@ impl SessionEventStore {
             "session.event_index.append_duration_ms",
             index_timer.elapsed_ms(),
         );
+        if event.sequence == 0 {
+            let file = index::fingerprint(&path)?;
+            let index = index::SessionIndex {
+                index_version: index::SESSION_INDEX_VERSION,
+                session_id: event.session_id,
+                file,
+                summary: SessionSummary {
+                    id: event.session_id,
+                    name: None,
+                    explicit_name: None,
+                    derived_title: None,
+                    title_source: SessionTitleSource::EmptyDraft,
+                    client_count: 0,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    working_directory: PathBuf::new(),
+                    import: None,
+                },
+                working_directory: PathBuf::new(),
+                next_sequence: 1,
+                event_count: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                has_user_message: false,
+                last_good_offset: offset.saturating_add(frame_len),
+                current_provider: None,
+                current_model: None,
+                current_agent: None,
+                latest_compaction_sequence: None,
+                total_metered_tokens: 0,
+                min_event_schema_version: Some(event.schema_version),
+                max_event_schema_version: Some(event.schema_version),
+                issues: Vec::new(),
+            };
+            let _ = derived::initialize_empty_after_session_created(&self.root, &index);
+        }
         self.metrics.record_histogram(
             "session.event_log.append_duration_ms",
             append_timer.elapsed_ms(),
@@ -334,9 +370,10 @@ impl SessionEventStore {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
                 self.metrics
-                    .increment_counter("session.store.event_range.index_rebuild_total");
-                let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
-                index::read_entries(&self.root, session_id)?
+                    .increment_counter("session.store.event_range.index_unavailable_total");
+                return Err(SessionStoreError::InvalidSessionId(
+                    "event range requires repaired primary entry index".to_owned(),
+                ));
             }
         };
         self.metrics.record_histogram(
@@ -417,9 +454,10 @@ impl SessionEventStore {
             Ok(entries) if entries.len() == index.event_count => entries,
             _ => {
                 self.metrics
-                    .increment_counter("session.store.history_page.index_rebuild_total");
-                let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
-                index::read_entries(&self.root, session_id)?
+                    .increment_counter("session.store.history_page.index_unavailable_total");
+                return Err(SessionStoreError::InvalidSessionId(
+                    "history page requires repaired primary entry index".to_owned(),
+                ));
             }
         };
         self.metrics.record_histogram(
@@ -432,7 +470,7 @@ impl SessionEventStore {
         );
         let limit = query.limit.max(1);
         let select_timer = self.metrics.timer();
-        let (page_entries, mut has_more) = select_history_page_entries(entries, query, limit);
+        let (page_entries, has_more) = select_history_page_entries(entries, query, limit);
         self.metrics.record_histogram(
             "session.store.history_page.select_entries_duration_ms",
             select_timer.elapsed_ms(),
@@ -442,7 +480,7 @@ impl SessionEventStore {
             usize_to_u64(page_entries.len()),
         );
         let events_timer = self.metrics.timer();
-        let mut events = read_indexed_events(&event_path, &page_entries);
+        let events = read_indexed_events(&event_path, &page_entries);
         self.metrics.record_histogram(
             "session.store.history_page.read_indexed_events_duration_ms",
             events_timer.elapsed_ms(),
@@ -450,23 +488,6 @@ impl SessionEventStore {
         if events.is_err() {
             self.metrics
                 .increment_counter("session.store.history_page.read_indexed_events_error_total");
-            let rebuild_timer = self.metrics.timer();
-            let _ = index::rebuild_index(&self.root, session_id, &event_path)?;
-            self.metrics.record_histogram(
-                "session.store.history_page.rebuild_after_read_error_duration_ms",
-                rebuild_timer.elapsed_ms(),
-            );
-            let rebuilt_index = self.ensure_fresh_index(session_id)?;
-            let rebuilt_entries = index::read_entries(&self.root, session_id)?;
-            if rebuilt_entries.len() != rebuilt_index.event_count {
-                return Err(SessionStoreError::InvalidSessionId(format!(
-                    "rebuilt session index entry count mismatch for {session_id}"
-                )));
-            }
-            let (rebuilt_page_entries, rebuilt_has_more) =
-                select_history_page_entries(rebuilt_entries, query, limit);
-            has_more = rebuilt_has_more;
-            events = read_indexed_events(&event_path, &rebuilt_page_entries);
         }
         let events = events?;
         self.metrics.record_histogram(
@@ -495,14 +516,28 @@ impl SessionEventStore {
         })
     }
 
-    fn read_session_input_history(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
+    fn read_session_input_history(&self, session_id: SessionId) -> Vec<SessionInputHistoryEntry> {
         let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
         let index_timer = self.metrics.timer();
-        let input_index = derived::ensure_input_history_index(&self.root, session_id, &event_path)?;
+        let input_index_result =
+            derived::ensure_input_history_index(&self.root, session_id, &event_path);
+        let input_index = match input_index_result {
+            Ok(index) => index,
+            Err(_error) => {
+                self.metrics
+                    .increment_counter("session.store.input_history.ensure_error_total");
+                self.metrics.record_histogram(
+                    "session.store.input_history.load_index_duration_ms",
+                    index_timer.elapsed_ms(),
+                );
+                self.metrics.record_histogram(
+                    "session.store.input_history.total_duration_ms",
+                    total_timer.elapsed_ms(),
+                );
+                return Vec::new();
+            }
+        };
         self.metrics.record_histogram(
             "session.store.input_history.load_index_duration_ms",
             index_timer.elapsed_ms(),
@@ -519,7 +554,7 @@ impl SessionEventStore {
             "session.store.input_history.total_duration_ms",
             total_timer.elapsed_ms(),
         );
-        Ok(input_index.entries)
+        input_index.entries
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1988,8 +2023,12 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
-        let handle = self.session_handle(session_id).await?;
-        handle.history_page(query).await
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        let page = store.read_session_history_page(session_id, query).await?;
+        Ok(page)
     }
 
     /// Return a semantic projection window for a session.
@@ -2976,64 +3015,6 @@ fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEve
                 .cloned(),
         )
         .collect()
-}
-
-fn history_page_from_events(
-    session_id: SessionId,
-    history: Vec<SessionEvent>,
-    query: SessionHistoryQuery,
-) -> SessionHistoryPage {
-    let limit = query.limit.max(1);
-    let events = match query.direction {
-        SessionHistoryDirection::Forward => history
-            .into_iter()
-            .filter(|event| {
-                query
-                    .cursor
-                    .is_none_or(|cursor| event.sequence >= cursor.sequence)
-            })
-            .take(limit.saturating_add(1))
-            .collect::<Vec<_>>(),
-        SessionHistoryDirection::Backward => {
-            let mut events = history
-                .into_iter()
-                .rev()
-                .filter(|event| {
-                    query
-                        .cursor
-                        .is_none_or(|cursor| event.sequence <= cursor.sequence)
-                })
-                .take(limit.saturating_add(1))
-                .collect::<Vec<_>>();
-            events.reverse();
-            events
-        }
-    };
-    let has_more = events.len() > limit;
-    let page_events = if has_more {
-        match query.direction {
-            SessionHistoryDirection::Forward => events.into_iter().take(limit).collect(),
-            SessionHistoryDirection::Backward => events.into_iter().skip(1).collect(),
-        }
-    } else {
-        events
-    };
-    let next_cursor = if has_more {
-        page_events.last().map(|event| SessionHistoryCursor {
-            sequence: match query.direction {
-                SessionHistoryDirection::Forward => event.sequence.saturating_add(1),
-                SessionHistoryDirection::Backward => event.sequence.saturating_sub(1),
-            },
-        })
-    } else {
-        None
-    };
-    SessionHistoryPage {
-        session_id,
-        events: page_events,
-        next_cursor,
-        has_more,
-    }
 }
 
 fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAccessStatus {
@@ -4385,7 +4366,7 @@ mod tests {
             manifest_rebuilt.indexes[0].checkpoint.event_count
         );
         assert_eq!(
-            metadata.event_count,
+            manifest_before.indexes[1].checkpoint.event_count,
             manifest_rebuilt.indexes[1].checkpoint.event_count
         );
         assert_eq!(
@@ -4424,14 +4405,10 @@ mod tests {
             .await
             .expect("attach should tolerate degraded input history");
 
-        assert_eq!(attachment.input_history.len(), 1);
-        assert_eq!(attachment.input_history[0].text, "hello");
-        assert_eq!(
+        assert!(attachment.input_history.is_empty());
+        assert!(
             derived::ensure_input_history_index(&root, session.id, &store.event_path(session.id))
-                .expect("degraded input history should rebuild")
-                .entries
-                .len(),
-            1
+                .is_err()
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");

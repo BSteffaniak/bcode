@@ -161,14 +161,6 @@ impl SessionHandle {
         self.send(SessionCommand::History).await?
     }
 
-    pub async fn history_page(
-        &self,
-        query: SessionHistoryQuery,
-    ) -> Result<SessionHistoryPage, SessionError> {
-        self.send(|reply| SessionCommand::HistoryPage { query, reply })
-            .await?
-    }
-
     pub async fn projection_window(
         &self,
         request: ProjectionWindowRequest,
@@ -289,10 +281,6 @@ enum SessionCommand {
     },
     AccessStatus(oneshot::Sender<SessionAccessStatus>),
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
-    HistoryPage {
-        query: SessionHistoryQuery,
-        reply: oneshot::Sender<Result<SessionHistoryPage, SessionError>>,
-    },
     ProjectionWindow {
         request: ProjectionWindowRequest,
         reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
@@ -418,9 +406,6 @@ impl SessionActor {
             }
             SessionCommand::History(reply) => {
                 let _ = reply.send(self.history().await);
-            }
-            SessionCommand::HistoryPage { query, reply } => {
-                let _ = reply.send(self.history_page(query).await);
             }
             SessionCommand::ProjectionWindow { request, reply } => {
                 let _ = reply.send(self.projection_window(request).await);
@@ -559,6 +544,7 @@ impl SessionActor {
         Ok(events)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn attach(
         &mut self,
         client_id: ClientId,
@@ -591,13 +577,21 @@ impl SessionActor {
                     metrics
                         .record_histogram("session.actor.attach.recent_limit", usize_to_u64(limit));
                 }
-                self.history_page(SessionHistoryQuery {
-                    cursor: None,
-                    limit,
-                    direction: SessionHistoryDirection::Backward,
-                })
-                .await?
-                .events
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or(SessionError::NotFound(self.state.summary.id))?;
+                store
+                    .read_session_history_page(
+                        self.state.summary.id,
+                        SessionHistoryQuery {
+                            cursor: None,
+                            limit,
+                            direction: SessionHistoryDirection::Backward,
+                        },
+                    )
+                    .await?
+                    .events
             }
             AttachMode::ProjectionWindow { history } => history,
         };
@@ -669,13 +663,21 @@ impl SessionActor {
         let history = match mode {
             AttachMode::Full => self.history().await?,
             AttachMode::Recent { limit } => {
-                self.history_page(SessionHistoryQuery {
-                    cursor: None,
-                    limit,
-                    direction: SessionHistoryDirection::Backward,
-                })
-                .await?
-                .events
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or(SessionError::NotFound(self.state.summary.id))?;
+                store
+                    .read_session_history_page(
+                        self.state.summary.id,
+                        SessionHistoryQuery {
+                            cursor: None,
+                            limit,
+                            direction: SessionHistoryDirection::Backward,
+                        },
+                    )
+                    .await?
+                    .events
             }
             AttachMode::ProjectionWindow { history } => history,
         };
@@ -735,32 +737,6 @@ impl SessionActor {
             .as_ref()
             .ok_or(SessionError::NotFound(self.state.summary.id))?;
         Ok(store.read_session_events(self.state.summary.id).await?)
-    }
-
-    async fn history_page(
-        &mut self,
-        query: SessionHistoryQuery,
-    ) -> Result<SessionHistoryPage, SessionError> {
-        if let Some(events) = &self.state.events {
-            return Ok(history_page_from_events(
-                self.state.summary.id,
-                events.clone(),
-                query,
-            ));
-        }
-        let should_mark_current = self.state.index_status == SessionIndexStatusKind::Stale;
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        let page = store
-            .read_session_history_page(self.state.summary.id, query)
-            .await?;
-        if should_mark_current {
-            self.state.index_status = SessionIndexStatusKind::Current;
-            self.refresh_snapshot();
-        }
-        Ok(page)
     }
 
     async fn projection_window(

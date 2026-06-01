@@ -529,7 +529,7 @@ pub fn rebuild_index(
     if let Some(index) = &index {
         write_index(root, index)?;
         write_entries(root, session_id, &report.entries)?;
-        crate::derived::rebuild_all(root, session_id, event_path)?;
+        crate::derived::repair_rebuild_all_from_event_log(root, session_id, event_path)?;
     }
     Ok((index, report.events))
 }

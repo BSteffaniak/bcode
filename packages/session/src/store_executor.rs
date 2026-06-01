@@ -166,7 +166,7 @@ impl SessionStoreExecutor {
                 elapsed_ms(queued_at),
             );
             let timer = store.metrics.timer();
-            let result = store.append(&event).map(|_| ());
+            let result = store.append(&event).map(|_entry| ());
             store.metrics.record_histogram(
                 "session.store.append_event_frame.duration_ms",
                 timer.elapsed_ms(),
@@ -300,18 +300,16 @@ impl SessionStoreExecutor {
                 elapsed_ms(queued_at),
             );
             let timer = store.metrics.timer();
-            let result = store.read_session_input_history(session_id);
-            if let Ok(input_history) = &result {
-                store.metrics.record_histogram(
-                    "session.store.input_history.entry_count",
-                    usize_to_u64(input_history.len()),
-                );
-            }
+            let input_history = store.read_session_input_history(session_id);
+            store.metrics.record_histogram(
+                "session.store.input_history.entry_count",
+                usize_to_u64(input_history.len()),
+            );
             store.metrics.record_histogram(
                 "session.store.input_history.duration_ms",
                 timer.elapsed_ms(),
             );
-            result
+            Ok(input_history)
         })
         .await?
     }
