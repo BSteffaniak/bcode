@@ -151,6 +151,18 @@ struct StreamedToolResultContext {
     saw_output: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEventApplication {
+    Replay,
+    Live,
+}
+
+impl SessionEventApplication {
+    const fn live_activity(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
 impl BmuxApp {
     /// Create TUI state with replayed session data.
     #[must_use]
@@ -888,7 +900,7 @@ impl BmuxApp {
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_history.extend_from_slice(events);
         for event in events {
-            self.absorb_session_event_without_history_record(event);
+            self.apply_session_event(event, SessionEventApplication::Replay);
         }
     }
 
@@ -945,11 +957,11 @@ impl BmuxApp {
         if event_affects_transcript_rows(event) {
             self.transcript_history.push(event.clone());
         }
-        self.absorb_session_event_without_history_record(event);
+        self.apply_session_event(event, SessionEventApplication::Live);
     }
 
     #[allow(clippy::too_many_lines)]
-    fn absorb_session_event_without_history_record(&mut self, event: &SessionEvent) {
+    fn apply_session_event(&mut self, event: &SessionEvent, application: SessionEventApplication) {
         if self.submitted_user_message_following == SubmittedUserMessageFollowing::Anchored
             && !matches!(&event.kind, SessionEventKind::UserMessage { .. })
             && event_affects_transcript_rows(event)
@@ -968,16 +980,16 @@ impl BmuxApp {
         }
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => {
-                self.push_committed_user_message(event.sequence, text);
+                self.push_committed_user_message(event.sequence, text, application);
             }
             SessionEventKind::AssistantDelta { text } => {
                 if was_following {
                     self.pending_assistant_stream_anchor = true;
                 }
-                self.push_live_assistant_delta(text);
+                self.push_live_assistant_delta(text, application);
             }
             SessionEventKind::AssistantMessage { text } => {
-                self.finish_streaming_item("Assistant", text);
+                self.finish_streaming_item("Assistant", text, application);
             }
             SessionEventKind::SystemMessage { text } => self.push_system_message(text),
             SessionEventKind::ToolCallRequested {
@@ -991,11 +1003,13 @@ impl BmuxApp {
                 is_error,
                 ..
             } => {
-                self.set_activity(ActivityState::Thinking);
-                self.push_tool_result(tool_call_id, result, *is_error);
+                if application.live_activity() {
+                    self.set_activity(ActivityState::Thinking);
+                }
+                self.push_tool_result(tool_call_id, result, *is_error, application);
             }
             SessionEventKind::ToolInvocationStream { event } => {
-                self.apply_tool_stream_event(event);
+                self.apply_tool_stream_event(event, application);
             }
             SessionEventKind::PermissionRequested {
                 permission_id,
@@ -1008,31 +1022,38 @@ impl BmuxApp {
                     tool_call_id,
                     tool_name,
                     arguments_json,
+                    application,
                 );
             }
             SessionEventKind::PermissionResolved {
                 permission_id,
                 approved,
             } => {
-                self.set_activity(ActivityState::Thinking);
+                if application.live_activity() {
+                    self.set_activity(ActivityState::Thinking);
+                }
                 self.set_permission_status(permission_id, *approved);
             }
             SessionEventKind::ModelChanged { provider, model } => {
                 self.apply_model_changed(provider, model);
             }
             SessionEventKind::ModelTurnStarted { .. } => {
-                self.set_activity(ActivityState::Thinking);
-                "thinking".clone_into(&mut self.status);
+                if application.live_activity() {
+                    self.set_activity(ActivityState::Thinking);
+                    "thinking".clone_into(&mut self.status);
+                }
             }
             SessionEventKind::ModelTurnCancelRequested { .. } => {
-                self.set_cancelling();
-                "cancellation requested".clone_into(&mut self.status);
+                if application.live_activity() {
+                    self.set_cancelling();
+                    "cancellation requested".clone_into(&mut self.status);
+                }
             }
             SessionEventKind::ModelTurnFinished {
                 outcome, message, ..
-            } => self.finish_model_turn(*outcome, message.as_deref()),
+            } => self.finish_model_turn(*outcome, message.as_deref(), application),
             SessionEventKind::ModelUsage { turn_id, usage } => {
-                self.push_model_usage(turn_id, usage);
+                self.push_model_usage(turn_id, usage, application);
             }
             SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
             SessionEventKind::WorkingDirectoryChanged {
@@ -1065,14 +1086,14 @@ impl BmuxApp {
                 skill_id, error, ..
             } => self.push_skill_error(skill_id, error),
             SessionEventKind::AssistantReasoningDelta { text } => {
-                self.add_streaming_delta(text);
+                self.add_streaming_delta(text, application);
                 if self.reasoning_visible() {
                     self.push_streaming_item("Reasoning", text);
                 }
             }
             SessionEventKind::AssistantReasoningMessage { text } => {
                 if self.reasoning_visible() {
-                    self.finish_streaming_item("Reasoning", text);
+                    self.finish_streaming_item("Reasoning", text, application);
                 }
             }
             SessionEventKind::SessionCreated { name, .. } => {
@@ -1083,11 +1104,19 @@ impl BmuxApp {
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent_id.clone_from(agent_id);
             }
-            SessionEventKind::TraceEvent { trace } => self.apply_trace_event(trace),
+            SessionEventKind::TraceEvent { trace } => {
+                if application.live_activity() {
+                    self.apply_trace_event(trace);
+                }
+            }
             SessionEventKind::RuntimeWorkStarted { .. }
             | SessionEventKind::RuntimeWorkCancelRequested { .. }
             | SessionEventKind::RuntimeWorkProgress { .. }
-            | SessionEventKind::RuntimeWorkFinished { .. } => self.apply_runtime_work_event(event),
+            | SessionEventKind::RuntimeWorkFinished { .. } => {
+                if application.live_activity() {
+                    self.apply_runtime_work_event(event);
+                }
+            }
             _ => {}
         }
     }
@@ -1248,9 +1277,18 @@ impl BmuxApp {
         self.pending_submissions.remove(text);
     }
 
-    fn push_committed_user_message(&mut self, sequence: u64, text: &str) {
+    fn push_committed_user_message(
+        &mut self,
+        sequence: u64,
+        text: &str,
+        application: SessionEventApplication,
+    ) {
         self.input_history.push_committed(sequence, text);
-        self.push_live_user_message(text);
+        if application.live_activity() {
+            self.push_live_user_message(text);
+        } else {
+            self.push_user_message(text);
+        }
     }
 
     fn push_live_user_message(&mut self, text: &str) {
@@ -1258,8 +1296,8 @@ impl BmuxApp {
         self.push_user_message(text);
     }
 
-    fn push_live_assistant_delta(&mut self, text: &str) {
-        self.add_streaming_delta(text);
+    fn push_live_assistant_delta(&mut self, text: &str, application: SessionEventApplication) {
+        self.add_streaming_delta(text, application);
         self.push_streaming_item("Assistant", text);
     }
 
@@ -1290,8 +1328,16 @@ impl BmuxApp {
         push_streaming_transcript_item(&mut self.transcript, role, text);
     }
 
-    fn finish_streaming_item(&mut self, role: &'static str, text: &str) {
+    fn finish_streaming_item(
+        &mut self,
+        role: &'static str,
+        text: &str,
+        application: SessionEventApplication,
+    ) {
         finish_streaming_transcript_item(&mut self.transcript, role, text);
+        if application.live_activity() && matches!(self.activity, ActivityState::Streaming { .. }) {
+            self.set_activity(ActivityState::Thinking);
+        }
     }
 
     fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
@@ -1359,17 +1405,27 @@ impl BmuxApp {
         false
     }
 
-    fn push_tool_result(&mut self, tool_call_id: &str, result: &str, is_error: bool) {
+    fn push_tool_result(
+        &mut self,
+        tool_call_id: &str,
+        result: &str,
+        is_error: bool,
+        application: SessionEventApplication,
+    ) {
         if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result)) {
+            if application.live_activity() {
+                if is_error {
+                    "failed".clone_into(&mut self.status);
+                } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                    self.status = format!("applied · {status}");
+                } else {
+                    "finished".clone_into(&mut self.status);
+                }
+            }
             if is_error {
-                "failed".clone_into(&mut self.status);
                 self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
-            } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
-                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-                self.status = format!("applied · {status}");
             } else {
                 self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-                "finished".clone_into(&mut self.status);
             }
             self.finish_tool_request_preview(tool_call_id);
             return;
@@ -1383,19 +1439,29 @@ impl BmuxApp {
             is_error,
         ));
         if is_error {
-            "failed".clone_into(&mut self.status);
+            if application.live_activity() {
+                "failed".clone_into(&mut self.status);
+            }
             self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
         } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
             self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-            self.status = format!("applied · {status}");
+            if application.live_activity() {
+                self.status = format!("applied · {status}");
+            }
         } else {
             self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-            "finished".clone_into(&mut self.status);
+            if application.live_activity() {
+                "finished".clone_into(&mut self.status);
+            }
         }
         self.finish_tool_request_preview(tool_call_id);
     }
 
-    fn apply_tool_stream_event(&mut self, event: &ToolInvocationStreamEvent) {
+    fn apply_tool_stream_event(
+        &mut self,
+        event: &ToolInvocationStreamEvent,
+        application: SessionEventApplication,
+    ) {
         match event {
             ToolInvocationStreamEvent::OutputDelta {
                 tool_call_id,
@@ -1404,7 +1470,9 @@ impl BmuxApp {
                 ..
             } => self.push_tool_output_delta(tool_call_id, *stream, text),
             ToolInvocationStreamEvent::Status { message, .. } => {
-                message.clone_into(&mut self.status);
+                if application.live_activity() {
+                    message.clone_into(&mut self.status);
+                }
             }
             ToolInvocationStreamEvent::Started {
                 tool_call_id,
@@ -1427,12 +1495,16 @@ impl BmuxApp {
                         },
                     );
                 }
-                self.set_activity_for_tool_call(tool_call_id, tool_name);
+                if application.live_activity() {
+                    self.set_activity_for_tool_call(tool_call_id, tool_name);
+                }
                 self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applying);
-                if let Some(status) = self.tool_call_file_status(tool_call_id) {
-                    self.status = status;
-                } else {
-                    tool_name.clone_into(&mut self.status);
+                if application.live_activity() {
+                    if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                        self.status = status;
+                    } else {
+                        tool_name.clone_into(&mut self.status);
+                    }
                 }
             }
             ToolInvocationStreamEvent::Finished {
@@ -1450,14 +1522,20 @@ impl BmuxApp {
                 }
                 self.finish_tool_request_preview(tool_call_id);
                 if *is_error {
-                    "failed".clone_into(&mut self.status);
+                    if application.live_activity() {
+                        "failed".clone_into(&mut self.status);
+                    }
                     self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
                 } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
                     self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-                    self.status = format!("applied · {status}");
+                    if application.live_activity() {
+                        self.status = format!("applied · {status}");
+                    }
                 } else {
                     self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-                    "finished".clone_into(&mut self.status);
+                    if application.live_activity() {
+                        "finished".clone_into(&mut self.status);
+                    }
                 }
             }
         }
@@ -1545,6 +1623,7 @@ impl BmuxApp {
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
+        application: SessionEventApplication,
     ) {
         self.transcript.push(permission_request_item(
             permission_id,
@@ -1552,17 +1631,21 @@ impl BmuxApp {
             tool_name,
             arguments_json,
         ));
-        self.set_activity(ActivityState::WaitingPermission {
-            name: tool_name.to_owned(),
-        });
+        if application.live_activity() {
+            self.set_activity(ActivityState::WaitingPermission {
+                name: tool_name.to_owned(),
+            });
+        }
         self.set_tool_request_file_phase(tool_call_id, FileEditPhase::WaitingPermission);
-        self.status = self.tool_call_file_status(tool_call_id).map_or_else(
-            || {
-                tool_request_status(tool_name, arguments_json)
-                    .unwrap_or_else(|| tool_name.to_owned())
-            },
-            |status| format!("waiting permission · {status}"),
-        );
+        if application.live_activity() {
+            self.status = self.tool_call_file_status(tool_call_id).map_or_else(
+                || {
+                    tool_request_status(tool_name, arguments_json)
+                        .unwrap_or_else(|| tool_name.to_owned())
+                },
+                |status| format!("waiting permission · {status}"),
+            );
+        }
     }
 
     fn set_permission_status(&mut self, permission_id: &str, approved: bool) {
@@ -1662,25 +1745,41 @@ impl BmuxApp {
         }
     }
 
-    fn push_model_usage(&mut self, turn_id: &str, usage: &bcode_session_models::SessionTokenUsage) {
+    fn push_model_usage(
+        &mut self,
+        turn_id: &str,
+        usage: &bcode_session_models::SessionTokenUsage,
+        application: SessionEventApplication,
+    ) {
         self.token_usage.absorb(usage);
-        if let Some(tokens) = usage.metered_total_tokens() {
+        if application.live_activity()
+            && let Some(tokens) = usage.metered_total_tokens()
+        {
             self.status = format!("tokens: {tokens}");
         }
         self.transcript.push(model_usage_item(turn_id, usage));
     }
 
-    fn finish_model_turn(&mut self, outcome: ModelTurnOutcome, message: Option<&str>) {
-        self.status = message.map_or_else(
-            || model_turn_outcome_label(outcome).to_owned(),
-            ToOwned::to_owned,
-        );
+    fn finish_model_turn(
+        &mut self,
+        outcome: ModelTurnOutcome,
+        message: Option<&str>,
+        application: SessionEventApplication,
+    ) {
+        if application.live_activity() {
+            self.status = message.map_or_else(
+                || model_turn_outcome_label(outcome).to_owned(),
+                ToOwned::to_owned,
+            );
+        }
         if let Some(last) = self.transcript.last_mut()
             && last.role == "Assistant"
         {
             last.streaming = false;
         }
-        self.set_activity(ActivityState::Idle);
+        if application.live_activity() {
+            self.set_activity(ActivityState::Idle);
+        }
     }
 
     fn apply_runtime_work_event(&mut self, event: &SessionEvent) {
@@ -1710,7 +1809,10 @@ impl BmuxApp {
         }
     }
 
-    fn add_streaming_delta(&mut self, text: &str) {
+    fn add_streaming_delta(&mut self, text: &str, application: SessionEventApplication) {
+        if !application.live_activity() {
+            return;
+        }
         let delta = text.chars().count();
         if let ActivityState::Streaming { chars } = &mut self.activity {
             *chars = chars.saturating_add(delta);
