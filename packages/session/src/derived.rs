@@ -566,9 +566,8 @@ pub fn append_event_to_indexes(
     let (mut transcript, mut input_history) =
         load_indexes_from_manifest(root, session_id, &manifest)?;
     let file = index::fingerprint(event_path)?;
-    let events = std::slice::from_ref(event);
-    let new_spans = transcript.apply_events(events);
-    let new_entries = input_history.apply_events(events);
+    let new_spans = transcript.apply_appended_event(event);
+    let new_entries = input_history.apply_events(std::slice::from_ref(event));
     transcript.file = file.clone();
     transcript.event_count = transcript.event_count.saturating_add(1);
     transcript.end_offset = entry.offset.saturating_add(entry.frame_len);
@@ -609,7 +608,13 @@ pub fn ensure_transcript_index(
 ) -> Result<TranscriptIndex, SessionStoreError> {
     let manifest =
         ensure_index_current(root, session_id, event_path, DerivedIndexKind::Transcript)?;
-    let (transcript, _input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
+    let (mut transcript, input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
+    if transcript.has_pending_streams() {
+        let new_spans = transcript.flush_pending_streams();
+        append_transcript_spans(root, session_id, &new_spans)?;
+        let file = index::fingerprint(event_path)?;
+        write_manifest(root, session_id, file, &transcript, &input_history)?;
+    }
     Ok(transcript)
 }
 
@@ -750,6 +755,36 @@ impl TranscriptIndex {
         self.projector_state = state;
         new_spans
     }
+
+    fn apply_appended_event(
+        &mut self,
+        event: &SessionEvent,
+    ) -> Vec<index::TranscriptProjectionIndexEntry> {
+        let (mut spans, state) = project_transcript_events_incremental(
+            std::slice::from_ref(event),
+            Some(self.projector_state.clone()),
+        );
+        let new_spans = spans.clone();
+        self.spans.append(&mut spans);
+        self.spans
+            .sort_by_key(|span| span.source_range.start_sequence);
+        self.projector_state = state;
+        new_spans
+    }
+
+    const fn has_pending_streams(&self) -> bool {
+        self.projector_state.assistant.is_some() || self.projector_state.reasoning.is_some()
+    }
+
+    fn flush_pending_streams(&mut self) -> Vec<index::TranscriptProjectionIndexEntry> {
+        let (mut spans, state) = project_transcript_events(&[], Some(self.projector_state.clone()));
+        let new_spans = spans.clone();
+        self.spans.append(&mut spans);
+        self.spans
+            .sort_by_key(|span| span.source_range.start_sequence);
+        self.projector_state = state;
+        new_spans
+    }
 }
 
 fn can_resume_manifest(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
@@ -784,6 +819,20 @@ fn project_transcript_events(
         projector.apply(event);
     }
     projector.finish_batch()
+}
+
+fn project_transcript_events_incremental(
+    events: &[SessionEvent],
+    initial_state: Option<TranscriptProjectorState>,
+) -> (
+    Vec<index::TranscriptProjectionIndexEntry>,
+    TranscriptProjectorState,
+) {
+    let mut projector = TranscriptIncrementalProjector::new(initial_state.unwrap_or_default());
+    for event in events {
+        projector.apply(event);
+    }
+    projector.finish_incremental()
 }
 
 struct TranscriptIncrementalProjector {
@@ -857,6 +906,15 @@ impl TranscriptIncrementalProjector {
                 self.flush_streams();
                 self.finish_tool_invocation(tool_call_id, event.sequence, result.len());
             }
+            SessionEventKind::RuntimeWorkStarted { .. }
+            | SessionEventKind::RuntimeWorkCancelRequested { .. }
+            | SessionEventKind::RuntimeWorkProgress { .. }
+            | SessionEventKind::RuntimeWorkFinished { .. }
+            | SessionEventKind::ModelUsage { .. } => {
+                if let Some((kind, bytes)) = non_streaming_transcript_item(event) {
+                    self.push_span(kind, event.sequence, event.sequence, bytes);
+                }
+            }
             _ => {
                 self.flush_streams();
                 if let Some((kind, bytes)) = non_streaming_transcript_item(event) {
@@ -873,6 +931,15 @@ impl TranscriptIncrementalProjector {
         TranscriptProjectorState,
     ) {
         self.flush_streams();
+        self.finish_incremental()
+    }
+
+    fn finish_incremental(
+        mut self,
+    ) -> (
+        Vec<index::TranscriptProjectionIndexEntry>,
+        TranscriptProjectorState,
+    ) {
         self.spans.sort_by_key(|span| {
             (
                 span.source_range.start_sequence,

@@ -4591,11 +4591,11 @@ mod tests {
         )
         .expect("manifest should decode");
         assert_eq!(
-            manifest_before.indexes[0].checkpoint.event_count,
+            metadata.event_count,
             manifest_after.indexes[0].checkpoint.event_count
         );
         assert_eq!(
-            manifest_before.indexes[1].checkpoint.event_count,
+            metadata.event_count,
             manifest_after.indexes[1].checkpoint.event_count
         );
         assert_eq!(
@@ -4619,7 +4619,7 @@ mod tests {
             manifest_rebuilt.indexes[0].checkpoint.event_count
         );
         assert_eq!(
-            manifest_before.indexes[1].checkpoint.event_count,
+            metadata.event_count,
             manifest_rebuilt.indexes[1].checkpoint.event_count
         );
         assert_eq!(
