@@ -348,6 +348,9 @@ fn catalog_status_text(session_list: &SessionList, session_count: usize) -> Stri
     let failed_sources = status_source_ids(&session_list.catalog_sources, |status| {
         matches!(status, SessionCatalogStatus::Failed(_))
     });
+    let degraded_sources = status_source_ids(&session_list.catalog_sources, |status| {
+        matches!(status, SessionCatalogStatus::Degraded(_))
+    });
 
     if catalog_still_loading(&session_list.catalog_status) {
         let mut phases = Vec::new();
@@ -362,6 +365,9 @@ fn catalog_status_text(session_list: &SessionList, session_count: usize) -> Stri
         if !failed_sources.is_empty() {
             phases.push(format!("failed {}", failed_sources.join(", ")));
         }
+        if !degraded_sources.is_empty() {
+            phases.push(format!("needs repair {}", degraded_sources.join(", ")));
+        }
         return format!(
             "Loading sessions: {}; {session_count} found so far; press Ctrl-N to create one",
             phases.join("; ")
@@ -374,6 +380,9 @@ fn catalog_status_text(session_list: &SessionList, session_count: usize) -> Stri
     }
     if !failed_sources.is_empty() {
         phases.push(format!("failed {}", failed_sources.join(", ")));
+    }
+    if !degraded_sources.is_empty() {
+        phases.push(format!("needs repair {}", degraded_sources.join(", ")));
     }
     if phases.is_empty() {
         format!("Select a session ({session_count} found) or press Ctrl-N to create one")

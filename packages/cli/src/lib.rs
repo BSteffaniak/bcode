@@ -2892,6 +2892,12 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
                 status.sessions.len()
             );
         }
+        bcode_ipc::SessionCatalogStatus::Degraded(message) => {
+            println!(
+                "sessions: {} cached (catalog degraded: {message})",
+                status.sessions.len()
+            );
+        }
         bcode_ipc::SessionCatalogStatus::Failed(message) => {
             println!(
                 "sessions: {} cached (catalog failed: {message})",

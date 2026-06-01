@@ -905,7 +905,7 @@ fn select_event_range_from_events(
 pub struct SessionSnapshot {
     pub summary: SessionSummary,
     pub working_directory: PathBuf,
-    access_status: SessionAccessStatus,
+    pub access_status: SessionAccessStatus,
     pub index_status: SessionIndexStatusKind,
 }
 

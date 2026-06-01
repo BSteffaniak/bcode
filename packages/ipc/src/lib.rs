@@ -324,6 +324,7 @@ pub enum SessionCatalogStatus {
     NotStarted,
     Loading,
     Loaded,
+    Degraded(String),
     Failed(String),
 }
 

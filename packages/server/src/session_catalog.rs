@@ -2,6 +2,7 @@
 
 use crate::ServerState;
 use bcode_ipc::{SessionCatalogSourceStatus, SessionCatalogStatus};
+use bcode_session::{SessionAccessStatus, SessionCatalogEntry, SessionCatalogIndexStatus};
 use bcode_session_import::ImportableSessionStatus;
 use bcode_session_models::{SessionId, SessionImportSummary, SessionSummary, SessionTitleSource};
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,11 +58,21 @@ enum SourceCacheState {
     Loading,
     Loaded {
         sessions: Vec<SessionSummary>,
+        diagnostics: SourceDiagnostics,
     },
     Failed {
         message: String,
         sessions: Vec<SessionSummary>,
+        diagnostics: SourceDiagnostics,
     },
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceDiagnostics {
+    stale_indexes: usize,
+    read_only_sessions: usize,
+    repair_required_sessions: usize,
+    blocked_future_sessions: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +145,7 @@ impl SessionCatalog {
                 return;
             };
             let sessions = match &mut source.state {
-                SourceCacheState::Loaded { sessions }
+                SourceCacheState::Loaded { sessions, .. }
                 | SourceCacheState::Failed { sessions, .. } => sessions,
                 SourceCacheState::Empty | SourceCacheState::Loading => return,
             };
@@ -154,7 +165,7 @@ impl SessionCatalog {
                 return;
             };
             let sessions = match &mut source.state {
-                SourceCacheState::Loaded { sessions }
+                SourceCacheState::Loaded { sessions, .. }
                 | SourceCacheState::Failed { sessions, .. } => sessions,
                 SourceCacheState::Empty | SourceCacheState::Loading => return,
             };
@@ -265,7 +276,7 @@ impl SessionCatalog {
         &self,
         key: CatalogSourceKey,
         metadata: SourceMetadata,
-        result: Result<Vec<SessionSummary>, String>,
+        result: Result<SourceLoadResult, String>,
     ) {
         {
             let mut inner = self.inner.lock().await;
@@ -275,10 +286,14 @@ impl SessionCatalog {
             });
             source.metadata = metadata;
             source.state = match result {
-                Ok(sessions) => SourceCacheState::Loaded { sessions },
+                Ok(result) => SourceCacheState::Loaded {
+                    sessions: result.sessions,
+                    diagnostics: result.diagnostics,
+                },
                 Err(message) => SourceCacheState::Failed {
                     message,
                     sessions: Vec::new(),
+                    diagnostics: SourceDiagnostics::default(),
                 },
             };
         }
@@ -293,6 +308,12 @@ impl SessionCatalog {
         }
         self.notify.notify_waiters();
     }
+}
+
+#[derive(Debug, Clone)]
+struct SourceLoadResult {
+    sessions: Vec<SessionSummary>,
+    diagnostics: SourceDiagnostics,
 }
 
 impl CatalogSourcePlan {
@@ -360,7 +381,7 @@ async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<Cata
 async fn load_source(
     state: &ServerState,
     plan: &CatalogSourcePlan,
-) -> Result<Vec<SessionSummary>, String> {
+) -> Result<SourceLoadResult, String> {
     match plan {
         CatalogSourcePlan::Native => load_native_source(state).await,
         CatalogSourcePlan::Import {
@@ -371,13 +392,46 @@ async fn load_source(
     }
 }
 
-async fn load_native_source(state: &ServerState) -> Result<Vec<SessionSummary>, String> {
+async fn load_native_source(state: &ServerState) -> Result<SourceLoadResult, String> {
     state
         .sessions
         .wait_catalog_loaded()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(state.sessions.all_session_summaries().await)
+    let entries = state.sessions.all_session_catalog_entries().await;
+    let diagnostics = native_source_diagnostics(&entries);
+    Ok(SourceLoadResult {
+        sessions: entries.into_iter().map(|entry| entry.summary).collect(),
+        diagnostics,
+    })
+}
+
+fn import_source_result(sessions: Vec<SessionSummary>) -> SourceLoadResult {
+    SourceLoadResult {
+        sessions,
+        diagnostics: SourceDiagnostics::default(),
+    }
+}
+
+fn native_source_diagnostics(entries: &[SessionCatalogEntry]) -> SourceDiagnostics {
+    SourceDiagnostics {
+        stale_indexes: entries
+            .iter()
+            .filter(|entry| entry.index_status == SessionCatalogIndexStatus::Stale)
+            .count(),
+        read_only_sessions: entries
+            .iter()
+            .filter(|entry| entry.access_status == SessionAccessStatus::ReadOnlyMigrationRequired)
+            .count(),
+        repair_required_sessions: entries
+            .iter()
+            .filter(|entry| entry.access_status == SessionAccessStatus::RepairRequired)
+            .count(),
+        blocked_future_sessions: entries
+            .iter()
+            .filter(|entry| entry.access_status == SessionAccessStatus::BlockedFutureVersion)
+            .count(),
+    }
 }
 
 fn snapshot_locked(
@@ -441,7 +495,10 @@ impl SourceCache {
         match &self.state {
             SourceCacheState::Empty => SessionCatalogStatus::NotStarted,
             SourceCacheState::Loading => SessionCatalogStatus::Loading,
-            SourceCacheState::Loaded { .. } => SessionCatalogStatus::Loaded,
+            SourceCacheState::Loaded { .. } => {
+                let status = diagnostic_status(&self.metadata.display_name, self.diagnostics());
+                status.unwrap_or(SessionCatalogStatus::Loaded)
+            }
             SourceCacheState::Failed { message, .. } => {
                 SessionCatalogStatus::Failed(message.clone())
             }
@@ -450,12 +507,70 @@ impl SourceCache {
 
     fn sessions(&self) -> &[SessionSummary] {
         match &self.state {
-            SourceCacheState::Loaded { sessions } | SourceCacheState::Failed { sessions, .. } => {
-                sessions
-            }
+            SourceCacheState::Loaded { sessions, .. }
+            | SourceCacheState::Failed { sessions, .. } => sessions,
             SourceCacheState::Empty | SourceCacheState::Loading => &[],
         }
     }
+
+    fn diagnostics(&self) -> &SourceDiagnostics {
+        static EMPTY: SourceDiagnostics = SourceDiagnostics {
+            stale_indexes: 0,
+            read_only_sessions: 0,
+            repair_required_sessions: 0,
+            blocked_future_sessions: 0,
+        };
+        match &self.state {
+            SourceCacheState::Loaded { diagnostics, .. }
+            | SourceCacheState::Failed { diagnostics, .. } => diagnostics,
+            SourceCacheState::Empty | SourceCacheState::Loading => &EMPTY,
+        }
+    }
+}
+
+fn diagnostic_status(
+    display_name: &str,
+    diagnostics: &SourceDiagnostics,
+) -> Option<SessionCatalogStatus> {
+    let mut issues = Vec::new();
+    if diagnostics.stale_indexes > 0 {
+        issues.push(format!(
+            "{} stale primary index{}",
+            diagnostics.stale_indexes,
+            plural_suffix(diagnostics.stale_indexes)
+        ));
+    }
+    if diagnostics.read_only_sessions > 0 {
+        issues.push(format!(
+            "{} read-only migration-required session{}",
+            diagnostics.read_only_sessions,
+            plural_suffix(diagnostics.read_only_sessions)
+        ));
+    }
+    if diagnostics.repair_required_sessions > 0 {
+        issues.push(format!(
+            "{} repair-required session{}",
+            diagnostics.repair_required_sessions,
+            plural_suffix(diagnostics.repair_required_sessions)
+        ));
+    }
+    if diagnostics.blocked_future_sessions > 0 {
+        issues.push(format!(
+            "{} future-version blocked session{}",
+            diagnostics.blocked_future_sessions,
+            plural_suffix(diagnostics.blocked_future_sessions)
+        ));
+    }
+    (!issues.is_empty()).then(|| {
+        SessionCatalogStatus::Degraded(format!(
+            "{display_name} needs attention: {}",
+            issues.join(", ")
+        ))
+    })
+}
+
+const fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
 
 fn source_relevant_to_working_directory(key: &CatalogSourceKey, working_directory: &Path) -> bool {
@@ -496,7 +611,9 @@ fn aggregate_status<'a>(
         saw_status = true;
         match status {
             SessionCatalogStatus::NotStarted | SessionCatalogStatus::Loading => has_loading = true,
-            SessionCatalogStatus::Failed(message) => failures.push(message.clone()),
+            SessionCatalogStatus::Failed(message) | SessionCatalogStatus::Degraded(message) => {
+                failures.push(message.clone());
+            }
             SessionCatalogStatus::Loaded => {}
         }
     }
@@ -534,7 +651,7 @@ async fn discover_import_source(
     plugin_id: &str,
     source_id: &str,
     working_directory: &Path,
-) -> Result<Vec<SessionSummary>, String> {
+) -> Result<SourceLoadResult, String> {
     let response = state
         .plugins
         .invoke_service_json::<_, bcode_session_import::DiscoverImportableSessionsResponse>(
@@ -548,14 +665,15 @@ async fn discover_import_source(
         )
         .await
         .map_err(|error| error.to_string())?;
-    Ok(response
+    let sessions = response
         .sessions
         .into_iter()
         .filter(|summary| {
             summary.status == ImportableSessionStatus::Available && summary.source_id == source_id
         })
         .map(importable_to_summary)
-        .collect())
+        .collect();
+    Ok(import_source_result(sessions))
 }
 
 fn importable_to_summary(

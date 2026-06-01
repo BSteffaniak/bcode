@@ -1579,7 +1579,34 @@ pub(crate) struct SessionState {
     sender: broadcast::Sender<SessionEvent>,
 }
 
-/// Active session attachment.
+/// Native catalog entry with maintenance/access metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCatalogEntry {
+    pub summary: SessionSummary,
+    pub access_status: SessionAccessStatus,
+    pub index_status: SessionCatalogIndexStatus,
+}
+
+/// Primary metadata index status for catalog/status reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCatalogIndexStatus {
+    Current,
+    Stale,
+}
+
+impl SessionCatalogEntry {
+    fn from_snapshot(snapshot: actor::SessionSnapshot) -> Self {
+        Self {
+            summary: snapshot.summary,
+            access_status: snapshot.access_status,
+            index_status: match snapshot.index_status {
+                SessionIndexStatusKind::Current => SessionCatalogIndexStatus::Current,
+                SessionIndexStatusKind::Stale => SessionCatalogIndexStatus::Stale,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionAttachment {
     pub session: SessionSummary,
@@ -1947,6 +1974,14 @@ impl SessionManager {
     }
 
     pub async fn all_session_summaries(&self) -> Vec<SessionSummary> {
+        self.all_session_catalog_entries()
+            .await
+            .into_iter()
+            .map(|entry| entry.summary)
+            .collect()
+    }
+
+    pub async fn all_session_catalog_entries(&self) -> Vec<SessionCatalogEntry> {
         self.start_catalog_load();
         let handles = {
             let inner = self.inner.lock().await;
@@ -1954,7 +1989,7 @@ impl SessionManager {
         };
         handles
             .into_iter()
-            .map(|handle| handle.snapshot().summary)
+            .map(|handle| SessionCatalogEntry::from_snapshot(handle.snapshot()))
             .collect()
     }
 
