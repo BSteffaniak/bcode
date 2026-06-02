@@ -5,30 +5,6 @@ use bcode_session_models::{
 };
 use std::collections::BTreeMap;
 
-#[cfg(test)]
-fn projection_window_from_index_entries(
-    entries: &[crate::index::TranscriptProjectionIndexEntry],
-    first_event_sequence: Option<u64>,
-    last_event_sequence: Option<u64>,
-    request: &ProjectionWindowRequest,
-) -> Option<ProjectionWindow> {
-    let mut spans = entries
-        .iter()
-        .map(|entry| TranscriptProjectionItem {
-            kind: entry.kind,
-            source_range: entry.source_range,
-            estimated_rows: estimate_rows(entry.content_bytes, request.target.width_columns),
-            content_bytes: entry.content_bytes,
-        })
-        .collect::<Vec<_>>();
-    projection_window_from_transcript_projection_items(
-        &mut spans,
-        first_event_sequence,
-        last_event_sequence,
-        request,
-    )
-}
-
 pub(crate) fn projection_window_from_db_transcript_items(
     items: &[crate::db::TranscriptItem],
     first_event_sequence: Option<u64>,
@@ -540,15 +516,15 @@ mod tests {
     };
 
     #[test]
-    fn latest_projection_window_from_index_entries_satisfies_targets() {
+    fn latest_projection_window_from_db_transcript_items_satisfies_targets() {
         let entries = vec![
-            index_entry(1, TranscriptProjectionItemKind::UserMessage, 5),
-            index_entry(2, TranscriptProjectionItemKind::AssistantMessage, 5),
-            index_entry(3, TranscriptProjectionItemKind::UserMessage, 5),
-            index_entry(4, TranscriptProjectionItemKind::AssistantMessage, 5),
+            db_transcript_item(1, TranscriptProjectionItemKind::UserMessage, 5),
+            db_transcript_item(2, TranscriptProjectionItemKind::AssistantMessage, 5),
+            db_transcript_item(3, TranscriptProjectionItemKind::UserMessage, 5),
+            db_transcript_item(4, TranscriptProjectionItemKind::AssistantMessage, 5),
         ];
 
-        let window = projection_window_from_index_entries(
+        let window = projection_window_from_db_transcript_items(
             &entries,
             Some(1),
             Some(4),
@@ -569,7 +545,7 @@ mod tests {
                 },
             },
         )
-        .expect("index-backed latest transcript windows are supported");
+        .expect("DB-backed latest transcript windows are supported");
 
         assert_eq!(window.transcript_items.len(), 3);
         assert_eq!(window.source_range.expect("source range").start_sequence, 2);
@@ -578,14 +554,14 @@ mod tests {
     }
 
     #[test]
-    fn latest_projection_window_from_index_entries_sorts_legacy_unsorted_entries() {
+    fn latest_projection_window_from_db_transcript_items_sorts_unsorted_rows() {
         let entries = vec![
-            index_entry(10, TranscriptProjectionItemKind::ToolInvocation, 5),
-            index_entry(2, TranscriptProjectionItemKind::UserMessage, 5),
-            index_entry(20, TranscriptProjectionItemKind::AssistantMessage, 5),
+            db_transcript_item(10, TranscriptProjectionItemKind::ToolInvocation, 5),
+            db_transcript_item(2, TranscriptProjectionItemKind::UserMessage, 5),
+            db_transcript_item(20, TranscriptProjectionItemKind::AssistantMessage, 5),
         ];
 
-        let window = projection_window_from_index_entries(
+        let window = projection_window_from_db_transcript_items(
             &entries,
             Some(2),
             Some(20),
@@ -606,7 +582,7 @@ mod tests {
                 },
             },
         )
-        .expect("index-backed latest transcript windows are supported");
+        .expect("DB-backed latest transcript windows are supported");
 
         assert_eq!(window.transcript_items.len(), 2);
         assert_eq!(
@@ -617,14 +593,14 @@ mod tests {
     }
 
     #[test]
-    fn latest_projection_window_from_index_entries_estimates_rows_from_request_width() {
-        let entries = vec![index_entry(
+    fn latest_projection_window_from_db_transcript_items_estimates_rows_from_request_width() {
+        let entries = vec![db_transcript_item(
             1,
             TranscriptProjectionItemKind::AssistantMessage,
             100,
         )];
 
-        let narrow = projection_window_from_index_entries(
+        let narrow = projection_window_from_db_transcript_items(
             &entries,
             Some(1),
             Some(1),
@@ -645,8 +621,8 @@ mod tests {
                 },
             },
         )
-        .expect("index-backed latest transcript windows are supported");
-        let wide = projection_window_from_index_entries(
+        .expect("DB-backed latest transcript windows are supported");
+        let wide = projection_window_from_db_transcript_items(
             &entries,
             Some(1),
             Some(1),
@@ -667,20 +643,20 @@ mod tests {
                 },
             },
         )
-        .expect("index-backed latest transcript windows are supported");
+        .expect("DB-backed latest transcript windows are supported");
 
         assert_eq!(narrow.transcript_items[0].estimated_rows, Some(6));
         assert_eq!(wide.transcript_items[0].estimated_rows, Some(2));
     }
 
     #[test]
-    fn latest_projection_window_from_index_entries_respects_byte_cap() {
+    fn latest_projection_window_from_db_transcript_items_respects_byte_cap() {
         let entries = vec![
-            index_entry(1, TranscriptProjectionItemKind::UserMessage, 5),
-            index_entry(2, TranscriptProjectionItemKind::AssistantMessage, 5),
+            db_transcript_item(1, TranscriptProjectionItemKind::UserMessage, 5),
+            db_transcript_item(2, TranscriptProjectionItemKind::AssistantMessage, 5),
         ];
 
-        let window = projection_window_from_index_entries(
+        let window = projection_window_from_db_transcript_items(
             &entries,
             Some(1),
             Some(2),
@@ -701,7 +677,7 @@ mod tests {
                 },
             },
         )
-        .expect("index-backed latest transcript windows are supported");
+        .expect("DB-backed latest transcript windows are supported");
 
         assert_eq!(window.transcript_items.len(), 1);
         assert_eq!(window.source_range.expect("source range").start_sequence, 2);
@@ -1184,19 +1160,25 @@ mod tests {
         assert_eq!(ranges, vec![1, 2, 3]);
     }
 
-    fn index_entry(
+    fn db_transcript_item(
         sequence: u64,
         kind: TranscriptProjectionItemKind,
         content_bytes: usize,
-    ) -> crate::index::TranscriptProjectionIndexEntry {
-        crate::index::TranscriptProjectionIndexEntry {
-            projection_item_id: format!("transcript:{sequence}:{sequence}"),
-            kind,
-            source_range: ProjectionSourceRange {
-                start_sequence: sequence,
-                end_sequence: sequence,
-            },
-            content_bytes,
+    ) -> crate::db::TranscriptItem {
+        let (role, db_kind) = match kind {
+            TranscriptProjectionItemKind::UserMessage => ("user", "message"),
+            TranscriptProjectionItemKind::AssistantMessage => ("assistant", "message"),
+            TranscriptProjectionItemKind::ToolInvocation => ("tool", "invocation"),
+            _ => ("system", "other"),
+        };
+        crate::db::TranscriptItem {
+            transcript_seq: sequence,
+            event_seq_start: sequence,
+            event_seq_end: sequence,
+            role: role.to_string(),
+            kind: db_kind.to_string(),
+            status: "complete".to_string(),
+            content: Some("x".repeat(content_bytes)),
         }
     }
 
