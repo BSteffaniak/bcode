@@ -6,9 +6,9 @@ use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
 use bcode_config::TuiThinkingConfig;
 use bcode_session_models::{
-    ClientId, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
-    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    ClientId, RuntimeWorkId, RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId,
+    SessionInputHistoryEntry, SessionProjectionKind, SessionSummary, SessionTitleSource,
+    SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -2181,6 +2181,120 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
     render::render(&mut app, &mut frame);
 
     assert!(app.bottom_overscroll() > 0);
+}
+
+#[test]
+fn runtime_work_events_do_not_pull_final_response_to_bottom() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        0,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "prompt".to_owned(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::AssistantDelta {
+            text: "final answer\nline 2\nline 3\nline 4".to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::AssistantMessage {
+            text: "final answer\nline 2\nline 3\nline 4".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::RuntimeWorkStarted {
+            work_id: RuntimeWorkId::new("work-1"),
+            kind: RuntimeWorkKind::ModelTurn,
+            label: "model turn".to_owned(),
+            tool_call_id: None,
+            plugin_id: None,
+            service_interface: None,
+            operation: None,
+            parent_work_id: None,
+            started_at_ms: None,
+            cancellable: false,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        4,
+        SessionEventKind::ModelUsage {
+            turn_id: "turn-1".to_owned(),
+            usage: SessionTokenUsage::default(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(output_line_y(&buffer, "Bcode"), Some(1));
+}
+
+#[test]
+fn committed_user_echo_does_not_restart_submitted_message_anchor() {
+    let session_id = SessionId::new();
+    let history = (0..12)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.replace_composer_with("new prompt");
+    app.stage_submission();
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+
+    app.absorb_session_event(&event(
+        session_id,
+        12,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "new prompt".to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(output_line_y(&buffer, "You"), Some(1));
 }
 
 #[test]

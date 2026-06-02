@@ -2313,10 +2313,6 @@ const fn event_is_tool_activity(event: &SessionEvent) -> bool {
             | SessionEventKind::PermissionRequested { .. }
             | SessionEventKind::PermissionResolved { .. }
             | SessionEventKind::ToolInvocationStream { .. }
-            | SessionEventKind::RuntimeWorkStarted { .. }
-            | SessionEventKind::RuntimeWorkCancelRequested { .. }
-            | SessionEventKind::RuntimeWorkProgress { .. }
-            | SessionEventKind::RuntimeWorkFinished { .. }
     )
 }
 
