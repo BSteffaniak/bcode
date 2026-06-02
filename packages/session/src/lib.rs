@@ -383,6 +383,7 @@ impl SessionEventStore {
         self.load_session_metadata(session_id, &path)
     }
 
+    #[allow(dead_code)]
     fn append(&self, event: &SessionEvent) -> Result<index::SessionIndexEntry, SessionStoreError> {
         let append_timer = self.metrics.timer();
         fs::create_dir_all(&self.root)?;
@@ -923,6 +924,7 @@ impl SessionEventStore {
         })
     }
 
+    #[allow(dead_code)]
     fn write_metadata_index(
         &self,
         metadata: &PersistedSessionMetadata,
@@ -1776,6 +1778,25 @@ impl SessionManager {
             return Err(SessionError::NotFound(session_id));
         };
         let load_timer = self.metrics.timer();
+        if db::session_db_path(&store.root_path(), session_id).exists() {
+            let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+            let events = db.all_events().await?;
+            let state = SessionState::from_events(session_id, &events)?;
+            self.metrics.record_histogram(
+                "session.manager.ensure_loaded.load_db_session_duration_ms",
+                load_timer.elapsed_ms(),
+            );
+            self.inner
+                .lock()
+                .await
+                .sessions
+                .insert(session_id, SessionHandle::new(state, Some(store.clone())));
+            self.metrics.record_histogram(
+                "session.manager.ensure_loaded.total_duration_ms",
+                total_timer.elapsed_ms(),
+            );
+            return Ok(());
+        }
         let Some(state) = store.load_session(session_id).await? else {
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.total_duration_ms",
@@ -1995,6 +2016,30 @@ impl SessionManager {
             .await?;
         self.inner.lock().await.sessions.insert(id, handle);
         Ok(summary)
+    }
+
+    /// Migrate a legacy `.events` session file into the per-session database.
+    ///
+    /// This is explicit migration/import behavior. Normal DB-backed runtime paths must not call it
+    /// as a hidden fallback or repair step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if legacy events cannot be read or the session DB cannot be written.
+    pub async fn migrate_legacy_events_to_db(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        let events = store.read_session_events(session_id).await?;
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        for event in &events {
+            db.append_event(event).await?;
+        }
+        Ok(())
     }
 
     /// List known sessions from the session catalog.
@@ -3049,6 +3094,76 @@ impl SessionManager {
 }
 
 impl SessionState {
+    pub(crate) fn from_events(
+        session_id: SessionId,
+        events: &[SessionEvent],
+    ) -> Result<Self, SessionError> {
+        let (sender, _) = broadcast::channel(512);
+        let mut state = Self {
+            summary: SessionSummary {
+                id: session_id,
+                name: None,
+                explicit_name: None,
+                derived_title: None,
+                title_source: SessionTitleSource::EmptyDraft,
+                client_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                working_directory: PathBuf::new(),
+                import: None,
+            },
+            working_directory: PathBuf::new(),
+            clients: BTreeSet::new(),
+            events: None,
+            next_sequence: 0,
+            event_count: 0,
+            has_user_message: false,
+            current_provider: None,
+            current_model: None,
+            current_agent: None,
+            latest_compaction_sequence: None,
+            total_metered_tokens: 0,
+            index_issues: Vec::new(),
+            index_status: SessionIndexStatusKind::Current,
+            access_status: SessionAccessStatus::ReadWrite,
+            sender,
+        };
+
+        for event in events {
+            if event.session_id != session_id {
+                return Err(SessionError::NotFound(session_id));
+            }
+            let activity_timestamp_ms = if state.summary.created_at_ms == 0 {
+                current_unix_millis()
+            } else {
+                state.summary.updated_at_ms.saturating_add(1)
+            };
+            if let SessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            } = &event.kind
+            {
+                let working_directory = normalize_working_directory(working_directory);
+                state.summary.name.clone_from(name);
+                state.summary.explicit_name.clone_from(name);
+                state.summary.title_source = if name.is_some() {
+                    SessionTitleSource::Explicit
+                } else {
+                    SessionTitleSource::EmptyDraft
+                };
+                state.summary.created_at_ms = activity_timestamp_ms;
+                state
+                    .summary
+                    .working_directory
+                    .clone_from(&working_directory);
+                state.working_directory = working_directory;
+            }
+            state.apply_persisted_event(event.clone(), activity_timestamp_ms);
+        }
+
+        Ok(state)
+    }
+
     pub(crate) fn from_index(index: index::SessionIndex) -> Self {
         let (sender, _) = broadcast::channel(512);
         let access_status = access_status_from_index(
@@ -3423,7 +3538,7 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionAccessStatus, SessionManager, access_status_from_report, derived, index, reader,
+        SessionAccessStatus, SessionManager, access_status_from_report, db, derived, index, reader,
     };
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowAnchor,
@@ -4635,12 +4750,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_uses_db_input_history_when_legacy_input_history_index_is_degraded() {
+    async fn attach_uses_db_input_history_without_legacy_event_sidecars() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
             .create_session(
-                Some("degraded input history".to_string()),
+                Some("db input history".to_string()),
                 test_working_directory(),
             )
             .await
@@ -4649,18 +4764,19 @@ mod tests {
             .append_user_message(session.id, ClientId::new(), "hello".to_owned())
             .await
             .expect("message should append");
-        let store = super::SessionEventStore::new(&root);
-        store
-            .reindex_session(session.id)
-            .expect("session should reindex");
-        std::fs::remove_file(derived::input_history_index_path(&root, session.id))
-            .expect("input history sidecar should remove");
+
+        assert!(
+            !super::SessionEventStore::new(&root)
+                .event_path(session.id)
+                .exists(),
+            "new DB-backed sessions should not write legacy .events sidecars"
+        );
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
         let attachment = restored
             .attach_session_recent(session.id, ClientId::new(), 16)
             .await
-            .expect("attach should use the fresh DB projection despite degraded legacy sidecar");
+            .expect("attach should use DB projections");
 
         assert_eq!(
             attachment.input_history,
@@ -4669,10 +4785,55 @@ mod tests {
                 text: "hello".to_owned(),
             }]
         );
-        assert!(
-            derived::ensure_input_history_index(&root, session.id, &store.event_path(session.id))
-                .is_err()
-        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn read_events_migrated_from_legacy_event_file() {
+        let root = unique_temp_dir();
+        let legacy_store = super::SessionEventStore::new(&root);
+        let session_id = SessionId::new();
+        let client_id = ClientId::new();
+        let events = [
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::SessionCreated {
+                    name: Some("legacy".to_string()),
+                    working_directory: test_working_directory(),
+                },
+            },
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id,
+                    text: "legacy hello".to_string(),
+                },
+            },
+        ];
+        for event in &events {
+            legacy_store
+                .append(event)
+                .expect("legacy event should append");
+        }
+
+        let manager = SessionManager::persistent_lazy(&root);
+        manager
+            .migrate_legacy_events_to_db(session_id)
+            .await
+            .expect("legacy events should migrate into db");
+
+        let db = db::SessionDb::open_turso_in_root(session_id, &root)
+            .await
+            .expect("db should open");
+        let migrated_events = db.events_range(0, 1, 10).await.expect("events should read");
+        assert_eq!(migrated_events, events);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

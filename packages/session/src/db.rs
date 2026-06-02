@@ -211,6 +211,28 @@ impl SessionDb {
         rows.iter().map(input_history_entry_from_row).collect()
     }
 
+    /// Return all canonical events in sequence order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or event deserialization fails.
+    pub async fn all_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["payload"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload = required_string(&row, "payload")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
     /// Return events from the canonical event table for the inclusive sequence range.
     ///
     /// # Errors

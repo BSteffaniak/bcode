@@ -10,6 +10,7 @@ use bcode_session_models::{
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
+#[allow(dead_code)]
 pub struct PersistedSessionMetadata {
     pub summary: SessionSummary,
     pub working_directory: PathBuf,
@@ -24,6 +25,7 @@ pub struct PersistedSessionMetadata {
     pub index_issues: Vec<index::SessionIndexIssue>,
 }
 
+#[allow(dead_code)]
 impl PersistedSessionMetadata {
     pub fn from_state(state: &SessionState) -> Self {
         Self {
@@ -161,6 +163,7 @@ impl SessionStoreExecutor {
         spawn_blocking(move || store.delete(session_id)).await?
     }
 
+    #[allow(dead_code)]
     pub async fn append_event_frame(&self, event: SessionEvent) -> Result<(), SessionStoreError> {
         let queued_at = Instant::now();
         let store = self.store.clone();
@@ -180,6 +183,7 @@ impl SessionStoreExecutor {
         .await?
     }
 
+    #[allow(dead_code)]
     pub async fn write_metadata_index(
         &self,
         metadata: PersistedSessionMetadata,

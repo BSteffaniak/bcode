@@ -2,8 +2,6 @@
 
 use super::*;
 use crate::db::SessionDb;
-use crate::store_executor::PersistedSessionMetadata;
-use bcode_session_models::ToolInvocationStreamEvent;
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
@@ -515,43 +513,9 @@ impl SessionActor {
                 );
             }
         }
-        if let Some(store) = &self.store {
-            let append_started_at = Instant::now();
-            store.append_event_frame(event.clone()).await?;
-            store.metrics().record_histogram(
-                "session.actor.append_event.append_frame_duration_ms",
-                elapsed_ms(append_started_at),
-            );
-        }
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.state.index_status = SessionIndexStatusKind::Current;
-        if let Some(store) = &self.store
-            && should_write_metadata_index_on_append(&event)
-        {
-            self.state.index_status = SessionIndexStatusKind::Stale;
-            let metadata = PersistedSessionMetadata::from_state(&self.state);
-            let write_index_started_at = Instant::now();
-            match store.write_metadata_index(metadata).await {
-                Ok(()) => {
-                    store.metrics().record_histogram(
-                        "session.actor.append_event.write_metadata_index_duration_ms",
-                        elapsed_ms(write_index_started_at),
-                    );
-                    self.state.index_status = SessionIndexStatusKind::Current;
-                }
-                Err(error) => {
-                    store.metrics().record_histogram(
-                        "session.actor.append_event.write_metadata_index_duration_ms",
-                        elapsed_ms(write_index_started_at),
-                    );
-                    eprintln!(
-                        "failed to update session index for {}: {error}",
-                        self.state.summary.id
-                    );
-                }
-            }
-        }
         self.refresh_snapshot();
         Ok(event)
     }
@@ -951,19 +915,6 @@ impl SessionActor {
         let _ = self.state.sender.send(event.clone());
         Some(event)
     }
-}
-
-const fn should_write_metadata_index_on_append(event: &SessionEvent) -> bool {
-    !matches!(
-        event.kind,
-        SessionEventKind::AssistantDelta { .. }
-            | SessionEventKind::AssistantReasoningDelta { .. }
-            | SessionEventKind::RuntimeWorkProgress { .. }
-            | SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { .. }
-                    | ToolInvocationStreamEvent::Status { .. }
-            }
-    )
 }
 
 fn select_event_range_from_events(
