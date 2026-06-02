@@ -888,30 +888,7 @@ impl SessionActor {
         }
     }
 
-    async fn input_history(&mut self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
-        if let Some(db) = self.session_db().await? {
-            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-            match db.projection_checkpoint("input_history").await {
-                Ok(Some(checkpoint)) if checkpoint >= expected_last_sequence => {
-                    match db.input_history().await {
-                        Ok(input_history) => return Ok(input_history),
-                        Err(error) => {
-                            eprintln!(
-                                "failed to read session input history from database for {}: {error}",
-                                self.state.summary.id
-                            );
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!(
-                        "failed to read session input history checkpoint for {}: {error}",
-                        self.state.summary.id
-                    );
-                }
-            }
-        }
+    async fn input_history(&self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
         if let Some(events) = &self.state.events {
             return Ok(input_history_from_events(events));
         }
