@@ -300,7 +300,7 @@ impl SessionStoreExecutor {
                 elapsed_ms(queued_at),
             );
             let timer = store.metrics.timer();
-            let input_history = store.read_session_input_history(session_id);
+            let input_history = store.read_session_input_history(session_id)?;
             store.metrics.record_histogram(
                 "session.store.input_history.entry_count",
                 usize_to_u64(input_history.len()),

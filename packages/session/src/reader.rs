@@ -96,61 +96,6 @@ pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> 
     })
 }
 
-pub fn read_events_from_offset(
-    path: &Path,
-    start_offset: u64,
-) -> Result<SessionReadReport, SessionStoreError> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start_offset))?;
-    let mut events = Vec::new();
-    let mut entries = Vec::new();
-    let mut issues = Vec::new();
-    let mut offset = start_offset;
-    let mut last_good_offset = start_offset;
-    let mut needs_encoding_migration = false;
-
-    loop {
-        let frame_offset = offset;
-        let Some(frame) = read_next_frame(&mut file, &mut offset, frame_offset, &mut issues)?
-        else {
-            break;
-        };
-        if frame.encoding == SessionEventFrameEncoding::Positional {
-            needs_encoding_migration = true;
-        }
-        match decode_session_event(&frame.payload, frame.encoding) {
-            Ok(event) => {
-                let frame_len = offset.saturating_sub(frame_offset);
-                entries.push(SessionIndexEntry::from_event(
-                    &event,
-                    frame_offset,
-                    frame_len,
-                ));
-                events.push(event);
-            }
-            Err(error) => issues.push(SessionReadIssue {
-                offset: frame_offset,
-                kind: SessionReadIssueKind::Decode {
-                    message: error.to_string(),
-                },
-            }),
-        }
-        last_good_offset = offset;
-    }
-
-    let min_schema_version = events.iter().map(|event| event.schema_version).min();
-    let max_schema_version = events.iter().map(|event| event.schema_version).max();
-    Ok(SessionReadReport {
-        events,
-        entries,
-        last_good_offset,
-        issues,
-        min_schema_version,
-        max_schema_version,
-        needs_encoding_migration,
-    })
-}
-
 pub fn read_event_at(path: &Path, offset: u64) -> Result<SessionEvent, SessionStoreError> {
     let mut events = read_events_at_offsets(path, &[offset])?;
     events

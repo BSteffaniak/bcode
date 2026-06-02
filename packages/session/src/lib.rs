@@ -442,8 +442,14 @@ impl SessionEventStore {
             let _ = derived::initialize_empty_after_session_created(&self.root, &index);
         } else {
             let derived_timer = self.metrics.timer();
-            if let Err(error) =
-                derived::append_event_to_indexes(&self.root, event.session_id, &path, &entry, event)
+            if derived::event_updates_indexes_on_append(event)
+                && let Err(error) = derived::append_event_to_indexes(
+                    &self.root,
+                    event.session_id,
+                    &path,
+                    &entry,
+                    event,
+                )
             {
                 self.metrics
                     .increment_counter("session.derived_index.append_error_total");
@@ -716,7 +722,10 @@ impl SessionEventStore {
         })
     }
 
-    fn read_session_input_history(&self, session_id: SessionId) -> Vec<SessionInputHistoryEntry> {
+    fn read_session_input_history(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
         let total_timer = self.metrics.timer();
         let event_path = self.event_path(session_id);
         let index_timer = self.metrics.timer();
@@ -724,25 +733,18 @@ impl SessionEventStore {
             derived::ensure_input_history_index(&self.root, session_id, &event_path);
         let input_index = match input_index_result {
             Ok(index) => index,
-            Err(_error) => {
+            Err(error) => {
                 self.metrics
                     .increment_counter("session.store.input_history.ensure_error_total");
-                let stale_entries =
-                    derived::load_stale_input_history_entries(&self.root, session_id)
-                        .unwrap_or_default();
                 self.metrics.record_histogram(
                     "session.store.input_history.load_index_duration_ms",
                     index_timer.elapsed_ms(),
                 );
                 self.metrics.record_histogram(
-                    "session.store.input_history.entry_count",
-                    usize_to_u64(stale_entries.len()),
-                );
-                self.metrics.record_histogram(
                     "session.store.input_history.total_duration_ms",
                     total_timer.elapsed_ms(),
                 );
-                return stale_entries;
+                return Err(error);
             }
         };
         self.metrics.record_histogram(
@@ -761,7 +763,7 @@ impl SessionEventStore {
             "session.store.input_history.total_duration_ms",
             total_timer.elapsed_ms(),
         );
-        input_index.entries
+        Ok(input_index.entries)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4295,7 +4297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_session_recent_reads_old_schema_sessions_without_migrating() {
+    async fn attach_session_recent_requires_indexes_for_old_schema_sessions() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("session dir should create");
         let session_id = bcode_session_models::SessionId::new();
@@ -4322,16 +4324,11 @@ mod tests {
                 .expect("status should load"),
             super::SessionAccessStatus::ReadOnlyMigrationRequired
         );
-        let attachment = manager
+        let error = manager
             .attach_session_recent(session_id, ClientId::new(), 10)
             .await
-            .expect("old session should attach read-only");
-        assert!(
-            attachment
-                .history
-                .iter()
-                .any(|event| { event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1 })
-        );
+            .expect_err("old session without indexes should require repair");
+        assert!(matches!(error, super::SessionError::Store(_)));
         assert_eq!(
             manager
                 .session_access_status(session_id)
@@ -4631,7 +4628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_does_not_fail_when_input_history_index_is_degraded() {
+    async fn attach_fails_when_input_history_index_is_degraded() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -4653,12 +4650,12 @@ mod tests {
             .expect("input history sidecar should remove");
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let attachment = restored
+        let error = restored
             .attach_session_recent(session.id, ClientId::new(), 16)
             .await
-            .expect("attach should tolerate degraded input history");
+            .expect_err("attach should fail when input history index is degraded");
 
-        assert!(attachment.input_history.is_empty());
+        assert!(matches!(error, super::SessionError::Store(_)));
         assert!(
             derived::ensure_input_history_index(&root, session.id, &store.event_path(session.id))
                 .is_err()
@@ -4700,16 +4697,9 @@ mod tests {
             transcript_before,
             std::fs::read_to_string(&transcript_path).expect("transcript index should read")
         );
-        let rebuilt =
+        assert!(
             derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should rebuild");
-        let assistant = rebuilt
-            .spans
-            .last()
-            .expect("assistant span should be rebuilt from canonical events");
-        assert_eq!(
-            assistant.kind,
-            bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
+                .is_err()
         );
         assert!(
             !std::path::Path::new(&root)
@@ -4718,8 +4708,6 @@ mod tests {
                 .join("dirty.json")
                 .exists()
         );
-        assert_eq!(assistant.content_bytes, "partial response".len());
-        assert!(assistant.source_range.start_sequence < assistant.source_range.end_sequence);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

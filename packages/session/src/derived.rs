@@ -18,12 +18,6 @@ pub const TRANSCRIPT_INDEX_VERSION: u16 = 1;
 /// Current durable input history index format version.
 pub const INPUT_HISTORY_INDEX_VERSION: u16 = 1;
 
-/// Maximum derived-index tail bytes normal attach/read paths will catch up inline.
-const MAX_INLINE_DERIVED_CATCH_UP_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Maximum derived-index tail events normal attach/read paths will catch up inline.
-const MAX_INLINE_DERIVED_CATCH_UP_EVENTS: usize = 4096;
-
 /// Derived index owned by the session store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -534,6 +528,24 @@ fn index_health_without_manifest(
     vec![transcript, input_history]
 }
 
+/// Return whether this event should update derived indexes on the hot append path.
+///
+/// Volatile in-progress stream chunks are intentionally excluded so streaming does not rewrite
+/// derived manifests for every token or tool-output fragment.
+#[must_use]
+pub const fn event_updates_indexes_on_append(event: &SessionEvent) -> bool {
+    !matches!(
+        event.kind,
+        SessionEventKind::AssistantDelta { .. }
+            | SessionEventKind::AssistantReasoningDelta { .. }
+            | SessionEventKind::RuntimeWorkProgress { .. }
+            | SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { .. }
+                    | ToolInvocationStreamEvent::Status { .. }
+            }
+    )
+}
+
 /// Incrementally advance all derived indexes for one newly-appended event.
 ///
 /// This is a normal append-path update only. It refuses to rebuild or catch up stale/missing
@@ -572,9 +584,16 @@ fn append_transcript_event_from_manifest(
 ) -> Result<(), SessionStoreError> {
     let entry = manifest_entry_mut(manifest, DerivedIndexKind::Transcript)
         .map_err(|error| invalid_to_store(&error))?;
+    let span_start_sequence = entry
+        .checkpoint
+        .last_sequence
+        .map_or(event.sequence, |sequence| sequence.saturating_add(1));
     let initial_state = entry.transcript_state.clone().unwrap_or_default();
-    let (spans, state) =
-        project_transcript_events_incremental(std::slice::from_ref(event), Some(initial_state));
+    let (spans, state) = project_transcript_events_incremental_from_sequence(
+        std::slice::from_ref(event),
+        Some(initial_state),
+        span_start_sequence,
+    );
     append_transcript_spans(root, session_id, &spans)?;
     entry.item_count = entry.item_count.saturating_add(spans.len());
     entry.transcript_state = Some(state);
@@ -623,25 +642,20 @@ fn validate_manifest_at_append_checkpoint(
     event: &SessionEvent,
 ) -> Result<(), SessionStoreError> {
     if manifest.indexes.iter().any(|manifest_entry| {
-        manifest_entry.checkpoint.end_offset != entry.offset
+        manifest_entry.checkpoint.end_offset > entry.offset
             || manifest_entry.checkpoint.event_count
-                != usize::try_from(event.sequence).unwrap_or(usize::MAX)
-            || manifest_entry.checkpoint.last_sequence != event.sequence.checked_sub(1)
+                > usize::try_from(event.sequence).unwrap_or(usize::MAX)
+            || manifest_entry
+                .checkpoint
+                .last_sequence
+                .is_some_and(|sequence| sequence >= event.sequence)
     }) {
         return Err(SessionStoreError::InvalidSessionId(
-            "derived manifest is not at the append checkpoint; explicit repair is required"
+            "derived manifest checkpoint is beyond the append event; explicit repair is required"
                 .to_owned(),
         ));
     }
     Ok(())
-}
-
-pub fn load_stale_input_history_entries(
-    root: &Path,
-    session_id: SessionId,
-) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
-    let index = load_input_history_index_lenient(root, session_id).map_err(load_error_to_store)?;
-    Ok(index.entries)
 }
 
 pub fn ensure_input_history_index(
@@ -649,124 +663,41 @@ pub fn ensure_input_history_index(
     session_id: SessionId,
     event_path: &Path,
 ) -> Result<InputHistoryIndex, SessionStoreError> {
-    let manifest =
-        ensure_index_current(root, session_id, event_path, DerivedIndexKind::InputHistory)?;
+    let file = index::fingerprint(event_path)?;
+    let manifest = load_current_manifest(root, session_id, &file)?;
     let (_transcript, input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(input_history)
 }
 
-/// Load a fresh transcript index, incrementally catching it up when stale.
+/// Load a fresh transcript index.
 pub fn ensure_transcript_index(
     root: &Path,
     session_id: SessionId,
     event_path: &Path,
 ) -> Result<TranscriptIndex, SessionStoreError> {
-    let manifest =
-        ensure_index_current(root, session_id, event_path, DerivedIndexKind::Transcript)?;
-    let (mut transcript, input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
-    if transcript.has_pending_streams() {
-        let new_spans = transcript.flush_pending_streams();
-        append_transcript_spans(root, session_id, &new_spans)?;
-        let file = index::fingerprint(event_path)?;
-        write_manifest(root, session_id, file, &transcript, &input_history)?;
-    }
+    let file = index::fingerprint(event_path)?;
+    let manifest = load_current_manifest(root, session_id, &file)?;
+    let (transcript, _input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(transcript)
 }
 
-fn ensure_index_current(
+fn load_current_manifest(
     root: &Path,
     session_id: SessionId,
-    event_path: &Path,
-    kind: DerivedIndexKind,
+    file: &EventFileFingerprint,
 ) -> Result<DerivedIndexManifest, SessionStoreError> {
-    let current_file = index::fingerprint(event_path)?;
-    let manifest = match load_manifest(root, session_id) {
-        Ok(manifest) => manifest,
-        Err(_error) => {
-            return Err(SessionStoreError::InvalidSessionId(
-                "derived manifest missing; explicit repair is required".to_owned(),
-            ));
-        }
-    };
-    if validate_manifest(root, &manifest, session_id).is_err() {
+    let manifest = load_manifest(root, session_id).map_err(|_error| {
+        SessionStoreError::InvalidSessionId(
+            "derived manifest missing; explicit repair is required".to_owned(),
+        )
+    })?;
+    validate_manifest(root, &manifest, session_id).map_err(|error| invalid_to_store(&error))?;
+    if !manifest_is_current(&manifest, file.len) {
         return Err(SessionStoreError::InvalidSessionId(
-            "derived manifest requires repair".to_owned(),
+            "derived manifest is stale; explicit repair is required".to_owned(),
         ));
     }
-    if !can_resume_manifest(&manifest, current_file.len) {
-        return Err(SessionStoreError::InvalidSessionId(
-            "derived manifest checkpoint is beyond the event log".to_owned(),
-        ));
-    }
-    if manifest_entry_is_current(&manifest, kind, current_file.len) {
-        return Ok(manifest);
-    }
-
-    catch_up_manifest(root, session_id, event_path, &manifest, current_file, kind)
-}
-
-fn catch_up_manifest(
-    root: &Path,
-    session_id: SessionId,
-    event_path: &Path,
-    manifest: &DerivedIndexManifest,
-    current_file: EventFileFingerprint,
-    kind: DerivedIndexKind,
-) -> Result<DerivedIndexManifest, SessionStoreError> {
-    let (mut transcript, mut input_history) =
-        load_indexes_from_manifest(root, session_id, manifest)?;
-    let checkpoint = manifest_entry(manifest, kind)
-        .map_err(|error| invalid_to_store(&error))?
-        .checkpoint
-        .clone();
-    let tail_len = current_file.len.saturating_sub(checkpoint.end_offset);
-    if tail_len > MAX_INLINE_DERIVED_CATCH_UP_BYTES {
-        return Err(SessionStoreError::InvalidSessionId(
-            "derived index tail is too large for normal attach; run session repair/reindex"
-                .to_owned(),
-        ));
-    }
-    let tail = read_tail_events(event_path, checkpoint.end_offset)?;
-    if tail.len() > MAX_INLINE_DERIVED_CATCH_UP_EVENTS {
-        return Err(SessionStoreError::InvalidSessionId(
-            "derived index tail has too many events for normal attach; run session repair/reindex"
-                .to_owned(),
-        ));
-    }
-    let end_offset = current_file.len;
-    let event_count = checkpoint.event_count.saturating_add(tail.len());
-    let last_sequence = tail
-        .last()
-        .map_or(checkpoint.last_sequence, |event| Some(event.sequence));
-    let mut new_spans = Vec::new();
-    let mut new_entries = Vec::new();
-    match kind {
-        DerivedIndexKind::Transcript => {
-            new_spans = transcript.apply_events(&tail);
-            transcript.file = current_file.clone();
-            transcript.event_count = event_count;
-            transcript.end_offset = end_offset;
-            transcript.last_sequence = last_sequence;
-        }
-        DerivedIndexKind::InputHistory => {
-            new_entries = input_history.apply_events(&tail);
-            input_history.file = current_file.clone();
-            input_history.event_count = event_count;
-            input_history.end_offset = end_offset;
-            input_history.last_sequence = last_sequence;
-        }
-    }
-    append_transcript_spans(root, session_id, &new_spans)?;
-    append_input_history_entries(root, session_id, &new_entries)?;
-    write_manifest(root, session_id, current_file, &transcript, &input_history)
-}
-
-fn manifest_entry_is_current(
-    manifest: &DerivedIndexManifest,
-    kind: DerivedIndexKind,
-    file_len: u64,
-) -> bool {
-    manifest_entry(manifest, kind).is_ok_and(|entry| entry.checkpoint.end_offset == file_len)
+    Ok(manifest)
 }
 
 fn manifest_is_current(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
@@ -774,76 +705,6 @@ fn manifest_is_current(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
         .indexes
         .iter()
         .all(|entry| entry.checkpoint.end_offset == file_len)
-}
-
-impl InputHistoryIndex {
-    fn apply_events(&mut self, events: &[SessionEvent]) -> Vec<SessionInputHistoryEntry> {
-        let new_entries = events
-            .iter()
-            .filter_map(|event| {
-                if let SessionEventKind::UserMessage { text, .. } = &event.kind {
-                    Some(SessionInputHistoryEntry {
-                        sequence: event.sequence,
-                        text: text.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        self.entries.extend(new_entries.clone());
-        new_entries
-    }
-}
-
-impl TranscriptIndex {
-    fn apply_events(
-        &mut self,
-        events: &[SessionEvent],
-    ) -> Vec<index::TranscriptProjectionIndexEntry> {
-        let (mut spans, state) =
-            project_transcript_events(events, Some(self.projector_state.clone()));
-        let new_spans = spans.clone();
-        self.spans.append(&mut spans);
-        self.spans
-            .sort_by_key(|span| span.source_range.start_sequence);
-        self.projector_state = state;
-        new_spans
-    }
-
-    const fn has_pending_streams(&self) -> bool {
-        self.projector_state.assistant.is_some() || self.projector_state.reasoning.is_some()
-    }
-
-    fn flush_pending_streams(&mut self) -> Vec<index::TranscriptProjectionIndexEntry> {
-        let (mut spans, state) = project_transcript_events(&[], Some(self.projector_state.clone()));
-        let new_spans = spans.clone();
-        self.spans.append(&mut spans);
-        self.spans
-            .sort_by_key(|span| span.source_range.start_sequence);
-        self.projector_state = state;
-        new_spans
-    }
-}
-
-fn can_resume_manifest(manifest: &DerivedIndexManifest, file_len: u64) -> bool {
-    manifest
-        .indexes
-        .iter()
-        .all(|entry| entry.checkpoint.end_offset <= file_len)
-}
-
-fn read_tail_events(
-    event_path: &Path,
-    offset: u64,
-) -> Result<Vec<SessionEvent>, SessionStoreError> {
-    let report = crate::reader::read_events_from_offset(event_path, offset)?;
-    if !report.issues.is_empty() {
-        return Err(SessionStoreError::InvalidSessionId(
-            "derived catch-up tail read encountered an unreadable event frame".to_owned(),
-        ));
-    }
-    Ok(report.events)
 }
 
 fn project_transcript_events(
@@ -860,14 +721,16 @@ fn project_transcript_events(
     projector.finish_batch()
 }
 
-fn project_transcript_events_incremental(
+fn project_transcript_events_incremental_from_sequence(
     events: &[SessionEvent],
     initial_state: Option<TranscriptProjectorState>,
+    minimum_start_sequence: u64,
 ) -> (
     Vec<index::TranscriptProjectionIndexEntry>,
     TranscriptProjectorState,
 ) {
     let mut projector = TranscriptIncrementalProjector::new(initial_state.unwrap_or_default());
+    projector.minimum_start_sequence = minimum_start_sequence;
     for event in events {
         projector.apply(event);
     }
@@ -877,6 +740,7 @@ fn project_transcript_events_incremental(
 struct TranscriptIncrementalProjector {
     state: TranscriptProjectorState,
     spans: Vec<index::TranscriptProjectionIndexEntry>,
+    minimum_start_sequence: u64,
 }
 
 impl TranscriptIncrementalProjector {
@@ -884,6 +748,7 @@ impl TranscriptIncrementalProjector {
         Self {
             state,
             spans: Vec::new(),
+            minimum_start_sequence: 0,
         }
     }
 
@@ -1043,7 +908,7 @@ impl TranscriptIncrementalProjector {
         let entry = self
             .state
             .tools
-            .entry(tool_call_id)
+            .entry(tool_call_id.clone())
             .or_insert(PendingToolState {
                 start_sequence: sequence,
                 end_sequence: sequence,
@@ -1054,6 +919,16 @@ impl TranscriptIncrementalProjector {
         entry.content_bytes = entry.content_bytes.saturating_add(content_bytes);
         if !matches!(event, ToolInvocationStreamEvent::Started { .. }) {
             entry.saw_stream_output = true;
+        }
+        if matches!(event, ToolInvocationStreamEvent::Finished { .. })
+            && let Some(invocation) = self.state.tools.remove(&tool_call_id)
+        {
+            self.push_span(
+                TranscriptProjectionItemKind::ToolInvocation,
+                invocation.start_sequence,
+                invocation.end_sequence,
+                invocation.content_bytes,
+            );
         }
     }
 
@@ -1086,6 +961,7 @@ impl TranscriptIncrementalProjector {
         end_sequence: u64,
         content_bytes: usize,
     ) {
+        let start_sequence = start_sequence.max(self.minimum_start_sequence);
         self.spans.push(index::TranscriptProjectionIndexEntry {
             projection_item_id: format!("transcript:{start_sequence}:{end_sequence}"),
             kind,
