@@ -919,6 +919,19 @@ impl SessionActor {
     }
 
     async fn model_context_events(&mut self) -> Result<Vec<SessionEvent>, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+            let checkpoint = db.projection_checkpoint("model_context").await?;
+            if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
+                return Ok(db.model_context_events().await?);
+            }
+            return Err(SessionError::ProjectionStale {
+                session_id: self.state.summary.id,
+                projection: "model_context",
+                checkpoint,
+                expected: expected_last_sequence,
+            });
+        }
         if let Some(events) = &self.state.events {
             return Ok(model_context_events_from_history(events));
         }

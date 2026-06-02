@@ -439,6 +439,60 @@ impl SessionDb {
         })
     }
 
+    /// Return model-context events from canonical DB events and indexed compaction metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event queries or deserialization fail.
+    pub async fn model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
+        let Some(compaction_event) = self.latest_context_compaction_event().await? else {
+            return self.all_events().await;
+        };
+        let SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        } = &compaction_event.kind
+        else {
+            return self.all_events().await;
+        };
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["payload"])
+            .where_gt("event_seq", seq_to_value(*compacted_through_sequence))
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        let mut events = Vec::with_capacity(rows.len().saturating_add(1));
+        events.push(compaction_event.clone());
+        for row in rows {
+            let payload = required_string(&row, "payload")?;
+            let event = serde_json::from_str::<SessionEvent>(&payload)?;
+            if event.sequence != compaction_event.sequence {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    async fn latest_context_compaction_event(&self) -> SessionDbResult<Option<SessionEvent>> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_type", "context_compacted")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| {
+                let payload = required_string(row, "payload")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .transpose()
+    }
+
     /// Return events from the canonical event table for the inclusive sequence range.
     ///
     /// # Errors
@@ -1197,6 +1251,51 @@ mod tests {
                 .expect("transcript checkpoint"),
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn model_context_events_start_at_latest_compaction() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "old".to_string(),
+            },
+        ))
+        .await
+        .expect("append old event");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ContextCompacted {
+                summary: "summary".to_string(),
+                compacted_through_sequence: 1,
+            },
+        ))
+        .await
+        .expect("append compaction");
+        db.append_event(&event(
+            session_id,
+            2,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "new".to_string(),
+            },
+        ))
+        .await
+        .expect("append new event");
+
+        let events = db.model_context_events().await.expect("model context");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
     }
 
     #[tokio::test]
