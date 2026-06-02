@@ -222,9 +222,6 @@ impl SessionEventStore {
                     .and_then(|name| name.to_str())
                     .and_then(|name| name.parse::<SessionId>().ok())
             {
-                if sessions.contains_key(&session_id) {
-                    continue;
-                }
                 match self.load_db_session_state(session_id) {
                     Ok(Some(state)) => {
                         sessions.insert(session_id, state);
@@ -252,6 +249,9 @@ impl SessionEventStore {
                     continue;
                 }
             };
+            if db::session_db_path(&self.root, session_id).exists() {
+                continue;
+            }
             match self.load_session_metadata(session_id, &path) {
                 Ok(Some(state)) => {
                     sessions.insert(session_id, state);
@@ -1629,7 +1629,6 @@ pub struct SessionManager {
     catalog_status_tx: watch::Sender<CatalogLoadStatus>,
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
     metrics: MetricsRegistry,
-    legacy_compat_writes: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1738,20 +1737,11 @@ impl Default for SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             metrics: MetricsRegistry::default(),
-            legacy_compat_writes: false,
         }
     }
 }
 
 impl SessionManager {
-    /// Enable legacy `.events` compatibility writes for tests and migration tooling that exercise
-    /// the pre-DB store. Normal DB-backed sessions should not use this.
-    #[must_use]
-    pub const fn with_legacy_compat_writes(mut self) -> Self {
-        self.legacy_compat_writes = true;
-        self
-    }
-
     /// Create a session manager backed by an append-only event store.
     ///
     /// # Errors
@@ -1811,11 +1801,7 @@ impl SessionManager {
                     .map(|(session_id, state)| {
                         (
                             session_id,
-                            SessionHandle::new_with_legacy_compat_writes(
-                                state,
-                                Some(executor.clone()),
-                                true,
-                            ),
+                            SessionHandle::new(state, Some(executor.clone())),
                         )
                     })
                     .collect(),
@@ -1827,7 +1813,6 @@ impl SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             metrics,
-            legacy_compat_writes: false,
         }
     }
 
@@ -1868,14 +1853,11 @@ impl SessionManager {
                 "session.manager.ensure_loaded.load_db_session_duration_ms",
                 load_timer.elapsed_ms(),
             );
-            self.inner.lock().await.sessions.insert(
-                session_id,
-                SessionHandle::new_with_legacy_compat_writes(
-                    state,
-                    Some(store.clone()),
-                    self.legacy_compat_writes,
-                ),
-            );
+            self.inner
+                .lock()
+                .await
+                .sessions
+                .insert(session_id, SessionHandle::new(state, Some(store.clone())));
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.total_duration_ms",
                 total_timer.elapsed_ms(),
@@ -1895,13 +1877,10 @@ impl SessionManager {
         );
         let insert_timer = self.metrics.timer();
         let mut inner = self.inner.lock().await;
-        inner.sessions.entry(session_id).or_insert_with(|| {
-            SessionHandle::new_with_legacy_compat_writes(
-                state,
-                self.store.clone(),
-                self.legacy_compat_writes,
-            )
-        });
+        inner
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| SessionHandle::new(state, self.store.clone()));
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.insert_duration_ms",
             insert_timer.elapsed_ms(),
@@ -1937,7 +1916,6 @@ impl SessionManager {
         let _ = self.catalog_status_tx.send(CatalogLoadStatus::Loading);
         let registry = Arc::clone(&self.inner);
         let status = self.catalog_status_tx.clone();
-        let legacy_compat_writes = self.legacy_compat_writes;
         tokio::spawn(async move {
             let sessions = match store.load_catalog().await {
                 Ok(sessions) => sessions,
@@ -1949,13 +1927,10 @@ impl SessionManager {
             };
             let mut inner = registry.lock().await;
             for (session_id, state) in sessions {
-                inner.sessions.entry(session_id).or_insert_with(|| {
-                    SessionHandle::new_with_legacy_compat_writes(
-                        state,
-                        Some(store.clone()),
-                        legacy_compat_writes,
-                    )
-                });
+                inner
+                    .sessions
+                    .entry(session_id)
+                    .or_insert_with(|| SessionHandle::new(state, Some(store.clone())));
             }
             drop(inner);
             let _ = status.send(CatalogLoadStatus::Loaded);
@@ -2096,11 +2071,7 @@ impl SessionManager {
             access_status: SessionAccessStatus::ReadWrite,
             sender,
         };
-        let handle = SessionHandle::new_with_legacy_compat_writes(
-            state,
-            self.store.clone(),
-            self.legacy_compat_writes,
-        );
+        let handle = SessionHandle::new(state, self.store.clone());
         handle
             .append_event(
                 SessionEventKind::SessionCreated {
@@ -3641,17 +3612,12 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SessionAccessStatus, SessionManager, access_status_from_report, db, derived, index, reader,
-    };
+    use super::{SessionAccessStatus, SessionManager, access_status_from_report, db, reader};
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowAnchor,
-        ProjectionWindowDirection, ProjectionWindowLimits, ProjectionWindowRequest,
-        ProjectionWindowTarget, ProviderStreamEvent, RuntimeWorkId, RuntimeWorkKind,
-        RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
-        SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionProjectionKind,
-        SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
-        ToolOutputStream, TraceBlobRef,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
+        RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
+        SessionId, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -4626,9 +4592,13 @@ mod tests {
 
         let manager = SessionManager::persistent(&root).expect("manager should restore legacy");
         manager
-            .append_user_message(session_id, ClientId::new(), "new v2 event".to_string())
+            .migrate_legacy_events_to_db(session_id)
             .await
-            .expect("v2 append should work");
+            .expect("legacy events should migrate before DB append");
+        manager
+            .append_user_message(session_id, ClientId::new(), "new DB event".to_string())
+            .await
+            .expect("DB append should work");
 
         let restored = SessionManager::persistent(&root).expect("manager should restore mixed");
         let history = restored
@@ -4642,49 +4612,8 @@ mod tests {
         ));
         assert!(matches!(
             &history[1].kind,
-            SessionEventKind::UserMessage { text, .. } if text == "new v2 event"
+            SessionEventKind::UserMessage { text, .. } if text == "new DB event"
         ));
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn persistent_manager_ignores_corrupt_session_tail() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("test".to_string()), test_working_directory())
-            .await
-            .expect("session should be created");
-        manager
-            .append_user_message(session.id, ClientId::new(), "hello".to_string())
-            .await
-            .expect("message should append");
-
-        let path = root.join(format!("{}.events", session.id));
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .expect("event file should open");
-        file.write_all(&3_u32.to_le_bytes())
-            .expect("corrupt frame length should append");
-        file.write_all(&[1_u8])
-            .expect("partial corrupt frame should append");
-
-        let restored = SessionManager::persistent(&root)
-            .expect("manager should restore")
-            .with_legacy_compat_writes();
-        let history = restored
-            .session_history(session.id)
-            .await
-            .expect("history should load");
-
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::UserMessage { text, .. } if text == "hello"
-        )));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -4724,140 +4653,6 @@ mod tests {
             .expect("imported event should exist");
 
         assert_eq!(imported.provenance.as_ref(), Some(&provenance));
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn metadata_write_after_append_refreshes_transcript_projection_entries() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(
-                Some("projection stale".to_string()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should be created");
-        manager
-            .append_user_message(session.id, ClientId::new(), "first".to_owned())
-            .await
-            .expect("message should append");
-        let store = super::SessionEventStore::new(&root);
-        store
-            .reindex_session(session.id)
-            .expect("session should reindex");
-        let rebuilt =
-            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should load");
-        assert!(!rebuilt.spans.is_empty());
-
-        manager
-            .append_user_message(session.id, ClientId::new(), "second".to_owned())
-            .await
-            .expect("message should append");
-        let after_append =
-            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should load");
-        let metadata =
-            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
-                .expect("metadata index should load")
-                .expect("metadata index should exist");
-
-        assert_eq!(after_append.spans.len(), 2);
-        assert_eq!(after_append.event_count, rebuilt.event_count + 1);
-        assert_eq!(metadata.event_count, after_append.event_count);
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn invisible_event_leaves_derived_manifest_stale_until_read() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(
-                Some("projection invisible".to_string()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should be created");
-        manager
-            .append_user_message(session.id, ClientId::new(), "first".to_owned())
-            .await
-            .expect("message should append");
-        let store = super::SessionEventStore::new(&root);
-        store
-            .reindex_session(session.id)
-            .expect("session should reindex");
-        let transcript_path = derived::transcript_index_path(&root, session.id);
-        let input_history_path = derived::input_history_index_path(&root, session.id);
-        let manifest_path = derived::manifest_path(&root, session.id);
-        let transcript_before =
-            std::fs::read_to_string(&transcript_path).expect("transcript index should read");
-        let input_history_before =
-            std::fs::read_to_string(&input_history_path).expect("input history index should read");
-        let manifest_before: derived::DerivedIndexManifest = serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
-        )
-        .expect("manifest should decode");
-
-        manager
-            .append_agent_changed(session.id, "build".to_owned())
-            .await
-            .expect("agent change should append");
-
-        assert_eq!(
-            transcript_before,
-            std::fs::read_to_string(&transcript_path).expect("transcript index should read")
-        );
-        assert_eq!(
-            input_history_before,
-            std::fs::read_to_string(&input_history_path).expect("input history index should read")
-        );
-        let metadata =
-            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
-                .expect("metadata index should load")
-                .expect("metadata index should exist");
-        let manifest_after: derived::DerivedIndexManifest = serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
-        )
-        .expect("manifest should decode");
-        assert_eq!(
-            manifest_before.indexes[0].checkpoint.event_count,
-            manifest_after.indexes[0].checkpoint.event_count
-        );
-        assert_eq!(
-            manifest_before.indexes[1].checkpoint.event_count,
-            manifest_after.indexes[1].checkpoint.event_count
-        );
-        assert_eq!(
-            manifest_before.indexes[0].item_count,
-            manifest_after.indexes[0].item_count
-        );
-        assert_eq!(
-            manifest_before.indexes[1].item_count,
-            manifest_after.indexes[1].item_count
-        );
-        assert_eq!(
-            metadata.event_count,
-            manifest_after.indexes[0].checkpoint.event_count + 1
-        );
-        let transcript_index =
-            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should remain usable across irrelevant tail events");
-        assert_eq!(
-            manifest_before.indexes[0].checkpoint.event_count,
-            transcript_index.event_count
-        );
-        assert_eq!(
-            manifest_before.indexes[0].item_count,
-            transcript_index.spans.len()
-        );
-
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
@@ -4955,240 +4750,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_deltas_do_not_rewrite_transcript_index() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("streaming".to_string()), test_working_directory())
-            .await
-            .expect("session should be created");
-        manager
-            .append_user_message(session.id, ClientId::new(), "first".to_owned())
-            .await
-            .expect("message should append");
-        let store = super::SessionEventStore::new(&root);
-        store
-            .reindex_session(session.id)
-            .expect("session should reindex");
-        let transcript_path = derived::transcript_index_path(&root, session.id);
-        let transcript_before =
-            std::fs::read_to_string(&transcript_path).expect("transcript index should read");
-
-        manager
-            .append_assistant_delta(session.id, "partial".to_owned())
-            .await
-            .expect("delta should append");
-        manager
-            .append_assistant_delta(session.id, " response".to_owned())
-            .await
-            .expect("delta should append");
-
-        assert_eq!(
-            transcript_before,
-            std::fs::read_to_string(&transcript_path).expect("transcript index should read")
-        );
-        assert!(
-            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .is_ok()
-        );
-        assert!(
-            !std::path::Path::new(&root)
-                .join("index")
-                .join(session.id.to_string())
-                .join("dirty.json")
-                .exists()
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn attach_session_projection_window_returns_selected_source_history() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(
-                Some("projection attach".to_string()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should be created");
-        manager
-            .append_user_message(session.id, ClientId::new(), "older".to_owned())
-            .await
-            .expect("message should append");
-        manager
-            .append_assistant_message(session.id, "older answer".to_owned())
-            .await
-            .expect("message should append");
-        manager
-            .append_user_message(session.id, ClientId::new(), "newer".to_owned())
-            .await
-            .expect("message should append");
-        manager
-            .append_assistant_delta(session.id, "partial".to_owned())
-            .await
-            .expect("delta should append");
-        manager
-            .append_assistant_message(session.id, "newer answer".to_owned())
-            .await
-            .expect("message should append");
-
-        let restored = SessionManager::persistent(&root)
-            .expect("manager should restore")
-            .with_legacy_compat_writes();
-        let attached = restored
-            .attach_session_projection_window(
-                session.id,
-                ClientId::new(),
-                ProjectionWindowRequest {
-                    projection: SessionProjectionKind::Transcript,
-                    anchor: ProjectionWindowAnchor::Latest,
-                    direction: ProjectionWindowDirection::Backward,
-                    target: ProjectionWindowTarget {
-                        min_items: Some(2),
-                        min_estimated_rows: None,
-                        min_bytes: None,
-                        width_columns: Some(80),
-                    },
-                    limits: ProjectionWindowLimits {
-                        max_items: 8,
-                        max_events_scanned: 64,
-                        max_bytes: 4096,
-                    },
-                },
-            )
-            .await
-            .expect("projection attach should succeed");
-
-        assert_eq!(attached.projection_window.transcript_items.len(), 2);
-        assert_eq!(
-            attached
-                .attachment
-                .history
-                .iter()
-                .map(|event| event.sequence)
-                .collect::<Vec<_>>(),
-            vec![3, 4, 5]
-        );
-        assert!(matches!(
-            &attached.attachment.history[0].kind,
-            SessionEventKind::UserMessage { text, .. } if text == "newer"
-        ));
-        assert!(matches!(
-            &attached.attachment.history[2].kind,
-            SessionEventKind::AssistantMessage { text } if text == "newer answer"
-        ));
-        assert_eq!(
-            attached.attachment.session.name.as_deref(),
-            Some("projection attach")
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn projection_window_falls_back_when_index_has_no_transcript_entries() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(
-                Some("empty projection".to_string()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should be created");
-
-        let window = manager
-            .session_projection_window(
-                session.id,
-                ProjectionWindowRequest {
-                    projection: SessionProjectionKind::Transcript,
-                    anchor: ProjectionWindowAnchor::Latest,
-                    direction: ProjectionWindowDirection::Backward,
-                    target: ProjectionWindowTarget {
-                        min_items: Some(1),
-                        min_estimated_rows: None,
-                        min_bytes: None,
-                        width_columns: Some(80),
-                    },
-                    limits: ProjectionWindowLimits {
-                        max_items: 8,
-                        max_events_scanned: 64,
-                        max_bytes: 4096,
-                    },
-                },
-            )
-            .await
-            .expect("fallback projection window should succeed");
-
-        assert!(window.transcript_items.is_empty());
-        assert_eq!(window.source_range, None);
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn rebuilt_index_persists_transcript_projection_entries() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(
-                Some("projection-index".to_string()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should be created");
-        manager
-            .append_user_message(session.id, ClientId::new(), "question".to_owned())
-            .await
-            .expect("message should append");
-        manager
-            .append_assistant_delta(session.id, "partial".to_owned())
-            .await
-            .expect("delta should append");
-        manager
-            .append_assistant_message(session.id, "answer".to_owned())
-            .await
-            .expect("message should append");
-
-        let store = super::SessionEventStore::new(&root);
-        store
-            .reindex_session(session.id)
-            .expect("session should reindex");
-        let metadata =
-            super::index::load_fresh_index(&root, session.id, &store.event_path(session.id))
-                .expect("metadata index should load")
-                .expect("metadata index should exist");
-        let transcript_index =
-            derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should load");
-
-        assert_eq!(metadata.event_count, transcript_index.event_count);
-        assert_eq!(transcript_index.spans.len(), 2);
-        assert_eq!(
-            transcript_index.spans[0].kind,
-            bcode_session_models::TranscriptProjectionItemKind::UserMessage
-        );
-        assert_eq!(
-            transcript_index.spans[1].kind,
-            bcode_session_models::TranscriptProjectionItemKind::AssistantMessage
-        );
-        assert_eq!(transcript_index.spans[1].source_range.start_sequence, 2);
-        assert_eq!(transcript_index.spans[1].source_range.end_sequence, 3);
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
     async fn restored_session_events_range_reads_inclusive_sequences_from_disk_index() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -5263,52 +4824,6 @@ mod tests {
             vec![1, 2]
         );
         assert!(empty.is_empty());
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn restored_session_history_page_reads_from_disk_index() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("paged".to_string()), test_working_directory())
-            .await
-            .expect("session should be created");
-        for index in 0..5 {
-            manager
-                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
-                .await
-                .expect("message should append");
-        }
-
-        let restored = SessionManager::persistent(&root)
-            .expect("manager should restore")
-            .with_legacy_compat_writes();
-        let page = restored
-            .session_history_page(
-                session.id,
-                SessionHistoryQuery {
-                    cursor: None,
-                    limit: 2,
-                    direction: SessionHistoryDirection::Backward,
-                },
-            )
-            .await
-            .expect("history page should load");
-
-        assert_eq!(page.events.len(), 2);
-        assert!(page.has_more);
-        assert!(matches!(
-            &page.events[0].kind,
-            SessionEventKind::UserMessage { text, .. } if text == "message 3"
-        ));
-        assert!(matches!(
-            &page.events[1].kind,
-            SessionEventKind::UserMessage { text, .. } if text == "message 4"
-        ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -5668,37 +5183,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_doctor_is_read_only_without_fix() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("doctor".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        let index_path = root
-            .join("index")
-            .join(format!("{}.index.json", session.id));
-        std::fs::remove_file(&index_path).expect("index should remove");
-
-        let store = super::SessionEventStore::new(&root);
-        let health = store
-            .doctor_session(session.id)
-            .expect("doctor should inspect")
-            .expect("session should exist");
-        assert!(health.stale);
-        assert!(!index_path.exists());
-
-        store
-            .doctor_session_with_fix(session.id, true)
-            .expect("doctor fix should run");
-        assert!(index_path.exists());
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
     async fn lazy_persistent_manager_defers_catalog_until_requested() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -5737,56 +5221,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_catalog_includes_sessions_with_stale_indexes() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("stale catalog".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        manager
-            .append_user_message(session.id, ClientId::new(), "wake index".to_string())
-            .await
-            .expect("message should append");
-        let index_path = root
-            .join("index")
-            .join(format!("{}.index.json", session.id));
-        std::fs::remove_file(&index_path).expect("index should remove");
-
-        let restored = SessionManager::persistent_lazy(&root).with_legacy_compat_writes();
-        restored
-            .wait_catalog_loaded()
-            .await
-            .expect("catalog load should complete");
-        let sessions = restored.cached_sessions(&test_working_directory()).await;
-        let restored_session = sessions
-            .iter()
-            .find(|candidate| candidate.id == session.id)
-            .expect("stale-index session should appear in catalog");
-        assert_eq!(restored_session.name.as_deref(), Some("stale catalog"));
-
-        restored
-            .ensure_session_current(session.id)
-            .await
-            .expect("stale-index session should migrate successfully");
-        let summary = restored
-            .session_summary(session.id)
-            .await
-            .expect("session should remain loadable after migration check");
-        assert_eq!(summary.name.as_deref(), Some("stale catalog"));
-        let health = super::SessionEventStore::new(&root)
-            .doctor_session_with_fix(session.id, true)
-            .expect("doctor should inspect")
-            .expect("session should exist");
-        assert!(health.stale);
-        assert!(index_path.exists());
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
     async fn lazy_catalog_skips_unreadable_session_without_failing() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -5809,236 +5243,6 @@ mod tests {
         let sessions = restored.cached_sessions(&test_working_directory()).await;
         assert!(sessions.iter().any(|session| session.id == good.id));
         assert!(!sessions.iter().any(|session| session.id == bad_id));
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn lazy_catalog_tolerates_bad_entry_index_first_offset() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("bad entry".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        manager
-            .append_user_message(session.id, ClientId::new(), "hello".to_string())
-            .await
-            .expect("message should append");
-        let mut entries = index::read_entries(&root, session.id).expect("entries should read");
-        entries[0].offset = 1;
-        index::write_entries(&root, session.id, &entries).expect("entries should rewrite");
-        let index_path = index::index_path(&root, session.id);
-        std::fs::remove_file(&index_path).expect("metadata index should remove");
-
-        let restored = SessionManager::persistent_lazy(&root).with_legacy_compat_writes();
-        restored
-            .wait_catalog_loaded()
-            .await
-            .expect("catalog load should tolerate bad entry offset");
-        let sessions = restored.cached_sessions(&test_working_directory()).await;
-        let restored_session = sessions
-            .iter()
-            .find(|candidate| candidate.id == session.id)
-            .expect("session should remain discoverable from first event");
-        assert_eq!(restored_session.name.as_deref(), Some("bad entry"));
-        assert!(
-            !index_path.exists(),
-            "catalog load should not repair indexes"
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn lazy_catalog_missing_indexes_does_not_write_partial_repair() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(
-                Some("missing indexes".to_string()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should create");
-        manager
-            .append_user_message(session.id, ClientId::new(), "hello".to_string())
-            .await
-            .expect("message should append");
-        let index_path = index::index_path(&root, session.id);
-        let entries_path = index::entries_path(&root, session.id);
-        std::fs::remove_file(&index_path).expect("metadata index should remove");
-        std::fs::remove_file(&entries_path).expect("entry index should remove");
-
-        let restored = SessionManager::persistent_lazy(&root).with_legacy_compat_writes();
-        restored
-            .wait_catalog_loaded()
-            .await
-            .expect("catalog load should synthesize read-only metadata");
-        let sessions = restored.cached_sessions(&test_working_directory()).await;
-        assert!(sessions.iter().any(|candidate| candidate.id == session.id));
-        assert!(
-            !index_path.exists(),
-            "catalog load should not write metadata"
-        );
-        assert!(
-            !entries_path.exists(),
-            "catalog load should not write entries"
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn persistent_restore_defers_stale_index_repair_until_explicit_reindex() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("lazy".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        manager
-            .append_user_message(session.id, ClientId::new(), "hello".to_string())
-            .await
-            .expect("message should append");
-        let index_path = root
-            .join("index")
-            .join(format!("{}.index.json", session.id));
-        std::fs::remove_file(&index_path).expect("index should remove");
-
-        let restored = SessionManager::persistent(&root)
-            .expect("manager should restore")
-            .with_legacy_compat_writes();
-        assert!(
-            !index_path.exists(),
-            "persistent restore should not eagerly rewrite missing indexes"
-        );
-
-        restored
-            .session_history_page(
-                session.id,
-                SessionHistoryQuery {
-                    cursor: None,
-                    limit: 10,
-                    direction: SessionHistoryDirection::Forward,
-                },
-            )
-            .await
-            .expect_err("history page should require explicit repair for missing metadata index");
-        assert!(
-            !index_path.exists(),
-            "history page should not rebuild missing indexes implicitly"
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn session_migration_apply_rebuilds_missing_index() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("migration".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        std::fs::remove_file(
-            root.join("index")
-                .join(format!("{}.index.json", session.id)),
-        )
-        .expect("index should remove");
-
-        let store = super::SessionEventStore::new(&root);
-        let plan = store.migration_plan().expect("plan should load");
-        assert_eq!(plan.items.len(), 1);
-        assert_eq!(plan.items[0].migration_id, "sessions-index-rebuild-v2");
-
-        let report = store
-            .apply_migration_plan(super::SessionMigrationOptions {
-                dry_run: false,
-                backup: false,
-            })
-            .expect("migration should apply");
-        assert_eq!(report.items.len(), 1);
-        assert_eq!(
-            report.items[0].status,
-            super::SessionMigrationApplyStatus::Applied
-        );
-        assert!(
-            root.join("index")
-                .join(format!("{}.index.json", session.id))
-                .exists()
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn session_migration_apply_writes_journal_entries() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("journal".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        std::fs::remove_file(
-            root.join("index")
-                .join(format!("{}.index.json", session.id)),
-        )
-        .expect("index should remove");
-
-        let store = super::SessionEventStore::new(&root);
-        store
-            .apply_migration_plan(super::SessionMigrationOptions {
-                dry_run: false,
-                backup: false,
-            })
-            .expect("migration should apply");
-
-        let journal = std::fs::read_to_string(root.join("migrations.jsonl"))
-            .expect("journal should be written");
-        assert!(journal.contains("\"status\":\"started\""));
-        assert!(journal.contains("\"status\":\"completed\""));
-        assert!(journal.contains("sessions-index-rebuild-v2"));
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn session_migration_apply_can_create_backup_manifest() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root)
-            .expect("manager should initialize")
-            .with_legacy_compat_writes();
-        let session = manager
-            .create_session(Some("backup".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        std::fs::remove_file(
-            root.join("index")
-                .join(format!("{}.index.json", session.id)),
-        )
-        .expect("index should remove");
-
-        let store = super::SessionEventStore::new(&root);
-        let report = store
-            .apply_migration_plan(super::SessionMigrationOptions {
-                dry_run: false,
-                backup: true,
-            })
-            .expect("migration should apply");
-        let backup_dir = report.backup_dir.expect("backup should be created");
-        assert!(backup_dir.join("manifest.json").exists());
-        assert!(backup_dir.join(format!("{}.events", session.id)).exists());
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
