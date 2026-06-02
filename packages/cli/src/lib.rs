@@ -90,6 +90,8 @@ pub enum CliError {
     Blims(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
+    #[error("legacy session migration failed for {failed_count} session(s)")]
+    LegacyMigrationFailed { failed_count: usize },
 }
 
 /// Parse CLI arguments and run the requested command.
@@ -4165,28 +4167,61 @@ async fn legacy_migration_migrate(session_id: SessionId) -> Result<(), CliError>
 async fn legacy_migration_migrate_all(json: bool) -> Result<(), CliError> {
     ensure_server_running().await?;
     let mut connection = BcodeClient::default_endpoint().connect("bcode-cli").await?;
-    let results = connection.migrate_all_legacy_sessions_to_db().await?;
     if json {
+        let results = connection.migrate_all_legacy_sessions_to_db().await?;
         println!("{}", serde_json::to_string_pretty(&results)?);
         return Ok(());
     }
-    if results.is_empty() {
+
+    println!("discovering legacy sessions…");
+    std::io::stdout().flush()?;
+    let candidates = connection.list_legacy_sessions_for_migration().await?;
+    if candidates.is_empty() {
         println!("no legacy sessions found");
         return Ok(());
     }
-    for result in results {
-        let status = if result.migrated {
-            "migrated"
-        } else {
-            "skipped"
-        };
-        let detail = result.summary.as_ref().map_or_else(
-            || result.error.unwrap_or_default(),
-            |summary| summary.display_title().to_string(),
-        );
-        println!("{}\t{}\t{}", result.session_id, status, detail);
+
+    let total = candidates.len();
+    println!("found {total} legacy session(s)");
+    std::io::stdout().flush()?;
+
+    let mut migrated_count = 0_usize;
+    let skipped_count = 0_usize;
+    let mut failed_count = 0_usize;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let ordinal = index.saturating_add(1);
+
+        println!("[{ordinal}/{total}] migrating {} …", candidate.session_id);
+        std::io::stdout().flush()?;
+        match connection
+            .migrate_legacy_session_to_db(candidate.session_id)
+            .await
+        {
+            Ok(summary) => {
+                migrated_count = migrated_count.saturating_add(1);
+                println!(
+                    "[{ordinal}/{total}] migrated {}\t{}",
+                    summary.id,
+                    summary.display_title()
+                );
+            }
+            Err(error) => {
+                failed_count = failed_count.saturating_add(1);
+                eprintln!(
+                    "[{ordinal}/{total}] failed {}\t{error}",
+                    candidate.session_id
+                );
+            }
+        }
+        std::io::stdout().flush()?;
     }
-    Ok(())
+
+    println!("done: {migrated_count} migrated, {skipped_count} skipped, {failed_count} failed");
+    if failed_count == 0 {
+        Ok(())
+    } else {
+        Err(CliError::LegacyMigrationFailed { failed_count })
+    }
 }
 
 fn session_migration_plan(json: bool) -> Result<(), CliError> {

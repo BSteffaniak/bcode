@@ -1502,15 +1502,6 @@ impl SessionManager {
         let candidates = self.list_legacy_sessions_for_migration().await?;
         let mut results = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            if candidate.has_db {
-                results.push(LegacySessionMigrationResult {
-                    session_id: candidate.session_id,
-                    migrated: false,
-                    summary: None,
-                    error: None,
-                });
-                continue;
-            }
             match self
                 .migrate_legacy_session_to_db(candidate.session_id)
                 .await
@@ -1551,16 +1542,18 @@ impl SessionManager {
         };
         let db_path = db::session_db_path(&store.root_path(), session_id);
         let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-        if db.last_event_sequence().await?.is_none() {
-            let events = store
-                .read_events_migrated_to_current_for_db_import(session_id)
-                .await?;
-            if events.is_empty() {
-                return Err(SessionError::NotFound(session_id));
-            }
-            for event in &events {
-                db.append_event(event).await?;
-            }
+        let last_imported_sequence = db.last_event_sequence().await?;
+        let events = store
+            .read_events_migrated_to_current_for_db_import(session_id)
+            .await?;
+        if events.is_empty() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        for event in events
+            .iter()
+            .filter(|event| last_imported_sequence.is_none_or(|sequence| event.sequence > sequence))
+        {
+            db.append_event(event).await?;
         }
 
         let state = self.load_db_session_state(session_id, &db).await?;
