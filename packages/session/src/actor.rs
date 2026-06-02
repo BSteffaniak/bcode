@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::store_executor::PersistedSessionMetadata;
+use bcode_session_models::ToolInvocationStreamEvent;
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
@@ -483,7 +484,9 @@ impl SessionActor {
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.state.index_status = SessionIndexStatusKind::Current;
-        if let Some(store) = &self.store {
+        if let Some(store) = &self.store
+            && should_write_metadata_index_on_append(&event)
+        {
             self.state.index_status = SessionIndexStatusKind::Stale;
             let metadata = PersistedSessionMetadata::from_state(&self.state);
             let write_index_started_at = Instant::now();
@@ -845,6 +848,19 @@ impl SessionActor {
         let _ = self.state.sender.send(event.clone());
         Some(event)
     }
+}
+
+const fn should_write_metadata_index_on_append(event: &SessionEvent) -> bool {
+    !matches!(
+        event.kind,
+        SessionEventKind::AssistantDelta { .. }
+            | SessionEventKind::AssistantReasoningDelta { .. }
+            | SessionEventKind::RuntimeWorkProgress { .. }
+            | SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { .. }
+                    | ToolInvocationStreamEvent::Status { .. }
+            }
+    )
 }
 
 fn select_event_range_from_events(
