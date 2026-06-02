@@ -478,14 +478,83 @@ impl SessionDb {
         &self,
         limit: usize,
     ) -> SessionDbResult<Vec<TranscriptItem>> {
-        let mut items = self
-            .latest_transcript_rows(limit)
+        self.transcript_items_for_latest_window(limit, limit, usize::MAX)
+            .await
+    }
+
+    /// Return enough latest transcript projection items to satisfy bounded window targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails or a row is malformed.
+    pub async fn transcript_items_for_latest_window(
+        &self,
+        min_items: usize,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> SessionDbResult<Vec<TranscriptItem>> {
+        let fetch_limit = max_items.max(min_items).max(1);
+        let rows = self
+            .latest_transcript_rows(fetch_limit)
             .await?
-            .iter()
-            .map(transcript_item_from_row)
+            .into_iter()
+            .map(|row| transcript_item_from_row(&row))
             .collect::<SessionDbResult<Vec<_>>>()?;
+        let mut items = Vec::new();
+        let mut bytes = 0usize;
+        for item in rows {
+            let item_bytes = item.content.as_ref().map_or(0, String::len);
+            if items.len() >= min_items
+                && (items.len() >= max_items || bytes.saturating_add(item_bytes) > max_bytes)
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(item_bytes);
+            items.push(item);
+            if items.len() >= max_items {
+                break;
+            }
+        }
         items.sort_by_key(|item| item.transcript_seq);
         Ok(items)
+    }
+
+    /// Return the first canonical event sequence, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the row is malformed.
+    pub async fn first_event_sequence(&self) -> SessionDbResult<Option<u64>> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["event_seq"])
+            .sort("event_seq", SortDirection::Asc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
+            .transpose()
+    }
+
+    /// Return the last canonical event sequence, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the row is malformed.
+    pub async fn last_event_sequence(&self) -> SessionDbResult<Option<u64>> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["event_seq"])
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
+            .transpose()
     }
 
     /// Return the latest transcript projection rows as generic database rows for callers that
@@ -1127,6 +1196,44 @@ mod tests {
                 .await
                 .expect("transcript checkpoint"),
             Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_window_query_uses_bounded_latest_projection_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        for sequence in 0..5 {
+            db.append_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            ))
+            .await
+            .expect("append event");
+        }
+
+        let items = db
+            .transcript_items_for_latest_window(2, 3, usize::MAX)
+            .await
+            .expect("transcript window items");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].event_seq_start, 2);
+        assert_eq!(items[1].event_seq_start, 3);
+        assert_eq!(items[2].event_seq_start, 4);
+        assert_eq!(
+            db.first_event_sequence().await.expect("first sequence"),
+            Some(0)
+        );
+        assert_eq!(
+            db.last_event_sequence().await.expect("last sequence"),
+            Some(4)
         );
     }
 

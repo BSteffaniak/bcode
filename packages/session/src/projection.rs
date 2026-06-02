@@ -11,13 +11,6 @@ pub(crate) fn projection_window_from_index_entries(
     last_event_sequence: Option<u64>,
     request: &ProjectionWindowRequest,
 ) -> Option<ProjectionWindow> {
-    if request.projection != SessionProjectionKind::Transcript
-        || request.anchor != ProjectionWindowAnchor::Latest
-        || request.direction != ProjectionWindowDirection::Backward
-    {
-        return None;
-    }
-
     let mut spans = entries
         .iter()
         .map(|entry| TranscriptProjectionItem {
@@ -27,13 +20,63 @@ pub(crate) fn projection_window_from_index_entries(
             content_bytes: entry.content_bytes,
         })
         .collect::<Vec<_>>();
+    projection_window_from_transcript_projection_items(
+        &mut spans,
+        first_event_sequence,
+        last_event_sequence,
+        request,
+    )
+}
+
+pub(crate) fn projection_window_from_db_transcript_items(
+    items: &[crate::db::TranscriptItem],
+    first_event_sequence: Option<u64>,
+    last_event_sequence: Option<u64>,
+    request: &ProjectionWindowRequest,
+) -> Option<ProjectionWindow> {
+    let mut spans = items
+        .iter()
+        .map(|item| {
+            let content_bytes = item.content.as_ref().map_or(0, String::len);
+            TranscriptProjectionItem {
+                kind: transcript_projection_kind_from_db_item(item),
+                source_range: ProjectionSourceRange {
+                    start_sequence: item.event_seq_start,
+                    end_sequence: item.event_seq_end,
+                },
+                estimated_rows: estimate_rows(content_bytes, request.target.width_columns),
+                content_bytes,
+            }
+        })
+        .collect::<Vec<_>>();
+    projection_window_from_transcript_projection_items(
+        &mut spans,
+        first_event_sequence,
+        last_event_sequence,
+        request,
+    )
+}
+
+fn projection_window_from_transcript_projection_items(
+    spans: &mut [TranscriptProjectionItem],
+    first_event_sequence: Option<u64>,
+    last_event_sequence: Option<u64>,
+    request: &ProjectionWindowRequest,
+) -> Option<ProjectionWindow> {
+    if request.projection != SessionProjectionKind::Transcript
+        || request.anchor != ProjectionWindowAnchor::Latest
+        || request.direction != ProjectionWindowDirection::Backward
+    {
+        return None;
+    }
+
     spans.sort_by_key(|item| {
         (
             item.source_range.start_sequence,
             item.source_range.end_sequence,
         )
     });
-    let selected_items = select_latest_items(&spans, request);
+    let selected_items = select_latest_items(spans, request);
     let source_range = source_range_for_items(&selected_items);
     let scanned_events = source_range.map_or(0, |range| {
         usize::try_from(range.end_sequence - range.start_sequence + 1).unwrap_or(usize::MAX)
@@ -52,6 +95,17 @@ pub(crate) fn projection_window_from_index_entries(
         has_newer,
         scanned_events,
     })
+}
+
+fn transcript_projection_kind_from_db_item(
+    item: &crate::db::TranscriptItem,
+) -> TranscriptProjectionItemKind {
+    match item.kind.as_str() {
+        "message" if item.role == "user" => TranscriptProjectionItemKind::UserMessage,
+        "message" if item.role == "assistant" => TranscriptProjectionItemKind::AssistantMessage,
+        "invocation" | "result" => TranscriptProjectionItemKind::ToolInvocation,
+        _ => TranscriptProjectionItemKind::Other,
+    }
 }
 
 /// Select a bounded projection window from chronological session events.

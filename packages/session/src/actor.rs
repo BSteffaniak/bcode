@@ -764,9 +764,36 @@ impl SessionActor {
     }
 
     async fn projection_window_from_index(
-        &self,
+        &mut self,
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+            let checkpoint = db.projection_checkpoint("transcript").await?;
+            if checkpoint.is_none_or(|checkpoint| checkpoint < expected_last_sequence) {
+                return Err(SessionError::ProjectionStale {
+                    session_id: self.state.summary.id,
+                    projection: "transcript",
+                    checkpoint,
+                    expected: expected_last_sequence,
+                });
+            }
+            let transcript_items = db
+                .transcript_items_for_latest_window(
+                    request.target.min_items.unwrap_or(1),
+                    request.limits.max_items,
+                    request.limits.max_bytes,
+                )
+                .await?;
+            return crate::projection::projection_window_from_db_transcript_items(
+                &transcript_items,
+                db.first_event_sequence().await?,
+                db.last_event_sequence().await?,
+                &request,
+            )
+            .ok_or(SessionError::UnsupportedProjectionWindow);
+        }
+
         let store = self
             .store
             .as_ref()

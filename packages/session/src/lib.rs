@@ -2459,12 +2459,13 @@ impl SessionManager {
                     .increment_counter("session.manager.projection_window.fast_path_total");
                 Ok(window)
             }
-            Err(_error) => {
+            Err(SessionError::UnsupportedProjectionWindow) => {
                 self.metrics
                     .increment_counter("session.manager.projection_window.fallback_total");
                 self.projection_window_from_recent_history(session_id, request)
                     .await
             }
+            Err(error) => Err(error),
         }?;
         Ok(projection_window)
     }
@@ -2690,12 +2691,13 @@ impl SessionManager {
                     .increment_counter("session.manager.attach_projection_window.fast_path_total");
                 window
             }
-            Err(_error) => {
+            Err(SessionError::UnsupportedProjectionWindow) => {
                 self.metrics
                     .increment_counter("session.manager.attach_projection_window.fallback_total");
                 self.projection_window_from_recent_history(session_id, request)
                     .await?
             }
+            Err(error) => return Err(error),
         };
         self.metrics.record_histogram(
             "session.manager.attach_projection_window.projection_query_duration_ms",
