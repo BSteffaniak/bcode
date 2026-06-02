@@ -106,9 +106,26 @@ pub async fn attach_session_event_stream_with_limit(
     limit: usize,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
-    let attached = connection
+    let attached = match connection
         .attach_session_recent_with_input_history(session_id, limit)
-        .await?;
+        .await
+    {
+        Ok(attached) => attached,
+        Err(bcode_client::ClientError::Server { code, message: _ })
+            if code == "legacy_migration_required" =>
+        {
+            return Err(TuiError::LegacyMigrationRequired(session_id));
+        }
+        Err(bcode_client::ClientError::Server { code, message })
+            if code == "projection_stale" || code == "session_repair_required" =>
+        {
+            return Err(TuiError::SessionUnavailable {
+                session_id,
+                reason: message,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
     let event_task = spawn_reconnecting_recent_event_stream(
         client.clone(),
         session_id,
@@ -127,9 +144,26 @@ pub async fn attach_session_event_stream_with_window_request(
     request: ProjectionWindowRequest,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
-    let attached = connection
+    let attached = match connection
         .attach_session_projection_window_with_input_history(session_id, request.clone())
-        .await?;
+        .await
+    {
+        Ok(attached) => attached,
+        Err(bcode_client::ClientError::Server { code, message: _ })
+            if code == "legacy_migration_required" =>
+        {
+            return Err(TuiError::LegacyMigrationRequired(session_id));
+        }
+        Err(bcode_client::ClientError::Server { code, message })
+            if code == "projection_stale" || code == "session_repair_required" =>
+        {
+            return Err(TuiError::SessionUnavailable {
+                session_id,
+                reason: message,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
     let event_task = spawn_reconnecting_window_event_stream(
         client.clone(),
         session_id,

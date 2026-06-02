@@ -95,6 +95,15 @@ pub enum TuiError {
     /// Task join error.
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+    /// Session requires explicit legacy-to-DB migration before it can be opened.
+    #[error("session requires explicit DB migration before opening: {0}")]
+    LegacyMigrationRequired(SessionId),
+    /// Session storage is unavailable for normal runtime access.
+    #[error("session unavailable: {session_id}: {reason}")]
+    SessionUnavailable {
+        session_id: SessionId,
+        reason: String,
+    },
     /// Session selection was canceled.
     #[error("session selection canceled")]
     Canceled,

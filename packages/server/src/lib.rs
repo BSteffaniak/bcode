@@ -30,7 +30,7 @@ use bcode_model::{
     OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent,
     ReasoningEffort, StartTurnResponse, TokenUsage,
 };
-use bcode_session::{CatalogLoadStatus, SessionManager};
+use bcode_session::{CatalogLoadStatus, SessionHealth, SessionManager};
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
     RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionTokenUsage,
@@ -2283,6 +2283,35 @@ async fn send_incompatible_active_session_response(
     .await
 }
 
+const fn session_health_error_code(health: &SessionHealth) -> Option<&'static str> {
+    match health {
+        SessionHealth::Ready => None,
+        SessionHealth::LegacyMigrationRequired => Some("legacy_migration_required"),
+        SessionHealth::ProjectionStale { .. } => Some("projection_stale"),
+        SessionHealth::RepairRequired { .. } => Some("session_repair_required"),
+        SessionHealth::NotFound => Some("session_not_found"),
+    }
+}
+
+async fn ensure_attachable_session_health(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<bool, ServerError> {
+    let health = state.sessions.session_health(session_id).await;
+    let Some(code) = session_health_error_code(&health) else {
+        return Ok(true);
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Err(ErrorResponse::new(code, format!("{health:?}"))),
+    )
+    .await?;
+    Ok(false)
+}
+
 async fn handle_attach_session(
     request_id: u64,
     client_id: ClientId,
@@ -2291,6 +2320,9 @@ async fn handle_attach_session(
     attached_session: &mut Option<SessionId>,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
+    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
+        return Ok(());
+    }
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
         .try_activate_session_namespace(session_id, client_namespace)
@@ -2359,6 +2391,20 @@ async fn handle_attach_session_recent(
     state
         .metrics
         .record_histogram("server.attach_recent.limit", usize_to_u64(limit));
+    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
+        state.metrics.record_histogram(
+            "server.attach_recent.total_duration_ms",
+            elapsed_ms(total_started_at),
+        );
+        return Ok(());
+    }
+    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
+        state.metrics.record_histogram(
+            "server.attach_projection_window.total_duration_ms",
+            elapsed_ms(total_started_at),
+        );
+        return Ok(());
+    }
     let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
