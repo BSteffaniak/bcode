@@ -216,6 +216,29 @@ impl SessionEventStore {
 
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
+            if path.is_dir()
+                && let Some(session_id) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse::<SessionId>().ok())
+            {
+                if sessions.contains_key(&session_id) {
+                    continue;
+                }
+                match self.load_db_session_state(session_id) {
+                    Ok(Some(state)) => {
+                        sessions.insert(session_id, state);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("skipping unreadable DB session {session_id}: {error}");
+                    }
+                }
+            }
+        }
+
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
                 continue;
             }
@@ -241,6 +264,45 @@ impl SessionEventStore {
         }
 
         Ok(sessions)
+    }
+
+    fn load_db_session_state(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionState>, SessionStoreError> {
+        let db_path = db::session_db_path(&self.root, session_id);
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+            runtime.block_on(async move {
+                let db = db::SessionDb::open_turso_in_root(session_id, &root)
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let activity_bounds = db
+                    .activity_bounds()
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let events = db
+                    .all_events()
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let mut state = SessionState::from_events(session_id, &events)
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                if let Some((created_at_ms, updated_at_ms)) = activity_bounds {
+                    state.summary.created_at_ms = created_at_ms;
+                    state.summary.updated_at_ms = updated_at_ms;
+                }
+                Ok(Some(state))
+            })
+        })
+        .join()
+        .map_err(|_| SessionStoreError::CatalogLoad("DB session loader panicked".to_string()))?
     }
 
     fn load_session_metadata(
@@ -1567,6 +1629,7 @@ pub struct SessionManager {
     catalog_status_tx: watch::Sender<CatalogLoadStatus>,
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
     metrics: MetricsRegistry,
+    legacy_compat_writes: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1675,11 +1738,20 @@ impl Default for SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             metrics: MetricsRegistry::default(),
+            legacy_compat_writes: false,
         }
     }
 }
 
 impl SessionManager {
+    /// Enable legacy `.events` compatibility writes for tests and migration tooling that exercise
+    /// the pre-DB store. Normal DB-backed sessions should not use this.
+    #[must_use]
+    pub const fn with_legacy_compat_writes(mut self) -> Self {
+        self.legacy_compat_writes = true;
+        self
+    }
+
     /// Create a session manager backed by an append-only event store.
     ///
     /// # Errors
@@ -1739,7 +1811,11 @@ impl SessionManager {
                     .map(|(session_id, state)| {
                         (
                             session_id,
-                            SessionHandle::new(state, Some(executor.clone())),
+                            SessionHandle::new_with_legacy_compat_writes(
+                                state,
+                                Some(executor.clone()),
+                                true,
+                            ),
                         )
                     })
                     .collect(),
@@ -1751,6 +1827,7 @@ impl SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             metrics,
+            legacy_compat_writes: false,
         }
     }
 
@@ -1780,17 +1857,25 @@ impl SessionManager {
         let load_timer = self.metrics.timer();
         if db::session_db_path(&store.root_path(), session_id).exists() {
             let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+            let activity_bounds = db.activity_bounds().await?;
             let events = db.all_events().await?;
-            let state = SessionState::from_events(session_id, &events)?;
+            let mut state = SessionState::from_events(session_id, &events)?;
+            if let Some((created_at_ms, updated_at_ms)) = activity_bounds {
+                state.summary.created_at_ms = created_at_ms;
+                state.summary.updated_at_ms = updated_at_ms;
+            }
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.load_db_session_duration_ms",
                 load_timer.elapsed_ms(),
             );
-            self.inner
-                .lock()
-                .await
-                .sessions
-                .insert(session_id, SessionHandle::new(state, Some(store.clone())));
+            self.inner.lock().await.sessions.insert(
+                session_id,
+                SessionHandle::new_with_legacy_compat_writes(
+                    state,
+                    Some(store.clone()),
+                    self.legacy_compat_writes,
+                ),
+            );
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.total_duration_ms",
                 total_timer.elapsed_ms(),
@@ -1810,10 +1895,13 @@ impl SessionManager {
         );
         let insert_timer = self.metrics.timer();
         let mut inner = self.inner.lock().await;
-        inner
-            .sessions
-            .entry(session_id)
-            .or_insert_with(|| SessionHandle::new(state, self.store.clone()));
+        inner.sessions.entry(session_id).or_insert_with(|| {
+            SessionHandle::new_with_legacy_compat_writes(
+                state,
+                self.store.clone(),
+                self.legacy_compat_writes,
+            )
+        });
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.insert_duration_ms",
             insert_timer.elapsed_ms(),
@@ -1849,6 +1937,7 @@ impl SessionManager {
         let _ = self.catalog_status_tx.send(CatalogLoadStatus::Loading);
         let registry = Arc::clone(&self.inner);
         let status = self.catalog_status_tx.clone();
+        let legacy_compat_writes = self.legacy_compat_writes;
         tokio::spawn(async move {
             let sessions = match store.load_catalog().await {
                 Ok(sessions) => sessions,
@@ -1860,10 +1949,13 @@ impl SessionManager {
             };
             let mut inner = registry.lock().await;
             for (session_id, state) in sessions {
-                inner
-                    .sessions
-                    .entry(session_id)
-                    .or_insert_with(|| SessionHandle::new(state, Some(store.clone())));
+                inner.sessions.entry(session_id).or_insert_with(|| {
+                    SessionHandle::new_with_legacy_compat_writes(
+                        state,
+                        Some(store.clone()),
+                        legacy_compat_writes,
+                    )
+                });
             }
             drop(inner);
             let _ = status.send(CatalogLoadStatus::Loaded);
@@ -2004,7 +2096,11 @@ impl SessionManager {
             access_status: SessionAccessStatus::ReadWrite,
             sender,
         };
-        let handle = SessionHandle::new(state, self.store.clone());
+        let handle = SessionHandle::new_with_legacy_compat_writes(
+            state,
+            self.store.clone(),
+            self.legacy_compat_writes,
+        );
         handle
             .append_event(
                 SessionEventKind::SessionCreated {
@@ -2216,6 +2312,14 @@ impl SessionManager {
             .ok_or(SessionError::NotFound(session_id))?;
         if let Some(store) = &self.store {
             store.delete(session_id).await?;
+            let session_db_path = db::session_db_path(&store.root_path(), session_id);
+            if let Some(session_dir) = session_db_path.parent() {
+                match std::fs::remove_dir_all(session_dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(SessionStoreError::Io(error).into()),
+                }
+            }
         }
         handle.shutdown().await?;
         Ok(session)
@@ -3114,7 +3218,7 @@ impl SessionState {
             },
             working_directory: PathBuf::new(),
             clients: BTreeSet::new(),
-            events: None,
+            events: Some(Vec::new()),
             next_sequence: 0,
             event_count: 0,
             has_user_message: false,
@@ -4547,7 +4651,9 @@ mod tests {
     #[tokio::test]
     async fn persistent_manager_ignores_corrupt_session_tail() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("test".to_string()), test_working_directory())
             .await
@@ -4567,7 +4673,9 @@ mod tests {
         file.write_all(&[1_u8])
             .expect("partial corrupt frame should append");
 
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let restored = SessionManager::persistent(&root)
+            .expect("manager should restore")
+            .with_legacy_compat_writes();
         let history = restored
             .session_history(session.id)
             .await
@@ -4622,7 +4730,9 @@ mod tests {
     #[tokio::test]
     async fn metadata_write_after_append_refreshes_transcript_projection_entries() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(
                 Some("projection stale".to_string()),
@@ -4665,7 +4775,9 @@ mod tests {
     #[tokio::test]
     async fn invisible_event_leaves_derived_manifest_stale_until_read() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(
                 Some("projection invisible".to_string()),
@@ -4750,7 +4862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_uses_db_input_history_without_legacy_event_sidecars() {
+    async fn attach_uses_db_input_history_without_creating_legacy_event_sidecars() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -4769,7 +4881,7 @@ mod tests {
             !super::SessionEventStore::new(&root)
                 .event_path(session.id)
                 .exists(),
-            "new DB-backed sessions should not write legacy .events sidecars"
+            "new DB-backed sessions should not create legacy .events sidecars"
         );
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
@@ -4828,6 +4940,10 @@ mod tests {
             .migrate_legacy_events_to_db(session_id)
             .await
             .expect("legacy events should migrate into db");
+        assert!(
+            legacy_store.event_path(session_id).exists(),
+            "migration must not delete legacy .events files"
+        );
 
         let db = db::SessionDb::open_turso_in_root(session_id, &root)
             .await
@@ -4841,7 +4957,9 @@ mod tests {
     #[tokio::test]
     async fn streaming_deltas_do_not_rewrite_transcript_index() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("streaming".to_string()), test_working_directory())
             .await
@@ -4889,7 +5007,9 @@ mod tests {
     #[tokio::test]
     async fn attach_session_projection_window_returns_selected_source_history() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(
                 Some("projection attach".to_string()),
@@ -4918,7 +5038,9 @@ mod tests {
             .await
             .expect("message should append");
 
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let restored = SessionManager::persistent(&root)
+            .expect("manager should restore")
+            .with_legacy_compat_writes();
         let attached = restored
             .attach_session_projection_window(
                 session.id,
@@ -4972,7 +5094,9 @@ mod tests {
     #[tokio::test]
     async fn projection_window_falls_back_when_index_has_no_transcript_entries() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(
                 Some("empty projection".to_string()),
@@ -5013,7 +5137,9 @@ mod tests {
     #[tokio::test]
     async fn rebuilt_index_persists_transcript_projection_entries() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(
                 Some("projection-index".to_string()),
@@ -5144,7 +5270,9 @@ mod tests {
     #[tokio::test]
     async fn restored_session_history_page_reads_from_disk_index() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("paged".to_string()), test_working_directory())
             .await
@@ -5156,7 +5284,9 @@ mod tests {
                 .expect("message should append");
         }
 
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let restored = SessionManager::persistent(&root)
+            .expect("manager should restore")
+            .with_legacy_compat_writes();
         let page = restored
             .session_history_page(
                 session.id,
@@ -5540,7 +5670,9 @@ mod tests {
     #[tokio::test]
     async fn session_doctor_is_read_only_without_fix() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("doctor".to_string()), test_working_directory())
             .await
@@ -5607,7 +5739,9 @@ mod tests {
     #[tokio::test]
     async fn lazy_catalog_includes_sessions_with_stale_indexes() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("stale catalog".to_string()), test_working_directory())
             .await
@@ -5621,7 +5755,7 @@ mod tests {
             .join(format!("{}.index.json", session.id));
         std::fs::remove_file(&index_path).expect("index should remove");
 
-        let restored = SessionManager::persistent_lazy(&root);
+        let restored = SessionManager::persistent_lazy(&root).with_legacy_compat_writes();
         restored
             .wait_catalog_loaded()
             .await
@@ -5682,7 +5816,9 @@ mod tests {
     #[tokio::test]
     async fn lazy_catalog_tolerates_bad_entry_index_first_offset() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("bad entry".to_string()), test_working_directory())
             .await
@@ -5697,7 +5833,7 @@ mod tests {
         let index_path = index::index_path(&root, session.id);
         std::fs::remove_file(&index_path).expect("metadata index should remove");
 
-        let restored = SessionManager::persistent_lazy(&root);
+        let restored = SessionManager::persistent_lazy(&root).with_legacy_compat_writes();
         restored
             .wait_catalog_loaded()
             .await
@@ -5719,7 +5855,9 @@ mod tests {
     #[tokio::test]
     async fn lazy_catalog_missing_indexes_does_not_write_partial_repair() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(
                 Some("missing indexes".to_string()),
@@ -5736,7 +5874,7 @@ mod tests {
         std::fs::remove_file(&index_path).expect("metadata index should remove");
         std::fs::remove_file(&entries_path).expect("entry index should remove");
 
-        let restored = SessionManager::persistent_lazy(&root);
+        let restored = SessionManager::persistent_lazy(&root).with_legacy_compat_writes();
         restored
             .wait_catalog_loaded()
             .await
@@ -5758,7 +5896,9 @@ mod tests {
     #[tokio::test]
     async fn persistent_restore_defers_stale_index_repair_until_explicit_reindex() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("lazy".to_string()), test_working_directory())
             .await
@@ -5772,7 +5912,9 @@ mod tests {
             .join(format!("{}.index.json", session.id));
         std::fs::remove_file(&index_path).expect("index should remove");
 
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let restored = SessionManager::persistent(&root)
+            .expect("manager should restore")
+            .with_legacy_compat_writes();
         assert!(
             !index_path.exists(),
             "persistent restore should not eagerly rewrite missing indexes"
@@ -5800,7 +5942,9 @@ mod tests {
     #[tokio::test]
     async fn session_migration_apply_rebuilds_missing_index() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("migration".to_string()), test_working_directory())
             .await
@@ -5839,7 +5983,9 @@ mod tests {
     #[tokio::test]
     async fn session_migration_apply_writes_journal_entries() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("journal".to_string()), test_working_directory())
             .await
@@ -5870,7 +6016,9 @@ mod tests {
     #[tokio::test]
     async fn session_migration_apply_can_create_backup_manifest() {
         let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let manager = SessionManager::persistent(&root)
+            .expect("manager should initialize")
+            .with_legacy_compat_writes();
         let session = manager
             .create_session(Some("backup".to_string()), test_working_directory())
             .await

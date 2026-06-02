@@ -165,8 +165,22 @@ impl SessionDb {
     /// Returns an error if event serialization, event insertion, projection updates, or commit
     /// fail.
     pub async fn append_event(&self, event: &SessionEvent) -> SessionDbResult<()> {
+        self.append_event_with_activity_timestamp(event, None).await
+    }
+
+    /// Append an event with the manager-assigned activity timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event serialization, event insertion, projection updates, or commit
+    /// fail.
+    pub async fn append_event_with_activity_timestamp(
+        &self,
+        event: &SessionEvent,
+        activity_timestamp_ms: Option<u64>,
+    ) -> SessionDbResult<()> {
         let tx = self.db.begin_transaction().await?;
-        insert_event(&*tx, event).await?;
+        insert_event(&*tx, event, activity_timestamp_ms).await?;
         project_event(&*tx, event).await?;
         update_projection_checkpoints(&*tx, event).await?;
         tx.commit().await?;
@@ -209,6 +223,27 @@ impl SessionDb {
             .await?;
 
         rows.iter().map(input_history_entry_from_row).collect()
+    }
+
+    /// Return `(created_at_ms, updated_at_ms)` from stored event activity timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event timestamp queries fail or rows are malformed.
+    pub async fn activity_bounds(&self) -> SessionDbResult<Option<(u64, u64)>> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["created_at_ms"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        let timestamps = rows
+            .iter()
+            .filter_map(|row| row.get("created_at_ms").and_then(|value| value.as_i64()))
+            .map(i64_to_u64)
+            .collect::<Vec<_>>();
+        Ok(timestamps.first().copied().zip(timestamps.last().copied()))
     }
 
     /// Return all canonical events in sequence order.
@@ -423,7 +458,11 @@ fn add_sql_migration(
     ));
 }
 
-async fn insert_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+async fn insert_event(
+    db: &dyn Database,
+    event: &SessionEvent,
+    activity_timestamp_ms: Option<u64>,
+) -> SessionDbResult<()> {
     db.insert("events")
         .value("event_seq", seq_to_value(event.sequence))
         .value("event_type", event_kind_name(&event.kind))
@@ -433,7 +472,9 @@ async fn insert_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResul
         )
         .value(
             "created_at_ms",
-            event_created_at_ms(event).map(seq_to_value),
+            activity_timestamp_ms
+                .or_else(|| event_created_at_ms(event))
+                .map(seq_to_value),
         )
         .value("payload", serde_json::to_string(event)?)
         .execute(db)
