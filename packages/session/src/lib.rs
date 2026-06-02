@@ -1032,6 +1032,26 @@ pub enum CatalogLoadStatus {
     Failed(String),
 }
 
+/// First-class session health for normal runtime and migration UX.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionHealth {
+    /// DB-backed session is ready for normal runtime access.
+    Ready,
+    /// Legacy `.events` session must be explicitly migrated before normal access.
+    LegacyMigrationRequired,
+    /// A DB read model is missing or stale.
+    ProjectionStale {
+        projection: &'static str,
+        checkpoint: Option<u64>,
+        expected: u64,
+    },
+    /// Session storage exists but cannot be safely used without repair.
+    RepairRequired { reason: String },
+    /// No DB-backed or legacy session exists for the id.
+    NotFound,
+}
+
 /// Legacy `.events` file discovered for explicit DB migration.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LegacySessionCandidate {
@@ -1391,6 +1411,59 @@ impl SessionManager {
             status.changed().await.map_err(|_| {
                 SessionStoreError::CatalogLoad("session catalog status channel closed".to_string())
             })?;
+        }
+    }
+
+    /// Return first-class health for one session without event-log replay or repair.
+    pub async fn session_health(&self, session_id: SessionId) -> SessionHealth {
+        let Some(store) = &self.store else {
+            return if self.inner.lock().await.sessions.contains_key(&session_id) {
+                SessionHealth::Ready
+            } else {
+                SessionHealth::NotFound
+            };
+        };
+        let root = store.root_path();
+        let db_path = db::session_db_path(&root, session_id);
+        if !db_path.exists() {
+            return if root.join(format!("{session_id}.events")).exists() {
+                SessionHealth::LegacyMigrationRequired
+            } else {
+                SessionHealth::NotFound
+            };
+        }
+        let db = match db::SessionDb::open_turso_in_root(session_id, &root).await {
+            Ok(db) => db,
+            Err(error) => {
+                return SessionHealth::RepairRequired {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        let expected = match db.last_event_sequence().await {
+            Ok(Some(sequence)) => sequence,
+            Ok(None) => 0,
+            Err(error) => {
+                return SessionHealth::RepairRequired {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        match db.session_state().await {
+            Ok(Some(state)) if state.last_event_seq >= expected => SessionHealth::Ready,
+            Ok(Some(state)) => SessionHealth::ProjectionStale {
+                projection: "session_state",
+                checkpoint: Some(state.last_event_seq),
+                expected,
+            },
+            Ok(None) => SessionHealth::ProjectionStale {
+                projection: "session_state",
+                checkpoint: None,
+                expected,
+            },
+            Err(error) => SessionHealth::RepairRequired {
+                reason: error.to_string(),
+            },
         }
     }
 
@@ -3158,7 +3231,9 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionAccessStatus, SessionManager, access_status_from_report, db, reader};
+    use super::{
+        SessionAccessStatus, SessionHealth, SessionManager, access_status_from_report, db, reader,
+    };
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
@@ -3898,6 +3973,48 @@ mod tests {
             panic!("started run should require attention");
         };
         assert_eq!(items[0].run_id, "run-1");
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn session_health_reports_ready_legacy_and_missing_states() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let missing_id = SessionId::new();
+        assert_eq!(
+            manager.session_health(missing_id).await,
+            SessionHealth::NotFound
+        );
+
+        let session = manager
+            .create_session(Some("healthy".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        assert_eq!(
+            manager.session_health(session.id).await,
+            SessionHealth::Ready
+        );
+
+        let legacy_id = SessionId::new();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        write_legacy_event(
+            &root.join(format!("{legacy_id}.events")),
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                session_id: legacy_id,
+                provenance: None,
+                kind: SessionEventKind::SessionCreated {
+                    name: Some("legacy".to_string()),
+                    working_directory: test_working_directory(),
+                },
+            },
+        );
+        assert_eq!(
+            manager.session_health(legacy_id).await,
+            SessionHealth::LegacyMigrationRequired
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
