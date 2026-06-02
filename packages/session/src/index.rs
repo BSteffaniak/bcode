@@ -552,7 +552,7 @@ pub fn write_index(root: &Path, index: &SessionIndex) -> Result<(), SessionStore
         fs::create_dir_all(parent)?;
     }
     let tmp_path = path.with_extension("index.json.tmp");
-    let contents = serde_json::to_vec_pretty(index).map_err(SessionStoreError::Index)?;
+    let contents = serde_json::to_vec(index).map_err(SessionStoreError::Index)?;
     fs::write(&tmp_path, contents)?;
     fs::rename(tmp_path, path)?;
     Ok(())
@@ -570,7 +570,6 @@ pub fn append_entry(
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     serde_json::to_writer(&mut file, entry).map_err(SessionStoreError::Index)?;
     file.write_all(b"\n")?;
-    file.flush()?;
     Ok(())
 }
 

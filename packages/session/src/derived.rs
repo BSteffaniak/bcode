@@ -1115,7 +1115,7 @@ fn append_input_history_entries(
         serde_json::to_writer(&mut file, entry).map_err(SessionStoreError::Index)?;
         writeln!(file).map_err(SessionStoreError::Io)?;
     }
-    file.flush().map_err(SessionStoreError::Io)
+    Ok(())
 }
 
 fn append_transcript_spans(
@@ -1135,7 +1135,7 @@ fn append_transcript_spans(
         serde_json::to_writer(&mut file, span).map_err(SessionStoreError::Index)?;
         writeln!(file).map_err(SessionStoreError::Io)?;
     }
-    file.flush().map_err(SessionStoreError::Io)
+    Ok(())
 }
 
 pub fn write_transcript_index(
@@ -1218,7 +1218,7 @@ fn persist_manifest(root: &Path, manifest: &DerivedIndexManifest) -> Result<(), 
     }
     let tmp_path = path.with_extension("json.tmp");
     let file = File::create(&tmp_path).map_err(SessionStoreError::Io)?;
-    serde_json::to_writer_pretty(file, manifest).map_err(SessionStoreError::Index)?;
+    serde_json::to_writer(file, manifest).map_err(SessionStoreError::Index)?;
     fs::rename(&tmp_path, &path).map_err(SessionStoreError::Io)
 }
 
