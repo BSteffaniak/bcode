@@ -5,8 +5,7 @@ use super::{
     spawn_blocking,
 };
 use bcode_session_models::{
-    SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionSummary,
+    SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
@@ -257,90 +256,6 @@ impl SessionStoreExecutor {
                 .metrics
                 .record_histogram("session.store.history_page.duration_ms", timer.elapsed_ms());
             result
-        })
-        .await?
-    }
-
-    #[allow(dead_code)]
-    pub async fn read_session_events_range(
-        &self,
-        session_id: SessionId,
-        start_sequence: u64,
-        end_sequence: u64,
-        max_events: usize,
-    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.store.event_range.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let timer = store.metrics.timer();
-            let result = store.read_session_events_range(
-                session_id,
-                start_sequence,
-                end_sequence,
-                max_events,
-            );
-            if let Ok(events) = &result {
-                store.metrics.record_histogram(
-                    "session.store.event_range.result_event_count",
-                    usize_to_u64(events.len()),
-                );
-            }
-            store
-                .metrics
-                .record_histogram("session.store.event_range.duration_ms", timer.elapsed_ms());
-            result
-        })
-        .await?
-    }
-
-    #[allow(dead_code)]
-    pub async fn read_session_input_history(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<SessionInputHistoryEntry>, SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.store.input_history.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let timer = store.metrics.timer();
-            let input_history = store.read_session_input_history(session_id)?;
-            store.metrics.record_histogram(
-                "session.store.input_history.entry_count",
-                usize_to_u64(input_history.len()),
-            );
-            store.metrics.record_histogram(
-                "session.store.input_history.duration_ms",
-                timer.elapsed_ms(),
-            );
-            Ok(input_history)
-        })
-        .await?
-    }
-
-    #[allow(dead_code)]
-    pub async fn read_model_context_events(
-        &self,
-        session_id: SessionId,
-    ) -> Result<(Vec<SessionEvent>, Option<SessionState>), SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.model_context_events.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let read = store.read_model_context_events(session_id)?;
-            Ok((
-                read.events,
-                read.refreshed_index.map(SessionState::from_index),
-            ))
         })
         .await?
     }
