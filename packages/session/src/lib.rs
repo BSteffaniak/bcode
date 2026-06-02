@@ -9,6 +9,7 @@
 //! Session lifecycle, attachment management, and append-only event history.
 
 mod actor;
+pub mod db;
 pub(crate) mod derived;
 pub(crate) mod event_migration;
 pub(crate) mod index;

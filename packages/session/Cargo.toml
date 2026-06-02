@@ -11,15 +11,22 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_metrics        = { workspace = true }
+bcode_metrics = { workspace = true }
 bcode_session_models = { workspace = true }
-bcode_skill_models   = { workspace = true }
-bmux_codec           = { workspace = true }
-serde                = { workspace = true, features = ["derive"] }
-serde_json           = { workspace = true }
-sha2                 = { workspace = true }
-thiserror            = { workspace = true }
-tokio                = { workspace = true, features = ["macros", "rt", "sync"] }
+bcode_skill_models = { workspace = true }
+bmux_codec = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+switchy = { workspace = true, features = [
+    "database",
+    "database-schema",
+    "database-connection",
+    "database-connection-turso",
+    "schema",
+] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [features]
 default          = []
