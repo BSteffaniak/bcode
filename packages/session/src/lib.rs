@@ -2550,6 +2550,20 @@ impl SessionManager {
         handle.input_history().await
     }
 
+    /// Return active tool runs from the DB read model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or
+    /// [`SessionError::ProjectionStale`] when the DB projection is not current.
+    pub async fn active_tool_runs(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<db::ToolRun>, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.active_tool_runs().await
+    }
+
     /// Return the model-visible session events, starting at the latest compaction when possible.
     ///
     /// # Errors

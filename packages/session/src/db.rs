@@ -67,6 +67,23 @@ pub fn session_db_path(root: &Path, session_id: SessionId) -> std::path::PathBuf
     root.join(session_id.to_string()).join("session.db")
 }
 
+/// Typed tool-run projection row stored in a per-session database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRun {
+    /// Provider/tool-call identifier.
+    pub tool_call_id: String,
+    /// Event sequence that requested the tool call.
+    pub event_seq_start: u64,
+    /// Event sequence that finished the tool call, when complete.
+    pub event_seq_end: Option<u64>,
+    /// Projection status, for example `running`, `complete`, or `error`.
+    pub status: String,
+    /// Tool name, when known.
+    pub tool_name: Option<String>,
+    /// Whether the completed tool call ended in error.
+    pub is_error: Option<bool>,
+}
+
 /// Typed session-state projection row stored in a per-session database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDbState {
@@ -274,6 +291,39 @@ impl SessionDb {
             session_id,
             db: Arc::new(db),
         })
+    }
+
+    /// Return tool-run projection rows with `running` status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails or a row is malformed.
+    pub async fn active_tool_runs(&self) -> SessionDbResult<Vec<ToolRun>> {
+        self.tool_runs_by_status("running").await
+    }
+
+    /// Return tool-run projection rows matching `status`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails or a row is malformed.
+    pub async fn tool_runs_by_status(&self, status: &str) -> SessionDbResult<Vec<ToolRun>> {
+        let rows = self
+            .db
+            .select("tool_runs")
+            .columns(&[
+                "tool_call_id",
+                "event_seq_start",
+                "event_seq_end",
+                "status",
+                "tool_name",
+                "is_error",
+            ])
+            .where_eq("status", status)
+            .sort("event_seq_start", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        rows.iter().map(tool_run_from_row).collect()
     }
 
     /// Return the current projected session state row.
@@ -1129,6 +1179,17 @@ async fn update_projection_checkpoint(
     Ok(())
 }
 
+fn tool_run_from_row(row: &switchy::database::Row) -> SessionDbResult<ToolRun> {
+    Ok(ToolRun {
+        tool_call_id: required_string(row, "tool_call_id")?,
+        event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
+        event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
+        status: required_string(row, "status")?,
+        tool_name: optional_string(row, "tool_name"),
+        is_error: optional_i64(row, "is_error").map(|value| value != 0),
+    })
+}
+
 fn session_summary_from_catalog_row(
     row: &switchy::database::Row,
 ) -> SessionDbResult<SessionSummary> {
@@ -1194,6 +1255,10 @@ fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i
         .ok_or_else(|| SessionDbError::InvalidRow {
             column: column.to_string(),
         })
+}
+
+fn optional_i64(row: &switchy::database::Row, column: &str) -> Option<i64> {
+    row.get(column).and_then(|value| value.as_i64())
 }
 
 const fn i64_to_u64(value: i64) -> u64 {
@@ -1349,6 +1414,60 @@ mod tests {
                 .expect("transcript checkpoint"),
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn active_tool_runs_reflect_running_projection_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "tool-1".to_string(),
+                tool_name: "shell".to_string(),
+                arguments_json: "{}".to_string(),
+            },
+        ))
+        .await
+        .expect("append tool request");
+
+        let active = db.active_tool_runs().await.expect("active tool runs");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].tool_call_id, "tool-1");
+        assert_eq!(active[0].tool_name.as_deref(), Some("shell"));
+        assert_eq!(active[0].status, "running");
+
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "tool-1".to_string(),
+                result: "done".to_string(),
+                is_error: false,
+                output: None,
+            },
+        ))
+        .await
+        .expect("append tool finish");
+
+        assert!(
+            db.active_tool_runs()
+                .await
+                .expect("active after finish")
+                .is_empty()
+        );
+        let completed = db
+            .tool_runs_by_status("complete")
+            .await
+            .expect("complete tool runs");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].event_seq_end, Some(1));
+        assert_eq!(completed[0].is_error, Some(false));
     }
 
     #[tokio::test]

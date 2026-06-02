@@ -193,6 +193,10 @@ impl SessionHandle {
         self.send(SessionCommand::ModelContextEvents).await?
     }
 
+    pub async fn active_tool_runs(&self) -> Result<Vec<crate::db::ToolRun>, SessionError> {
+        self.send(SessionCommand::ActiveToolRuns).await?
+    }
+
     pub async fn current_model_selection(&self) -> Result<Option<(String, String)>, SessionError> {
         self.send(SessionCommand::CurrentModelSelection).await
     }
@@ -291,6 +295,7 @@ enum SessionCommand {
     },
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
+    ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
     CurrentModelSelection(oneshot::Sender<Option<(String, String)>>),
     CurrentAgentSelection(oneshot::Sender<Option<String>>),
     SetCurrentAgent {
@@ -425,6 +430,9 @@ impl SessionActor {
             }
             SessionCommand::ModelContextEvents(reply) => {
                 let _ = reply.send(self.model_context_events().await);
+            }
+            SessionCommand::ActiveToolRuns(reply) => {
+                let _ = reply.send(self.active_tool_runs().await);
             }
             SessionCommand::CurrentModelSelection(reply) => {
                 let _ = reply.send(
@@ -916,6 +924,23 @@ impl SessionActor {
         Ok(store
             .read_session_input_history(self.state.summary.id)
             .await?)
+    }
+
+    async fn active_tool_runs(&mut self) -> Result<Vec<crate::db::ToolRun>, SessionError> {
+        let Some(db) = self.existing_session_db().await? else {
+            return Ok(Vec::new());
+        };
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+        let checkpoint = db.projection_checkpoint("tool_runs").await?;
+        if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
+            return Ok(db.active_tool_runs().await?);
+        }
+        Err(SessionError::ProjectionStale {
+            session_id: self.state.summary.id,
+            projection: "tool_runs",
+            checkpoint,
+            expected: expected_last_sequence,
+        })
     }
 
     async fn model_context_events(&mut self) -> Result<Vec<SessionEvent>, SessionError> {
