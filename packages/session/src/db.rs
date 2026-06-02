@@ -67,6 +67,29 @@ pub fn session_db_path(root: &Path, session_id: SessionId) -> std::path::PathBuf
     root.join(session_id.to_string()).join("session.db")
 }
 
+/// Typed session-state projection row stored in a per-session database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDbState {
+    /// Session id owned by this state row.
+    pub session_id: SessionId,
+    /// Last durable event sequence applied to the state projection.
+    pub last_event_seq: u64,
+    /// Current explicit/display title, if any.
+    pub title: Option<String>,
+    /// Current working directory.
+    pub working_directory: std::path::PathBuf,
+    /// Current provider selection, if any.
+    pub current_provider: Option<String>,
+    /// Current model selection, if any.
+    pub current_model: Option<String>,
+    /// Projection-updated timestamp, when known.
+    pub updated_at_ms: Option<u64>,
+    /// Whether the input-history projection has at least one user message.
+    pub has_user_message: bool,
+    /// Latest context-compaction event sequence, if any.
+    pub latest_compaction_sequence: Option<u64>,
+}
+
 /// Typed transcript projection row stored in a per-session database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptItem {
@@ -251,6 +274,81 @@ impl SessionDb {
             session_id,
             db: Arc::new(db),
         })
+    }
+
+    /// Return the current projected session state row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state query fails or the row is malformed.
+    pub async fn session_state(&self) -> SessionDbResult<Option<SessionDbState>> {
+        let Some(row) = self
+            .db
+            .select("session_state")
+            .columns(&[
+                "session_id",
+                "last_event_seq",
+                "current_model",
+                "current_provider",
+                "working_directory",
+                "title",
+                "updated_at_ms",
+            ])
+            .where_eq("session_id", self.session_id.to_string())
+            .execute_first(&**self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let row_session_id = required_string(&row, "session_id")?.parse().map_err(|_| {
+            SessionDbError::InvalidRow {
+                column: "session_id".to_string(),
+            }
+        })?;
+        let has_user_message = self.input_message_count().await? > 0;
+        let latest_compaction_sequence = self.latest_context_compaction_sequence().await?;
+        Ok(Some(SessionDbState {
+            session_id: row_session_id,
+            last_event_seq: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
+            title: optional_string(&row, "title"),
+            working_directory: std::path::PathBuf::from(required_string(
+                &row,
+                "working_directory",
+            )?),
+            current_provider: optional_string(&row, "current_provider"),
+            current_model: optional_string(&row, "current_model"),
+            updated_at_ms: row
+                .get("updated_at_ms")
+                .and_then(|value| value.as_i64())
+                .map(i64_to_u64),
+            has_user_message,
+            latest_compaction_sequence,
+        }))
+    }
+
+    async fn input_message_count(&self) -> SessionDbResult<usize> {
+        Ok(self
+            .db
+            .select("input_messages")
+            .columns(&["event_seq"])
+            .execute(&**self.db)
+            .await?
+            .len())
+    }
+
+    async fn latest_context_compaction_sequence(&self) -> SessionDbResult<Option<u64>> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["event_seq"])
+            .where_eq("event_type", "context_compacted")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
+            .transpose()
     }
 
     /// Return the session id owned by this database.

@@ -1851,6 +1851,47 @@ impl SessionManager {
         }
     }
 
+    async fn load_db_session_state(
+        &self,
+        session_id: SessionId,
+        db: &db::SessionDb,
+    ) -> Result<SessionState, SessionError> {
+        let Some(db_state) = db.session_state().await? else {
+            return Err(SessionError::ProjectionStale {
+                session_id,
+                projection: "session_state",
+                checkpoint: None,
+                expected: db.last_event_sequence().await?.unwrap_or(0),
+            });
+        };
+        let expected_last_sequence = db
+            .last_event_sequence()
+            .await?
+            .unwrap_or(db_state.last_event_seq);
+        if db_state.last_event_seq < expected_last_sequence {
+            return Err(SessionError::ProjectionStale {
+                session_id,
+                projection: "session_state",
+                checkpoint: Some(db_state.last_event_seq),
+                expected: expected_last_sequence,
+            });
+        }
+        let activity_bounds = db.activity_bounds().await?;
+        let created_at_ms = activity_bounds
+            .map(|(created_at_ms, _)| created_at_ms)
+            .or(db_state.updated_at_ms)
+            .unwrap_or_else(current_unix_millis);
+        let updated_at_ms = db_state
+            .updated_at_ms
+            .or_else(|| activity_bounds.map(|(_, updated_at_ms)| updated_at_ms))
+            .unwrap_or(created_at_ms);
+        Ok(SessionState::from_db_state(
+            db_state,
+            created_at_ms,
+            updated_at_ms,
+        ))
+    }
+
     async fn session_handle(&self, session_id: SessionId) -> Result<SessionHandle, SessionError> {
         self.ensure_session_loaded(session_id).await?;
         self.inner
@@ -1871,13 +1912,7 @@ impl SessionManager {
                 && db::session_db_path(&store.root_path(), session_id).exists()
             {
                 let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-                let activity_bounds = db.activity_bounds().await?;
-                let events = db.all_events().await?;
-                let mut state = SessionState::from_events(session_id, &events)?;
-                if let Some((created_at_ms, updated_at_ms)) = activity_bounds {
-                    state.summary.created_at_ms = created_at_ms;
-                    state.summary.updated_at_ms = updated_at_ms;
-                }
+                let state = self.load_db_session_state(session_id, &db).await?;
                 handle.replace_state(state).await?;
             }
             self.metrics.record_histogram(
@@ -1892,13 +1927,7 @@ impl SessionManager {
         let load_timer = self.metrics.timer();
         if db::session_db_path(&store.root_path(), session_id).exists() {
             let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-            let activity_bounds = db.activity_bounds().await?;
-            let events = db.all_events().await?;
-            let mut state = SessionState::from_events(session_id, &events)?;
-            if let Some((created_at_ms, updated_at_ms)) = activity_bounds {
-                state.summary.created_at_ms = created_at_ms;
-                state.summary.updated_at_ms = updated_at_ms;
-            }
+            let state = self.load_db_session_state(session_id, &db).await?;
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.load_db_session_duration_ms",
                 load_timer.elapsed_ms(),
@@ -3249,6 +3278,50 @@ impl SessionState {
             total_metered_tokens: 0,
             index_issues: Vec::new(),
             index_status: SessionIndexStatusKind::Stale,
+            access_status: SessionAccessStatus::ReadWrite,
+            sender,
+        }
+    }
+
+    pub(crate) fn from_db_state(
+        state: db::SessionDbState,
+        created_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Self {
+        let (sender, _) = broadcast::channel(512);
+        let working_directory = normalize_working_directory(&state.working_directory);
+        let title_source = if state.title.is_some() {
+            SessionTitleSource::Explicit
+        } else {
+            SessionTitleSource::EmptyDraft
+        };
+        Self {
+            summary: SessionSummary {
+                id: state.session_id,
+                name: state.title.clone(),
+                explicit_name: state.title,
+                derived_title: None,
+                title_source,
+                client_count: 0,
+                created_at_ms,
+                updated_at_ms,
+                working_directory: working_directory.clone(),
+                import: None,
+            },
+            working_directory,
+            clients: BTreeSet::new(),
+            events: None,
+            next_sequence: state.last_event_seq.saturating_add(1),
+            event_count: usize::try_from(state.last_event_seq.saturating_add(1))
+                .unwrap_or(usize::MAX),
+            has_user_message: state.has_user_message,
+            current_provider: state.current_provider,
+            current_model: state.current_model,
+            current_agent: None,
+            latest_compaction_sequence: state.latest_compaction_sequence,
+            total_metered_tokens: 0,
+            index_issues: Vec::new(),
+            index_status: SessionIndexStatusKind::Current,
             access_status: SessionAccessStatus::ReadWrite,
             sender,
         }
