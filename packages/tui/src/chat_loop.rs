@@ -441,8 +441,11 @@ async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
         chat.app.set_status(format!("agent set to {agent_name}"));
         return;
     };
-    match client.set_session_agent(session_id, agent_id).await {
-        Ok(()) => chat.app.set_status(format!("agent set to {agent_name}")),
+    match client.set_session_agent(session_id, agent_id.clone()).await {
+        Ok(()) => {
+            chat.app.set_current_agent_id(agent_id);
+            chat.app.set_status(format!("agent set to {agent_name}"));
+        }
         Err(error) => chat.app.set_status(format!("agent switch failed: {error}")),
     }
 }

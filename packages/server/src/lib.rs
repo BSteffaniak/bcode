@@ -3475,16 +3475,15 @@ async fn handle_set_session_agent(
     };
     match state
         .sessions
-        .append_agent_changed(session_id, resolved_agent_id.clone())
+        .set_current_agent(session_id, resolved_agent_id.clone())
         .await
     {
-        Ok(event) => {
+        Ok(()) => {
             state
                 .session_agent_selections
                 .lock()
                 .await
                 .insert(session_id, resolved_agent_id);
-            publish_session_event(state, &event).await;
             send_response(
                 writer,
                 request_id,

@@ -457,15 +457,6 @@ async fn handle_agent_command(
         command.to_owned()
     };
 
-    if let Some(session_id) = session_id {
-        client
-            .set_session_agent(session_id, agent_id.clone())
-            .await?;
-        return Ok(SlashCommandOutcome::Handled(format!(
-            "agent set to {agent_id}"
-        )));
-    }
-
     let agents = client.list_agents().await?;
     let Some(agent) = agents
         .iter()
@@ -475,6 +466,13 @@ async fn handle_agent_command(
             "unknown agent profile: {agent_id}"
         )));
     };
+
+    if let Some(session_id) = session_id {
+        client
+            .set_session_agent(session_id, agent.id.clone())
+            .await?;
+    }
+
     Ok(SlashCommandOutcome::DraftAgentSelected {
         agent_id: agent.id.clone(),
         agent_name: agent.name.clone(),

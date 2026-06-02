@@ -200,6 +200,11 @@ impl SessionHandle {
         self.send(SessionCommand::CurrentAgentSelection).await
     }
 
+    pub async fn set_current_agent(&self, agent_id: String) -> Result<(), SessionError> {
+        self.send(|reply| SessionCommand::SetCurrentAgent { agent_id, reply })
+            .await?
+    }
+
     pub async fn publish_transient_event(
         &self,
         kind: SessionEventKind,
@@ -287,6 +292,10 @@ enum SessionCommand {
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     CurrentModelSelection(oneshot::Sender<Option<(String, String)>>),
     CurrentAgentSelection(oneshot::Sender<Option<String>>),
+    SetCurrentAgent {
+        agent_id: String,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
     PublishTransient {
         kind: SessionEventKind,
         reply: oneshot::Sender<Option<SessionEvent>>,
@@ -425,6 +434,9 @@ impl SessionActor {
             }
             SessionCommand::CurrentAgentSelection(reply) => {
                 let _ = reply.send(self.state.current_agent.clone());
+            }
+            SessionCommand::SetCurrentAgent { agent_id, reply } => {
+                let _ = reply.send(self.set_current_agent(agent_id));
             }
             SessionCommand::PublishTransient { kind, reply } => {
                 let _ = reply.send(self.publish_transient_event(kind));
@@ -810,6 +822,13 @@ impl SessionActor {
             self.refresh_snapshot();
         }
         Ok(events)
+    }
+
+    fn set_current_agent(&mut self, agent_id: String) -> Result<(), SessionError> {
+        self.state.ensure_writable()?;
+        self.state.current_agent = Some(agent_id);
+        self.refresh_snapshot();
+        Ok(())
     }
 
     fn publish_transient_event(&self, kind: SessionEventKind) -> Option<SessionEvent> {

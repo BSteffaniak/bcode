@@ -2847,6 +2847,20 @@ impl SessionManager {
             .await
     }
 
+    /// Set the current in-memory agent selection for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or is not writable.
+    pub async fn set_current_agent(
+        &self,
+        session_id: SessionId,
+        agent_id: String,
+    ) -> Result<(), SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.set_current_agent(agent_id).await
+    }
+
     /// Append a model-turn-started event to a session.
     ///
     /// # Errors

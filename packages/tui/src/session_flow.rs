@@ -289,7 +289,10 @@ pub async fn persist_draft_session<W: Write>(
     let draft_agent_id = chat.app.current_agent_id().to_owned();
     let session = client.create_session(None).await?;
     if draft_agent_id != "build" {
-        client.set_session_agent(session.id, draft_agent_id).await?;
+        client
+            .set_session_agent(session.id, draft_agent_id.clone())
+            .await?;
+        chat.app.set_current_agent_id(draft_agent_id);
     }
     let (attached, event_task) =
         history_flow::attach_session_event_stream(client, session.id, chat.event_sender.clone())
