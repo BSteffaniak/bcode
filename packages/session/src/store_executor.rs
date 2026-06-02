@@ -1,9 +1,6 @@
 //! Async adapter for blocking session store operations.
 
-use super::{
-    SessionEventStore, SessionMigrationReport, SessionState, SessionStoreError, index,
-    spawn_blocking,
-};
+use super::{SessionEventStore, SessionState, SessionStoreError, index, spawn_blocking};
 use bcode_session_models::{SessionEvent, SessionId, SessionSummary};
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
@@ -66,28 +63,6 @@ impl SessionStoreExecutor {
         spawn_blocking(move || store.load_catalog()).await?
     }
 
-    pub async fn migrate_event_log_to_current(
-        &self,
-        session_id: SessionId,
-    ) -> Result<SessionMigrationReport, SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.store.migrate_event_log.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let timer = store.metrics.timer();
-            let result = store.migrate_event_log_to_current(session_id);
-            store.metrics.record_histogram(
-                "session.store.migrate_event_log.duration_ms",
-                timer.elapsed_ms(),
-            );
-            result
-        })
-        .await?
-    }
-
     pub async fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let store = self.store.clone();
         spawn_blocking(move || store.delete(session_id)).await?
@@ -129,6 +104,34 @@ impl SessionStoreExecutor {
             let result = store.write_metadata_index(&metadata);
             store.metrics.record_histogram(
                 "session.store.write_metadata_index.duration_ms",
+                timer.elapsed_ms(),
+            );
+            result
+        })
+        .await?
+    }
+
+    pub async fn read_events_migrated_to_current_for_db_import(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let queued_at = Instant::now();
+        let store = self.store.clone();
+        spawn_blocking(move || {
+            store.metrics.record_histogram(
+                "session.store.read_events_migrated_for_db_import.blocking_queue_wait_duration_ms",
+                elapsed_ms(queued_at),
+            );
+            let timer = store.metrics.timer();
+            let result = store.read_events_migrated_to_current_for_db_import(session_id);
+            if let Ok(events) = &result {
+                store.metrics.record_histogram(
+                    "session.store.read_events_migrated_for_db_import.event_count",
+                    usize_to_u64(events.len()),
+                );
+            }
+            store.metrics.record_histogram(
+                "session.store.read_events_migrated_for_db_import.duration_ms",
                 timer.elapsed_ms(),
             );
             result

@@ -129,6 +129,33 @@ where
 }
 
 impl SessionEventStore {
+    /// Read legacy events and migrate them in memory for one-time DB import.
+    ///
+    /// This does not rewrite the canonical `.events` file or rebuild legacy sidecar indexes. The
+    /// DB import path only needs a decoded, current-schema event stream; DB events and read models
+    /// are populated by appending the returned events to the session DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log cannot be read, has blocking read issues, contains future-schema
+    /// events, or cannot be migrated to the current event schema.
+    pub fn read_events_migrated_to_current_for_db_import(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
+        let path = self.event_path(session_id);
+        let report = reader::read_events(&path)?;
+        if report.issues.iter().any(read_issue_blocks_access) {
+            return Err(SessionStoreError::InvalidSessionId(format!(
+                "session {session_id} has blocking read issues and must be repaired before DB import"
+            )));
+        }
+        if report.events.is_empty() {
+            return Ok(Vec::new());
+        }
+        migrate_events_to_current_schema(session_id, report.events)
+    }
+
     /// Rewrite every older event in a canonical log through the built-in
     /// step-by-step event schema chain until it reaches the current schema.
     ///
@@ -401,6 +428,43 @@ impl SessionEventStore {
             }],
         })
     }
+}
+
+fn migrate_events_to_current_schema(
+    session_id: SessionId,
+    events: Vec<SessionEvent>,
+) -> Result<Vec<SessionEvent>, SessionStoreError> {
+    let steps = BUILTIN_SESSION_EVENT_MIGRATIONS
+        .iter()
+        .map(|migration| migration as &dyn SessionEventMigrationStep)
+        .collect::<Vec<_>>();
+    let steps_by_from =
+        validate_event_migration_steps(&steps, CURRENT_SESSION_EVENT_SCHEMA_VERSION)?;
+    let mut used_steps = BTreeSet::new();
+    let mut sequence_map = BTreeMap::new();
+    let mut next_sequence = 0_u64;
+    let mut migrated_events = Vec::new();
+    for event in events {
+        let source_sequence = event.sequence;
+        let events = migrate_event_to_schema(
+            event,
+            session_id,
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            &steps_by_from,
+            &mut used_steps,
+        )?;
+        for mut event in events {
+            remap_event_sequence_references(&mut event, &sequence_map);
+            event.sequence = next_sequence;
+            sequence_map.insert(source_sequence, next_sequence);
+            next_sequence = next_sequence.saturating_add(1);
+            migrated_events.push(event);
+        }
+        sequence_map
+            .entry(source_sequence)
+            .or_insert_with(|| next_sequence.saturating_sub(1));
+    }
+    Ok(migrated_events)
 }
 
 fn validate_event_migration_steps<'a>(

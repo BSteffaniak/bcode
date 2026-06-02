@@ -1552,8 +1552,9 @@ impl SessionManager {
         let db_path = db::session_db_path(&store.root_path(), session_id);
         let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
         if db.last_event_sequence().await?.is_none() {
-            store.migrate_event_log_to_current(session_id).await?;
-            let events = store.read_legacy_events_for_migration(session_id).await?;
+            let events = store
+                .read_events_migrated_to_current_for_db_import(session_id)
+                .await?;
             if events.is_empty() {
                 return Err(SessionError::NotFound(session_id));
             }
@@ -4099,6 +4100,17 @@ mod tests {
             .expect("explicit migration should populate DB");
         assert_eq!(summary.id, session_id);
         assert!(super::db::session_db_path(&root, session_id).exists());
+        assert!(!super::index::index_path(&root, session_id).exists());
+        assert!(!super::index::entries_path(&root, session_id).exists());
+
+        let legacy_history = super::SessionEventStore::new(&root)
+            .read_legacy_events_for_migration(session_id)
+            .expect("legacy event log should remain readable");
+        assert!(
+            legacy_history
+                .iter()
+                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1)
+        );
 
         let history = manager
             .session_history(session_id)
