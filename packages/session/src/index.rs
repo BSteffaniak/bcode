@@ -517,35 +517,6 @@ pub fn catalog_state_from_first_entry(
     })
 }
 
-pub fn load_index_metadata(
-    root: &Path,
-    session_id: SessionId,
-) -> Result<Option<SessionIndex>, SessionStoreError> {
-    let path = index_path(root, session_id);
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(SessionStoreError::Io(error)),
-    };
-    let version =
-        serde_json::from_str::<RawIndexVersion>(&contents).map_err(SessionStoreError::Index)?;
-    if version.index_version != SESSION_INDEX_VERSION {
-        return Ok(None);
-    }
-    if let Some(index_session_id) = version.session_id
-        && index_session_id != session_id
-    {
-        return Ok(None);
-    }
-    let index =
-        serde_json::from_str::<SessionIndex>(&contents).map_err(SessionStoreError::Index)?;
-    if index.session_id == session_id {
-        Ok(Some(index))
-    } else {
-        Ok(None)
-    }
-}
-
 pub fn write_index(root: &Path, index: &SessionIndex) -> Result<(), SessionStoreError> {
     let path = index_path(root, index.session_id);
     if let Some(parent) = path.parent() {

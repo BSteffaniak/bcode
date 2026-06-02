@@ -676,17 +676,6 @@ pub fn ensure_input_history_index(
 }
 
 /// Load a fresh transcript index.
-pub fn ensure_transcript_index(
-    root: &Path,
-    session_id: SessionId,
-    event_path: &Path,
-) -> Result<TranscriptIndex, SessionStoreError> {
-    let file = index::fingerprint(event_path)?;
-    let manifest = load_current_manifest(root, session_id, &file, DerivedIndexKind::Transcript)?;
-    let (transcript, _input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
-    Ok(transcript)
-}
-
 fn load_current_manifest(
     root: &Path,
     session_id: SessionId,

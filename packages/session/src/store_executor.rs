@@ -109,52 +109,6 @@ impl SessionStoreExecutor {
         .await?
     }
 
-    pub async fn ensure_fresh_index(
-        &self,
-        session_id: SessionId,
-    ) -> Result<index::SessionIndex, SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.store.ensure_fresh_index.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let timer = store.metrics.timer();
-            let result = store.ensure_fresh_index(session_id);
-            store.metrics.record_histogram(
-                "session.store.ensure_fresh_index.duration_ms",
-                timer.elapsed_ms(),
-            );
-            result
-        })
-        .await?
-    }
-
-    pub async fn ensure_transcript_index(
-        &self,
-        session_id: SessionId,
-    ) -> Result<crate::derived::TranscriptIndex, SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.store.ensure_transcript_index.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let timer = store.metrics.timer();
-            let event_path = store.event_path(session_id);
-            let result =
-                crate::derived::ensure_transcript_index(&store.root, session_id, &event_path);
-            store.metrics.record_histogram(
-                "session.store.ensure_transcript_index.duration_ms",
-                timer.elapsed_ms(),
-            );
-            result
-        })
-        .await?
-    }
-
     pub async fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let store = self.store.clone();
         spawn_blocking(move || store.delete(session_id)).await?
@@ -203,7 +157,7 @@ impl SessionStoreExecutor {
         .await?
     }
 
-    pub async fn read_session_events(
+    pub async fn read_legacy_events_for_migration(
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionStoreError> {
@@ -211,20 +165,21 @@ impl SessionStoreExecutor {
         let store = self.store.clone();
         spawn_blocking(move || {
             store.metrics.record_histogram(
-                "session.store.read_events.blocking_queue_wait_duration_ms",
+                "session.store.read_legacy_events_for_migration.blocking_queue_wait_duration_ms",
                 elapsed_ms(queued_at),
             );
             let timer = store.metrics.timer();
-            let result = store.read_session_events(session_id);
+            let result = store.read_legacy_events_for_migration(session_id);
             if let Ok(events) = &result {
                 store.metrics.record_histogram(
-                    "session.store.read_events.event_count",
+                    "session.store.read_legacy_events_for_migration.event_count",
                     usize_to_u64(events.len()),
                 );
             }
-            store
-                .metrics
-                .record_histogram("session.store.read_events.duration_ms", timer.elapsed_ms());
+            store.metrics.record_histogram(
+                "session.store.read_legacy_events_for_migration.duration_ms",
+                timer.elapsed_ms(),
+            );
             result
         })
         .await?

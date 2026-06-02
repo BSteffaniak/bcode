@@ -789,25 +789,10 @@ impl SessionActor {
             .ok_or(SessionError::UnsupportedProjectionWindow);
         }
 
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::UnsupportedProjectionWindow)?;
-        let index = store.ensure_fresh_index(self.state.summary.id).await?;
-        let transcript_index = store
-            .ensure_transcript_index(self.state.summary.id)
-            .await
-            .map_err(|_error| SessionError::UnsupportedProjectionWindow)?;
-        if transcript_index.spans.is_empty() {
-            return Err(SessionError::UnsupportedProjectionWindow);
+        if self.store.is_some() {
+            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
         }
-        crate::projection::projection_window_from_index_entries(
-            &transcript_index.spans,
-            Some(0),
-            index.next_sequence.checked_sub(1),
-            &request,
-        )
-        .ok_or(SessionError::UnsupportedProjectionWindow)
+        Err(SessionError::UnsupportedProjectionWindow)
     }
 
     async fn events_range(

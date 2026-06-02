@@ -5,7 +5,8 @@ use bcode_session_models::{
 };
 use std::collections::BTreeMap;
 
-pub(crate) fn projection_window_from_index_entries(
+#[cfg(test)]
+fn projection_window_from_index_entries(
     entries: &[crate::index::TranscriptProjectionIndexEntry],
     first_event_sequence: Option<u64>,
     last_event_sequence: Option<u64>,

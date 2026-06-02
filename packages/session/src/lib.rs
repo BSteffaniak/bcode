@@ -55,8 +55,6 @@ use tokio::task::spawn_blocking;
 
 const FRAME_V3_MAGIC: &[u8; 4] = b"BSE3";
 const FRAME_V3_VERSION: u16 = 3;
-const MAX_INLINE_METADATA_CATCH_UP_EVENTS: usize = 4096;
-const MAX_INLINE_METADATA_CATCH_UP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
@@ -578,114 +576,12 @@ impl SessionEventStore {
         Ok(entry)
     }
 
-    fn read_session_events(
+    fn read_legacy_events_for_migration(
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, SessionStoreError> {
         let path = self.event_path(session_id);
         Ok(reader::read_events(&path)?.events)
-    }
-
-    fn ensure_fresh_index(
-        &self,
-        session_id: SessionId,
-    ) -> Result<index::SessionIndex, SessionStoreError> {
-        let event_path = self.event_path(session_id);
-        if let Some(index) = index::load_fresh_index(&self.root, session_id, &event_path)? {
-            return Ok(index);
-        }
-        self.catch_up_metadata_index_from_entries(session_id)
-    }
-
-    fn catch_up_metadata_index_from_entries(
-        &self,
-        session_id: SessionId,
-    ) -> Result<index::SessionIndex, SessionStoreError> {
-        let event_path = self.event_path(session_id);
-        let mut index = index::load_index_metadata(&self.root, session_id)?.ok_or_else(|| {
-            SessionStoreError::InvalidSessionId(
-                "session metadata index is missing; run session repair".to_owned(),
-            )
-        })?;
-        let entries = index::read_entries(&self.root, session_id).map_err(|_error| {
-            SessionStoreError::InvalidSessionId(
-                "session entry index is missing; run session repair".to_owned(),
-            )
-        })?;
-        if entries.len() < index.event_count {
-            return Err(SessionStoreError::InvalidSessionId(
-                "session entry index is behind metadata; run session repair".to_owned(),
-            ));
-        }
-        let append_entries = entries
-            .iter()
-            .skip(index.event_count)
-            .cloned()
-            .collect::<Vec<_>>();
-        if append_entries.len() > MAX_INLINE_METADATA_CATCH_UP_EVENTS {
-            return Err(SessionStoreError::InvalidSessionId(
-                "session metadata index tail has too many events for normal access; run session repair/reindex"
-                    .to_owned(),
-            ));
-        }
-        if let (Some(first), Some(last)) = (append_entries.first(), append_entries.last()) {
-            let tail_bytes = last
-                .offset
-                .saturating_add(last.frame_len)
-                .saturating_sub(first.offset);
-            if tail_bytes > MAX_INLINE_METADATA_CATCH_UP_BYTES {
-                return Err(SessionStoreError::InvalidSessionId(
-                    "session metadata index tail is too large for normal access; run session repair/reindex"
-                        .to_owned(),
-                ));
-            }
-        }
-        if append_entries.is_empty() {
-            return Err(SessionStoreError::InvalidSessionId(
-                "session metadata index is stale but has no entry-index tail; run session repair"
-                    .to_owned(),
-            ));
-        }
-        let tail_events = read_indexed_events(&event_path, &append_entries)?;
-        let mut state = SessionState::from_index(index.clone());
-        for event in tail_events {
-            if event.sequence != state.next_sequence {
-                return Err(SessionStoreError::InvalidSessionId(
-                    "session entry index has non-contiguous metadata tail; run session repair"
-                        .to_owned(),
-                ));
-            }
-            let activity_timestamp_ms = index.file.modified_at_ms();
-            state.apply_persisted_event(event, activity_timestamp_ms);
-        }
-        let file = index::fingerprint(&event_path)?;
-        index = index::SessionIndex {
-            index_version: index::SESSION_INDEX_VERSION,
-            session_id,
-            file: file.clone(),
-            summary: state.summary(),
-            working_directory: state.working_directory,
-            next_sequence: state.next_sequence,
-            event_count: state.event_count,
-            created_at_ms: state.summary.created_at_ms,
-            updated_at_ms: file.modified_at_ms(),
-            has_user_message: state.has_user_message,
-            last_good_offset: append_entries
-                .last()
-                .map_or(index.last_good_offset, |entry| {
-                    entry.offset.saturating_add(entry.frame_len)
-                }),
-            current_provider: state.current_provider,
-            current_model: state.current_model,
-            current_agent: state.current_agent,
-            latest_compaction_sequence: state.latest_compaction_sequence,
-            total_metered_tokens: state.total_metered_tokens,
-            min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            issues: state.index_issues,
-        };
-        index::write_index(&self.root, &index)?;
-        Ok(index)
     }
 
     #[allow(dead_code)]
@@ -1254,14 +1150,6 @@ impl SessionEventStore {
     }
 }
 
-fn read_indexed_events(
-    event_path: &Path,
-    entries: &[index::SessionIndexEntry],
-) -> Result<Vec<SessionEvent>, SessionStoreError> {
-    let offsets = entries.iter().map(|entry| entry.offset).collect::<Vec<_>>();
-    reader::read_events_at_offsets(event_path, &offsets)
-}
-
 #[allow(dead_code)]
 fn select_event_range_entries(
     mut entries: Vec<index::SessionIndexEntry>,
@@ -1683,7 +1571,7 @@ impl SessionManager {
         let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
         if db.last_event_sequence().await?.is_none() {
             store.migrate_event_log_to_current(session_id).await?;
-            let events = store.read_session_events(session_id).await?;
+            let events = store.read_legacy_events_for_migration(session_id).await?;
             if events.is_empty() {
                 return Err(SessionError::NotFound(session_id));
             }
@@ -1798,7 +1686,7 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(session_id))?;
-        let events = store.read_session_events(session_id).await?;
+        let events = store.read_legacy_events_for_migration(session_id).await?;
         let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
         for event in &events {
             db.append_event(event).await?;
@@ -3445,16 +3333,13 @@ mod tests {
         assert_eq!(report.items.len(), 1);
 
         let migrated = store
-            .read_session_events(session_id)
+            .read_legacy_events_for_migration(session_id)
             .expect("migrated fixture should read");
         assert!(migrated.len() >= original.len());
         assert!(migrated.iter().all(|event| {
             event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION
                 && event.session_id == session_id
         }));
-        store
-            .ensure_fresh_index(session_id)
-            .expect("migrated fixture should reindex");
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
     }
 
@@ -3536,7 +3421,7 @@ mod tests {
             .migrate_event_log_to_current(session_id)
             .expect("migration should succeed");
         let migrated = store
-            .read_session_events(session_id)
+            .read_legacy_events_for_migration(session_id)
             .expect("migrated events should read");
 
         assert_eq!(migrated.len(), 3);
@@ -4319,7 +4204,7 @@ mod tests {
         );
         assert!(report.backup_dir.expect("backup should exist").exists());
         let history = store
-            .read_session_events(session_id)
+            .read_legacy_events_for_migration(session_id)
             .expect("history should read");
         assert_eq!(history.len(), 3);
         assert!(
