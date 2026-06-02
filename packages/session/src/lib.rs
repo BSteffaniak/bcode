@@ -214,6 +214,30 @@ impl SessionEventStore {
             return Ok(sessions);
         }
 
+        if db::global_catalog_db_path(&self.root).exists() {
+            match self.load_global_catalog_session_ids() {
+                Ok(session_ids) => {
+                    for session_id in session_ids {
+                        match self.load_db_session_state(session_id) {
+                            Ok(Some(state)) => {
+                                sessions.insert(session_id, state);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!(
+                                    "skipping unreadable catalog DB session {session_id}: {error}"
+                                );
+                            }
+                        }
+                    }
+                    return Ok(sessions);
+                }
+                Err(error) => {
+                    eprintln!("failed to load global session catalog DB: {error}");
+                }
+            }
+        }
+
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
             if path.is_dir()
@@ -264,6 +288,31 @@ impl SessionEventStore {
         }
 
         Ok(sessions)
+    }
+
+    fn load_global_catalog_session_ids(&self) -> Result<Vec<SessionId>, SessionStoreError> {
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+            runtime.block_on(async move {
+                let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let summaries = catalog
+                    .list_sessions()
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                Ok(summaries
+                    .into_iter()
+                    .map(|summary| summary.id)
+                    .collect::<Vec<_>>())
+            })
+        })
+        .join()
+        .map_err(|_| SessionStoreError::CatalogLoad("global catalog loader panicked".to_string()))?
     }
 
     fn load_db_session_state(
@@ -2282,6 +2331,8 @@ impl SessionManager {
             .remove(&session_id)
             .ok_or(SessionError::NotFound(session_id))?;
         if let Some(store) = &self.store {
+            let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
+            catalog.delete_session(session_id).await?;
             store.delete(session_id).await?;
             let session_db_path = db::session_db_path(&store.root_path(), session_id);
             if let Some(session_dir) = session_db_path.parent() {

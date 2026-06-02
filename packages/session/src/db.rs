@@ -8,7 +8,10 @@
 
 use std::{fs, path::Path, sync::Arc};
 
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry};
+use bcode_session_models::{
+    SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionSummary,
+    SessionTitleSource,
+};
 use switchy::{
     database::{
         Database, DatabaseError, DatabaseValue,
@@ -51,6 +54,12 @@ pub enum SessionDbError {
 /// Result type for session DB operations.
 pub type SessionDbResult<T> = Result<T, SessionDbError>;
 
+/// Return Bcode's global catalog database path under `root`.
+#[must_use]
+pub fn global_catalog_db_path(root: &Path) -> std::path::PathBuf {
+    root.join("catalog.db")
+}
+
 /// Return Bcode's default per-session database path for `session_id`.
 #[must_use]
 pub fn session_db_path(root: &Path, session_id: SessionId) -> std::path::PathBuf {
@@ -83,6 +92,16 @@ pub struct GlobalSessionDb {
 }
 
 impl GlobalSessionDb {
+    /// Open the global session catalog database under `root` and apply cheap schema migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog DB cannot be opened or migrated.
+    pub async fn open_turso_in_root(root: &Path) -> SessionDbResult<Self> {
+        let path = global_catalog_db_path(root);
+        Self::open_turso(&path).await
+    }
+
     /// Open the global session catalog database at `path` and apply cheap schema migrations.
     ///
     /// # Errors
@@ -95,6 +114,93 @@ impl GlobalSessionDb {
         let db = switchy::database_connection::init_turso_local(Some(path)).await?;
         run_global_migrations(&*db).await?;
         Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Upsert one session catalog row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog write fails.
+    pub async fn upsert_session(
+        &self,
+        summary: &SessionSummary,
+        db_path: &Path,
+    ) -> SessionDbResult<()> {
+        let existing = self
+            .db
+            .select("sessions")
+            .columns(&["session_id"])
+            .where_eq("session_id", summary.id.to_string())
+            .execute_first(&**self.db)
+            .await?;
+        let title = summary.name.clone();
+        let working_directory = summary.working_directory.to_string_lossy().to_string();
+        let db_path = db_path.to_string_lossy().to_string();
+        if existing.is_some() {
+            self.db
+                .update("sessions")
+                .value("db_path", db_path)
+                .value("title", title)
+                .value("working_directory", working_directory)
+                .value("created_at_ms", seq_to_value(summary.created_at_ms))
+                .value("updated_at_ms", seq_to_value(summary.updated_at_ms))
+                .value("state", "active")
+                .value("projection_status", "fresh")
+                .where_eq("session_id", summary.id.to_string())
+                .execute(&**self.db)
+                .await?;
+        } else {
+            self.db
+                .insert("sessions")
+                .value("session_id", summary.id.to_string())
+                .value("db_path", db_path)
+                .value("title", title)
+                .value("working_directory", working_directory)
+                .value("created_at_ms", seq_to_value(summary.created_at_ms))
+                .value("updated_at_ms", seq_to_value(summary.updated_at_ms))
+                .value("state", "active")
+                .value("projection_status", "fresh")
+                .execute(&**self.db)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Remove a session catalog row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete_session(&self, session_id: SessionId) -> SessionDbResult<()> {
+        self.db
+            .delete("sessions")
+            .where_eq("session_id", session_id.to_string())
+            .execute(&**self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Read all global catalog session rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or row conversion fails.
+    pub async fn list_sessions(&self) -> SessionDbResult<Vec<SessionSummary>> {
+        self.db
+            .select("sessions")
+            .columns(&[
+                "session_id",
+                "title",
+                "working_directory",
+                "created_at_ms",
+                "updated_at_ms",
+            ])
+            .sort("updated_at_ms", SortDirection::Desc)
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(session_summary_from_catalog_row)
+            .collect()
     }
 
     /// Return the underlying database trait object.
@@ -735,6 +841,31 @@ async fn update_projection_checkpoint(
     }
 
     Ok(())
+}
+
+fn session_summary_from_catalog_row(
+    row: &switchy::database::Row,
+) -> SessionDbResult<SessionSummary> {
+    let session_id =
+        required_string(row, "session_id")?
+            .parse()
+            .map_err(|_| SessionDbError::InvalidRow {
+                column: "session_id".to_string(),
+            })?;
+    let working_directory = std::path::PathBuf::from(required_string(row, "working_directory")?);
+    let name = optional_string(row, "title");
+    Ok(SessionSummary {
+        id: session_id,
+        name: name.clone(),
+        explicit_name: name,
+        derived_title: None,
+        title_source: SessionTitleSource::Explicit,
+        client_count: 0,
+        created_at_ms: required_i64(row, "created_at_ms").map(i64_to_u64)?,
+        updated_at_ms: required_i64(row, "updated_at_ms").map(i64_to_u64)?,
+        working_directory,
+        import: None,
+    })
 }
 
 fn transcript_item_from_row(row: &switchy::database::Row) -> SessionDbResult<TranscriptItem> {

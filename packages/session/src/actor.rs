@@ -516,6 +516,16 @@ impl SessionActor {
         }
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
+        if let Some(store) = &self.store {
+            let catalog =
+                crate::db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
+            catalog
+                .upsert_session(
+                    &self.state.summary(),
+                    &crate::db::session_db_path(&store.root_path(), self.state.summary.id),
+                )
+                .await?;
+        }
         self.state.index_status = SessionIndexStatusKind::Current;
         self.refresh_snapshot();
         Ok(event)
