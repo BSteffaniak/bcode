@@ -76,6 +76,15 @@ pub enum SessionError {
         session_id: SessionId,
         status: SessionAccessStatus,
     },
+    #[error(
+        "session DB projection is stale: {session_id} {projection} checkpoint={checkpoint:?} expected={expected}"
+    )]
+    ProjectionStale {
+        session_id: SessionId,
+        projection: &'static str,
+        checkpoint: Option<u64>,
+        expected: u64,
+    },
     /// Session database error: {0}
     #[error("session database error: {0}")]
     Db(#[from] db::SessionDbError),

@@ -468,13 +468,29 @@ impl SessionActor {
             .expect("session snapshot lock poisoned") = SessionSnapshot::from_state(&self.state);
     }
 
-    async fn session_db(&mut self) -> Result<Option<SessionDb>, SessionError> {
+    async fn session_db_for_write(&mut self) -> Result<SessionDb, SessionError> {
+        if let Some(db) = &self.db {
+            return Ok(db.clone());
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(self.state.summary.id))?;
+        let db = SessionDb::open_turso_in_root(self.state.summary.id, &store.root_path()).await?;
+        self.db = Some(db.clone());
+        Ok(db)
+    }
+
+    async fn existing_session_db(&mut self) -> Result<Option<SessionDb>, SessionError> {
         if self.db.is_some() {
             return Ok(self.db.clone());
         }
         let Some(store) = &self.store else {
             return Ok(None);
         };
+        if !crate::db::session_db_path(&store.root_path(), self.state.summary.id).exists() {
+            return Ok(None);
+        }
         let db = SessionDb::open_turso_in_root(self.state.summary.id, &store.root_path()).await?;
         self.db = Some(db.clone());
         Ok(Some(db))
@@ -488,6 +504,17 @@ impl SessionActor {
     ) -> Result<SessionEvent, SessionError> {
         let mut event = self.state.build_next_event(kind)?;
         event.provenance = provenance;
+        if self.store.is_some() {
+            let db = self.session_db_for_write().await?;
+            let db_append_started_at = Instant::now();
+            db.append_event(&event).await?;
+            if let Some(store) = &self.store {
+                store.metrics().record_histogram(
+                    "session.actor.append_event.db_append_duration_ms",
+                    elapsed_ms(db_append_started_at),
+                );
+            }
+        }
         if let Some(store) = &self.store {
             let append_started_at = Instant::now();
             store.append_event_frame(event.clone()).await?;
@@ -495,21 +522,6 @@ impl SessionActor {
                 "session.actor.append_event.append_frame_duration_ms",
                 elapsed_ms(append_started_at),
             );
-        }
-        if let Some(db) = self.session_db().await? {
-            let db_append_started_at = Instant::now();
-            if let Err(error) = db.append_event(&event).await {
-                eprintln!(
-                    "failed to mirror session event {}:{} into session database: {error}",
-                    event.session_id, event.sequence
-                );
-            }
-            if let Some(store) = &self.store {
-                store.metrics().record_histogram(
-                    "session.actor.append_event.db_append_duration_ms",
-                    elapsed_ms(db_append_started_at),
-                );
-            }
         }
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
@@ -830,32 +842,23 @@ impl SessionActor {
         &mut self,
         limit: usize,
     ) -> Result<Option<Vec<SessionEvent>>, SessionError> {
-        let Some(db) = self.session_db().await? else {
+        let Some(db) = self.existing_session_db().await? else {
             return Ok(None);
         };
         let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-        match db.projection_checkpoint("transcript").await {
-            Ok(Some(checkpoint)) if checkpoint >= expected_last_sequence => {}
-            Ok(_) => return Ok(None),
-            Err(error) => {
-                eprintln!(
-                    "failed to read session transcript checkpoint for {}: {error}",
-                    self.state.summary.id
-                );
-                return Ok(None);
+        match db.projection_checkpoint("transcript").await? {
+            Some(checkpoint) if checkpoint >= expected_last_sequence => {}
+            checkpoint => {
+                return Err(SessionError::ProjectionStale {
+                    session_id: self.state.summary.id,
+                    projection: "transcript",
+                    checkpoint,
+                    expected: expected_last_sequence,
+                });
             }
         }
 
-        let transcript_items = match db.latest_transcript_items(limit).await {
-            Ok(items) => items,
-            Err(error) => {
-                eprintln!(
-                    "failed to read session transcript projection for {}: {error}",
-                    self.state.summary.id
-                );
-                return Ok(None);
-            }
-        };
+        let transcript_items = db.latest_transcript_items(limit).await?;
         if transcript_items.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -873,44 +876,25 @@ impl SessionActor {
         let max_events =
             usize::try_from(end_sequence.saturating_sub(start_sequence) + 1).unwrap_or(usize::MAX);
 
-        match db
-            .events_range(start_sequence, end_sequence, max_events)
-            .await
-        {
-            Ok(events) => Ok(Some(events)),
-            Err(error) => {
-                eprintln!(
-                    "failed to read recent session events from database for {}: {error}",
-                    self.state.summary.id
-                );
-                Ok(None)
-            }
-        }
+        Ok(Some(
+            db.events_range(start_sequence, end_sequence, max_events)
+                .await?,
+        ))
     }
 
     async fn input_history(&mut self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
-        if let Some(db) = self.session_db().await? {
+        if let Some(db) = self.existing_session_db().await? {
             let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-            match db.projection_checkpoint("input_history").await {
-                Ok(Some(checkpoint)) if checkpoint >= expected_last_sequence => {
-                    match db.input_history().await {
-                        Ok(input_history) => return Ok(input_history),
-                        Err(error) => {
-                            eprintln!(
-                                "failed to read session input history from database for {}: {error}",
-                                self.state.summary.id
-                            );
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!(
-                        "failed to read session input history checkpoint for {}: {error}",
-                        self.state.summary.id
-                    );
-                }
+            let checkpoint = db.projection_checkpoint("input_history").await?;
+            if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
+                return Ok(db.input_history().await?);
             }
+            return Err(SessionError::ProjectionStale {
+                session_id: self.state.summary.id,
+                projection: "input_history",
+                checkpoint,
+                expected: expected_last_sequence,
+            });
         }
         if let Some(events) = &self.state.events {
             return Ok(input_history_from_events(events));
