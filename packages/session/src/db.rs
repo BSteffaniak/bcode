@@ -973,6 +973,22 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
                 .value("text", text.clone())
                 .execute(db)
                 .await?;
+            if db
+                .select("session_state")
+                .columns(&["title"])
+                .where_eq("session_id", event.session_id.to_string())
+                .execute_first(db)
+                .await?
+                .as_ref()
+                .and_then(|row| optional_string(row, "title"))
+                .is_none()
+            {
+                db.update("session_state")
+                    .value("title", crate::title_from_first_prompt(text))
+                    .where_eq("session_id", event.session_id.to_string())
+                    .execute(db)
+                    .await?;
+            }
             insert_transcript_item(db, event, "user", "message", "complete", Some(text.clone()))
                 .await?;
         }

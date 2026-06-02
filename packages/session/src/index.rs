@@ -1,12 +1,12 @@
+use crate::SessionStoreError;
 use crate::reader::{SessionReadIssue, SessionReadIssueKind, SessionReadReport};
-use crate::{SessionState, SessionStoreError};
 use bcode_session_models::{
     ProjectionSourceRange, SessionEvent, SessionEventKind, SessionId, SessionImportSummary,
     SessionSummary, SessionTitleSource, TranscriptProjectionItemKind,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -310,10 +310,6 @@ impl SessionIndex {
         Some(index)
     }
 
-    pub(crate) fn into_state(self) -> SessionState {
-        SessionState::from_index(self)
-    }
-
     pub const fn health(
         &self,
         stale: bool,
@@ -448,75 +444,6 @@ pub fn inspect_index(
     }
 }
 
-pub fn catalog_state_from_first_entry(
-    session_id: SessionId,
-    file: &EventFileFingerprint,
-    entries: &[SessionIndexEntry],
-    first_event: &SessionEvent,
-) -> Option<SessionState> {
-    let mut builder = SessionIndexBuilder::default();
-    builder.apply_event(first_event);
-    let working_directory = builder.working_directory.clone()?;
-    let explicit_name = builder.name.clone();
-    let derived_title = if builder.import.is_some()
-        && builder.name.is_none()
-        && builder.first_user_message.is_some()
-    {
-        builder.first_user_message.clone()
-    } else {
-        (!builder.suppress_derived_name)
-            .then(|| {
-                builder
-                    .first_user_message
-                    .as_deref()
-                    .map(crate::title_from_first_prompt)
-            })
-            .flatten()
-    };
-    let name = explicit_name.clone().or_else(|| derived_title.clone());
-    let title_source = if explicit_name.is_some() {
-        SessionTitleSource::Explicit
-    } else if derived_title.is_some() && builder.import.is_some() && !builder.has_user_message {
-        SessionTitleSource::Imported
-    } else if derived_title.is_some() {
-        SessionTitleSource::FirstUserMessage
-    } else {
-        SessionTitleSource::EmptyDraft
-    };
-    let summary = SessionSummary {
-        id: session_id,
-        name,
-        explicit_name,
-        derived_title,
-        title_source,
-        client_count: 0,
-        created_at_ms: file.created_at_ms(),
-        updated_at_ms: file.modified_at_ms(),
-        working_directory: working_directory.clone(),
-        import: builder.import,
-    };
-    Some(SessionState {
-        summary,
-        working_directory,
-        clients: std::collections::BTreeSet::new(),
-        events: None,
-        next_sequence: entries
-            .last()
-            .map_or(0, |entry| entry.sequence.saturating_add(1)),
-        event_count: entries.len(),
-        has_user_message: entries.iter().any(|entry| entry.kind == "user_message"),
-        current_provider: None,
-        current_model: None,
-        current_agent: None,
-        latest_compaction_sequence: None,
-        total_metered_tokens: 0,
-        index_issues: Vec::new(),
-        index_status: crate::SessionIndexStatusKind::Stale,
-        access_status: crate::SessionAccessStatus::ReadWrite,
-        sender: tokio::sync::broadcast::channel(512).0,
-    })
-}
-
 pub fn write_index(root: &Path, index: &SessionIndex) -> Result<(), SessionStoreError> {
     let path = index_path(root, index.session_id);
     if let Some(parent) = path.parent() {
@@ -542,28 +469,6 @@ pub fn append_entry(
     serde_json::to_writer(&mut file, entry).map_err(SessionStoreError::Index)?;
     file.write_all(b"\n")?;
     Ok(())
-}
-
-pub fn read_entries(
-    root: &Path,
-    session_id: SessionId,
-) -> Result<Vec<SessionIndexEntry>, SessionStoreError> {
-    let path = entries_path(root, session_id);
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry =
-            serde_json::from_str::<SessionIndexEntry>(&line).map_err(SessionStoreError::Index)?;
-        if entry.entry_index_version == SESSION_ENTRY_INDEX_VERSION {
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
 }
 
 pub fn write_entries(

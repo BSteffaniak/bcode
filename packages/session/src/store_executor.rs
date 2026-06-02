@@ -66,27 +66,6 @@ impl SessionStoreExecutor {
         spawn_blocking(move || store.load_catalog()).await?
     }
 
-    pub async fn load_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionState>, SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.store.load_session.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let timer = store.metrics.timer();
-            let result = store.load_session(session_id);
-            store
-                .metrics
-                .record_histogram("session.store.load_session.duration_ms", timer.elapsed_ms());
-            result
-        })
-        .await?
-    }
-
     pub async fn migrate_event_log_to_current(
         &self,
         session_id: SessionId,

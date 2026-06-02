@@ -243,35 +243,6 @@ impl SessionEventStore {
             }
         }
 
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
-                continue;
-            }
-            let session_id = match parse_session_file_name(&path) {
-                Ok(session_id) => session_id,
-                Err(error) => {
-                    eprintln!(
-                        "skipping unreadable session event file {}: {error}",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-            if db::session_db_path(&self.root, session_id).exists() {
-                continue;
-            }
-            match self.load_session_metadata(session_id, &path) {
-                Ok(Some(state)) => {
-                    sessions.insert(session_id, state);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("skipping unreadable session {session_id}: {error}");
-                }
-            }
-        }
-
         Ok(sessions)
     }
 
@@ -333,146 +304,6 @@ impl SessionEventStore {
         })
         .join()
         .map_err(|_| SessionStoreError::CatalogLoad("DB session loader panicked".to_string()))?
-    }
-
-    fn load_session_metadata(
-        &self,
-        session_id: SessionId,
-        path: &Path,
-    ) -> Result<Option<SessionState>, SessionStoreError> {
-        if let Some(index) = index::load_fresh_index(&self.root, session_id, path)? {
-            return Ok(Some(index.into_state()));
-        }
-        let event_path = self.event_path(session_id);
-        let Ok(entries) = index::read_entries(&self.root, session_id) else {
-            return self.synthesize_initial_index_from_first_event(session_id, path);
-        };
-        let Some(first_entry) = entries.first() else {
-            return self.synthesize_initial_index_from_first_event(session_id, path);
-        };
-        if first_entry.sequence != 0
-            || first_entry.kind != "session_created"
-            || first_entry.offset != 0
-        {
-            return self.synthesize_initial_index_from_first_event(session_id, path);
-        }
-        let Some((first_event, _frame_len)) = reader::read_first_event_lenient(path)? else {
-            return Ok(None);
-        };
-        let file = index::fingerprint(&event_path)?;
-        Ok(index::catalog_state_from_first_entry(
-            session_id,
-            &file,
-            &entries,
-            &first_event,
-        ))
-    }
-
-    fn synthesize_initial_index_from_first_event(
-        &self,
-        session_id: SessionId,
-        path: &Path,
-    ) -> Result<Option<SessionState>, SessionStoreError> {
-        let Some((first_event, frame_len)) = reader::read_first_event_lenient(path)? else {
-            return Ok(None);
-        };
-        let event_path = self.event_path(session_id);
-        let file = index::fingerprint(&event_path)?;
-        let entry = index::SessionIndexEntry::from_event(&first_event, 0, frame_len);
-        if first_event.sequence != 0 || entry.kind != "session_created" {
-            return Ok(None);
-        }
-        let Some(mut state) = index::catalog_state_from_first_entry(
-            session_id,
-            &file,
-            std::slice::from_ref(&entry),
-            &first_event,
-        ) else {
-            return Ok(None);
-        };
-        let has_unindexed_tail = frame_len < file.len;
-        state.access_status = access_status_from_schema_versions(
-            Some(first_event.schema_version),
-            Some(first_event.schema_version),
-            has_unindexed_tail,
-        );
-        if !has_unindexed_tail {
-            index::write_entries(&self.root, session_id, std::slice::from_ref(&entry))?;
-            index::write_index(
-                &self.root,
-                &index::SessionIndex {
-                    index_version: index::SESSION_INDEX_VERSION,
-                    session_id,
-                    file,
-                    summary: state.summary(),
-                    working_directory: state.working_directory.clone(),
-                    next_sequence: state.next_sequence,
-                    event_count: state.event_count,
-                    created_at_ms: state.summary.created_at_ms,
-                    updated_at_ms: state.summary.updated_at_ms,
-                    has_user_message: state.has_user_message,
-                    last_good_offset: frame_len,
-                    current_provider: state.current_provider.clone(),
-                    current_model: state.current_model.clone(),
-                    current_agent: state.current_agent.clone(),
-                    latest_compaction_sequence: state.latest_compaction_sequence,
-                    total_metered_tokens: state.total_metered_tokens,
-                    min_event_schema_version: Some(first_event.schema_version),
-                    max_event_schema_version: Some(first_event.schema_version),
-                    issues: Vec::new(),
-                },
-            )?;
-        }
-        Ok(Some(state))
-    }
-
-    fn load_sessions(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
-        let mut sessions = self.load_catalog()?;
-        if !self.root.exists() {
-            return Ok(sessions);
-        }
-
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
-                continue;
-            }
-            let session_id = match parse_session_file_name(&path) {
-                Ok(session_id) => session_id,
-                Err(error) => {
-                    eprintln!(
-                        "skipping unreadable session event file {}: {error}",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-            if sessions.contains_key(&session_id) {
-                continue;
-            }
-            match self.load_session(session_id) {
-                Ok(Some(state)) => {
-                    sessions.insert(session_id, state);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("skipping unreadable session {session_id}: {error}");
-                }
-            }
-        }
-
-        Ok(sessions)
-    }
-
-    fn load_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionState>, SessionStoreError> {
-        let path = self.event_path(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        self.load_session_metadata(session_id, &path)
     }
 
     #[allow(dead_code)]
@@ -1201,6 +1032,23 @@ pub enum CatalogLoadStatus {
     Failed(String),
 }
 
+/// Legacy `.events` file discovered for explicit DB migration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LegacySessionCandidate {
+    pub session_id: SessionId,
+    pub event_path: PathBuf,
+    pub has_db: bool,
+}
+
+/// Result of explicitly migrating one legacy session candidate to DB.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LegacySessionMigrationResult {
+    pub session_id: SessionId,
+    pub migrated: bool,
+    pub summary: Option<SessionSummary>,
+    pub error: Option<String>,
+}
+
 /// Background session maintenance status.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionMaintenanceStatus {
@@ -1309,7 +1157,7 @@ impl SessionManager {
         metrics: MetricsRegistry,
     ) -> Result<Self, SessionStoreError> {
         let store = SessionEventStore::with_metrics(root, metrics);
-        let sessions = store.load_sessions()?;
+        let sessions = store.load_catalog()?;
         Ok(Self::from_store(store, sessions, true))
     }
 
@@ -1456,30 +1304,26 @@ impl SessionManager {
             );
             return Ok(());
         }
-        let Some(state) = store.load_session(session_id).await? else {
+        if store
+            .root_path()
+            .join(format!("{session_id}.events"))
+            .exists()
+        {
+            self.metrics.record_histogram(
+                "session.manager.ensure_loaded.legacy_migration_required_duration_ms",
+                load_timer.elapsed_ms(),
+            );
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.total_duration_ms",
                 total_timer.elapsed_ms(),
             );
-            return Err(SessionError::NotFound(session_id));
-        };
-        self.metrics.record_histogram(
-            "session.manager.ensure_loaded.legacy_migration_required_duration_ms",
-            load_timer.elapsed_ms(),
-        );
-        if state.index_status == SessionIndexStatusKind::Stale {
-            self.inner
-                .lock()
-                .await
-                .sessions
-                .entry(session_id)
-                .or_insert_with(|| SessionHandle::new(state, self.store.clone()));
+            return Err(SessionError::LegacyMigrationRequired(session_id));
         }
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.total_duration_ms",
             total_timer.elapsed_ms(),
         );
-        Err(SessionError::LegacyMigrationRequired(session_id))
+        Err(SessionError::NotFound(session_id))
     }
 
     /// Return the current persistent catalog discovery status.
@@ -1550,6 +1394,87 @@ impl SessionManager {
         }
     }
 
+    /// List legacy `.events` files that can be explicitly migrated into session DBs.
+    ///
+    /// This is bounded to file-name discovery only. It does not read, replay, repair, or index
+    /// event logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session root cannot be read.
+    pub async fn list_legacy_sessions_for_migration(
+        &self,
+    ) -> Result<Vec<LegacySessionCandidate>, SessionError> {
+        let Some(store) = &self.store else {
+            return Ok(Vec::new());
+        };
+        let root = store.root_path();
+        let candidates = spawn_blocking(move || {
+            let mut candidates = Vec::new();
+            if !root.exists() {
+                return Ok(candidates);
+            }
+            for entry in fs::read_dir(&root)? {
+                let path = entry?.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
+                    continue;
+                }
+                let session_id = parse_session_file_name(&path)?;
+                candidates.push(LegacySessionCandidate {
+                    session_id,
+                    event_path: path,
+                    has_db: db::session_db_path(&root, session_id).exists(),
+                });
+            }
+            candidates.sort_by_key(|candidate| candidate.session_id.to_string());
+            Ok::<_, SessionStoreError>(candidates)
+        })
+        .await
+        .map_err(SessionStoreError::BlockingTask)??;
+        Ok(candidates)
+    }
+
+    /// Explicitly migrate every discovered legacy `.events` session into DBs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if legacy discovery cannot read the session root.
+    pub async fn migrate_all_legacy_sessions_to_db(
+        &self,
+    ) -> Result<Vec<LegacySessionMigrationResult>, SessionError> {
+        let candidates = self.list_legacy_sessions_for_migration().await?;
+        let mut results = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if candidate.has_db {
+                results.push(LegacySessionMigrationResult {
+                    session_id: candidate.session_id,
+                    migrated: false,
+                    summary: None,
+                    error: None,
+                });
+                continue;
+            }
+            match self
+                .migrate_legacy_session_to_db(candidate.session_id)
+                .await
+            {
+                Ok(summary) => results.push(LegacySessionMigrationResult {
+                    session_id: candidate.session_id,
+                    migrated: true,
+                    summary: Some(summary),
+                    error: None,
+                }),
+                Err(error) => results.push(LegacySessionMigrationResult {
+                    session_id: candidate.session_id,
+                    migrated: false,
+                    summary: None,
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+        Ok(results)
+    }
+
     /// Explicitly migrate a legacy event-log session into the canonical DB-backed layout.
     ///
     /// Normal session open/read/write paths do not perform this replay. This method is the
@@ -1600,12 +1525,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<(), SessionError> {
-        if let Err(SessionError::LegacyMigrationRequired(_)) =
-            self.ensure_session_loaded(session_id).await
-        {
-            self.migrate_legacy_session_to_db(session_id).await?;
-        }
-        Ok(())
+        self.ensure_session_loaded(session_id).await
     }
 
     /// Create a new session.
@@ -2912,38 +2832,6 @@ impl SessionState {
         Ok(state)
     }
 
-    pub(crate) fn from_index(index: index::SessionIndex) -> Self {
-        let (sender, _) = broadcast::channel(512);
-        let access_status = access_status_from_index(
-            index.min_event_schema_version,
-            index.max_event_schema_version,
-            &index.issues,
-        );
-        let mut summary = index.summary;
-        let working_directory = normalize_working_directory(&index.working_directory);
-        summary.working_directory.clone_from(&working_directory);
-        summary.created_at_ms = index.created_at_ms;
-        summary.updated_at_ms = index.updated_at_ms;
-        Self {
-            summary,
-            working_directory,
-            clients: BTreeSet::new(),
-            events: None,
-            next_sequence: index.next_sequence,
-            event_count: index.event_count,
-            has_user_message: index.has_user_message,
-            current_provider: index.current_provider,
-            current_model: index.current_model,
-            current_agent: index.current_agent,
-            latest_compaction_sequence: index.latest_compaction_sequence,
-            total_metered_tokens: index.total_metered_tokens,
-            index_issues: index.issues,
-            index_status: SessionIndexStatusKind::Current,
-            access_status,
-            sender,
-        }
-    }
-
     fn summary(&self) -> SessionSummary {
         let mut summary = self.summary.clone();
         if summary.name.is_none() {
@@ -3158,18 +3046,6 @@ fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAcces
     }
 }
 
-fn access_status_from_index(
-    min_schema_version: Option<u16>,
-    max_schema_version: Option<u16>,
-    issues: &[index::SessionIndexIssue],
-) -> SessionAccessStatus {
-    access_status_from_schema_versions(
-        min_schema_version,
-        max_schema_version,
-        issues.iter().any(index_issue_blocks_access),
-    )
-}
-
 pub(crate) fn read_issue_blocks_access(issue: &reader::SessionReadIssue) -> bool {
     match &issue.kind {
         reader::SessionReadIssueKind::Decode { message } => decode_issue_blocks_access(message),
@@ -3179,15 +3055,12 @@ pub(crate) fn read_issue_blocks_access(issue: &reader::SessionReadIssue) -> bool
     }
 }
 
-fn index_issue_blocks_access(issue: &index::SessionIndexIssue) -> bool {
-    decode_issue_blocks_access(&issue.message)
-}
-
 fn decode_issue_blocks_access(message: &str) -> bool {
     message.contains("session event frame checksum mismatch")
         || message.contains("unsupported session frame version")
 }
 
+#[cfg(test)]
 fn access_status_from_schema_versions(
     min_schema_version: Option<u16>,
     max_schema_version: Option<u16>,
@@ -4030,6 +3903,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_session_discovery_is_filename_only_and_migrate_all_populates_db() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        let session_id = bcode_session_models::SessionId::new();
+        let path = root.join(format!("{session_id}.events"));
+        write_legacy_event(
+            &path,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::SessionCreated {
+                    name: Some("discover".to_string()),
+                    working_directory: test_working_directory(),
+                },
+            },
+        );
+
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let candidates = manager
+            .list_legacy_sessions_for_migration()
+            .await
+            .expect("legacy discovery should list files");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, session_id);
+        assert!(!candidates[0].has_db);
+
+        let results = manager
+            .migrate_all_legacy_sessions_to_db()
+            .await
+            .expect("migrate all should run");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].migrated);
+        assert!(super::db::session_db_path(&root, session_id).exists());
+
+        let candidates = manager
+            .list_legacy_sessions_for_migration()
+            .await
+            .expect("legacy discovery should still be explicit");
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].has_db);
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn explicit_legacy_session_migration_populates_db() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("session dir should create");
@@ -4122,13 +4042,14 @@ mod tests {
         assert!(report.backup_dir.expect("backup should exist").exists());
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        assert_eq!(
-            restored
-                .session_access_status(session_id)
-                .await
-                .expect("status should load"),
-            super::SessionAccessStatus::ReadWrite
-        );
+        let error = restored
+            .session_access_status(session_id)
+            .await
+            .expect_err("normal status access should require DB migration");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
         let error = restored
             .session_history(session_id)
             .await
@@ -4248,13 +4169,14 @@ mod tests {
         );
 
         let manager = SessionManager::persistent(&root).expect("manager should restore");
-        assert_eq!(
-            manager
-                .session_access_status(session_id)
-                .await
-                .expect("status should load"),
-            super::SessionAccessStatus::ReadOnlyMigrationRequired
-        );
+        let error = manager
+            .session_access_status(session_id)
+            .await
+            .expect_err("legacy session status should require explicit DB migration");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
         let error = manager
             .attach_session_recent(session_id, ClientId::new(), 10)
             .await
@@ -4263,13 +4185,14 @@ mod tests {
             error,
             super::SessionError::LegacyMigrationRequired(_)
         ));
-        assert_eq!(
-            manager
-                .session_access_status(session_id)
-                .await
-                .expect("status should remain read-only"),
-            super::SessionAccessStatus::ReadOnlyMigrationRequired
-        );
+        let error = manager
+            .session_access_status(session_id)
+            .await
+            .expect_err("legacy session status should require explicit DB migration");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -4293,18 +4216,22 @@ mod tests {
         write_legacy_event(&path, &event);
 
         let manager = SessionManager::persistent(&root).expect("manager should restore");
-        assert_eq!(
-            manager
-                .session_access_status(session_id)
-                .await
-                .expect("status should load"),
-            super::SessionAccessStatus::BlockedFutureVersion
-        );
+        let error = manager
+            .session_access_status(session_id)
+            .await
+            .expect_err("future legacy session should require explicit DB migration");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
         let error = manager
             .append_user_message(session_id, ClientId::new(), "nope".to_string())
             .await
-            .expect_err("future schema should block writes");
-        assert!(matches!(error, super::SessionError::NotWritable { .. }));
+            .expect_err("legacy session should require explicit DB migration before writes");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -4772,12 +4699,15 @@ mod tests {
         let report = reader::read_events(&event_path).expect("migrated events should read");
         assert!(!report.needs_encoding_migration);
 
-        store
-            .doctor_session_with_fix(session_id, true)
-            .expect("doctor should rebuild")
-            .expect("session should exist");
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let sessions = restored.list_sessions(&test_working_directory()).await;
+        let manager = SessionManager::persistent(&root).expect("manager should restore");
+        let sessions = manager.list_sessions(&test_working_directory()).await;
+        assert!(sessions.is_empty());
+
+        manager
+            .migrate_legacy_session_to_db(session_id)
+            .await
+            .expect("legacy session should explicitly migrate to DB");
+        let sessions = manager.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].name.as_deref(), Some("Recover old title"));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
