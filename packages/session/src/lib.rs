@@ -33,8 +33,8 @@ use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
-    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
     SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
@@ -688,90 +688,6 @@ impl SessionEventStore {
         Ok(index)
     }
 
-    fn read_session_history_page(
-        &self,
-        session_id: SessionId,
-        query: SessionHistoryQuery,
-    ) -> Result<SessionHistoryPage, SessionStoreError> {
-        let total_timer = self.metrics.timer();
-        let event_path = self.event_path(session_id);
-        let index_timer = self.metrics.timer();
-        let index = self.ensure_fresh_index(session_id)?;
-        self.metrics.record_histogram(
-            "session.store.history_page.ensure_fresh_index_duration_ms",
-            index_timer.elapsed_ms(),
-        );
-        self.metrics.record_histogram(
-            "session.store.history_page.index_event_count",
-            usize_to_u64(index.event_count),
-        );
-        let entries_timer = self.metrics.timer();
-        let entries = match index::read_entries(&self.root, session_id) {
-            Ok(entries) if entries.len() == index.event_count => entries,
-            _ => {
-                self.metrics
-                    .increment_counter("session.store.history_page.index_unavailable_total");
-                return Err(SessionStoreError::InvalidSessionId(
-                    "history page requires repaired primary entry index".to_owned(),
-                ));
-            }
-        };
-        self.metrics.record_histogram(
-            "session.store.history_page.read_entries_duration_ms",
-            entries_timer.elapsed_ms(),
-        );
-        self.metrics.record_histogram(
-            "session.store.history_page.read_entry_count",
-            usize_to_u64(entries.len()),
-        );
-        let limit = query.limit.max(1);
-        let select_timer = self.metrics.timer();
-        let (page_entries, has_more) = select_history_page_entries(entries, query, limit);
-        self.metrics.record_histogram(
-            "session.store.history_page.select_entries_duration_ms",
-            select_timer.elapsed_ms(),
-        );
-        self.metrics.record_histogram(
-            "session.store.history_page.selected_entry_count",
-            usize_to_u64(page_entries.len()),
-        );
-        let events_timer = self.metrics.timer();
-        let events = read_indexed_events(&event_path, &page_entries);
-        self.metrics.record_histogram(
-            "session.store.history_page.read_indexed_events_duration_ms",
-            events_timer.elapsed_ms(),
-        );
-        if events.is_err() {
-            self.metrics
-                .increment_counter("session.store.history_page.read_indexed_events_error_total");
-        }
-        let events = events?;
-        self.metrics.record_histogram(
-            "session.store.history_page.result_event_count",
-            usize_to_u64(events.len()),
-        );
-        let next_cursor = if has_more {
-            events.last().map(|event| SessionHistoryCursor {
-                sequence: match query.direction {
-                    SessionHistoryDirection::Forward => event.sequence.saturating_add(1),
-                    SessionHistoryDirection::Backward => event.sequence.saturating_sub(1),
-                },
-            })
-        } else {
-            None
-        };
-        self.metrics.record_histogram(
-            "session.store.history_page.total_duration_ms",
-            total_timer.elapsed_ms(),
-        );
-        Ok(SessionHistoryPage {
-            session_id,
-            events,
-            next_cursor,
-            has_more,
-        })
-    }
-
     #[allow(dead_code)]
     fn write_metadata_index(
         &self,
@@ -1338,49 +1254,6 @@ impl SessionEventStore {
     }
 }
 
-fn select_history_page_entries(
-    mut entries: Vec<index::SessionIndexEntry>,
-    query: SessionHistoryQuery,
-    limit: usize,
-) -> (Vec<index::SessionIndexEntry>, bool) {
-    entries.sort_by_key(|entry| entry.sequence);
-    let selected = match query.direction {
-        SessionHistoryDirection::Forward => entries
-            .into_iter()
-            .filter(|entry| {
-                query
-                    .cursor
-                    .is_none_or(|cursor| entry.sequence >= cursor.sequence)
-            })
-            .take(limit.saturating_add(1))
-            .collect::<Vec<_>>(),
-        SessionHistoryDirection::Backward => {
-            let mut selected = entries
-                .into_iter()
-                .rev()
-                .filter(|entry| {
-                    query
-                        .cursor
-                        .is_none_or(|cursor| entry.sequence <= cursor.sequence)
-                })
-                .take(limit.saturating_add(1))
-                .collect::<Vec<_>>();
-            selected.reverse();
-            selected
-        }
-    };
-    let has_more = selected.len() > limit;
-    let page_entries = if has_more {
-        match query.direction {
-            SessionHistoryDirection::Forward => selected.into_iter().take(limit).collect(),
-            SessionHistoryDirection::Backward => selected.into_iter().skip(1).collect(),
-        }
-    } else {
-        selected
-    };
-    (page_entries, has_more)
-}
-
 fn read_indexed_events(
     event_path: &Path,
     entries: &[index::SessionIndexEntry],
@@ -1789,66 +1662,61 @@ impl SessionManager {
         }
     }
 
+    /// Explicitly migrate a legacy event-log session into the canonical DB-backed layout.
+    ///
+    /// Normal session open/read/write paths do not perform this replay. This method is the
+    /// migration boundary where legacy events are allowed to be read, schema-migrated, and
+    /// projected into the per-session DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the legacy session does not exist, event migration fails, event-log
+    /// replay fails, DB writes fail, or the migrated DB state is incomplete.
+    pub async fn migrate_legacy_session_to_db(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, SessionError> {
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        let db_path = db::session_db_path(&store.root_path(), session_id);
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        if db.last_event_sequence().await?.is_none() {
+            store.migrate_event_log_to_current(session_id).await?;
+            let events = store.read_session_events(session_id).await?;
+            if events.is_empty() {
+                return Err(SessionError::NotFound(session_id));
+            }
+            for event in &events {
+                db.append_event(event).await?;
+            }
+        }
+
+        let state = self.load_db_session_state(session_id, &db).await?;
+        let summary = state.summary();
+        let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
+        catalog.upsert_session(&summary, &db_path).await?;
+
+        let mut inner = self.inner.lock().await;
+        if let Some(handle) = inner.sessions.get(&session_id) {
+            handle.replace_state(state).await?;
+        } else {
+            inner
+                .sessions
+                .insert(session_id, SessionHandle::new(state, Some(store.clone())));
+        }
+        Ok(summary)
+    }
+
     async fn migrate_session_to_current_if_required(
         &self,
         session_id: SessionId,
     ) -> Result<(), SessionError> {
-        let total_timer = self.metrics.timer();
-        self.ensure_session_loaded(session_id).await?;
-        let access_timer = self.metrics.timer();
-        let should_migrate = {
-            let handle = self.session_handle(session_id).await?;
-            handle.requires_migration_for_write().await?
-        };
-        self.metrics.record_histogram(
-            "session.manager.migrate_if_required.access_check_duration_ms",
-            access_timer.elapsed_ms(),
-        );
-        if !should_migrate {
-            self.metrics
-                .increment_counter("session.manager.migrate_if_required.not_required_total");
-            self.metrics.record_histogram(
-                "session.manager.migrate_if_required.total_duration_ms",
-                total_timer.elapsed_ms(),
-            );
-            return Ok(());
+        if let Err(SessionError::LegacyMigrationRequired(_)) =
+            self.ensure_session_loaded(session_id).await
+        {
+            self.migrate_legacy_session_to_db(session_id).await?;
         }
-        self.metrics
-            .increment_counter("session.manager.migrate_if_required.required_total");
-        let Some(store) = &self.store else {
-            self.metrics.record_histogram(
-                "session.manager.migrate_if_required.total_duration_ms",
-                total_timer.elapsed_ms(),
-            );
-            return Ok(());
-        };
-        let migrate_timer = self.metrics.timer();
-        store.migrate_event_log_to_current(session_id).await?;
-        self.metrics.record_histogram(
-            "session.manager.migrate_if_required.migrate_duration_ms",
-            migrate_timer.elapsed_ms(),
-        );
-        let index_timer = self.metrics.timer();
-        let index = store.ensure_fresh_index(session_id).await?;
-        self.metrics.record_histogram(
-            "session.manager.migrate_if_required.ensure_index_duration_ms",
-            index_timer.elapsed_ms(),
-        );
-        let handle = self.session_handle(session_id).await?;
-        let clients = handle.client_ids().await?;
-        let mut state = SessionState::from_index(index);
-        state.clients = clients;
-        state.summary.client_count = state.clients.len();
-        let replace_timer = self.metrics.timer();
-        handle.replace_state(state).await?;
-        self.metrics.record_histogram(
-            "session.manager.migrate_if_required.replace_state_duration_ms",
-            replace_timer.elapsed_ms(),
-        );
-        self.metrics.record_histogram(
-            "session.manager.migrate_if_required.total_duration_ms",
-            total_timer.elapsed_ms(),
-        );
         Ok(())
     }
 
@@ -2211,12 +2079,7 @@ impl SessionManager {
                 return Ok(db.history_page(query).await?);
             }
         }
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(session_id))?;
-        let page = store.read_session_history_page(session_id, query).await?;
-        Ok(page)
+        Err(SessionError::LegacyMigrationRequired(session_id))
     }
 
     /// Return a semantic projection window for a session.
@@ -4277,6 +4140,70 @@ mod tests {
             panic!("started run should require attention");
         };
         assert_eq!(items[0].run_id, "run-1");
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_session_migration_populates_db() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("session dir should create");
+        let session_id = bcode_session_models::SessionId::new();
+        let path = root.join(format!("{session_id}.events"));
+        write_legacy_event(
+            &path,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
+                sequence: 0,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::SessionCreated {
+                    name: Some("legacy".to_string()),
+                    working_directory: test_working_directory(),
+                },
+            },
+        );
+        append_legacy_event(
+            &path,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
+                sequence: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "hello".to_string(),
+                },
+            },
+        );
+
+        let manager = SessionManager::persistent(&root).expect("manager should restore catalog");
+        let error = manager
+            .session_history(session_id)
+            .await
+            .expect_err("normal access should require migration");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
+
+        let summary = manager
+            .migrate_legacy_session_to_db(session_id)
+            .await
+            .expect("explicit migration should populate DB");
+        assert_eq!(summary.id, session_id);
+        assert!(super::db::session_db_path(&root, session_id).exists());
+
+        let history = manager
+            .session_history(session_id)
+            .await
+            .expect("DB-backed history should load after migration");
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION)
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

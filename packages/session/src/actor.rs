@@ -218,10 +218,6 @@ impl SessionHandle {
             .await
     }
 
-    pub async fn client_ids(&self) -> Result<BTreeSet<ClientId>, SessionError> {
-        self.send(SessionCommand::ClientIds).await
-    }
-
     pub async fn replace_state(&self, state: SessionState) -> Result<(), SessionError> {
         self.send(|reply| SessionCommand::ReplaceState {
             state: Box::new(state),
@@ -306,7 +302,6 @@ enum SessionCommand {
         kind: SessionEventKind,
         reply: oneshot::Sender<Option<SessionEvent>>,
     },
-    ClientIds(oneshot::Sender<BTreeSet<ClientId>>),
     ReplaceState {
         state: Box<SessionState>,
         reply: oneshot::Sender<()>,
@@ -450,9 +445,6 @@ impl SessionActor {
             }
             SessionCommand::PublishTransient { kind, reply } => {
                 let _ = reply.send(self.publish_transient_event(kind));
-            }
-            SessionCommand::ClientIds(reply) => {
-                let _ = reply.send(self.state.clients.clone());
             }
             SessionCommand::ReplaceState { state, reply } => {
                 self.state = *state;
