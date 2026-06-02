@@ -607,21 +607,25 @@ impl SessionActor {
                     metrics
                         .record_histogram("session.actor.attach.recent_limit", usize_to_u64(limit));
                 }
-                let store = self
-                    .store
-                    .as_ref()
-                    .ok_or(SessionError::NotFound(self.state.summary.id))?;
-                store
-                    .read_session_history_page(
-                        self.state.summary.id,
-                        SessionHistoryQuery {
-                            cursor: None,
-                            limit,
-                            direction: SessionHistoryDirection::Backward,
-                        },
-                    )
-                    .await?
-                    .events
+                if let Some(history) = self.recent_history_from_db(limit).await? {
+                    history
+                } else {
+                    let store = self
+                        .store
+                        .as_ref()
+                        .ok_or(SessionError::NotFound(self.state.summary.id))?;
+                    store
+                        .read_session_history_page(
+                            self.state.summary.id,
+                            SessionHistoryQuery {
+                                cursor: None,
+                                limit,
+                                direction: SessionHistoryDirection::Backward,
+                            },
+                        )
+                        .await?
+                        .events
+                }
             }
             AttachMode::ProjectionWindow { history } => history,
         };
@@ -820,6 +824,68 @@ impl SessionActor {
                 max_events,
             )
             .await?)
+    }
+
+    async fn recent_history_from_db(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionEvent>>, SessionError> {
+        let Some(db) = self.session_db().await? else {
+            return Ok(None);
+        };
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+        match db.projection_checkpoint("transcript").await {
+            Ok(Some(checkpoint)) if checkpoint >= expected_last_sequence => {}
+            Ok(_) => return Ok(None),
+            Err(error) => {
+                eprintln!(
+                    "failed to read session transcript checkpoint for {}: {error}",
+                    self.state.summary.id
+                );
+                return Ok(None);
+            }
+        }
+
+        let transcript_items = match db.latest_transcript_items(limit).await {
+            Ok(items) => items,
+            Err(error) => {
+                eprintln!(
+                    "failed to read session transcript projection for {}: {error}",
+                    self.state.summary.id
+                );
+                return Ok(None);
+            }
+        };
+        if transcript_items.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let start_sequence = transcript_items
+            .iter()
+            .map(|item| item.event_seq_start)
+            .min()
+            .unwrap_or(0);
+        let end_sequence = transcript_items
+            .iter()
+            .map(|item| item.event_seq_end)
+            .max()
+            .unwrap_or(start_sequence);
+        let max_events =
+            usize::try_from(end_sequence.saturating_sub(start_sequence) + 1).unwrap_or(usize::MAX);
+
+        match db
+            .events_range(start_sequence, end_sequence, max_events)
+            .await
+        {
+            Ok(events) => Ok(Some(events)),
+            Err(error) => {
+                eprintln!(
+                    "failed to read recent session events from database for {}: {error}",
+                    self.state.summary.id
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn input_history(&mut self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {

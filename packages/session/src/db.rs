@@ -57,6 +57,25 @@ pub fn session_db_path(root: &Path, session_id: SessionId) -> std::path::PathBuf
     root.join(session_id.to_string()).join("session.db")
 }
 
+/// Typed transcript projection row stored in a per-session database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptItem {
+    /// Monotonic transcript sequence.
+    pub transcript_seq: u64,
+    /// First durable event sequence covered by this item.
+    pub event_seq_start: u64,
+    /// Last durable event sequence covered by this item.
+    pub event_seq_end: u64,
+    /// UI role, for example `user`, `assistant`, or `tool`.
+    pub role: String,
+    /// Transcript item kind.
+    pub kind: String,
+    /// Projection status, for example `complete`, `running`, or `error`.
+    pub status: String,
+    /// Optional display content.
+    pub content: Option<String>,
+}
+
 /// Backend-agnostic handle for Bcode's global session catalog database.
 #[derive(Debug, Clone)]
 pub struct GlobalSessionDb {
@@ -222,6 +241,25 @@ impl SessionDb {
             .collect()
     }
 
+    /// Return latest transcript projection items in chronological order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails or a row is malformed.
+    pub async fn latest_transcript_items(
+        &self,
+        limit: usize,
+    ) -> SessionDbResult<Vec<TranscriptItem>> {
+        let mut items = self
+            .latest_transcript_rows(limit)
+            .await?
+            .iter()
+            .map(transcript_item_from_row)
+            .collect::<SessionDbResult<Vec<_>>>()?;
+        items.sort_by_key(|item| item.transcript_seq);
+        Ok(items)
+    }
+
     /// Return the latest transcript projection rows as generic database rows for callers that
     /// need a lightweight window before typed projection models are finalized.
     ///
@@ -234,6 +272,15 @@ impl SessionDb {
     ) -> Result<Vec<switchy::database::Row>, DatabaseError> {
         self.db
             .select("transcript_items")
+            .columns(&[
+                "transcript_seq",
+                "event_seq_start",
+                "event_seq_end",
+                "role",
+                "kind",
+                "status",
+                "content",
+            ])
             .sort("transcript_seq", SortDirection::Desc)
             .limit(limit)
             .execute(&**self.db)
@@ -255,125 +302,103 @@ async fn run_session_migrations(db: &dyn Database) -> Result<(), MigrationError>
 
 fn global_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
-    source.add_migration(CodeMigration::new(
-        "001_global_catalog".to_string(),
-        Box::new(
-            r"
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY NOT NULL,
-    db_path TEXT NOT NULL,
-    title TEXT,
-    working_directory TEXT,
-    created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    state TEXT NOT NULL DEFAULT 'active',
-    projection_status TEXT NOT NULL DEFAULT 'fresh'
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_updated_at_ms ON sessions(updated_at_ms);
-"
-            .to_string(),
-        ),
-        Some(Box::new("DROP TABLE IF EXISTS sessions".to_string())),
-    ));
+    add_sql_migration(
+        &mut source,
+        "001_global_sessions_table",
+        "CREATE TABLE IF NOT EXISTS sessions (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    db_path TEXT NOT NULL,\n    title TEXT,\n    working_directory TEXT,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    state TEXT NOT NULL DEFAULT 'active',\n    projection_status TEXT NOT NULL DEFAULT 'fresh'\n)",
+        "DROP TABLE IF EXISTS sessions",
+    );
+    add_sql_migration(
+        &mut source,
+        "002_global_sessions_updated_at_index",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at_ms ON sessions(updated_at_ms)",
+        "DROP INDEX IF EXISTS idx_sessions_updated_at_ms",
+    );
     source
 }
 
 fn session_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
-    source.add_migration(CodeMigration::new(
-        "001_session_event_store_and_projections".to_string(),
-        Box::new(
-            r"
-CREATE TABLE IF NOT EXISTS events (
-    event_seq INTEGER PRIMARY KEY NOT NULL,
-    event_type TEXT NOT NULL,
-    schema_version INTEGER NOT NULL,
-    created_at_ms INTEGER,
-    causation_id TEXT,
-    correlation_id TEXT,
-    payload TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
-
-CREATE TABLE IF NOT EXISTS session_state (
-    session_id TEXT PRIMARY KEY NOT NULL,
-    last_event_seq INTEGER NOT NULL,
-    current_model TEXT,
-    current_provider TEXT,
-    working_directory TEXT,
-    title TEXT,
-    updated_at_ms INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS input_messages (
-    input_seq INTEGER PRIMARY KEY NOT NULL,
-    event_seq INTEGER NOT NULL,
-    created_at_ms INTEGER,
-    text TEXT NOT NULL,
-    working_directory TEXT,
-    model TEXT,
-    FOREIGN KEY(event_seq) REFERENCES events(event_seq)
-);
-CREATE INDEX IF NOT EXISTS idx_input_messages_event_seq ON input_messages(event_seq);
-
-CREATE TABLE IF NOT EXISTS transcript_items (
-    transcript_seq INTEGER PRIMARY KEY NOT NULL,
-    event_seq_start INTEGER NOT NULL,
-    event_seq_end INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    status TEXT NOT NULL,
-    content TEXT,
-    created_at_ms INTEGER,
-    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)
-);
-CREATE INDEX IF NOT EXISTS idx_transcript_items_event_range ON transcript_items(event_seq_start, event_seq_end);
-
-CREATE TABLE IF NOT EXISTS tool_runs (
-    tool_call_id TEXT PRIMARY KEY NOT NULL,
-    event_seq_start INTEGER NOT NULL,
-    event_seq_end INTEGER,
-    status TEXT NOT NULL,
-    tool_name TEXT,
-    started_at_ms INTEGER,
-    completed_at_ms INTEGER,
-    output_bytes INTEGER,
-    is_error INTEGER,
-    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)
-);
-CREATE INDEX IF NOT EXISTS idx_tool_runs_status ON tool_runs(status);
-
-CREATE TABLE IF NOT EXISTS projection_checkpoints (
-    projection_name TEXT PRIMARY KEY NOT NULL,
-    last_event_seq INTEGER NOT NULL,
-    projection_version INTEGER NOT NULL,
-    updated_at_ms INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS snapshots (
-    snapshot_name TEXT PRIMARY KEY NOT NULL,
-    last_event_seq INTEGER NOT NULL,
-    schema_version INTEGER NOT NULL,
-    payload TEXT NOT NULL,
-    updated_at_ms INTEGER
-);
-"
-            .to_string(),
-        ),
-        Some(Box::new(
-            r"
-DROP TABLE IF EXISTS snapshots;
-DROP TABLE IF EXISTS projection_checkpoints;
-DROP TABLE IF EXISTS tool_runs;
-DROP TABLE IF EXISTS transcript_items;
-DROP TABLE IF EXISTS input_messages;
-DROP TABLE IF EXISTS session_state;
-DROP TABLE IF EXISTS events;
-"
-            .to_string(),
-        )),
-    ));
+    add_sql_migration(
+        &mut source,
+        "001_events_table",
+        "CREATE TABLE IF NOT EXISTS events (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_type TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    causation_id TEXT,\n    correlation_id TEXT,\n    payload TEXT NOT NULL\n)",
+        "DROP TABLE IF EXISTS events",
+    );
+    add_sql_migration(
+        &mut source,
+        "002_events_event_type_index",
+        "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)",
+        "DROP INDEX IF EXISTS idx_events_event_type",
+    );
+    add_sql_migration(
+        &mut source,
+        "003_session_state_table",
+        "CREATE TABLE IF NOT EXISTS session_state (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    current_model TEXT,\n    current_provider TEXT,\n    working_directory TEXT,\n    title TEXT,\n    updated_at_ms INTEGER\n)",
+        "DROP TABLE IF EXISTS session_state",
+    );
+    add_sql_migration(
+        &mut source,
+        "004_input_messages_table",
+        "CREATE TABLE IF NOT EXISTS input_messages (\n    input_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    text TEXT NOT NULL,\n    working_directory TEXT,\n    model TEXT,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS input_messages",
+    );
+    add_sql_migration(
+        &mut source,
+        "005_input_messages_event_seq_index",
+        "CREATE INDEX IF NOT EXISTS idx_input_messages_event_seq ON input_messages(event_seq)",
+        "DROP INDEX IF EXISTS idx_input_messages_event_seq",
+    );
+    add_sql_migration(
+        &mut source,
+        "006_transcript_items_table",
+        "CREATE TABLE IF NOT EXISTS transcript_items (\n    transcript_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER NOT NULL,\n    role TEXT NOT NULL,\n    kind TEXT NOT NULL,\n    status TEXT NOT NULL,\n    content TEXT,\n    created_at_ms INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS transcript_items",
+    );
+    add_sql_migration(
+        &mut source,
+        "007_transcript_items_event_range_index",
+        "CREATE INDEX IF NOT EXISTS idx_transcript_items_event_range ON transcript_items(event_seq_start, event_seq_end)",
+        "DROP INDEX IF EXISTS idx_transcript_items_event_range",
+    );
+    add_sql_migration(
+        &mut source,
+        "008_tool_runs_table",
+        "CREATE TABLE IF NOT EXISTS tool_runs (\n    tool_call_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    status TEXT NOT NULL,\n    tool_name TEXT,\n    started_at_ms INTEGER,\n    completed_at_ms INTEGER,\n    output_bytes INTEGER,\n    is_error INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS tool_runs",
+    );
+    add_sql_migration(
+        &mut source,
+        "009_tool_runs_status_index",
+        "CREATE INDEX IF NOT EXISTS idx_tool_runs_status ON tool_runs(status)",
+        "DROP INDEX IF EXISTS idx_tool_runs_status",
+    );
+    add_sql_migration(
+        &mut source,
+        "010_projection_checkpoints_table",
+        "CREATE TABLE IF NOT EXISTS projection_checkpoints (\n    projection_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    projection_version INTEGER NOT NULL,\n    updated_at_ms INTEGER\n)",
+        "DROP TABLE IF EXISTS projection_checkpoints",
+    );
+    add_sql_migration(
+        &mut source,
+        "011_snapshots_table",
+        "CREATE TABLE IF NOT EXISTS snapshots (\n    snapshot_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    schema_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    updated_at_ms INTEGER\n)",
+        "DROP TABLE IF EXISTS snapshots",
+    );
     source
+}
+
+fn add_sql_migration(
+    source: &mut CodeMigrationSource<'static>,
+    id: &str,
+    up_sql: &str,
+    down_sql: &str,
+) {
+    source.add_migration(CodeMigration::new(
+        id.to_string(),
+        Box::new(up_sql.to_string()),
+        Some(Box::new(down_sql.to_string())),
+    ));
 }
 
 async fn insert_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
@@ -605,7 +630,36 @@ async fn update_projection_checkpoints(
         "tool_runs",
         "model_context",
     ] {
-        db.upsert("projection_checkpoints")
+        update_projection_checkpoint(db, projection_name, event).await?;
+    }
+    Ok(())
+}
+
+async fn update_projection_checkpoint(
+    db: &dyn Database,
+    projection_name: &str,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let existing = db
+        .select("projection_checkpoints")
+        .columns(&["projection_name"])
+        .where_eq("projection_name", projection_name)
+        .execute_first(db)
+        .await?;
+
+    if existing.is_some() {
+        db.update("projection_checkpoints")
+            .value("last_event_seq", seq_to_value(event.sequence))
+            .value("projection_version", DatabaseValue::Int32(1))
+            .value(
+                "updated_at_ms",
+                event_created_at_ms(event).map(seq_to_value),
+            )
+            .where_eq("projection_name", projection_name)
+            .execute(db)
+            .await?;
+    } else {
+        db.insert("projection_checkpoints")
             .value("projection_name", projection_name)
             .value("last_event_seq", seq_to_value(event.sequence))
             .value("projection_version", DatabaseValue::Int32(1))
@@ -616,7 +670,20 @@ async fn update_projection_checkpoints(
             .execute(db)
             .await?;
     }
+
     Ok(())
+}
+
+fn transcript_item_from_row(row: &switchy::database::Row) -> SessionDbResult<TranscriptItem> {
+    Ok(TranscriptItem {
+        transcript_seq: required_i64(row, "transcript_seq").map(i64_to_u64)?,
+        event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
+        event_seq_end: required_i64(row, "event_seq_end").map(i64_to_u64)?,
+        role: required_string(row, "role")?,
+        kind: required_string(row, "kind")?,
+        status: required_string(row, "status")?,
+        content: optional_string(row, "content"),
+    })
 }
 
 fn input_history_entry_from_row(
@@ -634,6 +701,11 @@ fn required_string(row: &switchy::database::Row, column: &str) -> SessionDbResul
         .ok_or_else(|| SessionDbError::InvalidRow {
             column: column.to_string(),
         })
+}
+
+fn optional_string(row: &switchy::database::Row, column: &str) -> Option<String> {
+    row.get(column)
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
 }
 
 fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i64> {
@@ -711,4 +783,117 @@ fn usize_to_value(value: usize) -> DatabaseValue {
 
 const fn bool_to_value(value: bool) -> DatabaseValue {
     DatabaseValue::Int32(if value { 1 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId};
+
+    fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            session_id,
+            provenance: None,
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn append_event_updates_input_history_and_transcript_projections() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("test".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append session created");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "hello".to_string(),
+            },
+        ))
+        .await
+        .expect("append user message");
+        db.append_event(&event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "hi there".to_string(),
+            },
+        ))
+        .await
+        .expect("append assistant message");
+
+        let input_history = db.input_history().await.expect("input history");
+        assert_eq!(
+            input_history,
+            vec![SessionInputHistoryEntry {
+                sequence: 1,
+                text: "hello".to_string(),
+            }]
+        );
+
+        let transcript = db
+            .latest_transcript_items(10)
+            .await
+            .expect("transcript items");
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].role, "user");
+        assert_eq!(transcript[0].content.as_deref(), Some("hello"));
+        assert_eq!(transcript[1].role, "assistant");
+        assert_eq!(transcript[1].content.as_deref(), Some("hi there"));
+
+        assert_eq!(
+            db.projection_checkpoint("input_history")
+                .await
+                .expect("input checkpoint"),
+            Some(2)
+        );
+        assert_eq!(
+            db.projection_checkpoint("transcript")
+                .await
+                .expect("transcript checkpoint"),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn events_range_reads_canonical_db_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        for sequence in 0..3 {
+            db.append_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            ))
+            .await
+            .expect("append event");
+        }
+
+        let events = db.events_range(1, 2, 10).await.expect("events range");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
+    }
 }
