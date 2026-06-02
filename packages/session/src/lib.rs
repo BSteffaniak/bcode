@@ -76,6 +76,9 @@ pub enum SessionError {
         session_id: SessionId,
         status: SessionAccessStatus,
     },
+    /// Session database error: {0}
+    #[error("session database error: {0}")]
+    Db(#[from] db::SessionDbError),
 }
 
 /// Canonical session access status used to gate reads and writes.

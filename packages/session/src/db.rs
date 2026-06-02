@@ -6,11 +6,14 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
-use std::{path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 
-use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
+use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry};
 use switchy::{
-    database::{Database, DatabaseError, DatabaseValue, query::FilterableQuery},
+    database::{
+        Database, DatabaseError, DatabaseValue,
+        query::{FilterableQuery, SortDirection},
+    },
     schema::{
         MigrationError,
         discovery::code::{CodeMigration, CodeMigrationSource},
@@ -34,13 +37,25 @@ pub enum SessionDbError {
     /// Schema migration failed.
     #[error(transparent)]
     Migration(#[from] MigrationError),
+    /// A filesystem operation failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// Event serialization failed.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
+    /// A database row did not contain the expected column/type.
+    #[error("invalid session database row: missing or invalid column {column}")]
+    InvalidRow { column: String },
 }
 
 /// Result type for session DB operations.
 pub type SessionDbResult<T> = Result<T, SessionDbError>;
+
+/// Return Bcode's default per-session database path for `session_id`.
+#[must_use]
+pub fn session_db_path(root: &Path, session_id: SessionId) -> std::path::PathBuf {
+    root.join(session_id.to_string()).join("session.db")
+}
 
 /// Backend-agnostic handle for Bcode's global session catalog database.
 #[derive(Debug, Clone)]
@@ -78,6 +93,20 @@ pub struct SessionDb {
 }
 
 impl SessionDb {
+    /// Open one session database under `root` using Bcode's default per-session layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session directory cannot be created, the database cannot be
+    /// opened, or schema migrations fail.
+    pub async fn open_turso_in_root(session_id: SessionId, root: &Path) -> SessionDbResult<Self> {
+        let path = session_db_path(root, session_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Self::open_turso(session_id, &path).await
+    }
+
     /// Open one session database at `path` and apply cheap schema migrations.
     ///
     /// This must not replay events or rebuild projections. Repair/reprojection belongs behind
@@ -120,8 +149,73 @@ impl SessionDb {
         let tx = self.db.begin_transaction().await?;
         insert_event(&*tx, event).await?;
         project_event(&*tx, event).await?;
+        update_projection_checkpoints(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
+    }
+    /// Return input history from the indexed projection table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails.
+    pub async fn input_history(&self) -> SessionDbResult<Vec<SessionInputHistoryEntry>> {
+        let rows = self
+            .db
+            .select("input_messages")
+            .columns(&["event_seq", "text"])
+            .sort("input_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+
+        rows.iter().map(input_history_entry_from_row).collect()
+    }
+
+    /// Return events from the canonical event table for the inclusive sequence range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or event deserialization fails.
+    pub async fn events_range(
+        &self,
+        start_sequence: u64,
+        end_sequence: u64,
+        max_events: usize,
+    ) -> SessionDbResult<Vec<SessionEvent>> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["payload"])
+            .where_gte("event_seq", seq_to_value(start_sequence))
+            .where_lte("event_seq", seq_to_value(end_sequence))
+            .sort("event_seq", SortDirection::Asc)
+            .limit(max_events)
+            .execute(&**self.db)
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload = required_string(&row, "payload")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    /// Return the latest transcript projection rows as generic database rows for callers that
+    /// need a lightweight window before typed projection models are finalized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails.
+    pub async fn latest_transcript_rows(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<switchy::database::Row>, DatabaseError> {
+        self.db
+            .select("transcript_items")
+            .sort("transcript_seq", SortDirection::Desc)
+            .limit(limit)
+            .execute(&**self.db)
+            .await
     }
 }
 
@@ -268,19 +362,62 @@ async fn insert_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResul
             "schema_version",
             DatabaseValue::Int32(i32::from(event.schema_version)),
         )
+        .value(
+            "created_at_ms",
+            event_created_at_ms(event).map(seq_to_value),
+        )
         .value("payload", serde_json::to_string(event)?)
         .execute(db)
         .await?;
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
     update_session_state(db, event).await?;
     match &event.kind {
+        SessionEventKind::SessionCreated {
+            name,
+            working_directory,
+        } => {
+            db.upsert("session_state")
+                .value("session_id", event.session_id.to_string())
+                .value("last_event_seq", seq_to_value(event.sequence))
+                .value("title", name.clone())
+                .value(
+                    "working_directory",
+                    working_directory.to_string_lossy().to_string(),
+                )
+                .value(
+                    "updated_at_ms",
+                    event_created_at_ms(event).map(seq_to_value),
+                )
+                .execute(db)
+                .await?;
+        }
+        SessionEventKind::SessionRenamed { name } => {
+            db.update("session_state")
+                .value("title", name.clone())
+                .where_eq("session_id", event.session_id.to_string())
+                .execute(db)
+                .await?;
+        }
+        SessionEventKind::ModelChanged { provider, model } => {
+            db.update("session_state")
+                .value("current_provider", provider.clone())
+                .value("current_model", model.clone())
+                .where_eq("session_id", event.session_id.to_string())
+                .execute(db)
+                .await?;
+        }
         SessionEventKind::UserMessage { text, .. } => {
             db.insert("input_messages")
                 .value("input_seq", seq_to_value(event.sequence))
                 .value("event_seq", seq_to_value(event.sequence))
+                .value(
+                    "created_at_ms",
+                    event_created_at_ms(event).map(seq_to_value),
+                )
                 .value("text", text.clone())
                 .execute(db)
                 .await?;
@@ -357,6 +494,10 @@ async fn update_session_state(db: &dyn Database, event: &SessionEvent) -> Sessio
     db.upsert("session_state")
         .value("session_id", event.session_id.to_string())
         .value("last_event_seq", seq_to_value(event.sequence))
+        .value(
+            "updated_at_ms",
+            event_created_at_ms(event).map(seq_to_value),
+        )
         .execute(db)
         .await?;
     Ok(())
@@ -377,7 +518,11 @@ async fn insert_transcript_item(
         .value("event_seq_end", seq_to_value(event.sequence))
         .value("role", role)
         .value("kind", kind)
-        .value("status", status);
+        .value("status", status)
+        .value(
+            "created_at_ms",
+            event_created_at_ms(event).map(seq_to_value),
+        );
 
     if let Some(content) = content {
         statement = statement.value("content", content);
@@ -424,6 +569,112 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
+    }
+}
+
+async fn update_projection_checkpoints(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    for projection_name in [
+        "session_state",
+        "input_history",
+        "transcript",
+        "tool_runs",
+        "model_context",
+    ] {
+        db.upsert("projection_checkpoints")
+            .value("projection_name", projection_name)
+            .value("last_event_seq", seq_to_value(event.sequence))
+            .value("projection_version", DatabaseValue::Int32(1))
+            .value(
+                "updated_at_ms",
+                event_created_at_ms(event).map(seq_to_value),
+            )
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+fn input_history_entry_from_row(
+    row: &switchy::database::Row,
+) -> SessionDbResult<SessionInputHistoryEntry> {
+    Ok(SessionInputHistoryEntry {
+        sequence: required_i64(row, "event_seq").map(i64_to_u64)?,
+        text: required_string(row, "text")?,
+    })
+}
+
+fn required_string(row: &switchy::database::Row, column: &str) -> SessionDbResult<String> {
+    row.get(column)
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| SessionDbError::InvalidRow {
+            column: column.to_string(),
+        })
+}
+
+fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i64> {
+    row.get(column)
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| SessionDbError::InvalidRow {
+            column: column.to_string(),
+        })
+}
+
+const fn i64_to_u64(value: i64) -> u64 {
+    if value.is_negative() {
+        0
+    } else {
+        value.cast_unsigned()
+    }
+}
+
+const fn event_created_at_ms(event: &SessionEvent) -> Option<u64> {
+    match &event.kind {
+        SessionEventKind::SkillInvoked { invoked_at_ms, .. }
+        | SessionEventKind::SkillSuggested {
+            suggested_at_ms: invoked_at_ms,
+            ..
+        }
+        | SessionEventKind::SkillActivated {
+            activated_at_ms: invoked_at_ms,
+            ..
+        }
+        | SessionEventKind::SkillDeactivated {
+            deactivated_at_ms: invoked_at_ms,
+            ..
+        }
+        | SessionEventKind::SkillContextLoaded {
+            loaded_at_ms: invoked_at_ms,
+            ..
+        }
+        | SessionEventKind::SkillInvocationFailed {
+            failed_at_ms: invoked_at_ms,
+            ..
+        }
+        | SessionEventKind::SessionImported {
+            imported_at_ms: invoked_at_ms,
+            ..
+        } => Some(*invoked_at_ms),
+        SessionEventKind::RuntimeWorkStarted { started_at_ms, .. }
+        | SessionEventKind::RuntimeWorkCancelRequested {
+            requested_at_ms: started_at_ms,
+            ..
+        }
+        | SessionEventKind::RuntimeWorkFinished {
+            finished_at_ms: started_at_ms,
+            ..
+        }
+        | SessionEventKind::RuntimeWorkProgress {
+            progress_at_ms: started_at_ms,
+            ..
+        }
+        | SessionEventKind::ModelTurnCancelRequested {
+            requested_at_ms: started_at_ms,
+            ..
+        } => *started_at_ms,
+        _ => None,
     }
 }
 
