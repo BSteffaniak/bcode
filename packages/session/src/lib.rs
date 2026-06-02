@@ -2424,6 +2424,14 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        if let Some(store) = &self.store {
+            let db_path = db::session_db_path(&store.root_path(), session_id);
+            if db_path.exists() {
+                let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+                return Ok(db.history_page(query).await?);
+            }
+        }
         let store = self
             .store
             .as_ref()

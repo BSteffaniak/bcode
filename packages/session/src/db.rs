@@ -9,7 +9,8 @@
 use std::{fs, path::Path, sync::Arc};
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry, SessionSummary,
+    SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
     SessionTitleSource,
 };
 use switchy::{
@@ -372,6 +373,70 @@ impl SessionDb {
                 Ok(serde_json::from_str(&payload)?)
             })
             .collect()
+    }
+
+    /// Return a bounded history page from canonical DB events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event queries or deserialization fail.
+    pub async fn history_page(
+        &self,
+        query: SessionHistoryQuery,
+    ) -> SessionDbResult<SessionHistoryPage> {
+        let limit = query.limit.max(1);
+        let fetch_limit = limit.saturating_add(1);
+        let mut select = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .limit(fetch_limit);
+        select = match query.direction {
+            SessionHistoryDirection::Forward => {
+                let select = if let Some(cursor) = query.cursor {
+                    select.where_gte("event_seq", seq_to_value(cursor.sequence))
+                } else {
+                    select
+                };
+                select.sort("event_seq", SortDirection::Asc)
+            }
+            SessionHistoryDirection::Backward => {
+                let select = if let Some(cursor) = query.cursor {
+                    select.where_lte("event_seq", seq_to_value(cursor.sequence))
+                } else {
+                    select
+                };
+                select.sort("event_seq", SortDirection::Desc)
+            }
+        };
+
+        let rows = select.execute(&**self.db).await?;
+        let has_more = rows.len() > limit;
+        let mut events = rows
+            .iter()
+            .take(limit)
+            .map(|row| {
+                let payload = required_string(row, "payload")?;
+                let event = serde_json::from_str::<SessionEvent>(&payload)?;
+                Ok(event)
+            })
+            .collect::<SessionDbResult<Vec<_>>>()?;
+        if matches!(query.direction, SessionHistoryDirection::Backward) {
+            events.reverse();
+        }
+        let next_cursor = if has_more {
+            events.first().map(|event| SessionHistoryCursor {
+                sequence: event.sequence,
+            })
+        } else {
+            None
+        };
+        Ok(SessionHistoryPage {
+            session_id: self.session_id,
+            events,
+            next_cursor,
+            has_more,
+        })
     }
 
     /// Return events from the canonical event table for the inclusive sequence range.

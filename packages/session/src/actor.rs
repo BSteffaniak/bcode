@@ -749,7 +749,10 @@ impl SessionActor {
         Ok(None)
     }
 
-    async fn history(&self) -> Result<Vec<SessionEvent>, SessionError> {
+    async fn history(&mut self) -> Result<Vec<SessionEvent>, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            return Ok(db.all_events().await?);
+        }
         if let Some(events) = &self.state.events {
             return Ok(events.clone());
         }
@@ -786,11 +789,16 @@ impl SessionActor {
     }
 
     async fn events_range(
-        &self,
+        &mut self,
         start_sequence: u64,
         end_sequence: u64,
         max_events: usize,
     ) -> Result<Vec<SessionEvent>, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            return Ok(db
+                .events_range(start_sequence, end_sequence, max_events)
+                .await?);
+        }
         if let Some(events) = &self.state.events {
             return Ok(select_event_range_from_events(
                 events,
