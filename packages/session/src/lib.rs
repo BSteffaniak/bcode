@@ -4626,7 +4626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_fails_when_input_history_index_is_degraded() {
+    async fn attach_uses_db_input_history_when_legacy_input_history_index_is_degraded() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -4648,12 +4648,18 @@ mod tests {
             .expect("input history sidecar should remove");
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let error = restored
+        let attachment = restored
             .attach_session_recent(session.id, ClientId::new(), 16)
             .await
-            .expect_err("attach should fail when input history index is degraded");
+            .expect("attach should use the fresh DB projection despite degraded legacy sidecar");
 
-        assert!(matches!(error, super::SessionError::Store(_)));
+        assert_eq!(
+            attachment.input_history,
+            vec![bcode_session_models::SessionInputHistoryEntry {
+                sequence: 1,
+                text: "hello".to_owned(),
+            }]
+        );
         assert!(
             derived::ensure_input_history_index(&root, session.id, &store.event_path(session.id))
                 .is_err()
