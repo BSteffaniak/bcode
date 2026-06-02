@@ -915,21 +915,6 @@ impl SessionEventStore {
         metadata: &PersistedSessionMetadata,
     ) -> Result<(), SessionStoreError> {
         let path = self.event_path(metadata.summary.id);
-        let existing_index = index::load_fresh_index(&self.root, metadata.summary.id, &path)?;
-        if let Some(existing_index) = &existing_index
-            && (metadata.event_count < existing_index.event_count
-                || metadata.next_sequence < existing_index.next_sequence)
-        {
-            self.metrics
-                .increment_counter("session.metadata_index.stale_write_total");
-            return Err(SessionStoreError::StaleMetadataWrite {
-                session_id: metadata.summary.id,
-                current_event_count: existing_index.event_count,
-                attempted_event_count: metadata.event_count,
-                current_next_sequence: existing_index.next_sequence,
-                attempted_next_sequence: metadata.next_sequence,
-            });
-        }
         let file = index::fingerprint(&path)?;
         let index = index::SessionIndex {
             index_version: index::SESSION_INDEX_VERSION,
