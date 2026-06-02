@@ -4588,11 +4588,11 @@ mod tests {
         )
         .expect("manifest should decode");
         assert_eq!(
-            metadata.event_count,
+            manifest_before.indexes[0].checkpoint.event_count,
             manifest_after.indexes[0].checkpoint.event_count
         );
         assert_eq!(
-            metadata.event_count,
+            manifest_before.indexes[1].checkpoint.event_count,
             manifest_after.indexes[1].checkpoint.event_count
         );
         assert_eq!(
@@ -4603,21 +4603,16 @@ mod tests {
             manifest_before.indexes[1].item_count,
             manifest_after.indexes[1].item_count
         );
+        assert_eq!(
+            metadata.event_count,
+            manifest_after.indexes[0].checkpoint.event_count + 1
+        );
         let transcript_index =
             derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .expect("transcript index should rebuild when stale");
-        let manifest_rebuilt: derived::DerivedIndexManifest = serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
-        )
-        .expect("manifest should decode");
-        assert_eq!(metadata.event_count, transcript_index.event_count);
+                .expect("transcript index should remain usable across irrelevant tail events");
         assert_eq!(
-            metadata.event_count,
-            manifest_rebuilt.indexes[0].checkpoint.event_count
-        );
-        assert_eq!(
-            metadata.event_count,
-            manifest_rebuilt.indexes[1].checkpoint.event_count
+            manifest_before.indexes[0].checkpoint.event_count,
+            transcript_index.event_count
         );
         assert_eq!(
             manifest_before.indexes[0].item_count,
@@ -4699,7 +4694,7 @@ mod tests {
         );
         assert!(
             derived::ensure_transcript_index(&root, session.id, &store.event_path(session.id))
-                .is_err()
+                .is_ok()
         );
         assert!(
             !std::path::Path::new(&root)

@@ -534,14 +534,23 @@ fn index_health_without_manifest(
 /// derived manifests for every token or tool-output fragment.
 #[must_use]
 pub const fn event_updates_indexes_on_append(event: &SessionEvent) -> bool {
-    !matches!(
+    matches!(
         event.kind,
-        SessionEventKind::AssistantDelta { .. }
-            | SessionEventKind::AssistantReasoningDelta { .. }
-            | SessionEventKind::RuntimeWorkProgress { .. }
+        SessionEventKind::UserMessage { .. }
+            | SessionEventKind::AssistantMessage { .. }
+            | SessionEventKind::AssistantReasoningMessage { .. }
+            | SessionEventKind::ToolCallRequested { .. }
+            | SessionEventKind::ToolCallFinished { .. }
+            | SessionEventKind::PermissionRequested { .. }
+            | SessionEventKind::PermissionResolved { .. }
+            | SessionEventKind::ContextCompacted { .. }
+            | SessionEventKind::WorkingDirectoryChanged { .. }
+            | SessionEventKind::SkillInvoked { .. }
+            | SessionEventKind::SkillInvocationFailed { .. }
+            | SessionEventKind::ModelUsage { .. }
             | SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta { .. }
-                    | ToolInvocationStreamEvent::Status { .. }
+                event: ToolInvocationStreamEvent::Started { .. }
+                    | ToolInvocationStreamEvent::Finished { .. }
             }
     )
 }
@@ -569,9 +578,9 @@ pub fn append_event_to_indexes(
     let file = index::fingerprint(event_path)?;
     let end_offset = entry.offset.saturating_add(entry.frame_len);
 
-    append_transcript_event_from_manifest(root, session_id, &mut manifest, event)?;
-    append_input_history_event_from_manifest(root, session_id, &mut manifest, event)?;
-    advance_manifest_checkpoints(&mut manifest, file, end_offset, event);
+    manifest.file = file;
+    append_transcript_event_from_manifest(root, session_id, &mut manifest, event, end_offset)?;
+    append_input_history_event_from_manifest(root, session_id, &mut manifest, event, end_offset)?;
     persist_manifest(root, &manifest)?;
     Ok(manifest)
 }
@@ -581,6 +590,7 @@ fn append_transcript_event_from_manifest(
     session_id: SessionId,
     manifest: &mut DerivedIndexManifest,
     event: &SessionEvent,
+    end_offset: u64,
 ) -> Result<(), SessionStoreError> {
     let entry = manifest_entry_mut(manifest, DerivedIndexKind::Transcript)
         .map_err(|error| invalid_to_store(&error))?;
@@ -597,6 +607,10 @@ fn append_transcript_event_from_manifest(
     append_transcript_spans(root, session_id, &spans)?;
     entry.item_count = entry.item_count.saturating_add(spans.len());
     entry.transcript_state = Some(state);
+    entry.checkpoint.event_count =
+        usize::try_from(event.sequence.saturating_add(1)).unwrap_or(usize::MAX);
+    entry.checkpoint.end_offset = end_offset;
+    entry.checkpoint.last_sequence = Some(event.sequence);
     Ok(())
 }
 
@@ -605,6 +619,7 @@ fn append_input_history_event_from_manifest(
     session_id: SessionId,
     manifest: &mut DerivedIndexManifest,
     event: &SessionEvent,
+    end_offset: u64,
 ) -> Result<(), SessionStoreError> {
     let entry = manifest_entry_mut(manifest, DerivedIndexKind::InputHistory)
         .map_err(|error| invalid_to_store(&error))?;
@@ -618,22 +633,12 @@ fn append_input_history_event_from_manifest(
     if let Some(new_entry) = new_entry {
         append_input_history_entries(root, session_id, std::slice::from_ref(&new_entry))?;
         entry.item_count = entry.item_count.saturating_add(1);
-    }
-    Ok(())
-}
-
-fn advance_manifest_checkpoints(
-    manifest: &mut DerivedIndexManifest,
-    file: EventFileFingerprint,
-    end_offset: u64,
-    event: &SessionEvent,
-) {
-    manifest.file = file;
-    for entry in &mut manifest.indexes {
-        entry.checkpoint.event_count = entry.checkpoint.event_count.saturating_add(1);
+        entry.checkpoint.event_count =
+            usize::try_from(event.sequence.saturating_add(1)).unwrap_or(usize::MAX);
         entry.checkpoint.end_offset = end_offset;
         entry.checkpoint.last_sequence = Some(event.sequence);
     }
+    Ok(())
 }
 
 fn validate_manifest_at_append_checkpoint(
@@ -664,7 +669,7 @@ pub fn ensure_input_history_index(
     event_path: &Path,
 ) -> Result<InputHistoryIndex, SessionStoreError> {
     let file = index::fingerprint(event_path)?;
-    let manifest = load_current_manifest(root, session_id, &file)?;
+    let manifest = load_current_manifest(root, session_id, &file, DerivedIndexKind::InputHistory)?;
     let (_transcript, input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(input_history)
 }
@@ -676,7 +681,7 @@ pub fn ensure_transcript_index(
     event_path: &Path,
 ) -> Result<TranscriptIndex, SessionStoreError> {
     let file = index::fingerprint(event_path)?;
-    let manifest = load_current_manifest(root, session_id, &file)?;
+    let manifest = load_current_manifest(root, session_id, &file, DerivedIndexKind::Transcript)?;
     let (transcript, _input_history) = load_indexes_from_manifest(root, session_id, &manifest)?;
     Ok(transcript)
 }
@@ -685,6 +690,7 @@ fn load_current_manifest(
     root: &Path,
     session_id: SessionId,
     file: &EventFileFingerprint,
+    kind: DerivedIndexKind,
 ) -> Result<DerivedIndexManifest, SessionStoreError> {
     let manifest = load_manifest(root, session_id).map_err(|_error| {
         SessionStoreError::InvalidSessionId(
@@ -692,9 +698,11 @@ fn load_current_manifest(
         )
     })?;
     validate_manifest(root, &manifest, session_id).map_err(|error| invalid_to_store(&error))?;
-    if !manifest_is_current(&manifest, file.len) {
+    let entry = manifest_entry(&manifest, kind).map_err(|error| invalid_to_store(&error))?;
+    if entry.checkpoint.end_offset > file.len {
         return Err(SessionStoreError::InvalidSessionId(
-            "derived manifest is stale; explicit repair is required".to_owned(),
+            "derived manifest checkpoint is beyond event log; explicit repair is required"
+                .to_owned(),
         ));
     }
     Ok(manifest)
