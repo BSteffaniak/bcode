@@ -1,6 +1,6 @@
 //! TUI app state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
@@ -118,6 +118,9 @@ pub struct BmuxApp {
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
     submitted_user_message_following: SubmittedUserMessageFollowing,
+    assistant_scroll_anchor: AssistantScrollAnchorState,
+    active_tool_calls: BTreeSet<String>,
+    tool_activity_seen: bool,
     pending_assistant_stream_anchor: bool,
     older_history: OlderHistoryState,
     activity: ActivityState,
@@ -134,6 +137,36 @@ enum SubmittedUserMessageFollowing {
     Idle,
     PendingAnchor,
     Anchored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AssistantScrollAnchorState {
+    #[default]
+    Idle,
+    Pending {
+        index: usize,
+    },
+    Anchored {
+        index: usize,
+    },
+    Interrupted {
+        index: usize,
+    },
+}
+
+impl AssistantScrollAnchorState {
+    const fn index(self) -> Option<usize> {
+        match self {
+            Self::Idle => None,
+            Self::Pending { index } | Self::Anchored { index } | Self::Interrupted { index } => {
+                Some(index)
+            }
+        }
+    }
+
+    const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +235,9 @@ impl BmuxApp {
             manual_transcript_scroll_until: None,
             transcript_scroll_animation: None,
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
+            assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
+            active_tool_calls: BTreeSet::new(),
+            tool_activity_seen: false,
             pending_assistant_stream_anchor: false,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
@@ -675,6 +711,9 @@ impl BmuxApp {
         } else {
             SubmittedUserMessageFollowing::PendingAnchor
         };
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        self.active_tool_calls.clear();
+        self.tool_activity_seen = false;
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
         self.composer.buffer_mut().clear();
@@ -690,6 +729,8 @@ impl BmuxApp {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        self.pending_assistant_stream_anchor = false;
     }
 
     /// Mark the oldest pending submission as queued by the server.
@@ -711,6 +752,8 @@ impl BmuxApp {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        self.pending_assistant_stream_anchor = false;
         self.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
     }
@@ -787,11 +830,15 @@ impl BmuxApp {
         self.transcript_scroll_animation = None;
         self.manual_transcript_scroll_until = None;
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        self.pending_assistant_stream_anchor = false;
         self.viewport.scroll_to_bottom(&mut self.older_history)
     }
 
     fn cancel_transcript_scroll_animation_for_manual_scroll(&mut self) {
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+        self.pending_assistant_stream_anchor = false;
+        self.interrupt_current_assistant_anchor();
         let Some(animation) = self.transcript_scroll_animation.take() else {
             return;
         };
@@ -855,17 +902,65 @@ impl BmuxApp {
             return;
         }
         if self.pending_assistant_stream_anchor
-            && let Some(index) = self
-                .transcript
-                .iter()
-                .rposition(|item| item.role() == "Assistant" && item.streaming())
+            && let AssistantScrollAnchorState::Pending { index } = self.assistant_scroll_anchor
             && let Some(top_row) = self
                 .transcript_layout
                 .entry_start_row(VisibleTranscriptSource::Transcript, index)
         {
             self.start_transcript_scroll_animation(top_row);
+            self.assistant_scroll_anchor = AssistantScrollAnchorState::Anchored { index };
             self.pending_assistant_stream_anchor = false;
         }
+    }
+
+    fn interrupt_current_assistant_anchor(&mut self) {
+        if let Some(index) = self.assistant_scroll_anchor.index()
+            && self
+                .transcript
+                .get(index)
+                .is_some_and(|item| item.role() == "Assistant" && item.streaming())
+        {
+            self.assistant_scroll_anchor = AssistantScrollAnchorState::Interrupted { index };
+        } else {
+            self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        }
+    }
+
+    fn maybe_request_assistant_stream_anchor(&mut self, was_following: bool) {
+        let Some(index) = self
+            .transcript
+            .iter()
+            .rposition(|item| item.role() == "Assistant" && item.streaming())
+        else {
+            return;
+        };
+        if self.assistant_scroll_anchor.index() == Some(index) {
+            return;
+        }
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        if !was_following || self.active_tool_loop() {
+            return;
+        }
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Pending { index };
+        self.pending_assistant_stream_anchor = true;
+    }
+
+    fn finish_assistant_stream_anchor(&mut self) {
+        if let Some(index) = self.assistant_scroll_anchor.index()
+            && self
+                .transcript
+                .get(index)
+                .is_some_and(|item| item.role() == "Assistant" && !item.streaming())
+        {
+            self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        }
+        if !self.active_tool_loop() {
+            self.tool_activity_seen = false;
+        }
+    }
+
+    fn active_tool_loop(&self) -> bool {
+        !self.active_tool_calls.is_empty()
     }
 
     fn start_transcript_scroll_animation(&mut self, top_row: usize) {
@@ -970,33 +1065,45 @@ impl BmuxApp {
             self.viewport.scroll_to_bottom(&mut self.older_history);
             self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         }
+        if event_is_tool_activity(event) && !self.manual_transcript_scroll_active() {
+            self.transcript_scroll_animation = None;
+            self.viewport.scroll_to_bottom(&mut self.older_history);
+            self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+            self.pending_assistant_stream_anchor = false;
+        }
         let was_following = self.viewport.following()
             && self.transcript_scroll_animation.is_none()
             && self.submitted_user_message_following
                 != SubmittedUserMessageFollowing::PendingAnchor
-            && !self.pending_assistant_stream_anchor;
+            && !self.assistant_scroll_anchor.is_pending();
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();
         }
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => {
+                self.active_tool_calls.clear();
+                self.tool_activity_seen = false;
+                self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.push_committed_user_message(event.sequence, text, application);
             }
             SessionEventKind::AssistantDelta { text } => {
-                if was_following {
-                    self.pending_assistant_stream_anchor = true;
-                }
                 self.push_live_assistant_delta(text, application);
+                self.maybe_request_assistant_stream_anchor(was_following);
             }
             SessionEventKind::AssistantMessage { text } => {
                 self.finish_streaming_item("Assistant", text, application);
+                self.finish_assistant_stream_anchor();
             }
             SessionEventKind::SystemMessage { text } => self.push_system_message(text),
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-            } => self.push_tool_request(tool_call_id, tool_name, arguments_json),
+            } => {
+                self.active_tool_calls.insert(tool_call_id.clone());
+                self.tool_activity_seen = true;
+                self.push_tool_request(tool_call_id, tool_name, arguments_json);
+            }
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
                 result,
@@ -1006,6 +1113,7 @@ impl BmuxApp {
                 if application.live_activity() {
                     self.set_activity(ActivityState::Thinking);
                 }
+                self.active_tool_calls.remove(tool_call_id);
                 self.push_tool_result(tool_call_id, result, *is_error, application);
             }
             SessionEventKind::ToolInvocationStream { event } => {
@@ -1483,6 +1591,8 @@ impl BmuxApp {
                 started_at_ms,
                 ..
             } => {
+                self.active_tool_calls.insert(tool_call_id.clone());
+                self.tool_activity_seen = true;
                 if *terminal {
                     self.streamed_tool_results.insert(
                         tool_call_id.clone(),
@@ -1513,6 +1623,7 @@ impl BmuxApp {
                 finished_at_ms,
                 ..
             } => {
+                self.active_tool_calls.remove(tool_call_id);
                 if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id)
                     && let Some(index) = context.index
                     && let Some(item) = self.transcript.get_mut(index)
@@ -1546,6 +1657,7 @@ impl BmuxApp {
             return;
         }
         if stream == ToolOutputStream::Pty {
+            self.tool_activity_seen = true;
             self.push_terminal_output_delta(tool_call_id, text);
             return;
         }
@@ -1553,10 +1665,12 @@ impl BmuxApp {
             && let Some(index) = context.index
             && let Some(item) = self.transcript.get_mut(index)
         {
+            self.tool_activity_seen = true;
             item.append_text(text);
             return;
         }
         let context = self.tool_call_contexts.get(tool_call_id);
+        self.tool_activity_seen = true;
         self.transcript.push(streaming_tool_output_item(
             tool_call_id,
             context.map(|context| context.tool_name.as_str()),
@@ -2188,6 +2302,21 @@ fn working_directory_changed_message(
         "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
         old_working_directory.display(),
         new_working_directory.display()
+    )
+}
+
+const fn event_is_tool_activity(event: &SessionEvent) -> bool {
+    matches!(
+        &event.kind,
+        SessionEventKind::ToolCallRequested { .. }
+            | SessionEventKind::ToolCallFinished { .. }
+            | SessionEventKind::PermissionRequested { .. }
+            | SessionEventKind::PermissionResolved { .. }
+            | SessionEventKind::ToolInvocationStream { .. }
+            | SessionEventKind::RuntimeWorkStarted { .. }
+            | SessionEventKind::RuntimeWorkCancelRequested { .. }
+            | SessionEventKind::RuntimeWorkProgress { .. }
+            | SessionEventKind::RuntimeWorkFinished { .. }
     )
 }
 
