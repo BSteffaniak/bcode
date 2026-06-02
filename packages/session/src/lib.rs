@@ -76,6 +76,8 @@ pub enum SessionError {
         session_id: SessionId,
         status: SessionAccessStatus,
     },
+    #[error("legacy session requires explicit migration to DB before normal access: {0}")]
+    LegacyMigrationRequired(SessionId),
     #[error(
         "session DB projection is stale: {session_id} {projection} checkpoint={checkpoint:?} expected={expected}"
     )]
@@ -163,6 +165,7 @@ struct SessionMigrationBackupManifest {
     files: Vec<SessionMigrationBackupFile>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct ModelContextEventsRead {
     events: Vec<SessionEvent>,
     refreshed_index: Option<index::SessionIndex>,
@@ -589,6 +592,7 @@ impl SessionEventStore {
         Ok(reader::read_events(&path)?.events)
     }
 
+    #[allow(dead_code)]
     fn read_session_events_range(
         &self,
         session_id: SessionId,
@@ -833,6 +837,7 @@ impl SessionEventStore {
         })
     }
 
+    #[allow(dead_code)]
     fn read_session_input_history(
         &self,
         session_id: SessionId,
@@ -877,7 +882,7 @@ impl SessionEventStore {
         Ok(input_index.entries)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(dead_code, clippy::too_many_lines)]
     fn read_model_context_events(
         &self,
         session_id: SessionId,
@@ -1638,6 +1643,7 @@ fn read_indexed_events(
     reader::read_events_at_offsets(event_path, &offsets)
 }
 
+#[allow(dead_code)]
 fn select_event_range_entries(
     mut entries: Vec<index::SessionIndexEntry>,
     start_sequence: u64,
@@ -1951,24 +1957,22 @@ impl SessionManager {
             return Err(SessionError::NotFound(session_id));
         };
         self.metrics.record_histogram(
-            "session.manager.ensure_loaded.load_session_duration_ms",
+            "session.manager.ensure_loaded.legacy_migration_required_duration_ms",
             load_timer.elapsed_ms(),
         );
-        let insert_timer = self.metrics.timer();
-        let mut inner = self.inner.lock().await;
-        inner
-            .sessions
-            .entry(session_id)
-            .or_insert_with(|| SessionHandle::new(state, self.store.clone()));
-        self.metrics.record_histogram(
-            "session.manager.ensure_loaded.insert_duration_ms",
-            insert_timer.elapsed_ms(),
-        );
+        if state.index_status == SessionIndexStatusKind::Stale {
+            self.inner
+                .lock()
+                .await
+                .sessions
+                .entry(session_id)
+                .or_insert_with(|| SessionHandle::new(state, self.store.clone()));
+        }
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.total_duration_ms",
             total_timer.elapsed_ms(),
         );
-        Ok(())
+        Err(SessionError::LegacyMigrationRequired(session_id))
     }
 
     /// Return the current persistent catalog discovery status.
@@ -4567,14 +4571,14 @@ mod tests {
                 .expect("status should load"),
             super::SessionAccessStatus::ReadWrite
         );
-        let history = restored
+        let error = restored
             .session_history(session_id)
             .await
-            .expect("history should load");
-        assert_eq!(
-            history[0].schema_version,
-            CURRENT_SESSION_EVENT_SCHEMA_VERSION
-        );
+            .expect_err("normal history access should require DB migration");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
 
         let second = store
             .migrate_event_log(session_id, &TestV7ToCurrentMigration)
@@ -4696,8 +4700,11 @@ mod tests {
         let error = manager
             .attach_session_recent(session_id, ClientId::new(), 10)
             .await
-            .expect_err("old session without indexes should require repair");
-        assert!(matches!(error, super::SessionError::Store(_)));
+            .expect_err("old session without DB should require explicit DB migration");
+        assert!(matches!(
+            error,
+            super::SessionError::LegacyMigrationRequired(_)
+        ));
         assert_eq!(
             manager
                 .session_access_status(session_id)

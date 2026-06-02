@@ -663,6 +663,7 @@ fn validate_manifest_at_append_checkpoint(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn ensure_input_history_index(
     root: &Path,
     session_id: SessionId,

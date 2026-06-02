@@ -604,22 +604,18 @@ impl SessionActor {
                 }
                 if let Some(history) = self.recent_history_from_db(limit).await? {
                     history
+                } else if self.store.is_some() {
+                    return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
                 } else {
-                    let store = self
-                        .store
-                        .as_ref()
-                        .ok_or(SessionError::NotFound(self.state.summary.id))?;
-                    store
-                        .read_session_history_page(
-                            self.state.summary.id,
-                            SessionHistoryQuery {
-                                cursor: None,
-                                limit,
-                                direction: SessionHistoryDirection::Backward,
-                            },
-                        )
+                    self.history()
                         .await?
-                        .events
+                        .into_iter()
+                        .rev()
+                        .take(limit)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect()
                 }
             }
             AttachMode::ProjectionWindow { history } => history,
@@ -692,21 +688,21 @@ impl SessionActor {
         let history = match mode {
             AttachMode::Full => self.history().await?,
             AttachMode::Recent { limit } => {
-                let store = self
-                    .store
-                    .as_ref()
-                    .ok_or(SessionError::NotFound(self.state.summary.id))?;
-                store
-                    .read_session_history_page(
-                        self.state.summary.id,
-                        SessionHistoryQuery {
-                            cursor: None,
-                            limit,
-                            direction: SessionHistoryDirection::Backward,
-                        },
-                    )
-                    .await?
-                    .events
+                if let Some(history) = self.recent_history_from_db(limit).await? {
+                    history
+                } else if self.store.is_some() {
+                    return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+                } else {
+                    self.history()
+                        .await?
+                        .into_iter()
+                        .rev()
+                        .take(limit)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect()
+                }
             }
             AttachMode::ProjectionWindow { history } => history,
         };
@@ -764,11 +760,10 @@ impl SessionActor {
         if let Some(events) = &self.state.events {
             return Ok(events.clone());
         }
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        Ok(store.read_session_events(self.state.summary.id).await?)
+        if self.store.is_some() {
+            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+        }
+        Err(SessionError::NotFound(self.state.summary.id))
     }
 
     async fn projection_window_from_index(
@@ -842,18 +837,10 @@ impl SessionActor {
                 max_events,
             ));
         }
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        Ok(store
-            .read_session_events_range(
-                self.state.summary.id,
-                start_sequence,
-                end_sequence,
-                max_events,
-            )
-            .await?)
+        if self.store.is_some() {
+            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+        }
+        Err(SessionError::NotFound(self.state.summary.id))
     }
 
     async fn recent_history_from_db(
@@ -917,13 +904,10 @@ impl SessionActor {
         if let Some(events) = &self.state.events {
             return Ok(input_history_from_events(events));
         }
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        Ok(store
-            .read_session_input_history(self.state.summary.id)
-            .await?)
+        if self.store.is_some() {
+            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+        }
+        Err(SessionError::NotFound(self.state.summary.id))
     }
 
     async fn active_tool_runs(&mut self) -> Result<Vec<crate::db::ToolRun>, SessionError> {
@@ -960,22 +944,10 @@ impl SessionActor {
         if let Some(events) = &self.state.events {
             return Ok(model_context_events_from_history(events));
         }
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        let (events, refreshed_state) = store
-            .read_model_context_events(self.state.summary.id)
-            .await?;
-        if let Some(mut state) = refreshed_state {
-            state.clients.clone_from(&self.state.clients);
-            state.summary.client_count = self.state.summary.client_count;
-            state.sender = self.state.sender.clone();
-            state.access_status = self.state.access_status;
-            self.state = state;
-            self.refresh_snapshot();
+        if self.store.is_some() {
+            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
         }
-        Ok(events)
+        Err(SessionError::NotFound(self.state.summary.id))
     }
 
     fn set_current_agent(&mut self, agent_id: String) -> Result<(), SessionError> {

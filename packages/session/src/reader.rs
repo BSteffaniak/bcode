@@ -96,6 +96,7 @@ pub fn read_events(path: &Path) -> Result<SessionReadReport, SessionStoreError> 
     })
 }
 
+#[allow(dead_code)]
 pub fn read_event_at(path: &Path, offset: u64) -> Result<SessionEvent, SessionStoreError> {
     let mut events = read_events_at_offsets(path, &[offset])?;
     events

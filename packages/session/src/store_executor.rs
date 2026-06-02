@@ -261,6 +261,7 @@ impl SessionStoreExecutor {
         .await?
     }
 
+    #[allow(dead_code)]
     pub async fn read_session_events_range(
         &self,
         session_id: SessionId,
@@ -296,6 +297,7 @@ impl SessionStoreExecutor {
         .await?
     }
 
+    #[allow(dead_code)]
     pub async fn read_session_input_history(
         &self,
         session_id: SessionId,
@@ -322,6 +324,7 @@ impl SessionStoreExecutor {
         .await?
     }
 
+    #[allow(dead_code)]
     pub async fn read_model_context_events(
         &self,
         session_id: SessionId,
