@@ -215,20 +215,10 @@ impl SessionEventStore {
         }
 
         if db::global_catalog_db_path(&self.root).exists() {
-            match self.load_global_catalog_session_ids() {
-                Ok(session_ids) => {
-                    for session_id in session_ids {
-                        match self.load_db_session_state(session_id) {
-                            Ok(Some(state)) => {
-                                sessions.insert(session_id, state);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                eprintln!(
-                                    "skipping unreadable catalog DB session {session_id}: {error}"
-                                );
-                            }
-                        }
+            match self.load_global_catalog_summaries() {
+                Ok(summaries) => {
+                    for summary in summaries {
+                        sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
                     }
                     return Ok(sessions);
                 }
@@ -290,7 +280,7 @@ impl SessionEventStore {
         Ok(sessions)
     }
 
-    fn load_global_catalog_session_ids(&self) -> Result<Vec<SessionId>, SessionStoreError> {
+    fn load_global_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
         let root = self.root.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -301,14 +291,10 @@ impl SessionEventStore {
                 let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
                     .await
                     .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                let summaries = catalog
+                catalog
                     .list_sessions()
                     .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                Ok(summaries
-                    .into_iter()
-                    .map(|summary| summary.id)
-                    .collect::<Vec<_>>())
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))
             })
         })
         .join()
@@ -1878,7 +1864,22 @@ impl SessionManager {
 
     async fn ensure_session_loaded(&self, session_id: SessionId) -> Result<(), SessionError> {
         let total_timer = self.metrics.timer();
-        if self.inner.lock().await.sessions.contains_key(&session_id) {
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            if handle.snapshot().index_status == SessionIndexStatusKind::Stale
+                && let Some(store) = &self.store
+                && db::session_db_path(&store.root_path(), session_id).exists()
+            {
+                let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+                let activity_bounds = db.activity_bounds().await?;
+                let events = db.all_events().await?;
+                let mut state = SessionState::from_events(session_id, &events)?;
+                if let Some((created_at_ms, updated_at_ms)) = activity_bounds {
+                    state.summary.created_at_ms = created_at_ms;
+                    state.summary.updated_at_ms = updated_at_ms;
+                }
+                handle.replace_state(state).await?;
+            }
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.cached_total_duration_ms",
                 total_timer.elapsed_ms(),
@@ -3220,6 +3221,29 @@ impl SessionManager {
 }
 
 impl SessionState {
+    pub(crate) fn from_catalog_summary(summary: SessionSummary) -> Self {
+        let (sender, _) = broadcast::channel(512);
+        let working_directory = normalize_working_directory(&summary.working_directory);
+        Self {
+            summary,
+            working_directory,
+            clients: BTreeSet::new(),
+            events: None,
+            next_sequence: 0,
+            event_count: 0,
+            has_user_message: false,
+            current_provider: None,
+            current_model: None,
+            current_agent: None,
+            latest_compaction_sequence: None,
+            total_metered_tokens: 0,
+            index_issues: Vec::new(),
+            index_status: SessionIndexStatusKind::Stale,
+            access_status: SessionAccessStatus::ReadWrite,
+            sender,
+        }
+    }
+
     pub(crate) fn from_events(
         session_id: SessionId,
         events: &[SessionEvent],
