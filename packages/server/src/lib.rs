@@ -1490,6 +1490,15 @@ async fn handle_request(
             )
             .await
         }
+        Request::ListLegacySessionsForMigration => {
+            handle_list_legacy_sessions_for_migration(request_id, state, writer).await
+        }
+        Request::MigrateLegacySessionToDb { session_id } => {
+            handle_migrate_legacy_session_to_db(request_id, state, writer, session_id).await
+        }
+        Request::MigrateAllLegacySessionsToDb => {
+            handle_migrate_all_legacy_sessions_to_db(request_id, state, writer).await
+        }
         Request::ImportExternalSession {
             source_id,
             external_session_id,
@@ -2310,6 +2319,107 @@ async fn ensure_attachable_session_health(
     )
     .await?;
     Ok(false)
+}
+
+async fn handle_list_legacy_sessions_for_migration(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match state.sessions.list_legacy_sessions_for_migration().await {
+        Ok(candidates) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::LegacySessionMigrationCandidates { candidates }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "legacy_discovery_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_migrate_legacy_session_to_db(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    match state
+        .sessions
+        .migrate_legacy_session_to_db(session_id)
+        .await
+    {
+        Ok(session) => {
+            state
+                .session_catalog
+                .upsert_native_session(session.clone())
+                .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::LegacySessionMigrated { session }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "legacy_migration_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_migrate_all_legacy_sessions_to_db(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match state.sessions.migrate_all_legacy_sessions_to_db().await {
+        Ok(results) => {
+            for result in &results {
+                if let Some(summary) = &result.summary {
+                    state
+                        .session_catalog
+                        .upsert_native_session(summary.clone())
+                        .await;
+                }
+            }
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::LegacySessionMigrationResults { results }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "legacy_migration_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_attach_session(

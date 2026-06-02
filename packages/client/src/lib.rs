@@ -14,9 +14,9 @@ use bcode_ipc::{
     decode, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
-    SessionEventKind, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionSummary,
+    ClientId, LegacySessionCandidate, LegacySessionMigrationResult, ProjectionWindowRequest,
+    RuntimeWorkId, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryPage,
+    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::BTreeMap;
@@ -1505,6 +1505,58 @@ impl ClientConnection {
                 input_history,
                 import_warnings,
             }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List legacy sessions that can be explicitly migrated to DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_legacy_sessions_for_migration(
+        &mut self,
+    ) -> Result<Vec<LegacySessionCandidate>, ClientError> {
+        match self
+            .send_request(Request::ListLegacySessionsForMigration)
+            .await?
+        {
+            ResponsePayload::LegacySessionMigrationCandidates { candidates } => Ok(candidates),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Explicitly migrate one legacy session to DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or migration fails.
+    pub async fn migrate_legacy_session_to_db(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, ClientError> {
+        match self
+            .send_request(Request::MigrateLegacySessionToDb { session_id })
+            .await?
+        {
+            ResponsePayload::LegacySessionMigrated { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Explicitly migrate all discovered legacy sessions to DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when legacy discovery cannot run.
+    pub async fn migrate_all_legacy_sessions_to_db(
+        &mut self,
+    ) -> Result<Vec<LegacySessionMigrationResult>, ClientError> {
+        match self
+            .send_request(Request::MigrateAllLegacySessionsToDb)
+            .await?
+        {
+            ResponsePayload::LegacySessionMigrationResults { results } => Ok(results),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

@@ -31,11 +31,12 @@ pub use migration::{
 use actor::{AttachMode, SessionHandle};
 use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
-    ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
-    SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacySessionCandidate,
+    LegacySessionMigrationResult, ModelTurnOutcome, ProjectionWindow, ProjectionWindowRequest,
+    SessionEvent, SessionEventKind, SessionEventProvenance, SessionHistoryDirection,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
+    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, SessionTokenUsage,
+    SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1050,23 +1051,6 @@ pub enum SessionHealth {
     RepairRequired { reason: String },
     /// No DB-backed or legacy session exists for the id.
     NotFound,
-}
-
-/// Legacy `.events` file discovered for explicit DB migration.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct LegacySessionCandidate {
-    pub session_id: SessionId,
-    pub event_path: PathBuf,
-    pub has_db: bool,
-}
-
-/// Result of explicitly migrating one legacy session candidate to DB.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct LegacySessionMigrationResult {
-    pub session_id: SessionId,
-    pub migrated: bool,
-    pub summary: Option<SessionSummary>,
-    pub error: Option<String>,
 }
 
 /// Background session maintenance status.
