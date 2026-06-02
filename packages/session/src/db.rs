@@ -153,6 +153,28 @@ impl SessionDb {
         tx.commit().await?;
         Ok(())
     }
+    /// Return the last event sequence processed by a projection, if known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint query fails or returns an invalid row.
+    pub async fn projection_checkpoint(
+        &self,
+        projection_name: &str,
+    ) -> SessionDbResult<Option<u64>> {
+        let row = self
+            .db
+            .select("projection_checkpoints")
+            .columns(&["last_event_seq"])
+            .where_eq("projection_name", projection_name)
+            .execute_first(&**self.db)
+            .await?;
+
+        row.as_ref()
+            .map(|row| required_i64(row, "last_event_seq").map(i64_to_u64))
+            .transpose()
+    }
+
     /// Return input history from the indexed projection table.
     ///
     /// # Errors

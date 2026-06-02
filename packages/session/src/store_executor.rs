@@ -48,6 +48,10 @@ pub struct SessionStoreExecutor {
 }
 
 impl SessionStoreExecutor {
+    pub fn root_path(&self) -> PathBuf {
+        self.store.root().to_path_buf()
+    }
+
     pub const fn new(store: SessionEventStore) -> Self {
         Self { store }
     }

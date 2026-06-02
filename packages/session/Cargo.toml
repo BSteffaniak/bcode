@@ -28,6 +28,9 @@ switchy = { workspace = true, features = [
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

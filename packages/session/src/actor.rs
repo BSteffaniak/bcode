@@ -1,6 +1,7 @@
 //! Session actor, handle, and snapshot plumbing.
 
 use super::*;
+use crate::db::SessionDb;
 use crate::store_executor::PersistedSessionMetadata;
 use bcode_session_models::ToolInvocationStreamEvent;
 use std::sync::RwLock;
@@ -20,6 +21,7 @@ impl SessionHandle {
         let actor = SessionActor {
             state,
             store,
+            db: None,
             commands: receiver,
             snapshot: Arc::clone(&snapshot),
         };
@@ -312,6 +314,7 @@ enum SessionCommand {
 struct SessionActor {
     state: SessionState,
     store: Option<SessionStoreExecutor>,
+    db: Option<SessionDb>,
     commands: mpsc::Receiver<SessionCommand>,
     snapshot: Arc<RwLock<SessionSnapshot>>,
 }
@@ -465,6 +468,18 @@ impl SessionActor {
             .expect("session snapshot lock poisoned") = SessionSnapshot::from_state(&self.state);
     }
 
+    async fn session_db(&mut self) -> Result<Option<SessionDb>, SessionError> {
+        if self.db.is_some() {
+            return Ok(self.db.clone());
+        }
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let db = SessionDb::open_turso_in_root(self.state.summary.id, &store.root_path()).await?;
+        self.db = Some(db.clone());
+        Ok(Some(db))
+    }
+
     async fn append_event(
         &mut self,
         kind: SessionEventKind,
@@ -480,6 +495,21 @@ impl SessionActor {
                 "session.actor.append_event.append_frame_duration_ms",
                 elapsed_ms(append_started_at),
             );
+        }
+        if let Some(db) = self.session_db().await? {
+            let db_append_started_at = Instant::now();
+            if let Err(error) = db.append_event(&event).await {
+                eprintln!(
+                    "failed to mirror session event {}:{} into session database: {error}",
+                    event.session_id, event.sequence
+                );
+            }
+            if let Some(store) = &self.store {
+                store.metrics().record_histogram(
+                    "session.actor.append_event.db_append_duration_ms",
+                    elapsed_ms(db_append_started_at),
+                );
+            }
         }
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
@@ -792,7 +822,30 @@ impl SessionActor {
             .await?)
     }
 
-    async fn input_history(&self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+    async fn input_history(&mut self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+        if let Some(db) = self.session_db().await? {
+            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+            match db.projection_checkpoint("input_history").await {
+                Ok(Some(checkpoint)) if checkpoint >= expected_last_sequence => {
+                    match db.input_history().await {
+                        Ok(input_history) => return Ok(input_history),
+                        Err(error) => {
+                            eprintln!(
+                                "failed to read session input history from database for {}: {error}",
+                                self.state.summary.id
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!(
+                        "failed to read session input history checkpoint for {}: {error}",
+                        self.state.summary.id
+                    );
+                }
+            }
+        }
         if let Some(events) = &self.state.events {
             return Ok(input_history_from_events(events));
         }
