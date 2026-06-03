@@ -10,23 +10,8 @@
 
 mod actor;
 pub mod db;
-pub(crate) mod derived;
-pub(crate) mod event_migration;
-pub(crate) mod index;
-pub mod migration;
 pub mod projection;
-pub(crate) mod reader;
 mod store_executor;
-
-pub use index::{SessionIndexHealth, SessionIndexStatus};
-pub use migration::{
-    SessionEventLogMigration, SessionEventLogMigrationError, SessionMigrationAction,
-    SessionMigrationApplyPolicy, SessionMigrationApplyStatus, SessionMigrationBackupPolicy,
-    SessionMigrationDefinition, SessionMigrationJournalEntry, SessionMigrationJournalStatus,
-    SessionMigrationOptions, SessionMigrationPlan, SessionMigrationPlanItem,
-    SessionMigrationRecoveryItem, SessionMigrationRecoveryStatus, SessionMigrationRegistry,
-    SessionMigrationRegistryError, SessionMigrationReport, SessionMigrationReportItem,
-};
 
 use actor::{AttachMode, SessionHandle};
 use bcode_metrics::MetricsRegistry;
@@ -37,24 +22,19 @@ use bcode_session_models::{
     SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
     SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Seek as _, SeekFrom, Write};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use store_executor::{PersistedSessionMetadata, SessionStoreExecutor};
+use store_executor::SessionStoreExecutor;
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::spawn_blocking;
-
-const FRAME_V3_MAGIC: &[u8; 4] = b"BSE3";
-const FRAME_V3_VERSION: u16 = 3;
 
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
@@ -143,8 +123,6 @@ pub enum SessionStoreError {
         current_next_sequence: u64,
         attempted_next_sequence: u64,
     },
-    #[error("session migration registry error: {0}")]
-    MigrationRegistry(#[from] SessionMigrationRegistryError),
 }
 
 /// Append-only event store for session histories.
@@ -152,34 +130,6 @@ pub enum SessionStoreError {
 pub struct SessionEventStore {
     root: PathBuf,
     pub(crate) metrics: MetricsRegistry,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SessionMigrationBackupManifest {
-    created_at_ms: u64,
-    domain: &'static str,
-    files: Vec<SessionMigrationBackupFile>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SessionMigrationBackupFile {
-    session_id: SessionId,
-    source: String,
-    backup: String,
-}
-
-fn write_event_frame(file: &mut fs::File, event: &SessionEvent) -> Result<u64, SessionStoreError> {
-    let payload = bmux_codec::to_vec(event).map_err(SessionStoreError::Encode)?;
-    let payload_len = u32::try_from(payload.len())
-        .map_err(|_| SessionStoreError::FrameTooLarge(payload.len()))?;
-    let checksum = Sha256::digest(&payload);
-    file.write_all(FRAME_V3_MAGIC)?;
-    file.write_all(&FRAME_V3_VERSION.to_le_bytes())?;
-    file.write_all(&CURRENT_SESSION_EVENT_SCHEMA_VERSION.to_le_bytes())?;
-    file.write_all(&payload_len.to_le_bytes())?;
-    file.write_all(&checksum)?;
-    file.write_all(&payload)?;
-    Ok(u64::from(payload_len).saturating_add(44))
 }
 
 impl SessionEventStore {
@@ -304,652 +254,6 @@ impl SessionEventStore {
         .map_err(|_| SessionStoreError::CatalogLoad("DB session loader panicked".to_string()))?
     }
 
-    #[allow(dead_code)]
-    fn append(&self, event: &SessionEvent) -> Result<index::SessionIndexEntry, SessionStoreError> {
-        let append_timer = self.metrics.timer();
-        fs::create_dir_all(&self.root)?;
-        let path = self.event_path(event.session_id);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
-        let offset = file.seek(SeekFrom::End(0))?;
-        let write_timer = self.metrics.timer();
-        let frame_len = write_event_frame(&mut file, event)?;
-        file.flush()?;
-        self.metrics.record_histogram(
-            "session.event_log.write_flush_duration_ms",
-            write_timer.elapsed_ms(),
-        );
-        self.metrics
-            .record_histogram("session.event_log.frame_bytes", frame_len);
-        self.metrics
-            .increment_counter("session.event_log.append_total");
-        let entry = index::SessionIndexEntry::from_event(event, offset, frame_len);
-        let index_timer = self.metrics.timer();
-        if let Err(error) = index::append_entry(&self.root, event.session_id, &entry) {
-            self.metrics
-                .increment_counter("session.event_index.append_error_total");
-            eprintln!(
-                "failed to update session entry index for {}: {error}",
-                event.session_id
-            );
-        }
-        self.metrics.record_histogram(
-            "session.event_index.append_duration_ms",
-            index_timer.elapsed_ms(),
-        );
-        if event.sequence == 0 {
-            let file = index::fingerprint(&path)?;
-            let index = index::SessionIndex {
-                index_version: index::SESSION_INDEX_VERSION,
-                session_id: event.session_id,
-                file,
-                summary: SessionSummary {
-                    id: event.session_id,
-                    name: None,
-                    explicit_name: None,
-                    derived_title: None,
-                    title_source: SessionTitleSource::EmptyDraft,
-                    client_count: 0,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                    working_directory: PathBuf::new(),
-                    import: None,
-                },
-                working_directory: PathBuf::new(),
-                next_sequence: 1,
-                event_count: 1,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                has_user_message: false,
-                last_good_offset: offset.saturating_add(frame_len),
-                current_provider: None,
-                current_model: None,
-                current_agent: None,
-                latest_compaction_sequence: None,
-                total_metered_tokens: 0,
-                min_event_schema_version: Some(event.schema_version),
-                max_event_schema_version: Some(event.schema_version),
-                issues: Vec::new(),
-            };
-            let _ = derived::initialize_empty_after_session_created(&self.root, &index);
-        } else {
-            let derived_timer = self.metrics.timer();
-            if derived::event_updates_indexes_on_append(event)
-                && let Err(error) = derived::append_event_to_indexes(
-                    &self.root,
-                    event.session_id,
-                    &path,
-                    &entry,
-                    event,
-                )
-            {
-                self.metrics
-                    .increment_counter("session.derived_index.append_error_total");
-                eprintln!(
-                    "failed to update derived session indexes for {}: {error}",
-                    event.session_id
-                );
-            }
-            self.metrics.record_histogram(
-                "session.derived_index.append_duration_ms",
-                derived_timer.elapsed_ms(),
-            );
-        }
-        self.metrics.record_histogram(
-            "session.event_log.append_duration_ms",
-            append_timer.elapsed_ms(),
-        );
-        Ok(entry)
-    }
-
-    fn read_legacy_events_for_migration(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
-        let path = self.event_path(session_id);
-        Ok(reader::read_events(&path)?.events)
-    }
-
-    #[allow(dead_code)]
-    fn write_metadata_index(
-        &self,
-        metadata: &PersistedSessionMetadata,
-    ) -> Result<(), SessionStoreError> {
-        let path = self.event_path(metadata.summary.id);
-        let file = index::fingerprint(&path)?;
-        let index = index::SessionIndex {
-            index_version: index::SESSION_INDEX_VERSION,
-            session_id: metadata.summary.id,
-            last_good_offset: file.len,
-            file,
-            summary: SessionSummary {
-                client_count: 0,
-                ..metadata.summary.clone()
-            },
-            working_directory: metadata.working_directory.clone(),
-            next_sequence: metadata.next_sequence,
-            event_count: metadata.event_count,
-            created_at_ms: metadata.summary.created_at_ms,
-            updated_at_ms: metadata.summary.updated_at_ms,
-            has_user_message: metadata.has_user_message,
-            current_provider: metadata.current_provider.clone(),
-            current_model: metadata.current_model.clone(),
-            current_agent: metadata.current_agent.clone(),
-            latest_compaction_sequence: metadata.latest_compaction_sequence,
-            total_metered_tokens: metadata.total_metered_tokens,
-            min_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            max_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            issues: metadata.index_issues.clone(),
-        };
-        let timer = self.metrics.timer();
-        let result = index::write_index(&self.root, &index);
-        self.metrics.record_histogram(
-            "session.metadata_index.write_duration_ms",
-            timer.elapsed_ms(),
-        );
-        if result.is_err() {
-            self.metrics
-                .increment_counter("session.metadata_index.write_error_total");
-        }
-        result
-    }
-
-    /// Repair a session log by backing up and truncating an unreadable tail.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the event file cannot be read, backed up, truncated, or reindexed.
-    pub fn repair_session_tail(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<PathBuf>, SessionStoreError> {
-        let path = self.event_path(session_id);
-        let report = reader::read_events(&path)?;
-        let file_len = fs::metadata(&path)?.len();
-        if report.last_good_offset >= file_len {
-            self.reindex_session(session_id)?;
-            return Ok(None);
-        }
-        let backup = corrupt_backup_path(&path);
-        fs::copy(&path, &backup)?;
-        let file = OpenOptions::new().write(true).open(&path)?;
-        file.set_len(report.last_good_offset)?;
-        self.reindex_session(session_id)?;
-        Ok(Some(backup))
-    }
-
-    /// Restore a session's canonical event log from a migration backup and rebuild its index.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the backup, event file, or rebuilt index cannot be read or written.
-    pub fn restore_session_from_backup(
-        &self,
-        session_id: SessionId,
-        backup_path: &Path,
-    ) -> Result<PathBuf, SessionStoreError> {
-        let path = self.event_path(session_id);
-        if !backup_path.exists() {
-            return Err(SessionStoreError::InvalidSessionId(format!(
-                "backup does not exist: {}",
-                backup_path.display()
-            )));
-        }
-        let restore_backup = corrupt_backup_path(&path);
-        if path.exists() {
-            fs::copy(&path, &restore_backup)?;
-        }
-        fs::copy(backup_path, &path)?;
-        self.reindex_session(session_id)?;
-        Ok(restore_backup)
-    }
-
-    /// Rebuild the sidecar index for one session from its canonical event log.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the event file cannot be read or the index cannot be written.
-    pub fn reindex_session(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
-        let path = self.event_path(session_id);
-        let _ = index::rebuild_index(&self.root, session_id, &path)?;
-        Ok(())
-    }
-
-    /// Rebuild every session sidecar index under this store.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session directory cannot be scanned or any index cannot be rebuilt.
-    pub fn reindex_all(&self) -> Result<Vec<SessionId>, SessionStoreError> {
-        let mut rebuilt = Vec::new();
-        if !self.root.exists() {
-            return Ok(rebuilt);
-        }
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
-                continue;
-            }
-            let session_id = parse_session_file_name(&path)?;
-            self.reindex_session(session_id)?;
-            rebuilt.push(session_id);
-        }
-        Ok(rebuilt)
-    }
-
-    /// Return index health for one persisted session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session event file or index cannot be read.
-    pub fn doctor_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
-        self.doctor_session_with_fix(session_id, false)
-    }
-
-    /// Return index health for one persisted session, optionally rebuilding stale indexes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session event file or index cannot be read.
-    pub fn doctor_session_with_fix(
-        &self,
-        session_id: SessionId,
-        fix: bool,
-    ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
-        self.doctor_session_with_options(session_id, fix, false)
-    }
-
-    /// Return index health for one persisted session with explicit rebuild behavior.
-    ///
-    /// When `force` is true the index is rebuilt even if the existing index is
-    /// fresh. This lets metadata-only derivation changes (for example legacy
-    /// title recovery) be applied without requiring an event-file change.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session event file or index cannot be read.
-    pub fn doctor_session_with_options(
-        &self,
-        session_id: SessionId,
-        fix: bool,
-        force: bool,
-    ) -> Result<Option<SessionIndexHealth>, SessionStoreError> {
-        let path = self.event_path(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        if fix && force {
-            let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
-            let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
-            return Ok(index.map(|index| index.health(true, derived)));
-        }
-        if let Some(index) = index::load_fresh_index(&self.root, session_id, &path)? {
-            let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
-            return Ok(Some(index.health(false, derived)));
-        }
-        if fix {
-            let (index, _) = index::rebuild_index(&self.root, session_id, &path)?;
-            let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
-            return Ok(index.map(|index| index.health(true, derived)));
-        }
-        let derived = derived::health_all(&self.root, session_id, &path, fix, force)?;
-        Ok(
-            index::rebuild_index_metadata(&self.root, session_id, &path)?
-                .map(|index| index.health(true, derived)),
-        )
-    }
-
-    /// Return index health for every persisted session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session directory or an index file cannot be read.
-    pub fn doctor_all(&self) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
-        self.doctor_all_with_fix(false)
-    }
-
-    /// Return index health for every persisted session, optionally rebuilding stale indexes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session directory or an index file cannot be read.
-    pub fn doctor_all_with_fix(
-        &self,
-        fix: bool,
-    ) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
-        self.doctor_all_with_options(fix, false)
-    }
-
-    /// Return index health for every persisted session with explicit rebuild behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session directory or an index file cannot be read.
-    pub fn doctor_all_with_options(
-        &self,
-        fix: bool,
-        force: bool,
-    ) -> Result<Vec<SessionIndexHealth>, SessionStoreError> {
-        let mut health = Vec::new();
-        if !self.root.exists() {
-            return Ok(health);
-        }
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
-                continue;
-            }
-            let session_id = parse_session_file_name(&path)?;
-            if let Some(item) = self.doctor_session_with_options(session_id, fix, force)? {
-                health.push(item);
-            }
-        }
-        Ok(health)
-    }
-
-    /// Return recovery status from the session migration journal.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the migration journal cannot be read or decoded.
-    pub fn migration_recovery_status(
-        &self,
-    ) -> Result<SessionMigrationRecoveryStatus, SessionStoreError> {
-        let entries = migration::read_journal_entries(&self.root)?;
-        migration::recovery_status(&self.root, &entries)
-    }
-
-    /// Plan safe session persistence migrations without applying them.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session directory or event metadata cannot be read.
-    pub fn migration_plan(&self) -> Result<SessionMigrationPlan, SessionStoreError> {
-        let registry = SessionMigrationRegistry::builtin();
-        registry.validate()?;
-        let index_rebuild =
-            registry.required_migration_for_action(SessionMigrationAction::RebuildDerivedIndex)?;
-        let mut items = Vec::new();
-        if !self.root.exists() {
-            return Ok(SessionMigrationPlan {
-                domain: "sessions/index",
-                items,
-            });
-        }
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
-                continue;
-            }
-            let session_id = parse_session_file_name(&path)?;
-            match index::inspect_index(&self.root, session_id, &path)? {
-                index::SessionIndexStatus::Current(_) => {}
-                index::SessionIndexStatus::Missing { current_version } => {
-                    items.push(SessionMigrationPlanItem {
-                        migration_id: index_rebuild.id,
-                        session_id,
-                        current_version,
-                        found_version: None,
-                        action: index_rebuild.action,
-                        reason: "index is missing".to_string(),
-                        automatic: index_rebuild.automatic(),
-                        backup_policy: index_rebuild.backup_policy,
-                    });
-                }
-                index::SessionIndexStatus::Stale {
-                    found_version,
-                    current_version,
-                    reason,
-                } => {
-                    items.push(SessionMigrationPlanItem {
-                        migration_id: index_rebuild.id,
-                        session_id,
-                        current_version,
-                        found_version,
-                        action: index_rebuild.action,
-                        reason,
-                        automatic: index_rebuild.automatic(),
-                        backup_policy: index_rebuild.backup_policy,
-                    });
-                }
-                index::SessionIndexStatus::Corrupt {
-                    current_version,
-                    reason,
-                } => {
-                    items.push(SessionMigrationPlanItem {
-                        migration_id: index_rebuild.id,
-                        session_id,
-                        current_version,
-                        found_version: None,
-                        action: index_rebuild.action,
-                        reason: format!("index is corrupt: {reason}"),
-                        automatic: index_rebuild.automatic(),
-                        backup_policy: index_rebuild.backup_policy,
-                    });
-                }
-                index::SessionIndexStatus::Future {
-                    found_version,
-                    current_version,
-                } => {
-                    items.push(SessionMigrationPlanItem {
-                        migration_id: index_rebuild.id,
-                        session_id,
-                        current_version,
-                        found_version: Some(found_version),
-                        action: SessionMigrationAction::None,
-                        reason: "index was written by a newer Bcode version".to_string(),
-                        automatic: false,
-                        backup_policy: SessionMigrationBackupPolicy::NotRequired,
-                    });
-                }
-            }
-        }
-        Ok(SessionMigrationPlan {
-            domain: "sessions/index",
-            items,
-        })
-    }
-
-    /// Apply safe session persistence migrations.
-    ///
-    /// Derived index migrations are rebuilt from canonical event logs. When
-    /// `backup` is set, canonical event logs are copied to a migration backup
-    /// directory before any derived files are rewritten.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if migration planning, backup creation, or index rebuilds fail.
-    pub fn apply_migration_plan(
-        &self,
-        options: SessionMigrationOptions,
-    ) -> Result<SessionMigrationReport, SessionStoreError> {
-        let started_at_ms = current_unix_millis();
-        let run_id = format!("session-migration-{started_at_ms}");
-        let plan = self.migration_plan()?;
-        if plan.items.is_empty() {
-            return Ok(SessionMigrationReport {
-                domain: plan.domain,
-                dry_run: options.dry_run,
-                backup_dir: None,
-                items: Vec::new(),
-            });
-        }
-        let migration_ids: Vec<_> = plan
-            .items
-            .iter()
-            .map(|item| item.migration_id.to_string())
-            .collect();
-        let session_ids: Vec<_> = plan.items.iter().map(|item| item.session_id).collect();
-        migration::append_journal_entry(
-            &self.root,
-            &SessionMigrationJournalEntry {
-                run_id: run_id.clone(),
-                domain: plan.domain.to_string(),
-                status: SessionMigrationJournalStatus::Started,
-                dry_run: options.dry_run,
-                backup: options.backup,
-                backup_dir: None,
-                started_at_ms,
-                finished_at_ms: None,
-                migration_ids: migration_ids.clone(),
-                session_ids: session_ids.clone(),
-                error: None,
-            },
-        )?;
-
-        let result = self.apply_migration_plan_inner(&plan, options);
-        let finished_at_ms = current_unix_millis();
-        match &result {
-            Ok(report) => {
-                migration::append_journal_entry(
-                    &self.root,
-                    &SessionMigrationJournalEntry {
-                        run_id,
-                        domain: plan.domain.to_string(),
-                        status: SessionMigrationJournalStatus::Completed,
-                        dry_run: options.dry_run,
-                        backup: options.backup,
-                        backup_dir: report
-                            .backup_dir
-                            .as_ref()
-                            .map(|path| path.display().to_string()),
-                        started_at_ms,
-                        finished_at_ms: Some(finished_at_ms),
-                        migration_ids,
-                        session_ids,
-                        error: None,
-                    },
-                )?;
-            }
-            Err(error) => {
-                let _ = migration::append_journal_entry(
-                    &self.root,
-                    &SessionMigrationJournalEntry {
-                        run_id,
-                        domain: plan.domain.to_string(),
-                        status: SessionMigrationJournalStatus::Failed,
-                        dry_run: options.dry_run,
-                        backup: options.backup,
-                        backup_dir: None,
-                        started_at_ms,
-                        finished_at_ms: Some(finished_at_ms),
-                        migration_ids,
-                        session_ids,
-                        error: Some(error.to_string()),
-                    },
-                );
-            }
-        }
-        result
-    }
-
-    fn apply_migration_plan_inner(
-        &self,
-        plan: &SessionMigrationPlan,
-        options: SessionMigrationOptions,
-    ) -> Result<SessionMigrationReport, SessionStoreError> {
-        let backup_dir = if options.backup && !options.dry_run && !plan.items.is_empty() {
-            Some(self.backup_canonical_events(&plan.items)?)
-        } else {
-            None
-        };
-        let mut items = Vec::new();
-        for item in &plan.items {
-            match item.action {
-                SessionMigrationAction::None => {
-                    items.push(SessionMigrationReportItem {
-                        migration_id: item.migration_id,
-                        session_id: item.session_id,
-                        action: item.action,
-                        status: SessionMigrationApplyStatus::Skipped,
-                        message: item.reason.clone(),
-                    });
-                }
-                SessionMigrationAction::RewriteCanonicalEvents => {
-                    items.push(SessionMigrationReportItem {
-                        migration_id: item.migration_id,
-                        session_id: item.session_id,
-                        action: item.action,
-                        status: SessionMigrationApplyStatus::Skipped,
-                        message: "canonical event migrations require the typed executor"
-                            .to_string(),
-                    });
-                }
-                SessionMigrationAction::RebuildDerivedIndex => {
-                    if options.dry_run {
-                        items.push(SessionMigrationReportItem {
-                            migration_id: item.migration_id,
-                            session_id: item.session_id,
-                            action: item.action,
-                            status: SessionMigrationApplyStatus::Planned,
-                            message: item.reason.clone(),
-                        });
-                    } else {
-                        self.reindex_session(item.session_id)?;
-                        items.push(SessionMigrationReportItem {
-                            migration_id: item.migration_id,
-                            session_id: item.session_id,
-                            action: item.action,
-                            status: SessionMigrationApplyStatus::Applied,
-                            message: item.reason.clone(),
-                        });
-                    }
-                }
-            }
-        }
-        Ok(SessionMigrationReport {
-            domain: plan.domain,
-            dry_run: options.dry_run,
-            backup_dir,
-            items,
-        })
-    }
-
-    pub(crate) fn backup_canonical_events(
-        &self,
-        items: &[SessionMigrationPlanItem],
-    ) -> Result<PathBuf, SessionStoreError> {
-        let backup_dir = self
-            .root
-            .join("backups")
-            .join(format!("migration-{}", current_unix_millis()));
-        fs::create_dir_all(&backup_dir)?;
-        let mut manifest = SessionMigrationBackupManifest {
-            created_at_ms: current_unix_millis(),
-            domain: "sessions/events",
-            files: Vec::new(),
-        };
-        for item in items {
-            if item.action == SessionMigrationAction::None {
-                continue;
-            }
-            let source = self.event_path(item.session_id);
-            if !source.exists() {
-                continue;
-            }
-            let file_name = format!("{}.events", item.session_id);
-            let destination = backup_dir.join(&file_name);
-            fs::copy(&source, &destination)?;
-            manifest.files.push(SessionMigrationBackupFile {
-                session_id: item.session_id,
-                source: source.display().to_string(),
-                backup: file_name,
-            });
-        }
-        let manifest_path = backup_dir.join("manifest.json");
-        let tmp_path = backup_dir.join("manifest.json.tmp");
-        let contents = serde_json::to_vec_pretty(&manifest).map_err(SessionStoreError::Index)?;
-        fs::write(&tmp_path, contents)?;
-        fs::rename(tmp_path, manifest_path)?;
-        Ok(backup_dir)
-    }
-
     fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
         let path = self.event_path(session_id);
         match fs::remove_file(path) {
@@ -957,16 +261,7 @@ impl SessionEventStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(SessionStoreError::Io(error)),
         }
-        match fs::remove_file(index::index_path(&self.root, session_id)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(SessionStoreError::Io(error)),
-        }
-        match fs::remove_file(index::entries_path(&self.root, session_id)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(SessionStoreError::Io(error)),
-        }
+        Ok(())
     }
 
     #[must_use]
@@ -977,24 +272,6 @@ impl SessionEventStore {
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
     }
-}
-
-#[allow(dead_code)]
-fn select_event_range_entries(
-    mut entries: Vec<index::SessionIndexEntry>,
-    start_sequence: u64,
-    end_sequence: u64,
-    max_events: usize,
-) -> Vec<index::SessionIndexEntry> {
-    if start_sequence > end_sequence || max_events == 0 {
-        return Vec::new();
-    }
-    entries.sort_by_key(|entry| entry.sequence);
-    entries
-        .into_iter()
-        .filter(|entry| entry.sequence >= start_sequence && entry.sequence <= end_sequence)
-        .take(max_events)
-        .collect()
 }
 
 /// In-memory session manager with optional append-only persistence.
@@ -1072,7 +349,6 @@ pub(crate) struct SessionState {
     current_agent: Option<String>,
     latest_compaction_sequence: Option<u64>,
     total_metered_tokens: u64,
-    index_issues: Vec<index::SessionIndexIssue>,
     index_status: SessionIndexStatusKind,
     access_status: SessionAccessStatus,
     sender: broadcast::Sender<SessionEvent>,
@@ -1483,7 +759,6 @@ impl SessionManager {
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
-            index_issues: Vec::new(),
             index_status: SessionIndexStatusKind::Current,
             access_status: SessionAccessStatus::ReadWrite,
             sender,
@@ -1500,30 +775,6 @@ impl SessionManager {
             .await?;
         self.inner.lock().await.sessions.insert(id, handle);
         Ok(summary)
-    }
-
-    /// Migrate a legacy `.events` session file into the per-session database.
-    ///
-    /// This is explicit migration/import behavior. Normal DB-backed runtime paths must not call it
-    /// as a hidden fallback or repair step.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if legacy events cannot be read or the session DB cannot be written.
-    pub async fn migrate_legacy_events_to_db(
-        &self,
-        session_id: SessionId,
-    ) -> Result<(), SessionError> {
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(session_id))?;
-        let events = store.read_legacy_events_for_migration(session_id).await?;
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-        for event in &events {
-            db.append_event(event).await?;
-        }
-        Ok(())
     }
 
     /// List known sessions from the session catalog.
@@ -2623,7 +1874,6 @@ impl SessionState {
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
-            index_issues: Vec::new(),
             index_status: SessionIndexStatusKind::Stale,
             access_status: SessionAccessStatus::ReadWrite,
             sender,
@@ -2667,7 +1917,6 @@ impl SessionState {
             current_agent: None,
             latest_compaction_sequence: state.latest_compaction_sequence,
             total_metered_tokens: 0,
-            index_issues: Vec::new(),
             index_status: SessionIndexStatusKind::Current,
             access_status: SessionAccessStatus::ReadWrite,
             sender,
@@ -2703,7 +1952,6 @@ impl SessionState {
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
-            index_issues: Vec::new(),
             index_status: SessionIndexStatusKind::Current,
             access_status: SessionAccessStatus::ReadWrite,
             sender,
@@ -2944,52 +2192,6 @@ fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEve
         .collect()
 }
 
-#[cfg(test)]
-fn access_status_from_report(report: &reader::SessionReadReport) -> SessionAccessStatus {
-    let status = access_status_from_schema_versions(
-        report.min_schema_version,
-        report.max_schema_version,
-        report.issues.iter().any(read_issue_blocks_access),
-    );
-    if report.needs_encoding_migration && status == SessionAccessStatus::ReadWrite {
-        SessionAccessStatus::ReadOnlyMigrationRequired
-    } else {
-        status
-    }
-}
-
-pub(crate) fn read_issue_blocks_access(issue: &reader::SessionReadIssue) -> bool {
-    match &issue.kind {
-        reader::SessionReadIssueKind::Decode { message } => decode_issue_blocks_access(message),
-        reader::SessionReadIssueKind::TruncatedLength { .. }
-        | reader::SessionReadIssueKind::TruncatedPayload { .. }
-        | reader::SessionReadIssueKind::OversizedFrame { .. } => true,
-    }
-}
-
-fn decode_issue_blocks_access(message: &str) -> bool {
-    message.contains("session event frame checksum mismatch")
-        || message.contains("unsupported session frame version")
-}
-
-#[cfg(test)]
-fn access_status_from_schema_versions(
-    min_schema_version: Option<u16>,
-    max_schema_version: Option<u16>,
-    has_issues: bool,
-) -> SessionAccessStatus {
-    if has_issues {
-        return SessionAccessStatus::RepairRequired;
-    }
-    if max_schema_version.is_some_and(|version| version > CURRENT_SESSION_EVENT_SCHEMA_VERSION) {
-        return SessionAccessStatus::BlockedFutureVersion;
-    }
-    if min_schema_version.is_some_and(|version| version < CURRENT_SESSION_EVENT_SCHEMA_VERSION) {
-        return SessionAccessStatus::ReadOnlyMigrationRequired;
-    }
-    SessionAccessStatus::ReadWrite
-}
-
 fn current_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3048,29 +2250,9 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn corrupt_backup_path(path: &Path) -> PathBuf {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map_or_else(|| "session.events".to_string(), ToString::to_string);
-    path.with_file_name(format!("{file_name}.corrupt.{timestamp}"))
-}
-
-fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> {
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| SessionStoreError::InvalidFileName(path.to_path_buf()))?;
-    stem.parse()
-        .map_err(|_| SessionStoreError::InvalidSessionId(stem.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{SessionAccessStatus, SessionManager, access_status_from_report, db, reader};
+    use super::SessionManager;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
@@ -3085,154 +2267,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn session_event_log_golden_fixture_migrates_to_current_schema() {
-        let fixture = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("fixtures/session-events/v1/basic.json"),
-        )
-        .expect("fixture should be readable");
-        let original: Vec<SessionEvent> =
-            serde_json::from_str(&fixture).expect("fixture should decode");
-        let session_id = original
-            .first()
-            .expect("fixture should contain events")
-            .session_id;
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("temp session dir should be created");
-        let store = super::SessionEventStore::new(&root);
-        let path = store.event_path(session_id);
-        {
-            let mut file =
-                std::fs::File::create(&path).expect("fixture event log should be writable");
-            for event in &original {
-                super::write_event_frame(&mut file, event).expect("fixture frame should write");
-            }
-        }
-
-        let report = store
-            .migrate_event_log_to_current(session_id)
-            .expect("fixture should migrate");
-        assert_eq!(report.items.len(), 1);
-
-        let migrated = store
-            .read_legacy_events_for_migration(session_id)
-            .expect("migrated fixture should read");
-        assert!(migrated.len() >= original.len());
-        assert!(migrated.iter().all(|event| {
-            event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION
-                && event.session_id == session_id
-        }));
-        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
-    }
-
-    #[test]
-    fn migration_to_v13_drops_persisted_tool_output_deltas() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("temp session dir should be created");
-        let store = super::SessionEventStore::new(&root);
-        let session_id = bcode_session_models::SessionId::new();
-        let path = store.event_path(session_id);
-        let events = vec![
-            SessionEvent {
-                schema_version: 12,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: None,
-                    working_directory: test_working_directory(),
-                },
-            },
-            SessionEvent {
-                schema_version: 12,
-                sequence: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::Started {
-                        tool_call_id: "tool-1".to_string(),
-                        tool_name: "shell".to_string(),
-                        terminal: false,
-                        columns: None,
-                        rows: None,
-                        started_at_ms: None,
-                    },
-                },
-            },
-            SessionEvent {
-                schema_version: 12,
-                sequence: 2,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::OutputDelta {
-                        tool_call_id: "tool-1".to_string(),
-                        stream: ToolOutputStream::Stdout,
-                        sequence: 1,
-                        text: "large output chunk".to_string(),
-                        byte_len: 18,
-                    },
-                },
-            },
-            SessionEvent {
-                schema_version: 12,
-                sequence: 3,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::Finished {
-                        tool_call_id: "tool-1".to_string(),
-                        sequence: 2,
-                        is_error: false,
-                        finished_at_ms: None,
-                    },
-                },
-            },
-        ];
-        {
-            let mut file = std::fs::File::create(&path).expect("event log should be writable");
-            for event in &events {
-                if event.sequence == 3 {
-                    append_invalid_legacy_payload(&mut file);
-                }
-                super::write_event_frame(&mut file, event).expect("event frame should write");
-            }
-        }
-
-        store
-            .migrate_event_log_to_current(session_id)
-            .expect("migration should succeed");
-        let migrated = store
-            .read_legacy_events_for_migration(session_id)
-            .expect("migrated events should read");
-
-        assert_eq!(migrated.len(), 3);
-        assert!(migrated.iter().all(|event| {
-            event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION
-                && !matches!(
-                    event.kind,
-                    SessionEventKind::ToolInvocationStream {
-                        event: ToolInvocationStreamEvent::OutputDelta { .. }
-                    }
-                )
-        }));
-        assert!(matches!(
-            migrated[1].kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started { .. }
-            }
-        ));
-        assert!(matches!(
-            migrated[2].kind,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Finished { .. }
-            }
-        ));
-        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
-    }
 
     #[tokio::test]
     async fn transient_tool_output_delta_is_not_persisted() {
@@ -3412,52 +2446,6 @@ mod tests {
     }
 
     #[test]
-    fn session_event_binary_golden_fixture_decodes_stable_variant_order() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("fixture root should create");
-        let fixture_path = stable_order_binary_fixture_path();
-        let event_path = root.join("fixture.events");
-        std::fs::copy(&fixture_path, &event_path).expect("fixture should copy");
-
-        let report = reader::read_events(&event_path).expect("fixture should decode");
-        if !report.issues.is_empty() {
-            std::fs::remove_dir_all(root).expect("temp dir should clean up");
-            return;
-        }
-        assert_eq!(report.events.len(), 4);
-        assert!(matches!(
-            &report.events[0].kind,
-            SessionEventKind::SessionCreated { name, .. } if name.as_deref() == Some("stable-order")
-        ));
-        assert!(matches!(
-            &report.events[1].kind,
-            SessionEventKind::AssistantDelta { text } if text == "partial"
-        ));
-        assert!(matches!(
-            &report.events[2].kind,
-            SessionEventKind::ToolCallRequested { tool_name, .. } if tool_name == "read"
-        ));
-        assert!(matches!(
-            &report.events[3].kind,
-            SessionEventKind::SkillInvocationFailed { skill_id, .. } if skill_id.as_str() == "fixture"
-        ));
-
-        std::fs::remove_dir_all(root).expect("fixture root should clean up");
-    }
-
-    #[test]
-    #[ignore = "fixture regeneration is intentional and writes to the repository"]
-    fn write_session_event_binary_golden_fixture() {
-        let path = stable_order_binary_fixture_path();
-        let parent = path.parent().expect("fixture should have parent");
-        std::fs::create_dir_all(parent).expect("fixture dir should create");
-        let mut file = std::fs::File::create(&path).expect("fixture should create");
-        for event in stable_order_binary_fixture_events() {
-            super::write_event_frame(&mut file, &event).expect("fixture event should write");
-        }
-    }
-
-    #[test]
     fn old_order_trace_payload_tool_events_decode_as_same_variant() {
         #[allow(dead_code)]
         #[derive(Serialize)]
@@ -3493,30 +2481,6 @@ mod tests {
             SessionTracePayload::ToolInvocationStarted { tool_call_id, .. }
                 if tool_call_id == "call"
         ));
-    }
-
-    #[test]
-    fn intact_decode_issues_do_not_make_session_read_only() {
-        let report = reader::SessionReadReport {
-            events: Vec::new(),
-            entries: Vec::new(),
-            last_good_offset: 0,
-            issues: vec![reader::SessionReadIssue {
-                offset: 0,
-                kind: reader::SessionReadIssueKind::Decode {
-                    message: "invalid value: integer `29`, expected variant index 0 <= i < 5"
-                        .to_string(),
-                },
-            }],
-            min_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            max_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
-            needs_encoding_migration: false,
-        };
-
-        assert_eq!(
-            access_status_from_report(&report),
-            SessionAccessStatus::ReadWrite
-        );
     }
 
     #[test]
@@ -3722,129 +2686,6 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
-    #[test]
-    fn session_migration_fixture_declarations_exist() {
-        let fixtures = super::migration::session_migration_fixtures();
-        assert!(!fixtures.is_empty());
-        for fixture in fixtures {
-            assert!(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join(fixture.path)
-                    .exists(),
-                "fixture should exist: {}",
-                fixture.path
-            );
-        }
-    }
-
-    #[test]
-    fn migration_authoring_macros_create_expected_definitions() {
-        let derived = super::register_session_derived_rebuild!(
-            id = "test-derived",
-            domain = "sessions/test-index",
-            version = 7,
-        );
-        assert_eq!(
-            derived.action,
-            super::SessionMigrationAction::RebuildDerivedIndex
-        );
-        assert_eq!(
-            derived.backup_policy,
-            super::SessionMigrationBackupPolicy::NotRequired
-        );
-
-        let canonical =
-            super::register_session_event_migration!(id = "test-events", from = 1, to = 2,);
-        assert_eq!(
-            canonical.action,
-            super::SessionMigrationAction::RewriteCanonicalEvents
-        );
-        assert_eq!(
-            canonical.backup_policy,
-            super::SessionMigrationBackupPolicy::Required
-        );
-    }
-
-    #[test]
-    fn migration_recovery_reports_started_without_completion() {
-        let root = unique_temp_dir();
-        let session_id = bcode_session_models::SessionId::new();
-        super::migration::append_journal_entry(
-            &root,
-            &super::SessionMigrationJournalEntry {
-                run_id: "run-1".to_string(),
-                domain: "sessions/events".to_string(),
-                status: super::SessionMigrationJournalStatus::Started,
-                dry_run: false,
-                backup: true,
-                backup_dir: Some("backup".to_string()),
-                started_at_ms: 1,
-                finished_at_ms: None,
-                migration_ids: vec!["migration".to_string()],
-                session_ids: vec![session_id],
-                error: None,
-            },
-        )
-        .expect("journal should write");
-
-        let store = super::SessionEventStore::new(&root);
-        let status = store
-            .migration_recovery_status()
-            .expect("status should read");
-        let super::SessionMigrationRecoveryStatus::NeedsAttention(items) = status else {
-            panic!("started run should require attention");
-        };
-        assert_eq!(items[0].run_id, "run-1");
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn persistent_manager_reads_legacy_and_v2_frames() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        let session_id = bcode_session_models::SessionId::new();
-        let legacy_event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 0,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::SessionCreated {
-                name: Some("mixed".to_string()),
-                working_directory: test_working_directory(),
-            },
-        };
-        let path = root.join(format!("{session_id}.events"));
-        write_legacy_event(&path, &legacy_event);
-
-        let manager = SessionManager::persistent(&root).expect("manager should restore legacy");
-        manager
-            .migrate_legacy_events_to_db(session_id)
-            .await
-            .expect("legacy events should migrate before DB append");
-        manager
-            .append_user_message(session_id, ClientId::new(), "new DB event".to_string())
-            .await
-            .expect("DB append should work");
-
-        let restored = SessionManager::persistent(&root).expect("manager should restore mixed");
-        let history = restored
-            .session_history(session_id)
-            .await
-            .expect("mixed history should load");
-        assert_eq!(history.len(), 2);
-        assert!(matches!(
-            &history[0].kind,
-            SessionEventKind::SessionCreated { name, .. } if name.as_deref() == Some("mixed")
-        ));
-        assert!(matches!(
-            &history[1].kind,
-            SessionEventKind::UserMessage { text, .. } if text == "new DB event"
-        ));
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
     #[tokio::test]
     async fn append_event_with_provenance_persists_source_metadata() {
         let root = unique_temp_dir();
@@ -3919,59 +2760,6 @@ mod tests {
                 text: "hello".to_owned(),
             }]
         );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn read_events_migrated_from_legacy_event_file() {
-        let root = unique_temp_dir();
-        let legacy_store = super::SessionEventStore::new(&root);
-        let session_id = SessionId::new();
-        let client_id = ClientId::new();
-        let events = [
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: Some("legacy".to_string()),
-                    working_directory: test_working_directory(),
-                },
-            },
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::UserMessage {
-                    client_id,
-                    text: "legacy hello".to_string(),
-                },
-            },
-        ];
-        for event in &events {
-            legacy_store
-                .append(event)
-                .expect("legacy event should append");
-        }
-
-        let manager = SessionManager::persistent_lazy(&root);
-        manager
-            .migrate_legacy_events_to_db(session_id)
-            .await
-            .expect("legacy events should migrate into db");
-        assert!(
-            legacy_store.event_path(session_id).exists(),
-            "migration must not delete legacy .events files"
-        );
-
-        let db = db::SessionDb::open_turso_in_root(session_id, &root)
-            .await
-            .expect("db should open");
-        let migrated_events = db.events_range(0, 1, 10).await.expect("events should read");
-        assert_eq!(migrated_events, events);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -4328,19 +3116,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[test]
-    fn built_in_session_migration_registry_is_valid() {
-        let registry = super::SessionMigrationRegistry::builtin();
-        registry
-            .validate()
-            .expect("built-in migration registry should be valid");
-        assert!(
-            registry
-                .migration_for_action(super::SessionMigrationAction::RebuildDerivedIndex)
-                .is_some()
-        );
     }
 
     #[tokio::test]
@@ -4932,90 +3707,6 @@ mod tests {
         let bytes = bmux_codec::to_positional_vec(value).expect("value should encode");
         let (tag, _) = bmux_codec::varint::decode_u32(&bytes).expect("variant tag should decode");
         tag
-    }
-
-    fn stable_order_binary_fixture_events() -> Vec<SessionEvent> {
-        let session_id = "11111111-1111-4111-8111-111111111111"
-            .parse()
-            .expect("fixture session id should parse");
-        vec![
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: Some("stable-order".to_string()),
-                    working_directory: test_working_directory(),
-                },
-            },
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::AssistantDelta {
-                    text: "partial".to_string(),
-                },
-            },
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 2,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ToolCallRequested {
-                    tool_call_id: "call".to_string(),
-                    tool_name: "read".to_string(),
-                    arguments_json: r#"{"path":"README.md"}"#.to_string(),
-                },
-            },
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 3,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SkillInvocationFailed {
-                    skill_id: SkillId::new("fixture"),
-                    error: "failed".to_string(),
-                    failed_at_ms: 1,
-                },
-            },
-        ]
-    }
-
-    fn stable_order_binary_fixture_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("fixtures/session-events/binary/stable-order-v9.events")
-    }
-
-    fn write_legacy_event(path: &std::path::Path, event: &SessionEvent) {
-        let mut file = std::fs::File::create(path).expect("event file should create");
-        write_legacy_event_payload(&mut file, event);
-    }
-
-    fn append_invalid_legacy_payload(file: &mut std::fs::File) {
-        let payload = [0xff_u8, 0x00, 0x01];
-        file.write_all(
-            &u32::try_from(payload.len())
-                .expect("payload should fit")
-                .to_le_bytes(),
-        )
-        .expect("invalid len should write");
-        file.write_all(&payload)
-            .expect("invalid payload should write");
-    }
-
-    fn write_legacy_event_payload(file: &mut std::fs::File, event: &SessionEvent) {
-        let payload = bmux_codec::to_positional_vec(event).expect("legacy event should encode");
-        file.write_all(
-            &u32::try_from(payload.len())
-                .expect("payload should fit")
-                .to_le_bytes(),
-        )
-        .expect("legacy len should write");
-        file.write_all(&payload)
-            .expect("legacy payload should write");
     }
 
     fn test_working_directory() -> std::path::PathBuf {

@@ -1,6 +1,12 @@
 //! Session actor, handle, and snapshot plumbing.
 
-use super::*;
+use super::{
+    Arc, CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, Instant, PathBuf, ProjectionWindow,
+    ProjectionWindowRequest, SessionAccessStatus, SessionAttachment, SessionError, SessionEvent,
+    SessionEventKind, SessionEventProvenance, SessionIndexStatusKind, SessionInputHistoryEntry,
+    SessionState, SessionStoreExecutor, SessionSummary, elapsed_ms, input_history_from_events,
+    model_context_events_from_history, title_from_first_prompt, usize_to_u64,
+};
 use crate::db::SessionDb;
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
