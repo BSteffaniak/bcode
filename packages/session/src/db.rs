@@ -32,6 +32,7 @@ const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_CONTEXT_EVENT_LIMIT: usize = 512;
 
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
@@ -105,6 +106,12 @@ pub struct RuntimeWorkProjection {
     pub status: RuntimeWorkStatus,
     /// Parent runtime work id, when nested.
     pub parent_work_id: Option<RuntimeWorkId>,
+    /// Start timestamp, when known.
+    pub started_at_ms: Option<u64>,
+    /// Finish timestamp, when terminal and known.
+    pub finished_at_ms: Option<u64>,
+    /// Latest progress or terminal message, when known.
+    pub message: Option<String>,
     /// Whether the work advertised cancellation support.
     pub cancellable: bool,
 }
@@ -368,6 +375,9 @@ impl SessionDb {
                 "label",
                 "status",
                 "parent_work_id",
+                "started_at_ms",
+                "finished_at_ms",
+                "message",
                 "cancellable",
             ])
             .where_eq(
@@ -378,6 +388,45 @@ impl SessionDb {
             .execute(&**self.db)
             .await?;
         rows.iter().map(runtime_work_from_row).collect()
+    }
+
+    /// Return latest runtime-work projection rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails or a row is malformed.
+    pub async fn runtime_work_history(
+        &self,
+        limit: usize,
+    ) -> SessionDbResult<Vec<RuntimeWorkProjection>> {
+        let mut query = self
+            .db
+            .select("runtime_work")
+            .columns(&[
+                "work_id",
+                "event_seq_start",
+                "event_seq_end",
+                "kind",
+                "label",
+                "status",
+                "parent_work_id",
+                "started_at_ms",
+                "finished_at_ms",
+                "message",
+                "cancellable",
+            ])
+            .sort("event_seq_start", SortDirection::Desc);
+        if limit > 0 {
+            query = query.limit(limit);
+        }
+        let mut work = query
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(runtime_work_from_row)
+            .collect::<SessionDbResult<Vec<_>>>()?;
+        work.reverse();
+        Ok(work)
     }
 
     /// Return the current projected session state row.
@@ -538,21 +587,29 @@ impl SessionDb {
     ///
     /// # Errors
     ///
-    /// Returns an error if event timestamp queries fail or rows are malformed.
+    /// Returns an error if bounded event timestamp queries fail or rows are malformed.
     pub async fn activity_bounds(&self) -> SessionDbResult<Option<(u64, u64)>> {
-        let rows = self
+        let first = self
             .db
             .select("events")
             .columns(&["created_at_ms"])
             .sort("event_seq", SortDirection::Asc)
-            .execute(&**self.db)
-            .await?;
-        let timestamps = rows
-            .iter()
-            .filter_map(|row| row.get("created_at_ms").and_then(|value| value.as_i64()))
-            .map(i64_to_u64)
-            .collect::<Vec<_>>();
-        Ok(timestamps.first().copied().zip(timestamps.last().copied()))
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?
+            .and_then(|row| row.get("created_at_ms").and_then(|value| value.as_i64()))
+            .map(i64_to_u64);
+        let last = self
+            .db
+            .select("events")
+            .columns(&["created_at_ms"])
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?
+            .and_then(|row| row.get("created_at_ms").and_then(|value| value.as_i64()))
+            .map(i64_to_u64);
+        Ok(first.zip(last))
     }
 
     /// Return all canonical events in sequence order.
@@ -648,14 +705,21 @@ impl SessionDb {
     /// Returns an error if event queries or deserialization fail.
     pub async fn model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
         let Some(compaction_event) = self.latest_context_compaction_event().await? else {
-            return self.all_events().await;
+            return self
+                .history_page(SessionHistoryQuery {
+                    cursor: None,
+                    limit: MODEL_CONTEXT_EVENT_LIMIT,
+                    direction: SessionHistoryDirection::Backward,
+                })
+                .await
+                .map(|page| page.events);
         };
         let SessionEventKind::ContextCompacted {
             compacted_through_sequence,
             ..
         } = &compaction_event.kind
         else {
-            return self.all_events().await;
+            return Ok(vec![compaction_event]);
         };
         let rows = self
             .db
@@ -1376,6 +1440,9 @@ fn runtime_work_from_row(row: &switchy::database::Row) -> SessionDbResult<Runtim
         label: required_string(row, "label")?,
         status: parse_runtime_work_status(&required_string(row, "status")?),
         parent_work_id: optional_string(row, "parent_work_id").map(RuntimeWorkId::new),
+        started_at_ms: optional_i64(row, "started_at_ms").map(i64_to_u64),
+        finished_at_ms: optional_i64(row, "finished_at_ms").map(i64_to_u64),
+        message: optional_string(row, "message"),
         cancellable: optional_i64(row, "cancellable").is_some_and(|value| value != 0),
     })
 }

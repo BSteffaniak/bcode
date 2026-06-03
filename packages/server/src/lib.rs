@@ -32,10 +32,11 @@ use bcode_model::{
 };
 use bcode_session::{CatalogLoadStatus, SessionHealth, SessionManager};
 use bcode_session_models::{
-    ClientId, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
-    RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
+    ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
+    SessionId, SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
+    TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -1804,10 +1805,13 @@ async fn handle_create_session(
         .session_catalog
         .upsert_native_session(session.clone())
         .await;
-    if let Ok(history) = state.sessions.session_history(session.id).await
-        && let Some(event) = history.last()
+    if let Ok(mut events) = state
+        .sessions
+        .session_events_range(session.id, 0, 0, 1)
+        .await
+        && let Some(event) = events.pop()
     {
-        publish_session_event(state, event).await;
+        publish_session_event(state, &event).await;
     }
     send_response(
         writer,
@@ -3696,18 +3700,10 @@ async fn handle_runtime_work_history(
 ) -> Result<(), ServerError> {
     let mut events = state
         .sessions
-        .session_history(session_id)
+        .runtime_work_history(session_id, limit)
         .await?
         .into_iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                SessionEventKind::RuntimeWorkStarted { .. }
-                    | SessionEventKind::RuntimeWorkCancelRequested { .. }
-                    | SessionEventKind::RuntimeWorkProgress { .. }
-                    | SessionEventKind::RuntimeWorkFinished { .. }
-            )
-        })
+        .flat_map(|work| runtime_work_projection_to_events(session_id, work))
         .collect::<Vec<_>>();
     if limit > 0 && events.len() > limit {
         events.drain(0..events.len() - limit);
@@ -3718,6 +3714,46 @@ async fn handle_runtime_work_history(
         Response::Ok(ResponsePayload::RuntimeWorkHistory { events }),
     )
     .await
+}
+
+fn runtime_work_projection_to_events(
+    session_id: SessionId,
+    work: bcode_session::db::RuntimeWorkProjection,
+) -> Vec<bcode_session_models::SessionEvent> {
+    let start = bcode_session_models::SessionEvent {
+        schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: work.event_seq_start,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::RuntimeWorkStarted {
+            work_id: work.work_id.clone(),
+            kind: work.kind,
+            label: work.label,
+            tool_call_id: None,
+            plugin_id: None,
+            service_interface: None,
+            operation: None,
+            parent_work_id: work.parent_work_id,
+            started_at_ms: work.started_at_ms,
+            cancellable: work.cancellable,
+        },
+    };
+    if work.status == RuntimeWorkStatus::Running {
+        return vec![start];
+    }
+    let finish = bcode_session_models::SessionEvent {
+        schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: work.event_seq_end.unwrap_or(work.event_seq_start),
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::RuntimeWorkFinished {
+            work_id: work.work_id,
+            status: work.status,
+            finished_at_ms: work.finished_at_ms,
+            message: work.message,
+        },
+    };
+    vec![start, finish]
 }
 
 async fn handle_subscribe_runtime_work(
@@ -4093,7 +4129,7 @@ async fn compact_session_context_with_limit(
         return Err(CompactionError::Busy);
     }
 
-    let history = state.sessions.session_history(session_id).await?;
+    let history = state.sessions.model_context_events(session_id).await?;
     let transcript_history = first_kept_sequence.map_or_else(
         || history.clone(),
         |first_kept_sequence| {

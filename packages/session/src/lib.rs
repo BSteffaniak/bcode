@@ -61,6 +61,9 @@ pub enum SessionError {
     /// Session database error: {0}
     #[error("session database error: {0}")]
     Db(#[from] db::SessionDbError),
+    /// Session database is unavailable for this operation.
+    #[error("session database is unavailable: {0}")]
+    DbUnavailable(SessionId),
 }
 
 /// Errors returned by the session store.
@@ -1034,6 +1037,36 @@ impl SessionManager {
     ) -> Result<Vec<db::ToolRun>, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.active_tool_runs().await
+    }
+
+    /// Return latest runtime-work rows from the DB read model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or
+    /// [`SessionError::ProjectionStale`] when the DB projection is not current.
+    pub async fn runtime_work_history(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Vec<db::RuntimeWorkProjection>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(session_id))?;
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        let expected_last_sequence = db.last_event_sequence().await?.unwrap_or(0);
+        let checkpoint = db.projection_checkpoint("runtime_work").await?;
+        if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
+            return Ok(db.runtime_work_history(limit).await?);
+        }
+        Err(SessionError::ProjectionStale {
+            session_id,
+            projection: "runtime_work",
+            checkpoint,
+            expected: expected_last_sequence,
+        })
     }
 
     /// Return the model-visible session events, starting at the latest compaction when possible.
