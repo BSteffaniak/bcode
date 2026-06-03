@@ -1238,6 +1238,8 @@ impl BmuxApp {
             self.set_cancelling();
         } else if self.runtime_work.is_busy() {
             self.set_activity(ActivityState::Thinking);
+        } else {
+            self.set_activity(ActivityState::Idle);
         }
     }
 

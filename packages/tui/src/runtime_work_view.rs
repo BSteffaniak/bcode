@@ -65,6 +65,7 @@ impl RuntimeWorkViewState {
     }
 
     pub fn apply_snapshots(&mut self, snapshots: &[RuntimeWorkSnapshot]) {
+        self.active.clear();
         for snapshot in snapshots {
             self.apply_snapshot(snapshot);
         }
