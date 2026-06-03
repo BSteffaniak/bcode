@@ -182,20 +182,43 @@ impl SessionStore {
                 let db = db::SessionDb::open_turso_in_root(session_id, &root)
                     .await
                     .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let Some(db_state) = db
+                    .session_state()
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                if db_state.session_id != session_id {
+                    return Err(SessionStoreError::CatalogLoad(format!(
+                        "session DB state id mismatch: expected {session_id}, found {}",
+                        db_state.session_id
+                    )));
+                }
+                let expected_last_sequence = db
+                    .last_event_sequence()
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?
+                    .unwrap_or(db_state.last_event_seq);
+                let load_status = if db_state.last_event_seq < expected_last_sequence {
+                    SessionLoadStatusKind::SummaryOnly
+                } else {
+                    SessionLoadStatusKind::Current
+                };
                 let activity_bounds = db
                     .activity_bounds()
                     .await
                     .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                let events = db
-                    .all_events()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                let mut state = SessionState::from_events(session_id, &events)
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                if let Some((created_at_ms, updated_at_ms)) = activity_bounds {
-                    state.summary.created_at_ms = created_at_ms;
-                    state.summary.updated_at_ms = updated_at_ms;
-                }
+                let created_at_ms = activity_bounds
+                    .map(|(created_at_ms, _)| created_at_ms)
+                    .or(db_state.updated_at_ms)
+                    .unwrap_or_else(current_unix_millis);
+                let updated_at_ms = db_state
+                    .updated_at_ms
+                    .or_else(|| activity_bounds.map(|(_, updated_at_ms)| updated_at_ms))
+                    .unwrap_or(created_at_ms);
+                let mut state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
+                state.load_status = load_status;
                 Ok(Some(state))
             })
         })
@@ -1762,74 +1785,6 @@ impl SessionState {
             load_status: SessionLoadStatusKind::Current,
             sender,
         }
-    }
-
-    pub(crate) fn from_events(
-        session_id: SessionId,
-        events: &[SessionEvent],
-    ) -> Result<Self, SessionError> {
-        let (sender, _) = broadcast::channel(512);
-        let mut state = Self {
-            summary: SessionSummary {
-                id: session_id,
-                name: None,
-                explicit_name: None,
-                derived_title: None,
-                title_source: SessionTitleSource::EmptyDraft,
-                client_count: 0,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                working_directory: PathBuf::new(),
-                import: None,
-            },
-            working_directory: PathBuf::new(),
-            clients: BTreeSet::new(),
-            events: Some(Vec::new()),
-            next_sequence: 0,
-            event_count: 0,
-            has_user_message: false,
-            current_provider: None,
-            current_model: None,
-            current_agent: None,
-            latest_compaction_sequence: None,
-            total_metered_tokens: 0,
-            load_status: SessionLoadStatusKind::Current,
-            sender,
-        };
-
-        for event in events {
-            if event.session_id != session_id {
-                return Err(SessionError::NotFound(session_id));
-            }
-            let activity_timestamp_ms = if state.summary.created_at_ms == 0 {
-                current_unix_millis()
-            } else {
-                state.summary.updated_at_ms.saturating_add(1)
-            };
-            if let SessionEventKind::SessionCreated {
-                name,
-                working_directory,
-            } = &event.kind
-            {
-                let working_directory = normalize_working_directory(working_directory);
-                state.summary.name.clone_from(name);
-                state.summary.explicit_name.clone_from(name);
-                state.summary.title_source = if name.is_some() {
-                    SessionTitleSource::Explicit
-                } else {
-                    SessionTitleSource::EmptyDraft
-                };
-                state.summary.created_at_ms = activity_timestamp_ms;
-                state
-                    .summary
-                    .working_directory
-                    .clone_from(&working_directory);
-                state.working_directory = working_directory;
-            }
-            state.apply_persisted_event(event.clone(), activity_timestamp_ms);
-        }
-
-        Ok(state)
     }
 
     fn summary(&self) -> SessionSummary {
