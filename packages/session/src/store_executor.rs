@@ -111,34 +111,6 @@ impl SessionStoreExecutor {
         .await?
     }
 
-    pub async fn read_events_migrated_to_current_for_db_import(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<SessionEvent>, SessionStoreError> {
-        let queued_at = Instant::now();
-        let store = self.store.clone();
-        spawn_blocking(move || {
-            store.metrics.record_histogram(
-                "session.store.read_events_migrated_for_db_import.blocking_queue_wait_duration_ms",
-                elapsed_ms(queued_at),
-            );
-            let timer = store.metrics.timer();
-            let result = store.read_events_migrated_to_current_for_db_import(session_id);
-            if let Ok(events) = &result {
-                store.metrics.record_histogram(
-                    "session.store.read_events_migrated_for_db_import.event_count",
-                    usize_to_u64(events.len()),
-                );
-            }
-            store.metrics.record_histogram(
-                "session.store.read_events_migrated_for_db_import.duration_ms",
-                timer.elapsed_ms(),
-            );
-            result
-        })
-        .await?
-    }
-
     pub async fn read_legacy_events_for_migration(
         &self,
         session_id: SessionId,

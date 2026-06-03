@@ -129,26 +129,6 @@ pub struct SessionImportSummary {
     pub imported_at_ms: u64,
 }
 
-/// Legacy `.events` file discovered for explicit DB migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacySessionCandidate {
-    pub session_id: SessionId,
-    pub event_path: PathBuf,
-    #[serde(default)]
-    pub has_db: bool,
-}
-
-/// Result of explicitly migrating one legacy session candidate to DB.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacySessionMigrationResult {
-    pub session_id: SessionId,
-    pub migrated: bool,
-    #[serde(default)]
-    pub summary: Option<SessionSummary>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
 /// Direction for paged session history reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

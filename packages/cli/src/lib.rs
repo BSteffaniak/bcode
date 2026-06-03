@@ -90,8 +90,6 @@ pub enum CliError {
     Blims(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
-    #[error("legacy session migration failed for {failed_count} session(s)")]
-    LegacyMigrationFailed { failed_count: usize },
 }
 
 /// Parse CLI arguments and run the requested command.
@@ -142,7 +140,6 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
                 force,
                 json,
             } => session_doctor(session_id, fix, force, json)?,
-            SessionCommand::Migrate { command } => handle_session_migrate_command(command).await?,
             SessionCommand::Import { command } => handle_session_import_command(command).await?,
             SessionCommand::Reindex { session_id } => session_reindex(session_id)?,
             SessionCommand::Repair {
@@ -154,7 +151,6 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         },
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
-        Commands::Migrate { command } => handle_migrate_command(command)?,
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
             PluginCommand::Services { root, daemon } => {
@@ -223,7 +219,6 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Session { .. }
         | Commands::Worktree { .. }
         | Commands::Blims { .. }
-        | Commands::Migrate { .. }
         | Commands::Plugin { .. }
         | Commands::Model { .. }
         | Commands::Auth { .. }
@@ -312,10 +307,6 @@ enum Commands {
     Blims {
         #[command(subcommand)]
         command: blims::BlimsCommand,
-    },
-    Migrate {
-        #[command(subcommand)]
-        command: MigrateCommand,
     },
     Plugin {
         #[command(subcommand)]
@@ -413,24 +404,6 @@ enum ServerCommand {
     Stop,
     Cleanup,
     StopAll,
-}
-
-#[derive(Debug, Clone, Copy, Subcommand)]
-enum MigrateCommand {
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    Plan {
-        #[arg(long)]
-        json: bool,
-    },
-    Apply {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        backup: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -536,10 +509,6 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
-    Migrate {
-        #[command(subcommand)]
-        command: SessionMigrateCommand,
-    },
     Import {
         #[command(subcommand)]
         command: SessionImportCommand,
@@ -573,35 +542,6 @@ enum SessionImportCommand {
         #[arg(long, default_value = "pi")]
         source: String,
         external_session_id: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Subcommand)]
-enum SessionMigrateCommand {
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    Plan {
-        #[arg(long)]
-        json: bool,
-    },
-    Apply {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        backup: bool,
-    },
-    LegacyList {
-        #[arg(long)]
-        json: bool,
-    },
-    LegacyMigrate {
-        session_id: SessionId,
-    },
-    LegacyMigrateAll {
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -4016,15 +3956,6 @@ fn print_session_index_health(item: &bcode_session::SessionIndexHealth) {
     }
 }
 
-fn handle_migrate_command(command: MigrateCommand) -> Result<(), CliError> {
-    match command {
-        MigrateCommand::Status { json } | MigrateCommand::Plan { json } => {
-            session_migration_plan(json)
-        }
-        MigrateCommand::Apply { dry_run, backup } => session_migration_apply(dry_run, backup),
-    }
-}
-
 async fn handle_session_import_command(command: SessionImportCommand) -> Result<(), CliError> {
     ensure_server_running().await?;
     let client = BcodeClient::default_endpoint();
@@ -4111,207 +4042,6 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
                 }
             }
         }
-    }
-    Ok(())
-}
-
-async fn handle_session_migrate_command(command: SessionMigrateCommand) -> Result<(), CliError> {
-    match command {
-        SessionMigrateCommand::Status { json } | SessionMigrateCommand::Plan { json } => {
-            session_migration_plan(json)
-        }
-        SessionMigrateCommand::Apply { dry_run, backup } => {
-            session_migration_apply(dry_run, backup)
-        }
-        SessionMigrateCommand::LegacyList { json } => legacy_migration_list(json).await,
-        SessionMigrateCommand::LegacyMigrate { session_id } => {
-            legacy_migration_migrate(session_id).await
-        }
-        SessionMigrateCommand::LegacyMigrateAll { json } => {
-            legacy_migration_migrate_all(json).await
-        }
-    }
-}
-
-async fn legacy_migration_list(json: bool) -> Result<(), CliError> {
-    ensure_server_running().await?;
-    let mut connection = BcodeClient::default_endpoint().connect("bcode-cli").await?;
-    let candidates = connection.list_legacy_sessions_for_migration().await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&candidates)?);
-        return Ok(());
-    }
-    if candidates.is_empty() {
-        println!("no legacy sessions found");
-        return Ok(());
-    }
-    for candidate in candidates {
-        println!(
-            "{}\t{}\thas_db={}",
-            candidate.session_id,
-            candidate.event_path.display(),
-            candidate.has_db
-        );
-    }
-    Ok(())
-}
-
-async fn legacy_migration_migrate(session_id: SessionId) -> Result<(), CliError> {
-    ensure_server_running().await?;
-    let mut connection = BcodeClient::default_endpoint().connect("bcode-cli").await?;
-    let session = connection.migrate_legacy_session_to_db(session_id).await?;
-    println!("migrated {}\t{}", session.id, session.display_title());
-    Ok(())
-}
-
-async fn legacy_migration_migrate_all(json: bool) -> Result<(), CliError> {
-    ensure_server_running().await?;
-    let mut connection = BcodeClient::default_endpoint().connect("bcode-cli").await?;
-    if json {
-        let results = connection.migrate_all_legacy_sessions_to_db().await?;
-        println!("{}", serde_json::to_string_pretty(&results)?);
-        return Ok(());
-    }
-
-    println!("discovering legacy sessions…");
-    std::io::stdout().flush()?;
-    let candidates = connection.list_legacy_sessions_for_migration().await?;
-    if candidates.is_empty() {
-        println!("no legacy sessions found");
-        return Ok(());
-    }
-
-    let total = candidates.len();
-    println!("found {total} legacy session(s)");
-    std::io::stdout().flush()?;
-
-    let mut migrated_count = 0_usize;
-    let skipped_count = 0_usize;
-    let mut failed_count = 0_usize;
-    for (index, candidate) in candidates.iter().enumerate() {
-        let ordinal = index.saturating_add(1);
-
-        println!("[{ordinal}/{total}] migrating {} …", candidate.session_id);
-        std::io::stdout().flush()?;
-        match connection
-            .migrate_legacy_session_to_db(candidate.session_id)
-            .await
-        {
-            Ok(summary) => {
-                migrated_count = migrated_count.saturating_add(1);
-                println!(
-                    "[{ordinal}/{total}] migrated {}\t{}",
-                    summary.id,
-                    summary.display_title()
-                );
-            }
-            Err(error) => {
-                failed_count = failed_count.saturating_add(1);
-                eprintln!(
-                    "[{ordinal}/{total}] failed {}\t{error}",
-                    candidate.session_id
-                );
-            }
-        }
-        std::io::stdout().flush()?;
-    }
-
-    println!("done: {migrated_count} migrated, {skipped_count} skipped, {failed_count} failed");
-    if failed_count == 0 {
-        Ok(())
-    } else {
-        Err(CliError::LegacyMigrationFailed { failed_count })
-    }
-}
-
-fn session_migration_plan(json: bool) -> Result<(), CliError> {
-    let store = bcode_session::SessionEventStore::new(default_session_store_dir());
-    let plan = store.migration_plan()?;
-    let recovery = store.migration_recovery_status()?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "plan": plan,
-                "recovery": recovery,
-            }))?
-        );
-        return Ok(());
-    }
-    match recovery {
-        bcode_session::SessionMigrationRecoveryStatus::Clean => {}
-        bcode_session::SessionMigrationRecoveryStatus::NeedsAttention(items) => {
-            println!("migration recovery: {} run(s) need attention", items.len());
-            for item in items {
-                println!(
-                    "{}	{}	{:?}	{:?}",
-                    item.run_id, item.domain, item.status, item.error
-                );
-            }
-        }
-    }
-    if plan.is_empty() {
-        println!("{}: current", plan.domain);
-        return Ok(());
-    }
-    println!("{}: {} migration item(s)", plan.domain, plan.items.len());
-    for item in plan.items {
-        let found_version = item
-            .found_version
-            .map_or_else(|| "none".to_string(), |version| version.to_string());
-        let action = match item.action {
-            bcode_session::SessionMigrationAction::None => "none",
-            bcode_session::SessionMigrationAction::RebuildDerivedIndex => "rebuild-derived-index",
-            bcode_session::SessionMigrationAction::RewriteCanonicalEvents => {
-                "rewrite-canonical-events"
-            }
-        };
-        let mode = if item.automatic {
-            "automatic"
-        } else {
-            "manual"
-        };
-        println!(
-            "{}\t{}\tfound={}\tcurrent={}\t{}\t{}",
-            item.session_id, action, found_version, item.current_version, mode, item.reason
-        );
-    }
-    Ok(())
-}
-
-fn session_migration_apply(dry_run: bool, backup: bool) -> Result<(), CliError> {
-    let store = bcode_session::SessionEventStore::new(default_session_store_dir());
-    let report =
-        store.apply_migration_plan(bcode_session::SessionMigrationOptions { dry_run, backup })?;
-    if report.items.is_empty() {
-        println!("{}: current", report.domain);
-        return Ok(());
-    }
-    if let Some(backup_dir) = &report.backup_dir {
-        println!("backup: {}", backup_dir.display());
-    }
-    println!(
-        "{}: {} migration item(s)",
-        report.domain,
-        report.items.len()
-    );
-    for item in report.items {
-        let action = match item.action {
-            bcode_session::SessionMigrationAction::None => "none",
-            bcode_session::SessionMigrationAction::RebuildDerivedIndex => "rebuild-derived-index",
-            bcode_session::SessionMigrationAction::RewriteCanonicalEvents => {
-                "rewrite-canonical-events"
-            }
-        };
-        let status = match item.status {
-            bcode_session::SessionMigrationApplyStatus::Planned => "planned",
-            bcode_session::SessionMigrationApplyStatus::Applied => "applied",
-            bcode_session::SessionMigrationApplyStatus::Skipped => "skipped",
-        };
-        println!(
-            "{}\t{}\t{}\t{}",
-            item.session_id, action, status, item.message
-        );
     }
     Ok(())
 }

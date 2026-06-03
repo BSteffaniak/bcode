@@ -31,12 +31,11 @@ pub use migration::{
 use actor::{AttachMode, SessionHandle};
 use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacySessionCandidate,
-    LegacySessionMigrationResult, ModelTurnOutcome, ProjectionWindow, ProjectionWindowRequest,
-    SessionEvent, SessionEventKind, SessionEventProvenance, SessionHistoryDirection,
-    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
-    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, TraceBlobRef,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
+    ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
+    SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -75,8 +74,6 @@ pub enum SessionError {
         session_id: SessionId,
         status: SessionAccessStatus,
     },
-    #[error("legacy session requires explicit migration to DB before normal access: {0}")]
-    LegacyMigrationRequired(SessionId),
     #[error(
         "session DB projection is stale: {session_id} {projection} checkpoint={checkpoint:?} expected={expected}"
     )]
@@ -1033,14 +1030,12 @@ pub enum CatalogLoadStatus {
     Failed(String),
 }
 
-/// First-class session health for normal runtime and migration UX.
+/// First-class session health for normal runtime UX.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionHealth {
     /// DB-backed session is ready for normal runtime access.
     Ready,
-    /// Legacy `.events` session must be explicitly migrated before normal access.
-    LegacyMigrationRequired,
     /// A DB read model is missing or stale.
     ProjectionStale {
         projection: &'static str,
@@ -1314,21 +1309,6 @@ impl SessionManager {
             );
             return Ok(());
         }
-        if store
-            .root_path()
-            .join(format!("{session_id}.events"))
-            .exists()
-        {
-            self.metrics.record_histogram(
-                "session.manager.ensure_loaded.legacy_migration_required_duration_ms",
-                load_timer.elapsed_ms(),
-            );
-            self.metrics.record_histogram(
-                "session.manager.ensure_loaded.total_duration_ms",
-                total_timer.elapsed_ms(),
-            );
-            return Err(SessionError::LegacyMigrationRequired(session_id));
-        }
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.total_duration_ms",
             total_timer.elapsed_ms(),
@@ -1416,11 +1396,7 @@ impl SessionManager {
         let root = store.root_path();
         let db_path = db::session_db_path(&root, session_id);
         if !db_path.exists() {
-            return if root.join(format!("{session_id}.events")).exists() {
-                SessionHealth::LegacyMigrationRequired
-            } else {
-                SessionHealth::NotFound
-            };
+            return SessionHealth::NotFound;
         }
         let db = match db::SessionDb::open_turso_in_root(session_id, &root).await {
             Ok(db) => db,
@@ -1455,127 +1431,6 @@ impl SessionManager {
                 reason: error.to_string(),
             },
         }
-    }
-
-    /// List legacy `.events` files that can be explicitly migrated into session DBs.
-    ///
-    /// This is bounded to file-name discovery only. It does not read, replay, repair, or index
-    /// event logs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session root cannot be read.
-    pub async fn list_legacy_sessions_for_migration(
-        &self,
-    ) -> Result<Vec<LegacySessionCandidate>, SessionError> {
-        let Some(store) = &self.store else {
-            return Ok(Vec::new());
-        };
-        let root = store.root_path();
-        let candidates = spawn_blocking(move || {
-            let mut candidates = Vec::new();
-            if !root.exists() {
-                return Ok(candidates);
-            }
-            for entry in fs::read_dir(&root)? {
-                let path = entry?.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("events") {
-                    continue;
-                }
-                let session_id = parse_session_file_name(&path)?;
-                candidates.push(LegacySessionCandidate {
-                    session_id,
-                    event_path: path,
-                    has_db: db::session_db_path(&root, session_id).exists(),
-                });
-            }
-            candidates.sort_by_key(|candidate| candidate.session_id.to_string());
-            Ok::<_, SessionStoreError>(candidates)
-        })
-        .await
-        .map_err(SessionStoreError::BlockingTask)??;
-        Ok(candidates)
-    }
-
-    /// Explicitly migrate every discovered legacy `.events` session into DBs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if legacy discovery cannot read the session root.
-    pub async fn migrate_all_legacy_sessions_to_db(
-        &self,
-    ) -> Result<Vec<LegacySessionMigrationResult>, SessionError> {
-        let candidates = self.list_legacy_sessions_for_migration().await?;
-        let mut results = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            match self
-                .migrate_legacy_session_to_db(candidate.session_id)
-                .await
-            {
-                Ok(summary) => results.push(LegacySessionMigrationResult {
-                    session_id: candidate.session_id,
-                    migrated: true,
-                    summary: Some(summary),
-                    error: None,
-                }),
-                Err(error) => results.push(LegacySessionMigrationResult {
-                    session_id: candidate.session_id,
-                    migrated: false,
-                    summary: None,
-                    error: Some(error.to_string()),
-                }),
-            }
-        }
-        Ok(results)
-    }
-
-    /// Explicitly migrate a legacy event-log session into the canonical DB-backed layout.
-    ///
-    /// Normal session open/read/write paths do not perform this replay. This method is the
-    /// migration boundary where legacy events are allowed to be read, schema-migrated, and
-    /// projected into the per-session DB.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the legacy session does not exist, event migration fails, event-log
-    /// replay fails, DB writes fail, or the migrated DB state is incomplete.
-    pub async fn migrate_legacy_session_to_db(
-        &self,
-        session_id: SessionId,
-    ) -> Result<SessionSummary, SessionError> {
-        let Some(store) = &self.store else {
-            return Err(SessionError::NotFound(session_id));
-        };
-        let db_path = db::session_db_path(&store.root_path(), session_id);
-        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-        let last_imported_sequence = db.last_event_sequence().await?;
-        let events = store
-            .read_events_migrated_to_current_for_db_import(session_id)
-            .await?;
-        if events.is_empty() {
-            return Err(SessionError::NotFound(session_id));
-        }
-        for event in events
-            .iter()
-            .filter(|event| last_imported_sequence.is_none_or(|sequence| event.sequence > sequence))
-        {
-            db.append_event(event).await?;
-        }
-
-        let state = self.load_db_session_state(session_id, &db).await?;
-        let summary = state.summary();
-        let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
-        catalog.upsert_session(&summary, &db_path).await?;
-
-        let mut inner = self.inner.lock().await;
-        if let Some(handle) = inner.sessions.get(&session_id) {
-            handle.replace_state(state).await?;
-        } else {
-            inner
-                .sessions
-                .insert(session_id, SessionHandle::new(state, Some(store.clone())));
-        }
-        Ok(summary)
     }
 
     async fn migrate_session_to_current_if_required(
@@ -1944,7 +1799,7 @@ impl SessionManager {
                 return Ok(db.history_page(query).await?);
             }
         }
-        Err(SessionError::LegacyMigrationRequired(session_id))
+        Err(SessionError::NotFound(session_id))
     }
 
     /// Return a semantic projection window for a session.
@@ -3215,9 +3070,7 @@ fn parse_session_file_name(path: &Path) -> Result<SessionId, SessionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SessionAccessStatus, SessionHealth, SessionManager, access_status_from_report, db, reader,
-    };
+    use super::{SessionAccessStatus, SessionManager, access_status_from_report, db, reader};
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
@@ -3869,21 +3722,6 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
-    struct TestV7ToCurrentMigration;
-
-    impl super::SessionEventLogMigration for TestV7ToCurrentMigration {
-        const ID: &'static str = "test-session-events-v7-to-current";
-        const FROM_SCHEMA: u16 = CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1;
-        const TO_SCHEMA: u16 = CURRENT_SESSION_EVENT_SCHEMA_VERSION;
-
-        fn migrate_event(
-            &self,
-            event: SessionEvent,
-        ) -> Result<SessionEvent, super::SessionEventLogMigrationError> {
-            Ok(event)
-        }
-    }
-
     #[test]
     fn session_migration_fixture_declarations_exist() {
         let fixtures = super::migration::session_migration_fixtures();
@@ -3957,393 +3795,6 @@ mod tests {
             panic!("started run should require attention");
         };
         assert_eq!(items[0].run_id, "run-1");
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn session_health_reports_ready_legacy_and_missing_states() {
-        let root = unique_temp_dir();
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
-        let missing_id = SessionId::new();
-        assert_eq!(
-            manager.session_health(missing_id).await,
-            SessionHealth::NotFound
-        );
-
-        let session = manager
-            .create_session(Some("healthy".to_string()), test_working_directory())
-            .await
-            .expect("session should create");
-        assert_eq!(
-            manager.session_health(session.id).await,
-            SessionHealth::Ready
-        );
-
-        let legacy_id = SessionId::new();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        write_legacy_event(
-            &root.join(format!("{legacy_id}.events")),
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 0,
-                session_id: legacy_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: Some("legacy".to_string()),
-                    working_directory: test_working_directory(),
-                },
-            },
-        );
-        assert_eq!(
-            manager.session_health(legacy_id).await,
-            SessionHealth::LegacyMigrationRequired
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn legacy_session_discovery_is_filename_only_and_migrate_all_populates_db() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        let session_id = bcode_session_models::SessionId::new();
-        let path = root.join(format!("{session_id}.events"));
-        write_legacy_event(
-            &path,
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: Some("discover".to_string()),
-                    working_directory: test_working_directory(),
-                },
-            },
-        );
-
-        let manager = SessionManager::persistent(&root).expect("manager should initialize");
-        let candidates = manager
-            .list_legacy_sessions_for_migration()
-            .await
-            .expect("legacy discovery should list files");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].session_id, session_id);
-        assert!(!candidates[0].has_db);
-
-        let results = manager
-            .migrate_all_legacy_sessions_to_db()
-            .await
-            .expect("migrate all should run");
-        assert_eq!(results.len(), 1);
-        assert!(results[0].migrated);
-        assert!(super::db::session_db_path(&root, session_id).exists());
-
-        let candidates = manager
-            .list_legacy_sessions_for_migration()
-            .await
-            .expect("legacy discovery should still be explicit");
-        assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].has_db);
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn explicit_legacy_session_migration_populates_db() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        let session_id = bcode_session_models::SessionId::new();
-        let path = root.join(format!("{session_id}.events"));
-        write_legacy_event(
-            &path,
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: Some("legacy".to_string()),
-                    working_directory: test_working_directory(),
-                },
-            },
-        );
-        append_legacy_event(
-            &path,
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
-                sequence: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::UserMessage {
-                    client_id: ClientId::new(),
-                    text: "hello".to_string(),
-                },
-            },
-        );
-
-        let manager = SessionManager::persistent(&root).expect("manager should restore catalog");
-        let error = manager
-            .session_history(session_id)
-            .await
-            .expect_err("normal access should require migration");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
-
-        let summary = manager
-            .migrate_legacy_session_to_db(session_id)
-            .await
-            .expect("explicit migration should populate DB");
-        assert_eq!(summary.id, session_id);
-        assert!(super::db::session_db_path(&root, session_id).exists());
-        assert!(!super::index::index_path(&root, session_id).exists());
-        assert!(!super::index::entries_path(&root, session_id).exists());
-
-        let legacy_history = super::SessionEventStore::new(&root)
-            .read_legacy_events_for_migration(session_id)
-            .expect("legacy event log should remain readable");
-        assert!(
-            legacy_history
-                .iter()
-                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1)
-        );
-
-        let history = manager
-            .session_history(session_id)
-            .await
-            .expect("DB-backed history should load after migration");
-        assert_eq!(history.len(), 2);
-        assert!(
-            history
-                .iter()
-                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION)
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn canonical_event_log_migration_rewrites_validates_and_reindexes() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        let session_id = bcode_session_models::SessionId::new();
-        let event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
-            sequence: 0,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::SessionCreated {
-                name: Some("old".to_string()),
-                working_directory: test_working_directory(),
-            },
-        };
-        let path = root.join(format!("{session_id}.events"));
-        write_legacy_event(&path, &event);
-
-        let store = super::SessionEventStore::new(&root);
-        let report = store
-            .migrate_event_log(session_id, &TestV7ToCurrentMigration)
-            .expect("migration should apply");
-        assert_eq!(
-            report.items[0].status,
-            super::SessionMigrationApplyStatus::Applied
-        );
-        assert!(report.backup_dir.expect("backup should exist").exists());
-
-        let restored = SessionManager::persistent(&root).expect("manager should restore");
-        let error = restored
-            .session_access_status(session_id)
-            .await
-            .expect_err("normal status access should require DB migration");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
-        let error = restored
-            .session_history(session_id)
-            .await
-            .expect_err("normal history access should require DB migration");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
-
-        let second = store
-            .migrate_event_log(session_id, &TestV7ToCurrentMigration)
-            .expect("second migration should be idempotent");
-        assert_eq!(
-            second.items[0].status,
-            super::SessionMigrationApplyStatus::Skipped
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn built_in_event_log_migration_handles_mixed_schema_events() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        let session_id = bcode_session_models::SessionId::new();
-        let path = root.join(format!("{session_id}.events"));
-        write_legacy_event(
-            &path,
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 2,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: Some("mixed old".to_string()),
-                    working_directory: test_working_directory(),
-                },
-            },
-        );
-        append_legacy_event(
-            &path,
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
-                sequence: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::UserMessage {
-                    client_id: ClientId::new(),
-                    text: "hello".to_string(),
-                },
-            },
-        );
-        append_legacy_event(
-            &path,
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 2,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SystemMessage {
-                    text: "current".to_string(),
-                },
-            },
-        );
-
-        let store = super::SessionEventStore::new(&root);
-        let report = store
-            .migrate_event_log_to_current(session_id)
-            .expect("mixed event migration should apply");
-        assert_eq!(
-            report.items[0].status,
-            super::SessionMigrationApplyStatus::Applied
-        );
-        assert!(report.backup_dir.expect("backup should exist").exists());
-        let history = store
-            .read_legacy_events_for_migration(session_id)
-            .expect("history should read");
-        assert_eq!(history.len(), 3);
-        assert!(
-            history
-                .iter()
-                .all(|event| event.schema_version == CURRENT_SESSION_EVENT_SCHEMA_VERSION)
-        );
-        assert_eq!(history[0].sequence, 0);
-        assert_eq!(history[1].sequence, 1);
-        assert_eq!(history[2].sequence, 2);
-
-        let second = store
-            .migrate_event_log_to_current(session_id)
-            .expect("second migration should skip");
-        assert_eq!(
-            second.items[0].status,
-            super::SessionMigrationApplyStatus::Skipped
-        );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn attach_session_recent_requires_indexes_for_old_schema_sessions() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        let session_id = bcode_session_models::SessionId::new();
-        let path = root.join(format!("{session_id}.events"));
-        write_legacy_event(
-            &path,
-            &SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: Some("auto".to_string()),
-                    working_directory: test_working_directory(),
-                },
-            },
-        );
-
-        let manager = SessionManager::persistent(&root).expect("manager should restore");
-        let error = manager
-            .session_access_status(session_id)
-            .await
-            .expect_err("legacy session status should require explicit DB migration");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
-        let error = manager
-            .attach_session_recent(session_id, ClientId::new(), 10)
-            .await
-            .expect_err("old session without DB should require explicit DB migration");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
-        let error = manager
-            .session_access_status(session_id)
-            .await
-            .expect_err("legacy session status should require explicit DB migration");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn future_schema_session_is_not_writable() {
-        let root = unique_temp_dir();
-        std::fs::create_dir_all(&root).expect("session dir should create");
-        let session_id = bcode_session_models::SessionId::new();
-        let event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION.saturating_add(1),
-            sequence: 0,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::SessionCreated {
-                name: Some("future".to_string()),
-                working_directory: test_working_directory(),
-            },
-        };
-        let path = root.join(format!("{session_id}.events"));
-        write_legacy_event(&path, &event);
-
-        let manager = SessionManager::persistent(&root).expect("manager should restore");
-        let error = manager
-            .session_access_status(session_id)
-            .await
-            .expect_err("future legacy session should require explicit DB migration");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
-        let error = manager
-            .append_user_message(session_id, ClientId::new(), "nope".to_string())
-            .await
-            .expect_err("legacy session should require explicit DB migration before writes");
-        assert!(matches!(
-            error,
-            super::SessionError::LegacyMigrationRequired(_)
-        ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -4752,75 +4203,6 @@ mod tests {
             restored_sessions[0].name.as_deref(),
             Some("Fix session selection UX")
         );
-
-        std::fs::remove_dir_all(root).expect("temp dir should clean up");
-    }
-
-    #[tokio::test]
-    async fn legacy_unnamed_session_index_derives_title_from_first_prompt() {
-        let root = unique_temp_dir();
-        let session_id = SessionId::new();
-        let store = super::SessionEventStore::new(&root);
-        std::fs::create_dir_all(&root).expect("session root should create");
-        let event_path = root.join(format!("{session_id}.events"));
-        let events = [
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 0,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::SessionCreated {
-                    name: None,
-                    working_directory: test_working_directory(),
-                },
-            },
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ClientAttached {
-                    client_id: ClientId::new(),
-                },
-            },
-            SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 2,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::UserMessage {
-                    client_id: ClientId::new(),
-                    text: "# Recover old title\n\nbody".to_string(),
-                },
-            },
-        ];
-        let mut file = std::fs::File::create(&event_path).expect("event file should create");
-        for event in events {
-            write_legacy_event_payload(&mut file, &event);
-        }
-
-        assert_eq!(
-            access_status_from_report(
-                &reader::read_events(&event_path).expect("legacy encoding should read")
-            ),
-            SessionAccessStatus::ReadOnlyMigrationRequired
-        );
-        store
-            .migrate_event_log_to_current(session_id)
-            .expect("encoding migration should rewrite stable frames");
-        let report = reader::read_events(&event_path).expect("migrated events should read");
-        assert!(!report.needs_encoding_migration);
-
-        let manager = SessionManager::persistent(&root).expect("manager should restore");
-        let sessions = manager.list_sessions(&test_working_directory()).await;
-        assert!(sessions.is_empty());
-
-        manager
-            .migrate_legacy_session_to_db(session_id)
-            .await
-            .expect("legacy session should explicitly migrate to DB");
-        let sessions = manager.list_sessions(&test_working_directory()).await;
-        assert_eq!(sessions[0].name.as_deref(), Some("Recover old title"));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -5609,15 +4991,6 @@ mod tests {
 
     fn write_legacy_event(path: &std::path::Path, event: &SessionEvent) {
         let mut file = std::fs::File::create(path).expect("event file should create");
-        write_legacy_event_payload(&mut file, event);
-    }
-
-    fn append_legacy_event(path: &std::path::Path, event: &SessionEvent) {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .expect("event file should open");
         write_legacy_event_payload(&mut file, event);
     }
 

@@ -597,7 +597,7 @@ impl SessionActor {
                 if let Some(history) = self.recent_history_from_db(limit).await? {
                     history
                 } else if self.store.is_some() {
-                    return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+                    return Err(SessionError::NotFound(self.state.summary.id));
                 } else {
                     self.history()
                         .await?
@@ -683,7 +683,7 @@ impl SessionActor {
                 if let Some(history) = self.recent_history_from_db(limit).await? {
                     history
                 } else if self.store.is_some() {
-                    return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+                    return Err(SessionError::NotFound(self.state.summary.id));
                 } else {
                     self.history()
                         .await?
@@ -753,7 +753,7 @@ impl SessionActor {
             return Ok(events.clone());
         }
         if self.store.is_some() {
-            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+            return Err(SessionError::NotFound(self.state.summary.id));
         }
         Err(SessionError::NotFound(self.state.summary.id))
     }
@@ -790,7 +790,7 @@ impl SessionActor {
         }
 
         if self.store.is_some() {
-            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+            return Err(SessionError::NotFound(self.state.summary.id));
         }
         Err(SessionError::UnsupportedProjectionWindow)
     }
@@ -815,7 +815,7 @@ impl SessionActor {
             ));
         }
         if self.store.is_some() {
-            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+            return Err(SessionError::NotFound(self.state.summary.id));
         }
         Err(SessionError::NotFound(self.state.summary.id))
     }
@@ -882,7 +882,7 @@ impl SessionActor {
             return Ok(input_history_from_events(events));
         }
         if self.store.is_some() {
-            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+            return Err(SessionError::NotFound(self.state.summary.id));
         }
         Err(SessionError::NotFound(self.state.summary.id))
     }
@@ -922,7 +922,7 @@ impl SessionActor {
             return Ok(model_context_events_from_history(events));
         }
         if self.store.is_some() {
-            return Err(SessionError::LegacyMigrationRequired(self.state.summary.id));
+            return Err(SessionError::NotFound(self.state.summary.id));
         }
         Err(SessionError::NotFound(self.state.summary.id))
     }

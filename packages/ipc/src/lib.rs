@@ -7,9 +7,9 @@
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 use bcode_session_models::{
-    ClientId, LegacySessionCandidate, LegacySessionMigrationResult, ProjectionWindowRequest,
-    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
+    ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
+    SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
+    SessionSummary,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -289,11 +289,6 @@ pub enum Request {
         session_id: SessionId,
         request: ProjectionWindowRequest,
     },
-    ListLegacySessionsForMigration,
-    MigrateLegacySessionToDb {
-        session_id: SessionId,
-    },
-    MigrateAllLegacySessionsToDb,
 }
 
 /// Server stop request policy.
@@ -606,15 +601,6 @@ pub enum ResponsePayload {
         events: Vec<SessionEvent>,
     },
     RuntimeWorkSubscribed,
-    LegacySessionMigrationCandidates {
-        candidates: Vec<LegacySessionCandidate>,
-    },
-    LegacySessionMigrated {
-        session: SessionSummary,
-    },
-    LegacySessionMigrationResults {
-        results: Vec<LegacySessionMigrationResult>,
-    },
 }
 
 /// Structured error response.

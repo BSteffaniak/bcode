@@ -97,39 +97,13 @@ pub fn start_switch_session(
     let event_sender = chat.event_sender.clone();
     let async_event_sender = chat.async_event_sender.clone();
     chat.session_open_task = Some(tokio::spawn(async move {
-        let result = match history_flow::attach_session_event_stream_with_window_request(
+        let result = history_flow::attach_session_event_stream_with_window_request(
             &client,
             next_session_id,
-            event_sender.clone(),
-            initial_window_request.clone(),
+            event_sender,
+            initial_window_request,
         )
-        .await
-        {
-            Err(TuiError::LegacyMigrationRequired(_)) => {
-                match client.connect("bcode-tui-bmux").await {
-                    Ok(mut migration_connection) => match migration_connection
-                        .migrate_legacy_session_to_db(next_session_id)
-                        .await
-                    {
-                        Ok(_summary) => {
-                            history_flow::attach_session_event_stream_with_window_request(
-                                &client,
-                                next_session_id,
-                                event_sender,
-                                initial_window_request,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(TuiError::SessionUnavailable {
-                            session_id: next_session_id,
-                            reason: format!("legacy DB migration failed: {error}"),
-                        }),
-                    },
-                    Err(error) => Err(error.into()),
-                }
-            }
-            result => result,
-        };
+        .await;
         let _ = async_event_sender.send(ChatAsyncEvent::SessionOpened(SessionOpenResult {
             session_id: next_session_id,
             has_older_history: true,

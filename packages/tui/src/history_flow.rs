@@ -111,11 +111,6 @@ pub async fn attach_session_event_stream_with_limit(
         .await
     {
         Ok(attached) => attached,
-        Err(bcode_client::ClientError::Server { code, message: _ })
-            if code == "legacy_migration_required" =>
-        {
-            return Err(TuiError::LegacyMigrationRequired(session_id));
-        }
         Err(bcode_client::ClientError::Server { code, message })
             if code == "projection_stale" || code == "session_repair_required" =>
         {
@@ -149,11 +144,6 @@ pub async fn attach_session_event_stream_with_window_request(
         .await
     {
         Ok(attached) => attached,
-        Err(bcode_client::ClientError::Server { code, message: _ })
-            if code == "legacy_migration_required" =>
-        {
-            return Err(TuiError::LegacyMigrationRequired(session_id));
-        }
         Err(bcode_client::ClientError::Server { code, message })
             if code == "projection_stale" || code == "session_repair_required" =>
         {
