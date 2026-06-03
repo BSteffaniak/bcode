@@ -31,4 +31,10 @@ if ! rg -q "mod store_executor;" packages/session/src/lib.rs; then
   violations=1
 fi
 
+if rg -n "SessionDb::open_turso_in_root" packages/server/src --glob '*.rs' >/tmp/bcode-server-session-db-open-violations.txt; then
+  echo "Session architecture violation: server code must access per-session DBs through SessionManager/SessionActor." >&2
+  cat /tmp/bcode-server-session-db-open-violations.txt >&2
+  violations=1
+fi
+
 exit "$violations"

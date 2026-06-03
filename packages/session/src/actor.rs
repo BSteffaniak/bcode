@@ -186,6 +186,12 @@ impl SessionHandle {
         self.send(SessionCommand::ActiveToolRuns).await?
     }
 
+    pub async fn active_runtime_work(
+        &self,
+    ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
+        self.send(SessionCommand::ActiveRuntimeWork).await?
+    }
+
     pub async fn current_model_selection(&self) -> Result<Option<(String, String)>, SessionError> {
         self.send(SessionCommand::CurrentModelSelection).await
     }
@@ -272,6 +278,7 @@ enum SessionCommand {
     InputHistory(oneshot::Sender<Result<Vec<SessionInputHistoryEntry>, SessionError>>),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
+    ActiveRuntimeWork(oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>),
     CurrentModelSelection(oneshot::Sender<Option<(String, String)>>),
     CurrentAgentSelection(oneshot::Sender<Option<String>>),
     SetCurrentAgent {
@@ -392,6 +399,9 @@ impl SessionActor {
             }
             SessionCommand::ActiveToolRuns(reply) => {
                 let _ = reply.send(self.active_tool_runs().await);
+            }
+            SessionCommand::ActiveRuntimeWork(reply) => {
+                let _ = reply.send(self.active_runtime_work().await);
             }
             SessionCommand::CurrentModelSelection(reply) => {
                 let _ = reply.send(
@@ -817,6 +827,27 @@ impl SessionActor {
         Err(SessionError::ProjectionStale {
             session_id: self.state.summary.id,
             projection: "tool_runs",
+            checkpoint,
+            expected: expected_last_sequence,
+        })
+    }
+
+    async fn active_runtime_work(
+        &mut self,
+    ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
+        let Some(db) = self.existing_session_db().await? else {
+            return Ok(Vec::new());
+        };
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+        let checkpoint = db
+            .materialized_projection_checkpoint(MaterializedProjection::RuntimeWork)
+            .await?;
+        if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
+            return Ok(db.active_runtime_work().await?);
+        }
+        Err(SessionError::ProjectionStale {
+            session_id: self.state.summary.id,
+            projection: "runtime_work",
             checkpoint,
             expected: expected_last_sequence,
         })

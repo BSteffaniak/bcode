@@ -30,7 +30,7 @@ use bcode_model::{
     OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent,
     ReasoningEffort, StartTurnResponse, TokenUsage,
 };
-use bcode_session::{CatalogLoadStatus, SessionHealth, SessionManager};
+use bcode_session::{CatalogLoadStatus, SessionManager};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
@@ -1279,12 +1279,7 @@ async fn recover_abandoned_session_runtime_work(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let root = state
-        .sessions
-        .session_store_root()
-        .ok_or_else(|| ServerError::Session(bcode_session::SessionError::NotFound(session_id)))?;
-    let db = bcode_session::db::SessionDb::open_turso_in_root(session_id, &root).await?;
-    let active = db.active_runtime_work().await?;
+    let active = state.sessions.active_runtime_work(session_id).await?;
     let work_ids = active
         .iter()
         .map(|work| work.work_id.clone())
@@ -2289,34 +2284,6 @@ async fn send_incompatible_active_session_response(
     .await
 }
 
-const fn session_health_error_code(health: &SessionHealth) -> Option<&'static str> {
-    match health {
-        SessionHealth::Ready => None,
-        SessionHealth::ProjectionStale { .. } => Some("projection_stale"),
-        SessionHealth::RepairRequired { .. } => Some("session_repair_required"),
-        SessionHealth::NotFound => Some("session_not_found"),
-    }
-}
-
-async fn ensure_attachable_session_health(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<bool, ServerError> {
-    let health = state.sessions.session_health(session_id).await;
-    let Some(code) = session_health_error_code(&health) else {
-        return Ok(true);
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Err(ErrorResponse::new(code, format!("{health:?}"))),
-    )
-    .await?;
-    Ok(false)
-}
-
 async fn handle_attach_session(
     request_id: u64,
     client_id: ClientId,
@@ -2325,9 +2292,6 @@ async fn handle_attach_session(
     attached_session: &mut Option<SessionId>,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
-        return Ok(());
-    }
     recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
@@ -2397,13 +2361,6 @@ async fn handle_attach_session_recent(
     state
         .metrics
         .record_histogram("server.attach_recent.limit", usize_to_u64(limit));
-    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
-        state.metrics.record_histogram(
-            "server.attach_recent.total_duration_ms",
-            elapsed_ms(total_started_at),
-        );
-        return Ok(());
-    }
     recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;
@@ -2489,13 +2446,6 @@ async fn handle_attach_session_projection_window(
     state
         .metrics
         .increment_counter("server.attach_projection_window.total");
-    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
-        state.metrics.record_histogram(
-            "server.attach_projection_window.total_duration_ms",
-            elapsed_ms(total_started_at),
-        );
-        return Ok(());
-    }
     recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;

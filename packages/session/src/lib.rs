@@ -1043,6 +1043,20 @@ impl SessionManager {
         handle.active_tool_runs().await
     }
 
+    /// Return active runtime-work rows through the session actor's DB connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or
+    /// [`SessionError::ProjectionStale`] when the DB projection is not current.
+    pub async fn active_runtime_work(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<db::RuntimeWorkProjection>, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.active_runtime_work().await
+    }
+
     /// Return latest runtime-work rows from the DB read model.
     ///
     /// # Errors
