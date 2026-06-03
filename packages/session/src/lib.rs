@@ -49,11 +49,6 @@ pub enum SessionError {
     Deleting(SessionId),
     #[error("unsupported session projection window request")]
     UnsupportedProjectionWindow,
-    #[error("session is not writable: {session_id} ({status:?})")]
-    NotWritable {
-        session_id: SessionId,
-        status: SessionAccessStatus,
-    },
     #[error(
         "session DB projection is stale: {session_id} {projection} checkpoint={checkpoint:?} expected={expected}"
     )]
@@ -68,71 +63,25 @@ pub enum SessionError {
     Db(#[from] db::SessionDbError),
 }
 
-/// Canonical session access status used to gate reads and writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionAccessStatus {
-    /// Canonical events are readable and writable by this version.
-    ReadWrite,
-    /// Canonical events are readable, but writes require a migration first.
-    ReadOnlyMigrationRequired,
-    /// Canonical events were written by a newer unsupported version.
-    BlockedFutureVersion,
-    /// Canonical events are corrupt and require repair before safe access.
-    RepairRequired,
-}
-
-impl SessionAccessStatus {
-    #[must_use]
-    pub const fn writable(self) -> bool {
-        matches!(self, Self::ReadWrite)
-    }
-}
-
-/// Errors returned by the append-only session event store.
+/// Errors returned by the session store.
 #[derive(Debug, Error)]
 pub enum SessionStoreError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to encode session event: {0}")]
-    Encode(#[source] bmux_codec::Error),
-    #[error("failed to decode session event: {0}")]
-    Decode(#[source] bmux_codec::Error),
     #[error("blocking session store task failed: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
     #[error("session catalog load failed: {0}")]
     CatalogLoad(String),
-    #[error("session index error: {0}")]
-    Index(#[source] serde_json::Error),
-    #[error("session event frame is too large: {0} bytes")]
-    FrameTooLarge(usize),
-    #[error("unsupported session event frame version: {0}")]
-    UnsupportedFrameVersion(u16),
-    #[error("session event frame checksum mismatch")]
-    ChecksumMismatch,
-    #[error("session event file has a non-UTF-8 or missing file stem: {0:?}")]
-    InvalidFileName(PathBuf),
-    #[error("session event file name is not a session ID: {0}")]
-    InvalidSessionId(String),
-    #[error(
-        "refusing to write stale session metadata for {session_id}: current event_count={current_event_count}, attempted event_count={attempted_event_count}, current next_sequence={current_next_sequence}, attempted next_sequence={attempted_next_sequence}"
-    )]
-    StaleMetadataWrite {
-        session_id: SessionId,
-        current_event_count: usize,
-        attempted_event_count: usize,
-        current_next_sequence: u64,
-        attempted_next_sequence: u64,
-    },
 }
 
-/// Append-only event store for session histories.
+/// Filesystem-rooted session store for DB-backed session histories.
 #[derive(Debug, Clone)]
-pub struct SessionEventStore {
+pub struct SessionStore {
     root: PathBuf,
     pub(crate) metrics: MetricsRegistry,
 }
 
-impl SessionEventStore {
+impl SessionStore {
     /// Create an event store rooted at the provided directory.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -254,27 +203,12 @@ impl SessionEventStore {
         .map_err(|_| SessionStoreError::CatalogLoad("DB session loader panicked".to_string()))?
     }
 
-    fn delete(&self, session_id: SessionId) -> Result<(), SessionStoreError> {
-        let path = self.event_path(session_id);
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(SessionStoreError::Io(error)),
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn event_path(&self, session_id: SessionId) -> PathBuf {
-        self.root.join(format!("{session_id}.events"))
-    }
-
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
     }
 }
 
-/// In-memory session manager with optional append-only persistence.
+/// In-memory session manager with optional DB-backed persistence.
 #[derive(Debug)]
 pub struct SessionManager {
     inner: Arc<Mutex<SessionManagerInner>>,
@@ -288,14 +222,12 @@ pub struct SessionManager {
 #[derive(Debug, Default)]
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
-    completed_rebuilds: usize,
-    failed_rebuilds: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionIndexStatusKind {
+enum SessionLoadStatusKind {
     Current,
-    Stale,
+    SummaryOnly,
 }
 
 /// Current asynchronous catalog discovery status.
@@ -325,16 +257,6 @@ pub enum SessionHealth {
     NotFound,
 }
 
-/// Background session maintenance status.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SessionMaintenanceStatus {
-    pub catalog_status: CatalogLoadStatus,
-    pub stale_indexes: usize,
-    pub running_rebuilds: usize,
-    pub completed_rebuilds: usize,
-    pub failed_rebuilds: usize,
-}
-
 #[derive(Debug)]
 pub(crate) struct SessionState {
     summary: SessionSummary,
@@ -349,8 +271,7 @@ pub(crate) struct SessionState {
     current_agent: Option<String>,
     latest_compaction_sequence: Option<u64>,
     total_metered_tokens: u64,
-    index_status: SessionIndexStatusKind,
-    access_status: SessionAccessStatus,
+    load_status: SessionLoadStatusKind,
     sender: broadcast::Sender<SessionEvent>,
 }
 
@@ -358,25 +279,23 @@ pub(crate) struct SessionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCatalogEntry {
     pub summary: SessionSummary,
-    pub access_status: SessionAccessStatus,
-    pub index_status: SessionCatalogIndexStatus,
+    pub load_status: SessionCatalogLoadStatus,
 }
 
-/// Primary metadata index status for catalog/status reporting.
+/// Session load status for catalog/status reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionCatalogIndexStatus {
+pub enum SessionCatalogLoadStatus {
     Current,
-    Stale,
+    SummaryOnly,
 }
 
 impl SessionCatalogEntry {
     fn from_snapshot(snapshot: actor::SessionSnapshot) -> Self {
         Self {
             summary: snapshot.summary,
-            access_status: snapshot.access_status,
-            index_status: match snapshot.index_status {
-                SessionIndexStatusKind::Current => SessionCatalogIndexStatus::Current,
-                SessionIndexStatusKind::Stale => SessionCatalogIndexStatus::Stale,
+            load_status: match snapshot.load_status {
+                SessionLoadStatusKind::Current => SessionCatalogLoadStatus::Current,
+                SessionLoadStatusKind::SummaryOnly => SessionCatalogLoadStatus::SummaryOnly,
             },
         }
     }
@@ -413,7 +332,7 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
-    /// Create a session manager backed by an append-only event store.
+    /// Create a session manager backed by a session store root.
     ///
     /// # Errors
     ///
@@ -422,7 +341,7 @@ impl SessionManager {
         Self::persistent_with_metrics(root, MetricsRegistry::default())
     }
 
-    /// Create a session manager backed by an append-only event store with metrics instrumentation.
+    /// Create a session manager backed by a session store root with metrics instrumentation.
     ///
     /// # Errors
     ///
@@ -431,7 +350,7 @@ impl SessionManager {
         root: impl Into<PathBuf>,
         metrics: MetricsRegistry,
     ) -> Result<Self, SessionStoreError> {
-        let store = SessionEventStore::with_metrics(root, metrics);
+        let store = SessionStore::with_metrics(root, metrics);
         let sessions = store.load_catalog()?;
         Ok(Self::from_store(store, sessions, true))
     }
@@ -448,12 +367,12 @@ impl SessionManager {
         root: impl Into<PathBuf>,
         metrics: MetricsRegistry,
     ) -> Self {
-        let store = SessionEventStore::with_metrics(root, metrics);
+        let store = SessionStore::with_metrics(root, metrics);
         Self::from_store(store, BTreeMap::new(), false)
     }
 
     fn from_store(
-        store: SessionEventStore,
+        store: SessionStore,
         sessions: BTreeMap<SessionId, SessionState>,
         catalog_loaded: bool,
     ) -> Self {
@@ -476,8 +395,6 @@ impl SessionManager {
                         )
                     })
                     .collect(),
-                completed_rebuilds: 0,
-                failed_rebuilds: 0,
             })),
             store: Some(executor),
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
@@ -549,7 +466,7 @@ impl SessionManager {
         let total_timer = self.metrics.timer();
         let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
         if let Some(handle) = cached_handle {
-            if handle.snapshot().index_status == SessionIndexStatusKind::Stale
+            if handle.snapshot().load_status == SessionLoadStatusKind::SummaryOnly
                 && let Some(store) = &self.store
                 && db::session_db_path(&store.root_path(), session_id).exists()
             {
@@ -709,13 +626,6 @@ impl SessionManager {
         }
     }
 
-    async fn migrate_session_to_current_if_required(
-        &self,
-        session_id: SessionId,
-    ) -> Result<(), SessionError> {
-        self.ensure_session_loaded(session_id).await
-    }
-
     /// Create a new session.
     ///
     /// # Errors
@@ -759,8 +669,7 @@ impl SessionManager {
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
-            index_status: SessionIndexStatusKind::Current,
-            access_status: SessionAccessStatus::ReadWrite,
+            load_status: SessionLoadStatusKind::Current,
             sender,
         };
         let handle = SessionHandle::new(state, self.store.clone());
@@ -818,23 +727,6 @@ impl SessionManager {
         matches!(self.catalog_status(), CatalogLoadStatus::Loaded)
     }
 
-    /// Return background maintenance status.
-    pub async fn maintenance_status(&self) -> SessionMaintenanceStatus {
-        let (handles, completed_rebuilds, failed_rebuilds) = {
-            let inner = self.inner.lock().await;
-            let handles = inner.sessions.values().cloned().collect::<Vec<_>>();
-            (handles, inner.completed_rebuilds, inner.failed_rebuilds)
-        };
-        let stale_indexes = stale_index_count(handles);
-        SessionMaintenanceStatus {
-            catalog_status: self.catalog_status(),
-            stale_indexes,
-            running_rebuilds: 0,
-            completed_rebuilds,
-            failed_rebuilds,
-        }
-    }
-
     /// Rename a session.
     ///
     /// # Errors
@@ -848,8 +740,7 @@ impl SessionManager {
         session_id: SessionId,
         name: Option<String>,
     ) -> Result<SessionEvent, SessionError> {
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
+        self.ensure_session_loaded(session_id).await?;
         let normalized_name = normalize_session_name(name);
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
@@ -874,8 +765,7 @@ impl SessionManager {
         session_id: SessionId,
         new_working_directory: PathBuf,
     ) -> Result<Option<SessionEvent>, SessionError> {
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
+        self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let old_working_directory = handle.working_directory().await?;
         let new_working_directory = normalize_working_directory(&new_working_directory);
@@ -952,7 +842,6 @@ impl SessionManager {
         if let Some(store) = &self.store {
             let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
             catalog.delete_session(session_id).await?;
-            store.delete(session_id).await?;
             let session_db_path = db::session_db_path(&store.root_path(), session_id);
             if let Some(session_dir) = session_db_path.parent() {
                 match std::fs::remove_dir_all(session_dir) {
@@ -964,17 +853,6 @@ impl SessionManager {
         }
         handle.shutdown().await?;
         Ok(session)
-    }
-
-    /// Ensure the session's canonical event log has been migrated to the current schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session does not exist, has blocking read issues,
-    /// or cannot be migrated.
-    pub async fn ensure_session_current(&self, session_id: SessionId) -> Result<(), SessionError> {
-        self.migrate_session_to_current_if_required(session_id)
-            .await
     }
 
     /// Return a summary for one session.
@@ -1006,20 +884,7 @@ impl SessionManager {
         handle.working_directory().await
     }
 
-    /// Return canonical access status for one session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError::NotFound`] when the session does not exist.
-    pub async fn session_access_status(
-        &self,
-        session_id: SessionId,
-    ) -> Result<SessionAccessStatus, SessionError> {
-        let handle = self.session_handle(session_id).await?;
-        handle.access_status().await
-    }
-
-    /// Return replayable history for a session.
+    /// Return durable history for a session.
     ///
     /// # Errors
     ///
@@ -1066,7 +931,7 @@ impl SessionManager {
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
         let handle = self.session_handle(session_id).await?;
-        let projection_window = match handle.projection_window_from_index(request.clone()).await {
+        let projection_window = match handle.projection_window(request.clone()).await {
             Ok(window) => {
                 self.metrics
                     .increment_counter("session.manager.projection_window.fast_path_total");
@@ -1194,7 +1059,6 @@ impl SessionManager {
     /// Returns an error when:
     ///
     /// * the session does not exist
-    /// * required session event migration fails
     /// * the client-attached event cannot be persisted
     pub async fn attach_session(
         &self,
@@ -1210,13 +1074,9 @@ impl SessionManager {
         );
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let result = if handle.requires_migration_for_write().await? {
-            handle.read_only_attach(client_id, AttachMode::Full).await
-        } else {
-            handle
-                .attach(client_id, AttachMode::Full, activity_timestamp_ms)
-                .await
-        };
+        let result = handle
+            .attach(client_id, AttachMode::Full, activity_timestamp_ms)
+            .await;
         self.metrics.record_histogram(
             "session.manager.attach_full.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -1235,7 +1095,6 @@ impl SessionManager {
     /// Returns an error when:
     ///
     /// * the session does not exist
-    /// * required session event migration fails
     /// * the client-attached event cannot be persisted
     pub async fn attach_session_recent(
         &self,
@@ -1254,19 +1113,13 @@ impl SessionManager {
         );
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let result = if handle.requires_migration_for_write().await? {
-            handle
-                .read_only_attach(client_id, AttachMode::Recent { limit })
-                .await
-        } else {
-            handle
-                .attach(
-                    client_id,
-                    AttachMode::Recent { limit },
-                    activity_timestamp_ms,
-                )
-                .await
-        };
+        let result = handle
+            .attach(
+                client_id,
+                AttachMode::Recent { limit },
+                activity_timestamp_ms,
+            )
+            .await;
         self.metrics.record_histogram(
             "session.manager.attach_recent.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -1295,7 +1148,6 @@ impl SessionManager {
     /// Returns an error when:
     ///
     /// * the session does not exist
-    /// * required session event migration fails
     /// * the projection request is not supported
     /// * the client-attached event cannot be persisted
     pub async fn attach_session_projection_window(
@@ -1312,7 +1164,7 @@ impl SessionManager {
             handle_timer.elapsed_ms(),
         );
         let projection_timer = self.metrics.timer();
-        let projection_window = match handle.projection_window_from_index(request.clone()).await {
+        let projection_window = match handle.projection_window(request.clone()).await {
             Ok(window) => {
                 self.metrics
                     .increment_counter("session.manager.attach_projection_window.fast_path_total");
@@ -1344,19 +1196,13 @@ impl SessionManager {
         };
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let mut attachment = if handle.requires_migration_for_write().await? {
-            handle
-                .read_only_attach(client_id, AttachMode::ProjectionWindow { history })
-                .await?
-        } else {
-            handle
-                .attach(
-                    client_id,
-                    AttachMode::ProjectionWindow { history },
-                    activity_timestamp_ms,
-                )
-                .await?
-        };
+        let mut attachment = handle
+            .attach(
+                client_id,
+                AttachMode::ProjectionWindow { history },
+                activity_timestamp_ms,
+            )
+            .await?;
         self.metrics.record_histogram(
             "session.manager.attach_projection_window.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -1411,8 +1257,7 @@ impl SessionManager {
         client_id: ClientId,
         text: String,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
+        self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         handle
@@ -1810,8 +1655,7 @@ impl SessionManager {
         session_id: SessionId,
         kind: SessionEventKind,
     ) -> Result<SessionEvent, SessionError> {
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
+        self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let event = handle.append_event(kind, activity_timestamp_ms).await?;
@@ -1832,8 +1676,7 @@ impl SessionManager {
         kind: SessionEventKind,
         provenance: Option<SessionEventProvenance>,
     ) -> Result<SessionEvent, SessionError> {
-        self.migrate_session_to_current_if_required(session_id)
-            .await?;
+        self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let event = handle
@@ -1874,8 +1717,7 @@ impl SessionState {
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
-            index_status: SessionIndexStatusKind::Stale,
-            access_status: SessionAccessStatus::ReadWrite,
+            load_status: SessionLoadStatusKind::SummaryOnly,
             sender,
         }
     }
@@ -1917,8 +1759,7 @@ impl SessionState {
             current_agent: None,
             latest_compaction_sequence: state.latest_compaction_sequence,
             total_metered_tokens: 0,
-            index_status: SessionIndexStatusKind::Current,
-            access_status: SessionAccessStatus::ReadWrite,
+            load_status: SessionLoadStatusKind::Current,
             sender,
         }
     }
@@ -1952,8 +1793,7 @@ impl SessionState {
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
-            index_status: SessionIndexStatusKind::Current,
-            access_status: SessionAccessStatus::ReadWrite,
+            load_status: SessionLoadStatusKind::Current,
             sender,
         };
 
@@ -2003,38 +1843,14 @@ impl SessionState {
         summary
     }
 
-    const fn ensure_writable(&self) -> Result<(), SessionError> {
-        if self.access_status.writable() {
-            Ok(())
-        } else {
-            Err(SessionError::NotWritable {
-                session_id: self.summary.id,
-                status: self.access_status,
-            })
-        }
-    }
-
-    const fn requires_migration_for_write(
-        &self,
-        session_id: SessionId,
-    ) -> Result<bool, SessionError> {
-        match self.access_status {
-            SessionAccessStatus::ReadWrite => Ok(false),
-            SessionAccessStatus::ReadOnlyMigrationRequired => Ok(true),
-            status => Err(SessionError::NotWritable { session_id, status }),
-        }
-    }
-
-    fn build_next_event(&self, kind: SessionEventKind) -> Result<SessionEvent, SessionError> {
-        self.ensure_writable()?;
-        let event = SessionEvent {
+    const fn build_next_event(&self, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: self.next_sequence,
             session_id: self.summary.id,
             provenance: None,
             kind,
-        };
-        Ok(event)
+        }
     }
 
     fn apply_persisted_event(&mut self, event: SessionEvent, activity_timestamp_ms: u64) {
@@ -2116,13 +1932,6 @@ impl SessionState {
         }
         let _ = self.sender.send(event);
     }
-}
-
-fn stale_index_count(handles: Vec<SessionHandle>) -> usize {
-    handles
-        .into_iter()
-        .filter(|handle| handle.snapshot().index_status == SessionIndexStatusKind::Stale)
-        .count()
 }
 
 fn sorted_session_summaries(
@@ -2741,9 +2550,7 @@ mod tests {
             .expect("message should append");
 
         assert!(
-            !super::SessionEventStore::new(&root)
-                .event_path(session.id)
-                .exists(),
+            !root.join(format!("{}.events", session.id)).exists(),
             "new DB-backed sessions should not create legacy .events sidecars"
         );
 
@@ -2765,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_session_events_range_reads_inclusive_sequences_from_disk_index() {
+    async fn restored_session_events_range_reads_inclusive_sequences_from_db() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager

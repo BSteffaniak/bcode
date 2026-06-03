@@ -2,7 +2,7 @@
 
 use crate::ServerState;
 use bcode_ipc::{SessionCatalogSourceStatus, SessionCatalogStatus};
-use bcode_session::{SessionAccessStatus, SessionCatalogEntry, SessionCatalogIndexStatus};
+use bcode_session::SessionCatalogEntry;
 use bcode_session_import::ImportableSessionStatus;
 use bcode_session_models::{SessionId, SessionImportSummary, SessionSummary, SessionTitleSource};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,12 +68,7 @@ enum SourceCacheState {
 }
 
 #[derive(Debug, Clone, Default)]
-struct SourceDiagnostics {
-    stale_indexes: usize,
-    read_only_sessions: usize,
-    repair_required_sessions: usize,
-    blocked_future_sessions: usize,
-}
+struct SourceDiagnostics {}
 
 #[derive(Debug, Clone)]
 enum CatalogSourcePlan {
@@ -413,25 +408,8 @@ fn import_source_result(sessions: Vec<SessionSummary>) -> SourceLoadResult {
     }
 }
 
-fn native_source_diagnostics(entries: &[SessionCatalogEntry]) -> SourceDiagnostics {
-    SourceDiagnostics {
-        stale_indexes: entries
-            .iter()
-            .filter(|entry| entry.index_status == SessionCatalogIndexStatus::Stale)
-            .count(),
-        read_only_sessions: entries
-            .iter()
-            .filter(|entry| entry.access_status == SessionAccessStatus::ReadOnlyMigrationRequired)
-            .count(),
-        repair_required_sessions: entries
-            .iter()
-            .filter(|entry| entry.access_status == SessionAccessStatus::RepairRequired)
-            .count(),
-        blocked_future_sessions: entries
-            .iter()
-            .filter(|entry| entry.access_status == SessionAccessStatus::BlockedFutureVersion)
-            .count(),
-    }
+fn native_source_diagnostics(_entries: &[SessionCatalogEntry]) -> SourceDiagnostics {
+    SourceDiagnostics::default()
 }
 
 fn snapshot_locked(
@@ -514,12 +492,7 @@ impl SourceCache {
     }
 
     fn diagnostics(&self) -> &SourceDiagnostics {
-        static EMPTY: SourceDiagnostics = SourceDiagnostics {
-            stale_indexes: 0,
-            read_only_sessions: 0,
-            repair_required_sessions: 0,
-            blocked_future_sessions: 0,
-        };
+        static EMPTY: SourceDiagnostics = SourceDiagnostics {};
         match &self.state {
             SourceCacheState::Loaded { diagnostics, .. }
             | SourceCacheState::Failed { diagnostics, .. } => diagnostics,
@@ -528,49 +501,11 @@ impl SourceCache {
     }
 }
 
-fn diagnostic_status(
-    display_name: &str,
-    diagnostics: &SourceDiagnostics,
+const fn diagnostic_status(
+    _display_name: &str,
+    _diagnostics: &SourceDiagnostics,
 ) -> Option<SessionCatalogStatus> {
-    let mut issues = Vec::new();
-    if diagnostics.stale_indexes > 0 {
-        issues.push(format!(
-            "{} stale primary index{}",
-            diagnostics.stale_indexes,
-            plural_suffix(diagnostics.stale_indexes)
-        ));
-    }
-    if diagnostics.read_only_sessions > 0 {
-        issues.push(format!(
-            "{} read-only migration-required session{}",
-            diagnostics.read_only_sessions,
-            plural_suffix(diagnostics.read_only_sessions)
-        ));
-    }
-    if diagnostics.repair_required_sessions > 0 {
-        issues.push(format!(
-            "{} repair-required session{}",
-            diagnostics.repair_required_sessions,
-            plural_suffix(diagnostics.repair_required_sessions)
-        ));
-    }
-    if diagnostics.blocked_future_sessions > 0 {
-        issues.push(format!(
-            "{} future-version blocked session{}",
-            diagnostics.blocked_future_sessions,
-            plural_suffix(diagnostics.blocked_future_sessions)
-        ));
-    }
-    (!issues.is_empty()).then(|| {
-        SessionCatalogStatus::Degraded(format!(
-            "{display_name} needs attention: {}",
-            issues.join(", ")
-        ))
-    })
-}
-
-const fn plural_suffix(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
+    None
 }
 
 fn source_relevant_to_working_directory(key: &CatalogSourceKey, working_directory: &Path) -> bool {

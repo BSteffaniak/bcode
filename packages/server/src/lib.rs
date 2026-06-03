@@ -2758,7 +2758,6 @@ async fn enqueue_session_command(
     session_id: SessionId,
     command: SessionCommand,
 ) -> Result<MessageQueueStatus, ServerError> {
-    state.sessions.ensure_session_current(session_id).await?;
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
     let pending_before = handle.queued_commands.fetch_add(1, Ordering::AcqRel);

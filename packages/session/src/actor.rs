@@ -2,9 +2,9 @@
 
 use super::{
     Arc, CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, Instant, PathBuf, ProjectionWindow,
-    ProjectionWindowRequest, SessionAccessStatus, SessionAttachment, SessionError, SessionEvent,
-    SessionEventKind, SessionEventProvenance, SessionIndexStatusKind, SessionInputHistoryEntry,
-    SessionState, SessionStoreExecutor, SessionSummary, elapsed_ms, input_history_from_events,
+    ProjectionWindowRequest, SessionAttachment, SessionError, SessionEvent, SessionEventKind,
+    SessionEventProvenance, SessionInputHistoryEntry, SessionLoadStatusKind, SessionState,
+    SessionStoreExecutor, SessionSummary, elapsed_ms, input_history_from_events,
     model_context_events_from_history, title_from_first_prompt, usize_to_u64,
 };
 use crate::db::SessionDb;
@@ -121,19 +121,6 @@ impl SessionHandle {
             .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?
     }
 
-    pub async fn read_only_attach(
-        &self,
-        client_id: ClientId,
-        mode: AttachMode,
-    ) -> Result<SessionAttachment, SessionError> {
-        self.send(|reply| SessionCommand::ReadOnlyAttach {
-            client_id,
-            mode,
-            reply,
-        })
-        .await?
-    }
-
     pub async fn detach(
         &self,
         client_id: ClientId,
@@ -155,20 +142,11 @@ impl SessionHandle {
         self.send(SessionCommand::WorkingDirectory).await
     }
 
-    pub async fn requires_migration_for_write(&self) -> Result<bool, SessionError> {
-        self.send(|reply| SessionCommand::RequiresMigrationForWrite { reply })
-            .await?
-    }
-
-    pub async fn access_status(&self) -> Result<SessionAccessStatus, SessionError> {
-        self.send(SessionCommand::AccessStatus).await
-    }
-
     pub async fn history(&self) -> Result<Vec<SessionEvent>, SessionError> {
         self.send(SessionCommand::History).await?
     }
 
-    pub async fn projection_window_from_index(
+    pub async fn projection_window(
         &self,
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
@@ -268,11 +246,6 @@ enum SessionCommand {
         queued_at: Instant,
         reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
     },
-    ReadOnlyAttach {
-        client_id: ClientId,
-        mode: AttachMode,
-        reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
-    },
     Detach {
         client_id: ClientId,
         activity_timestamp_ms: u64,
@@ -280,10 +253,6 @@ enum SessionCommand {
     },
     Summary(oneshot::Sender<SessionSummary>),
     WorkingDirectory(oneshot::Sender<PathBuf>),
-    RequiresMigrationForWrite {
-        reply: oneshot::Sender<Result<bool, SessionError>>,
-    },
-    AccessStatus(oneshot::Sender<SessionAccessStatus>),
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ProjectionWindowFromIndex {
         request: ProjectionWindowRequest,
@@ -380,13 +349,6 @@ impl SessionActor {
             | SessionCommand::Attach { .. } => {
                 unreachable!("write commands are handled before read commands")
             }
-            SessionCommand::ReadOnlyAttach {
-                client_id,
-                mode,
-                reply,
-            } => {
-                let _ = reply.send(self.read_only_attach(client_id, mode).await);
-            }
             SessionCommand::Detach {
                 client_id,
                 activity_timestamp_ms,
@@ -400,20 +362,11 @@ impl SessionActor {
             SessionCommand::WorkingDirectory(reply) => {
                 let _ = reply.send(self.state.working_directory.clone());
             }
-            SessionCommand::RequiresMigrationForWrite { reply } => {
-                let _ = reply.send(
-                    self.state
-                        .requires_migration_for_write(self.state.summary.id),
-                );
-            }
-            SessionCommand::AccessStatus(reply) => {
-                let _ = reply.send(self.state.access_status);
-            }
             SessionCommand::History(reply) => {
                 let _ = reply.send(self.history().await);
             }
             SessionCommand::ProjectionWindowFromIndex { request, reply } => {
-                let _ = reply.send(self.projection_window_from_index(request).await);
+                let _ = reply.send(self.projection_window(request).await);
             }
             SessionCommand::EventsRange {
                 start_sequence,
@@ -447,7 +400,8 @@ impl SessionActor {
                 let _ = reply.send(self.state.current_agent.clone());
             }
             SessionCommand::SetCurrentAgent { agent_id, reply } => {
-                let _ = reply.send(self.set_current_agent(agent_id));
+                self.set_current_agent(agent_id);
+                let _ = reply.send(Ok(()));
             }
             SessionCommand::PublishTransient { kind, reply } => {
                 let _ = reply.send(self.publish_transient_event(kind));
@@ -506,7 +460,7 @@ impl SessionActor {
         provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
-        let mut event = self.state.build_next_event(kind)?;
+        let mut event = self.state.build_next_event(kind);
         event.provenance = provenance;
         if self.store.is_some() {
             let db = self.session_db_for_write().await?;
@@ -532,7 +486,7 @@ impl SessionActor {
                 )
                 .await?;
         }
-        self.state.index_status = SessionIndexStatusKind::Current;
+        self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         Ok(event)
     }
@@ -543,7 +497,6 @@ impl SessionActor {
         text: String,
         activity_timestamp_ms: u64,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        self.state.ensure_writable()?;
         let mut events = Vec::new();
         if self.state.summary.name.is_none() && !self.state.has_user_message {
             let title = title_from_first_prompt(&text);
@@ -585,7 +538,6 @@ impl SessionActor {
             );
         }
         let writable_started_at = Instant::now();
-        self.state.ensure_writable()?;
         if let Some(metrics) = &metrics {
             metrics.record_histogram(
                 "session.actor.attach.ensure_writable_duration_ms",
@@ -678,65 +630,11 @@ impl SessionActor {
         })
     }
 
-    async fn read_only_attach(
-        &mut self,
-        client_id: ClientId,
-        mode: AttachMode,
-    ) -> Result<SessionAttachment, SessionError> {
-        let history = match mode {
-            AttachMode::Full => self.history().await?,
-            AttachMode::Recent { limit } => {
-                if let Some(history) = self.recent_history_from_db(limit).await? {
-                    history
-                } else if self.store.is_some() {
-                    return Err(SessionError::NotFound(self.state.summary.id));
-                } else {
-                    self.history()
-                        .await?
-                        .into_iter()
-                        .rev()
-                        .take(limit)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect()
-                }
-            }
-            AttachMode::ProjectionWindow { history } => history,
-        };
-        let input_history = self.input_history().await?;
-        self.state.clients.insert(client_id);
-        self.state.summary.client_count = self.state.clients.len();
-        self.refresh_snapshot();
-        let events = self.state.sender.subscribe();
-        let attached_event = SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: self.state.next_sequence,
-            session_id: self.state.summary.id,
-            provenance: None,
-            kind: SessionEventKind::ClientAttached { client_id },
-        };
-        Ok(SessionAttachment {
-            session: self.state.summary(),
-            history,
-            input_history,
-            attached_event,
-            events,
-        })
-    }
-
     async fn detach(
         &mut self,
         client_id: ClientId,
         activity_timestamp_ms: u64,
     ) -> Result<Option<SessionEvent>, SessionError> {
-        if !self.state.access_status.writable() {
-            if self.state.clients.remove(&client_id) {
-                self.state.summary.client_count = self.state.clients.len();
-                self.refresh_snapshot();
-            }
-            return Ok(None);
-        }
         if self.state.clients.remove(&client_id) {
             self.state.summary.client_count = self.state.clients.len();
             return Ok(Some(
@@ -764,7 +662,7 @@ impl SessionActor {
         Err(SessionError::NotFound(self.state.summary.id))
     }
 
-    async fn projection_window_from_index(
+    async fn projection_window(
         &mut self,
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
@@ -933,11 +831,9 @@ impl SessionActor {
         Err(SessionError::NotFound(self.state.summary.id))
     }
 
-    fn set_current_agent(&mut self, agent_id: String) -> Result<(), SessionError> {
-        self.state.ensure_writable()?;
+    fn set_current_agent(&mut self, agent_id: String) {
         self.state.current_agent = Some(agent_id);
         self.refresh_snapshot();
-        Ok(())
     }
 
     fn publish_transient_event(&self, kind: SessionEventKind) -> Option<SessionEvent> {
@@ -977,8 +873,7 @@ fn select_event_range_from_events(
 pub struct SessionSnapshot {
     pub summary: SessionSummary,
     pub working_directory: PathBuf,
-    pub access_status: SessionAccessStatus,
-    pub index_status: SessionIndexStatusKind,
+    pub load_status: SessionLoadStatusKind,
 }
 
 impl SessionSnapshot {
@@ -986,8 +881,7 @@ impl SessionSnapshot {
         Self {
             summary: state.summary(),
             working_directory: state.working_directory.clone(),
-            access_status: state.access_status,
-            index_status: state.index_status,
+            load_status: state.load_status,
         }
     }
 }
