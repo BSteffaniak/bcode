@@ -140,6 +140,7 @@ fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Inst
         app.latest_bar_animation_started_at(),
         now,
     );
+    frame.fill(area, " ", latest_bar_background_style());
     frame.write_line_with_fallback_style(area, &line, latest_bar_background_style());
 }
 
