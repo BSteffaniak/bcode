@@ -1234,7 +1234,6 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             config.daemon.idle_shutdown_after_secs,
         ));
     }
-    recover_abandoned_runtime_work(&state).await?;
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
     tracing::info!(target: "bcode_server::startup", "server ready; accepting clients");
@@ -1261,13 +1260,16 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     Ok(())
 }
 
-async fn recover_abandoned_runtime_work(state: &ServerState) -> Result<(), ServerError> {
-    state.sessions.wait_catalog_loaded().await?;
-    let summaries = state.sessions.all_session_summaries().await;
-    for summary in summaries {
-        recover_abandoned_session_runtime_work(state, summary.id).await?;
+async fn recover_abandoned_session_runtime_work_best_effort(
+    state: &ServerState,
+    session_id: SessionId,
+) {
+    if let Err(error) = recover_abandoned_session_runtime_work(state, session_id).await {
+        state
+            .metrics
+            .increment_counter("server.runtime_work.recovery_error_total");
+        eprintln!("failed to recover abandoned runtime work for session {session_id}: {error}");
     }
-    Ok(())
 }
 
 async fn recover_abandoned_session_runtime_work(
@@ -2433,6 +2435,7 @@ async fn handle_attach_session(
     if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
         return Ok(());
     }
+    recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
         .try_activate_session_namespace(session_id, client_namespace)
@@ -2508,13 +2511,7 @@ async fn handle_attach_session_recent(
         );
         return Ok(());
     }
-    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
-        state.metrics.record_histogram(
-            "server.attach_projection_window.total_duration_ms",
-            elapsed_ms(total_started_at),
-        );
-        return Ok(());
-    }
+    recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
@@ -2599,6 +2596,14 @@ async fn handle_attach_session_projection_window(
     state
         .metrics
         .increment_counter("server.attach_projection_window.total");
+    if !ensure_attachable_session_health(request_id, state, writer, session_id).await? {
+        state.metrics.record_histogram(
+            "server.attach_projection_window.total_duration_ms",
+            elapsed_ms(total_started_at),
+        );
+        return Ok(());
+    }
+    recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
