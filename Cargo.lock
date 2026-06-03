@@ -2120,7 +2120,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2511,7 +2511,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2672,7 +2672,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3516,7 +3516,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_actions"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer_models",
@@ -3531,7 +3531,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_color"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "color-hex",
  "log",
@@ -3543,7 +3543,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_markdown"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer",
@@ -3558,7 +3558,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "html-escape",
  "hyperchad_actions",
@@ -3579,7 +3579,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer_models"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "log",
  "moosicbox_assert",
@@ -4311,7 +4311,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_arb"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "log",
  "moosicbox_assert",
@@ -4322,7 +4322,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_assert"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "colored",
  "moosicbox_env_utils",
@@ -4331,12 +4331,12 @@ dependencies = [
 [[package]]
 name = "moosicbox_env_utils"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 
 [[package]]
 name = "moosicbox_json_utils"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4348,7 +4348,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_logging"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "free_log_client",
  "log",
@@ -4358,7 +4358,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_profiles"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "actix-web",
  "futures",
@@ -4431,7 +4431,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5653,7 +5653,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6175,7 +6175,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6700,7 +6700,7 @@ dependencies = [
 [[package]]
 name = "switchy"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "switchy_database",
  "switchy_database_connection",
@@ -6710,7 +6710,7 @@ dependencies = [
 [[package]]
 name = "switchy_async"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "flume",
  "futures",
@@ -6725,7 +6725,7 @@ dependencies = [
 [[package]]
 name = "switchy_database"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6744,7 +6744,7 @@ dependencies = [
 [[package]]
 name = "switchy_database_connection"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "log",
  "rusqlite",
@@ -6757,7 +6757,7 @@ dependencies = [
 [[package]]
 name = "switchy_env"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "log",
  "thiserror 2.0.18",
@@ -6766,7 +6766,7 @@ dependencies = [
 [[package]]
 name = "switchy_schema"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6783,7 +6783,7 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#b1ef231df4995e0d286a5ad184109741aedf0b7a"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
 dependencies = [
  "chrono",
  "log",
@@ -6863,7 +6863,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7910,7 +7910,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

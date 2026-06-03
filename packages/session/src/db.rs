@@ -31,6 +31,7 @@ const SESSION_MIGRATIONS_TABLE: &str = "__bcode_session_migrations";
 const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
@@ -796,7 +797,14 @@ async fn init_turso_local_with_retry(
     let mut attempt = 0_u32;
     let mut delay = DATABASE_OPEN_INITIAL_RETRY_DELAY;
     loop {
-        match switchy::database_connection::init_turso_local(Some(path)).await {
+        match switchy::database_connection::builder()
+            .turso()
+            .with_path(path)
+            .with_busy_timeout(DATABASE_BUSY_TIMEOUT)
+            .with_multiprocess_wal(true)
+            .build()
+            .await
+        {
             Ok(db) => return Ok(db),
             Err(error)
                 if is_database_lock_error(&error) && attempt < DATABASE_OPEN_RETRY_ATTEMPTS =>
