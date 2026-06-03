@@ -1319,6 +1319,29 @@ impl SessionManager {
         handle.detach(client_id, activity_timestamp_ms).await
     }
 
+    /// Release cached per-session resources when no clients remain attached.
+    ///
+    /// The session stays visible through its lightweight summary, but the actor drops any cached
+    /// database connection so older daemon instances do not hold contentious WAL files while idle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session actor is unavailable.
+    pub async fn release_idle_session_resources(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, SessionError> {
+        let handle = self
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(SessionError::NotFound(session_id))?;
+        handle.release_idle_resources().await
+    }
+
     /// Append a user message to a session.
     ///
     /// # Errors
@@ -2570,6 +2593,55 @@ mod tests {
                 text: "hello".to_owned(),
             }]
         );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn release_idle_session_resources_drops_loaded_state_until_next_use() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("idle".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let client_id = ClientId::new();
+        manager
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("session should attach");
+
+        assert!(
+            !manager
+                .release_idle_session_resources(session.id)
+                .await
+                .expect("release should check clients"),
+            "attached sessions should not release resources"
+        );
+
+        manager
+            .detach_session(session.id, client_id)
+            .await
+            .expect("session should detach");
+        assert!(
+            manager
+                .release_idle_session_resources(session.id)
+                .await
+                .expect("idle resources should release")
+        );
+
+        manager
+            .append_user_message(session.id, ClientId::new(), "after release".to_owned())
+            .await
+            .expect("released session should reload on next use");
+        let history = manager
+            .session_history(session.id)
+            .await
+            .expect("history should load after release");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "after release"
+        )));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

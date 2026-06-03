@@ -221,6 +221,10 @@ impl SessionHandle {
         .await
     }
 
+    pub async fn release_idle_resources(&self) -> Result<bool, SessionError> {
+        self.send(SessionCommand::ReleaseIdleResources).await
+    }
+
     pub fn client_count(&self) -> usize {
         self.snapshot().summary.client_count
     }
@@ -293,6 +297,7 @@ enum SessionCommand {
         state: Box<SessionState>,
         reply: oneshot::Sender<()>,
     },
+    ReleaseIdleResources(oneshot::Sender<bool>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -426,6 +431,9 @@ impl SessionActor {
                 self.refresh_snapshot();
                 let _ = reply.send(());
             }
+            SessionCommand::ReleaseIdleResources(reply) => {
+                let _ = reply.send(self.release_idle_resources());
+            }
             SessionCommand::Shutdown(reply) => {
                 let _ = reply.send(());
                 return true;
@@ -439,6 +447,17 @@ impl SessionActor {
             .snapshot
             .write()
             .expect("session snapshot lock poisoned") = SessionSnapshot::from_state(&self.state);
+    }
+
+    fn release_idle_resources(&mut self) -> bool {
+        if !self.state.clients.is_empty() {
+            return false;
+        }
+        self.db = None;
+        self.state.events = None;
+        self.state.load_status = SessionLoadStatusKind::SummaryOnly;
+        self.refresh_snapshot();
+        true
     }
 
     async fn session_db_for_write(&mut self) -> Result<SessionDb, SessionError> {

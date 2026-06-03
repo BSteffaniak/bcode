@@ -584,17 +584,51 @@ impl ServerState {
             .lock()
             .await
             .remove(&client_id);
-        if let Some(session_id) = session_id
-            && let Some(event) = self.sessions.detach_session(session_id, client_id).await?
-        {
-            publish_session_event(self, &event).await;
-            if let Ok(session) = self.sessions.session_summary(session_id).await {
-                self.session_catalog.upsert_native_session(session).await;
+        if let Some(session_id) = session_id {
+            if let Some(event) = self.sessions.detach_session(session_id, client_id).await? {
+                publish_session_event(self, &event).await;
+                if let Ok(session) = self.sessions.session_summary(session_id).await {
+                    self.session_catalog.upsert_native_session(session).await;
+                }
             }
             self.deactivate_session_namespace_if_inactive(session_id)
                 .await;
+            self.release_session_resources_if_idle(session_id).await;
         }
         Ok(())
+    }
+
+    async fn release_session_resources_if_idle(&self, session_id: SessionId) {
+        if self
+            .attached_client_sessions
+            .lock()
+            .await
+            .values()
+            .any(|attached_session_id| *attached_session_id == session_id)
+        {
+            return;
+        }
+        if self
+            .active_session_turns
+            .lock()
+            .await
+            .contains_key(&session_id)
+            || self.active_turns.lock().await.contains_key(&session_id)
+            || !self
+                .runtime_work
+                .active_for_session(session_id)
+                .await
+                .is_empty()
+        {
+            return;
+        }
+        if let Err(error) = self
+            .sessions
+            .release_idle_session_resources(session_id)
+            .await
+        {
+            eprintln!("failed to release idle session resources for {session_id}: {error}");
+        }
     }
 
     async fn register_client_forwarder(&self, client_id: ClientId, handle: JoinHandle<()>) {
@@ -7975,6 +8009,7 @@ async fn finish_registered_runtime_work(
 ) {
     state.runtime_work.finish(session_id, &work_id).await;
     append_runtime_work_finished_event(state, session_id, work_id, status, message).await;
+    state.release_session_resources_if_idle(session_id).await;
 }
 
 async fn append_model_runtime_work_started_event(
