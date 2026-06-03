@@ -28,6 +28,12 @@ impl TranscriptViewport {
         self.bottom_overscroll
     }
 
+    /// Return the last synced viewport height.
+    #[must_use]
+    pub const fn height(&self) -> u16 {
+        self.viewport_height
+    }
+
     /// Return whether the viewport is following live transcript output.
     #[must_use]
     pub const fn following(&self) -> bool {

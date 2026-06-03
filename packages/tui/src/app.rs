@@ -124,6 +124,7 @@ pub struct BmuxApp {
     scroll_mode: TranscriptScrollMode,
     pending_visual_overflow_bottom: Option<usize>,
     latest_hidden_activity_at: Option<Instant>,
+    latest_bar_animation_started_at: Instant,
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
     active_tool_calls: BTreeSet<String>,
@@ -237,6 +238,7 @@ impl BmuxApp {
         input_history: &[SessionInputHistoryEntry],
         has_older_history: bool,
     ) -> Self {
+        let now = Instant::now();
         let mut app = Self {
             session_id,
             session_title: None,
@@ -269,6 +271,7 @@ impl BmuxApp {
             scroll_mode: TranscriptScrollMode::BottomFollow,
             pending_visual_overflow_bottom: None,
             latest_hidden_activity_at: None,
+            latest_bar_animation_started_at: now,
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
             active_tool_calls: BTreeSet::new(),
@@ -634,6 +637,12 @@ impl BmuxApp {
         self.latest_hidden_activity_at
     }
 
+    /// Return the latest-bar animation origin.
+    #[must_use]
+    pub const fn latest_bar_animation_started_at(&self) -> Instant {
+        self.latest_bar_animation_started_at
+    }
+
     /// Return the key label for jumping to the latest transcript content.
     #[must_use]
     pub fn jump_to_latest_key_label(&self) -> &str {
@@ -910,6 +919,29 @@ impl BmuxApp {
         self.viewport.scroll_to_bottom(&mut self.older_history)
     }
 
+    /// Animate transcript to the newest rows.
+    pub fn transition_transcript_to_bottom(&mut self) -> bool {
+        self.manual_transcript_scroll_until = None;
+        self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+        self.scroll_mode = TranscriptScrollMode::BottomFollow;
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
+        self.pending_assistant_stream_anchor = false;
+        self.pending_visual_overflow_bottom = None;
+        let total_rows = self.transcript_layout.total_rows();
+        let viewport_height = self.viewport.height();
+        let start_top_row = self.viewport.top_row(total_rows, viewport_height);
+        let target_top_row = total_rows.saturating_sub(usize::from(viewport_height));
+        if start_top_row == target_top_row {
+            return self.scroll_transcript_to_bottom();
+        }
+        self.transcript_scroll_animation = Some(TranscriptScrollAnimation::new(
+            start_top_row,
+            target_top_row,
+            Instant::now(),
+        ));
+        true
+    }
+
     fn cancel_transcript_scroll_animation_for_manual_scroll(&mut self) {
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.scroll_mode = TranscriptScrollMode::ManualDetached;
@@ -951,8 +983,16 @@ impl BmuxApp {
             if animation.finished(now) {
                 self.transcript_scroll_animation = None;
                 self.viewport.follow_anchor(animation.target_top_row);
-                if let TranscriptScrollMode::TransitionToEntry { sticky } = self.scroll_mode {
-                    self.scroll_mode = TranscriptScrollMode::AnchoredToEntry { sticky };
+                match self.scroll_mode {
+                    TranscriptScrollMode::TransitionToEntry { sticky } => {
+                        self.scroll_mode = TranscriptScrollMode::AnchoredToEntry { sticky };
+                    }
+                    TranscriptScrollMode::BottomFollow => {
+                        self.latest_hidden_activity_at = None;
+                        self.viewport.scroll_to_bottom(&mut self.older_history);
+                    }
+                    TranscriptScrollMode::AnchoredToEntry { .. }
+                    | TranscriptScrollMode::ManualDetached => {}
                 }
             } else {
                 self.viewport.materialize_top_row(top_row);
@@ -1437,6 +1477,17 @@ impl BmuxApp {
         if animation.finished(now) {
             self.transcript_scroll_animation = None;
             self.viewport.follow_anchor(animation.target_top_row);
+            match self.scroll_mode {
+                TranscriptScrollMode::TransitionToEntry { sticky } => {
+                    self.scroll_mode = TranscriptScrollMode::AnchoredToEntry { sticky };
+                }
+                TranscriptScrollMode::BottomFollow => {
+                    self.latest_hidden_activity_at = None;
+                    self.viewport.scroll_to_bottom(&mut self.older_history);
+                }
+                TranscriptScrollMode::AnchoredToEntry { .. }
+                | TranscriptScrollMode::ManualDetached => {}
+            }
         }
         true
     }

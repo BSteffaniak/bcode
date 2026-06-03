@@ -137,6 +137,7 @@ fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Inst
         area.width,
         app.jump_to_latest_key_label(),
         app.latest_hidden_activity_at(),
+        app.latest_bar_animation_started_at(),
         now,
     );
     frame.write_line(area, &line);
@@ -146,70 +147,77 @@ fn latest_bar_line(
     width: u16,
     key_label: &str,
     latest_hidden_activity_at: Option<Instant>,
+    animation_started_at: Instant,
     now: Instant,
 ) -> Line {
     let active = latest_hidden_activity_at
         .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW);
     if active {
-        active_latest_bar_line(width, key_label, now)
+        active_latest_bar_line(width, key_label, animation_started_at, now)
     } else {
-        stale_latest_bar_line(width, key_label, now)
+        stale_latest_bar_line(width, key_label, animation_started_at, now)
     }
 }
 
-fn active_latest_bar_line(width: u16, key_label: &str, now: Instant) -> Line {
+fn active_latest_bar_line(
+    width: u16,
+    key_label: &str,
+    animation_started_at: Instant,
+    now: Instant,
+) -> Line {
     let width = usize::from(width);
     let text = if width < 32 {
         format!("activity below · {key_label}")
     } else {
         format!("New activity below · {key_label} to jump")
     };
+    let text = centered_bar_text(&text, width);
     let text_width = text_display_width(&text);
-    let side_width = width.saturating_sub(text_width).saturating_sub(2) / 2;
-    let phase =
-        usize::try_from(now.elapsed().as_millis() / LATEST_BAR_ACTIVE_FRAME.as_millis().max(1))
-            .unwrap_or_default();
+    let left_width = width.saturating_sub(text_width) / 2;
+    let right_width = width.saturating_sub(text_width).saturating_sub(left_width);
+    let phase = latest_bar_phase(animation_started_at, now, LATEST_BAR_ACTIVE_FRAME);
     let mut spans = Vec::new();
-    push_chevron_wave(&mut spans, side_width, phase, false);
+    push_chevron_wave(&mut spans, left_width, phase, false);
     spans.push(Span::styled(
-        " ",
-        latest_bar_background_style().fg(Color::BrightBlack),
-    ));
-    spans.push(Span::styled(
-        truncate_to_display_width(&text, width.saturating_sub(side_width.saturating_mul(2))),
+        text,
         latest_bar_background_style()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled(
-        " ",
-        latest_bar_background_style().fg(Color::BrightBlack),
-    ));
-    let used = side_width
-        .saturating_add(2)
-        .saturating_add(text_width.min(width.saturating_sub(side_width.saturating_mul(2))));
-    push_chevron_wave(&mut spans, width.saturating_sub(used), phase, true);
+    push_chevron_wave(
+        &mut spans,
+        right_width,
+        phase.saturating_add(left_width),
+        false,
+    );
     Line::from_spans(spans)
 }
 
-fn stale_latest_bar_line(width: u16, key_label: &str, now: Instant) -> Line {
+fn stale_latest_bar_line(
+    width: u16,
+    key_label: &str,
+    animation_started_at: Instant,
+    now: Instant,
+) -> Line {
     let width = usize::from(width);
     let text = if width < 30 {
         format!("latest below · {key_label}")
     } else {
         format!("New messages below · {key_label} to jump")
     };
-    let pulse =
-        usize::try_from(now.elapsed().as_millis() / LATEST_BAR_STALE_FRAME.as_millis().max(1))
-            .unwrap_or_default()
-            % 3;
-    let chevron = ["⌄", "˅", "▾"][pulse];
-    let text = truncate_to_display_width(&text, width.saturating_sub(2));
+    let text = centered_bar_text(&text, width.saturating_sub(1));
     let text_width = text_display_width(&text);
-    let spacer = width.saturating_sub(text_width).saturating_sub(1);
+    let left_width = width.saturating_sub(1).saturating_sub(text_width) / 2;
+    let right_width = width
+        .saturating_sub(1)
+        .saturating_sub(text_width)
+        .saturating_sub(left_width);
+    let pulse = latest_bar_phase(animation_started_at, now, LATEST_BAR_STALE_FRAME) % 3;
+    let chevron = ["⌄", "˅", "▾"][pulse];
     Line::from_spans(vec![
+        Span::styled(" ".repeat(left_width), latest_bar_background_style()),
         Span::styled(text, latest_bar_background_style().fg(Color::BrightBlack)),
-        Span::styled(" ".repeat(spacer), latest_bar_background_style()),
+        Span::styled(" ".repeat(right_width), latest_bar_background_style()),
         Span::styled(
             chevron,
             latest_bar_background_style()
@@ -217,6 +225,17 @@ fn stale_latest_bar_line(width: u16, key_label: &str, now: Instant) -> Line {
                 .add_modifier(Modifier::BOLD),
         ),
     ])
+}
+
+fn centered_bar_text(text: &str, width: usize) -> String {
+    truncate_to_display_width(text, width)
+}
+
+fn latest_bar_phase(started_at: Instant, now: Instant, frame: Duration) -> usize {
+    usize::try_from(
+        now.saturating_duration_since(started_at).as_millis() / frame.as_millis().max(1),
+    )
+    .unwrap_or_default()
 }
 
 fn push_chevron_wave(spans: &mut Vec<Span>, width: usize, phase: usize, reverse: bool) {
