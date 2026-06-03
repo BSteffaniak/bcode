@@ -1216,6 +1216,12 @@ impl SessionManager {
         }
     }
 
+    /// Return the persistent session store root, when this manager is store-backed.
+    #[must_use]
+    pub fn session_store_root(&self) -> Option<PathBuf> {
+        self.store.as_ref().map(SessionStoreExecutor::root_path)
+    }
+
     async fn load_db_session_state(
         &self,
         session_id: SessionId,

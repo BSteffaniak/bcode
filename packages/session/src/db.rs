@@ -9,9 +9,9 @@
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
-    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary,
-    SessionTitleSource,
+    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
+    SessionId, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
 };
 use switchy::{
     database::{
@@ -86,6 +86,27 @@ pub struct ToolRun {
     pub tool_name: Option<String>,
     /// Whether the completed tool call ended in error.
     pub is_error: Option<bool>,
+}
+
+/// Projected runtime-work row stored in a per-session database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkProjection {
+    /// Runtime work identifier.
+    pub work_id: RuntimeWorkId,
+    /// Event sequence that started the work.
+    pub event_seq_start: u64,
+    /// Event sequence that finished the work, when terminal.
+    pub event_seq_end: Option<u64>,
+    /// Runtime work category.
+    pub kind: RuntimeWorkKind,
+    /// Display label.
+    pub label: String,
+    /// Current status.
+    pub status: RuntimeWorkStatus,
+    /// Parent runtime work id, when nested.
+    pub parent_work_id: Option<RuntimeWorkId>,
+    /// Whether the work advertised cancellation support.
+    pub cancellable: bool,
 }
 
 /// Typed session-state projection row stored in a per-session database.
@@ -328,6 +349,35 @@ impl SessionDb {
             .execute(&**self.db)
             .await?;
         rows.iter().map(tool_run_from_row).collect()
+    }
+
+    /// Return active runtime-work projection rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails or a row is malformed.
+    pub async fn active_runtime_work(&self) -> SessionDbResult<Vec<RuntimeWorkProjection>> {
+        let rows = self
+            .db
+            .select("runtime_work")
+            .columns(&[
+                "work_id",
+                "event_seq_start",
+                "event_seq_end",
+                "kind",
+                "label",
+                "status",
+                "parent_work_id",
+                "cancellable",
+            ])
+            .where_eq(
+                "status",
+                runtime_work_status_name(RuntimeWorkStatus::Running),
+            )
+            .sort("event_seq_start", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        rows.iter().map(runtime_work_from_row).collect()
     }
 
     /// Return the current projected session state row.
@@ -927,6 +977,24 @@ fn session_migrations() -> CodeMigrationSource<'static> {
         "CREATE TABLE IF NOT EXISTS snapshots (\n    snapshot_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    schema_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    updated_at_ms INTEGER\n)",
         "DROP TABLE IF EXISTS snapshots",
     );
+    add_sql_migration(
+        &mut source,
+        "012_runtime_work_table",
+        "CREATE TABLE IF NOT EXISTS runtime_work (\n    work_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    parent_work_id TEXT,\n    kind TEXT NOT NULL,\n    label TEXT NOT NULL,\n    status TEXT NOT NULL,\n    started_at_ms INTEGER,\n    finished_at_ms INTEGER,\n    message TEXT,\n    cancellable INTEGER NOT NULL DEFAULT 0,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS runtime_work",
+    );
+    add_sql_migration(
+        &mut source,
+        "013_runtime_work_status_index",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_work_status ON runtime_work(status)",
+        "DROP INDEX IF EXISTS idx_runtime_work_status",
+    );
+    add_sql_migration(
+        &mut source,
+        "014_runtime_work_parent_index",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_work_parent_work_id ON runtime_work(parent_work_id)",
+        "DROP INDEX IF EXISTS idx_runtime_work_parent_work_id",
+    );
     source
 }
 
@@ -1082,6 +1150,67 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
             )
             .await?;
         }
+        SessionEventKind::RuntimeWorkStarted {
+            work_id,
+            kind,
+            label,
+            parent_work_id,
+            started_at_ms,
+            cancellable,
+            ..
+        } => {
+            db.upsert("runtime_work")
+                .value("work_id", work_id.to_string())
+                .value("event_seq_start", seq_to_value(event.sequence))
+                .value("kind", runtime_work_kind_name(*kind))
+                .value("label", label.clone())
+                .value(
+                    "status",
+                    runtime_work_status_name(RuntimeWorkStatus::Running),
+                )
+                .value(
+                    "parent_work_id",
+                    parent_work_id.as_ref().map(ToString::to_string),
+                )
+                .value("started_at_ms", started_at_ms.map(seq_to_value))
+                .value("cancellable", bool_to_value(*cancellable))
+                .execute(db)
+                .await?;
+        }
+        SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
+            db.update("runtime_work")
+                .value(
+                    "status",
+                    runtime_work_status_name(RuntimeWorkStatus::Cancelling),
+                )
+                .where_eq("work_id", work_id.to_string())
+                .execute(db)
+                .await?;
+        }
+        SessionEventKind::RuntimeWorkFinished {
+            work_id,
+            status,
+            finished_at_ms,
+            message,
+        } => {
+            db.update("runtime_work")
+                .value("event_seq_end", seq_to_value(event.sequence))
+                .value("status", runtime_work_status_name(*status))
+                .value("finished_at_ms", finished_at_ms.map(seq_to_value))
+                .value("message", message.clone())
+                .where_eq("work_id", work_id.to_string())
+                .execute(db)
+                .await?;
+        }
+        SessionEventKind::RuntimeWorkProgress {
+            work_id, message, ..
+        } => {
+            db.update("runtime_work")
+                .value("message", message.clone())
+                .where_eq("work_id", work_id.to_string())
+                .execute(db)
+                .await?;
+        }
         SessionEventKind::WorkingDirectoryChanged {
             new_working_directory,
             ..
@@ -1192,7 +1321,7 @@ async fn update_projection_checkpoints(
         "input_history",
         "transcript",
         "tool_runs",
-        "model_context",
+        "runtime_work",
     ] {
         update_projection_checkpoint(db, projection_name, event).await?;
     }
@@ -1236,6 +1365,19 @@ async fn update_projection_checkpoint(
     }
 
     Ok(())
+}
+
+fn runtime_work_from_row(row: &switchy::database::Row) -> SessionDbResult<RuntimeWorkProjection> {
+    Ok(RuntimeWorkProjection {
+        work_id: RuntimeWorkId::new(required_string(row, "work_id")?),
+        event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
+        event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
+        kind: parse_runtime_work_kind(&required_string(row, "kind")?),
+        label: required_string(row, "label")?,
+        status: parse_runtime_work_status(&required_string(row, "status")?),
+        parent_work_id: optional_string(row, "parent_work_id").map(RuntimeWorkId::new),
+        cancellable: optional_i64(row, "cancellable").is_some_and(|value| value != 0),
+    })
 }
 
 fn tool_run_from_row(row: &switchy::database::Row) -> SessionDbResult<ToolRun> {
@@ -1325,6 +1467,48 @@ const fn i64_to_u64(value: i64) -> u64 {
         0
     } else {
         value.cast_unsigned()
+    }
+}
+
+const fn runtime_work_kind_name(kind: RuntimeWorkKind) -> &'static str {
+    match kind {
+        RuntimeWorkKind::Tool => "tool",
+        RuntimeWorkKind::PluginInvocation => "plugin_invocation",
+        RuntimeWorkKind::ModelTurn => "model_turn",
+        RuntimeWorkKind::EventDelivery => "event_delivery",
+    }
+}
+
+fn parse_runtime_work_kind(value: &str) -> RuntimeWorkKind {
+    match value {
+        "plugin_invocation" => RuntimeWorkKind::PluginInvocation,
+        "model_turn" => RuntimeWorkKind::ModelTurn,
+        "event_delivery" => RuntimeWorkKind::EventDelivery,
+        _ => RuntimeWorkKind::Tool,
+    }
+}
+
+const fn runtime_work_status_name(status: RuntimeWorkStatus) -> &'static str {
+    match status {
+        RuntimeWorkStatus::Queued => "queued",
+        RuntimeWorkStatus::Running => "running",
+        RuntimeWorkStatus::Cancelling => "cancelling",
+        RuntimeWorkStatus::Completed => "completed",
+        RuntimeWorkStatus::Failed => "failed",
+        RuntimeWorkStatus::TimedOut => "timed_out",
+        RuntimeWorkStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
+    match value {
+        "queued" => RuntimeWorkStatus::Queued,
+        "cancelling" => RuntimeWorkStatus::Cancelling,
+        "completed" => RuntimeWorkStatus::Completed,
+        "failed" => RuntimeWorkStatus::Failed,
+        "timed_out" => RuntimeWorkStatus::TimedOut,
+        "cancelled" => RuntimeWorkStatus::Cancelled,
+        _ => RuntimeWorkStatus::Running,
     }
 }
 
@@ -1541,6 +1725,62 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].event_seq_end, Some(1));
         assert_eq!(completed[0].is_error, Some(false));
+    }
+
+    #[tokio::test]
+    async fn active_runtime_work_uses_projection_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let work_id = RuntimeWorkId::new("work-1");
+
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: work_id.clone(),
+                kind: RuntimeWorkKind::Tool,
+                label: "shell".to_string(),
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(123),
+                cancellable: true,
+            },
+        ))
+        .await
+        .expect("append runtime work start");
+
+        let active = db.active_runtime_work().await.expect("active runtime work");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].work_id, work_id);
+        assert_eq!(active[0].label, "shell");
+        assert_eq!(active[0].status, RuntimeWorkStatus::Running);
+        assert!(active[0].cancellable);
+
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status: RuntimeWorkStatus::Failed,
+                finished_at_ms: Some(456),
+                message: Some("daemon stopped".to_string()),
+            },
+        ))
+        .await
+        .expect("append runtime work finish");
+
+        assert!(
+            db.active_runtime_work()
+                .await
+                .expect("active after finish")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

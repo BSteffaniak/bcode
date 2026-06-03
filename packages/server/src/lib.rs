@@ -91,6 +91,8 @@ pub enum ServerError {
     Session(#[from] bcode_session::SessionError),
     #[error("session event store error: {0}")]
     SessionStore(#[from] bcode_session::SessionStoreError),
+    #[error("session database error: {0}")]
+    SessionDb(#[from] bcode_session::db::SessionDbError),
     /// Registry I/O error: {0}
     #[error("daemon lifecycle error: {0}")]
     DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
@@ -1276,40 +1278,33 @@ async fn recover_abandoned_session_runtime_work(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let mut active = BTreeMap::<RuntimeWorkId, (String, Option<RuntimeWorkId>)>::new();
-    for event in state.sessions.session_history(session_id).await? {
-        match event.kind {
-            SessionEventKind::RuntimeWorkStarted {
-                work_id,
-                label,
-                parent_work_id,
-                ..
-            } => {
-                active.insert(work_id, (label, parent_work_id));
-            }
-            SessionEventKind::RuntimeWorkFinished { work_id, .. } => {
-                active.remove(&work_id);
-            }
-            _ => {}
-        }
-    }
-    let work_ids = active.keys().cloned().collect::<Vec<_>>();
-    for work_id in work_ids {
-        let Some((label, parent_work_id)) = active.remove(&work_id) else {
-            continue;
-        };
-        let message = if parent_work_id
+    let root = state
+        .sessions
+        .session_store_root()
+        .ok_or_else(|| ServerError::Session(bcode_session::SessionError::NotFound(session_id)))?;
+    let db = bcode_session::db::SessionDb::open_turso_in_root(session_id, &root).await?;
+    let active = db.active_runtime_work().await?;
+    let work_ids = active
+        .iter()
+        .map(|work| work.work_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for work in active {
+        let message = if work
+            .parent_work_id
             .as_ref()
-            .is_some_and(|parent| !active.contains_key(parent))
+            .is_some_and(|parent| !work_ids.contains(parent))
         {
-            format!("parent work ended before child finished: {label}")
+            format!("parent work ended before child finished: {}", work.label)
         } else {
-            format!("daemon stopped before runtime work finished: {label}")
+            format!(
+                "daemon stopped before runtime work finished: {}",
+                work.label
+            )
         };
         append_runtime_work_finished_event(
             state,
             session_id,
-            work_id,
+            work.work_id,
             RuntimeWorkStatus::Failed,
             Some(message),
         )
