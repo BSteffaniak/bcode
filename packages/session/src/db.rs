@@ -60,6 +60,49 @@ pub enum SessionDbError {
 /// Result type for session DB operations.
 pub type SessionDbResult<T> = Result<T, SessionDbError>;
 
+/// Incrementally materialized session DB projections that maintain freshness checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializedProjection {
+    /// Projected current session state.
+    SessionState,
+    /// User-authored input history.
+    InputHistory,
+    /// Transcript item spans for UI/history windows.
+    Transcript,
+    /// Active and completed tool-call rows.
+    ToolRuns,
+    /// Runtime-work lifecycle rows.
+    RuntimeWork,
+}
+
+impl MaterializedProjection {
+    const ALL: [Self; 5] = [
+        Self::SessionState,
+        Self::InputHistory,
+        Self::Transcript,
+        Self::ToolRuns,
+        Self::RuntimeWork,
+    ];
+
+    /// Return all checkpointed materialized projections.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    /// Return the stable projection checkpoint name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionState => "session_state",
+            Self::InputHistory => "input_history",
+            Self::Transcript => "transcript",
+            Self::ToolRuns => "tool_runs",
+            Self::RuntimeWork => "runtime_work",
+        }
+    }
+}
+
 /// Return Bcode's global catalog database path under `root`.
 #[must_use]
 pub fn global_catalog_db_path(root: &Path) -> std::path::PathBuf {
@@ -544,15 +587,19 @@ impl SessionDb {
         tx.commit().await?;
         Ok(())
     }
-    /// Return the last event sequence processed by a projection, if known.
+    /// Return the last event sequence processed by a materialized projection, if known.
     ///
     /// # Errors
     ///
     /// Returns an error if the checkpoint query fails or returns an invalid row.
-    pub async fn projection_checkpoint(
+    pub async fn materialized_projection_checkpoint(
         &self,
-        projection_name: &str,
+        projection: MaterializedProjection,
     ) -> SessionDbResult<Option<u64>> {
+        self.projection_checkpoint(projection.as_str()).await
+    }
+
+    async fn projection_checkpoint(&self, projection_name: &str) -> SessionDbResult<Option<u64>> {
         let row = self
             .db
             .select("projection_checkpoints")
@@ -1380,14 +1427,8 @@ async fn update_projection_checkpoints(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    for projection_name in [
-        "session_state",
-        "input_history",
-        "transcript",
-        "tool_runs",
-        "runtime_work",
-    ] {
-        update_projection_checkpoint(db, projection_name, event).await?;
+    for projection in MaterializedProjection::all() {
+        update_projection_checkpoint(db, projection.as_str(), event).await?;
     }
     Ok(())
 }
@@ -1727,16 +1768,32 @@ mod tests {
         assert_eq!(transcript[1].content.as_deref(), Some("hi there"));
 
         assert_eq!(
-            db.projection_checkpoint("input_history")
+            db.materialized_projection_checkpoint(MaterializedProjection::InputHistory)
                 .await
                 .expect("input checkpoint"),
             Some(2)
         );
         assert_eq!(
-            db.projection_checkpoint("transcript")
+            db.materialized_projection_checkpoint(MaterializedProjection::Transcript)
                 .await
                 .expect("transcript checkpoint"),
             Some(2)
+        );
+        for projection in MaterializedProjection::all() {
+            assert_eq!(
+                db.materialized_projection_checkpoint(*projection)
+                    .await
+                    .expect("materialized projection checkpoint"),
+                Some(2),
+                "projection {} should be checkpointed",
+                projection.as_str()
+            );
+        }
+        assert_eq!(
+            db.projection_checkpoint("model_context")
+                .await
+                .expect("model context should not be checkpointed"),
+            None
         );
     }
 

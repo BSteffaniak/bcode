@@ -1061,7 +1061,9 @@ impl SessionManager {
             .ok_or(SessionError::DbUnavailable(session_id))?;
         let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
         let expected_last_sequence = db.last_event_sequence().await?.unwrap_or(0);
-        let checkpoint = db.projection_checkpoint("runtime_work").await?;
+        let checkpoint = db
+            .materialized_projection_checkpoint(db::MaterializedProjection::RuntimeWork)
+            .await?;
         if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
             return Ok(db.runtime_work_history(limit).await?);
         }
@@ -2554,6 +2556,51 @@ mod tests {
                 text: "hello".to_owned(),
             }]
         );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn restored_model_context_uses_canonical_db_events_without_checkpoint() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("model context".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first".to_owned())
+            .await
+            .expect("first message should append");
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let appended = restored
+            .append_user_message(session.id, ClientId::new(), "carry on".to_owned())
+            .await
+            .expect("carry-on message should append");
+        let user_sequence = appended
+            .last()
+            .expect("user event should be returned")
+            .sequence;
+        restored
+            .append_model_turn_started(session.id, "turn-1".to_owned())
+            .await
+            .expect("turn start should append");
+
+        let context = restored
+            .model_context_events(session.id)
+            .await
+            .expect("model context should load from canonical DB events");
+
+        assert!(context.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. }
+                if event.sequence == user_sequence && text == "carry on"
+        )));
+        assert!(context.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelTurnStarted { turn_id } if turn_id == "turn-1"
+        )));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

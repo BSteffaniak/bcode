@@ -7,7 +7,7 @@ use super::{
     SessionStoreExecutor, SessionSummary, elapsed_ms, input_history_from_events,
     model_context_events_from_history, title_from_first_prompt, usize_to_u64,
 };
-use crate::db::SessionDb;
+use crate::db::{MaterializedProjection, SessionDb};
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
@@ -673,7 +673,9 @@ impl SessionActor {
     ) -> Result<ProjectionWindow, SessionError> {
         if let Some(db) = self.existing_session_db().await? {
             let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-            let checkpoint = db.projection_checkpoint("transcript").await?;
+            let checkpoint = db
+                .materialized_projection_checkpoint(MaterializedProjection::Transcript)
+                .await?;
             if checkpoint.is_none_or(|checkpoint| checkpoint < expected_last_sequence) {
                 return Err(SessionError::ProjectionStale {
                     session_id: self.state.summary.id,
@@ -737,7 +739,10 @@ impl SessionActor {
             return Ok(None);
         };
         let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-        match db.projection_checkpoint("transcript").await? {
+        match db
+            .materialized_projection_checkpoint(MaterializedProjection::Transcript)
+            .await?
+        {
             Some(checkpoint) if checkpoint >= expected_last_sequence => {}
             checkpoint => {
                 return Err(SessionError::ProjectionStale {
@@ -776,7 +781,9 @@ impl SessionActor {
     async fn input_history(&mut self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
         if let Some(db) = self.existing_session_db().await? {
             let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-            let checkpoint = db.projection_checkpoint("input_history").await?;
+            let checkpoint = db
+                .materialized_projection_checkpoint(MaterializedProjection::InputHistory)
+                .await?;
             if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
                 return Ok(db.input_history().await?);
             }
@@ -801,7 +808,9 @@ impl SessionActor {
             return Ok(Vec::new());
         };
         let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-        let checkpoint = db.projection_checkpoint("tool_runs").await?;
+        let checkpoint = db
+            .materialized_projection_checkpoint(MaterializedProjection::ToolRuns)
+            .await?;
         if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
             return Ok(db.active_tool_runs().await?);
         }
@@ -815,17 +824,7 @@ impl SessionActor {
 
     async fn model_context_events(&mut self) -> Result<Vec<SessionEvent>, SessionError> {
         if let Some(db) = self.existing_session_db().await? {
-            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-            let checkpoint = db.projection_checkpoint("model_context").await?;
-            if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
-                return Ok(db.model_context_events().await?);
-            }
-            return Err(SessionError::ProjectionStale {
-                session_id: self.state.summary.id,
-                projection: "model_context",
-                checkpoint,
-                expected: expected_last_sequence,
-            });
+            return Ok(db.model_context_events().await?);
         }
         if let Some(events) = &self.state.events {
             return Ok(model_context_events_from_history(events));
