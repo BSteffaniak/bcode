@@ -6,7 +6,7 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc, time::Duration};
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
@@ -28,6 +28,9 @@ use thiserror::Error;
 
 const GLOBAL_MIGRATIONS_TABLE: &str = "__bcode_global_migrations";
 const SESSION_MIGRATIONS_TABLE: &str = "__bcode_session_migrations";
+const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
+const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
+const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
@@ -149,10 +152,10 @@ impl GlobalSessionDb {
     ///
     /// Returns an error if:
     ///
-    /// * the Turso connection cannot be opened
+    /// * the Turso connection cannot be opened after bounded lock retries
     /// * schema migrations fail
     pub async fn open_turso(path: &Path) -> SessionDbResult<Self> {
-        let db = switchy::database_connection::init_turso_local(Some(path)).await?;
+        let db = init_turso_local_with_retry(path).await?;
         run_global_migrations(&*db).await?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -282,10 +285,10 @@ impl SessionDb {
     ///
     /// Returns an error if:
     ///
-    /// * the Turso connection cannot be opened
+    /// * the Turso connection cannot be opened after bounded lock retries
     /// * schema migrations fail
     pub async fn open_turso(session_id: SessionId, path: &Path) -> SessionDbResult<Self> {
-        let db = switchy::database_connection::init_turso_local(Some(path)).await?;
+        let db = init_turso_local_with_retry(path).await?;
         run_session_migrations(&*db).await?;
         Ok(Self {
             session_id,
@@ -785,6 +788,38 @@ impl SessionDb {
             .execute(&**self.db)
             .await
     }
+}
+
+async fn init_turso_local_with_retry(
+    path: &Path,
+) -> Result<Box<dyn Database>, switchy::database_connection::InitTursoError> {
+    let mut attempt = 0_u32;
+    let mut delay = DATABASE_OPEN_INITIAL_RETRY_DELAY;
+    loop {
+        match switchy::database_connection::init_turso_local(Some(path)).await {
+            Ok(db) => return Ok(db),
+            Err(error)
+                if is_database_lock_error(&error) && attempt < DATABASE_OPEN_RETRY_ATTEMPTS =>
+            {
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(DATABASE_OPEN_MAX_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_database_lock_error(error: &switchy::database_connection::InitTursoError) -> bool {
+    is_database_lock_error_message(&error.to_string())
+}
+
+fn is_database_lock_error_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("locking error")
+        || message.contains("failed locking file")
+        || message.contains("database is locked")
+        || message.contains("busy")
 }
 
 async fn run_global_migrations(db: &dyn Database) -> Result<(), MigrationError> {
@@ -1359,6 +1394,20 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn identifies_database_lock_errors() {
+        assert!(is_database_lock_error_message(
+            "Locking error: Failed locking file '/tmp/session.db-wal'"
+        ));
+        assert!(is_database_lock_error_message("database is locked"));
+        assert!(is_database_lock_error_message("database busy"));
+    }
+
+    #[test]
+    fn ignores_non_lock_database_errors() {
+        assert!(!is_database_lock_error_message("permission denied"));
     }
 
     #[tokio::test]
