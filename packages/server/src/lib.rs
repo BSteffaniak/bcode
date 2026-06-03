@@ -4395,7 +4395,7 @@ fn local_compaction_summary(transcript: &CompactionTranscript, reason: &str) -> 
     }
     parts.push("## Local Compaction Fallback".to_string());
     parts.push(format!(
-        "Bcode compacted older session context locally because the provider compaction request could not be used: {reason}. The full canonical history remains in the session event log."
+        "Bcode compacted older session context locally because the provider compaction request could not be used: {reason}. The full canonical history remains in durable session storage."
     ));
     parts.push("## Older Context Outline".to_string());
     parts.push(bounded_compaction_body(
@@ -7038,7 +7038,7 @@ async fn invoke_model_tool(
 ///
 /// `OutputDelta` carries raw live tool output, including PTY bytes. These chunks
 /// are intentionally transient: they are broadcast to currently attached clients
-/// and must not be appended to the session event log. Durable history stores the
+/// and must not be appended to durable session history. Durable history stores the
 /// tool request, stream lifecycle metadata, final status, and final bounded tool
 /// result instead.
 async fn append_tool_stream_event(

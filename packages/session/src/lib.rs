@@ -276,7 +276,7 @@ pub enum SessionHealth {
     },
     /// Session storage exists but cannot be safely used without repair.
     RepairRequired { reason: String },
-    /// No DB-backed or legacy session exists for the id.
+    /// No DB-backed session exists for the id.
     NotFound,
 }
 
@@ -378,7 +378,7 @@ impl SessionManager {
         Ok(Self::from_store(store, sessions, true))
     }
 
-    /// Create a session manager whose catalog and event logs are loaded on demand.
+    /// Create a session manager whose catalog is loaded on demand.
     #[must_use]
     pub fn persistent_lazy(root: impl Into<PathBuf>) -> Self {
         Self::persistent_lazy_with_metrics(root, MetricsRegistry::default())
@@ -846,7 +846,7 @@ impl SessionManager {
     ///
     /// * the session does not exist
     /// * the session has connected clients
-    /// * the persistent event file cannot be removed
+    /// * the persistent session data cannot be removed
     pub async fn delete_session(
         &self,
         session_id: SessionId,
@@ -2180,7 +2180,7 @@ mod tests {
             assert_eq!(
                 encoded_variant_tag(&kind),
                 expected_tag,
-                "persisted SessionEventKind tag changed for {name}; append new variants only or add compatibility decoding/migration plus binary fixtures"
+                "persisted SessionEventKind tag changed for {name}; append new variants only or add compatibility decoding plus binary fixtures"
             );
         }
     }
@@ -2192,7 +2192,7 @@ mod tests {
             assert_eq!(
                 encoded_variant_tag(&phase),
                 expected_tag,
-                "persisted SessionTracePhase tag changed for {name}; append new variants only or add compatibility decoding/migration plus binary fixtures"
+                "persisted SessionTracePhase tag changed for {name}; append new variants only or add compatibility decoding plus binary fixtures"
             );
         }
     }
@@ -2204,7 +2204,7 @@ mod tests {
             assert_eq!(
                 encoded_variant_tag(&payload),
                 expected_tag,
-                "persisted SessionTracePayload tag changed for {name}; append new variants only or add compatibility decoding/migration plus binary fixtures"
+                "persisted SessionTracePayload tag changed for {name}; append new variants only or add compatibility decoding plus binary fixtures"
             );
         }
     }
@@ -2489,7 +2489,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_uses_db_input_history_without_creating_legacy_event_sidecars() {
+    async fn attach_uses_db_input_history() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -2503,11 +2503,6 @@ mod tests {
             .append_user_message(session.id, ClientId::new(), "hello".to_owned())
             .await
             .expect("message should append");
-
-        assert!(
-            !root.join(format!("{}.events", session.id)).exists(),
-            "new DB-backed sessions should not create legacy .events sidecars"
-        );
 
         let restored = SessionManager::persistent(&root).expect("manager should restore");
         let attachment = restored
@@ -2919,7 +2914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_catalog_skips_unreadable_session_without_failing() {
+    async fn lazy_catalog_skips_unreadable_db_session_without_failing() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let good = manager
@@ -2927,11 +2922,13 @@ mod tests {
             .await
             .expect("session should create");
         let bad_id = SessionId::new();
-        let bad_path = root.join(format!("{bad_id}.events"));
+        let bad_dir = root.join(bad_id.to_string());
+        std::fs::create_dir_all(&bad_dir).expect("bad session dir should create");
+        let bad_path = bad_dir.join("session.db");
         std::fs::File::create(&bad_path)
-            .expect("bad event file should create")
+            .expect("bad session DB should create")
             .write_all(&[1_u8])
-            .expect("bad event file should write");
+            .expect("bad session DB should write");
 
         let restored = SessionManager::persistent_lazy(&root);
         restored
