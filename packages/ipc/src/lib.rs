@@ -153,6 +153,11 @@ pub enum Request {
     DeleteSession {
         session_id: SessionId,
     },
+    /// Explicit complete-history request for export/debug/history commands only.
+    ///
+    /// This request may force the server to read every canonical event for the session.
+    /// Normal runtime flows must use `SessionHistoryPage`, projection-window requests, or
+    /// typed read-model endpoints instead.
     SessionHistory {
         session_id: SessionId,
     },

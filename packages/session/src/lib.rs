@@ -910,7 +910,11 @@ impl SessionManager {
         handle.working_directory().await
     }
 
-    /// Return durable history for a session.
+    /// Return the complete durable event history for explicit export/debug/history commands only.
+    ///
+    /// This API performs a full canonical event read. Do not call it from normal UI, attach,
+    /// prompt/model-context, catalog, or background maintenance paths. Use bounded pages,
+    /// projection windows, or typed read models for runtime flows.
     ///
     /// # Errors
     ///

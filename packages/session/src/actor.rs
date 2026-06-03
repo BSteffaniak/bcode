@@ -142,6 +142,11 @@ impl SessionHandle {
         self.send(SessionCommand::WorkingDirectory).await
     }
 
+    /// Return the complete durable event history.
+    ///
+    /// This method performs a full canonical event read and is reserved for explicit
+    /// export/debug/history commands. Normal runtime flows must use bounded history pages,
+    /// projection windows, or typed read models instead.
     pub async fn history(&self) -> Result<Vec<SessionEvent>, SessionError> {
         self.send(SessionCommand::History).await?
     }

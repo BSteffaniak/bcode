@@ -698,7 +698,11 @@ impl BcodeClient {
         }
     }
 
-    /// Return replayable session history.
+    /// Return complete replayable session history for explicit export/debug/history commands.
+    ///
+    /// This request performs a full canonical event read on the daemon. Do not use it for
+    /// normal UI, attach, prompt/model-context, catalog, or background maintenance flows; use
+    /// [`Self::session_history_page`] or projection-specific APIs instead.
     ///
     /// # Errors
     ///

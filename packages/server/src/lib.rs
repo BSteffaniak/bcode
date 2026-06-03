@@ -2194,6 +2194,11 @@ async fn handle_delete_session(
     }
 }
 
+/// Handle an explicit full-history request.
+///
+/// This endpoint performs a complete canonical event read and is intended only for
+/// export/debug/history commands. Normal UI, attach, prompt/model-context, catalog,
+/// and maintenance flows must use bounded pages, projection windows, or typed read models.
 async fn handle_session_history(
     request_id: u64,
     client_id: ClientId,
