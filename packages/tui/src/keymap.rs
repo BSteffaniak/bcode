@@ -183,6 +183,12 @@ impl BmuxKeyMap {
         .join(" · ")
     }
 
+    /// Return the compact key label for a chat action.
+    #[must_use]
+    pub fn chat_action_label(&self, action: BmuxAction) -> Option<String> {
+        self.key_for_action(BmuxScope::Chat, action).map(key_label)
+    }
+
     fn key_for_action(&self, scope: BmuxScope, action: BmuxAction) -> Option<KeyStroke> {
         self.bindings.get(&scope).and_then(|bindings| {
             bindings

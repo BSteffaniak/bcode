@@ -1,5 +1,7 @@
 //! TUI rendering.
 
+use std::time::{Duration, Instant};
+
 use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bmux_terminal_grid::{
@@ -43,6 +45,9 @@ const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
+const LATEST_BAR_ACTIVE_FRAME: Duration = Duration::from_millis(120);
+const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
 /// Compute the transcript area for a full terminal frame.
 #[must_use]
 pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
@@ -77,16 +82,38 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
 
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
-    let transcript_area = transcript_area_for_body(app, body);
-    sync_transcript_layout(app, transcript_area.width);
+    let initial_transcript_area = transcript_area_for_body(app, body);
+    sync_transcript_layout(app, initial_transcript_area.width);
     app.sync_transcript_scroll_max(
-        max_transcript_scroll_offset(app, transcript_area),
-        max_transcript_bottom_overscroll(transcript_area),
+        max_transcript_scroll_offset(app, initial_transcript_area),
+        max_transcript_bottom_overscroll(initial_transcript_area),
         app.transcript_layout().total_rows(),
-        transcript_area.height,
+        initial_transcript_area.height,
     );
     app.sync_transcript_anchor_requests();
+    let latest_bar_height = u16::from(app.newer_transcript_content_below());
+    let body = Rect::new(
+        body.x,
+        body.y,
+        body.width,
+        body.height.saturating_sub(latest_bar_height),
+    );
+    let transcript_area = transcript_area_for_body(app, body);
+    if latest_bar_height > 0 {
+        sync_transcript_layout(app, transcript_area.width);
+        app.sync_transcript_scroll_max(
+            max_transcript_scroll_offset(app, transcript_area),
+            max_transcript_bottom_overscroll(transcript_area),
+            app.transcript_layout().total_rows(),
+            transcript_area.height,
+        );
+        app.sync_transcript_anchor_requests();
+    }
     render_body(app, body, frame);
+    if latest_bar_height > 0 {
+        let latest_bar = Rect::new(area.x, body.bottom(), area.width, 1);
+        render_latest_bar(app, latest_bar, frame, Instant::now());
+    }
 
     let status = Rect::new(
         area.x,
@@ -95,6 +122,126 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
         u16::from(composer.y > area.y.saturating_add(1)),
     );
     render_status(app, status, frame);
+}
+
+fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Instant) {
+    if area.is_empty() {
+        return;
+    }
+    frame.push_hit(
+        HitRegion::new("latest-bar", area)
+            .role(HitRole::ListItem)
+            .layer(1),
+    );
+    let line = latest_bar_line(
+        area.width,
+        app.jump_to_latest_key_label(),
+        app.latest_hidden_activity_at(),
+        now,
+    );
+    frame.write_line(area, &line);
+}
+
+fn latest_bar_line(
+    width: u16,
+    key_label: &str,
+    latest_hidden_activity_at: Option<Instant>,
+    now: Instant,
+) -> Line {
+    let active = latest_hidden_activity_at
+        .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW);
+    if active {
+        active_latest_bar_line(width, key_label, now)
+    } else {
+        stale_latest_bar_line(width, key_label, now)
+    }
+}
+
+fn active_latest_bar_line(width: u16, key_label: &str, now: Instant) -> Line {
+    let width = usize::from(width);
+    let text = if width < 32 {
+        format!("activity below · {key_label}")
+    } else {
+        format!("New activity below · {key_label} to jump")
+    };
+    let text_width = text_display_width(&text);
+    let side_width = width.saturating_sub(text_width).saturating_sub(2) / 2;
+    let phase =
+        usize::try_from(now.elapsed().as_millis() / LATEST_BAR_ACTIVE_FRAME.as_millis().max(1))
+            .unwrap_or_default();
+    let mut spans = Vec::new();
+    push_chevron_wave(&mut spans, side_width, phase, false);
+    spans.push(Span::styled(
+        " ",
+        latest_bar_background_style().fg(Color::BrightBlack),
+    ));
+    spans.push(Span::styled(
+        truncate_to_display_width(&text, width.saturating_sub(side_width.saturating_mul(2))),
+        latest_bar_background_style()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        " ",
+        latest_bar_background_style().fg(Color::BrightBlack),
+    ));
+    let used = side_width
+        .saturating_add(2)
+        .saturating_add(text_width.min(width.saturating_sub(side_width.saturating_mul(2))));
+    push_chevron_wave(&mut spans, width.saturating_sub(used), phase, true);
+    Line::from_spans(spans)
+}
+
+fn stale_latest_bar_line(width: u16, key_label: &str, now: Instant) -> Line {
+    let width = usize::from(width);
+    let text = if width < 30 {
+        format!("latest below · {key_label}")
+    } else {
+        format!("New messages below · {key_label} to jump")
+    };
+    let pulse =
+        usize::try_from(now.elapsed().as_millis() / LATEST_BAR_STALE_FRAME.as_millis().max(1))
+            .unwrap_or_default()
+            % 3;
+    let chevron = ["⌄", "˅", "▾"][pulse];
+    let text = truncate_to_display_width(&text, width.saturating_sub(2));
+    let text_width = text_display_width(&text);
+    let spacer = width.saturating_sub(text_width).saturating_sub(1);
+    Line::from_spans(vec![
+        Span::styled(text, latest_bar_background_style().fg(Color::BrightBlack)),
+        Span::styled(" ".repeat(spacer), latest_bar_background_style()),
+        Span::styled(
+            chevron,
+            latest_bar_background_style()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn push_chevron_wave(spans: &mut Vec<Span>, width: usize, phase: usize, reverse: bool) {
+    for column in 0..width {
+        let wave = if reverse {
+            phase.saturating_add(width.saturating_sub(column))
+        } else {
+            phase.saturating_add(column)
+        } % 6;
+        let (glyph, color, bold) = match wave {
+            0 => ("▾", Color::Cyan, true),
+            1 | 5 => ("˅", Color::Cyan, false),
+            2 | 4 => ("⌄", Color::Blue, false),
+            _ => (" ", Color::BrightBlack, false),
+        };
+        let mut style = latest_bar_background_style().fg(color);
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(glyph, style));
+    }
+}
+
+const fn latest_bar_background_style() -> Style {
+    Style::new().bg(Color::Rgb(12, 24, 32))
 }
 
 fn composer_height(app: &BmuxApp, area: Rect) -> u16 {

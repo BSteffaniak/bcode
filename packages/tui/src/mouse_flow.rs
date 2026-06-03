@@ -39,6 +39,9 @@ pub async fn handle_mouse(
             }
             _ => Ok(chat.app.scroll_transcript_down(scroll_rows)),
         },
+        MouseEventKind::Down(MouseButton::Left) if hit_id.as_deref() == Some("latest-bar") => {
+            Ok(chat.app.scroll_transcript_to_bottom())
+        }
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
             permission_flow::handle_permission_mouse(client, chat, permission_dialog, mouse).await
         }

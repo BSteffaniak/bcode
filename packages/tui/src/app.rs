@@ -46,6 +46,10 @@ const MANUAL_TRANSCRIPT_SCROLL_GRACE: Duration = Duration::from_millis(450);
 const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
+const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
+const LATEST_BAR_ACTIVE_FRAME: Duration = Duration::from_millis(120);
+const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
@@ -119,6 +123,7 @@ pub struct BmuxApp {
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
     scroll_mode: TranscriptScrollMode,
     pending_visual_overflow_bottom: Option<usize>,
+    latest_hidden_activity_at: Option<Instant>,
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
     active_tool_calls: BTreeSet<String>,
@@ -128,6 +133,7 @@ pub struct BmuxApp {
     activity: ActivityState,
     status: String,
     key_hints: String,
+    jump_to_latest_key_label: String,
     tui_config: TuiConfig,
     exit: ExitState,
     cursor: CursorBlink,
@@ -262,6 +268,7 @@ impl BmuxApp {
             transcript_scroll_animation: None,
             scroll_mode: TranscriptScrollMode::BottomFollow,
             pending_visual_overflow_bottom: None,
+            latest_hidden_activity_at: None,
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
             active_tool_calls: BTreeSet::new(),
@@ -271,6 +278,7 @@ impl BmuxApp {
             activity: ActivityState::Idle,
             status: String::from("TUI connected. Enter submits; Esc/Ctrl-C exits."),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
+            jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
@@ -612,6 +620,26 @@ impl BmuxApp {
         self.viewport.bottom_overscroll()
     }
 
+    /// Return whether there is newer transcript content below the viewport.
+    #[must_use]
+    pub fn newer_transcript_content_below(&self) -> bool {
+        self.viewport
+            .bottom_row(self.transcript_layout.total_rows())
+            < self.transcript_layout.total_rows()
+    }
+
+    /// Return the most recent time hidden transcript content changed.
+    #[must_use]
+    pub const fn latest_hidden_activity_at(&self) -> Option<Instant> {
+        self.latest_hidden_activity_at
+    }
+
+    /// Return the key label for jumping to the latest transcript content.
+    #[must_use]
+    pub fn jump_to_latest_key_label(&self) -> &str {
+        &self.jump_to_latest_key_label
+    }
+
     /// Return the transcript row that should render at the top of the viewport.
     #[must_use]
     pub fn transcript_top_row(&self, viewport_height: u16) -> usize {
@@ -672,6 +700,11 @@ impl BmuxApp {
     /// Store configured key hints for the status line.
     pub fn set_key_hints(&mut self, key_hints: String) {
         self.key_hints = key_hints;
+    }
+
+    /// Store the configured key label for jumping to latest transcript content.
+    pub fn set_jump_to_latest_key_label(&mut self, key_label: String) {
+        self.jump_to_latest_key_label = key_label;
     }
 
     /// Append a system-style transcript note.
@@ -857,6 +890,7 @@ impl BmuxApp {
         let changed = self.viewport.scroll_down(rows);
         if self.viewport.at_bottom_threshold() {
             self.scroll_mode = TranscriptScrollMode::BottomFollow;
+            self.latest_hidden_activity_at = None;
         } else {
             self.scroll_mode = TranscriptScrollMode::ManualDetached;
         }
@@ -869,6 +903,7 @@ impl BmuxApp {
         self.manual_transcript_scroll_until = None;
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
+        self.latest_hidden_activity_at = None;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_assistant_stream_anchor = false;
         self.pending_visual_overflow_bottom = None;
@@ -932,13 +967,20 @@ impl BmuxApp {
             self.manual_transcript_scroll_active(),
             &mut self.older_history,
         );
-        self.resolve_visual_overflow_follow(total_rows);
+        self.resolve_visual_overflow_follow(total_rows, now);
     }
 
-    fn resolve_visual_overflow_follow(&mut self, total_rows: usize) {
+    fn resolve_visual_overflow_follow(&mut self, total_rows: usize, now: Instant) {
         let Some(previous_bottom) = self.pending_visual_overflow_bottom else {
+            if !self.newer_transcript_content_below() {
+                self.latest_hidden_activity_at = None;
+            }
             return;
         };
+        let overflowed = total_rows > previous_bottom;
+        if overflowed && self.newer_transcript_content_below() {
+            self.latest_hidden_activity_at = Some(now);
+        }
         if self.manual_transcript_scroll_active()
             || self.transcript_scroll_animation.is_some()
             || !self.scroll_mode.allows_overflow_catch()
@@ -946,10 +988,14 @@ impl BmuxApp {
             return;
         }
         self.pending_visual_overflow_bottom = None;
-        if total_rows <= previous_bottom {
+        if !overflowed {
+            if !self.newer_transcript_content_below() {
+                self.latest_hidden_activity_at = None;
+            }
             return;
         }
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
+        self.latest_hidden_activity_at = None;
         self.viewport.scroll_to_bottom(&mut self.older_history);
     }
 
@@ -1135,7 +1181,7 @@ impl BmuxApp {
         if event_breaks_sticky_entry_anchor(event) {
             self.downgrade_sticky_entry_anchor();
         }
-        if event_affects_transcript_rows(event) && self.scroll_mode.allows_overflow_catch() {
+        if event_affects_transcript_rows(event) {
             self.pending_visual_overflow_bottom = Some(
                 self.viewport
                     .bottom_row(self.transcript_layout.total_rows()),
@@ -1339,6 +1385,12 @@ impl BmuxApp {
                 now + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
             ));
         }
+        if self.newer_transcript_content_below() {
+            requests.push(InvalidationRequest::new(
+                InvalidationKey::new(LATEST_BAR_ANIMATION_INVALIDATION_KEY),
+                self.next_latest_bar_invalidation(now),
+            ));
+        }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
         requests
     }
@@ -1358,12 +1410,24 @@ impl BmuxApp {
                 } else {
                     invalidation
                 }
+            } else if is_latest_bar_animation_invalidation(key) {
+                invalidation.merge(UiInvalidation::Paint)
             } else if is_tool_elapsed_invalidation(key) {
                 invalidation.merge(UiInvalidation::Layout)
             } else {
                 invalidation
             }
         })
+    }
+
+    fn next_latest_bar_invalidation(&self, now: Instant) -> Instant {
+        if self
+            .latest_hidden_activity_at
+            .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW)
+        {
+            return now + LATEST_BAR_ACTIVE_FRAME;
+        }
+        now + LATEST_BAR_STALE_FRAME
     }
 
     fn handle_transcript_scroll_animation(&mut self, now: Instant) -> bool {
@@ -2210,6 +2274,10 @@ fn tool_elapsed_invalidation_key(tool_call_id: &str) -> InvalidationKey {
 
 fn is_tool_elapsed_invalidation(key: &InvalidationKey) -> bool {
     key.as_str().starts_with(TOOL_ELAPSED_INVALIDATION_PREFIX)
+}
+
+fn is_latest_bar_animation_invalidation(key: &InvalidationKey) -> bool {
+    key.as_str() == LATEST_BAR_ANIMATION_INVALIDATION_KEY
 }
 
 fn is_transcript_scroll_animation_invalidation(key: &InvalidationKey) -> bool {

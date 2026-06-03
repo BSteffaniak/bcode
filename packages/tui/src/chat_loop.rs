@@ -66,13 +66,13 @@ pub async fn run_with_client<W: Write>(
         permission_dialog: None,
         thinking_dialog: None,
     };
-    chat.app.set_key_hints(keymap.chat_hints());
+    sync_chat_key_labels(chat, keymap);
     let mut invalidation_queue = InvalidationQueue::default();
     refresh_invalidation_queue(chat, &mut invalidation_queue);
     let mut needs_redraw = true;
 
     while !chat.app.should_exit() {
-        chat.app.set_key_hints(keymap.chat_hints());
+        sync_chat_key_labels(chat, keymap);
         while let Ok(event) = chat.event_receiver.try_recv() {
             match event {
                 BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
@@ -230,6 +230,13 @@ fn handle_async_event(
             chat.status_hydration_task = None;
             session_flow::complete_status_hydration(chat, hydrated);
         }
+    }
+}
+
+fn sync_chat_key_labels(chat: &mut ActiveChat, keymap: &BmuxKeyMap) {
+    chat.app.set_key_hints(keymap.chat_hints());
+    if let Some(label) = keymap.chat_action_label(BmuxAction::TranscriptBottom) {
+        chat.app.set_jump_to_latest_key_label(label);
     }
 }
 
