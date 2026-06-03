@@ -31,7 +31,20 @@ impl TranscriptViewport {
     /// Return whether the viewport is following live transcript output.
     #[must_use]
     pub const fn following(&self) -> bool {
-        self.offset == 0 && self.bottom_overscroll == 0
+        self.offset == 0 && self.bottom_overscroll == 0 && self.anchor_top_row.is_none()
+    }
+
+    /// Return whether newest content is at or above the viewport's bottom edge.
+    #[must_use]
+    pub const fn at_bottom_threshold(&self) -> bool {
+        self.offset == 0 && self.anchor_top_row.is_none()
+    }
+
+    /// Return the current viewport bottom row in transcript row coordinates.
+    #[must_use]
+    pub fn bottom_row(&self, total_rows: usize) -> usize {
+        self.top_row(total_rows, self.viewport_height)
+            .saturating_add(usize::from(self.viewport_height))
     }
 
     /// Preserve viewport position before live transcript rows append.
