@@ -48,7 +48,6 @@ const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
-const LATEST_BAR_ACTIVE_FRAME: Duration = Duration::from_millis(120);
 const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +123,7 @@ pub struct BmuxApp {
     scroll_mode: TranscriptScrollMode,
     pending_visual_overflow_bottom: Option<usize>,
     latest_hidden_activity_at: Option<Instant>,
+    latest_hidden_activity_burst: u8,
     latest_bar_animation_started_at: Instant,
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
@@ -271,6 +271,7 @@ impl BmuxApp {
             scroll_mode: TranscriptScrollMode::BottomFollow,
             pending_visual_overflow_bottom: None,
             latest_hidden_activity_at: None,
+            latest_hidden_activity_burst: 0,
             latest_bar_animation_started_at: now,
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
@@ -637,6 +638,12 @@ impl BmuxApp {
         self.latest_hidden_activity_at
     }
 
+    /// Return the current hidden transcript activity burst intensity.
+    #[must_use]
+    pub const fn latest_hidden_activity_burst(&self) -> u8 {
+        self.latest_hidden_activity_burst
+    }
+
     /// Return the latest-bar animation origin.
     #[must_use]
     pub const fn latest_bar_animation_started_at(&self) -> Instant {
@@ -900,6 +907,7 @@ impl BmuxApp {
         if self.viewport.at_bottom_threshold() {
             self.scroll_mode = TranscriptScrollMode::BottomFollow;
             self.latest_hidden_activity_at = None;
+            self.latest_hidden_activity_burst = 0;
         } else {
             self.scroll_mode = TranscriptScrollMode::ManualDetached;
         }
@@ -913,6 +921,7 @@ impl BmuxApp {
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
         self.latest_hidden_activity_at = None;
+        self.latest_hidden_activity_burst = 0;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_assistant_stream_anchor = false;
         self.pending_visual_overflow_bottom = None;
@@ -989,6 +998,7 @@ impl BmuxApp {
                     }
                     TranscriptScrollMode::BottomFollow => {
                         self.latest_hidden_activity_at = None;
+                        self.latest_hidden_activity_burst = 0;
                         self.viewport.scroll_to_bottom(&mut self.older_history);
                     }
                     TranscriptScrollMode::AnchoredToEntry { .. }
@@ -1014,12 +1024,13 @@ impl BmuxApp {
         let Some(previous_bottom) = self.pending_visual_overflow_bottom else {
             if !self.newer_transcript_content_below() {
                 self.latest_hidden_activity_at = None;
+                self.latest_hidden_activity_burst = 0;
             }
             return;
         };
         let overflowed = total_rows > previous_bottom;
         if overflowed && self.newer_transcript_content_below() {
-            self.latest_hidden_activity_at = Some(now);
+            self.record_latest_hidden_activity(now);
         }
         if self.manual_transcript_scroll_active()
             || self.transcript_scroll_animation.is_some()
@@ -1031,12 +1042,20 @@ impl BmuxApp {
         if !overflowed {
             if !self.newer_transcript_content_below() {
                 self.latest_hidden_activity_at = None;
+                self.latest_hidden_activity_burst = 0;
             }
             return;
         }
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
         self.latest_hidden_activity_at = None;
+        self.latest_hidden_activity_burst = 0;
         self.viewport.scroll_to_bottom(&mut self.older_history);
+    }
+
+    fn record_latest_hidden_activity(&mut self, now: Instant) {
+        self.latest_hidden_activity_at = Some(now);
+        self.latest_hidden_activity_burst =
+            self.latest_hidden_activity_burst.saturating_add(1).min(8);
     }
 
     /// Resolve deferred user-message and live-stream top anchoring against the latest cached layout.
@@ -1465,7 +1484,7 @@ impl BmuxApp {
             .latest_hidden_activity_at
             .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW)
         {
-            return now + LATEST_BAR_ACTIVE_FRAME;
+            return now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst);
         }
         now + LATEST_BAR_STALE_FRAME
     }
@@ -2321,6 +2340,14 @@ const TOOL_ELAPSED_INVALIDATION_PREFIX: &str = "tool-elapsed:";
 
 fn tool_elapsed_invalidation_key(tool_call_id: &str) -> InvalidationKey {
     InvalidationKey::new(format!("{TOOL_ELAPSED_INVALIDATION_PREFIX}{tool_call_id}"))
+}
+
+fn latest_bar_active_frame_duration(burst: u8) -> Duration {
+    Duration::from_millis(
+        220_u64
+            .saturating_sub(u64::from(burst).saturating_mul(18))
+            .max(80),
+    )
 }
 
 fn is_tool_elapsed_invalidation(key: &InvalidationKey) -> bool {

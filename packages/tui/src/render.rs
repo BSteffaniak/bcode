@@ -46,7 +46,6 @@ const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
-const LATEST_BAR_ACTIVE_FRAME: Duration = Duration::from_millis(120);
 const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
 /// Compute the transcript area for a full terminal frame.
 #[must_use]
@@ -137,23 +136,31 @@ fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Inst
         area.width,
         app.jump_to_latest_key_label(),
         app.latest_hidden_activity_at(),
+        app.latest_hidden_activity_burst(),
         app.latest_bar_animation_started_at(),
         now,
     );
-    frame.write_line(area, &line);
+    frame.write_line_with_fallback_style(area, &line, latest_bar_background_style());
 }
 
 fn latest_bar_line(
     width: u16,
     key_label: &str,
     latest_hidden_activity_at: Option<Instant>,
+    latest_hidden_activity_burst: u8,
     animation_started_at: Instant,
     now: Instant,
 ) -> Line {
     let active = latest_hidden_activity_at
         .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW);
     if active {
-        active_latest_bar_line(width, key_label, animation_started_at, now)
+        active_latest_bar_line(
+            width,
+            key_label,
+            latest_hidden_activity_burst,
+            animation_started_at,
+            now,
+        )
     } else {
         stale_latest_bar_line(width, key_label, animation_started_at, now)
     }
@@ -162,6 +169,7 @@ fn latest_bar_line(
 fn active_latest_bar_line(
     width: u16,
     key_label: &str,
+    burst: u8,
     animation_started_at: Instant,
     now: Instant,
 ) -> Line {
@@ -175,9 +183,14 @@ fn active_latest_bar_line(
     let text_width = text_display_width(&text);
     let left_width = width.saturating_sub(text_width) / 2;
     let right_width = width.saturating_sub(text_width).saturating_sub(left_width);
-    let phase = latest_bar_phase(animation_started_at, now, LATEST_BAR_ACTIVE_FRAME);
+    let phase = latest_bar_phase(
+        animation_started_at,
+        now,
+        latest_bar_active_frame_duration(burst),
+    );
+    let pulse = latest_bar_pulse(phase, burst);
     let mut spans = Vec::new();
-    push_chevron_wave(&mut spans, left_width, phase, false);
+    push_chevron_wave(&mut spans, left_width, phase, pulse, false);
     spans.push(Span::styled(
         text,
         latest_bar_background_style()
@@ -188,6 +201,7 @@ fn active_latest_bar_line(
         &mut spans,
         right_width,
         phase.saturating_add(left_width),
+        pulse,
         false,
     );
     Line::from_spans(spans)
@@ -238,17 +252,39 @@ fn latest_bar_phase(started_at: Instant, now: Instant, frame: Duration) -> usize
     .unwrap_or_default()
 }
 
-fn push_chevron_wave(spans: &mut Vec<Span>, width: usize, phase: usize, reverse: bool) {
+fn latest_bar_active_frame_duration(burst: u8) -> Duration {
+    Duration::from_millis(
+        220_u64
+            .saturating_sub(u64::from(burst).saturating_mul(18))
+            .max(80),
+    )
+}
+
+fn latest_bar_pulse(phase: usize, burst: u8) -> usize {
+    const PULSE: [usize; 16] = [0, 1, 2, 4, 6, 8, 7, 6, 4, 3, 2, 1, 0, 0, 1, 2];
+    PULSE[phase % PULSE.len()].saturating_add(usize::from(burst) / 2)
+}
+
+fn push_chevron_wave(
+    spans: &mut Vec<Span>,
+    width: usize,
+    phase: usize,
+    pulse: usize,
+    reverse: bool,
+) {
     for column in 0..width {
         let wave = if reverse {
             phase.saturating_add(width.saturating_sub(column))
         } else {
             phase.saturating_add(column)
-        } % 6;
-        let (glyph, color, bold) = match wave {
+        } % 10;
+        let crest = pulse % 10;
+        let distance = wave.abs_diff(crest);
+        let (glyph, color, bold) = match distance {
             0 => ("▾", Color::Cyan, true),
-            1 | 5 => ("˅", Color::Cyan, false),
-            2 | 4 => ("⌄", Color::Blue, false),
+            1 => ("▾", Color::Cyan, false),
+            2 => ("˅", Color::Blue, false),
+            3 | 4 => ("⌄", Color::BrightBlack, false),
             _ => (" ", Color::BrightBlack, false),
         };
         let mut style = latest_bar_background_style().fg(color);
