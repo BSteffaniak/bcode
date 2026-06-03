@@ -249,7 +249,7 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
-/// Product-facing derived view over a session event log.
+/// Product-facing derived view over durable session history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionProjectionKind {
