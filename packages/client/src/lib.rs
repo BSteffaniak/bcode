@@ -5,6 +5,7 @@
 //! Programmatic client API for Bcode.
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
+use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
@@ -106,12 +107,45 @@ pub enum ClientError {
     Transport(#[from] bcode_ipc::IpcTransportError),
     #[error("IPC codec error: {0}")]
     Codec(#[from] CodecError),
+    #[error("daemon start error: {0}")]
+    DaemonStart(#[from] DaemonStartError),
     #[error("server returned error {code}: {message}")]
     Server { code: String, message: String },
     #[error("unexpected response payload")]
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
     UnexpectedEnvelope,
+}
+
+impl ClientError {
+    /// Return true when the error means the local daemon transport is unavailable.
+    #[must_use]
+    pub fn is_daemon_unavailable(&self) -> bool {
+        match self {
+            Self::Transport(bcode_ipc::IpcTransportError::Io(error)) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            Self::Codec(CodecError::Io(error)) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            Self::Transport(_)
+            | Self::Codec(_)
+            | Self::DaemonStart(_)
+            | Self::Server { .. }
+            | Self::UnexpectedResponse
+            | Self::UnexpectedEnvelope => false,
+        }
+    }
 }
 
 /// Session list response with persistent catalog status.
@@ -290,6 +324,16 @@ impl MessageAcceptance {
 pub struct BcodeClient {
     endpoint: IpcEndpoint,
     runtime_context: Option<ClientRuntimeContext>,
+    daemon_availability: DaemonAvailability,
+}
+
+/// Daemon availability policy used by client connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAvailability {
+    /// Require an already-running daemon and return transport errors directly.
+    RequireRunning,
+    /// Start the daemon when recoverable IPC failures indicate it is unavailable.
+    AutoStart,
 }
 
 /// Event-driven session catalog watcher.
@@ -360,6 +404,7 @@ impl BcodeClient {
         Self {
             endpoint: default_endpoint(),
             runtime_context: current_runtime_context(),
+            daemon_availability: DaemonAvailability::AutoStart,
         }
     }
 
@@ -369,6 +414,7 @@ impl BcodeClient {
         Self {
             endpoint,
             runtime_context: None,
+            daemon_availability: DaemonAvailability::RequireRunning,
         }
     }
 
@@ -376,6 +422,16 @@ impl BcodeClient {
     #[must_use]
     pub fn with_runtime_context(mut self, runtime_context: Option<ClientRuntimeContext>) -> Self {
         self.runtime_context = runtime_context;
+        self
+    }
+
+    /// Configure daemon availability behavior for future connections.
+    #[must_use]
+    pub const fn with_daemon_availability(
+        mut self,
+        daemon_availability: DaemonAvailability,
+    ) -> Self {
+        self.daemon_availability = daemon_availability;
         self
     }
 
@@ -413,8 +469,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn ping(&self) -> Result<(), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::Ping).await? {
+        match self.send_request(Request::Ping).await? {
             ResponsePayload::Pong => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -426,8 +481,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn server_status(&self) -> Result<bcode_ipc::ServerStatus, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::ServerStatus).await? {
+        match self.send_request(Request::ServerStatus).await? {
             ResponsePayload::ServerStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -453,11 +507,7 @@ impl BcodeClient {
     }
 
     async fn server_stop_with_mode(&self, mode: ServerStopMode) -> Result<(), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
-            .send_request(Request::ServerStop { mode })
-            .await?
-        {
+        match self.send_request(Request::ServerStop { mode }).await? {
             ResponsePayload::ServerStopping => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -472,8 +522,7 @@ impl BcodeClient {
         &self,
         name: Option<String>,
     ) -> Result<SessionSummary, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::CreateSession {
                 name,
                 working_directory: current_working_directory(),
@@ -500,8 +549,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_sessions_with_status(&self) -> Result<SessionList, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::ListSessions {
                 working_directory: current_working_directory(),
             })
@@ -532,8 +580,7 @@ impl BcodeClient {
         source_id: impl Into<String>,
         external_session_id: impl Into<String>,
     ) -> Result<(SessionSummary, Vec<SessionImportWarning>), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::ImportExternalSession {
                 source_id: source_id.into(),
                 external_session_id: external_session_id.into(),
@@ -556,8 +603,7 @@ impl BcodeClient {
         &self,
         sources: Option<Vec<String>>,
     ) -> Result<SessionList, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::RefreshSessionCatalog {
                 working_directory: Some(current_working_directory()),
                 sources,
@@ -589,8 +635,7 @@ impl BcodeClient {
         session_id: SessionId,
         working_directory: impl Into<std::path::PathBuf>,
     ) -> Result<SessionSummary, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::ChangeSessionWorkingDirectory {
                 session_id,
                 working_directory: working_directory.into(),
@@ -611,11 +656,7 @@ impl BcodeClient {
         &self,
         request: WorktreeListRequest,
     ) -> Result<WorktreeListResponse, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
-            .send_request(Request::ListWorktrees(request))
-            .await?
-        {
+        match self.send_request(Request::ListWorktrees(request)).await? {
             ResponsePayload::WorktreeList(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -630,11 +671,7 @@ impl BcodeClient {
         &self,
         request: WorktreeCreateRequest,
     ) -> Result<WorktreeCreateResponse, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
-            .send_request(Request::CreateWorktree(request))
-            .await?
-        {
+        match self.send_request(Request::CreateWorktree(request)).await? {
             ResponsePayload::WorktreeCreated(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -649,11 +686,7 @@ impl BcodeClient {
         &self,
         request: WorktreeRemoveRequest,
     ) -> Result<WorktreeRemoveResponse, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
-            .send_request(Request::RemoveWorktree(request))
-            .await?
-        {
+        match self.send_request(Request::RemoveWorktree(request)).await? {
             ResponsePayload::WorktreeRemoved(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -669,8 +702,7 @@ impl BcodeClient {
         session_id: SessionId,
         name: Option<String>,
     ) -> Result<SessionSummary, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::RenameSession { session_id, name })
             .await?
         {
@@ -688,8 +720,7 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::DeleteSession { session_id })
             .await?
         {
@@ -711,8 +742,7 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<SessionEvent>, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::SessionHistory { session_id })
             .await?
         {
@@ -731,8 +761,7 @@ impl BcodeClient {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::SessionHistoryPage { session_id, query })
             .await?
         {
@@ -751,8 +780,20 @@ impl BcodeClient {
         session_id: SessionId,
         text: String,
     ) -> Result<MessageAcceptance, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        connection.send_user_message(session_id, text).await
+        match self
+            .send_request(Request::SendUserMessage { session_id, text })
+            .await?
+        {
+            ResponsePayload::MessageAccepted {
+                queued,
+                queue_position,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+            }),
+            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     /// Set a session-specific model selection.
@@ -766,8 +807,7 @@ impl BcodeClient {
         provider_plugin_id: Option<String>,
         model_id: String,
     ) -> Result<(), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::SetSessionModel {
                 session_id,
                 provider_plugin_id,
@@ -791,8 +831,7 @@ impl BcodeClient {
         effort: Option<String>,
         summary: Option<String>,
     ) -> Result<(), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::SetSessionReasoning {
                 session_id,
                 effort,
@@ -814,8 +853,7 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
     ) -> Result<bcode_ipc::SessionModelStatus, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::SessionModelStatus { session_id })
             .await?
         {
@@ -833,8 +871,7 @@ impl BcodeClient {
         &self,
         provider_plugin_id: Option<String>,
     ) -> Result<bcode_model::ModelList, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::SessionModelList { provider_plugin_id })
             .await?
         {
@@ -863,8 +900,7 @@ impl BcodeClient {
         session_id: SessionId,
         clear_queue: bool,
     ) -> Result<bool, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::CancelSessionTurn {
                 session_id,
                 clear_queue,
@@ -886,8 +922,7 @@ impl BcodeClient {
         session_id: SessionId,
         work_id: bcode_session_models::RuntimeWorkId,
     ) -> Result<bool, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::CancelRuntimeWork {
                 session_id,
                 work_id,
@@ -908,8 +943,7 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<bcode_ipc::RuntimeWorkSnapshot>, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::ListRuntimeWork { session_id })
             .await?
         {
@@ -928,8 +962,7 @@ impl BcodeClient {
         session_id: SessionId,
         limit: usize,
     ) -> Result<Vec<bcode_session_models::SessionEvent>, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::RuntimeWorkHistory { session_id, limit })
             .await?
         {
@@ -959,8 +992,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn compact_session(&self, session_id: SessionId) -> Result<String, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::CompactSession { session_id })
             .await?
         {
@@ -975,8 +1007,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_agents(&self) -> Result<Vec<AgentInfo>, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::ListAgents).await? {
+        match self.send_request(Request::ListAgents).await? {
             ResponsePayload::AgentList { agents } => Ok(agents),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -988,8 +1019,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_skills(&self) -> Result<SkillList, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::ListSkills).await? {
+        match self.send_request(Request::ListSkills).await? {
             ResponsePayload::SkillList { skills } => Ok(*skills),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1001,8 +1031,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn describe_skill(&self, skill_id: SkillId) -> Result<SkillManifest, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::DescribeSkill { skill_id })
             .await?
         {
@@ -1023,8 +1052,7 @@ impl BcodeClient {
         arguments: String,
         display_text: String,
     ) -> Result<MessageAcceptance, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::InvokeSkill {
                 session_id,
                 skill_id,
@@ -1055,8 +1083,7 @@ impl BcodeClient {
         session_id: SessionId,
         skill_id: SkillId,
     ) -> Result<(), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::ActivateSkill {
                 session_id,
                 skill_id,
@@ -1078,8 +1105,7 @@ impl BcodeClient {
         session_id: SessionId,
         skill_id: SkillId,
     ) -> Result<(), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::DeactivateSkill {
                 session_id,
                 skill_id,
@@ -1100,8 +1126,7 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<bcode_skill_models::SkillContextResponse>, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::ActiveSkills { session_id })
             .await?
         {
@@ -1116,8 +1141,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn agent_policy_status(&self) -> Result<PolicyStatusResponse, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::AgentPolicyStatus).await? {
+        match self.send_request(Request::AgentPolicyStatus).await? {
             ResponsePayload::AgentPolicyStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1133,8 +1157,7 @@ impl BcodeClient {
         session_id: SessionId,
         agent_id: String,
     ) -> Result<(), ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::SetSessionAgent {
                 session_id,
                 agent_id,
@@ -1152,8 +1175,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_permissions(&self) -> Result<Vec<PermissionSummary>, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::ListPermissions).await? {
+        match self.send_request(Request::ListPermissions).await? {
             ResponsePayload::PermissionList { permissions } => Ok(permissions),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1169,8 +1191,7 @@ impl BcodeClient {
         permission_id: String,
         approved: bool,
     ) -> Result<bool, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::ResolvePermission {
                 permission_id,
                 approved,
@@ -1197,8 +1218,7 @@ impl BcodeClient {
         pattern: String,
         action: String,
     ) -> Result<String, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::AddPermissionRule {
                 agent_id,
                 category,
@@ -1218,8 +1238,7 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn plugin_services(&self) -> Result<Vec<PluginServiceSummary>, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(Request::ListPluginServices).await? {
+        match self.send_request(Request::ListPluginServices).await? {
             ResponsePayload::PluginServices { services } => Ok(services),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1237,8 +1256,7 @@ impl BcodeClient {
         operation: String,
         payload: Vec<u8>,
     ) -> Result<PluginServiceResponse, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::InvokePluginService {
                 plugin_id,
                 interface_id,
@@ -1263,8 +1281,7 @@ impl BcodeClient {
         operation: String,
         payload: Vec<u8>,
     ) -> Result<PluginServiceResponse, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::CallPluginService {
                 interface_id,
                 operation,
@@ -1287,13 +1304,33 @@ impl BcodeClient {
         topic: String,
         payload: Vec<u8>,
     ) -> Result<usize, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection
+        match self
             .send_request(Request::PublishPluginEvent { topic, payload })
             .await?
         {
             ResponsePayload::PluginEventPublished { delivered } => Ok(delivered),
             _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    async fn send_request(&self, request: Request) -> Result<ResponsePayload, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        match connection.send_request(request.clone()).await {
+            Ok(response) => Ok(response),
+            Err(error)
+                if self.daemon_availability == DaemonAvailability::AutoStart
+                    && error.is_daemon_unavailable() =>
+            {
+                ensure_daemon_running(&EnsureDaemonOptions {
+                    endpoint: self.endpoint.clone(),
+                    quiet: true,
+                    log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
+                })
+                .await?;
+                let mut connection = self.connect_once("bcode-cli").await?;
+                connection.send_request(request).await
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1303,6 +1340,25 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the handshake.
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
+        match self.connect_once(client_name).await {
+            Ok(connection) => Ok(connection),
+            Err(error)
+                if self.daemon_availability == DaemonAvailability::AutoStart
+                    && error.is_daemon_unavailable() =>
+            {
+                ensure_daemon_running(&EnsureDaemonOptions {
+                    endpoint: self.endpoint.clone(),
+                    quiet: true,
+                    log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
+                })
+                .await?;
+                self.connect_once(client_name).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn connect_once(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
         let stream = LocalIpcStream::connect(&self.endpoint).await?;
         let mut connection = ClientConnection {
             stream,

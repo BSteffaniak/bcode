@@ -11,16 +11,17 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_profile  = { workspace = true }
-bcode_command        = { workspace = true }
-bcode_config         = { workspace = true }
-bcode_ipc            = { workspace = true }
-bcode_model          = { workspace = true }
-bcode_provider_auth  = { workspace = true }
-bcode_session_models = { workspace = true }
-bcode_skill_models   = { workspace = true }
-sshenv_vault         = { workspace = true }
-thiserror            = { workspace = true }
+bcode_agent_profile    = { workspace = true }
+bcode_command          = { workspace = true }
+bcode_config           = { workspace = true }
+bcode_daemon_lifecycle = { workspace = true }
+bcode_ipc              = { workspace = true }
+bcode_model            = { workspace = true }
+bcode_provider_auth    = { workspace = true }
+bcode_session_models   = { workspace = true }
+bcode_skill_models     = { workspace = true }
+sshenv_vault           = { workspace = true }
+thiserror              = { workspace = true }
 
 [features]
 default          = []

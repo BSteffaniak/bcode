@@ -8,7 +8,7 @@ mod blims;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bcode_client::{BcodeClient, ClientError};
+use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
 use bcode_config::AuthMode;
 use bcode_ipc::{Event, PermissionSummary, ServerStatus, default_endpoint};
 use bcode_session_import::{
@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -45,6 +45,8 @@ const SESSION_CLI_PAGE_LIMIT: usize = 500;
 pub enum CliError {
     #[error("client error: {0}")]
     Client(#[from] ClientError),
+    #[error("daemon start error: {0}")]
+    DaemonStart(#[from] bcode_daemon_lifecycle::DaemonStartError),
     #[error("config error: {0}")]
     Config(#[from] bcode_config::ConfigError),
     #[error("server error: {0}")]
@@ -59,28 +61,6 @@ pub enum CliError {
     Plugin(#[from] bcode_plugin::PluginLoadError),
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
-    #[error(
-        "daemon did not become ready after auto-start; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
-    )]
-    DaemonStartTimeout {
-        log_path: String,
-        recent_log: String,
-    },
-    #[error(
-        "daemon exited before becoming ready ({status}); log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
-    )]
-    DaemonExited {
-        status: String,
-        log_path: String,
-        recent_log: String,
-    },
-    #[error(
-        "daemon became ready but failed a follow-up health check; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
-    )]
-    DaemonHealthCheckFailed {
-        log_path: String,
-        recent_log: String,
-    },
     #[error("--new cannot be combined with a subcommand")]
     NewSessionWithCommand,
     #[error("{0}")]
@@ -2642,7 +2622,14 @@ fn dynamic_library_name(library_stem: &str) -> String {
 }
 
 async fn ensure_server_running() -> Result<(), CliError> {
-    start_server_daemon(true).await
+    ensure_bundled_plugins_installed()?;
+    bcode_daemon_lifecycle::ensure_daemon_running(&bcode_daemon_lifecycle::EnsureDaemonOptions {
+        endpoint: default_endpoint(),
+        quiet: true,
+        log_path: daemon_log_path(),
+    })
+    .await?;
+    Ok(())
 }
 
 async fn run_server_foreground() -> Result<(), CliError> {
@@ -2652,45 +2639,13 @@ async fn run_server_foreground() -> Result<(), CliError> {
 }
 
 async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
-    cleanup_stale_daemon_records().await;
-    if server_ping_ready(&client).await {
-        if !quiet {
-            println!("server already running");
-            println!("namespace: {}", bcode_ipc::daemon_namespace());
-            println!("log: {}", daemon_log_path().display());
-        }
-        return Ok(());
-    }
-
     ensure_bundled_plugins_installed()?;
-
-    let log_path = daemon_log_path();
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)?;
-    writeln!(log_file, "--- bcode daemon start ---")?;
-    let stderr_log = log_file.try_clone()?;
-
-    let exe = std::env::current_exe()?;
-    let mut child = Command::new(exe)
-        .args(["server", "run"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr_log))
-        .spawn()?;
-
-    wait_for_server_ready(&client, &mut child, &log_path).await?;
-    if !quiet {
-        println!("server started");
-        println!("namespace: {}", bcode_ipc::daemon_namespace());
-        println!("log: {}", log_path.display());
-    }
+    bcode_daemon_lifecycle::ensure_daemon_running(&bcode_daemon_lifecycle::EnsureDaemonOptions {
+        endpoint: default_endpoint(),
+        quiet,
+        log_path: daemon_log_path(),
+    })
+    .await?;
     Ok(())
 }
 
@@ -2703,67 +2658,6 @@ fn daemon_log_path() -> PathBuf {
         },
         PathBuf::from,
     )
-}
-
-async fn wait_for_server_ready(
-    client: &BcodeClient,
-    child: &mut Child,
-    log_path: &Path,
-) -> Result<(), CliError> {
-    for _ in 0..50 {
-        if server_ping_ready(client).await {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            if let Some(status) = child.try_wait()? {
-                return Err(CliError::DaemonExited {
-                    status: status.to_string(),
-                    log_path: log_path.display().to_string(),
-                    recent_log: recent_log_excerpt(log_path),
-                });
-            }
-            if server_ping_ready(client).await {
-                return Ok(());
-            }
-            return Err(CliError::DaemonHealthCheckFailed {
-                log_path: log_path.display().to_string(),
-                recent_log: recent_log_excerpt(log_path),
-            });
-        }
-        if let Some(status) = child.try_wait()? {
-            return Err(CliError::DaemonExited {
-                status: status.to_string(),
-                log_path: log_path.display().to_string(),
-                recent_log: recent_log_excerpt(log_path),
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    Err(CliError::DaemonStartTimeout {
-        log_path: log_path.display().to_string(),
-        recent_log: recent_log_excerpt(log_path),
-    })
-}
-
-async fn server_ping_ready(client: &BcodeClient) -> bool {
-    matches!(
-        tokio::time::timeout(Duration::from_millis(250), client.ping()).await,
-        Ok(Ok(()))
-    )
-}
-
-fn recent_log_excerpt(log_path: &Path) -> String {
-    let Ok(contents) = std::fs::read_to_string(log_path) else {
-        return "daemon log could not be read".to_string();
-    };
-    let lines = contents.lines().rev().take(30).collect::<Vec<_>>();
-    if lines.is_empty() {
-        return "daemon log is empty".to_string();
-    }
-    let mut excerpt = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
-    if !excerpt.ends_with('\n') {
-        excerpt.push('\n');
-    }
-    excerpt
 }
 
 async fn server_status(verbose: bool) -> Result<(), CliError> {
@@ -3235,30 +3129,6 @@ async fn server_cleanup(stop_current: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn cleanup_stale_daemon_records() {
-    let _ = tokio::time::timeout(Duration::from_millis(1_000), remove_stale_daemon_records()).await;
-}
-
-async fn remove_stale_daemon_records() {
-    let state_dir = bcode_config::default_state_dir();
-    for (path, record) in bcode_daemon_lifecycle::read_records(&state_dir) {
-        if record.is_current_namespace() {
-            continue;
-        }
-        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
-            continue;
-        };
-        let client = BcodeClient::new(endpoint);
-        let status = tokio::time::timeout(Duration::from_millis(250), client.server_status()).await;
-        if matches!(status, Ok(Ok(status)) if daemon_status_matches(&record, &status.daemon)) {
-            continue;
-        }
-        if bcode_daemon_lifecycle::remove_record_path(&path).is_ok() {
-            remove_stale_socket(&record);
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct DaemonCleanupSummary {
     stopped: usize,
@@ -3286,7 +3156,8 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
             }
             continue;
         };
-        let client = BcodeClient::new(endpoint);
+        let client =
+            BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
         let status = tokio::time::timeout(Duration::from_millis(250), client.server_status()).await;
         match status {
             Ok(Ok(status)) if daemon_status_matches(&record, &status.daemon) => {
@@ -3375,7 +3246,8 @@ fn unix_socket_has_listener(path: &Path) -> bool {
 }
 
 async fn server_stop() -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
+    let client = BcodeClient::default_endpoint()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
     match client.server_stop().await {
         Ok(()) => println!("server stopping"),
         Err(error) if server_is_unreachable(&error) => println!("server not running"),

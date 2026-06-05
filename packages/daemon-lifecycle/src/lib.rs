@@ -7,6 +7,7 @@
 use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon_namespace};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -310,4 +311,259 @@ mod tests {
             PathBuf::from("/state/daemons/ipc-v1-test.json")
         );
     }
+}
+
+/// Options controlling daemon startup orchestration.
+#[derive(Debug, Clone)]
+pub struct EnsureDaemonOptions {
+    /// Endpoint the daemon should serve.
+    pub endpoint: IpcEndpoint,
+    /// Suppress user-facing status output.
+    pub quiet: bool,
+    /// Path used for daemon stdout/stderr logs.
+    pub log_path: PathBuf,
+}
+
+impl EnsureDaemonOptions {
+    /// Build default daemon startup options for the current namespace.
+    #[must_use]
+    pub fn default_for_current_namespace() -> Self {
+        Self {
+            endpoint: bcode_ipc::default_endpoint(),
+            quiet: true,
+            log_path: default_daemon_log_path(),
+        }
+    }
+}
+
+/// Error returned when daemon process startup fails.
+#[derive(Debug, Error)]
+pub enum DaemonStartError {
+    /// Daemon lifecycle registry cleanup failed.
+    #[error("daemon lifecycle error: {0}")]
+    Lifecycle(#[from] DaemonLifecycleError),
+    /// Daemon process I/O failed.
+    #[error("daemon process I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Daemon did not become ready before the startup timeout.
+    #[error(
+        "daemon did not become ready after auto-start; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
+    )]
+    StartTimeout {
+        /// Daemon log path.
+        log_path: String,
+        /// Recent daemon log excerpt.
+        recent_log: String,
+    },
+    /// Daemon process exited before readiness.
+    #[error(
+        "daemon exited before becoming ready ({status}); log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
+    )]
+    Exited {
+        /// Child process exit status.
+        status: String,
+        /// Daemon log path.
+        log_path: String,
+        /// Recent daemon log excerpt.
+        recent_log: String,
+    },
+    /// Daemon readiness was transient and failed a follow-up health check.
+    #[error(
+        "daemon became ready but failed a follow-up health check; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
+    )]
+    HealthCheckFailed {
+        /// Daemon log path.
+        log_path: String,
+        /// Recent daemon log excerpt.
+        recent_log: String,
+    },
+}
+
+/// Ensure the current namespace daemon is running, starting it when needed.
+///
+/// # Errors
+///
+/// Returns an error when stale-record cleanup fails, spawning the daemon fails,
+/// or the daemon does not pass bounded readiness checks.
+pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
+    cleanup_stale_daemon_records().await?;
+    if ping_ready(&options.endpoint).await {
+        if !options.quiet {
+            println!("server already running");
+            println!("namespace: {}", daemon_namespace());
+            println!("log: {}", options.log_path.display());
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = options.log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut log_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&options.log_path)?;
+    writeln!(log_file, "--- bcode daemon start ---")?;
+    let stderr_log = log_file.try_clone()?;
+
+    let exe = std::env::current_exe()?;
+    let mut child = tokio::process::Command::new(exe)
+        .args(["server", "run"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(stderr_log))
+        .spawn()?;
+
+    wait_for_server_ready(&options.endpoint, &mut child, &options.log_path).await?;
+    if !options.quiet {
+        println!("server started");
+        println!("namespace: {}", daemon_namespace());
+        println!("log: {}", options.log_path.display());
+    }
+    Ok(())
+}
+
+/// Return the default daemon log path for the current namespace.
+#[must_use]
+pub fn default_daemon_log_path() -> PathBuf {
+    std::env::var_os("BCODE_DAEMON_LOG").map_or_else(
+        || {
+            bcode_config::default_state_dir()
+                .join("logs")
+                .join(format!("daemon-{}.log", daemon_namespace()))
+        },
+        PathBuf::from,
+    )
+}
+
+async fn wait_for_server_ready(
+    endpoint: &IpcEndpoint,
+    child: &mut tokio::process::Child,
+    log_path: &Path,
+) -> Result<(), DaemonStartError> {
+    for _ in 0..50 {
+        if ping_ready(endpoint).await {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if let Some(status) = child.try_wait()? {
+                return Err(DaemonStartError::Exited {
+                    status: status.to_string(),
+                    log_path: log_path.display().to_string(),
+                    recent_log: recent_log_excerpt(log_path),
+                });
+            }
+            if ping_ready(endpoint).await {
+                return Ok(());
+            }
+            return Err(DaemonStartError::HealthCheckFailed {
+                log_path: log_path.display().to_string(),
+                recent_log: recent_log_excerpt(log_path),
+            });
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(DaemonStartError::Exited {
+                status: status.to_string(),
+                log_path: log_path.display().to_string(),
+                recent_log: recent_log_excerpt(log_path),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    Err(DaemonStartError::StartTimeout {
+        log_path: log_path.display().to_string(),
+        recent_log: recent_log_excerpt(log_path),
+    })
+}
+
+async fn ping_ready(endpoint: &IpcEndpoint) -> bool {
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), ping_once(endpoint)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn ping_once(endpoint: &IpcEndpoint) -> Result<(), bcode_ipc::CodecError> {
+    let mut stream =
+        bcode_ipc::LocalIpcStream::connect(endpoint)
+            .await
+            .map_err(|error| match error {
+                bcode_ipc::IpcTransportError::Io(error) => bcode_ipc::CodecError::Io(error),
+                other => bcode_ipc::CodecError::Io(std::io::Error::other(other.to_string())),
+            })?;
+    let envelope = bcode_ipc::request_envelope(1, &bcode_ipc::Request::Ping)?;
+    bcode_ipc::send_envelope(&mut stream, &envelope).await?;
+    loop {
+        let envelope = bcode_ipc::recv_envelope(&mut stream).await?;
+        if envelope.kind != bcode_ipc::EnvelopeKind::Response || envelope.request_id != 1 {
+            continue;
+        }
+        let response: bcode_ipc::Response = bcode_ipc::decode(&envelope.payload)?;
+        return match response {
+            bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Pong) => Ok(()),
+            _ => Err(bcode_ipc::CodecError::Io(std::io::Error::other(
+                "unexpected ping response",
+            ))),
+        };
+    }
+}
+
+async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {
+    let state_dir = bcode_config::default_state_dir();
+    for (path, record) in read_records(&state_dir) {
+        if record.is_current_namespace() {
+            continue;
+        }
+        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
+            continue;
+        };
+        if ping_ready(&endpoint).await {
+            continue;
+        }
+        remove_record_path(&path)?;
+        remove_stale_socket(&record);
+    }
+    Ok(())
+}
+
+fn remove_stale_socket(record: &DaemonRecord) {
+    #[cfg(unix)]
+    if let DaemonEndpointRecord::UnixSocket { path } = &record.endpoint
+        && is_bcode_socket_path(path)
+        && !unix_socket_has_listener(path)
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(unix)]
+fn is_bcode_socket_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("bcode-")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("sock"))
+        })
+}
+
+#[cfg(unix)]
+fn unix_socket_has_listener(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+fn recent_log_excerpt(log_path: &Path) -> String {
+    let Ok(contents) = fs::read_to_string(log_path) else {
+        return "daemon log could not be read".to_string();
+    };
+    let lines = contents.lines().rev().take(30).collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "daemon log is empty".to_string();
+    }
+    let mut excerpt = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    if !excerpt.ends_with('\n') {
+        excerpt.push('\n');
+    }
+    excerpt
 }

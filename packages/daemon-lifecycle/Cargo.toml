@@ -11,10 +11,12 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_ipc  = { workspace = true }
-serde      = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true }
-thiserror  = { workspace = true }
+bcode_config = { workspace = true }
+bcode_ipc    = { workspace = true }
+serde        = { workspace = true, features = ["derive", "std"] }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true, features = ["process", "time"] }
 
 [features]
 default          = []
