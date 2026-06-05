@@ -2647,7 +2647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_model_context_uses_canonical_db_events_without_checkpoint() {
+    async fn restored_model_context_uses_relevant_canonical_db_events_without_checkpoint() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
@@ -2683,7 +2683,7 @@ mod tests {
             SessionEventKind::UserMessage { text, .. }
                 if event.sequence == user_sequence && text == "carry on"
         )));
-        assert!(context.iter().any(|event| matches!(
+        assert!(!context.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ModelTurnStarted { turn_id } if turn_id == "turn-1"
         )));

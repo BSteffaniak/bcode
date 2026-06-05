@@ -7443,81 +7443,117 @@ fn session_events_to_model_messages_with_limit(
                 _ => None,
             });
 
-    let mut messages = Vec::new();
-    if let Some((index, compacted_through_sequence)) = latest_compaction {
-        if let Some(message) =
-            session_event_to_model_message_with_limit(&history[index], tool_output_context_chars)
-        {
-            messages.push(message);
-        }
-        messages.extend(
-            history
-                .iter()
-                .enumerate()
-                .filter_map(|(event_index, event)| {
-                    (event_index != index && event.sequence > compacted_through_sequence).then(
-                        || {
-                            session_event_to_model_message_with_limit(
-                                event,
-                                tool_output_context_chars,
-                            )
-                        },
-                    )?
-                }),
-        );
+    let selected_events = if let Some((index, compacted_through_sequence)) = latest_compaction {
+        std::iter::once(&history[index])
+            .chain(
+                history
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(event_index, event)| {
+                        (event_index != index && event.sequence > compacted_through_sequence)
+                            .then_some(event)
+                    }),
+            )
+            .collect::<Vec<_>>()
     } else {
-        messages.extend(history.iter().filter_map(|event| {
-            session_event_to_model_message_with_limit(event, tool_output_context_chars)
-        }));
-    }
-    complete_orphaned_tool_calls_for_model_context(messages)
+        history.iter().collect::<Vec<_>>()
+    };
+    session_events_to_sanitized_model_messages(&selected_events, tool_output_context_chars)
 }
 
-fn complete_orphaned_tool_calls_for_model_context(
-    messages: Vec<ModelMessage>,
+fn session_events_to_sanitized_model_messages(
+    events: &[&bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
 ) -> Vec<ModelMessage> {
-    let mut completed = Vec::with_capacity(messages.len());
+    let mut messages = Vec::new();
+    let mut seen_tool_call_ids = BTreeSet::new();
     let mut pending_tool_call_ids = Vec::<String>::new();
 
-    for message in messages {
-        if message.role != MessageRole::Tool && !pending_tool_call_ids.is_empty() {
-            append_missing_tool_results(&mut completed, &mut pending_tool_call_ids);
+    for event in events {
+        match &event.kind {
+            SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => {
+                if seen_tool_call_ids.contains(tool_call_id) {
+                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+                    messages.push(plain_context_message(format!(
+                        "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {tool_call_id}; tool: {tool_name}; arguments: {}",
+                        truncate_text(arguments_json, MAX_CONTEXT_FILE_CHARS),
+                    )));
+                    continue;
+                }
+                let Ok(arguments) = serde_json::from_str(arguments_json) else {
+                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+                    messages.push(plain_context_message(format!(
+                        "Historical assistant tool call omitted from structured tool protocol because its arguments were malformed or truncated. Call id: {tool_call_id}; tool: {tool_name}; raw arguments: {}",
+                        truncate_text(arguments_json, MAX_CONTEXT_FILE_CHARS),
+                    )));
+                    continue;
+                };
+                messages.push(ModelMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        call: bcode_model::ToolCall {
+                            id: tool_call_id.clone(),
+                            name: tool_name.clone(),
+                            arguments,
+                        },
+                    }],
+                });
+                seen_tool_call_ids.insert(tool_call_id.clone());
+                pending_tool_call_ids.push(tool_call_id.clone());
+            }
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                is_error,
+                output,
+            } => {
+                if pending_tool_call_ids
+                    .iter()
+                    .any(|pending| pending == tool_call_id)
+                {
+                    pending_tool_call_ids.retain(|pending| pending != tool_call_id);
+                    messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: vec![ContentBlock::ToolResult {
+                            result: bcode_model::ToolResult {
+                                call_id: tool_call_id.clone(),
+                                output: project_tool_result_for_model_context(
+                                    result,
+                                    output.as_ref().map(trace_blob_read_path),
+                                    tool_output_context_chars,
+                                ),
+                                is_error: *is_error,
+                                content: tool_result_content_from_output(result),
+                            },
+                        }],
+                    });
+                } else {
+                    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+                    messages.push(plain_context_message(format!(
+                        "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {tool_call_id}; error={is_error}; result: {}",
+                        project_tool_result_for_model_context(
+                            result,
+                            output.as_ref().map(trace_blob_read_path),
+                            tool_output_context_chars,
+                        ),
+                    )));
+                }
+            }
+            _ => {
+                append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+                if let Some(message) = non_tool_session_event_to_model_message(event) {
+                    messages.push(message);
+                }
+            }
         }
-
-        collect_tool_results(&message, &mut pending_tool_call_ids);
-        let tool_call_ids = assistant_tool_call_ids(&message);
-        completed.push(message);
-        pending_tool_call_ids.extend(tool_call_ids);
     }
 
-    append_missing_tool_results(&mut completed, &mut pending_tool_call_ids);
-    completed
-}
-
-fn assistant_tool_call_ids(message: &ModelMessage) -> Vec<String> {
-    if message.role != MessageRole::Assistant {
-        return Vec::new();
-    }
-    message
-        .content
-        .iter()
-        .filter_map(|content| match content {
-            ContentBlock::ToolCall { call } => Some(call.id.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_tool_results(message: &ModelMessage, pending_tool_call_ids: &mut Vec<String>) {
-    if message.role != MessageRole::Tool {
-        return;
-    }
-    for call_id in message.content.iter().filter_map(|content| match content {
-        ContentBlock::ToolResult { result } => Some(&result.call_id),
-        _ => None,
-    }) {
-        pending_tool_call_ids.retain(|pending_call_id| pending_call_id != call_id);
-    }
+    append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
+    messages
 }
 
 fn append_missing_tool_results(
@@ -7538,9 +7574,15 @@ fn append_missing_tool_results(
     }));
 }
 
-fn session_event_to_model_message_with_limit(
+fn plain_context_message(text: String) -> ModelMessage {
+    ModelMessage {
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text { text }],
+    }
+}
+
+fn non_tool_session_event_to_model_message(
     event: &bcode_session_models::SessionEvent,
-    tool_output_context_chars: usize,
 ) -> Option<ModelMessage> {
     match &event.kind {
         SessionEventKind::UserMessage { text, .. } => Some(ModelMessage {
@@ -7551,44 +7593,12 @@ fn session_event_to_model_message_with_limit(
             role: MessageRole::Assistant,
             content: vec![ContentBlock::Text { text: text.clone() }],
         }),
-        SessionEventKind::ToolCallRequested {
-            tool_call_id,
-            tool_name,
-            arguments_json,
-        } => Some(ModelMessage {
-            role: MessageRole::Assistant,
-            content: vec![ContentBlock::ToolCall {
-                call: bcode_model::ToolCall {
-                    id: tool_call_id.clone(),
-                    name: tool_name.clone(),
-                    arguments: serde_json::from_str(arguments_json).unwrap_or_default(),
-                },
-            }],
-        }),
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result,
-            is_error,
-            output,
-        } => Some(ModelMessage {
-            role: MessageRole::Tool,
-            content: vec![ContentBlock::ToolResult {
-                result: bcode_model::ToolResult {
-                    call_id: tool_call_id.clone(),
-                    output: project_tool_result_for_model_context(
-                        result,
-                        output.as_ref().map(trace_blob_read_path),
-                        tool_output_context_chars,
-                    ),
-                    is_error: *is_error,
-                    content: tool_result_content_from_output(result),
-                },
-            }],
-        }),
-        SessionEventKind::SystemMessage { text } => Some(ModelMessage {
-            role: MessageRole::System,
-            content: vec![ContentBlock::Text { text: text.clone() }],
-        }),
+        SessionEventKind::SystemMessage { text } if system_message_is_model_context(text) => {
+            Some(ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text { text: text.clone() }],
+            })
+        }
         SessionEventKind::WorkingDirectoryChanged {
             old_working_directory,
             new_working_directory,
@@ -7609,6 +7619,14 @@ fn session_event_to_model_message_with_limit(
         }),
         _ => None,
     }
+}
+
+fn system_message_is_model_context(text: &str) -> bool {
+    !text.starts_with("model error ")
+        && !text.starts_with("model warning ")
+        && !text.starts_with("model turn cancelled")
+        && !text.starts_with("model provider polling ended")
+        && !text.starts_with("auto compaction failed")
 }
 
 fn working_directory_changed_message(
@@ -9080,6 +9098,57 @@ mod tests {
     }
 
     #[test]
+    fn session_projection_converts_orphan_tool_result_to_plain_context() {
+        let session_id = SessionId::new();
+        let history = vec![session_event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-1".to_string(),
+                result: "orphaned output".to_string(),
+                is_error: false,
+                output: None,
+            },
+        )];
+
+        let messages = session_events_to_model_messages(&history);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("matching assistant tool call is unavailable")
+                    && text.contains("orphaned output")
+        ));
+    }
+
+    #[test]
+    fn session_projection_converts_malformed_tool_call_to_plain_context() {
+        let session_id = SessionId::new();
+        let history = vec![session_event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "shell.run".to_string(),
+                arguments_json: "{not-json".to_string(),
+            },
+        )];
+
+        let messages = session_events_to_model_messages(&history);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("arguments were malformed or truncated")
+                    && text.contains("{not-json")
+        ));
+    }
+
+    #[test]
     fn compaction_request_omits_optional_params_for_strict_providers() {
         let session_id = SessionId::new();
         let selection = SessionModelSelection {
@@ -9604,22 +9673,34 @@ mod tests {
     fn tool_result_model_message_uses_truncated_output() {
         let session_id = SessionId::new();
         let output = "x".repeat(4_001);
-        let event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-1".to_string(),
-                result: output,
-                is_error: false,
-                output: None,
+        let history = vec![
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "filesystem.read".to_string(),
+                    arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
+                },
             },
-        };
+            SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_string(),
+                    result: output,
+                    is_error: false,
+                    output: None,
+                },
+            },
+        ];
 
-        let message =
-            session_event_to_model_message_with_limit(&event, 1_000).expect("tool result message");
-        let ContentBlock::ToolResult { result } = &message.content[0] else {
+        let messages = session_events_to_model_messages_with_limit(&history, 1_000);
+        let ContentBlock::ToolResult { result } = &messages[1].content[0] else {
             panic!("expected tool result content block");
         };
 

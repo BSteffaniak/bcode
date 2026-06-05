@@ -33,6 +33,8 @@ const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_CONTEXT_EVENT_LIMIT: usize = 512;
+const MODEL_CONTEXT_SCAN_PAGE_LIMIT: usize = 512;
+const MODEL_CONTEXT_RAW_SCAN_LIMIT: usize = 8_192;
 
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
@@ -752,14 +754,7 @@ impl SessionDb {
     /// Returns an error if event queries or deserialization fail.
     pub async fn model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
         let Some(compaction_event) = self.latest_context_compaction_event().await? else {
-            return self
-                .history_page(SessionHistoryQuery {
-                    cursor: None,
-                    limit: MODEL_CONTEXT_EVENT_LIMIT,
-                    direction: SessionHistoryDirection::Backward,
-                })
-                .await
-                .map(|page| page.events);
+            return self.latest_model_context_events().await;
         };
         let SessionEventKind::ContextCompacted {
             compacted_through_sequence,
@@ -786,6 +781,61 @@ impl SessionDb {
             }
         }
         Ok(events)
+    }
+
+    async fn latest_model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
+        let mut selected_newest_first = Vec::new();
+        let mut scanned = 0_usize;
+        let mut before_sequence = None;
+
+        while selected_newest_first.len() < MODEL_CONTEXT_EVENT_LIMIT
+            && scanned < MODEL_CONTEXT_RAW_SCAN_LIMIT
+        {
+            let remaining_scan = MODEL_CONTEXT_RAW_SCAN_LIMIT.saturating_sub(scanned);
+            let page_limit = MODEL_CONTEXT_SCAN_PAGE_LIMIT.min(remaining_scan).max(1);
+            let mut select = self
+                .db
+                .select("events")
+                .columns(&["event_seq", "event_type", "payload"])
+                .sort("event_seq", SortDirection::Desc)
+                .limit(page_limit);
+            if let Some(sequence) = before_sequence {
+                select = select.where_lte("event_seq", seq_to_value(sequence));
+            }
+
+            let rows = select.execute(&**self.db).await?;
+            if rows.is_empty() {
+                break;
+            }
+            scanned = scanned.saturating_add(rows.len());
+
+            let mut oldest_sequence = None;
+            for row in &rows {
+                let sequence = required_i64(row, "event_seq").map(i64_to_u64)?;
+                oldest_sequence =
+                    Some(oldest_sequence.map_or(sequence, |oldest: u64| oldest.min(sequence)));
+                let event_type = required_string(row, "event_type")?;
+                if !is_model_context_event_type(&event_type) {
+                    continue;
+                }
+                let payload = required_string(row, "payload")?;
+                selected_newest_first.push(serde_json::from_str::<SessionEvent>(&payload)?);
+                if selected_newest_first.len() >= MODEL_CONTEXT_EVENT_LIMIT {
+                    break;
+                }
+            }
+
+            let Some(oldest_sequence) = oldest_sequence else {
+                break;
+            };
+            if oldest_sequence == 0 || rows.len() < page_limit {
+                break;
+            }
+            before_sequence = Some(oldest_sequence.saturating_sub(1));
+        }
+
+        selected_newest_first.reverse();
+        Ok(selected_newest_first)
     }
 
     async fn latest_context_compaction_event(&self) -> SessionDbResult<Option<SessionEvent>> {
@@ -1543,6 +1593,19 @@ fn input_history_entry_from_row(
         sequence: required_i64(row, "event_seq").map(i64_to_u64)?,
         text: required_string(row, "text")?,
     })
+}
+
+const fn is_model_context_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type.as_bytes(),
+        b"user_message"
+            | b"assistant_message"
+            | b"tool_call_requested"
+            | b"tool_call_finished"
+            | b"system_message"
+            | b"working_directory_changed"
+            | b"context_compacted"
+    )
 }
 
 fn required_string(row: &switchy::database::Row, column: &str) -> SessionDbResult<String> {

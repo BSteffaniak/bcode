@@ -1778,12 +1778,93 @@ fn model_messages_to_responses_input(
         })
         .flatten()
         .unwrap_or_default();
-    request
+    let mut input = Vec::new();
+    let mut seen_tool_call_ids = BTreeSet::new();
+    let mut pending_tool_call_ids = BTreeSet::new();
+    for message in request
         .messages
         .iter()
         .skip(start.min(request.messages.len()))
-        .flat_map(|message| model_message_to_responses_input(message, dialect))
-        .collect()
+    {
+        for item in model_message_to_responses_input(message, dialect) {
+            push_sanitized_responses_input_item(
+                &mut input,
+                &mut seen_tool_call_ids,
+                &mut pending_tool_call_ids,
+                item,
+            );
+        }
+    }
+    append_missing_responses_tool_outputs(&mut input, &mut pending_tool_call_ids);
+    input
+}
+
+fn push_sanitized_responses_input_item(
+    input: &mut Vec<ResponsesInputItem>,
+    seen_tool_call_ids: &mut BTreeSet<String>,
+    pending_tool_call_ids: &mut BTreeSet<String>,
+    item: ResponsesInputItem,
+) {
+    match item {
+        ResponsesInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => {
+            if !seen_tool_call_ids.insert(call_id.clone()) {
+                append_missing_responses_tool_outputs(input, pending_tool_call_ids);
+                input.push(ResponsesInputItem::Message {
+                    role: "user",
+                    content: vec![ResponsesContent::InputText {
+                        text: format!(
+                            "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {call_id}; tool: {name}; arguments: {arguments}"
+                        ),
+                    }],
+                });
+                return;
+            }
+            pending_tool_call_ids.insert(call_id.clone());
+            input.push(ResponsesInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            });
+        }
+        ResponsesInputItem::FunctionCallOutput { call_id, output } => {
+            if pending_tool_call_ids.remove(&call_id) {
+                input.push(ResponsesInputItem::FunctionCallOutput { call_id, output });
+            } else {
+                append_missing_responses_tool_outputs(input, pending_tool_call_ids);
+                input.push(ResponsesInputItem::Message {
+                    role: "user",
+                    content: vec![ResponsesContent::InputText {
+                        text: format!(
+                            "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {call_id}; result: {output}"
+                        ),
+                    }],
+                });
+            }
+        }
+        ResponsesInputItem::Message { role, content } => {
+            append_missing_responses_tool_outputs(input, pending_tool_call_ids);
+            input.push(ResponsesInputItem::Message { role, content });
+        }
+    }
+}
+
+fn append_missing_responses_tool_outputs(
+    input: &mut Vec<ResponsesInputItem>,
+    pending_tool_call_ids: &mut BTreeSet<String>,
+) {
+    input.extend(
+        std::mem::take(pending_tool_call_ids)
+            .into_iter()
+            .map(|call_id| ResponsesInputItem::FunctionCallOutput {
+                call_id,
+                output: "tool invocation was interrupted before Bcode could persist a result"
+                    .to_string(),
+            }),
+    );
 }
 
 fn model_message_to_responses_input(
@@ -1925,7 +2006,105 @@ fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessag
             .iter()
             .filter_map(model_message_to_chat_message),
     );
-    messages
+    sanitize_chat_tool_protocol(messages)
+}
+
+fn sanitize_chat_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut sanitized = Vec::with_capacity(messages.len());
+    let mut seen_tool_call_ids = BTreeSet::new();
+    let mut pending_tool_call_ids = BTreeSet::new();
+
+    for mut message in messages {
+        match message.role {
+            "assistant" if !message.tool_calls.is_empty() => {
+                let mut valid_tool_calls = Vec::new();
+                let mut omitted_context = Vec::new();
+                for tool_call in message.tool_calls {
+                    if seen_tool_call_ids.insert(tool_call.id.clone()) {
+                        pending_tool_call_ids.insert(tool_call.id.clone());
+                        valid_tool_calls.push(tool_call);
+                    } else {
+                        omitted_context.push(format!(
+                            "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {}; tool: {}; arguments: {}",
+                            tool_call.id, tool_call.function.name, tool_call.function.arguments
+                        ));
+                    }
+                }
+                message.tool_calls = valid_tool_calls;
+                if message.content.is_some() || !message.tool_calls.is_empty() {
+                    sanitized.push(message);
+                }
+                for context in omitted_context {
+                    append_missing_chat_tool_outputs(&mut sanitized, &mut pending_tool_call_ids);
+                    sanitized.push(chat_plain_user_message(context));
+                }
+            }
+            "tool" => {
+                if let Some(call_id) = message.tool_call_id.as_ref()
+                    && pending_tool_call_ids.remove(call_id)
+                {
+                    sanitized.push(message);
+                } else {
+                    append_missing_chat_tool_outputs(&mut sanitized, &mut pending_tool_call_ids);
+                    sanitized.push(chat_plain_user_message(format!(
+                        "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {}; result: {}",
+                        message.tool_call_id.as_deref().unwrap_or("<missing>"),
+                        chat_message_text_content(&message)
+                    )));
+                }
+            }
+            _ => {
+                append_missing_chat_tool_outputs(&mut sanitized, &mut pending_tool_call_ids);
+                sanitized.push(message);
+            }
+        }
+    }
+
+    append_missing_chat_tool_outputs(&mut sanitized, &mut pending_tool_call_ids);
+    sanitized
+}
+
+fn append_missing_chat_tool_outputs(
+    messages: &mut Vec<ChatMessage>,
+    pending_tool_call_ids: &mut BTreeSet<String>,
+) {
+    messages.extend(
+        std::mem::take(pending_tool_call_ids)
+            .into_iter()
+            .map(|call_id| ChatMessage {
+                role: "tool",
+                content: Some(ChatMessageContent::Text(
+                    "tool invocation was interrupted before Bcode could persist a result"
+                        .to_string(),
+                )),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(call_id),
+            }),
+    );
+}
+
+const fn chat_plain_user_message(text: String) -> ChatMessage {
+    ChatMessage {
+        role: "user",
+        content: Some(ChatMessageContent::Text(text)),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    }
+}
+
+fn chat_message_text_content(message: &ChatMessage) -> String {
+    match &message.content {
+        Some(ChatMessageContent::Text(text)) => text.clone(),
+        Some(ChatMessageContent::Parts(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ChatMessageContentPart::Text { text } => Some(text.as_str()),
+                ChatMessageContentPart::ImageUrl { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    }
 }
 
 fn model_message_to_chat_message(message: &ModelMessage) -> Option<ChatMessage> {
@@ -4140,6 +4319,78 @@ mod tests {
         );
 
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn responses_input_converts_orphan_tool_result_to_plain_message() {
+        let mut request = test_request(vec![ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "call-1".to_string(),
+                    output: "orphaned output".to_string(),
+                    is_error: false,
+                    content: Vec::new(),
+                },
+            }],
+        }]);
+        request.system_prompt = Some("system".to_string());
+
+        let items = model_messages_to_responses_input(
+            &request,
+            false,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        );
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            ResponsesInputItem::Message { role: "user", content }
+                if matches!(
+                    &content[0],
+                    ResponsesContent::InputText { text }
+                        if text.contains("matching assistant tool call is unavailable")
+                            && text.contains("orphaned output")
+                )
+        ));
+    }
+
+    #[test]
+    fn responses_input_synthesizes_missing_tool_output_before_user_message() {
+        let request = test_request(vec![
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".to_string(),
+                        name: "filesystem.read".to_string(),
+                        arguments: serde_json::json!({ "path": "Cargo.toml" }),
+                    },
+                }],
+            },
+            text_message(MessageRole::User, "continue"),
+        ]);
+
+        let items = model_messages_to_responses_input(
+            &request,
+            false,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        );
+
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[0],
+            ResponsesInputItem::FunctionCall { call_id, .. } if call_id == "call-1"
+        ));
+        assert!(matches!(
+            &items[1],
+            ResponsesInputItem::FunctionCallOutput { call_id, output }
+                if call_id == "call-1" && output.contains("interrupted")
+        ));
+        assert!(matches!(
+            &items[2],
+            ResponsesInputItem::Message { role: "user", .. }
+        ));
     }
 
     #[test]
