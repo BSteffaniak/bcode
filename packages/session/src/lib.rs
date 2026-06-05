@@ -19,8 +19,8 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionImportSummary, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
-    SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
+    SessionImportSummary, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind,
+    SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -299,6 +299,7 @@ pub(crate) struct SessionState {
     total_metered_tokens: u64,
     load_status: SessionLoadStatusKind,
     sender: broadcast::Sender<SessionEvent>,
+    live_sender: broadcast::Sender<SessionLiveEvent>,
 }
 
 /// Native catalog entry with maintenance/access metadata.
@@ -334,6 +335,7 @@ pub struct SessionAttachment {
     pub input_history: Vec<SessionInputHistoryEntry>,
     pub attached_event: SessionEvent,
     pub events: broadcast::Receiver<SessionEvent>,
+    pub live_events: broadcast::Receiver<SessionLiveEvent>,
 }
 
 /// Active session attachment plus projection-window metadata.
@@ -665,6 +667,7 @@ impl SessionManager {
         let working_directory = normalize_working_directory(&working_directory);
         let id = SessionId::new();
         let (sender, _) = broadcast::channel(512);
+        let (live_sender, _) = broadcast::channel(512);
         let now_ms = self.next_activity_timestamp_ms();
         let summary = SessionSummary {
             id,
@@ -697,6 +700,7 @@ impl SessionManager {
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
+            live_sender,
         };
         let handle = SessionHandle::new(state, self.store.clone());
         handle
@@ -1440,6 +1444,24 @@ impl SessionManager {
         .await
     }
 
+    /// Publish a live-only event to currently attached session subscribers.
+    ///
+    /// Live events are not appended to durable history and may be coalesced or
+    /// dropped by callers under backpressure. They are intended for high-rate
+    /// presentation streams whose final semantic result is recorded separately.
+    /// Returns `None` when the session is not loaded or has no active live subscribers.
+    pub async fn publish_live_event(
+        &self,
+        session_id: SessionId,
+        event: SessionLiveEventKind,
+    ) -> Option<SessionLiveEvent> {
+        let handle = {
+            let inner = self.inner.lock().await;
+            inner.sessions.get(&session_id).cloned()?
+        };
+        handle.publish_live_event(event).await.ok().flatten()
+    }
+
     /// Publish a transient event to currently attached session subscribers without
     /// appending it to durable history.
     ///
@@ -1802,6 +1824,7 @@ impl SessionManager {
 impl SessionState {
     pub(crate) fn from_catalog_summary(summary: SessionSummary) -> Self {
         let (sender, _) = broadcast::channel(512);
+        let (live_sender, _) = broadcast::channel(512);
         let working_directory = normalize_working_directory(&summary.working_directory);
         Self {
             summary,
@@ -1818,6 +1841,7 @@ impl SessionState {
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::SummaryOnly,
             sender,
+            live_sender,
         }
     }
 
@@ -1827,6 +1851,7 @@ impl SessionState {
         updated_at_ms: u64,
     ) -> Self {
         let (sender, _) = broadcast::channel(512);
+        let (live_sender, _) = broadcast::channel(512);
         let working_directory = normalize_working_directory(&state.working_directory);
         let title_source = if state.title.is_some() {
             SessionTitleSource::Explicit
@@ -1860,6 +1885,7 @@ impl SessionState {
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
+            live_sender,
         }
     }
 

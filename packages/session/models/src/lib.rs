@@ -249,6 +249,30 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
+/// Live-only session event emitted to currently attached clients.
+///
+/// Live events are intentionally not persisted, indexed, or used for replay.
+/// They are suitable for high-frequency UI streams where the durable event log
+/// records the final semantic result separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionLiveEvent {
+    pub session_id: SessionId,
+    pub kind: SessionLiveEventKind,
+}
+
+/// Live-only session event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLiveEventKind {
+    /// Coalesced assistant text produced by an active model turn.
+    AssistantTextDelta { turn_id: String, text: String },
+    /// Coalesced provider-exposed reasoning text produced by an active model turn.
+    AssistantReasoningDelta { turn_id: String, text: String },
+    /// Raw live tool output emitted while a tool is running.
+    ToolOutputDelta { event: ToolInvocationStreamEvent },
+}
+
 /// Product-facing derived view over durable session history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

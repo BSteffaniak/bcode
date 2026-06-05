@@ -368,8 +368,10 @@ impl SessionCatalogWatcher {
                     self.last_revision = snapshot.catalog_revision.max(revision);
                     return Ok(snapshot);
                 }
-                Event::SessionCatalogUpdated { .. } | Event::Session(_) | Event::RuntimeWork(_) => {
-                }
+                Event::SessionCatalogUpdated { .. }
+                | Event::Session(_)
+                | Event::SessionLive(_)
+                | Event::RuntimeWork(_) => {}
             }
         }
     }
@@ -391,7 +393,8 @@ impl RuntimeWorkWatcher {
         loop {
             match self.connection.recv_event().await? {
                 Event::RuntimeWork(event) => return Ok(event),
-                Event::Session(_) | Event::SessionCatalogUpdated { .. } => {}
+                Event::Session(_) | Event::SessionLive(_) | Event::SessionCatalogUpdated { .. } => {
+                }
             }
         }
     }

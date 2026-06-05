@@ -9,7 +9,7 @@ use bcode_metrics::MetricsSnapshot;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
     SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionSummary,
+    SessionLiveEvent, SessionSummary,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -641,6 +641,7 @@ pub enum Response {
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     Session(SessionEvent),
+    SessionLive(SessionLiveEvent),
     RuntimeWork(SessionEvent),
     SessionCatalogUpdated {
         #[serde(default)]

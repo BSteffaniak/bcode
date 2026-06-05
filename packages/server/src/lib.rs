@@ -34,9 +34,9 @@ use bcode_session::{CatalogLoadStatus, SessionManager};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
-    SessionId, SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
-    TraceRedaction,
+    SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
+    SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
+    TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -2360,6 +2360,7 @@ async fn handle_attach_session(
             let handle = forward_session_events(
                 ClientEventSink::new(client_id, writer.clone()),
                 attachment.events,
+                attachment.live_events,
             );
             state.register_client_forwarder(client_id, handle).await;
             Ok(())
@@ -2642,6 +2643,7 @@ async fn finish_attach_session_projection_window_success(
     let handle = forward_session_events(
         ClientEventSink::new(context.client_id, context.writer.clone()),
         attachment.events,
+        attachment.live_events,
     );
     state
         .register_client_forwarder(context.client_id, handle)
@@ -2739,6 +2741,7 @@ async fn finish_attach_session_recent_success(
     let handle = forward_session_events(
         ClientEventSink::new(context.client_id, context.writer.clone()),
         attachment.events,
+        attachment.live_events,
     );
     state
         .register_client_forwarder(context.client_id, handle)
@@ -3937,6 +3940,8 @@ async fn handle_resolve_permission(
 }
 
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MODEL_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+const MODEL_STREAM_FLUSH_BYTES: usize = 512;
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 
@@ -3957,6 +3962,90 @@ struct ToolArgumentStreamProgress {
 #[derive(Debug, Default)]
 struct ModelStreamProgress {
     active_tool_call: Option<ToolArgumentStreamProgress>,
+}
+
+#[derive(Debug)]
+struct ModelStreamAccumulator {
+    session_id: SessionId,
+    turn_id: String,
+    assistant_text: String,
+    pending_text: String,
+    pending_reasoning: String,
+    last_flush: Instant,
+}
+
+impl ModelStreamAccumulator {
+    fn new(session_id: SessionId, turn_id: &str) -> Self {
+        Self {
+            session_id,
+            turn_id: turn_id.to_owned(),
+            assistant_text: String::new(),
+            pending_text: String::new(),
+            pending_reasoning: String::new(),
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        self.assistant_text.push_str(text);
+        self.pending_text.push_str(text);
+    }
+
+    fn push_reasoning(&mut self, text: &str) {
+        self.pending_reasoning.push_str(text);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.pending_text
+            .len()
+            .saturating_add(self.pending_reasoning.len())
+            >= MODEL_STREAM_FLUSH_BYTES
+            || self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
+    }
+
+    async fn flush_if_ready(&mut self, state: &ServerState) {
+        if self.should_flush() {
+            self.flush(state).await;
+        }
+    }
+
+    async fn flush(&mut self, state: &ServerState) {
+        let text = std::mem::take(&mut self.pending_text);
+        if !text.is_empty() {
+            let _ = state
+                .sessions
+                .publish_live_event(
+                    self.session_id,
+                    SessionLiveEventKind::AssistantTextDelta {
+                        turn_id: self.turn_id.clone(),
+                        text,
+                    },
+                )
+                .await;
+        }
+        let reasoning = std::mem::take(&mut self.pending_reasoning);
+        if !reasoning.is_empty() {
+            let _ = state
+                .sessions
+                .publish_live_event(
+                    self.session_id,
+                    SessionLiveEventKind::AssistantReasoningDelta {
+                        turn_id: self.turn_id.clone(),
+                        text: reasoning,
+                    },
+                )
+                .await;
+        }
+        self.last_flush = Instant::now();
+    }
+
+    fn take_assistant_text(&mut self) -> String {
+        std::mem::take(&mut self.assistant_text)
+    }
+
+    fn finish(self) -> String {
+        self.assistant_text
+    }
 }
 
 impl ModelStreamProgress {
@@ -5235,7 +5324,7 @@ async fn poll_model_turn_events(
     turn_id: &str,
     cancel_state: Arc<TurnCancelState>,
 ) -> (String, ModelPollOutcome) {
-    let mut assistant_text = String::new();
+    let mut stream = ModelStreamAccumulator::new(session_id, turn_id);
     let mut outcome = ModelPollOutcome::default();
     let mut stream_progress = ModelStreamProgress::default();
     let mut idle_for = Duration::ZERO;
@@ -5301,7 +5390,7 @@ async fn poll_model_turn_events(
                 session_id,
                 turn_id,
                 event,
-                &mut assistant_text,
+                &mut stream,
                 &mut outcome,
                 &mut stream_progress,
             )
@@ -5330,7 +5419,8 @@ async fn poll_model_turn_events(
             idle_for = next_idle_for;
         }
     }
-    (assistant_text, outcome)
+    stream.flush(state).await;
+    (stream.finish(), outcome)
 }
 
 fn model_events_include_progress(events: &[ProviderTurnEvent]) -> bool {
@@ -5435,7 +5525,7 @@ async fn handle_provider_turn_event(
     session_id: SessionId,
     turn_id: &str,
     event: ProviderTurnEvent,
-    assistant_text: &mut String,
+    stream: &mut ModelStreamAccumulator,
     outcome: &mut ModelPollOutcome,
     stream_progress: &mut ModelStreamProgress,
 ) {
@@ -5460,8 +5550,8 @@ async fn handle_provider_turn_event(
                 "model.provider.text_delta_chars",
                 text.chars().count() as u64,
             );
-            assistant_text.push_str(&text);
-            append_assistant_delta_event(state, session_id, text).await;
+            stream.push_text(&text);
+            stream.flush_if_ready(state).await;
         }
         ProviderTurnEvent::Error { error } => {
             handle_provider_error_event(state, session_id, turn_id, error, outcome).await;
@@ -5476,14 +5566,8 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::ToolCallFinished { call } => {
             let call_id = call.id.clone();
             stream_progress.record_completed_tool_call(&call);
-            handle_provider_tool_call_finished_event(
-                state,
-                session_id,
-                turn_id,
-                call,
-                assistant_text,
-            )
-            .await;
+            handle_provider_tool_call_finished_event(state, session_id, turn_id, call, stream)
+                .await;
             stream_progress.finish_tool_call(&call_id);
         }
         ProviderTurnEvent::Warning { message } => {
@@ -5528,13 +5612,8 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::ReasoningDelta { text } => {
-            let _ = state
-                .sessions
-                .append_event(
-                    session_id,
-                    SessionEventKind::AssistantReasoningDelta { text },
-                )
-                .await;
+            stream.push_reasoning(&text);
+            stream.flush_if_ready(state).await;
             append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
         }
         ProviderTurnEvent::ToolCallDelta { .. } => {}
@@ -5619,7 +5698,7 @@ async fn handle_provider_tool_call_finished_event(
     session_id: SessionId,
     turn_id: &str,
     call: bcode_model::ToolCall,
-    assistant_text: &mut String,
+    stream: &mut ModelStreamAccumulator,
 ) {
     append_provider_stream_event_trace(
         state,
@@ -5642,8 +5721,10 @@ async fn handle_provider_tool_call_finished_event(
         },
     )
     .await;
+    stream.flush(state).await;
+    let assistant_text = stream.take_assistant_text();
     if !assistant_text.is_empty() {
-        append_assistant_message_event(state, session_id, std::mem::take(assistant_text)).await;
+        append_assistant_message_event(state, session_id, assistant_text).await;
     }
     let Some(cancel_state) = active_turn_cancel_state(state, session_id).await else {
         return;
@@ -7075,7 +7156,7 @@ async fn append_tool_stream_event(
     if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
         let _ = state
             .sessions
-            .publish_transient_event(session_id, SessionEventKind::ToolInvocationStream { event })
+            .publish_live_event(session_id, SessionLiveEventKind::ToolOutputDelta { event })
             .await;
         return;
     }
@@ -7745,17 +7826,6 @@ const fn conversation_reuse_mode_name(mode: bcode_model::ConversationReuseMode) 
     }
 }
 
-async fn append_assistant_delta_event(state: &ServerState, session_id: SessionId, text: String) {
-    match state
-        .sessions
-        .append_assistant_delta(session_id, text)
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append assistant delta: {error}"),
-    }
-}
-
 async fn append_assistant_message_event(state: &ServerState, session_id: SessionId, text: String) {
     match state
         .sessions
@@ -8413,10 +8483,23 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
 fn forward_session_events(
     sink: ClientEventSink,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
+    mut live_events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionLiveEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            if let Err(error) = sink.send(Event::Session(event)).await {
+        loop {
+            let event = tokio::select! {
+                durable = events.recv() => match durable {
+                    Ok(event) => Event::Session(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                live = live_events.recv() => match live {
+                    Ok(event) => Event::SessionLive(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            if let Err(error) = sink.send(event).await {
                 if !is_expected_disconnect(&error) {
                     eprintln!(
                         "failed to send session event to {}: {error}",
@@ -9582,17 +9665,17 @@ mod tests {
 
         let received = loop {
             let event = attachment
-                .events
+                .live_events
                 .recv()
                 .await
-                .expect("subscriber should receive transient delta");
-            if matches!(event.kind, SessionEventKind::ToolInvocationStream { .. }) {
+                .expect("subscriber should receive live delta");
+            if matches!(event.kind, SessionLiveEventKind::ToolOutputDelta { .. }) {
                 break event;
             }
         };
         assert_eq!(
             received.kind,
-            SessionEventKind::ToolInvocationStream { event: delta }
+            SessionLiveEventKind::ToolOutputDelta { event: delta }
         );
         let history = state
             .sessions

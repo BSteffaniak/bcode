@@ -6,8 +6,8 @@ use std::time::{Duration, Instant, SystemTime};
 use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
 use bcode_session_models::{
     ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
-    SessionId, SessionInputHistoryEntry, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    SessionId, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
+    SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -1233,6 +1233,40 @@ impl BmuxApp {
             self.transcript_history.push(event.clone());
         }
         self.apply_session_event(event, SessionEventApplication::Live);
+    }
+
+    /// Absorb one live-only session event.
+    pub fn absorb_session_live_event(&mut self, event: &SessionLiveEvent) {
+        match &event.kind {
+            SessionLiveEventKind::AssistantTextDelta { text, .. } => {
+                let was_following = self.viewport.following()
+                    && self.transcript_scroll_animation.is_none()
+                    && self.submitted_user_message_following
+                        != SubmittedUserMessageFollowing::PendingAnchor
+                    && !self.assistant_scroll_anchor.is_pending();
+                self.pending_visual_overflow_bottom = Some(
+                    self.viewport
+                        .bottom_row(self.transcript_layout.total_rows()),
+                );
+                self.viewport.preserve_for_append();
+                self.push_live_assistant_delta(text, SessionEventApplication::Live);
+                self.maybe_request_assistant_stream_anchor(was_following);
+            }
+            SessionLiveEventKind::AssistantReasoningDelta { text, .. } => {
+                self.pending_visual_overflow_bottom = Some(
+                    self.viewport
+                        .bottom_row(self.transcript_layout.total_rows()),
+                );
+                self.viewport.preserve_for_append();
+                self.add_streaming_delta(text, SessionEventApplication::Live);
+                if self.reasoning_visible() {
+                    self.push_streaming_item("Reasoning", text);
+                }
+            }
+            SessionLiveEventKind::ToolOutputDelta { event } => {
+                self.apply_tool_stream_event(event, SessionEventApplication::Live);
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]

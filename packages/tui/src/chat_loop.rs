@@ -74,14 +74,8 @@ pub async fn run_with_client<W: Write>(
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, keymap);
         while let Ok(event) = chat.event_receiver.try_recv() {
-            match event {
-                BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
-                    chat.app.absorb_session_event(&event);
-                    needs_redraw = true;
-                }
-                BcodeEvent::Session(_)
-                | BcodeEvent::RuntimeWork(_)
-                | BcodeEvent::SessionCatalogUpdated { .. } => {}
+            if absorb_bcode_event(chat, event) {
+                needs_redraw = true;
             }
         }
 
@@ -147,6 +141,11 @@ pub async fn run_with_client<W: Write>(
                     needs_redraw = event_invalidation.needs_render();
                 }
             }
+            ChatLoopEvent::Bcode(event) => {
+                if absorb_bcode_event(chat, *event) {
+                    needs_redraw = true;
+                }
+            }
             ChatLoopEvent::Async(event) => {
                 handle_async_event(client, chat, event);
                 needs_redraw = true;
@@ -168,8 +167,26 @@ pub async fn run_with_client<W: Write>(
 
 enum ChatLoopEvent {
     Terminal(Event),
+    Bcode(Box<BcodeEvent>),
     Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
+}
+
+fn absorb_bcode_event(chat: &mut ActiveChat, event: BcodeEvent) -> bool {
+    match event {
+        BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
+            chat.app.absorb_session_event(&event);
+            true
+        }
+        BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
+            chat.app.absorb_session_live_event(&event);
+            true
+        }
+        BcodeEvent::Session(_)
+        | BcodeEvent::SessionLive(_)
+        | BcodeEvent::RuntimeWork(_)
+        | BcodeEvent::SessionCatalogUpdated { .. } => false,
+    }
 }
 
 async fn next_chat_loop_event(
@@ -186,6 +203,10 @@ async fn next_chat_loop_event(
         let delay = next_at.saturating_duration_since(now);
         return tokio::select! {
             biased;
+            bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
+                || ChatLoopEvent::TimedInvalidations(Vec::new()),
+                |event| ChatLoopEvent::Bcode(Box::new(event)),
+            )),
             async_event = chat.async_event_receiver.recv() => Ok(async_event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
                 |event| ChatLoopEvent::Async(Box::new(event)),
@@ -203,6 +224,10 @@ async fn next_chat_loop_event(
     }
     tokio::select! {
         biased;
+        bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
+            || ChatLoopEvent::TimedInvalidations(Vec::new()),
+            |event| ChatLoopEvent::Bcode(Box::new(event)),
+        )),
         async_event = chat.async_event_receiver.recv() => Ok(async_event.map_or_else(
             || ChatLoopEvent::TimedInvalidations(Vec::new()),
             |event| ChatLoopEvent::Async(Box::new(event)),

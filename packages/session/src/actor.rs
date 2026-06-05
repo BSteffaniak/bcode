@@ -3,9 +3,10 @@
 use super::{
     Arc, CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, Instant, PathBuf, ProjectionWindow,
     ProjectionWindowRequest, SessionAttachment, SessionError, SessionEvent, SessionEventKind,
-    SessionEventProvenance, SessionInputHistoryEntry, SessionLoadStatusKind, SessionState,
-    SessionStoreExecutor, SessionSummary, elapsed_ms, input_history_from_events,
-    model_context_events_from_history, title_from_first_prompt, usize_to_u64,
+    SessionEventProvenance, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind,
+    SessionLoadStatusKind, SessionState, SessionStoreExecutor, SessionSummary, elapsed_ms,
+    input_history_from_events, model_context_events_from_history, title_from_first_prompt,
+    usize_to_u64,
 };
 use crate::db::{MaterializedProjection, SessionDb};
 use std::sync::RwLock;
@@ -205,6 +206,14 @@ impl SessionHandle {
             .await?
     }
 
+    pub async fn publish_live_event(
+        &self,
+        event: SessionLiveEventKind,
+    ) -> Result<Option<SessionLiveEvent>, SessionError> {
+        self.send(|reply| SessionCommand::PublishLive { event, reply })
+            .await
+    }
+
     pub async fn publish_transient_event(
         &self,
         kind: SessionEventKind,
@@ -288,6 +297,10 @@ enum SessionCommand {
     SetCurrentAgent {
         agent_id: String,
         reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    PublishLive {
+        event: SessionLiveEventKind,
+        reply: oneshot::Sender<Option<SessionLiveEvent>>,
     },
     PublishTransient {
         kind: SessionEventKind,
@@ -422,6 +435,9 @@ impl SessionActor {
             SessionCommand::SetCurrentAgent { agent_id, reply } => {
                 self.set_current_agent(agent_id);
                 let _ = reply.send(Ok(()));
+            }
+            SessionCommand::PublishLive { event, reply } => {
+                let _ = reply.send(self.publish_live_event(event));
             }
             SessionCommand::PublishTransient { kind, reply } => {
                 let _ = reply.send(self.publish_transient_event(kind));
@@ -661,6 +677,7 @@ impl SessionActor {
             input_history,
             attached_event,
             events,
+            live_events: self.state.live_sender.subscribe(),
         })
     }
 
@@ -888,6 +905,18 @@ impl SessionActor {
     fn set_current_agent(&mut self, agent_id: String) {
         self.state.current_agent = Some(agent_id);
         self.refresh_snapshot();
+    }
+
+    fn publish_live_event(&self, kind: SessionLiveEventKind) -> Option<SessionLiveEvent> {
+        if self.state.live_sender.receiver_count() == 0 {
+            return None;
+        }
+        let event = SessionLiveEvent {
+            session_id: self.state.summary.id,
+            kind,
+        };
+        let _ = self.state.live_sender.send(event.clone());
+        Some(event)
     }
 
     fn publish_transient_event(&self, kind: SessionEventKind) -> Option<SessionEvent> {
