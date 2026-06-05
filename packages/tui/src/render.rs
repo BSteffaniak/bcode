@@ -189,21 +189,20 @@ fn active_latest_bar_line(
         now,
         latest_bar_active_frame_duration(burst),
     );
-    let pulse = latest_bar_pulse(phase, burst);
     let mut spans = Vec::new();
-    push_chevron_wave(&mut spans, left_width, phase, pulse, false);
+    push_latest_bar_glow_rail(&mut spans, left_width, phase, burst, false);
     spans.push(Span::styled(
         text,
         latest_bar_background_style()
-            .fg(Color::White)
+            .fg(latest_bar_active_text_color(burst))
             .add_modifier(Modifier::BOLD),
     ));
-    push_chevron_wave(
+    push_latest_bar_glow_rail(
         &mut spans,
         right_width,
-        phase.saturating_add(left_width),
-        pulse,
-        false,
+        phase.saturating_add(left_width / 3),
+        burst,
+        true,
     );
     Line::from_spans(spans)
 }
@@ -227,16 +226,23 @@ fn stale_latest_bar_line(
         .saturating_sub(1)
         .saturating_sub(text_width)
         .saturating_sub(left_width);
-    let pulse = latest_bar_phase(animation_started_at, now, LATEST_BAR_STALE_FRAME) % 3;
-    let chevron = ["⌄", "˅", "▾"][pulse];
+    let phase = latest_bar_phase(animation_started_at, now, LATEST_BAR_STALE_FRAME) % 2;
+    let chevron_color = if phase == 0 {
+        Color::Rgb(74, 154, 174)
+    } else {
+        Color::Rgb(110, 220, 235)
+    };
     Line::from_spans(vec![
         Span::styled(" ".repeat(left_width), latest_bar_background_style()),
-        Span::styled(text, latest_bar_background_style().fg(Color::BrightBlack)),
+        Span::styled(
+            text,
+            latest_bar_background_style().fg(Color::Rgb(150, 180, 192)),
+        ),
         Span::styled(" ".repeat(right_width), latest_bar_background_style()),
         Span::styled(
-            chevron,
+            "▾",
             latest_bar_background_style()
-                .fg(Color::Cyan)
+                .fg(chevron_color)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
@@ -255,44 +261,73 @@ fn latest_bar_phase(started_at: Instant, now: Instant, frame: Duration) -> usize
 
 fn latest_bar_active_frame_duration(burst: u8) -> Duration {
     Duration::from_millis(
-        220_u64
-            .saturating_sub(u64::from(burst).saturating_mul(18))
-            .max(80),
+        180_u64
+            .saturating_sub(u64::from(burst).saturating_mul(10))
+            .max(90),
     )
 }
 
-fn latest_bar_pulse(phase: usize, burst: u8) -> usize {
-    const PULSE: [usize; 16] = [0, 1, 2, 4, 6, 8, 7, 6, 4, 3, 2, 1, 0, 0, 1, 2];
-    PULSE[phase % PULSE.len()].saturating_add(usize::from(burst) / 2)
-}
-
-fn push_chevron_wave(
+fn push_latest_bar_glow_rail(
     spans: &mut Vec<Span>,
     width: usize,
     phase: usize,
-    pulse: usize,
+    burst: u8,
     reverse: bool,
 ) {
+    const GLYPHS: [&str; 3] = ["·", "•", "▾"];
+    if width == 0 {
+        return;
+    }
+    let intensity = usize::from(burst.min(8));
+    let period = 14_usize.saturating_sub(intensity).max(7);
+    let trail = 2_usize.saturating_add(intensity / 2);
     for column in 0..width {
-        let wave = if reverse {
-            phase.saturating_add(width.saturating_sub(column))
+        let wave_column = if reverse {
+            width.saturating_sub(column).saturating_sub(1)
         } else {
-            phase.saturating_add(column)
-        } % 10;
-        let crest = pulse % 10;
-        let distance = wave.abs_diff(crest);
-        let (glyph, color, bold) = match distance {
-            0 => ("▾", Color::Cyan, true),
-            1 => ("▾", Color::Cyan, false),
-            2 => ("˅", Color::Blue, false),
-            3 | 4 => ("⌄", Color::BrightBlack, false),
-            _ => (" ", Color::BrightBlack, false),
+            column
         };
-        let mut style = latest_bar_background_style().fg(color);
-        if bold {
+        let wave = wave_column.saturating_add(phase) % period;
+        let distance = wave.min(period.saturating_sub(wave));
+        let glyph_index = match distance {
+            0 => 2,
+            1 | 2 => 1,
+            _ if distance <= trail => 0,
+            _ => usize::MAX,
+        };
+        if glyph_index == usize::MAX {
+            spans.push(Span::styled(" ", latest_bar_background_style()));
+            continue;
+        }
+        let mut style = latest_bar_background_style().fg(latest_bar_glow_color(distance, burst));
+        if distance == 0 || (intensity >= 5 && distance <= 1) {
             style = style.add_modifier(Modifier::BOLD);
         }
-        spans.push(Span::styled(glyph, style));
+        spans.push(Span::styled(GLYPHS[glyph_index], style));
+    }
+}
+
+const fn latest_bar_active_text_color(burst: u8) -> Color {
+    if burst >= 6 {
+        Color::Rgb(230, 255, 250)
+    } else if burst >= 3 {
+        Color::Rgb(210, 245, 250)
+    } else {
+        Color::White
+    }
+}
+
+const fn latest_bar_glow_color(distance: usize, burst: u8) -> Color {
+    match (burst >= 6, burst >= 3, distance) {
+        (true, _, 0) => Color::Rgb(245, 255, 255),
+        (true, _, 1 | 2) => Color::Rgb(120, 245, 255),
+        (true, _, _) => Color::Rgb(70, 170, 205),
+        (_, true, 0) => Color::Rgb(220, 255, 250),
+        (_, true, 1 | 2) => Color::Rgb(95, 230, 255),
+        (_, true, _) => Color::Rgb(60, 145, 180),
+        (_, _, 0) => Color::Rgb(205, 255, 245),
+        (_, _, 1 | 2) => Color::Rgb(90, 230, 255),
+        (_, _, _) => Color::Rgb(62, 142, 170),
     }
 }
 
