@@ -31,6 +31,8 @@ pub const OP_DRAFT_LIST: &str = "draft.list";
 pub const OP_DRAFT_SAVE: &str = "draft.save";
 /// Operation that deletes a persisted draft comment.
 pub const OP_DRAFT_DELETE: &str = "draft.delete";
+/// Operation that updates a persisted draft comment.
+pub const OP_DRAFT_UPDATE: &str = "draft.update";
 
 const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
 const DEFAULT_STATE_ROOT: &str = ".bcode/code-review";
@@ -59,6 +61,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_DRAFT_LIST => list_drafts(&context.request),
             OP_DRAFT_SAVE => save_draft(&context.request),
             OP_DRAFT_DELETE => delete_draft(&context.request),
+            OP_DRAFT_UPDATE => update_draft(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -141,6 +144,17 @@ pub struct DeleteDraftRequest {
     pub comment_id: String,
 }
 
+/// Request payload for `draft.update`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateDraftRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Comment id to update.
+    pub comment_id: String,
+    /// Updated draft body.
+    pub body: String,
+}
+
 /// Persisted draft anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftAnchor {
@@ -192,6 +206,15 @@ pub struct SaveDraftResponse {
 pub struct DeleteDraftResponse {
     /// Whether a persisted draft was deleted.
     pub deleted: bool,
+}
+
+/// Response payload for `draft.update`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateDraftResponse {
+    /// Whether a persisted draft was updated.
+    pub updated: bool,
+    /// Updated timestamp in milliseconds since Unix epoch, when updated.
+    pub updated_at_ms: Option<u64>,
 }
 
 /// Structured review response.
@@ -369,6 +392,18 @@ fn delete_draft(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn update_draft(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<UpdateDraftRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+
+    match update_draft_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("draft_update_failed", error.to_string()),
+    }
+}
+
 fn list_drafts_for_request(request: &ListDraftsRequest) -> Result<ListDraftsResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let review_key = review_key(&repo_root, &request.target)?;
@@ -413,6 +448,20 @@ fn delete_draft_for_request(
         })
     })?;
     Ok(DeleteDraftResponse { deleted })
+}
+
+fn update_draft_for_request(
+    request: UpdateDraftRequest,
+) -> Result<UpdateDraftResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let result = with_database(&repo_root, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .update_draft(&request.comment_id, &request.body)
+                .await
+        })
+    })?;
+    Ok(result)
 }
 
 fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
@@ -560,6 +609,39 @@ impl<'a> CodeReviewDb<'a> {
                 .await?;
         }
         Ok(true)
+    }
+
+    async fn update_draft(
+        &self,
+        comment_id: &str,
+        body: &str,
+    ) -> Result<UpdateDraftResponse, ReviewError> {
+        let exists = self
+            .db
+            .select("draft_comments")
+            .columns(&["comment_id"])
+            .filter(Box::new(where_eq("comment_id", comment_id)))
+            .execute_first(self.db)
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(UpdateDraftResponse {
+                updated: false,
+                updated_at_ms: None,
+            });
+        }
+        let now = now_ms();
+        self.db
+            .update("draft_comments")
+            .value("body", body.to_string())
+            .value("updated_at_ms", u64_to_i64(now))
+            .filter(Box::new(where_eq("comment_id", comment_id)))
+            .execute(self.db)
+            .await?;
+        Ok(UpdateDraftResponse {
+            updated: true,
+            updated_at_ms: Some(now),
+        })
     }
 
     async fn ensure_review(

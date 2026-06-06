@@ -21,6 +21,7 @@ const CREATE_REVIEW_OPERATION: &str = "create_review";
 const LIST_DRAFTS_OPERATION: &str = "draft.list";
 const SAVE_DRAFT_OPERATION: &str = "draft.save";
 const DELETE_DRAFT_OPERATION: &str = "draft.delete";
+const UPDATE_DRAFT_OPERATION: &str = "draft.update";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
 /// Local Git target to open in review mode.
@@ -113,6 +114,19 @@ pub async fn run<W: Write>(
                     app.restore_deleted_draft(delete);
                     app.status_message =
                         Some(format!("delete failed; restored local draft: {error}"));
+                }
+            }
+            needs_redraw = true;
+        }
+        if let Some(update) = app.take_pending_draft_update() {
+            match update_draft(&client, repo_path.clone(), update.clone()).await {
+                Ok(()) => {
+                    app.status_message = Some("updated draft comment".to_string());
+                }
+                Err(error) => {
+                    app.restore_updated_draft(update);
+                    app.status_message =
+                        Some(format!("update failed; restored local draft: {error}"));
                 }
             }
             needs_redraw = true;
@@ -231,6 +245,35 @@ async fn delete_draft(
     Ok(())
 }
 
+async fn update_draft(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    update: PendingDraftUpdate,
+) -> Result<(), TuiError> {
+    let request = UpdateDraftRequest {
+        repo_path,
+        comment_id: update.comment_id,
+        body: update.new_body,
+    };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            UPDATE_DRAFT_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let _: UpdateDraftResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(())
+}
+
 fn handle_event<W: Write>(
     app: &mut ReviewApp,
     terminal: &mut Terminal<&mut W>,
@@ -317,6 +360,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
         KeyCode::Char('c') => app.open_comment_editor(),
+        KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
@@ -439,6 +483,19 @@ struct DeleteDraftRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct DeleteDraftResponse {
     deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct UpdateDraftRequest {
+    repo_path: PathBuf,
+    comment_id: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct UpdateDraftResponse {
+    updated: bool,
+    updated_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -652,6 +709,33 @@ pub struct PendingDraftDelete {
     pub comment: ReviewDraftComment,
 }
 
+/// Pending draft comment update request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDraftUpdate {
+    /// Edited anchor.
+    pub anchor: ReviewCommentAnchor,
+    /// Persisted comment id.
+    pub comment_id: String,
+    /// Previous body for failure restore.
+    pub previous_body: String,
+    /// New body.
+    pub new_body: String,
+}
+
+/// Draft comment editor mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewCommentEditorMode {
+    /// Creating a new draft.
+    Create,
+    /// Editing an existing persisted draft.
+    Edit {
+        /// Existing comment id.
+        comment_id: String,
+        /// Previous body for failure restore.
+        previous_body: String,
+    },
+}
+
 /// Active draft comment editor.
 #[derive(Debug, Clone)]
 pub struct ReviewCommentEditor {
@@ -659,6 +743,8 @@ pub struct ReviewCommentEditor {
     pub anchor: ReviewCommentAnchor,
     /// Editable comment buffer.
     pub buffer: TextEditBuffer,
+    /// Editor mode.
+    pub mode: ReviewCommentEditorMode,
 }
 
 impl ReviewCommentEditor {
@@ -668,6 +754,20 @@ impl ReviewCommentEditor {
         Self {
             anchor,
             buffer: TextEditBuffer::new(),
+            mode: ReviewCommentEditorMode::Create,
+        }
+    }
+
+    /// Create an editor for updating an existing draft.
+    #[must_use]
+    pub fn edit(anchor: ReviewCommentAnchor, comment_id: String, body: String) -> Self {
+        Self {
+            anchor,
+            buffer: TextEditBuffer::from_text(&body),
+            mode: ReviewCommentEditorMode::Edit {
+                comment_id,
+                previous_body: body,
+            },
         }
     }
 }
@@ -701,6 +801,8 @@ pub struct ReviewApp {
     pub pending_draft_save: Option<PendingDraftSave>,
     /// Draft comment awaiting deletion.
     pub pending_draft_delete: Option<PendingDraftDelete>,
+    /// Draft comment awaiting update.
+    pub pending_draft_update: Option<PendingDraftUpdate>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
 }
@@ -723,6 +825,7 @@ impl ReviewApp {
             comment_editor: None,
             pending_draft_save: None,
             pending_draft_delete: None,
+            pending_draft_update: None,
             last_file_area: None,
             last_diff_area: None,
         }
@@ -942,6 +1045,35 @@ impl ReviewApp {
         true
     }
 
+    /// Open the latest persisted draft for editing.
+    pub fn open_latest_draft_editor(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a commented line to edit a draft".to_string());
+            return true;
+        };
+        let Some(comment) = self
+            .draft_comments
+            .get(&anchor)
+            .and_then(|comments| comments.last())
+        else {
+            self.status_message = Some("no draft comment at selected line".to_string());
+            return true;
+        };
+        let Some(comment_id) = comment.id.clone() else {
+            self.status_message =
+                Some("draft is not persisted yet; try again after save".to_string());
+            return true;
+        };
+        self.comment_editor = Some(ReviewCommentEditor::edit(
+            anchor,
+            comment_id,
+            comment.body.clone(),
+        ));
+        self.status_message =
+            Some("editing draft comment; enter/ctrl+s saves, esc cancels".to_string());
+        true
+    }
+
     /// Save the active draft comment editor.
     pub fn save_comment_editor(&mut self) -> bool {
         let Some(editor) = self.comment_editor.take() else {
@@ -953,19 +1085,36 @@ impl ReviewApp {
             return true;
         }
         let anchor = editor.anchor;
-        self.draft_comments
-            .entry(anchor.clone())
-            .or_default()
-            .push(ReviewDraftComment {
-                id: None,
-                body: text.clone(),
-                persisted: false,
-                created_at_ms: None,
-                updated_at_ms: None,
-            });
-        self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
-        let count = self.draft_comment_count();
-        self.status_message = Some(format!("saved draft comment ({count} total)"));
+        match editor.mode {
+            ReviewCommentEditorMode::Create => {
+                self.draft_comments
+                    .entry(anchor.clone())
+                    .or_default()
+                    .push(ReviewDraftComment {
+                        id: None,
+                        body: text.clone(),
+                        persisted: false,
+                        created_at_ms: None,
+                        updated_at_ms: None,
+                    });
+                self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
+                let count = self.draft_comment_count();
+                self.status_message = Some(format!("saved draft comment ({count} total)"));
+            }
+            ReviewCommentEditorMode::Edit {
+                comment_id,
+                previous_body,
+            } => {
+                self.update_local_draft_body(&anchor, &comment_id, text.clone());
+                self.pending_draft_update = Some(PendingDraftUpdate {
+                    anchor,
+                    comment_id,
+                    previous_body,
+                    new_body: text,
+                });
+                self.status_message = Some("updated draft comment".to_string());
+            }
+        }
         true
     }
 
@@ -979,12 +1128,40 @@ impl ReviewApp {
         self.pending_draft_delete.take()
     }
 
+    /// Take the pending draft update request, if present.
+    pub const fn take_pending_draft_update(&mut self) -> Option<PendingDraftUpdate> {
+        self.pending_draft_update.take()
+    }
+
+    /// Restore a locally updated draft after persistence failure.
+    pub fn restore_updated_draft(&mut self, update: PendingDraftUpdate) {
+        self.update_local_draft_body(&update.anchor, &update.comment_id, update.previous_body);
+    }
+
     /// Restore a locally deleted draft after persistence failure.
     pub fn restore_deleted_draft(&mut self, delete: PendingDraftDelete) {
         self.draft_comments
             .entry(delete.anchor)
             .or_default()
             .push(delete.comment);
+    }
+
+    fn update_local_draft_body(
+        &mut self,
+        anchor: &ReviewCommentAnchor,
+        comment_id: &str,
+        body: String,
+    ) {
+        let Some(comment) = self.draft_comments.get_mut(anchor).and_then(|comments| {
+            comments
+                .iter_mut()
+                .rev()
+                .find(|comment| comment.id.as_deref() == Some(comment_id))
+        }) else {
+            return;
+        };
+        comment.body = body;
+        comment.persisted = false;
     }
 
     /// Delete the latest draft comment at the selected line.
@@ -1303,6 +1480,42 @@ mod tests {
             .expect("draft should be pending persistence");
         assert_eq!(pending.anchor.diff_row, 2);
         assert_eq!(pending.body, "Needs a test");
+    }
+
+    #[test]
+    fn edits_persisted_draft_comment() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        app.load_persisted_drafts(vec![DraftComment {
+            comment_id: "comment-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            anchor: DraftAnchor {
+                file_path: "a.rs".to_string(),
+                diff_row: 2,
+                old_line: None,
+                new_line: Some(1),
+                line_kind: ReviewLineKind::Added,
+            },
+            body: "Before".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }]);
+
+        assert!(app.open_latest_draft_editor());
+        let editor = app.comment_editor.as_mut().expect("editor should open");
+        editor.buffer = TextEditBuffer::from_text("After");
+        assert!(app.save_comment_editor());
+
+        let pending = app
+            .take_pending_draft_update()
+            .expect("update should be pending persistence");
+        assert_eq!(pending.comment_id, "comment-1");
+        assert_eq!(pending.previous_body, "Before");
+        assert_eq!(pending.new_body, "After");
+        assert_eq!(
+            app.selected_draft_preview().as_deref(),
+            Some("1 draft: After")
+        );
     }
 
     #[test]
