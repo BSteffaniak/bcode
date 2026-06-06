@@ -2058,18 +2058,7 @@ impl BmuxApp {
 
     fn set_tool_request_file_phase(&mut self, tool_call_id: &str, phase: FileEditPhase) {
         for item in self.transcript.iter_mut().rev() {
-            let TranscriptItemKind::ToolRequest {
-                tool_call_id: item_tool_call_id,
-                file_edit_phase,
-                ..
-            } = item.kind_mut()
-            else {
-                continue;
-            };
-            if item_tool_call_id == tool_call_id {
-                if file_edit_phase.is_some() {
-                    *file_edit_phase = Some(phase);
-                }
+            if item.set_file_edit_phase(tool_call_id, phase) {
                 break;
             }
         }
@@ -2091,14 +2080,14 @@ impl BmuxApp {
 
     fn finish_tool_request_preview(&mut self, tool_call_id: &str) {
         for item in self.transcript.iter_mut().rev() {
-            let TranscriptItemKind::ToolRequest {
-                tool_call_id: item_tool_call_id,
-                ..
-            } = item.kind_mut()
-            else {
-                continue;
-            };
-            if item_tool_call_id == tool_call_id {
+            let is_target = matches!(
+                item.kind(),
+                TranscriptItemKind::ToolRequest {
+                    tool_call_id: item_tool_call_id,
+                    ..
+                } if item_tool_call_id == tool_call_id
+            );
+            if is_target {
                 item.finish_streaming();
                 break;
             }

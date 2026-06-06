@@ -132,9 +132,23 @@ struct ToolCallContext {
     arguments_json: String,
 }
 
+/// Stable identity for a rendered transcript item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TranscriptItemId(u64);
+
+impl TranscriptItemId {
+    /// Return the raw item id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Renderable transcript item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptItem {
+    id: TranscriptItemId,
+    revision: u64,
     pub role: &'static str,
     pub text: String,
     pub streaming: bool,
@@ -143,30 +157,32 @@ pub struct TranscriptItem {
 
 impl TranscriptItem {
     pub fn new(role: &'static str, text: String) -> Self {
-        Self {
-            role,
-            text,
-            streaming: false,
-            kind: kind_for_role(role),
-        }
+        Self::with_identity(role, text, false, kind_for_role(role))
     }
 
     pub fn new_streaming(role: &'static str, text: String) -> Self {
-        Self {
-            role,
-            text,
-            streaming: true,
-            kind: kind_for_role(role),
-        }
+        Self::with_identity(role, text, true, kind_for_role(role))
     }
 
-    const fn with_kind(
+    fn with_kind(
         role: &'static str,
         text: String,
         streaming: bool,
         kind: TranscriptItemKind,
     ) -> Self {
+        Self::with_identity(role, text, streaming, kind)
+    }
+
+    fn with_identity(
+        role: &'static str,
+        text: String,
+        streaming: bool,
+        kind: TranscriptItemKind,
+    ) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            id: TranscriptItemId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            revision: 0,
             role,
             text,
             streaming,
@@ -176,7 +192,24 @@ impl TranscriptItem {
 
     const fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
+        self.bump_revision();
         self
+    }
+
+    /// Return stable item identity.
+    #[must_use]
+    pub const fn id(&self) -> TranscriptItemId {
+        self.id
+    }
+
+    /// Return revision incremented whenever rendered state mutates.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    const fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// Return display role.
@@ -201,6 +234,7 @@ impl TranscriptItem {
             }
             _ => {}
         }
+        self.bump_revision();
     }
 
     /// Mark a terminal output item as finished with final process metadata.
@@ -227,6 +261,7 @@ impl TranscriptItem {
             *terminal_error = is_error;
         }
         self.streaming = false;
+        self.bump_revision();
     }
 
     /// Mark a terminal output item as failed or successful.
@@ -237,6 +272,7 @@ impl TranscriptItem {
         } = &mut self.kind
         {
             *terminal_error = is_error;
+            self.bump_revision();
         }
     }
 
@@ -248,17 +284,34 @@ impl TranscriptItem {
         } = &mut self.kind
         {
             *terminal_finished_at_ms = finished_at_ms;
+            self.bump_revision();
         }
     }
 
     /// Mark this transcript item as no longer streaming.
     pub const fn finish_streaming(&mut self) {
         self.streaming = false;
+        self.bump_revision();
     }
 
-    /// Return mutable semantic item kind.
-    pub const fn kind_mut(&mut self) -> &mut TranscriptItemKind {
-        &mut self.kind
+    /// Set file-edit phase for a tool request item.
+    pub fn set_file_edit_phase(&mut self, tool_call_id: &str, phase: FileEditPhase) -> bool {
+        let TranscriptItemKind::ToolRequest {
+            tool_call_id: item_tool_call_id,
+            file_edit_phase,
+            ..
+        } = &mut self.kind
+        else {
+            return false;
+        };
+        if item_tool_call_id != tool_call_id {
+            return false;
+        }
+        if file_edit_phase.is_some() {
+            *file_edit_phase = Some(phase);
+            self.bump_revision();
+        }
+        true
     }
 
     /// Return semantic item kind.

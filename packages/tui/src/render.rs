@@ -583,7 +583,9 @@ pub fn transcript_item_signature(
     inline_diff_config: TuiInlineDiffConfig,
 ) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{width}:{inline_diff_config:?}:{}:{}:{:?}:{}:{}",
+        "item:{}:{}:{width}:{inline_diff_config:?}:{}:{}:{:?}:{}:{}",
+        item.id().get(),
+        item.revision(),
         item.role(),
         item.streaming(),
         item.kind(),
