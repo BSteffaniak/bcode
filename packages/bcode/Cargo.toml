@@ -30,6 +30,10 @@ static-bundled-blims-plugin = [
     "_static-bundled",
     "bcode_cli/static-bundled-blims-plugin",
 ]
+static-bundled-code-review-plugin = [
+    "_static-bundled",
+    "bcode_cli/static-bundled-code-review-plugin",
+]
 static-bundled-default-agents-plugin = [
     "_static-bundled",
     "bcode_cli/static-bundled-default-agents-plugin",
@@ -66,6 +70,7 @@ static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
     "static-bundled-blims-plugin",
+    "static-bundled-code-review-plugin",
     "static-bundled-default-agents-plugin",
     "static-bundled-document-plugin",
     "static-bundled-fake-provider-plugin",
