@@ -31,7 +31,7 @@ use super::tool_present::{
     ToolResultPresentation, tool_request_presentation, tool_result_presentation,
 };
 use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
-use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
+use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::{format_elapsed_millis, format_millis};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
@@ -70,7 +70,7 @@ pub fn prepare_frame(app: &mut BmuxApp, area: Rect) {
     let composer_y = area.bottom().saturating_sub(composer_height);
     let body_height = composer_y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
-    prepare_transcript_layout_for_body(app, body);
+    super::transcript_projection::prepare_for_body(app, body);
 }
 
 /// Render one TUI frame.
@@ -120,36 +120,6 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>) {
         u16::from(composer.y > area.y.saturating_add(1)),
     );
     render_status(app, status, frame);
-}
-
-fn prepare_transcript_layout_for_body(app: &mut BmuxApp, body: Rect) {
-    let initial_transcript_area = transcript_area_for_body(app, body);
-    sync_transcript_layout(app, initial_transcript_area.width);
-    sync_transcript_viewport(app, initial_transcript_area);
-    let latest_bar_height = u16::from(app.newer_transcript_content_below());
-    if latest_bar_height == 0 {
-        return;
-    }
-
-    let body = Rect::new(
-        body.x,
-        body.y,
-        body.width,
-        body.height.saturating_sub(latest_bar_height),
-    );
-    let transcript_area = transcript_area_for_body(app, body);
-    sync_transcript_layout(app, transcript_area.width);
-    sync_transcript_viewport(app, transcript_area);
-}
-
-fn sync_transcript_viewport(app: &mut BmuxApp, transcript_area: Rect) {
-    app.sync_transcript_scroll_max(
-        max_transcript_scroll_offset(app, transcript_area),
-        max_transcript_bottom_overscroll(transcript_area),
-        app.transcript_layout().total_rows(),
-        transcript_area.height,
-    );
-    app.sync_transcript_anchor_requests();
 }
 
 fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Instant) {
@@ -437,7 +407,7 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
-fn transcript_area_for_body(app: &BmuxApp, area: Rect) -> Rect {
+pub fn transcript_area_for_body(app: &BmuxApp, area: Rect) -> Rect {
     let diff_height = if app.changed_files().is_empty() || !app.diff_visible() {
         0
     } else {
@@ -449,19 +419,6 @@ fn transcript_area_for_body(app: &BmuxApp, area: Rect) -> Rect {
         area.width,
         area.height.saturating_sub(diff_height),
     )
-}
-
-fn max_transcript_scroll_offset(app: &BmuxApp, area: Rect) -> usize {
-    if area.is_empty() || app.transcript().is_empty() && app.pending_submissions().is_empty() {
-        return 0;
-    }
-    app.transcript_layout()
-        .total_rows()
-        .saturating_sub(usize::from(area.height))
-}
-
-fn max_transcript_bottom_overscroll(area: Rect) -> usize {
-    usize::from(area.height).saturating_sub(1)
 }
 
 fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -485,46 +442,6 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
             y = y.saturating_add(1);
         }
     }
-}
-
-fn sync_transcript_layout(app: &mut BmuxApp, width: u16) {
-    let transcript_len = app.transcript_len();
-    let pending_len = app.pending_submissions_len();
-    let has_older_history = app.has_older_history();
-    let loading_older_history = app.loading_older_history();
-    let inline_diff_config = app.inline_diff_config();
-    let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
-    transcript_layout.sync(TranscriptLayoutSpec {
-        width,
-        transcript_len,
-        pending_len,
-        transcript_signature: |index| {
-            let item = app
-                .transcript_item(index)
-                .expect("transcript item index must be valid during layout sync");
-            transcript_item_signature(item, width, inline_diff_config)
-        },
-        transcript_rows: |index| transcript_item_rows(app, index, width, inline_diff_config),
-        pending_signature: |index| {
-            let submission = app
-                .pending_submission(index)
-                .expect("pending submission index must be valid during layout sync");
-            pending_submission_signature(submission, width)
-        },
-        pending_rows: |index| {
-            let submission = app
-                .pending_submission(index)
-                .expect("pending submission index must be valid during layout sync");
-            pending_submission_rows(submission, width)
-        },
-        history_banner_signature: || {
-            history_banner_text(has_older_history, loading_older_history)
-                .map(|text| TranscriptLayoutSignature::new(format!("history:{width}:{text}")))
-        },
-        history_banner_rows: || history_banner_rows(has_older_history, loading_older_history),
-        reset: || false,
-    });
-    *app.transcript_layout_mut() = transcript_layout;
 }
 
 fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -577,30 +494,24 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         .render(detail_area, frame, &mut diff_state);
 }
 
-fn transcript_item_rows(
-    app: &BmuxApp,
+pub fn transcript_item_rows(
+    transcript: &[TranscriptItem],
     index: usize,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
 ) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_transcript_item_rows(
-        &mut rows,
-        app.transcript(),
-        index,
-        width,
-        inline_diff_config,
-    );
+    push_transcript_item_rows(&mut rows, transcript, index, width, inline_diff_config);
     rows
 }
 
-fn pending_submission_rows(pending: &PendingSubmission, width: u16) -> Vec<Line> {
+pub fn pending_submission_rows(pending: &PendingSubmission, width: u16) -> Vec<Line> {
     let mut rows = Vec::new();
     push_pending_submission_rows(&mut rows, pending, width);
     rows
 }
 
-fn history_banner_rows(has_older_history: bool, loading_older_history: bool) -> Vec<Line> {
+pub fn history_banner_rows(has_older_history: bool, loading_older_history: bool) -> Vec<Line> {
     history_banner_text(has_older_history, loading_older_history).map_or_else(Vec::new, |text| {
         vec![Line::from_spans(vec![Span::styled(
             text,
@@ -609,7 +520,7 @@ fn history_banner_rows(has_older_history: bool, loading_older_history: bool) -> 
     })
 }
 
-const fn history_banner_text(
+pub const fn history_banner_text(
     has_older_history: bool,
     loading_older_history: bool,
 ) -> Option<&'static str> {
@@ -622,7 +533,7 @@ const fn history_banner_text(
     }
 }
 
-fn transcript_item_signature(
+pub fn transcript_item_signature(
     item: &TranscriptItem,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
@@ -650,7 +561,7 @@ fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> 
     format_elapsed_millis(Some(*started_at_ms), None).map(|elapsed| format!("elapsed:{elapsed}"))
 }
 
-fn pending_submission_signature(
+pub fn pending_submission_signature(
     pending: &PendingSubmission,
     width: u16,
 ) -> TranscriptLayoutSignature {

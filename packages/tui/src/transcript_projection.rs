@@ -1,0 +1,115 @@
+//! Transcript layout projection preparation.
+
+use bcode_config::TuiInlineDiffConfig;
+use bmux_tui::geometry::Rect;
+
+use super::app::BmuxApp;
+use super::pending_submission::PendingSubmission;
+use super::render;
+use super::transcript::TranscriptItem;
+use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
+
+/// Prepare transcript layout and viewport projections for a frame body.
+pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
+    let initial_transcript_area = render::transcript_area_for_body(app, body);
+    sync_layout(app, initial_transcript_area.width);
+    sync_viewport(app, initial_transcript_area);
+    let latest_bar_height = u16::from(app.newer_transcript_content_below());
+    if latest_bar_height == 0 {
+        return;
+    }
+
+    let body = Rect::new(
+        body.x,
+        body.y,
+        body.width,
+        body.height.saturating_sub(latest_bar_height),
+    );
+    let transcript_area = render::transcript_area_for_body(app, body);
+    sync_layout(app, transcript_area.width);
+    sync_viewport(app, transcript_area);
+}
+
+fn sync_viewport(app: &mut BmuxApp, transcript_area: Rect) {
+    app.sync_transcript_scroll_max(
+        max_scroll_offset(app, transcript_area),
+        max_bottom_overscroll(transcript_area),
+        app.transcript_layout().total_rows(),
+        transcript_area.height,
+    );
+    app.sync_transcript_anchor_requests();
+}
+
+fn max_scroll_offset(app: &BmuxApp, area: Rect) -> usize {
+    if area.is_empty() || app.transcript().is_empty() && app.pending_submissions().is_empty() {
+        return 0;
+    }
+    app.transcript_layout()
+        .total_rows()
+        .saturating_sub(usize::from(area.height))
+}
+
+fn max_bottom_overscroll(area: Rect) -> usize {
+    usize::from(area.height).saturating_sub(1)
+}
+
+fn sync_layout(app: &mut BmuxApp, width: u16) {
+    let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
+    let input = TranscriptLayoutInput::from_app(app, width);
+    transcript_layout.sync(TranscriptLayoutSpec {
+        width,
+        transcript_len: input.transcript.len(),
+        pending_len: input.pending.len(),
+        transcript_signature: |index| transcript_item_signature(&input.transcript[index], &input),
+        transcript_rows: |index| {
+            render::transcript_item_rows(
+                input.transcript,
+                index,
+                input.width,
+                input.inline_diff_config,
+            )
+        },
+        pending_signature: |index| {
+            render::pending_submission_signature(&input.pending[index], width)
+        },
+        pending_rows: |index| render::pending_submission_rows(&input.pending[index], width),
+        history_banner_signature: || {
+            render::history_banner_text(input.has_older_history, input.loading_older_history)
+                .map(|text| TranscriptLayoutSignature::new(format!("history:{width}:{text}")))
+        },
+        history_banner_rows: || {
+            render::history_banner_rows(input.has_older_history, input.loading_older_history)
+        },
+        reset: || false,
+    });
+    *app.transcript_layout_mut() = transcript_layout;
+}
+
+struct TranscriptLayoutInput<'a> {
+    width: u16,
+    transcript: &'a [TranscriptItem],
+    pending: &'a [PendingSubmission],
+    has_older_history: bool,
+    loading_older_history: bool,
+    inline_diff_config: TuiInlineDiffConfig,
+}
+
+impl<'a> TranscriptLayoutInput<'a> {
+    fn from_app(app: &'a BmuxApp, width: u16) -> Self {
+        Self {
+            width,
+            transcript: app.transcript(),
+            pending: app.pending_submissions(),
+            has_older_history: app.has_older_history(),
+            loading_older_history: app.loading_older_history(),
+            inline_diff_config: app.inline_diff_config(),
+        }
+    }
+}
+
+fn transcript_item_signature(
+    item: &TranscriptItem,
+    input: &TranscriptLayoutInput<'_>,
+) -> TranscriptLayoutSignature {
+    render::transcript_item_signature(item, input.width, input.inline_diff_config)
+}
