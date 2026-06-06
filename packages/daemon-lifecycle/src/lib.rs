@@ -387,6 +387,7 @@ pub enum DaemonStartError {
 /// or the daemon does not pass bounded readiness checks.
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
     cleanup_stale_daemon_records().await?;
+    cleanup_stale_endpoint(&options.endpoint)?;
     if ping_ready(&options.endpoint).await {
         if !options.quiet {
             println!("server already running");
@@ -395,6 +396,8 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         }
         return Ok(());
     }
+
+    cleanup_stale_endpoint(&options.endpoint)?;
 
     if let Some(parent) = options.log_path.parent() {
         fs::create_dir_all(parent)?;
@@ -528,12 +531,43 @@ async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {
 
 fn remove_stale_socket(record: &DaemonRecord) {
     #[cfg(unix)]
-    if let DaemonEndpointRecord::UnixSocket { path } = &record.endpoint
-        && is_bcode_socket_path(path)
-        && !unix_socket_has_listener(path)
-    {
-        let _ = fs::remove_file(path);
+    if let DaemonEndpointRecord::UnixSocket { path } = &record.endpoint {
+        let _ = remove_stale_unix_socket_path(path);
     }
+}
+
+fn cleanup_stale_endpoint(endpoint: &IpcEndpoint) -> Result<(), DaemonLifecycleError> {
+    #[cfg(unix)]
+    if let Some(path) = endpoint_unix_socket_path(endpoint) {
+        remove_stale_unix_socket_path(&path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_stale_unix_socket_path(path: &Path) -> Result<(), DaemonLifecycleError> {
+    if !is_bcode_socket_path(path) || unix_socket_has_listener(path) {
+        return Ok(());
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DaemonLifecycleError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn endpoint_unix_socket_path(endpoint: &IpcEndpoint) -> Option<PathBuf> {
+    let debug = format!("{endpoint:?}");
+    let marker = "UnixSocket(";
+    let start = debug.find(marker)? + marker.len();
+    let rest = &debug[start..];
+    let end = rest.rfind(')')?;
+    let path = rest[..end].trim().trim_matches('"');
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 #[cfg(unix)]

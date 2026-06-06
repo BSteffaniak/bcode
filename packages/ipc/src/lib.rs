@@ -43,9 +43,18 @@ impl LocalIpcListener {
     /// fails, or the listener cannot be created.
     pub fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
         prepare_endpoint_for_bind(endpoint)?;
-        Ok(Self {
-            inner: bmux_ipc::transport::LocalIpcListener::bind(endpoint)?,
-        })
+        match bmux_ipc::transport::LocalIpcListener::bind(endpoint) {
+            Ok(inner) => Ok(Self { inner }),
+            Err(IpcTransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                prepare_endpoint_for_bind(endpoint)?;
+                Ok(Self {
+                    inner: bmux_ipc::transport::LocalIpcListener::bind(endpoint)?,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Accept an incoming local connection.
