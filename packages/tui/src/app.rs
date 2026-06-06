@@ -34,11 +34,11 @@ use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, finish_streaming_transcript_item,
-    merge_transcript_boundary, model_usage_item, permission_request_item, permission_result_item,
-    push_streaming_transcript_item, streaming_terminal_output_item, streaming_tool_output_item,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, model_usage_item, permission_request_item,
+    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
     tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
+use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_viewport::TranscriptViewport;
 
@@ -108,9 +108,7 @@ pub struct BmuxApp {
     token_usage: TokenUsageMeter,
     composer: TextInputState,
     input_history: InputHistory,
-    transcript: Vec<TranscriptItem>,
-    transcript_projection_revision: u64,
-    pending_submissions_projection_revision: u64,
+    transcript: TranscriptDocument,
     transcript_history: Vec<SessionEvent>,
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
@@ -258,9 +256,7 @@ impl BmuxApp {
             token_usage: TokenUsageMeter::default(),
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
-            transcript: Vec::new(),
-            transcript_projection_revision: 0,
-            pending_submissions_projection_revision: 0,
+            transcript: TranscriptDocument::default(),
             transcript_history: Vec::new(),
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
@@ -420,45 +416,19 @@ impl BmuxApp {
     /// Return transcript items.
     #[must_use]
     pub fn transcript(&self) -> &[TranscriptItem] {
-        &self.transcript
+        self.transcript.items()
     }
 
     /// Return revision for layout-affecting transcript collection changes.
     #[must_use]
     pub const fn transcript_projection_revision(&self) -> u64 {
-        self.transcript_projection_revision
+        self.transcript.revision()
     }
 
     /// Return revision for layout-affecting pending submission changes.
     #[must_use]
     pub const fn pending_submissions_projection_revision(&self) -> u64 {
-        self.pending_submissions_projection_revision
-    }
-
-    const fn mark_transcript_projection_dirty(&mut self) {
-        self.transcript_projection_revision = self.transcript_projection_revision.saturating_add(1);
-    }
-
-    const fn mark_pending_submissions_projection_dirty(&mut self) {
-        self.pending_submissions_projection_revision = self
-            .pending_submissions_projection_revision
-            .saturating_add(1);
-    }
-
-    fn push_transcript_item(&mut self, item: TranscriptItem) {
-        self.transcript.push(item);
-        self.mark_transcript_projection_dirty();
-    }
-
-    fn replace_transcript(&mut self, transcript: Vec<TranscriptItem>) {
-        self.transcript = transcript;
-        self.mark_transcript_projection_dirty();
-    }
-
-    fn mark_transcript_item_dirty(&mut self, index: usize) {
-        if self.transcript.get(index).is_some() {
-            self.mark_transcript_projection_dirty();
-        }
+        self.pending_submissions.revision()
     }
 
     /// Return changed-file summaries inferred from edit tool calls.
@@ -767,7 +737,7 @@ impl BmuxApp {
 
     /// Append a system-style transcript note.
     pub fn push_system_note(&mut self, text: String) {
-        self.push_transcript_item(TranscriptItem::new("System", text));
+        self.transcript.push(TranscriptItem::new("System", text));
     }
 
     /// Replace the current status line.
@@ -835,7 +805,6 @@ impl BmuxApp {
         self.active_tool_calls.clear();
         self.tool_activity_seen = false;
         self.pending_submissions.stage(text);
-        self.mark_pending_submissions_projection_dirty();
         self.input_history.reset_navigation();
         self.composer.buffer_mut().clear();
     }
@@ -849,7 +818,6 @@ impl BmuxApp {
     pub fn clear_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
-        self.mark_pending_submissions_projection_dirty();
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
@@ -858,25 +826,18 @@ impl BmuxApp {
 
     /// Mark the oldest pending submission as queued by the server.
     pub fn mark_pending_submission_queued(&mut self, queue_position: Option<u32>) {
-        if let Some(pending) = self.pending_submissions.first_mut() {
-            pending.mark_queued(queue_position);
-            self.mark_pending_submissions_projection_dirty();
-        }
+        self.pending_submissions.mark_first_queued(queue_position);
     }
 
     /// Mark the oldest pending submission as sent to the server.
     pub fn mark_pending_submission_sent(&mut self) {
-        if let Some(pending) = self.pending_submissions.first_mut() {
-            pending.mark_sent();
-            self.mark_pending_submissions_projection_dirty();
-        }
+        self.pending_submissions.mark_first_sent();
     }
 
     /// Remove a pending submission and restore it into the composer.
     pub fn restore_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
-        self.mark_pending_submissions_projection_dirty();
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
@@ -1227,10 +1188,11 @@ impl BmuxApp {
     }
 
     fn rebuild_transcript_from_history(&mut self) {
-        self.replace_transcript(transcript_items_from_events_with_reasoning(
-            &self.transcript_history,
-            self.reasoning_visible(),
-        ));
+        self.transcript
+            .replace(transcript_items_from_events_with_reasoning(
+                &self.transcript_history,
+                self.reasoning_visible(),
+            ));
     }
 
     /// Prepend older history and preserve the current viewport.
@@ -1254,9 +1216,7 @@ impl BmuxApp {
         }
         let mut older =
             transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
-        merge_transcript_boundary(&mut older, &mut self.transcript);
-        older.append(&mut self.transcript);
-        self.replace_transcript(older);
+        self.transcript.merge_prepend(&mut older);
         self.older_history.update_cursor(events, has_more);
         self.older_history.set_loading(false);
         if self.older_history.has_older_history() {
@@ -1704,11 +1664,13 @@ impl BmuxApp {
 
     fn push_user_message(&mut self, text: &str) {
         self.remove_pending_submission(text);
-        self.push_transcript_item(TranscriptItem::new("You", text.to_owned()));
+        self.transcript
+            .push(TranscriptItem::new("You", text.to_owned()));
     }
 
     fn push_system_message(&mut self, text: &str) {
-        self.push_transcript_item(TranscriptItem::new("System", text.to_owned()));
+        self.transcript
+            .push(TranscriptItem::new("System", text.to_owned()));
     }
 
     fn apply_working_directory_changed(
@@ -1719,13 +1681,12 @@ impl BmuxApp {
         self.working_directory = Some(new_working_directory.to_path_buf());
         let message =
             working_directory_changed_message(old_working_directory, new_working_directory);
-        self.push_transcript_item(TranscriptItem::new("System", message));
+        self.transcript.push(TranscriptItem::new("System", message));
         self.status = format!("working directory: {}", new_working_directory.display());
     }
 
     fn push_streaming_item(&mut self, role: &'static str, text: &str) {
-        push_streaming_transcript_item(&mut self.transcript, role, text);
-        self.mark_transcript_projection_dirty();
+        self.transcript.push_streaming_item(role, text);
     }
 
     fn finish_streaming_item(
@@ -1734,8 +1695,7 @@ impl BmuxApp {
         text: &str,
         application: SessionEventApplication,
     ) {
-        finish_streaming_transcript_item(&mut self.transcript, role, text);
-        self.mark_transcript_projection_dirty();
+        self.transcript.finish_streaming_item(role, text);
         if application.live_activity() && matches!(self.activity, ActivityState::Streaming { .. }) {
             self.set_activity(ActivityState::Thinking);
         }
@@ -1803,7 +1763,6 @@ impl BmuxApp {
                 }
                 item.finish_streaming();
             }
-            self.mark_transcript_item_dirty(index);
         }
         saw_output
     }
@@ -1834,7 +1793,7 @@ impl BmuxApp {
             return;
         }
         let context = self.tool_call_contexts.get(tool_call_id);
-        self.push_transcript_item(tool_result_item(
+        self.transcript.push(tool_result_item(
             tool_call_id,
             context.map(|context| context.tool_name.as_str()),
             context.map(|context| context.arguments_json.as_str()),
@@ -1925,7 +1884,6 @@ impl BmuxApp {
                 {
                     item.set_terminal_error(*is_error);
                     item.set_terminal_finished_at(*finished_at_ms);
-                    self.mark_transcript_item_dirty(index);
                 }
                 self.finish_tool_request_preview(tool_call_id);
                 if *is_error {
@@ -1963,12 +1921,11 @@ impl BmuxApp {
         {
             self.tool_activity_seen = true;
             item.append_text(text);
-            self.mark_transcript_item_dirty(index);
             return;
         }
         let context = self.tool_call_contexts.get(tool_call_id);
         self.tool_activity_seen = true;
-        self.push_transcript_item(streaming_tool_output_item(
+        self.transcript.push(streaming_tool_output_item(
             tool_call_id,
             context.map(|context| context.tool_name.as_str()),
             context.map(|context| context.arguments_json.as_str()),
@@ -1992,7 +1949,6 @@ impl BmuxApp {
             if let Some(index) = context.index {
                 if let Some(item) = self.transcript.get_mut(index) {
                     item.append_text(text);
-                    self.mark_transcript_item_dirty(index);
                 }
                 return;
             }
@@ -2002,7 +1958,7 @@ impl BmuxApp {
             let columns = context.columns;
             let rows = context.rows;
             let started_at_ms = context.started_at_ms;
-            self.push_transcript_item(streaming_terminal_output_item(
+            self.transcript.push(streaming_terminal_output_item(
                 tool_call_id,
                 tool_context.map(|context| context.tool_name.as_str()),
                 text,
@@ -2017,7 +1973,7 @@ impl BmuxApp {
             return;
         }
         let tool_context = self.tool_call_contexts.get(tool_call_id);
-        self.push_transcript_item(streaming_terminal_output_item(
+        self.transcript.push(streaming_terminal_output_item(
             tool_call_id,
             tool_context.map(|context| context.tool_name.as_str()),
             text,
@@ -2045,7 +2001,7 @@ impl BmuxApp {
         arguments_json: &str,
         application: SessionEventApplication,
     ) {
-        self.push_transcript_item(permission_request_item(
+        self.transcript.push(permission_request_item(
             permission_id,
             tool_call_id,
             tool_name,
@@ -2139,21 +2095,18 @@ impl BmuxApp {
     }
 
     fn finish_tool_request_preview(&mut self, tool_call_id: &str) {
-        for index in (0..self.transcript.len()).rev() {
-            let item = &mut self.transcript[index];
-            let is_target = matches!(
-                item.kind(),
-                TranscriptItemKind::ToolRequest {
-                    tool_call_id: item_tool_call_id,
-                    ..
-                } if item_tool_call_id == tool_call_id
-            );
-            if is_target {
-                item.finish_streaming();
-                self.mark_transcript_item_dirty(index);
-                break;
-            }
-        }
+        self.transcript.mutate_rev_find(
+            |item| {
+                matches!(
+                    item.kind(),
+                    TranscriptItemKind::ToolRequest {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } if item_tool_call_id == tool_call_id
+                )
+            },
+            TranscriptItem::finish_streaming,
+        );
     }
 
     fn push_model_usage(
@@ -2168,7 +2121,7 @@ impl BmuxApp {
         {
             self.status = format!("tokens: {tokens}");
         }
-        self.push_transcript_item(model_usage_item(turn_id, usage));
+        self.transcript.push(model_usage_item(turn_id, usage));
     }
 
     fn finish_model_turn(
@@ -2183,12 +2136,10 @@ impl BmuxApp {
                 ToOwned::to_owned,
             );
         }
-        let last_index = self.transcript.len().saturating_sub(1);
         if let Some(last) = self.transcript.last_mut()
             && last.role == "Assistant"
         {
             last.finish_streaming();
-            self.mark_transcript_item_dirty(last_index);
         }
         if application.live_activity() {
             self.set_activity(ActivityState::Idle);
@@ -2210,7 +2161,7 @@ impl BmuxApp {
     }
 
     fn push_compaction(&mut self, summary: &str) {
-        self.push_transcript_item(TranscriptItem::new(
+        self.transcript.push(TranscriptItem::new(
             "Compaction",
             format!("context compacted: {summary}"),
         ));
@@ -2400,7 +2351,7 @@ impl BmuxApp {
     ) {
         let source =
             source.map_or_else(String::new, |source| format!("\nSource: {}", source.label));
-        self.push_transcript_item(TranscriptItem::new(
+        self.transcript.push(TranscriptItem::new(
             "Skill",
             format!("invoked {skill_id}{source}\nArguments: {arguments}"),
         ));
@@ -2409,7 +2360,7 @@ impl BmuxApp {
     fn push_skill_suggested(&mut self, skill_id: &impl std::fmt::Display, reason: Option<&str>) {
         self.status = format!("suggested skill: {skill_id}");
         if let Some(reason) = reason {
-            self.push_transcript_item(TranscriptItem::new(
+            self.transcript.push(TranscriptItem::new(
                 "Skill",
                 format!("suggested {skill_id}\nReason: {reason}"),
             ));
@@ -2417,7 +2368,7 @@ impl BmuxApp {
     }
 
     fn push_skill_error(&mut self, skill_id: &impl std::fmt::Display, error: &str) {
-        self.push_transcript_item(TranscriptItem::new(
+        self.transcript.push(TranscriptItem::new(
             "Skill error",
             format!("{skill_id}: {error}"),
         ));

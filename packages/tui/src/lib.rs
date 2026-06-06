@@ -63,6 +63,7 @@ pub(crate) mod thinking_flow;
 pub(crate) mod time_format;
 pub(crate) mod tool_present;
 pub(crate) mod transcript;
+pub(crate) mod transcript_document;
 pub(crate) mod transcript_layout;
 pub(crate) mod transcript_projection;
 pub(crate) mod transcript_viewport;
