@@ -18,6 +18,8 @@ use super::{TuiError, helpers};
 
 const SERVICE_INTERFACE_ID: &str = "bcode.code_review/v1";
 const CREATE_REVIEW_OPERATION: &str = "create_review";
+const LIST_DRAFTS_OPERATION: &str = "draft.list";
+const SAVE_DRAFT_OPERATION: &str = "draft.save";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
 /// Local Git target to open in review mode.
@@ -62,9 +64,17 @@ pub async fn run<W: Write>(
     target: ReviewOpenTarget,
 ) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
-    let review = load_review(&client, repo_path, target).await?;
+    let review_target: ReviewTarget = target.into();
+    let review = load_review(&client, repo_path.clone(), review_target.clone()).await?;
+    let drafts = load_drafts(&client, repo_path.clone(), review_target.clone()).await;
     let mut input = TuiInput::start();
     let mut app = ReviewApp::new(review);
+    match drafts {
+        Ok(drafts) => app.load_persisted_drafts(drafts),
+        Err(error) => {
+            app.status_message = Some(format!("failed to load persisted drafts: {error}"));
+        }
+    }
     let mut needs_redraw = true;
 
     while !app.should_exit {
@@ -81,6 +91,18 @@ pub async fn run<W: Write>(
         if handle_event(&mut app, terminal, &event) {
             needs_redraw = true;
         }
+        if let Some(save) = app.take_pending_draft_save() {
+            match save_draft(&client, repo_path.clone(), review_target.clone(), save).await {
+                Ok(()) => {
+                    app.status_message = Some("saved draft comment".to_string());
+                }
+                Err(error) => {
+                    app.status_message =
+                        Some(format!("saved locally; draft persistence failed: {error}"));
+                }
+            }
+            needs_redraw = true;
+        }
     }
 
     Ok(())
@@ -89,12 +111,9 @@ pub async fn run<W: Write>(
 async fn load_review(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewOpenTarget,
+    target: ReviewTarget,
 ) -> Result<ReviewSummary, TuiError> {
-    let request = CreateReviewRequest {
-        repo_path,
-        target: target.into(),
-    };
+    let request = CreateReviewRequest { repo_path, target };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
         .call_plugin_service(
@@ -110,6 +129,61 @@ async fn load_review(
         });
     }
     serde_json::from_slice(&response.payload).map_err(TuiError::Json)
+}
+
+async fn load_drafts(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+) -> Result<Vec<DraftComment>, TuiError> {
+    let request = ListDraftsRequest { repo_path, target };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            LIST_DRAFTS_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ListDraftsResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.drafts)
+}
+
+async fn save_draft(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    save: PendingDraftSave,
+) -> Result<(), TuiError> {
+    let request = SaveDraftRequest {
+        repo_path,
+        target,
+        anchor: save.anchor.into(),
+        body: save.body,
+    };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            SAVE_DRAFT_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let _: SaveDraftResponse = serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(())
 }
 
 fn handle_event<W: Write>(
@@ -296,6 +370,61 @@ impl From<ReviewOpenTarget> for ReviewTarget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ListDraftsRequest {
+    repo_path: PathBuf,
+    target: ReviewTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SaveDraftRequest {
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    anchor: DraftAnchor,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DraftAnchor {
+    file_path: String,
+    diff_row: u64,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    line_kind: ReviewLineKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct DraftComment {
+    comment_id: String,
+    thread_id: String,
+    anchor: DraftAnchor,
+    body: String,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ListDraftsResponse {
+    drafts: Vec<DraftComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct SaveDraftResponse {
+    draft: DraftComment,
+}
+
+impl From<ReviewCommentAnchor> for DraftAnchor {
+    fn from(anchor: ReviewCommentAnchor) -> Self {
+        Self {
+            file_path: anchor.path,
+            diff_row: u64::try_from(anchor.diff_row).unwrap_or(u64::MAX),
+            old_line: anchor.old_line,
+            new_line: anchor.new_line,
+            line_kind: anchor.line_kind,
+        }
+    }
+}
+
 /// Full review summary displayed by the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ReviewSummary {
@@ -405,7 +534,7 @@ pub struct ReviewLine {
 }
 
 /// Review diff line kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewLineKind {
     /// Context line.
@@ -431,6 +560,15 @@ pub struct ReviewCommentAnchor {
     pub new_line: Option<u32>,
     /// Anchored diff line kind.
     pub line_kind: ReviewLineKind,
+}
+
+/// Pending draft comment persistence request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDraftSave {
+    /// Saved anchor.
+    pub anchor: ReviewCommentAnchor,
+    /// Saved body.
+    pub body: String,
 }
 
 /// Active draft comment editor.
@@ -478,6 +616,8 @@ pub struct ReviewApp {
     pub draft_comments: BTreeMap<ReviewCommentAnchor, Vec<String>>,
     /// Active draft editor, if open.
     pub comment_editor: Option<ReviewCommentEditor>,
+    /// Draft comment awaiting persistence.
+    pub pending_draft_save: Option<PendingDraftSave>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
 }
@@ -498,6 +638,7 @@ impl ReviewApp {
             status_message: None,
             draft_comments: BTreeMap::new(),
             comment_editor: None,
+            pending_draft_save: None,
             last_file_area: None,
             last_diff_area: None,
         }
@@ -727,13 +868,49 @@ impl ReviewApp {
             self.status_message = Some("empty comment discarded".to_string());
             return true;
         }
+        let anchor = editor.anchor;
         self.draft_comments
-            .entry(editor.anchor)
+            .entry(anchor.clone())
             .or_default()
-            .push(text);
+            .push(text.clone());
+        self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
         let count = self.draft_comment_count();
         self.status_message = Some(format!("saved draft comment ({count} total)"));
         true
+    }
+
+    /// Take the pending draft save request, if present.
+    pub const fn take_pending_draft_save(&mut self) -> Option<PendingDraftSave> {
+        self.pending_draft_save.take()
+    }
+
+    /// Load persisted draft comments into local state.
+    fn load_persisted_drafts(&mut self, drafts: Vec<DraftComment>) {
+        for draft in drafts {
+            if let Some(anchor) = self.anchor_from_persisted_draft(&draft) {
+                self.draft_comments
+                    .entry(anchor)
+                    .or_default()
+                    .push(draft.body);
+            }
+        }
+    }
+
+    fn anchor_from_persisted_draft(&self, draft: &DraftComment) -> Option<ReviewCommentAnchor> {
+        let diff_row = usize::try_from(draft.anchor.diff_row).ok()?;
+        let file_index = self
+            .review
+            .files
+            .iter()
+            .position(|file| file.display_path() == draft.anchor.file_path)?;
+        Some(ReviewCommentAnchor {
+            file_index,
+            path: draft.anchor.file_path.clone(),
+            diff_row,
+            old_line: draft.anchor.old_line,
+            new_line: draft.anchor.new_line,
+            line_kind: draft.anchor.line_kind,
+        })
     }
 
     /// Return the selected diff line comment anchor, if the selected row is commentable.
@@ -981,5 +1158,33 @@ mod tests {
         assert_eq!(app.draft_comment_count(), 1);
         assert!(app.has_draft_comment_at(0, 2));
         assert_eq!(app.draft_comment_count_for_file(0), 1);
+        let pending = app
+            .take_pending_draft_save()
+            .expect("draft should be pending persistence");
+        assert_eq!(pending.anchor.diff_row, 2);
+        assert_eq!(pending.body, "Needs a test");
+    }
+
+    #[test]
+    fn loads_persisted_drafts_into_local_state() {
+        let mut app = sample_app();
+
+        app.load_persisted_drafts(vec![DraftComment {
+            comment_id: "comment-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            anchor: DraftAnchor {
+                file_path: "a.rs".to_string(),
+                diff_row: 2,
+                old_line: None,
+                new_line: Some(1),
+                line_kind: ReviewLineKind::Added,
+            },
+            body: "Persisted".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }]);
+
+        assert_eq!(app.draft_comment_count(), 1);
+        assert!(app.has_draft_comment_at(0, 2));
     }
 }
