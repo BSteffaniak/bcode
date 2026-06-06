@@ -73,10 +73,8 @@ pub async fn run_with_client<W: Write>(
 
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, keymap);
-        while let Ok(event) = chat.event_receiver.try_recv() {
-            if absorb_bcode_event(chat, event) {
-                needs_redraw = true;
-            }
+        if drain_bcode_events(chat) {
+            needs_redraw = true;
         }
 
         if chat.app.should_load_older_history() {
@@ -142,7 +140,7 @@ pub async fn run_with_client<W: Write>(
                 }
             }
             ChatLoopEvent::Bcode(event) => {
-                if absorb_bcode_event(chat, *event) {
+                if absorb_bcode_event(chat, *event) || drain_bcode_events(chat) {
                     needs_redraw = true;
                 }
             }
@@ -170,6 +168,14 @@ enum ChatLoopEvent {
     Bcode(Box<BcodeEvent>),
     Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
+}
+
+fn drain_bcode_events(chat: &mut ActiveChat) -> bool {
+    let mut needs_redraw = false;
+    while let Ok(event) = chat.event_receiver.try_recv() {
+        needs_redraw |= absorb_bcode_event(chat, event);
+    }
+    needs_redraw
 }
 
 fn absorb_bcode_event(chat: &mut ActiveChat, event: BcodeEvent) -> bool {

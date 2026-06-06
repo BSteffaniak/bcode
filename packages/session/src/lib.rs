@@ -2154,8 +2154,8 @@ mod tests {
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
-        SessionId, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
+        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
+        SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -2165,6 +2165,181 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn live_assistant_text_delta_is_not_persisted() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should create");
+        let session = manager
+            .create_session(Some("test".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let mut attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+
+        manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn-1".to_string(),
+                    text: "live text".to_string(),
+                },
+            )
+            .await
+            .expect("live event should publish");
+
+        let received = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("subscriber should receive live event");
+        assert_eq!(
+            received.kind,
+            SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_string(),
+                text: "live text".to_string(),
+            }
+        );
+        let persisted = manager
+            .session_history(session.id)
+            .await
+            .expect("history should read");
+        assert!(
+            !persisted
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::AssistantDelta { .. }))
+        );
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn live_assistant_reasoning_delta_is_not_persisted() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should create");
+        let session = manager
+            .create_session(Some("test".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let mut attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+
+        manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantReasoningDelta {
+                    turn_id: "turn-1".to_string(),
+                    text: "live reasoning".to_string(),
+                },
+            )
+            .await
+            .expect("live event should publish");
+
+        let received = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("subscriber should receive live event");
+        assert_eq!(
+            received.kind,
+            SessionLiveEventKind::AssistantReasoningDelta {
+                turn_id: "turn-1".to_string(),
+                text: "live reasoning".to_string(),
+            }
+        );
+        let persisted = manager
+            .session_history(session.id)
+            .await
+            .expect("history should read");
+        assert!(
+            !persisted.iter().any(|event| matches!(
+                event.kind,
+                SessionEventKind::AssistantReasoningDelta { .. }
+            ))
+        );
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn live_tool_output_delta_is_not_persisted() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should create");
+        let session = manager
+            .create_session(Some("test".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let mut attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let stream_event = ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id: "tool-1".to_string(),
+            stream: ToolOutputStream::Stdout,
+            sequence: 1,
+            text: "live only".to_string(),
+            byte_len: 9,
+        };
+        manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::ToolOutputDelta {
+                    event: stream_event.clone(),
+                },
+            )
+            .await
+            .expect("live event should publish");
+        let received = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("subscriber should receive live event");
+        assert_eq!(
+            received.kind,
+            SessionLiveEventKind::ToolOutputDelta {
+                event: stream_event
+            }
+        );
+        let persisted = manager
+            .session_history(session.id)
+            .await
+            .expect("history should read");
+        assert!(!persisted.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { .. }
+            }
+        )));
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[test]
+    fn live_event_broker_drops_without_receivers_and_tracks_publish_counts() {
+        let broker = super::SessionLiveEventBroker::new(4);
+        let session_id = SessionId::new();
+        let event = SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_string(),
+                text: "hello".to_string(),
+            },
+        };
+
+        assert_eq!(broker.publish(event.clone()), None);
+        assert_eq!(broker.published.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.dropped_no_receivers.load(Ordering::Relaxed), 1);
+
+        let mut receiver = broker.subscribe();
+        assert_eq!(broker.publish(event.clone()), Some(event.clone()));
+        assert_eq!(broker.published.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.dropped_no_receivers.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            receiver.try_recv().expect("event should be available"),
+            event
+        );
+    }
 
     #[tokio::test]
     async fn transient_tool_output_delta_is_not_persisted() {
