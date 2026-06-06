@@ -69,9 +69,16 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             app.review.files.len()
         )
     };
+    let (hunk, hunk_total) = app.hunk_position();
     let text = format!(
-        " bcode review  {}  {}  files {}  +{} -{} ",
-        app.review.title, file_label, file_position, app.review.additions, app.review.deletions
+        " bcode review  {}  {}  File {}  Hunk {}/{}  +{} -{} ",
+        app.review.title,
+        file_label,
+        file_position,
+        hunk,
+        hunk_total,
+        app.review.additions,
+        app.review.deletions
     );
     frame.write_line_with_fallback_style(
         area,
@@ -96,7 +103,14 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         "help"
     };
-    let text = format!(" j/k scroll  n/p file  J/K hunk  b sidebar:{sidebar}  ? {help}  q exit ");
+    let text = app.status_message.as_ref().map_or_else(
+        || {
+            format!(
+                " j/k scroll  n/p file  J/K hunk  c comment  b sidebar:{sidebar}  ? {help}  q exit "
+            )
+        },
+        |message| format!(" {message}"),
+    );
     frame.write_line_with_fallback_style(
         area,
         &Line::from_spans(vec![Span::styled(
@@ -207,9 +221,25 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         let row_area = Rect::new(area.x, y, area.width, 1);
         if let Some(rendered) = rows.get(index) {
-            frame.write_line_with_fallback_style(row_area, &rendered.line, rendered.style);
+            let (line, style) = if index == app.selected_diff_line {
+                (
+                    selected_line(&rendered.line),
+                    rendered.style.bg(Color::BrightBlack),
+                )
+            } else {
+                (rendered.line.clone(), rendered.style)
+            };
+            frame.write_line_with_fallback_style(row_area, &line, style);
         }
     }
+}
+
+fn selected_line(line: &Line) -> Line {
+    let mut line = line.clone();
+    for span in &mut line.spans {
+        span.style = span.style.bg(Color::BrightBlack);
+    }
+    line
 }
 
 fn render_empty(area: Rect, text: &str, frame: &mut Frame<'_>) {
@@ -289,6 +319,7 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " b                   toggle file sidebar",
         " mouse wheel         scroll diff",
         " click file          open file",
+        " c                   create comment (coming next)",
         " ?                   toggle this help",
         " q or esc            exit review",
     ];

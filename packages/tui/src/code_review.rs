@@ -147,6 +147,11 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('p') | KeyCode::Left => app.select_previous_file(),
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
+        KeyCode::Char('c') => {
+            app.status_message =
+                Some("comments are coming next; selected line is ready".to_string());
+            true
+        }
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
             true
@@ -157,8 +162,20 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
 
 fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(3),
-        MouseEventKind::ScrollDown => app.scroll_down(3),
+        MouseEventKind::ScrollUp => {
+            if app.file_area_contains(mouse.position.x, mouse.position.y) {
+                app.scroll_files_up(3)
+            } else {
+                app.scroll_up(3)
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.file_area_contains(mouse.position.x, mouse.position.y) {
+                app.scroll_files_down(3)
+            } else {
+                app.scroll_down(3)
+            }
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(index) = app.file_index_at(mouse.position.x, mouse.position.y) {
                 app.select_file(index)
@@ -372,6 +389,8 @@ pub struct ReviewApp {
     pub help_visible: bool,
     /// Whether to exit.
     pub should_exit: bool,
+    /// Last transient status message.
+    pub status_message: Option<String>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
 }
@@ -389,6 +408,7 @@ impl ReviewApp {
             sidebar_visible: true,
             help_visible: false,
             should_exit: false,
+            status_message: None,
             last_file_area: None,
             last_diff_area: None,
         }
@@ -426,6 +446,30 @@ impl ReviewApp {
         self.select_file((self.selected_file + 1).min(self.review.files.len().saturating_sub(1)))
     }
 
+    /// Scroll file sidebar down.
+    pub fn scroll_files_down(&mut self, rows: usize) -> bool {
+        let max = self.review.files.len().saturating_sub(
+            self.last_file_area
+                .map_or(1, |area| usize::from(area.height).max(1)),
+        );
+        let next = self.file_scroll.saturating_add(rows).min(max);
+        if next == self.file_scroll {
+            return false;
+        }
+        self.file_scroll = next;
+        true
+    }
+
+    /// Scroll file sidebar up.
+    pub const fn scroll_files_up(&mut self, rows: usize) -> bool {
+        let next = self.file_scroll.saturating_sub(rows);
+        if next == self.file_scroll {
+            return false;
+        }
+        self.file_scroll = next;
+        true
+    }
+
     /// Select previous file.
     pub const fn select_previous_file(&mut self) -> bool {
         self.select_file(self.selected_file.saturating_sub(1))
@@ -439,16 +483,24 @@ impl ReviewApp {
             return false;
         }
         self.diff_scroll = next;
+        self.selected_diff_line = self.selected_diff_line.max(self.diff_scroll);
         true
     }
 
     /// Scroll diff up.
-    pub const fn scroll_up(&mut self, rows: usize) -> bool {
+    pub fn scroll_up(&mut self, rows: usize) -> bool {
         let next = self.diff_scroll.saturating_sub(rows);
         if next == self.diff_scroll {
             return false;
         }
         self.diff_scroll = next;
+        self.selected_diff_line = self.selected_diff_line.min(
+            self.diff_scroll.saturating_add(
+                self.last_diff_area
+                    .map_or(1, |area| usize::from(area.height).max(1))
+                    .saturating_sub(1),
+            ),
+        );
         true
     }
 
@@ -476,11 +528,12 @@ impl ReviewApp {
         let Some(next) = self
             .hunk_render_rows()
             .into_iter()
-            .find(|row| *row > self.diff_scroll)
+            .find(|row| *row > self.selected_diff_line)
         else {
             return false;
         };
-        self.diff_scroll = next;
+        self.selected_diff_line = next;
+        self.ensure_selected_diff_line_visible();
         true
     }
 
@@ -490,18 +543,31 @@ impl ReviewApp {
             .hunk_render_rows()
             .into_iter()
             .rev()
-            .find(|row| *row < self.diff_scroll)
+            .find(|row| *row < self.selected_diff_line)
         else {
             return false;
         };
-        self.diff_scroll = previous;
+        self.selected_diff_line = previous;
+        self.ensure_selected_diff_line_visible();
         true
     }
 
     /// Select a visible diff line by rendered row index.
-    pub const fn select_diff_line(&mut self, index: usize) -> bool {
-        self.selected_diff_line = index;
+    pub fn select_diff_line(&mut self, index: usize) -> bool {
+        let clamped = index.min(self.rendered_diff_len().saturating_sub(1));
+        if clamped == self.selected_diff_line {
+            return false;
+        }
+        self.selected_diff_line = clamped;
+        self.ensure_selected_diff_line_visible();
         true
+    }
+
+    /// Return whether file sidebar contains terminal coordinates.
+    #[must_use]
+    pub fn file_area_contains(&self, x: u16, y: u16) -> bool {
+        self.last_file_area
+            .is_some_and(|area| x >= area.x && x < area.right() && y >= area.y && y < area.bottom())
     }
 
     /// Return visible file index under terminal coordinates.
@@ -523,6 +589,33 @@ impl ReviewApp {
             return None;
         }
         Some(self.diff_scroll + usize::from(y.saturating_sub(area.y)))
+    }
+
+    /// Return current hunk position as one-based `(current, total)`.
+    #[must_use]
+    pub fn hunk_position(&self) -> (usize, usize) {
+        let rows = self.hunk_render_rows();
+        let total = rows.len();
+        let current = rows
+            .iter()
+            .position(|row| *row > self.selected_diff_line)
+            .unwrap_or(total)
+            .max(1);
+        (current, total)
+    }
+
+    fn ensure_selected_diff_line_visible(&mut self) {
+        let height = self
+            .last_diff_area
+            .map_or(1, |area| usize::from(area.height).max(1));
+        if self.selected_diff_line < self.diff_scroll {
+            self.diff_scroll = self.selected_diff_line;
+        } else if self.selected_diff_line >= self.diff_scroll.saturating_add(height) {
+            self.diff_scroll = self
+                .selected_diff_line
+                .saturating_sub(height.saturating_sub(1));
+        }
+        self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
     }
 
     fn max_diff_scroll(&self) -> usize {
@@ -567,5 +660,109 @@ pub fn sidebar_width(app: &ReviewApp, width: u16) -> u16 {
         FILE_SIDEBAR_WIDTH.min(width.saturating_sub(30))
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_app() -> ReviewApp {
+        ReviewApp::new(ReviewSummary {
+            title: "test".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            additions: 2,
+            deletions: 1,
+            files: vec![
+                ReviewFile {
+                    old_path: Some("a.rs".to_string()),
+                    new_path: Some("a.rs".to_string()),
+                    status: ReviewFileStatus::Modified,
+                    additions: 2,
+                    deletions: 1,
+                    is_binary: false,
+                    hunks: vec![
+                        ReviewHunk {
+                            old_start: 1,
+                            old_count: 1,
+                            new_start: 1,
+                            new_count: 2,
+                            heading: None,
+                            lines: vec![
+                                ReviewLine {
+                                    kind: ReviewLineKind::Removed,
+                                    old_line: Some(1),
+                                    new_line: None,
+                                    content: "old".to_string(),
+                                },
+                                ReviewLine {
+                                    kind: ReviewLineKind::Added,
+                                    old_line: None,
+                                    new_line: Some(1),
+                                    content: "new".to_string(),
+                                },
+                            ],
+                        },
+                        ReviewHunk {
+                            old_start: 10,
+                            old_count: 1,
+                            new_start: 11,
+                            new_count: 1,
+                            heading: Some("next".to_string()),
+                            lines: vec![ReviewLine {
+                                kind: ReviewLineKind::Context,
+                                old_line: Some(10),
+                                new_line: Some(11),
+                                content: "ctx".to_string(),
+                            }],
+                        },
+                    ],
+                },
+                ReviewFile {
+                    old_path: Some("b.rs".to_string()),
+                    new_path: Some("b.rs".to_string()),
+                    status: ReviewFileStatus::Modified,
+                    additions: 0,
+                    deletions: 0,
+                    is_binary: false,
+                    hunks: Vec::new(),
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn file_navigation_resets_diff_state() {
+        let mut app = sample_app();
+        app.diff_scroll = 2;
+        app.selected_diff_line = 2;
+
+        assert!(app.select_next_file());
+
+        assert_eq!(app.selected_file, 1);
+        assert_eq!(app.diff_scroll, 0);
+        assert_eq!(app.selected_diff_line, 0);
+    }
+
+    #[test]
+    fn hunk_navigation_tracks_selected_line() {
+        let mut app = sample_app();
+        app.set_diff_area(Rect::new(0, 0, 80, 2));
+
+        assert!(app.select_next_hunk());
+
+        assert_eq!(app.selected_diff_line, 3);
+        assert_eq!(app.diff_scroll, 2);
+        assert_eq!(app.hunk_position(), (2, 2));
+    }
+
+    #[test]
+    fn mouse_file_hit_uses_last_rendered_file_area() {
+        let mut app = sample_app();
+        app.file_scroll = 1;
+        app.set_file_area(Some(Rect::new(0, 2, 20, 5)));
+
+        assert_eq!(app.file_index_at(3, 2), Some(1));
+        assert_eq!(app.file_index_at(30, 2), None);
     }
 }
