@@ -6,8 +6,18 @@
 
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::env;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use switchy::database::query::{FilterableQuery as _, where_eq};
+use switchy::database::schema::{Column, DataType, create_table};
+use switchy::database::{Database, DatabaseError, DatabaseValue, Row};
+use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
+use switchy::schema::runner::MigrationRunner;
 use thiserror::Error;
 
 /// Code review plugin service interface.
@@ -15,6 +25,19 @@ pub const CODE_REVIEW_SERVICE_INTERFACE_ID: &str = "bcode.code_review/v1";
 
 /// Operation that creates an ephemeral local review from a Git target.
 pub const OP_CREATE_REVIEW: &str = "create_review";
+/// Operation that lists persisted draft comments for a review target.
+pub const OP_DRAFT_LIST: &str = "draft.list";
+/// Operation that saves a persisted draft comment.
+pub const OP_DRAFT_SAVE: &str = "draft.save";
+
+const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
+const DEFAULT_STATE_ROOT: &str = ".bcode/code-review";
+const DATABASE_FILE_NAME: &str = "code-review.db";
+const MIGRATIONS_TABLE: &str = "__bcode_code_review_migrations";
+const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
+const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
+const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bundled local code review plugin.
 #[derive(Default)]
@@ -31,6 +54,8 @@ impl RustPlugin for CodeReviewPlugin {
 
         match context.request.operation.as_str() {
             OP_CREATE_REVIEW => create_review(&context.request),
+            OP_DRAFT_LIST => list_drafts(&context.request),
+            OP_DRAFT_SAVE => save_draft(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -80,6 +105,74 @@ pub enum ReviewTarget {
         #[serde(default = "default_true")]
         merge_base: bool,
     },
+}
+
+/// Request payload for `draft.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListDraftsRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Local Git target whose drafts should be listed.
+    pub target: ReviewTarget,
+}
+
+/// Request payload for `draft.save`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveDraftRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Local Git target whose draft should be saved.
+    pub target: ReviewTarget,
+    /// Comment anchor.
+    pub anchor: DraftAnchor,
+    /// Draft body.
+    pub body: String,
+}
+
+/// Persisted draft anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftAnchor {
+    /// File path in the review.
+    pub file_path: String,
+    /// Rendered diff row.
+    pub diff_row: u64,
+    /// Old line number, when present.
+    pub old_line: Option<u32>,
+    /// New line number, when present.
+    pub new_line: Option<u32>,
+    /// Line kind.
+    pub line_kind: ReviewLineKind,
+}
+
+/// Persisted draft comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftComment {
+    /// Comment id.
+    pub comment_id: String,
+    /// Thread id.
+    pub thread_id: String,
+    /// Comment anchor.
+    pub anchor: DraftAnchor,
+    /// Draft body.
+    pub body: String,
+    /// Creation timestamp in milliseconds since Unix epoch.
+    pub created_at_ms: u64,
+    /// Last update timestamp in milliseconds since Unix epoch.
+    pub updated_at_ms: u64,
+}
+
+/// Response payload for `draft.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListDraftsResponse {
+    /// Draft comments.
+    pub drafts: Vec<DraftComment>,
+}
+
+/// Response payload for `draft.save`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveDraftResponse {
+    /// Saved draft comment.
+    pub draft: DraftComment,
 }
 
 /// Structured review response.
@@ -195,6 +288,16 @@ enum ReviewError {
     Git(String),
     #[error("failed to parse diff: {0}")]
     Parse(String),
+    #[error("database connection failed: {0}")]
+    Connection(#[from] switchy::database_connection::InitTursoError),
+    #[error("database operation failed: {0}")]
+    Database(#[from] DatabaseError),
+    #[error("database migration failed: {0}")]
+    Migration(#[from] switchy::schema::MigrationError),
+    #[error("serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("database row is missing column {0}")]
+    MissingColumn(&'static str),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -211,16 +314,75 @@ fn create_review(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn create_review_summary(request: &CreateReviewRequest) -> Result<ReviewSummary, ReviewError> {
-    if !request.repo_path.is_dir() {
+fn list_drafts(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ListDraftsRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+
+    match list_drafts_for_request(&request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("draft_list_failed", error.to_string()),
+    }
+}
+
+fn save_draft(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<SaveDraftRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+
+    match save_draft_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("draft_save_failed", error.to_string()),
+    }
+}
+
+fn list_drafts_for_request(request: &ListDraftsRequest) -> Result<ListDraftsResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let review_key = review_key(&repo_root, &request.target)?;
+    let drafts = with_database(&repo_root, move |database| {
+        Box::pin(async move { CodeReviewDb::new(database).list_drafts(&review_key).await })
+    })?;
+    Ok(ListDraftsResponse { drafts })
+}
+
+fn save_draft_for_request(request: SaveDraftRequest) -> Result<SaveDraftResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let db_repo_root = repo_root.clone();
+    let review_key = review_key(&repo_root, &request.target)?;
+    let target_kind = target_kind(&request.target).to_string();
+    let target_json = serde_json::to_string(&request.target)?;
+    let draft = with_database(&repo_root, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .save_draft(
+                    &review_key,
+                    &db_repo_root,
+                    &target_kind,
+                    &target_json,
+                    request.anchor,
+                    &request.body,
+                )
+                .await
+        })
+    })?;
+    Ok(SaveDraftResponse { draft })
+}
+
+fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
+    if !repo_path.is_dir() {
         return Err(ReviewError::InvalidRequest(format!(
             "repo_path is not a directory: {}",
-            request.repo_path.display()
+            repo_path.display()
         )));
     }
+    let repo_root = git_output(repo_path, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(repo_root.trim()))
+}
 
-    let repo_root = git_output(&request.repo_path, &["rev-parse", "--show-toplevel"])?;
-    let repo_root = PathBuf::from(repo_root.trim());
+fn create_review_summary(request: &CreateReviewRequest) -> Result<ReviewSummary, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
     let diff = diff_for_target(&repo_root, &request.target)?;
     let files = parse_unified_diff(&diff)?;
     let additions = files.iter().map(|file| file.additions).sum();
@@ -233,6 +395,448 @@ fn create_review_summary(request: &CreateReviewRequest) -> Result<ReviewSummary,
         additions,
         deletions,
     })
+}
+
+struct CodeReviewDb<'a> {
+    db: &'a dyn Database,
+}
+
+impl<'a> CodeReviewDb<'a> {
+    const fn new(db: &'a dyn Database) -> Self {
+        Self { db }
+    }
+
+    async fn list_drafts(&self, review_key: &str) -> Result<Vec<DraftComment>, ReviewError> {
+        let thread_rows = self
+            .db
+            .select("draft_threads")
+            .columns(&[
+                "thread_id",
+                "file_path",
+                "diff_row",
+                "old_line",
+                "new_line",
+                "line_kind",
+            ])
+            .filter(Box::new(where_eq("review_key", review_key)))
+            .execute(self.db)
+            .await?;
+        let mut drafts = Vec::new();
+        for thread in thread_rows {
+            let thread_id = required_text(&thread, "thread_id")?;
+            let anchor = DraftAnchor {
+                file_path: required_text(&thread, "file_path")?,
+                diff_row: i64_to_u64(required_i64(&thread, "diff_row")?),
+                old_line: optional_i64(&thread, "old_line").map(i64_to_u32),
+                new_line: optional_i64(&thread, "new_line").map(i64_to_u32),
+                line_kind: line_kind_from_str(&required_text(&thread, "line_kind")?)?,
+            };
+            let comment_rows = self
+                .db
+                .select("draft_comments")
+                .columns(&["comment_id", "body", "created_at_ms", "updated_at_ms"])
+                .filter(Box::new(where_eq("thread_id", thread_id.clone())))
+                .execute(self.db)
+                .await?;
+            drafts.extend(
+                comment_rows
+                    .into_iter()
+                    .map(|row| comment_from_row(&row, &thread_id, &anchor))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(drafts)
+    }
+
+    async fn save_draft(
+        &self,
+        review_key: &str,
+        repo_root: &Path,
+        target_kind: &str,
+        target_json: &str,
+        anchor: DraftAnchor,
+        body: &str,
+    ) -> Result<DraftComment, ReviewError> {
+        let now = now_ms();
+        let thread_id = thread_id(review_key, &anchor)?;
+        let comment_id = comment_id(&thread_id, body, now);
+        self.ensure_review(review_key, repo_root, target_kind, target_json, now)
+            .await?;
+        self.ensure_thread(review_key, &thread_id, &anchor, now)
+            .await?;
+        self.db
+            .insert("draft_comments")
+            .value("comment_id", comment_id.clone())
+            .value("thread_id", thread_id.clone())
+            .value("body", body.to_string())
+            .value("created_at_ms", u64_to_i64(now))
+            .value("updated_at_ms", u64_to_i64(now))
+            .execute(self.db)
+            .await?;
+        Ok(DraftComment {
+            comment_id,
+            thread_id,
+            anchor,
+            body: body.to_string(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    async fn ensure_review(
+        &self,
+        review_key: &str,
+        repo_root: &Path,
+        target_kind: &str,
+        target_json: &str,
+        now: u64,
+    ) -> Result<(), ReviewError> {
+        if self
+            .db
+            .select("reviews")
+            .columns(&["review_key"])
+            .filter(Box::new(where_eq("review_key", review_key)))
+            .execute_first(self.db)
+            .await?
+            .is_some()
+        {
+            self.db
+                .update("reviews")
+                .value("updated_at_ms", u64_to_i64(now))
+                .filter(Box::new(where_eq("review_key", review_key)))
+                .execute(self.db)
+                .await?;
+            return Ok(());
+        }
+        self.db
+            .insert("reviews")
+            .value("review_key", review_key.to_string())
+            .value("repo_root", repo_root.display().to_string())
+            .value("target_kind", target_kind.to_string())
+            .value("target_json", target_json.to_string())
+            .value("created_at_ms", u64_to_i64(now))
+            .value("updated_at_ms", u64_to_i64(now))
+            .execute(self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_thread(
+        &self,
+        review_key: &str,
+        thread_id: &str,
+        anchor: &DraftAnchor,
+        now: u64,
+    ) -> Result<(), ReviewError> {
+        if self
+            .db
+            .select("draft_threads")
+            .columns(&["thread_id"])
+            .filter(Box::new(where_eq("thread_id", thread_id)))
+            .execute_first(self.db)
+            .await?
+            .is_some()
+        {
+            self.db
+                .update("draft_threads")
+                .value("updated_at_ms", u64_to_i64(now))
+                .filter(Box::new(where_eq("thread_id", thread_id)))
+                .execute(self.db)
+                .await?;
+            return Ok(());
+        }
+        self.db
+            .insert("draft_threads")
+            .value("thread_id", thread_id.to_string())
+            .value("review_key", review_key.to_string())
+            .value("file_path", anchor.file_path.clone())
+            .value("diff_row", u64_to_i64(anchor.diff_row))
+            .value("old_line", optional_u32(anchor.old_line))
+            .value("new_line", optional_u32(anchor.new_line))
+            .value("line_kind", line_kind_str(anchor.line_kind))
+            .value("created_at_ms", u64_to_i64(now))
+            .value("updated_at_ms", u64_to_i64(now))
+            .execute(self.db)
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatePaths {
+    state_root: PathBuf,
+    database_path: PathBuf,
+}
+
+fn state_paths(repo_root: &Path) -> StatePaths {
+    let state_root = env::var_os(CODE_REVIEW_STATE_DIR_ENV)
+        .map_or_else(|| repo_root.join(DEFAULT_STATE_ROOT), PathBuf::from);
+    let database_path = state_root.join(DATABASE_FILE_NAME);
+    StatePaths {
+        state_root,
+        database_path,
+    }
+}
+
+fn with_database<T>(
+    repo_root: &Path,
+    operation: impl for<'a> FnOnce(
+        &'a dyn Database,
+    ) -> Pin<Box<dyn Future<Output = Result<T, ReviewError>> + 'a>>
+    + Send
+    + 'static,
+) -> Result<T, ReviewError>
+where
+    T: Send + 'static,
+{
+    let paths = state_paths(repo_root);
+    std::fs::create_dir_all(&paths.state_root)?;
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread Tokio runtime should build");
+        runtime.block_on(async {
+            let database = open_database(&paths.database_path).await?;
+            run_migrations(database.as_ref()).await?;
+            operation(database.as_ref()).await
+        })
+    })
+    .join()
+    .map_err(|_| ReviewError::InvalidRequest("database worker panicked".to_string()))?
+}
+
+async fn open_database(path: &Path) -> Result<Box<dyn Database>, ReviewError> {
+    let mut attempt = 0_u32;
+    let mut delay = DATABASE_OPEN_INITIAL_RETRY_DELAY;
+    loop {
+        match switchy::database_connection::builder()
+            .turso()
+            .with_path(path)
+            .with_busy_timeout(DATABASE_BUSY_TIMEOUT)
+            .with_multiprocess_wal(true)
+            .build()
+            .await
+        {
+            Ok(db) => return Ok(db),
+            Err(error)
+                if is_database_lock_error(&error) && attempt < DATABASE_OPEN_RETRY_ATTEMPTS =>
+            {
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(DATABASE_OPEN_MAX_RETRY_DELAY);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn is_database_lock_error(error: &switchy::database_connection::InitTursoError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("locking error")
+        || message.contains("failed locking file")
+        || message.contains("database is locked")
+        || message.contains("busy")
+}
+
+async fn run_migrations(database: &dyn Database) -> Result<(), ReviewError> {
+    let runner = MigrationRunner::new(Box::new(code_review_migrations()))
+        .with_table_name(MIGRATIONS_TABLE.to_string());
+    runner.run(database).await?;
+    Ok(())
+}
+
+fn code_review_migrations() -> CodeMigrationSource<'static> {
+    let mut source = CodeMigrationSource::new();
+    source.add_migration(CodeMigration::new(
+        "001_reviews_table".to_string(),
+        Box::new(
+            create_table("reviews")
+                .if_not_exists(true)
+                .column(text_column("review_key"))
+                .column(text_column("repo_root"))
+                .column(text_column("target_kind"))
+                .column(text_column("target_json"))
+                .column(int_column("created_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .primary_key("review_key"),
+        ),
+        None,
+    ));
+    source.add_migration(CodeMigration::new(
+        "002_draft_threads_table".to_string(),
+        Box::new(
+            create_table("draft_threads")
+                .if_not_exists(true)
+                .column(text_column("thread_id"))
+                .column(text_column("review_key"))
+                .column(text_column("file_path"))
+                .column(int_column("diff_row"))
+                .column(nullable_int_column("old_line"))
+                .column(nullable_int_column("new_line"))
+                .column(text_column("line_kind"))
+                .column(int_column("created_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .primary_key("thread_id"),
+        ),
+        None,
+    ));
+    source.add_migration(CodeMigration::new(
+        "003_draft_comments_table".to_string(),
+        Box::new(
+            create_table("draft_comments")
+                .if_not_exists(true)
+                .column(text_column("comment_id"))
+                .column(text_column("thread_id"))
+                .column(text_column("body"))
+                .column(int_column("created_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .primary_key("comment_id"),
+        ),
+        None,
+    ));
+    source
+}
+
+fn text_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        nullable: false,
+        auto_increment: false,
+        data_type: DataType::Text,
+        default: None,
+    }
+}
+
+fn int_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        nullable: false,
+        auto_increment: false,
+        data_type: DataType::BigInt,
+        default: None,
+    }
+}
+
+fn nullable_int_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        nullable: true,
+        auto_increment: false,
+        data_type: DataType::BigInt,
+        default: None,
+    }
+}
+
+fn comment_from_row(
+    row: &Row,
+    thread_id: &str,
+    anchor: &DraftAnchor,
+) -> Result<DraftComment, ReviewError> {
+    Ok(DraftComment {
+        comment_id: required_text(row, "comment_id")?,
+        thread_id: thread_id.to_string(),
+        anchor: anchor.clone(),
+        body: required_text(row, "body")?,
+        created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
+        updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+    })
+}
+
+fn required_text(row: &Row, column: &'static str) -> Result<String, ReviewError> {
+    row.get(column)
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .ok_or(ReviewError::MissingColumn(column))
+}
+
+fn required_i64(row: &Row, column: &'static str) -> Result<i64, ReviewError> {
+    row.get(column)
+        .and_then(|value| value.as_i64())
+        .ok_or(ReviewError::MissingColumn(column))
+}
+
+fn optional_i64(row: &Row, column: &'static str) -> Option<i64> {
+    row.get(column).and_then(|value| value.as_i64())
+}
+
+fn review_key(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewError> {
+    let mut hasher = Sha256::new();
+    hasher.update(repo_root.display().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_string(target)?.as_bytes());
+    Ok(format!("review-{:x}", hasher.finalize()))
+}
+
+fn thread_id(review_key: &str, anchor: &DraftAnchor) -> Result<String, ReviewError> {
+    let mut hasher = Sha256::new();
+    hasher.update(review_key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_string(anchor)?.as_bytes());
+    Ok(format!("thread-{:x}", hasher.finalize()))
+}
+
+fn comment_id(thread_id: &str, body: &str, now: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(thread_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(body.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_string().as_bytes());
+    format!("comment-{:x}", hasher.finalize())
+}
+
+const fn target_kind(target: &ReviewTarget) -> &'static str {
+    match target {
+        ReviewTarget::WorkingTreeUnstaged => "working_tree_unstaged",
+        ReviewTarget::IndexStaged => "index_staged",
+        ReviewTarget::WorkingTreeAndIndex => "working_tree_and_index",
+        ReviewTarget::LastCommit => "last_commit",
+        ReviewTarget::CommitRange { .. } => "commit_range",
+        ReviewTarget::BranchCompare { .. } => "branch_compare",
+    }
+}
+
+const fn line_kind_str(kind: ReviewLineKind) -> &'static str {
+    match kind {
+        ReviewLineKind::Context => "context",
+        ReviewLineKind::Added => "added",
+        ReviewLineKind::Removed => "removed",
+    }
+}
+
+fn line_kind_from_str(value: &str) -> Result<ReviewLineKind, ReviewError> {
+    match value {
+        "context" => Ok(ReviewLineKind::Context),
+        "added" => Ok(ReviewLineKind::Added),
+        "removed" => Ok(ReviewLineKind::Removed),
+        _ => Err(ReviewError::InvalidRequest(format!(
+            "unknown line kind: {value}"
+        ))),
+    }
+}
+
+fn optional_u32(value: Option<u32>) -> DatabaseValue {
+    DatabaseValue::Int64Opt(value.map(i64::from))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+fn i64_to_u32(value: i64) -> u32 {
+    u32::try_from(value).unwrap_or(0)
 }
 
 fn diff_for_target(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewError> {

@@ -1112,7 +1112,10 @@ dependencies = [
  "bcode_plugin_sdk",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "switchy",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
