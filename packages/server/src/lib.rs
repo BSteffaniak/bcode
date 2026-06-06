@@ -9977,6 +9977,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_output_accumulator_flushes_at_byte_threshold() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let mut pending_output = None;
+
+        push_tool_output_stream(
+            &state,
+            session_id,
+            &mut pending_output,
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-1".to_owned(),
+                stream: SessionToolOutputStream::Pty,
+                sequence: 1,
+                text: "x".repeat(TOOL_OUTPUT_FLUSH_BYTES - 1),
+                byte_len: TOOL_OUTPUT_FLUSH_BYTES - 1,
+            },
+        )
+        .await;
+        assert!(attachment.live_events.try_recv().is_err());
+
+        push_tool_output_stream(
+            &state,
+            session_id,
+            &mut pending_output,
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-1".to_owned(),
+                stream: SessionToolOutputStream::Pty,
+                sequence: 2,
+                text: "y".to_owned(),
+                byte_len: 1,
+            },
+        )
+        .await;
+
+        let received = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("subscriber should receive threshold flush");
+        let SessionLiveEventKind::ToolOutputDelta {
+            event:
+                ToolInvocationStreamEvent::OutputDelta {
+                    sequence,
+                    text,
+                    byte_len,
+                    ..
+                },
+        } = received.kind
+        else {
+            panic!("expected tool output delta");
+        };
+        assert_eq!(sequence, 1);
+        assert_eq!(text.len(), TOOL_OUTPUT_FLUSH_BYTES);
+        assert!(text.ends_with('y'));
+        assert_eq!(byte_len, TOOL_OUTPUT_FLUSH_BYTES);
+        assert!(pending_output.is_none());
+    }
+
+    #[tokio::test]
     async fn append_tool_finished_event_inner_preserves_canonical_result() {
         let sessions = SessionManager::default();
         let summary = sessions

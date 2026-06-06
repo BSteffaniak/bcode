@@ -1,7 +1,7 @@
 //! Main chat event loop for the TUI.
 
 use std::io::Write;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::BcodeClient;
@@ -25,6 +25,8 @@ use super::{
     mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
     slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
 };
+
+const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 struct ModalState {
     palette: Option<BmuxCommandPalette>,
@@ -70,6 +72,9 @@ pub async fn run_with_client<W: Write>(
     let mut invalidation_queue = InvalidationQueue::default();
     refresh_invalidation_queue(chat, &mut invalidation_queue);
     let mut needs_redraw = true;
+    let mut last_redraw = Instant::now()
+        .checked_sub(TARGET_FRAME_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, keymap);
@@ -98,30 +103,19 @@ pub async fn run_with_client<W: Write>(
         }
 
         if needs_redraw {
-            terminal.draw(|frame| {
-                render::render(&mut chat.app, frame);
-                if let Some(slash_palette) = &modals.slash_palette {
-                    slash_palette_render::render_palette(
-                        slash_palette,
-                        chat.app.composer_content_area(),
-                        frame,
-                    );
-                }
-                if let Some(palette) = &mut modals.palette {
-                    command_palette_render::render_palette(palette, frame);
-                }
-                if let Some(dialog) = &modals.permission_dialog {
-                    permission_dialog_render::render_permission_dialog(dialog, frame);
-                }
-                if let Some(dialog) = &modals.thinking_dialog {
-                    thinking_dialog_render::render_thinking_dialog(dialog, frame);
-                }
-            })?;
+            draw_chat_frame(terminal, chat, &mut modals)?;
             refresh_invalidation_queue(chat, &mut invalidation_queue);
             needs_redraw = false;
+            last_redraw = Instant::now();
         }
 
-        let event = next_chat_loop_event(terminal_events, &mut invalidation_queue, chat).await?;
+        let event = next_chat_loop_event(
+            terminal_events,
+            &mut invalidation_queue,
+            chat,
+            needs_redraw.then_some(last_redraw + TARGET_FRAME_INTERVAL),
+        )
+        .await?;
         match event {
             ChatLoopEvent::Terminal(event) => {
                 let event_invalidation = if matches!(event, Event::Resize(_)) {
@@ -157,6 +151,7 @@ pub async fn run_with_client<W: Write>(
                     needs_redraw = true;
                 }
             }
+            ChatLoopEvent::RedrawFrame => {}
         }
     }
 
@@ -168,6 +163,34 @@ enum ChatLoopEvent {
     Bcode(Box<BcodeEvent>),
     Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
+    RedrawFrame,
+}
+
+fn draw_chat_frame<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    chat: &mut ActiveChat,
+    modals: &mut ModalState,
+) -> Result<(), TuiError> {
+    terminal.draw(|frame| {
+        render::render(&mut chat.app, frame);
+        if let Some(slash_palette) = &modals.slash_palette {
+            slash_palette_render::render_palette(
+                slash_palette,
+                chat.app.composer_content_area(),
+                frame,
+            );
+        }
+        if let Some(palette) = &mut modals.palette {
+            command_palette_render::render_palette(palette, frame);
+        }
+        if let Some(dialog) = &modals.permission_dialog {
+            permission_dialog_render::render_permission_dialog(dialog, frame);
+        }
+        if let Some(dialog) = &modals.thinking_dialog {
+            thinking_dialog_render::render_thinking_dialog(dialog, frame);
+        }
+    })?;
+    Ok(())
 }
 
 fn drain_bcode_events(chat: &mut ActiveChat) -> bool {
@@ -199,13 +222,20 @@ async fn next_chat_loop_event(
     terminal_events: &mut TuiInput,
     invalidation_queue: &mut InvalidationQueue,
     chat: &mut ActiveChat,
+    redraw_at: Option<Instant>,
 ) -> Result<ChatLoopEvent, TuiError> {
     let now = Instant::now();
     let due = invalidation_queue.take_due(now);
     if !due.is_empty() {
         return Ok(ChatLoopEvent::TimedInvalidations(due));
     }
-    if let Some(next_at) = invalidation_queue.next_at() {
+    let next_timer_at = match (invalidation_queue.next_at(), redraw_at) {
+        (Some(invalidation_at), Some(redraw_at)) => Some(invalidation_at.min(redraw_at)),
+        (Some(invalidation_at), None) => Some(invalidation_at),
+        (None, Some(redraw_at)) => Some(redraw_at),
+        (None, None) => None,
+    };
+    if let Some(next_at) = next_timer_at {
         let delay = next_at.saturating_duration_since(now);
         return tokio::select! {
             biased;
@@ -223,9 +253,15 @@ async fn next_chat_loop_event(
                     ChatLoopEvent::Terminal,
                 )
             }),
-            () = tokio::time::sleep(delay) => Ok(ChatLoopEvent::TimedInvalidations(
-                invalidation_queue.take_due(Instant::now())
-            )),
+            () = tokio::time::sleep(delay) => {
+                let now = Instant::now();
+                let due = invalidation_queue.take_due(now);
+                if due.is_empty() {
+                    Ok(ChatLoopEvent::RedrawFrame)
+                } else {
+                    Ok(ChatLoopEvent::TimedInvalidations(due))
+                }
+            },
         };
     }
     tokio::select! {
