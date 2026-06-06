@@ -8,6 +8,8 @@ pub(crate) mod activity;
 pub(crate) mod app;
 pub(crate) mod chat_loop;
 pub(crate) mod clipboard_image;
+pub mod code_review;
+pub(crate) mod code_review_render;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
 pub(crate) mod composer_flow;
@@ -97,6 +99,12 @@ pub enum TuiError {
     /// Task join error.
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+    /// Plugin service error.
+    #[error("plugin service error {code}: {message}")]
+    PluginService { code: String, message: String },
+    /// JSON error.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     /// Session storage is unavailable for normal runtime access.
     #[error("session unavailable: {session_id}: {reason}")]
     SessionUnavailable {
@@ -125,6 +133,36 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
             helpers::terminal_area()?,
         );
         runtime::run_event_loop(&mut terminal, session_id).await
+    };
+
+    match result {
+        Ok(()) => {
+            let _writer = guard.leave()?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Run the full-screen local code review interface.
+///
+/// # Errors
+///
+/// Returns I/O, client, or plugin service errors.
+pub async fn run_code_review(
+    repo_path: std::path::PathBuf,
+    target: code_review::ReviewOpenTarget,
+) -> Result<(), TuiError> {
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        code_review::run(&mut terminal, repo_path, target).await
     };
 
     match result {

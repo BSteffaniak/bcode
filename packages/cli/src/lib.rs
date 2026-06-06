@@ -117,6 +117,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         },
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
+        Commands::Review { command } => handle_review_command(command).await?,
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
             PluginCommand::Services { root, daemon } => {
@@ -185,6 +186,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Session { .. }
         | Commands::Worktree { .. }
         | Commands::Blims { .. }
+        | Commands::Review { .. }
         | Commands::Plugin { .. }
         | Commands::Model { .. }
         | Commands::Auth { .. }
@@ -274,6 +276,10 @@ enum Commands {
         #[command(subcommand)]
         command: blims::BlimsCommand,
     },
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
@@ -323,6 +329,47 @@ impl Default for Commands {
     fn default() -> Self {
         Self::Tui { session_id: None }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum ReviewCommand {
+    /// Review unstaged working-tree changes.
+    Unstaged {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Review staged index changes.
+    Staged {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Review staged and unstaged changes together.
+    All {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Review the last commit.
+    LastCommit {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Review an explicit revision range.
+    Range {
+        /// Base revision.
+        base: String,
+        /// Head revision.
+        head: String,
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Use two-dot range semantics instead of merge-base semantics.
+        #[arg(long)]
+        two_dot: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -705,6 +752,40 @@ enum PluginCommand {
         topic: String,
         payload: Option<String>,
     },
+}
+
+async fn handle_review_command(command: ReviewCommand) -> Result<(), CliError> {
+    let (repo, target) = match command {
+        ReviewCommand::Unstaged { repo } => (
+            repo,
+            bcode_tui::code_review::ReviewOpenTarget::WorkingTreeUnstaged,
+        ),
+        ReviewCommand::Staged { repo } => {
+            (repo, bcode_tui::code_review::ReviewOpenTarget::IndexStaged)
+        }
+        ReviewCommand::All { repo } => (
+            repo,
+            bcode_tui::code_review::ReviewOpenTarget::WorkingTreeAndIndex,
+        ),
+        ReviewCommand::LastCommit { repo } => {
+            (repo, bcode_tui::code_review::ReviewOpenTarget::LastCommit)
+        }
+        ReviewCommand::Range {
+            repo,
+            base,
+            head,
+            two_dot,
+        } => (
+            repo,
+            bcode_tui::code_review::ReviewOpenTarget::CommitRange {
+                base,
+                head,
+                merge_base: !two_dot,
+            },
+        ),
+    };
+    bcode_tui::run_code_review(repo, target).await?;
+    Ok(())
 }
 
 async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
