@@ -1,6 +1,7 @@
 //! Cached transcript layout for virtualized TUI rendering.
 
 use bmux_tui::prelude::Line;
+use bmux_tui::retained_list::{RetainedListLayout, RetainedListLine};
 
 /// Stable identity for a rendered transcript entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,25 +32,9 @@ impl TranscriptLayoutFingerprint {
 pub struct TranscriptLayoutCache {
     width: Option<u16>,
     fingerprint: Option<TranscriptLayoutFingerprint>,
-    transcript_entries: Vec<CachedTranscriptEntry>,
-    pending_entries: Vec<CachedTranscriptEntry>,
-    history_banner: Option<CachedTranscriptEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CachedTranscriptEntry {
-    signature: TranscriptLayoutSignature,
-    rows: Vec<Line>,
-}
-
-impl CachedTranscriptEntry {
-    const fn new(signature: TranscriptLayoutSignature, rows: Vec<Line>) -> Self {
-        Self { signature, rows }
-    }
-
-    const fn row_count(&self) -> usize {
-        self.rows.len()
-    }
+    transcript_entries: RetainedListLayout<TranscriptLayoutSignature>,
+    pending_entries: RetainedListLayout<TranscriptLayoutSignature>,
+    history_banner: RetainedListLayout<TranscriptLayoutSignature>,
 }
 
 /// A rendered line inside the transcript's global row space.
@@ -98,31 +83,24 @@ impl TranscriptLayoutCache {
             self.fingerprint = None;
             self.transcript_entries.clear();
             self.pending_entries.clear();
-            self.history_banner = None;
+            self.history_banner.clear();
         }
 
-        sync_entries(
-            &mut self.transcript_entries,
+        self.transcript_entries.sync(
             spec.transcript_len,
             spec.transcript_signature,
             spec.transcript_rows,
         );
-        sync_entries(
-            &mut self.pending_entries,
-            spec.pending_len,
-            spec.pending_signature,
-            spec.pending_rows,
-        );
-        self.history_banner = match (spec.history_banner_signature)() {
-            Some(signature) => match self.history_banner.take() {
-                Some(entry) if entry.signature == signature => Some(entry),
-                _ => Some(CachedTranscriptEntry::new(
-                    signature,
-                    (spec.history_banner_rows)(),
-                )),
-            },
-            None => None,
-        };
+        self.pending_entries
+            .sync(spec.pending_len, spec.pending_signature, spec.pending_rows);
+        match (spec.history_banner_signature)() {
+            Some(signature) => {
+                let rows = (spec.history_banner_rows)();
+                self.history_banner
+                    .sync(1, |_| signature.clone(), |_| rows.clone());
+            }
+            None => self.history_banner.clear(),
+        }
         self.fingerprint = Some(spec.fingerprint);
     }
 
@@ -130,21 +108,9 @@ impl TranscriptLayoutCache {
     #[must_use]
     pub fn total_rows(&self) -> usize {
         self.history_banner
-            .iter()
-            .map(CachedTranscriptEntry::row_count)
-            .sum::<usize>()
-            .saturating_add(
-                self.transcript_entries
-                    .iter()
-                    .map(CachedTranscriptEntry::row_count)
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                self.pending_entries
-                    .iter()
-                    .map(CachedTranscriptEntry::row_count)
-                    .sum::<usize>(),
-            )
+            .total_rows()
+            .saturating_add(self.transcript_entries.total_rows())
+            .saturating_add(self.pending_entries.total_rows())
     }
 
     /// Return visible cached rows for a top-origin start row and viewport height.
@@ -161,53 +127,44 @@ impl TranscriptLayoutCache {
         let mut visible = Vec::new();
         let mut row_cursor = 0usize;
 
-        if let Some(entry) = &self.history_banner {
-            push_visible_for_entry(
-                &mut visible,
-                start,
-                end,
-                &mut row_cursor,
-                VisibleTranscriptSource::HistoryBanner,
-                0,
-                entry.row_count(),
-            );
-        }
-        for (index, entry) in self.transcript_entries.iter().enumerate() {
-            push_visible_for_entry(
-                &mut visible,
-                start,
-                end,
-                &mut row_cursor,
-                VisibleTranscriptSource::Transcript,
-                index,
-                entry.row_count(),
-            );
-        }
-        for (index, entry) in self.pending_entries.iter().enumerate() {
-            push_visible_for_entry(
-                &mut visible,
-                start,
-                end,
-                &mut row_cursor,
-                VisibleTranscriptSource::Pending,
-                index,
-                entry.row_count(),
-            );
-        }
+        push_visible_from_layout(
+            &mut visible,
+            &mut row_cursor,
+            start,
+            end,
+            VisibleTranscriptSource::HistoryBanner,
+            &self.history_banner,
+        );
+        push_visible_from_layout(
+            &mut visible,
+            &mut row_cursor,
+            start,
+            end,
+            VisibleTranscriptSource::Transcript,
+            &self.transcript_entries,
+        );
+        push_visible_from_layout(
+            &mut visible,
+            &mut row_cursor,
+            start,
+            end,
+            VisibleTranscriptSource::Pending,
+            &self.pending_entries,
+        );
 
         visible
     }
 
-    /// Return a cached line for a visible row descriptor.
+    /// Return cached line for a visible transcript line.
     #[must_use]
     pub fn line(&self, visible: VisibleTranscriptLine) -> Option<&Line> {
-        let entry = match visible.source {
-            VisibleTranscriptSource::HistoryBanner => self.history_banner.as_ref(),
-            VisibleTranscriptSource::Transcript => self.transcript_entries.get(visible.entry_index),
-            VisibleTranscriptSource::Pending => self.pending_entries.get(visible.entry_index),
-        }?;
-        entry.rows.get(visible.row_in_entry)
+        match visible.source {
+            VisibleTranscriptSource::HistoryBanner => self.history_banner.line(retained(visible)),
+            VisibleTranscriptSource::Transcript => self.transcript_entries.line(retained(visible)),
+            VisibleTranscriptSource::Pending => self.pending_entries.line(retained(visible)),
+        }
     }
+
     /// Return the global start row for a cached transcript entry.
     #[must_use]
     pub fn entry_start_row(
@@ -216,27 +173,28 @@ impl TranscriptLayoutCache {
         entry_index: usize,
     ) -> Option<usize> {
         let mut row_cursor = 0usize;
-        if let Some(entry) = &self.history_banner {
-            if source == VisibleTranscriptSource::HistoryBanner && entry_index == 0 {
-                return Some(row_cursor);
-            }
-            row_cursor = row_cursor.saturating_add(entry.row_count());
+        if source == VisibleTranscriptSource::HistoryBanner && entry_index == 0 {
+            return Some(row_cursor);
         }
-        for (index, entry) in self.transcript_entries.iter().enumerate() {
-            if source == VisibleTranscriptSource::Transcript && index == entry_index {
-                return Some(row_cursor);
-            }
-            row_cursor = row_cursor.saturating_add(entry.row_count());
+        row_cursor = row_cursor.saturating_add(self.history_banner.total_rows());
+        if source == VisibleTranscriptSource::Transcript {
+            return self
+                .transcript_entries
+                .entry_start_row(entry_index)
+                .map(|start| start.saturating_add(row_cursor));
         }
-        for (index, entry) in self.pending_entries.iter().enumerate() {
-            if source == VisibleTranscriptSource::Pending && index == entry_index {
-                return Some(row_cursor);
-            }
-            row_cursor = row_cursor.saturating_add(entry.row_count());
+        row_cursor = row_cursor.saturating_add(self.transcript_entries.total_rows());
+        if source == VisibleTranscriptSource::Pending {
+            return self
+                .pending_entries
+                .entry_start_row(entry_index)
+                .map(|start| start.saturating_add(row_cursor));
         }
         None
     }
 }
+
+/// Specification used to synchronize transcript layout cache.
 pub struct TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R> {
     /// Render width.
     pub width: u16,
@@ -262,53 +220,43 @@ pub struct TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R> {
     pub reset: R,
 }
 
-fn sync_entries<S, R>(
-    entries: &mut Vec<CachedTranscriptEntry>,
-    len: usize,
-    signature_for: S,
-    rows_for: R,
-) where
-    S: Fn(usize) -> TranscriptLayoutSignature,
-    R: Fn(usize) -> Vec<Line>,
-{
-    entries.truncate(len);
-    for index in 0..len {
-        let signature = signature_for(index);
-        if entries
-            .get(index)
-            .is_some_and(|entry| entry.signature == signature)
-        {
-            continue;
-        }
-        let entry = CachedTranscriptEntry::new(signature, rows_for(index));
-        if let Some(slot) = entries.get_mut(index) {
-            *slot = entry;
-        } else {
-            entries.push(entry);
-        }
+fn push_visible_from_layout(
+    visible: &mut Vec<VisibleTranscriptLine>,
+    row_cursor: &mut usize,
+    start: usize,
+    end: usize,
+    source: VisibleTranscriptSource,
+    layout: &RetainedListLayout<TranscriptLayoutSignature>,
+) {
+    let section_start = *row_cursor;
+    let section_rows = layout.total_rows();
+    let section_end = section_start.saturating_add(section_rows);
+    if section_end > start && section_start < end {
+        let local_start = start.saturating_sub(section_start);
+        let local_height = end.saturating_sub(section_start).min(section_rows);
+        visible.extend(
+            layout
+                .visible_lines_from_top(local_start, saturating_u16(local_height))
+                .into_iter()
+                .map(|line| VisibleTranscriptLine {
+                    row_index: section_start.saturating_add(line.row_index),
+                    entry_index: line.entry_index,
+                    row_in_entry: line.row_in_entry,
+                    source,
+                }),
+        );
+    }
+    *row_cursor = section_end;
+}
+
+const fn retained(visible: VisibleTranscriptLine) -> RetainedListLine {
+    RetainedListLine {
+        row_index: visible.row_index,
+        entry_index: visible.entry_index,
+        row_in_entry: visible.row_in_entry,
     }
 }
 
-fn push_visible_for_entry(
-    visible: &mut Vec<VisibleTranscriptLine>,
-    start: usize,
-    end: usize,
-    row_cursor: &mut usize,
-    source: VisibleTranscriptSource,
-    entry_index: usize,
-    row_count: usize,
-) {
-    let entry_start = *row_cursor;
-    let entry_end = entry_start.saturating_add(row_count);
-    if entry_end > start && entry_start < end {
-        let first = start.saturating_sub(entry_start);
-        let last = end.saturating_sub(entry_start).min(row_count);
-        visible.extend((first..last).map(|row_in_entry| VisibleTranscriptLine {
-            row_index: entry_start.saturating_add(row_in_entry),
-            entry_index,
-            row_in_entry,
-            source,
-        }));
-    }
-    *row_cursor = entry_end;
+fn saturating_u16(value: usize) -> u16 {
+    u16::try_from(value.min(usize::from(u16::MAX))).unwrap_or(u16::MAX)
 }
