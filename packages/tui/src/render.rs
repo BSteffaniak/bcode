@@ -47,6 +47,18 @@ const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
 const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
+/// Prepared geometry for one TUI frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameLayout {
+    area: Rect,
+    header: Rect,
+    body: Rect,
+    latest_bar: Option<Rect>,
+    status: Rect,
+    composer: Rect,
+    composer_content: Rect,
+}
+
 /// Compute the transcript area for a full terminal frame.
 #[must_use]
 pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
@@ -61,39 +73,55 @@ pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
 }
 
 /// Prepare derived frame projections before rendering.
-pub fn prepare_frame(app: &mut BmuxApp, area: Rect) {
-    if area.is_empty() {
-        return;
-    }
-
-    let composer_height = composer_height(app, area);
-    let composer = composer_area(area, composer_height);
-    app.set_composer_content_area(composer_panel().inner_area(composer));
-    let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
-    let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
-    super::transcript_projection::prepare_for_body(app, body);
+pub fn prepare_frame(app: &mut BmuxApp, area: Rect) -> Option<FrameLayout> {
+    let layout = frame_layout(app, area)?;
+    app.set_composer_content_area(layout.composer_content);
+    super::transcript_projection::prepare_for_body(app, layout.body_without_latest_bar());
+    Some(frame_layout(app, area).unwrap_or(layout))
 }
 
 /// Render one TUI frame.
 pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
-    prepare_frame(app, frame.area());
-    render_prepared(app, frame);
+    if let Some(layout) = prepare_frame(app, frame.area()) {
+        render_prepared(app, frame, layout);
+    }
 }
 
 /// Render one TUI frame after [`prepare_frame`] has synchronized projections.
-pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>) {
-    let area = frame.area();
-    if area.is_empty() {
+pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLayout) {
+    if layout.area.is_empty() {
         return;
     }
 
-    let header = Rect::new(area.x, area.y, area.width, 1);
-    render_header(app, header, frame);
+    render_header(app, layout.header, frame);
+    render_composer(app, layout.composer, frame);
+    render_body(app, layout.body, frame);
+    if let Some(latest_bar) = layout.latest_bar {
+        render_latest_bar(app, latest_bar, frame, Instant::now());
+    }
+    render_status(app, layout.status, frame);
+}
 
+impl FrameLayout {
+    const fn body_without_latest_bar(self) -> Rect {
+        let latest_bar_height = if self.latest_bar.is_some() { 1 } else { 0 };
+        Rect::new(
+            self.body.x,
+            self.body.y,
+            self.body.width,
+            self.body.height.saturating_add(latest_bar_height),
+        )
+    }
+}
+
+fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
+    if area.is_empty() {
+        return None;
+    }
+
+    let header = Rect::new(area.x, area.y, area.width, 1);
     let composer_height = composer_height(app, area);
     let composer = composer_area(area, composer_height);
-    render_composer(app, composer, frame);
-
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
     let latest_bar_height = u16::from(app.newer_transcript_content_below());
@@ -103,19 +131,23 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>) {
         body.width,
         body.height.saturating_sub(latest_bar_height),
     );
-    render_body(app, body, frame);
-    if latest_bar_height > 0 {
-        let latest_bar = Rect::new(area.x, body.bottom(), area.width, 1);
-        render_latest_bar(app, latest_bar, frame, Instant::now());
-    }
-
+    let latest_bar =
+        (latest_bar_height > 0).then_some(Rect::new(area.x, body.bottom(), area.width, 1));
     let status = Rect::new(
         area.x,
         composer.y.saturating_sub(1),
         area.width,
         u16::from(composer.y > area.y.saturating_add(1)),
     );
-    render_status(app, status, frame);
+    Some(FrameLayout {
+        area,
+        header,
+        body,
+        latest_bar,
+        status,
+        composer,
+        composer_content: composer_panel().inner_area(composer),
+    })
 }
 
 fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Instant) {

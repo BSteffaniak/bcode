@@ -178,9 +178,11 @@ fn draw_chat_frame<W: Write>(
     chat: &mut ActiveChat,
     modals: &mut ModalState,
 ) -> Result<(), TuiError> {
-    render::prepare_frame(&mut chat.app, terminal.area());
+    let layout = render::prepare_frame(&mut chat.app, terminal.area());
     terminal.draw(|frame| {
-        render::render_prepared(&mut chat.app, frame);
+        if let Some(layout) = layout {
+            render::render_prepared(&mut chat.app, frame, layout);
+        }
         if let Some(slash_palette) = &modals.slash_palette {
             slash_palette_render::render_palette(
                 slash_palette,
