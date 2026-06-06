@@ -102,7 +102,8 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if needs_redraw {
+        let redraw_at = next_redraw_at(last_redraw);
+        if needs_redraw && Instant::now() >= redraw_at {
             draw_chat_frame(terminal, chat, &mut modals)?;
             refresh_invalidation_queue(chat, &mut invalidation_queue);
             needs_redraw = false;
@@ -113,7 +114,7 @@ pub async fn run_with_client<W: Write>(
             terminal_events,
             &mut invalidation_queue,
             chat,
-            needs_redraw.then_some(last_redraw + TARGET_FRAME_INTERVAL),
+            needs_redraw.then_some(redraw_at),
         )
         .await?;
         match event {
@@ -164,6 +165,12 @@ enum ChatLoopEvent {
     Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
     RedrawFrame,
+}
+
+fn next_redraw_at(last_redraw: Instant) -> Instant {
+    last_redraw
+        .checked_add(TARGET_FRAME_INTERVAL)
+        .unwrap_or(last_redraw)
 }
 
 fn draw_chat_frame<W: Write>(
