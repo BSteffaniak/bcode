@@ -677,7 +677,7 @@ impl SessionActor {
             input_history,
             attached_event,
             events,
-            live_events: self.state.live_sender.subscribe(),
+            live_events: self.state.live_events.subscribe(),
         })
     }
 
@@ -908,15 +908,11 @@ impl SessionActor {
     }
 
     fn publish_live_event(&self, kind: SessionLiveEventKind) -> Option<SessionLiveEvent> {
-        if self.state.live_sender.receiver_count() == 0 {
-            return None;
-        }
         let event = SessionLiveEvent {
             session_id: self.state.summary.id,
             kind,
         };
-        let _ = self.state.live_sender.send(event.clone());
-        Some(event)
+        self.state.live_events.publish(event)
     }
 
     fn publish_transient_event(&self, kind: SessionEventKind) -> Option<SessionEvent> {

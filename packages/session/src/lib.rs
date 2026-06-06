@@ -299,7 +299,39 @@ pub(crate) struct SessionState {
     total_metered_tokens: u64,
     load_status: SessionLoadStatusKind,
     sender: broadcast::Sender<SessionEvent>,
-    live_sender: broadcast::Sender<SessionLiveEvent>,
+    live_events: SessionLiveEventBroker,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionLiveEventBroker {
+    sender: broadcast::Sender<SessionLiveEvent>,
+    published: Arc<AtomicU64>,
+    dropped_no_receivers: Arc<AtomicU64>,
+}
+
+impl SessionLiveEventBroker {
+    fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            published: Arc::new(AtomicU64::new(0)),
+            dropped_no_receivers: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<SessionLiveEvent> {
+        self.sender.subscribe()
+    }
+
+    fn publish(&self, event: SessionLiveEvent) -> Option<SessionLiveEvent> {
+        if self.sender.receiver_count() == 0 {
+            self.dropped_no_receivers.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let _ = self.sender.send(event.clone());
+        self.published.fetch_add(1, Ordering::Relaxed);
+        Some(event)
+    }
 }
 
 /// Native catalog entry with maintenance/access metadata.
@@ -667,7 +699,7 @@ impl SessionManager {
         let working_directory = normalize_working_directory(&working_directory);
         let id = SessionId::new();
         let (sender, _) = broadcast::channel(512);
-        let (live_sender, _) = broadcast::channel(512);
+        let live_events = SessionLiveEventBroker::new(512);
         let now_ms = self.next_activity_timestamp_ms();
         let summary = SessionSummary {
             id,
@@ -700,7 +732,7 @@ impl SessionManager {
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
-            live_sender,
+            live_events,
         };
         let handle = SessionHandle::new(state, self.store.clone());
         handle
@@ -1824,7 +1856,7 @@ impl SessionManager {
 impl SessionState {
     pub(crate) fn from_catalog_summary(summary: SessionSummary) -> Self {
         let (sender, _) = broadcast::channel(512);
-        let (live_sender, _) = broadcast::channel(512);
+        let live_events = SessionLiveEventBroker::new(512);
         let working_directory = normalize_working_directory(&summary.working_directory);
         Self {
             summary,
@@ -1841,7 +1873,7 @@ impl SessionState {
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::SummaryOnly,
             sender,
-            live_sender,
+            live_events,
         }
     }
 
@@ -1851,7 +1883,7 @@ impl SessionState {
         updated_at_ms: u64,
     ) -> Self {
         let (sender, _) = broadcast::channel(512);
-        let (live_sender, _) = broadcast::channel(512);
+        let live_events = SessionLiveEventBroker::new(512);
         let working_directory = normalize_working_directory(&state.working_directory);
         let title_source = if state.title.is_some() {
             SessionTitleSource::Explicit
@@ -1885,7 +1917,7 @@ impl SessionState {
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
             sender,
-            live_sender,
+            live_events,
         }
     }
 
