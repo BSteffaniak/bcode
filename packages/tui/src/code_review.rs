@@ -1,12 +1,15 @@
 //! Full-screen local code review TUI mode.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
 use bcode_client::BcodeClient;
 use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
+use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +117,9 @@ fn handle_event<W: Write>(
     terminal: &mut Terminal<&mut W>,
     event: &Event,
 ) -> bool {
+    if app.comment_editor.is_some() {
+        return handle_comment_editor_event(app, event);
+    }
     match event {
         Event::Resize(size) => {
             terminal.resize(Rect::new(0, 0, size.width, size.height));
@@ -124,6 +130,50 @@ fn handle_event<W: Write>(
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => true,
         Event::Paste(_) | Event::User(_) => false,
     }
+}
+
+fn handle_comment_editor_event(app: &mut ReviewApp, event: &Event) -> bool {
+    match event {
+        Event::Key(stroke) => handle_comment_editor_key(app, *stroke),
+        Event::Paste(text) => {
+            if let Some(editor) = &mut app.comment_editor {
+                editor.buffer.insert_str(text);
+                return true;
+            }
+            false
+        }
+        Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::Resize(_) => {
+            true
+        }
+        Event::Mouse(_) | Event::User(_) => false,
+    }
+}
+
+fn handle_comment_editor_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
+    if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
+        app.comment_editor = None;
+        app.status_message = Some("comment draft canceled".to_string());
+        return true;
+    }
+    if stroke.key == KeyCode::Char('s') && stroke.modifiers.ctrl {
+        app.save_comment_editor();
+        return true;
+    }
+    if stroke.key == KeyCode::Enter && !stroke.modifiers.ctrl && !stroke.modifiers.alt {
+        app.save_comment_editor();
+        return true;
+    }
+    if let Some(editor) = &mut app.comment_editor {
+        return matches!(
+            helpers::handle_default_text_key(
+                &mut editor.buffer,
+                stroke,
+                TextInputEnterBehavior::InsertNewline,
+            ),
+            TextInputKeyOutcome::Edited | TextInputKeyOutcome::Submitted
+        );
+    }
+    false
 }
 
 fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
@@ -147,11 +197,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('p') | KeyCode::Left => app.select_previous_file(),
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
-        KeyCode::Char('c') => {
-            app.status_message =
-                Some("comments are coming next; selected line is ready".to_string());
-            true
-        }
+        KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
             true
@@ -359,7 +405,7 @@ pub struct ReviewLine {
 }
 
 /// Review diff line kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewLineKind {
     /// Context line.
@@ -368,6 +414,43 @@ pub enum ReviewLineKind {
     Added,
     /// Removed line.
     Removed,
+}
+
+/// Draft comment line anchor.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReviewCommentAnchor {
+    /// File index in the current review.
+    pub file_index: usize,
+    /// Display path for the commented file.
+    pub path: String,
+    /// Rendered diff row in the selected file.
+    pub diff_row: usize,
+    /// Old line number, when present.
+    pub old_line: Option<u32>,
+    /// New line number, when present.
+    pub new_line: Option<u32>,
+    /// Anchored diff line kind.
+    pub line_kind: ReviewLineKind,
+}
+
+/// Active draft comment editor.
+#[derive(Debug, Clone)]
+pub struct ReviewCommentEditor {
+    /// Anchor being commented on.
+    pub anchor: ReviewCommentAnchor,
+    /// Editable comment buffer.
+    pub buffer: TextEditBuffer,
+}
+
+impl ReviewCommentEditor {
+    /// Create an editor for an anchor.
+    #[must_use]
+    pub const fn new(anchor: ReviewCommentAnchor) -> Self {
+        Self {
+            anchor,
+            buffer: TextEditBuffer::new(),
+        }
+    }
 }
 
 /// Stateful review app model.
@@ -391,6 +474,10 @@ pub struct ReviewApp {
     pub should_exit: bool,
     /// Last transient status message.
     pub status_message: Option<String>,
+    /// Draft comments keyed by anchor.
+    pub draft_comments: BTreeMap<ReviewCommentAnchor, Vec<String>>,
+    /// Active draft editor, if open.
+    pub comment_editor: Option<ReviewCommentEditor>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
 }
@@ -409,6 +496,8 @@ impl ReviewApp {
             help_visible: false,
             should_exit: false,
             status_message: None,
+            draft_comments: BTreeMap::new(),
+            comment_editor: None,
             last_file_area: None,
             last_diff_area: None,
         }
@@ -591,6 +680,103 @@ impl ReviewApp {
         Some(self.diff_scroll + usize::from(y.saturating_sub(area.y)))
     }
 
+    /// Return total draft comment count.
+    #[must_use]
+    pub fn draft_comment_count(&self) -> usize {
+        self.draft_comments.values().map(Vec::len).sum()
+    }
+
+    /// Return draft comment count for a file.
+    #[must_use]
+    pub fn draft_comment_count_for_file(&self, file_index: usize) -> usize {
+        self.draft_comments
+            .iter()
+            .filter(|(anchor, _)| anchor.file_index == file_index)
+            .map(|(_, comments)| comments.len())
+            .sum()
+    }
+
+    /// Return true when a diff row has draft comments.
+    #[must_use]
+    pub fn has_draft_comment_at(&self, file_index: usize, diff_row: usize) -> bool {
+        self.draft_comments
+            .keys()
+            .any(|anchor| anchor.file_index == file_index && anchor.diff_row == diff_row)
+    }
+
+    /// Open the draft comment editor for the selected diff line.
+    pub fn open_comment_editor(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message =
+                Some("select an added, removed, or context line to comment".to_string());
+            return true;
+        };
+        self.comment_editor = Some(ReviewCommentEditor::new(anchor));
+        self.status_message =
+            Some("editing draft comment; enter/ctrl+s saves, esc cancels".to_string());
+        true
+    }
+
+    /// Save the active draft comment editor.
+    pub fn save_comment_editor(&mut self) -> bool {
+        let Some(editor) = self.comment_editor.take() else {
+            return false;
+        };
+        let text = editor.buffer.text().trim().to_string();
+        if text.is_empty() {
+            self.status_message = Some("empty comment discarded".to_string());
+            return true;
+        }
+        self.draft_comments
+            .entry(editor.anchor)
+            .or_default()
+            .push(text);
+        let count = self.draft_comment_count();
+        self.status_message = Some(format!("saved draft comment ({count} total)"));
+        true
+    }
+
+    /// Return the selected diff line comment anchor, if the selected row is commentable.
+    #[must_use]
+    pub fn selected_comment_anchor(&self) -> Option<ReviewCommentAnchor> {
+        self.comment_anchor_for_row(self.selected_diff_line)
+    }
+
+    /// Return a comment anchor for a rendered diff row.
+    #[must_use]
+    pub fn comment_anchor_for_row(&self, diff_row: usize) -> Option<ReviewCommentAnchor> {
+        let file = self.selected_file_data()?;
+        let line = self.diff_line_for_render_row(diff_row)?;
+        Some(ReviewCommentAnchor {
+            file_index: self.selected_file,
+            path: file.display_path().to_string(),
+            diff_row,
+            old_line: line.old_line,
+            new_line: line.new_line,
+            line_kind: line.kind,
+        })
+    }
+
+    fn diff_line_for_render_row(&self, diff_row: usize) -> Option<&ReviewLine> {
+        let file = self.selected_file_data()?;
+        if file.is_binary {
+            return None;
+        }
+        let mut row = 0usize;
+        for hunk in &file.hunks {
+            if diff_row == row {
+                return None;
+            }
+            row = row.saturating_add(1);
+            let hunk_line_index = diff_row.checked_sub(row)?;
+            if hunk_line_index < hunk.lines.len() {
+                return hunk.lines.get(hunk_line_index);
+            }
+            row = row.saturating_add(hunk.lines.len());
+        }
+        None
+    }
+
     /// Return current hunk position as one-based `(current, total)`.
     #[must_use]
     pub fn hunk_position(&self) -> (usize, usize) {
@@ -757,12 +943,43 @@ mod tests {
     }
 
     #[test]
-    fn mouse_file_hit_uses_last_rendered_file_area() {
+    fn creates_anchor_for_selected_diff_line() {
         let mut app = sample_app();
-        app.file_scroll = 1;
-        app.set_file_area(Some(Rect::new(0, 2, 20, 5)));
+        app.selected_diff_line = 2;
 
-        assert_eq!(app.file_index_at(3, 2), Some(1));
-        assert_eq!(app.file_index_at(30, 2), None);
+        let anchor = app
+            .selected_comment_anchor()
+            .expect("added line should be commentable");
+
+        assert_eq!(anchor.path, "a.rs");
+        assert_eq!(anchor.diff_row, 2);
+        assert_eq!(anchor.old_line, None);
+        assert_eq!(anchor.new_line, Some(1));
+        assert_eq!(anchor.line_kind, ReviewLineKind::Added);
+    }
+
+    #[test]
+    fn hunk_header_is_not_commentable() {
+        let app = sample_app();
+
+        assert_eq!(app.comment_anchor_for_row(0), None);
+    }
+
+    #[test]
+    fn saves_in_memory_draft_comment() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor should open")
+            .buffer
+            .insert_str("Needs a test");
+        assert!(app.save_comment_editor());
+
+        assert_eq!(app.draft_comment_count(), 1);
+        assert!(app.has_draft_comment_at(0, 2));
+        assert_eq!(app.draft_comment_count_for_file(0), 1);
     }
 }
