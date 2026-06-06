@@ -509,7 +509,8 @@ fn status_line_includes_scroll_offset_when_scrolled() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert!(rendered_text(&buffer).contains("1 rows from bottom"));
+    assert_eq!(app.scroll_offset(), 2);
+    assert!(rendered_text(&buffer).contains("2 rows from bottom"));
 }
 
 #[test]
@@ -2042,18 +2043,32 @@ fn manual_scroll_from_stream_anchor_preserves_visual_position() {
         session_id,
         1,
         SessionEventKind::AssistantDelta {
-            text: "first\nsecond\nthird\nfourth\nfifth\nsixth".to_owned(),
+            text: "first
+second
+third
+fourth
+fifth
+sixth
+seventh
+eighth
+ninth"
+                .to_owned(),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let initial_y = output_line_y(&buffer, "Bcode …").expect("streaming heading is visible");
     assert!(app.scroll_transcript_up(3));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(4));
+    assert_eq!(output_line_y(&buffer, "Bcode …"), initial_y.checked_add(3));
 }
 
 #[test]
@@ -2163,6 +2178,10 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
             text: "first\nsecond\nthird\nfourth\nfifth\nsixth".to_owned(),
         },
     ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);

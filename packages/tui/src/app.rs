@@ -1264,6 +1264,11 @@ impl BmuxApp {
                 }
             }
             SessionLiveEventKind::ToolOutputDelta { event } => {
+                self.pending_visual_overflow_bottom = Some(
+                    self.viewport
+                        .bottom_row(self.transcript_layout.total_rows()),
+                );
+                self.viewport.preserve_for_append();
                 self.apply_tool_stream_event(event, SessionEventApplication::Live);
             }
         }
