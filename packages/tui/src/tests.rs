@@ -22,10 +22,71 @@ use super::{
     input,
     input::KeyRequest,
     keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
+    pending_submissions::PendingSubmissions,
     render, slash_palette, slash_palette_render,
     time_format::{format_duration_nanos, format_millis},
-    transcript::{TranscriptItemKind, transcript_items_from_events_with_reasoning},
+    transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
+    transcript_document::TranscriptDocument,
 };
+
+#[test]
+fn transcript_document_mutations_bump_revision() {
+    let mut document = TranscriptDocument::default();
+    assert_eq!(document.revision(), 0);
+
+    document.push(TranscriptItem::new("System", "one".to_owned()));
+    assert_eq!(document.revision(), 1);
+
+    document.replace(vec![TranscriptItem::new("You", "two".to_owned())]);
+    assert_eq!(document.revision(), 2);
+
+    let item = document.get_mut(0).expect("item exists");
+    item.append_text("!");
+    assert_eq!(document.revision(), 3);
+
+    for item in document.iter_mut() {
+        item.finish_streaming();
+    }
+    assert_eq!(document.revision(), 4);
+}
+
+#[test]
+fn transcript_document_streaming_helpers_bump_revision() {
+    let mut document = TranscriptDocument::default();
+
+    document.push_streaming_item("Assistant", "hello");
+    assert_eq!(document.revision(), 1);
+    assert_eq!(document.items()[0].text(), "hello");
+
+    document.push_streaming_item("Assistant", " world");
+    assert_eq!(document.revision(), 2);
+    assert_eq!(document.items()[0].text(), "hello world");
+
+    document.finish_streaming_item("Assistant", "hello world");
+    assert_eq!(document.revision(), 3);
+    assert!(!document.items()[0].streaming());
+}
+
+#[test]
+fn pending_submissions_mutations_bump_revision() {
+    let mut pending = PendingSubmissions::default();
+    assert_eq!(pending.revision(), 0);
+
+    pending.stage("hello".to_owned());
+    assert_eq!(pending.revision(), 1);
+
+    pending.mark_first_queued(Some(1));
+    assert_eq!(pending.revision(), 2);
+
+    pending.mark_first_sent();
+    assert_eq!(pending.revision(), 3);
+
+    pending.remove("missing");
+    assert_eq!(pending.revision(), 3);
+
+    pending.remove("hello");
+    assert_eq!(pending.revision(), 4);
+}
 
 #[test]
 fn render_includes_status_and_composer() {
