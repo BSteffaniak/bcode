@@ -60,8 +60,27 @@ pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
     transcript_area_for_body(app, body)
 }
 
+/// Prepare derived frame projections before rendering.
+pub fn prepare_frame(app: &mut BmuxApp, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+
+    let composer_height = composer_height(app, area);
+    let composer_y = area.bottom().saturating_sub(composer_height);
+    let body_height = composer_y.saturating_sub(area.y.saturating_add(2));
+    let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
+    prepare_transcript_layout_for_body(app, body);
+}
+
 /// Render one TUI frame.
 pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
+    prepare_frame(app, frame.area());
+    render_prepared(app, frame);
+}
+
+/// Render one TUI frame after [`prepare_frame`] has synchronized projections.
+pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     let area = frame.area();
     if area.is_empty() {
         return;
@@ -81,15 +100,6 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
 
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
-    let initial_transcript_area = transcript_area_for_body(app, body);
-    sync_transcript_layout(app, initial_transcript_area.width);
-    app.sync_transcript_scroll_max(
-        max_transcript_scroll_offset(app, initial_transcript_area),
-        max_transcript_bottom_overscroll(initial_transcript_area),
-        app.transcript_layout().total_rows(),
-        initial_transcript_area.height,
-    );
-    app.sync_transcript_anchor_requests();
     let latest_bar_height = u16::from(app.newer_transcript_content_below());
     let body = Rect::new(
         body.x,
@@ -97,17 +107,6 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
         body.width,
         body.height.saturating_sub(latest_bar_height),
     );
-    let transcript_area = transcript_area_for_body(app, body);
-    if latest_bar_height > 0 {
-        sync_transcript_layout(app, transcript_area.width);
-        app.sync_transcript_scroll_max(
-            max_transcript_scroll_offset(app, transcript_area),
-            max_transcript_bottom_overscroll(transcript_area),
-            app.transcript_layout().total_rows(),
-            transcript_area.height,
-        );
-        app.sync_transcript_anchor_requests();
-    }
     render_body(app, body, frame);
     if latest_bar_height > 0 {
         let latest_bar = Rect::new(area.x, body.bottom(), area.width, 1);
@@ -121,6 +120,36 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
         u16::from(composer.y > area.y.saturating_add(1)),
     );
     render_status(app, status, frame);
+}
+
+fn prepare_transcript_layout_for_body(app: &mut BmuxApp, body: Rect) {
+    let initial_transcript_area = transcript_area_for_body(app, body);
+    sync_transcript_layout(app, initial_transcript_area.width);
+    sync_transcript_viewport(app, initial_transcript_area);
+    let latest_bar_height = u16::from(app.newer_transcript_content_below());
+    if latest_bar_height == 0 {
+        return;
+    }
+
+    let body = Rect::new(
+        body.x,
+        body.y,
+        body.width,
+        body.height.saturating_sub(latest_bar_height),
+    );
+    let transcript_area = transcript_area_for_body(app, body);
+    sync_transcript_layout(app, transcript_area.width);
+    sync_transcript_viewport(app, transcript_area);
+}
+
+fn sync_transcript_viewport(app: &mut BmuxApp, transcript_area: Rect) {
+    app.sync_transcript_scroll_max(
+        max_transcript_scroll_offset(app, transcript_area),
+        max_transcript_bottom_overscroll(transcript_area),
+        app.transcript_layout().total_rows(),
+        transcript_area.height,
+    );
+    app.sync_transcript_anchor_requests();
 }
 
 fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Instant) {
