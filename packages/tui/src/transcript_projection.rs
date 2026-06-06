@@ -7,7 +7,9 @@ use super::app::BmuxApp;
 use super::pending_submission::PendingSubmission;
 use super::render;
 use super::transcript::TranscriptItem;
-use super::transcript_layout::{TranscriptLayoutSignature, TranscriptLayoutSpec};
+use super::transcript_layout::{
+    TranscriptLayoutFingerprint, TranscriptLayoutSignature, TranscriptLayoutSpec,
+};
 
 /// Prepare transcript layout and viewport projections for a frame body.
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
@@ -56,8 +58,14 @@ fn max_bottom_overscroll(area: Rect) -> usize {
 fn sync_layout(app: &mut BmuxApp, width: u16) {
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
     let input = TranscriptLayoutInput::from_app(app, width);
+    let fingerprint = input.fingerprint();
+    if transcript_layout.is_current(&fingerprint) {
+        *app.transcript_layout_mut() = transcript_layout;
+        return;
+    }
     transcript_layout.sync(TranscriptLayoutSpec {
         width,
+        fingerprint,
         transcript_len: input.transcript.len(),
         pending_len: input.pending.len(),
         transcript_signature: |index| transcript_item_signature(&input.transcript[index], &input),
@@ -104,6 +112,30 @@ impl<'a> TranscriptLayoutInput<'a> {
             loading_older_history: app.loading_older_history(),
             inline_diff_config: app.inline_diff_config(),
         }
+    }
+
+    fn fingerprint(&self) -> TranscriptLayoutFingerprint {
+        let transcript = self
+            .transcript
+            .iter()
+            .map(|item| format!("{}:{}", item.id().get(), item.revision()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let pending = self
+            .pending
+            .iter()
+            .map(|pending| format!("{}:{:?}", pending.text(), pending.state()))
+            .collect::<Vec<_>>()
+            .join(",");
+        TranscriptLayoutFingerprint::new(format!(
+            "width:{};diff:{:?};history:{}:{};transcript:{};pending:{}",
+            self.width,
+            self.inline_diff_config,
+            self.has_older_history,
+            self.loading_older_history,
+            transcript,
+            pending
+        ))
     }
 }
 

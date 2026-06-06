@@ -14,10 +14,23 @@ impl TranscriptLayoutSignature {
     }
 }
 
+/// Fingerprint for inputs used to prepare transcript layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptLayoutFingerprint(String);
+
+impl TranscriptLayoutFingerprint {
+    /// Create a layout fingerprint from owned text.
+    #[must_use]
+    pub const fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Cached transcript layout rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TranscriptLayoutCache {
     width: Option<u16>,
+    fingerprint: Option<TranscriptLayoutFingerprint>,
     transcript_entries: Vec<CachedTranscriptEntry>,
     pending_entries: Vec<CachedTranscriptEntry>,
     history_banner: Option<CachedTranscriptEntry>,
@@ -61,6 +74,12 @@ pub enum VisibleTranscriptSource {
 }
 
 impl TranscriptLayoutCache {
+    /// Return whether the cache already represents the given fingerprint.
+    #[must_use]
+    pub fn is_current(&self, fingerprint: &TranscriptLayoutFingerprint) -> bool {
+        self.fingerprint.as_ref() == Some(fingerprint)
+    }
+
     /// Synchronize the cache for a terminal width and current transcript data.
     pub fn sync<TS, TR, PS, PR, HS, HR, R>(
         &mut self,
@@ -76,6 +95,7 @@ impl TranscriptLayoutCache {
     {
         if self.width != Some(spec.width) || (spec.reset)() {
             self.width = Some(spec.width);
+            self.fingerprint = None;
             self.transcript_entries.clear();
             self.pending_entries.clear();
             self.history_banner = None;
@@ -103,6 +123,7 @@ impl TranscriptLayoutCache {
             },
             None => None,
         };
+        self.fingerprint = Some(spec.fingerprint);
     }
 
     /// Return total rendered row count for the cached transcript document.
@@ -219,6 +240,8 @@ impl TranscriptLayoutCache {
 pub struct TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R> {
     /// Render width.
     pub width: u16,
+    /// Fingerprint for all layout-affecting inputs.
+    pub fingerprint: TranscriptLayoutFingerprint,
     /// Current committed transcript item count.
     pub transcript_len: usize,
     /// Current pending submission count.
