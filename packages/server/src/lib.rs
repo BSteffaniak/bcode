@@ -9745,19 +9745,8 @@ mod tests {
         assert!(truncated.contains('z'));
     }
 
-    #[tokio::test]
-    async fn tool_output_delta_is_transient_not_durable() {
-        let sessions = SessionManager::default();
-        let summary = sessions
-            .create_session(Some("test".to_owned()), test_working_directory())
-            .await
-            .expect("session should be created");
-        let session_id = summary.id;
-        let mut attachment = sessions
-            .attach_session(session_id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let state = ServerState::new(
+    fn test_server_state(sessions: SessionManager) -> ServerState {
+        ServerState::new(
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
@@ -9781,7 +9770,22 @@ mod tests {
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
             },
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_output_delta_is_transient_not_durable() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
         let delta = ToolInvocationStreamEvent::OutputDelta {
             tool_call_id: "call-1".to_owned(),
             stream: SessionToolOutputStream::Pty,
@@ -9817,6 +9821,159 @@ mod tests {
                 event: ToolInvocationStreamEvent::OutputDelta { .. }
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn tool_output_accumulator_coalesces_adjacent_deltas() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let mut pending_output = None;
+
+        push_tool_output_stream(
+            &state,
+            session_id,
+            &mut pending_output,
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-1".to_owned(),
+                stream: SessionToolOutputStream::Pty,
+                sequence: 1,
+                text: "hello ".to_owned(),
+                byte_len: 6,
+            },
+        )
+        .await;
+        push_tool_output_stream(
+            &state,
+            session_id,
+            &mut pending_output,
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-1".to_owned(),
+                stream: SessionToolOutputStream::Pty,
+                sequence: 2,
+                text: "world".to_owned(),
+                byte_len: 5,
+            },
+        )
+        .await;
+        flush_tool_output_stream(&state, session_id, &mut pending_output).await;
+
+        let received = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("subscriber should receive coalesced live delta");
+        assert_eq!(
+            received.kind,
+            SessionLiveEventKind::ToolOutputDelta {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-1".to_owned(),
+                    stream: SessionToolOutputStream::Pty,
+                    sequence: 1,
+                    text: "hello world".to_owned(),
+                    byte_len: 11,
+                },
+            }
+        );
+        assert!(attachment.live_events.try_recv().is_err());
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { .. }
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_output_accumulator_flushes_on_stream_change() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let mut pending_output = None;
+
+        push_tool_output_stream(
+            &state,
+            session_id,
+            &mut pending_output,
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-1".to_owned(),
+                stream: SessionToolOutputStream::Stdout,
+                sequence: 1,
+                text: "out".to_owned(),
+                byte_len: 3,
+            },
+        )
+        .await;
+        push_tool_output_stream(
+            &state,
+            session_id,
+            &mut pending_output,
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-1".to_owned(),
+                stream: SessionToolOutputStream::Stderr,
+                sequence: 2,
+                text: "err".to_owned(),
+                byte_len: 3,
+            },
+        )
+        .await;
+        flush_tool_output_stream(&state, session_id, &mut pending_output).await;
+
+        let first = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("subscriber should receive stdout delta");
+        let second = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("subscriber should receive stderr delta");
+        assert_eq!(
+            first.kind,
+            SessionLiveEventKind::ToolOutputDelta {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-1".to_owned(),
+                    stream: SessionToolOutputStream::Stdout,
+                    sequence: 1,
+                    text: "out".to_owned(),
+                    byte_len: 3,
+                },
+            }
+        );
+        assert_eq!(
+            second.kind,
+            SessionLiveEventKind::ToolOutputDelta {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-1".to_owned(),
+                    stream: SessionToolOutputStream::Stderr,
+                    sequence: 2,
+                    text: "err".to_owned(),
+                    byte_len: 3,
+                },
+            }
+        );
     }
 
     #[tokio::test]
