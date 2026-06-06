@@ -8,8 +8,8 @@ use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
     DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_OK, NativeEventContext,
-    NativeServiceContext, PluginConfigContext, PluginEvent, SERVICE_STATUS_OK,
-    ServiceEventCallback, ServiceRequest, StaticPluginVtable,
+    NativeServiceContext, PluginConfigContext, PluginEvent, SERVICE_RESPONSE_CHUNK_PREFIX,
+    SERVICE_STATUS_OK, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 use libloading::Library;
@@ -45,6 +45,11 @@ type StreamingServiceFn = unsafe extern "C" fn(
 ) -> i32;
 type EventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 
+struct ServiceCallbackState<'a> {
+    on_event: &'a mut dyn FnMut(Vec<u8>),
+    response_chunks: Vec<Vec<u8>>,
+}
+
 extern "C" fn service_event_callback(
     payload_ptr: *const u8,
     payload_len: usize,
@@ -54,8 +59,12 @@ extern "C" fn service_event_callback(
         return;
     }
     let payload = unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }.to_vec();
-    let callback = unsafe { &mut *user_data.cast::<&mut dyn FnMut(Vec<u8>)>() };
-    callback(payload);
+    let state = unsafe { &mut *user_data.cast::<ServiceCallbackState<'_>>() };
+    if let Some(chunk) = payload.strip_prefix(SERVICE_RESPONSE_CHUNK_PREFIX) {
+        state.response_chunks.push(chunk.to_vec());
+    } else {
+        (state.on_event)(payload);
+    }
 }
 
 /// Plugin manifest loaded from `bcode-plugin.toml`.
@@ -352,8 +361,11 @@ impl LoadedPlugin {
         let output_capacity = 1024 * 1024;
         let mut output_len = 0_usize;
         let mut output = vec![0_u8; output_capacity];
-        let mut event_callback: &mut dyn FnMut(Vec<u8>) = &mut on_event;
-        let event_user_data = (&raw mut event_callback).cast::<std::ffi::c_void>();
+        let mut callback_state = ServiceCallbackState {
+            on_event: &mut on_event,
+            response_chunks: Vec::new(),
+        };
+        let event_user_data = (&raw mut callback_state).cast::<std::ffi::c_void>();
         let status = self.invoke_service_raw(
             input.as_ptr(),
             input.len(),
@@ -376,7 +388,11 @@ impl LoadedPlugin {
                 code: status,
             });
         }
-        output.truncate(output_len);
+        if callback_state.response_chunks.is_empty() {
+            output.truncate(output_len);
+        } else {
+            output = callback_state.response_chunks.concat();
+        }
         serde_json::from_slice(&output).map_err(PluginLoadError::ServiceDecode)
     }
 
@@ -2494,6 +2510,28 @@ library = "libexample_plugin.dylib"
     }
 
     #[test]
+    fn chunked_service_response_reassembles_without_retry() {
+        LARGE_CHUNKING_CALLS.store(0, Ordering::SeqCst);
+        let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: test_manifest("large"),
+            backend: LoadedPluginBackend::Static {
+                vtable: test_large_chunking_vtable(),
+            },
+        };
+
+        let response = plugin
+            .invoke_service("large", "run", Vec::new())
+            .expect("chunked response should invoke");
+
+        assert_eq!(LARGE_CHUNKING_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response.payload_text().expect("response should be text"),
+            "x".repeat(1024 * 1024 + 1)
+        );
+    }
+
+    #[test]
     fn oversized_service_response_is_not_retried() {
         LARGE_CALLS.store(0, Ordering::SeqCst);
         let plugin = LoadedPlugin {
@@ -2809,6 +2847,7 @@ library = "libexample_plugin.dylib"
     }
 
     static LARGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LARGE_CHUNKING_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn test_large_service(
         _: *const std::ffi::c_void,
@@ -2821,6 +2860,57 @@ library = "libexample_plugin.dylib"
         LARGE_CALLS.fetch_add(1, Ordering::SeqCst);
         let response = ServiceResponse::text("x".repeat(1024 * 1024 + 1));
         write_test_response(&response, output, cap, len)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_large_chunking_service(
+        _: *const std::ffi::c_void,
+        _: *const u8,
+        _: usize,
+        output: *mut u8,
+        cap: usize,
+        len: *mut usize,
+        callback: Option<ServiceEventCallback>,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        LARGE_CHUNKING_CALLS.fetch_add(1, Ordering::SeqCst);
+        let response = ServiceResponse::text("x".repeat(1024 * 1024 + 1));
+        let encoded = serde_json::to_vec(&response).expect("service response encodes");
+        unsafe {
+            *len = encoded.len();
+        }
+        if output.is_null() || cap < encoded.len() {
+            if let Some(callback) = callback {
+                for chunk in encoded.chunks(256 * 1024) {
+                    let mut payload =
+                        Vec::with_capacity(SERVICE_RESPONSE_CHUNK_PREFIX.len() + chunk.len());
+                    payload.extend_from_slice(SERVICE_RESPONSE_CHUNK_PREFIX);
+                    payload.extend_from_slice(chunk);
+                    callback(payload.as_ptr(), payload.len(), user_data);
+                }
+                unsafe {
+                    *len = 0;
+                }
+                return SERVICE_STATUS_OK;
+            }
+            return SERVICE_STATUS_BUFFER_TOO_SMALL;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
+        }
+        SERVICE_STATUS_OK
+    }
+
+    fn test_large_chunking_vtable() -> StaticPluginVtable {
+        StaticPluginVtable {
+            instance: std::ptr::null(),
+            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
+            activate: test_activate,
+            deactivate: test_deactivate,
+            invoke_service: test_large_service,
+            invoke_service_streaming: test_large_chunking_service,
+            handle_event: test_handle_event,
+        }
     }
 
     fn test_large_vtable() -> StaticPluginVtable {

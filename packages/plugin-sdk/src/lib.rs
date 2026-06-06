@@ -16,6 +16,11 @@ use std::sync::{Mutex, OnceLock};
 /// ABI-safe callback used by plugins to emit incremental service events.
 pub type ServiceEventCallback = extern "C" fn(*const u8, usize, *mut c_void);
 
+/// Private marker prefix for transparent service response chunks emitted over the streaming
+/// callback channel.
+#[doc(hidden)]
+pub const SERVICE_RESPONSE_CHUNK_PREFIX: &[u8] = b"bcode.internal.service_response_chunk.v1\0";
+
 pub type StreamingServiceFn = fn(
     *const c_void,
     *const u8,
@@ -536,12 +541,30 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         *output_len = encoded.len();
     }
     if output_ptr.is_null() || output_capacity < encoded.len() {
+        if events.is_available() {
+            emit_service_response_chunks(events, &encoded);
+            unsafe {
+                *output_len = 0;
+            }
+            return SERVICE_STATUS_OK;
+        }
         return SERVICE_STATUS_BUFFER_TOO_SMALL;
     }
     unsafe {
         std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
     }
     SERVICE_STATUS_OK
+}
+
+const SERVICE_RESPONSE_CHUNK_DATA_SIZE: usize = 256 * 1024;
+
+fn emit_service_response_chunks(events: ServiceEventEmitter, encoded: &[u8]) {
+    for chunk in encoded.chunks(SERVICE_RESPONSE_CHUNK_DATA_SIZE) {
+        let mut payload = Vec::with_capacity(SERVICE_RESPONSE_CHUNK_PREFIX.len() + chunk.len());
+        payload.extend_from_slice(SERVICE_RESPONSE_CHUNK_PREFIX);
+        payload.extend_from_slice(chunk);
+        events.emit(&payload);
+    }
 }
 
 #[doc(hidden)]
