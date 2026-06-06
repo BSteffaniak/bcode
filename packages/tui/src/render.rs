@@ -67,8 +67,9 @@ pub fn prepare_frame(app: &mut BmuxApp, area: Rect) {
     }
 
     let composer_height = composer_height(app, area);
-    let composer_y = area.bottom().saturating_sub(composer_height);
-    let body_height = composer_y.saturating_sub(area.y.saturating_add(2));
+    let composer = composer_area(area, composer_height);
+    app.set_composer_content_area(composer_panel().inner_area(composer));
+    let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
     super::transcript_projection::prepare_for_body(app, body);
 }
@@ -90,12 +91,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>) {
     render_header(app, header, frame);
 
     let composer_height = composer_height(app, area);
-    let composer = Rect::new(
-        area.x,
-        area.bottom().saturating_sub(composer_height),
-        area.width,
-        composer_height,
-    );
+    let composer = composer_area(area, composer_height);
     render_composer(app, composer, frame);
 
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
@@ -346,6 +342,22 @@ fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
         .saturating_add(2)
         .min(area.height.saturating_sub(2).max(3))
         .min(area.height)
+}
+
+const fn composer_area(area: Rect, composer_height: u16) -> Rect {
+    Rect::new(
+        area.x,
+        area.bottom().saturating_sub(composer_height),
+        area.width,
+        composer_height,
+    )
+}
+
+fn composer_panel() -> Panel {
+    Panel::new()
+        .border(Border::single().style(Style::new().fg(Color::Cyan)))
+        .title(" Message ")
+        .padding(Insets::new(0, 1, 0, 1))
 }
 
 fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2582,10 +2594,7 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::Cyan)))
-        .title(" Message ")
-        .padding(Insets::new(0, 1, 0, 1));
+    let panel = composer_panel();
     panel.render(area, frame);
     let inner = panel.inner_area(area);
     app.set_composer_content_area(inner);
