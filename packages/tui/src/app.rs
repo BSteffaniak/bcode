@@ -419,6 +419,30 @@ impl BmuxApp {
         &self.transcript
     }
 
+    /// Return a transcript item by index.
+    #[must_use]
+    pub fn transcript_item(&self, index: usize) -> Option<&TranscriptItem> {
+        self.transcript.get(index)
+    }
+
+    /// Return the number of transcript items.
+    #[must_use]
+    pub const fn transcript_len(&self) -> usize {
+        self.transcript.len()
+    }
+
+    /// Return a pending submission by index.
+    #[must_use]
+    pub fn pending_submission(&self, index: usize) -> Option<&PendingSubmission> {
+        self.pending_submissions.items().get(index)
+    }
+
+    /// Return the number of pending submissions.
+    #[must_use]
+    pub fn pending_submissions_len(&self) -> usize {
+        self.pending_submissions.items().len()
+    }
+
     /// Return changed-file summaries inferred from edit tool calls.
     #[must_use]
     pub fn changed_files(&self) -> &[DiffFileSummary] {

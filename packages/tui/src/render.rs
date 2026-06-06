@@ -459,23 +459,35 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn sync_transcript_layout(app: &mut BmuxApp, width: u16) {
-    let transcript = app.transcript().to_vec();
-    let pending_submissions = app.pending_submissions().to_vec();
+    let transcript_len = app.transcript_len();
+    let pending_len = app.pending_submissions_len();
     let has_older_history = app.has_older_history();
     let loading_older_history = app.loading_older_history();
     let inline_diff_config = app.inline_diff_config();
-    app.transcript_layout_mut().sync(TranscriptLayoutSpec {
+    let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
+    transcript_layout.sync(TranscriptLayoutSpec {
         width,
-        transcript_len: transcript.len(),
-        pending_len: pending_submissions.len(),
+        transcript_len,
+        pending_len,
         transcript_signature: |index| {
-            transcript_item_signature(&transcript[index], width, inline_diff_config)
+            let item = app
+                .transcript_item(index)
+                .expect("transcript item index must be valid during layout sync");
+            transcript_item_signature(item, width, inline_diff_config)
         },
-        transcript_rows: |index| {
-            transcript_item_rows(&transcript, index, width, inline_diff_config)
+        transcript_rows: |index| transcript_item_rows(app, index, width, inline_diff_config),
+        pending_signature: |index| {
+            let submission = app
+                .pending_submission(index)
+                .expect("pending submission index must be valid during layout sync");
+            pending_submission_signature(submission, width)
         },
-        pending_signature: |index| pending_submission_signature(&pending_submissions[index], width),
-        pending_rows: |index| pending_submission_rows(&pending_submissions[index], width),
+        pending_rows: |index| {
+            let submission = app
+                .pending_submission(index)
+                .expect("pending submission index must be valid during layout sync");
+            pending_submission_rows(submission, width)
+        },
         history_banner_signature: || {
             history_banner_text(has_older_history, loading_older_history)
                 .map(|text| TranscriptLayoutSignature::new(format!("history:{width}:{text}")))
@@ -483,6 +495,7 @@ fn sync_transcript_layout(app: &mut BmuxApp, width: u16) {
         history_banner_rows: || history_banner_rows(has_older_history, loading_older_history),
         reset: || false,
     });
+    *app.transcript_layout_mut() = transcript_layout;
 }
 
 fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -536,13 +549,19 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn transcript_item_rows(
-    transcript: &[TranscriptItem],
+    app: &BmuxApp,
     index: usize,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
 ) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, transcript, index, width, inline_diff_config);
+    push_transcript_item_rows(
+        &mut rows,
+        app.transcript(),
+        index,
+        width,
+        inline_diff_config,
+    );
     rows
 }
 
