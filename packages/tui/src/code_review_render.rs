@@ -118,8 +118,11 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             if app.comment_editor.is_some() {
                 return " enter/ctrl+s save comment  esc cancel ".to_string();
             }
+            if let Some(preview) = app.selected_draft_preview() {
+                return format!(" {preview}  D delete latest draft ");
+            }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  J/K hunk  c comment  D delete draft  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -332,7 +335,7 @@ fn render_diff_line(line: &ReviewLine) -> RenderedRow {
 
 fn render_help(area: Rect, frame: &mut Frame<'_>) {
     let width = area.width.min(68);
-    let height = 12;
+    let height = 13;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
     let y = area
         .y
@@ -354,6 +357,7 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " mouse wheel         scroll diff",
         " click file          open file",
         " c                   create draft comment",
+        " D                   delete latest draft on line",
         " ?                   toggle this help",
         " q or esc            exit review",
     ];

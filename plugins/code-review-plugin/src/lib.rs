@@ -29,6 +29,8 @@ pub const OP_CREATE_REVIEW: &str = "create_review";
 pub const OP_DRAFT_LIST: &str = "draft.list";
 /// Operation that saves a persisted draft comment.
 pub const OP_DRAFT_SAVE: &str = "draft.save";
+/// Operation that deletes a persisted draft comment.
+pub const OP_DRAFT_DELETE: &str = "draft.delete";
 
 const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
 const DEFAULT_STATE_ROOT: &str = ".bcode/code-review";
@@ -56,6 +58,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_CREATE_REVIEW => create_review(&context.request),
             OP_DRAFT_LIST => list_drafts(&context.request),
             OP_DRAFT_SAVE => save_draft(&context.request),
+            OP_DRAFT_DELETE => delete_draft(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -129,6 +132,15 @@ pub struct SaveDraftRequest {
     pub body: String,
 }
 
+/// Request payload for `draft.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteDraftRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Comment id to delete.
+    pub comment_id: String,
+}
+
 /// Persisted draft anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftAnchor {
@@ -173,6 +185,13 @@ pub struct ListDraftsResponse {
 pub struct SaveDraftResponse {
     /// Saved draft comment.
     pub draft: DraftComment,
+}
+
+/// Response payload for `draft.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteDraftResponse {
+    /// Whether a persisted draft was deleted.
+    pub deleted: bool,
 }
 
 /// Structured review response.
@@ -338,6 +357,18 @@ fn save_draft(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn delete_draft(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<DeleteDraftRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+
+    match delete_draft_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("draft_delete_failed", error.to_string()),
+    }
+}
+
 fn list_drafts_for_request(request: &ListDraftsRequest) -> Result<ListDraftsResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let review_key = review_key(&repo_root, &request.target)?;
@@ -368,6 +399,20 @@ fn save_draft_for_request(request: SaveDraftRequest) -> Result<SaveDraftResponse
         })
     })?;
     Ok(SaveDraftResponse { draft })
+}
+
+fn delete_draft_for_request(
+    request: DeleteDraftRequest,
+) -> Result<DeleteDraftResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let deleted = with_database(&repo_root, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .delete_draft(&request.comment_id)
+                .await
+        })
+    })?;
+    Ok(DeleteDraftResponse { deleted })
 }
 
 fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
@@ -481,6 +526,40 @@ impl<'a> CodeReviewDb<'a> {
             created_at_ms: now,
             updated_at_ms: now,
         })
+    }
+
+    async fn delete_draft(&self, comment_id: &str) -> Result<bool, ReviewError> {
+        let Some(row) = self
+            .db
+            .select("draft_comments")
+            .columns(&["thread_id"])
+            .filter(Box::new(where_eq("comment_id", comment_id)))
+            .execute_first(self.db)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let thread_id = required_text(&row, "thread_id")?;
+        self.db
+            .delete("draft_comments")
+            .filter(Box::new(where_eq("comment_id", comment_id)))
+            .execute(self.db)
+            .await?;
+        let remaining = self
+            .db
+            .select("draft_comments")
+            .columns(&["comment_id"])
+            .filter(Box::new(where_eq("thread_id", thread_id.clone())))
+            .execute_first(self.db)
+            .await?;
+        if remaining.is_none() {
+            self.db
+                .delete("draft_threads")
+                .filter(Box::new(where_eq("thread_id", thread_id)))
+                .execute(self.db)
+                .await?;
+        }
+        Ok(true)
     }
 
     async fn ensure_review(
