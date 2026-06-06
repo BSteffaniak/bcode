@@ -3942,6 +3942,8 @@ async fn handle_resolve_permission(
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MODEL_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const MODEL_STREAM_FLUSH_BYTES: usize = 512;
+const TOOL_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+const TOOL_OUTPUT_FLUSH_BYTES: usize = 4096;
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
 
@@ -3962,6 +3964,119 @@ struct ToolArgumentStreamProgress {
 #[derive(Debug, Default)]
 struct ModelStreamProgress {
     active_tool_call: Option<ToolArgumentStreamProgress>,
+}
+
+#[derive(Debug)]
+struct ToolOutputStreamAccumulator {
+    tool_call_id: String,
+    stream: SessionToolOutputStream,
+    first_sequence: u64,
+    text: String,
+    byte_len: usize,
+    last_flush: Instant,
+}
+
+impl ToolOutputStreamAccumulator {
+    fn new(
+        tool_call_id: String,
+        stream: SessionToolOutputStream,
+        sequence: u64,
+        text: String,
+        byte_len: usize,
+    ) -> Self {
+        Self {
+            tool_call_id,
+            stream,
+            first_sequence: sequence,
+            text,
+            byte_len,
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn can_absorb(&self, tool_call_id: &str, stream: SessionToolOutputStream) -> bool {
+        self.tool_call_id == tool_call_id && self.stream == stream
+    }
+
+    fn push(&mut self, text: &str, byte_len: usize) {
+        self.text.push_str(text);
+        self.byte_len = self.byte_len.saturating_add(byte_len);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.byte_len >= TOOL_OUTPUT_FLUSH_BYTES
+            || self.last_flush.elapsed() >= TOOL_OUTPUT_FLUSH_INTERVAL
+    }
+
+    fn into_event(self) -> ToolInvocationStreamEvent {
+        ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id: self.tool_call_id,
+            stream: self.stream,
+            sequence: self.first_sequence,
+            text: self.text,
+            byte_len: self.byte_len,
+        }
+    }
+}
+
+async fn flush_tool_output_stream(
+    state: &ServerState,
+    session_id: SessionId,
+    pending_output: &mut Option<ToolOutputStreamAccumulator>,
+) {
+    if let Some(output) = pending_output.take() {
+        let _ = state
+            .sessions
+            .publish_live_event(
+                session_id,
+                SessionLiveEventKind::ToolOutputDelta {
+                    event: output.into_event(),
+                },
+            )
+            .await;
+    }
+}
+
+async fn push_tool_output_stream(
+    state: &ServerState,
+    session_id: SessionId,
+    pending_output: &mut Option<ToolOutputStreamAccumulator>,
+    event: ToolInvocationStreamEvent,
+) {
+    let ToolInvocationStreamEvent::OutputDelta {
+        tool_call_id,
+        stream,
+        sequence,
+        text,
+        byte_len,
+    } = event
+    else {
+        append_tool_stream_event(state, session_id, event).await;
+        return;
+    };
+
+    let can_absorb = pending_output
+        .as_ref()
+        .is_some_and(|output| output.can_absorb(&tool_call_id, stream));
+    if !can_absorb {
+        flush_tool_output_stream(state, session_id, pending_output).await;
+        *pending_output = Some(ToolOutputStreamAccumulator::new(
+            tool_call_id,
+            stream,
+            sequence,
+            text,
+            byte_len,
+        ));
+    } else if let Some(output) = pending_output.as_mut() {
+        output.push(&text, byte_len);
+    }
+
+    if pending_output
+        .as_ref()
+        .is_some_and(ToolOutputStreamAccumulator::should_flush)
+    {
+        flush_tool_output_stream(state, session_id, pending_output).await;
+    }
 }
 
 #[derive(Debug)]
@@ -7101,6 +7216,7 @@ async fn invoke_model_tool(
             CancellationHandle::PluginInvocation(invocation.cancel.clone()),
         )
         .await;
+    let mut pending_tool_output: Option<ToolOutputStreamAccumulator> = None;
     let response = loop {
         tokio::select! {
             () = cancel_state.cancelled() => {
@@ -7122,7 +7238,13 @@ async fn invoke_model_tool(
             }
             Some(payload) = invocation.events.recv() => {
                 if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
-                    append_tool_stream_event(state, session_id, convert_tool_stream_event(event)).await;
+                    push_tool_output_stream(
+                        state,
+                        session_id,
+                        &mut pending_tool_output,
+                        convert_tool_stream_event(event),
+                    )
+                    .await;
                 }
             }
             response = &mut invocation.response => {
@@ -7134,9 +7256,16 @@ async fn invoke_model_tool(
     };
     while let Ok(payload) = invocation.events.try_recv() {
         if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
-            append_tool_stream_event(state, session_id, convert_tool_stream_event(event)).await;
+            push_tool_output_stream(
+                state,
+                session_id,
+                &mut pending_tool_output,
+                convert_tool_stream_event(event),
+            )
+            .await;
         }
     }
+    flush_tool_output_stream(state, session_id, &mut pending_tool_output).await;
     bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())
 }
 
