@@ -97,6 +97,8 @@ struct TranscriptLayoutInput<'a> {
     width: u16,
     transcript: &'a [TranscriptItem],
     pending: &'a [PendingSubmission],
+    transcript_projection_revision: u64,
+    pending_submissions_projection_revision: u64,
     has_older_history: bool,
     loading_older_history: bool,
     inline_diff_config: TuiInlineDiffConfig,
@@ -108,6 +110,8 @@ impl<'a> TranscriptLayoutInput<'a> {
             width,
             transcript: app.transcript(),
             pending: app.pending_submissions(),
+            transcript_projection_revision: app.transcript_projection_revision(),
+            pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
             has_older_history: app.has_older_history(),
             loading_older_history: app.loading_older_history(),
             inline_diff_config: app.inline_diff_config(),
@@ -128,12 +132,14 @@ impl<'a> TranscriptLayoutInput<'a> {
             .collect::<Vec<_>>()
             .join(",");
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};history:{}:{};transcript:{};pending:{}",
+            "width:{};diff:{:?};history:{}:{};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
             self.width,
             self.inline_diff_config,
             self.has_older_history,
             self.loading_older_history,
+            self.transcript_projection_revision,
             transcript,
+            self.pending_submissions_projection_revision,
             pending
         ))
     }
