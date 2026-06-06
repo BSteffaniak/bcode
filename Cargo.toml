@@ -3,6 +3,7 @@ members = [
     "examples/hello-plugin",
     "plugins/filesystem-plugin",
     "plugins/git-plugin",
+    "plugins/code-review-plugin",
     "plugins/document-plugin",
     "plugins/bedrock-provider-plugin",
     "plugins/blims-plugin",
@@ -63,6 +64,7 @@ bcode_bedrock_provider_plugin           = { version = "0.0.1-alpha.0", default-f
 bcode_blims_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/blims-plugin" }
 bcode_cli                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bcode_client                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bcode_code_review_plugin                = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/code-review-plugin" }
 bcode_command                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
 bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bcode_daemon_lifecycle                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/daemon-lifecycle" }

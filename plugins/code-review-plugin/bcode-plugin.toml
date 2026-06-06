@@ -1,0 +1,20 @@
+id      = "bcode.code_review"
+name    = "Bcode Code Review Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Local Git code review services"
+interface_id = "bcode.code_review/v1"
+name         = "Code Review"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_code_review_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

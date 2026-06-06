@@ -1106,6 +1106,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_code_review_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bcode_command"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1350,6 +1360,7 @@ dependencies = [
  "bcode_agent_profile",
  "bcode_bedrock_provider_plugin",
  "bcode_blims_plugin",
+ "bcode_code_review_plugin",
  "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",

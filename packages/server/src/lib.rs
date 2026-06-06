@@ -979,6 +979,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/blims-plugin/bcode-plugin.toml"),
             bcode_blims_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-code-review-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
+            bcode_code_review_plugin::static_plugin(),
+        ),
         #[cfg(feature = "static-bundled-default-agents-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),

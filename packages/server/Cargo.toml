@@ -15,6 +15,7 @@ base64 = { workspace = true }
 bcode_agent_profile = { workspace = true }
 bcode_bedrock_provider_plugin = { workspace = true, optional = true }
 bcode_blims_plugin = { workspace = true, optional = true }
+bcode_code_review_plugin = { workspace = true, optional = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
@@ -72,6 +73,11 @@ static-bundled-blims-plugin = [
     "dep:bcode_blims_plugin",
     "bcode_blims_plugin/static-bundled",
 ]
+static-bundled-code-review-plugin = [
+    "_static-bundled",
+    "dep:bcode_code_review_plugin",
+    "bcode_code_review_plugin/static-bundled",
+]
 static-bundled-default-agents-plugin = [
     "_static-bundled",
     "dep:bcode_default_agents_plugin",
@@ -116,6 +122,7 @@ static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
     "static-bundled-blims-plugin",
+    "static-bundled-code-review-plugin",
     "static-bundled-default-agents-plugin",
     "static-bundled-document-plugin",
     "static-bundled-fake-provider-plugin",
