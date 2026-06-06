@@ -26,6 +26,7 @@ pub const BCODE_AUTH_PROFILE_ENV: &str = "BCODE_AUTH_PROFILE";
 
 const DEFAULT_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
 const DEFAULT_BLIMS_PLUGIN_ID: &str = "bcode.blims";
+const DEFAULT_CODE_REVIEW_PLUGIN_ID: &str = "bcode.code_review";
 const DEFAULT_DOCUMENT_PLUGIN_ID: &str = "bcode.document";
 const DEFAULT_FILESYSTEM_PLUGIN_ID: &str = "bcode.filesystem";
 const DEFAULT_GIT_PLUGIN_ID: &str = "bcode.git";
@@ -37,6 +38,7 @@ const DEFAULT_WORKTREE_PLUGIN_ID: &str = "bcode.worktree";
 const DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.pi-session-import";
 const DEFAULT_OPENCODE_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.opencode-session-import";
 const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
+    DEFAULT_CODE_REVIEW_PLUGIN_ID,
     DEFAULT_DOCUMENT_PLUGIN_ID,
     DEFAULT_FILESYSTEM_PLUGIN_ID,
     DEFAULT_GIT_PLUGIN_ID,
@@ -3220,11 +3222,12 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 mod tests {
     use super::{
         BcodeConfig, CompactionMode, ConfigLoadOverrides, DEFAULT_AGENT_PROFILE_PLUGIN_ID,
-        DEFAULT_DOCUMENT_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID,
-        DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID, DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID,
-        PluginSelection, TuiMouseConfig, default_config_paths_from, default_permissions_state_path,
-        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
-        merge_agent_configs, upsert_agent_permission_rule,
+        DEFAULT_CODE_REVIEW_PLUGIN_ID, DEFAULT_DOCUMENT_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID,
+        DEFAULT_GIT_PLUGIN_ID, DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID, DEFAULT_SHELL_PLUGIN_ID,
+        DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig, default_config_paths_from,
+        default_permissions_state_path, load_config_from_paths,
+        load_config_from_paths_with_overrides, load_permissions_state_from, merge_agent_configs,
+        upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::{Action, AgentConfig, PermissionConfig};
     use std::collections::BTreeMap;
@@ -3275,6 +3278,11 @@ triple_click_select = "all"
     }
 
     fn assert_default_core_plugins_enabled(plugin_selection: &PluginSelection) {
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_CODE_REVIEW_PLUGIN_ID)
+        );
         assert!(
             plugin_selection
                 .enabled
@@ -3688,6 +3696,33 @@ disabled = ["bcode.default-agents"]
                 .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
         );
         assert!(plugin_selection.enabled.contains(DEFAULT_SHELL_PLUGIN_ID));
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn default_code_review_can_be_disabled() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+disabled = ["bcode.code_review"]
+"#,
+        )
+        .expect("config should parse");
+        let plugin_selection = PluginSelection::from(&config);
+
+        assert!(
+            !plugin_selection
+                .enabled
+                .contains(DEFAULT_CODE_REVIEW_PLUGIN_ID)
+        );
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
+        );
 
         restore_provider_env(previous_env);
     }
