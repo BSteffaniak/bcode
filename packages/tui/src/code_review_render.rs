@@ -118,11 +118,14 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             if app.comment_editor.is_some() {
                 return " enter/ctrl+s save comment  esc cancel ".to_string();
             }
+            if let Some(range) = app.range_selection_label() {
+                return format!(" {range}  c comment  a ask Bcode  esc clear ");
+            }
             if let Some(preview) = app.selected_draft_preview() {
                 return format!(" {preview}  a ask Bcode  e edit  D delete latest draft ");
             }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  a ask Bcode  e edit  D delete draft  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  e edit  D delete draft  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -263,6 +266,8 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             let (line, style) = if index == app.selected_diff_line {
                 (selected_line(&line), rendered.style.bg(Color::BrightBlack))
+            } else if app.is_row_in_range_selection(app.selected_file, index) {
+                (selected_line(&line), rendered.style.bg(Color::Blue))
             } else {
                 (line, rendered.style)
             };
@@ -335,7 +340,7 @@ fn render_diff_line(line: &ReviewLine) -> RenderedRow {
 
 fn render_help(area: Rect, frame: &mut Frame<'_>) {
     let width = area.width.min(68);
-    let height = 15;
+    let height = 16;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
     let y = area
         .y
@@ -357,6 +362,7 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " mouse wheel         scroll diff",
         " click file          open file",
         " c                   create draft comment",
+        " v                   select/clear line range",
         " a                   ask Bcode about selected line",
         " e                   edit latest draft on line",
         " D                   delete latest draft on line",

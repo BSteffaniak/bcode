@@ -416,8 +416,15 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         return false;
     }
     match stroke.key {
-        KeyCode::Char('q') | KeyCode::Escape => {
+        KeyCode::Char('q') => {
             app.should_exit = true;
+            true
+        }
+        KeyCode::Escape => {
+            let cleared = app.clear_range_selection();
+            if !cleared {
+                app.should_exit = true;
+            }
             true
         }
         KeyCode::Char('b') => {
@@ -432,6 +439,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('p') | KeyCode::Left => app.select_previous_file(),
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
+        KeyCode::Char('v') => app.toggle_range_selection(),
         KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
@@ -590,6 +598,12 @@ struct DraftAnchor {
     file_path: String,
     diff_row: u64,
     old_line: Option<u32>,
+    start_diff_row: Option<u64>,
+    end_diff_row: Option<u64>,
+    old_start: Option<u32>,
+    old_end: Option<u32>,
+    new_start: Option<u32>,
+    new_end: Option<u32>,
     new_line: Option<u32>,
     line_kind: ReviewLineKind,
 }
@@ -619,8 +633,14 @@ struct SaveDraftResponse {
 impl From<ReviewCommentAnchor> for DraftAnchor {
     fn from(anchor: ReviewCommentAnchor) -> Self {
         Self {
-            file_path: anchor.path,
+            file_path: anchor.path.clone(),
             diff_row: u64::try_from(anchor.diff_row).unwrap_or(u64::MAX),
+            start_diff_row: Some(u64::try_from(anchor.start_diff_row()).unwrap_or(u64::MAX)),
+            end_diff_row: Some(u64::try_from(anchor.end_diff_row()).unwrap_or(u64::MAX)),
+            old_start: anchor.old_start,
+            old_end: anchor.old_end,
+            new_start: anchor.new_start,
+            new_end: anchor.new_end,
             old_line: anchor.old_line,
             new_line: anchor.new_line,
             line_kind: anchor.line_kind,
@@ -757,12 +777,39 @@ pub struct ReviewCommentAnchor {
     pub path: String,
     /// Rendered diff row in the selected file.
     pub diff_row: usize,
+    /// Rendered diff range end row in the selected file.
+    pub end_diff_row: Option<usize>,
     /// Old line number, when present.
     pub old_line: Option<u32>,
     /// New line number, when present.
     pub new_line: Option<u32>,
+    /// Old range start line, when present.
+    pub old_start: Option<u32>,
+    /// Old range end line, when present.
+    pub old_end: Option<u32>,
+    /// New range start line, when present.
+    pub new_start: Option<u32>,
+    /// New range end line, when present.
+    pub new_end: Option<u32>,
     /// Anchored diff line kind.
     pub line_kind: ReviewLineKind,
+}
+
+impl ReviewCommentAnchor {
+    /// Return the first rendered diff row for this anchor.
+    #[must_use]
+    pub const fn start_diff_row(&self) -> usize {
+        self.diff_row
+    }
+
+    /// Return the final rendered diff row for this anchor.
+    #[must_use]
+    pub const fn end_diff_row(&self) -> usize {
+        match self.end_diff_row {
+            Some(row) => row,
+            None => self.diff_row,
+        }
+    }
 }
 
 /// Review draft comment metadata.
@@ -905,6 +952,8 @@ pub struct ReviewApp {
     pub pending_draft_update: Option<PendingDraftUpdate>,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
+    /// Active range selection start row, if any.
+    pub range_selection_start: Option<usize>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
 }
@@ -929,6 +978,7 @@ impl ReviewApp {
             pending_draft_delete: None,
             pending_draft_update: None,
             pending_agent_session: None,
+            range_selection_start: None,
             last_file_area: None,
             last_diff_area: None,
         }
@@ -958,6 +1008,7 @@ impl ReviewApp {
         self.selected_file = index;
         self.diff_scroll = 0;
         self.selected_diff_line = 0;
+        self.range_selection_start = None;
         true
     }
 
@@ -1125,6 +1176,63 @@ impl ReviewApp {
             .filter(|(anchor, _)| anchor.file_index == file_index)
             .map(|(_, comments)| comments.len())
             .sum()
+    }
+
+    /// Clear active range selection.
+    pub fn clear_range_selection(&mut self) -> bool {
+        if self.range_selection_start.is_none() {
+            return false;
+        }
+        self.range_selection_start = None;
+        self.status_message = Some("cleared range selection".to_string());
+        true
+    }
+
+    /// Toggle range selection from the selected diff line.
+    pub fn toggle_range_selection(&mut self) -> bool {
+        if self.range_selection_start.is_some() {
+            self.range_selection_start = None;
+            self.status_message = Some("cleared range selection".to_string());
+            return true;
+        }
+        if self.selected_comment_anchor().is_none() {
+            self.status_message = Some("select a diff line to start range selection".to_string());
+            return true;
+        }
+        self.range_selection_start = Some(self.selected_diff_line);
+        self.status_message =
+            Some("range selection started; move then c comment or a ask Bcode".to_string());
+        true
+    }
+
+    /// Return selected range bounds, if active.
+    #[must_use]
+    pub fn selected_range_bounds(&self) -> Option<(usize, usize)> {
+        let start = self.range_selection_start?;
+        Some(if start <= self.selected_diff_line {
+            (start, self.selected_diff_line)
+        } else {
+            (self.selected_diff_line, start)
+        })
+    }
+
+    /// Return true when a rendered row is within the active range selection.
+    #[must_use]
+    pub fn is_row_in_range_selection(&self, file_index: usize, diff_row: usize) -> bool {
+        if file_index != self.selected_file {
+            return false;
+        }
+        let Some((start, end)) = self.selected_range_bounds() else {
+            return false;
+        };
+        (start..=end).contains(&diff_row)
+    }
+
+    /// Return a status label for an active range selection.
+    #[must_use]
+    pub fn range_selection_label(&self) -> Option<String> {
+        let (start, end) = self.selected_range_bounds()?;
+        Some(format!("range {start}-{end} selected"))
     }
 
     /// Return true when a diff row has draft comments.
@@ -1304,28 +1412,51 @@ impl ReviewApp {
     #[must_use]
     pub fn agent_session_prompt(&self, ask: &PendingAgentSession) -> String {
         let hunk = self.hunk_context_for_anchor(&ask.anchor);
+        let selected_lines = self.selected_lines_for_anchor(&ask.anchor);
         let other_comment_count = self.draft_comment_count().saturating_sub(usize::from(
             self.draft_comments
                 .get(&ask.anchor)
                 .is_some_and(|comments| !comments.is_empty()),
         ));
         format!(
-            "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nDiff row: {}\nOld line: {}\nNew line: {}\nLine kind: {:?}\nOther draft comment threads in this review: {}\n\nCurrent draft/comment:\n{}\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nPlease analyze this review thread. Keep the anchored file and line context in mind. If broader context is needed, inspect the repository from the session working directory.",
+            "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nDiff rows: {}-{}\nOld range: {}-{}\nNew range: {}-{}\nLine kind: {:?}\nOther draft comment threads in this review: {}\n\nCurrent draft/comment:\n{}\n\nSelected diff lines:\n```diff\n{}\n```\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nPlease analyze this review thread. Keep the anchored file and line context in mind. If broader context is needed, inspect the repository from the session working directory.",
             self.review.title,
             self.review.repo_root.display(),
             ask.anchor.path,
-            ask.anchor.diff_row,
+            ask.anchor.start_diff_row(),
+            ask.anchor.end_diff_row(),
             ask.anchor
-                .old_line
+                .old_start
                 .map_or_else(|| "none".to_string(), |line| line.to_string()),
             ask.anchor
-                .new_line
+                .old_end
+                .map_or_else(|| "none".to_string(), |line| line.to_string()),
+            ask.anchor
+                .new_start
+                .map_or_else(|| "none".to_string(), |line| line.to_string()),
+            ask.anchor
+                .new_end
                 .map_or_else(|| "none".to_string(), |line| line.to_string()),
             ask.anchor.line_kind,
             other_comment_count,
             ask.draft_body.as_deref().unwrap_or("(no draft body yet)"),
+            selected_lines,
             hunk,
         )
+    }
+
+    fn selected_lines_for_anchor(&self, anchor: &ReviewCommentAnchor) -> String {
+        let Some(file) = self.review.files.get(anchor.file_index) else {
+            return String::new();
+        };
+        let rows = rendered_rows_for_prompt(file);
+        let start = anchor.start_diff_row();
+        let end = anchor.end_diff_row();
+        rows.into_iter()
+            .enumerate()
+            .filter_map(|(index, row)| (start..=end).contains(&index).then_some(row))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn hunk_context_for_anchor(&self, anchor: &ReviewCommentAnchor) -> String {
@@ -1417,6 +1548,11 @@ impl ReviewApp {
 
     fn anchor_from_persisted_draft(&self, draft: &DraftComment) -> Option<ReviewCommentAnchor> {
         let diff_row = usize::try_from(draft.anchor.diff_row).ok()?;
+        let end_diff_row = draft
+            .anchor
+            .end_diff_row
+            .and_then(|row| usize::try_from(row).ok())
+            .filter(|row| *row != diff_row);
         let file_index = self
             .review
             .files
@@ -1426,8 +1562,13 @@ impl ReviewApp {
             file_index,
             path: draft.anchor.file_path.clone(),
             diff_row,
+            end_diff_row,
             old_line: draft.anchor.old_line,
             new_line: draft.anchor.new_line,
+            old_start: draft.anchor.old_start.or(draft.anchor.old_line),
+            old_end: draft.anchor.old_end.or(draft.anchor.old_line),
+            new_start: draft.anchor.new_start.or(draft.anchor.new_line),
+            new_end: draft.anchor.new_end.or(draft.anchor.new_line),
             line_kind: draft.anchor.line_kind,
         })
     }
@@ -1442,14 +1583,21 @@ impl ReviewApp {
     #[must_use]
     pub fn comment_anchor_for_row(&self, diff_row: usize) -> Option<ReviewCommentAnchor> {
         let file = self.selected_file_data()?;
-        let line = self.diff_line_for_render_row(diff_row)?;
+        let (start_row, end_row) = self.selected_range_bounds().unwrap_or((diff_row, diff_row));
+        let start_line = self.diff_line_for_render_row(start_row)?;
+        let end_line = self.diff_line_for_render_row(end_row)?;
         Some(ReviewCommentAnchor {
             file_index: self.selected_file,
             path: file.display_path().to_string(),
-            diff_row,
-            old_line: line.old_line,
-            new_line: line.new_line,
-            line_kind: line.kind,
+            diff_row: start_row,
+            end_diff_row: (end_row != start_row).then_some(end_row),
+            old_line: start_line.old_line,
+            new_line: start_line.new_line,
+            old_start: start_line.old_line.or(end_line.old_line),
+            old_end: end_line.old_line.or(start_line.old_line),
+            new_start: start_line.new_line.or(end_line.new_line),
+            new_end: end_line.new_line.or(start_line.new_line),
+            line_kind: start_line.kind,
         })
     }
 
@@ -1543,6 +1691,31 @@ pub fn sidebar_width(app: &ReviewApp, width: u16) -> u16 {
     } else {
         0
     }
+}
+
+fn rendered_rows_for_prompt(file: &ReviewFile) -> Vec<String> {
+    let mut rows = Vec::new();
+    for hunk in &file.hunks {
+        rows.push(format!(
+            "@@ -{},{} +{},{} @@{}",
+            hunk.old_start,
+            hunk.old_count,
+            hunk.new_start,
+            hunk.new_count,
+            hunk.heading
+                .as_ref()
+                .map_or(String::new(), |heading| format!(" {heading}")),
+        ));
+        rows.extend(hunk.lines.iter().map(|line| {
+            let marker = match line.kind {
+                ReviewLineKind::Context => ' ',
+                ReviewLineKind::Added => '+',
+                ReviewLineKind::Removed => '-',
+            };
+            format!("{marker}{}", line.content)
+        }));
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -1694,6 +1867,12 @@ mod tests {
             anchor: DraftAnchor {
                 file_path: "a.rs".to_string(),
                 diff_row: 2,
+                start_diff_row: Some(2),
+                end_diff_row: Some(2),
+                old_start: None,
+                old_end: None,
+                new_start: Some(1),
+                new_end: Some(1),
                 old_line: None,
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,
@@ -1731,6 +1910,12 @@ mod tests {
             anchor: DraftAnchor {
                 file_path: "a.rs".to_string(),
                 diff_row: 2,
+                start_diff_row: Some(2),
+                end_diff_row: Some(2),
+                old_start: None,
+                old_end: None,
+                new_start: Some(1),
+                new_end: Some(1),
                 old_line: None,
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,

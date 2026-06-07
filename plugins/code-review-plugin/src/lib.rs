@@ -178,6 +178,24 @@ pub struct DraftAnchor {
     pub file_path: String,
     /// Rendered diff row.
     pub diff_row: u64,
+    /// Start rendered diff row for range comments.
+    #[serde(default)]
+    pub start_diff_row: Option<u64>,
+    /// End rendered diff row for range comments.
+    #[serde(default)]
+    pub end_diff_row: Option<u64>,
+    /// Old range start line, when present.
+    #[serde(default)]
+    pub old_start: Option<u32>,
+    /// Old range end line, when present.
+    #[serde(default)]
+    pub old_end: Option<u32>,
+    /// New range start line, when present.
+    #[serde(default)]
+    pub new_start: Option<u32>,
+    /// New range end line, when present.
+    #[serde(default)]
+    pub new_end: Option<u32>,
     /// Old line number, when present.
     pub old_line: Option<u32>,
     /// New line number, when present.
@@ -572,6 +590,12 @@ impl<'a> CodeReviewDb<'a> {
                 "session_id",
                 "file_path",
                 "diff_row",
+                "start_diff_row",
+                "end_diff_row",
+                "old_start",
+                "old_end",
+                "new_start",
+                "new_end",
                 "old_line",
                 "new_line",
                 "line_kind",
@@ -586,6 +610,12 @@ impl<'a> CodeReviewDb<'a> {
             let anchor = DraftAnchor {
                 file_path: required_text(&thread, "file_path")?,
                 diff_row: i64_to_u64(required_i64(&thread, "diff_row")?),
+                start_diff_row: optional_i64(&thread, "start_diff_row").map(i64_to_u64),
+                end_diff_row: optional_i64(&thread, "end_diff_row").map(i64_to_u64),
+                old_start: optional_i64(&thread, "old_start").map(i64_to_u32),
+                old_end: optional_i64(&thread, "old_end").map(i64_to_u32),
+                new_start: optional_i64(&thread, "new_start").map(i64_to_u32),
+                new_end: optional_i64(&thread, "new_end").map(i64_to_u32),
                 old_line: optional_i64(&thread, "old_line").map(i64_to_u32),
                 new_line: optional_i64(&thread, "new_line").map(i64_to_u32),
                 line_kind: line_kind_from_str(&required_text(&thread, "line_kind")?)?,
@@ -803,6 +833,12 @@ impl<'a> CodeReviewDb<'a> {
             .value("review_key", review_key.to_string())
             .value("file_path", anchor.file_path.clone())
             .value("diff_row", u64_to_i64(anchor.diff_row))
+            .value("start_diff_row", optional_u64(anchor.start_diff_row))
+            .value("end_diff_row", optional_u64(anchor.end_diff_row))
+            .value("old_start", optional_u32(anchor.old_start))
+            .value("old_end", optional_u32(anchor.old_end))
+            .value("new_start", optional_u32(anchor.new_start))
+            .value("new_end", optional_u32(anchor.new_end))
             .value("old_line", optional_u32(anchor.old_line))
             .value("new_line", optional_u32(anchor.new_line))
             .value("line_kind", line_kind_str(anchor.line_kind))
@@ -924,6 +960,12 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
                 .column(text_column("review_key"))
                 .column(text_column("file_path"))
                 .column(int_column("diff_row"))
+                .column(nullable_int_column("start_diff_row"))
+                .column(nullable_int_column("end_diff_row"))
+                .column(nullable_int_column("old_start"))
+                .column(nullable_int_column("old_end"))
+                .column(nullable_int_column("new_start"))
+                .column(nullable_int_column("new_end"))
                 .column(nullable_int_column("old_line"))
                 .column(nullable_int_column("new_line"))
                 .column(text_column("line_kind"))
@@ -955,6 +997,19 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
             true,
             None,
         )),
+        None,
+    ));
+    source.add_migration(CodeMigration::new(
+        "005_thread_range_columns".to_string(),
+        Box::new(
+            alter_table("draft_threads")
+                .add_column("start_diff_row".to_string(), DataType::BigInt, true, None)
+                .add_column("end_diff_row".to_string(), DataType::BigInt, true, None)
+                .add_column("old_start".to_string(), DataType::BigInt, true, None)
+                .add_column("old_end".to_string(), DataType::BigInt, true, None)
+                .add_column("new_start".to_string(), DataType::BigInt, true, None)
+                .add_column("new_end".to_string(), DataType::BigInt, true, None),
+        ),
         None,
     ));
     source
@@ -1086,6 +1141,10 @@ fn line_kind_from_str(value: &str) -> Result<ReviewLineKind, ReviewError> {
 
 fn optional_u32(value: Option<u32>) -> DatabaseValue {
     DatabaseValue::Int64Opt(value.map(i64::from))
+}
+
+fn optional_u64(value: Option<u64>) -> DatabaseValue {
+    DatabaseValue::Int64Opt(value.map(u64_to_i64))
 }
 
 fn now_ms() -> u64 {
