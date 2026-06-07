@@ -426,6 +426,13 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             .await
         }
         KeyCode::Char('a') => toggle_archived(client, app).await,
+        KeyCode::Char('R') => match restore_selected_workspace(client, app).await {
+            Ok(restored) => restored,
+            Err(error) => {
+                app.status_message = Some(format!("failed to restore workspace: {error}"));
+                true
+            }
+        },
         KeyCode::Char('e') => {
             create_and_open_preset_workspace(client, app, "Empty review", Vec::new()).await
         }
@@ -583,6 +590,49 @@ async fn submit_rename_workspace(
     Ok(true)
 }
 
+async fn restore_selected_workspace(
+    client: &BcodeClient,
+    app: &mut ReviewHomeApp,
+) -> Result<bool, TuiError> {
+    let Some(workspace_index) = app.selected_workspace_index() else {
+        app.status_message = Some("no matching review workspace selected".to_string());
+        return Ok(true);
+    };
+    let Some(existing) = app.workspaces.get(workspace_index) else {
+        app.status_message = Some("no review workspace selected".to_string());
+        return Ok(true);
+    };
+    if existing.archived_at_ms.is_none() {
+        app.status_message = Some("selected review is not archived".to_string());
+        return Ok(true);
+    }
+    let mut workspace = existing.clone();
+    workspace.archived_at_ms = None;
+    let payload = serde_json::to_vec(&UpdateReviewWorkspaceRequest {
+        repo_path: app.repo_path.clone(),
+        workspace,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_WORKSPACE_UPDATE.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: UpdateReviewWorkspaceResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    app.workspaces[workspace_index] = response.workspace;
+    app.status_message = Some("restored review workspace".to_string());
+    Ok(true)
+}
+
 async fn archive_selected_workspace(
     client: &BcodeClient,
     app: &mut ReviewHomeApp,
@@ -692,7 +742,7 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n named   u/s/w/l/e presets   a archived   / search   r rename   x archive ",
+            " enter open   n named   u/s/w/l/e presets   a archived   R restore   / search   x archive ",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
@@ -809,7 +859,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n named, u/s/w/l/e presets, a archived, / search, r rename"
+                            "review home: enter open, n named, u/s/w/l/e presets, a archived, R restore, / search, r rename"
                                 .to_string()
                         })
                     }
