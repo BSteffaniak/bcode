@@ -42,12 +42,6 @@ impl TranscriptViewport {
         self.viewport_height
     }
 
-    /// Return whether the viewport is following live transcript output.
-    #[must_use]
-    pub const fn following(&self) -> bool {
-        matches!(self.mode, TranscriptViewportMode::FollowBottom) && self.bottom_overscroll == 0
-    }
-
     /// Return whether newest content is at or above the viewport's bottom edge.
     #[must_use]
     pub const fn at_bottom_threshold(&self) -> bool {
@@ -275,7 +269,7 @@ mod tests {
 
         assert_eq!(viewport.top_row(35, 10), 25);
         assert_eq!(viewport.offset(), 0);
-        assert!(viewport.following());
+        assert!(viewport.at_bottom_threshold());
     }
 
     #[test]

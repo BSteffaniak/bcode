@@ -1977,6 +1977,62 @@ fn submitted_user_message_anchors_at_top() {
 }
 
 #[test]
+fn assistant_stream_after_submitted_user_message_anchors_at_top() {
+    let session_id = SessionId::new();
+    let history = (0..12)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    app.replace_composer_with("new prompt");
+    app.stage_submission();
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+
+    app.absorb_session_event(&event(
+        session_id,
+        12,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "new prompt".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        13,
+        SessionEventKind::AssistantDelta {
+            text: "first response chunk".to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(1));
+}
+
+#[test]
 fn cleared_submission_does_not_anchor() {
     let session_id = SessionId::new();
     let history = (0..12)

@@ -162,6 +162,10 @@ impl TranscriptScrollMode {
                 | Self::AnchoredToEntry { sticky: false }
         )
     }
+
+    const fn allows_assistant_stream_anchor(self) -> bool {
+        !matches!(self, Self::ManualDetached)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1114,7 +1118,15 @@ impl BmuxApp {
         }
     }
 
-    fn maybe_request_assistant_stream_anchor(&mut self, was_following: bool) {
+    fn should_anchor_new_assistant_stream(&self) -> bool {
+        self.scroll_mode.allows_assistant_stream_anchor()
+            && !self.manual_transcript_scroll_active()
+            && self.transcript_scroll_animation.is_none()
+            && self.submitted_user_message_following != SubmittedUserMessageFollowing::PendingAnchor
+            && !self.assistant_scroll_anchor.is_pending()
+    }
+
+    fn maybe_request_assistant_stream_anchor(&mut self, should_anchor: bool) {
         let Some(index) = self
             .transcript
             .iter()
@@ -1126,7 +1138,7 @@ impl BmuxApp {
             return;
         }
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
-        if !was_following || self.active_tool_loop() {
+        if !should_anchor || self.active_tool_loop() {
             return;
         }
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Pending { index };
@@ -1246,18 +1258,14 @@ impl BmuxApp {
     pub fn absorb_session_live_event(&mut self, event: &SessionLiveEvent) {
         match &event.kind {
             SessionLiveEventKind::AssistantTextDelta { text, .. } => {
-                let was_following = self.viewport.following()
-                    && self.transcript_scroll_animation.is_none()
-                    && self.submitted_user_message_following
-                        != SubmittedUserMessageFollowing::PendingAnchor
-                    && !self.assistant_scroll_anchor.is_pending();
+                let should_anchor = self.should_anchor_new_assistant_stream();
                 self.pending_visual_overflow_bottom = Some(
                     self.viewport
                         .bottom_row(self.transcript_layout.total_rows()),
                 );
                 self.viewport.preserve_for_append();
                 self.push_live_assistant_delta(text, SessionEventApplication::Live);
-                self.maybe_request_assistant_stream_anchor(was_following);
+                self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionLiveEventKind::AssistantReasoningDelta { text, .. } => {
                 self.pending_visual_overflow_bottom = Some(
@@ -1292,11 +1300,7 @@ impl BmuxApp {
                     .bottom_row(self.transcript_layout.total_rows()),
             );
         }
-        let was_following = self.viewport.following()
-            && self.transcript_scroll_animation.is_none()
-            && self.submitted_user_message_following
-                != SubmittedUserMessageFollowing::PendingAnchor
-            && !self.assistant_scroll_anchor.is_pending();
+        let should_anchor = self.should_anchor_new_assistant_stream();
         if event_affects_transcript_rows(event) {
             self.viewport.preserve_for_append();
         }
@@ -1310,7 +1314,7 @@ impl BmuxApp {
             }
             SessionEventKind::AssistantDelta { text } => {
                 self.push_live_assistant_delta(text, application);
-                self.maybe_request_assistant_stream_anchor(was_following);
+                self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionEventKind::AssistantMessage { text } => {
                 self.finish_streaming_item("Assistant", text, application);
