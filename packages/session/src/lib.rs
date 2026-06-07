@@ -10,6 +10,7 @@
 
 mod actor;
 pub mod db;
+pub mod lease;
 pub mod projection;
 mod store_executor;
 
@@ -22,6 +23,7 @@ use bcode_session_models::{
     SessionImportSummary, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind,
     SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
+use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -64,6 +66,9 @@ pub enum SessionError {
     /// Session database is unavailable for this operation.
     #[error("session database is unavailable: {0}")]
     DbUnavailable(SessionId),
+    /// Session is owned by another daemon or cannot be leased.
+    #[error(transparent)]
+    Lease(#[from] lease::SessionLeaseError),
 }
 
 /// Errors returned by the session store.
@@ -82,6 +87,7 @@ pub enum SessionStoreError {
 pub struct SessionStore {
     root: PathBuf,
     pub(crate) metrics: MetricsRegistry,
+    lease_owner: SessionLeaseOwnerContext,
 }
 
 impl SessionStore {
@@ -91,6 +97,7 @@ impl SessionStore {
         Self {
             root: root.into(),
             metrics: MetricsRegistry::default(),
+            lease_owner: SessionLeaseOwnerContext::default(),
         }
     }
 
@@ -100,6 +107,7 @@ impl SessionStore {
         Self {
             root: root.into(),
             metrics,
+            lease_owner: SessionLeaseOwnerContext::default(),
         }
     }
 
@@ -232,6 +240,15 @@ impl SessionStore {
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
     }
+
+    fn with_lease_owner(mut self, lease_owner: SessionLeaseOwnerContext) -> Self {
+        self.lease_owner = lease_owner;
+        self
+    }
+
+    pub(crate) const fn lease_owner(&self) -> &SessionLeaseOwnerContext {
+        &self.lease_owner
+    }
 }
 
 /// In-memory session manager with optional DB-backed persistence.
@@ -248,6 +265,7 @@ pub struct SessionManager {
 #[derive(Debug, Default)]
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
+    leases: BTreeMap<SessionId, SessionLeaseGuard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +433,21 @@ impl SessionManager {
         Ok(Self::from_store(store, sessions, true))
     }
 
+    /// Create a session manager backed by a session store root with lease owner metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisted session history cannot be loaded.
+    pub fn persistent_with_metrics_and_lease_owner(
+        root: impl Into<PathBuf>,
+        metrics: MetricsRegistry,
+        lease_owner: SessionLeaseOwnerContext,
+    ) -> Result<Self, SessionStoreError> {
+        let store = SessionStore::with_metrics(root, metrics).with_lease_owner(lease_owner);
+        let sessions = store.load_catalog()?;
+        Ok(Self::from_store(store, sessions, true))
+    }
+
     /// Create a session manager whose catalog is loaded on demand.
     #[must_use]
     pub fn persistent_lazy(root: impl Into<PathBuf>) -> Self {
@@ -428,6 +461,17 @@ impl SessionManager {
         metrics: MetricsRegistry,
     ) -> Self {
         let store = SessionStore::with_metrics(root, metrics);
+        Self::from_store(store, BTreeMap::new(), false)
+    }
+
+    /// Create a lazy persistent session manager with lease owner metadata.
+    #[must_use]
+    pub fn persistent_lazy_with_metrics_and_lease_owner(
+        root: impl Into<PathBuf>,
+        metrics: MetricsRegistry,
+        lease_owner: SessionLeaseOwnerContext,
+    ) -> Self {
+        let store = SessionStore::with_metrics(root, metrics).with_lease_owner(lease_owner);
         Self::from_store(store, BTreeMap::new(), false)
     }
 
@@ -455,6 +499,7 @@ impl SessionManager {
                         )
                     })
                     .collect(),
+                leases: BTreeMap::new(),
             })),
             store: Some(executor),
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
@@ -526,13 +571,50 @@ impl SessionManager {
         let total_timer = self.metrics.timer();
         let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
         if let Some(handle) = cached_handle {
-            if handle.snapshot().load_status == SessionLoadStatusKind::SummaryOnly
-                && let Some(store) = &self.store
-                && db::session_db_path(&store.root_path(), session_id).exists()
-            {
-                let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-                let state = self.load_db_session_state(session_id, &db).await?;
-                handle.replace_state(state).await?;
+            let Some(store) = &self.store else {
+                self.metrics.record_histogram(
+                    "session.manager.ensure_loaded.cached_total_duration_ms",
+                    total_timer.elapsed_ms(),
+                );
+                return Ok(());
+            };
+            if !db::session_db_path(&store.root_path(), session_id).exists() {
+                self.metrics.record_histogram(
+                    "session.manager.ensure_loaded.cached_total_duration_ms",
+                    total_timer.elapsed_ms(),
+                );
+                return Ok(());
+            }
+            let snapshot = handle.snapshot();
+            let inserted_lease = {
+                let mut inner = self.inner.lock().await;
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    inner.leases.entry(session_id)
+                {
+                    let lease = lease::acquire_session_lease(
+                        &store.root_path(),
+                        session_id,
+                        store.lease_owner(),
+                    )?;
+                    entry.insert(lease);
+                    true
+                } else {
+                    false
+                }
+            };
+            if snapshot.load_status == SessionLoadStatusKind::SummaryOnly {
+                let result = async {
+                    let db =
+                        db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+                    let state = self.load_db_session_state(session_id, &db).await?;
+                    handle.replace_state(state).await?;
+                    Ok::<(), SessionError>(())
+                }
+                .await;
+                if result.is_err() && inserted_lease {
+                    self.inner.lock().await.leases.remove(&session_id);
+                }
+                result?;
             }
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.cached_total_duration_ms",
@@ -545,17 +627,19 @@ impl SessionManager {
         };
         let load_timer = self.metrics.timer();
         if db::session_db_path(&store.root_path(), session_id).exists() {
+            let lease =
+                lease::acquire_session_lease(&store.root_path(), session_id, store.lease_owner())?;
             let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
             let state = self.load_db_session_state(session_id, &db).await?;
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.load_db_session_duration_ms",
                 load_timer.elapsed_ms(),
             );
-            self.inner
-                .lock()
-                .await
+            let mut inner = self.inner.lock().await;
+            inner
                 .sessions
                 .insert(session_id, SessionHandle::new(state, Some(store.clone())));
+            inner.leases.insert(session_id, lease);
             self.metrics.record_histogram(
                 "session.manager.ensure_loaded.total_duration_ms",
                 total_timer.elapsed_ms(),
@@ -567,6 +651,12 @@ impl SessionManager {
             total_timer.elapsed_ms(),
         );
         Err(SessionError::NotFound(session_id))
+    }
+
+    async fn release_persistent_idle_session_resources(&self, session_id: SessionId) {
+        if self.store.is_some() {
+            let _ = self.release_idle_session_resources(session_id).await;
+        }
     }
 
     /// Return the current persistent catalog discovery status.
@@ -734,6 +824,11 @@ impl SessionManager {
             sender,
             live_events,
         };
+        let lease = self
+            .store
+            .as_ref()
+            .map(|store| lease::acquire_session_lease(&store.root_path(), id, store.lease_owner()))
+            .transpose()?;
         let handle = SessionHandle::new(state, self.store.clone());
         handle
             .append_event(
@@ -744,7 +839,14 @@ impl SessionManager {
                 now_ms,
             )
             .await?;
-        self.inner.lock().await.sessions.insert(id, handle);
+        {
+            let mut inner = self.inner.lock().await;
+            inner.sessions.insert(id, handle);
+            if let Some(lease) = lease {
+                inner.leases.insert(id, lease);
+            }
+        }
+        self.release_persistent_idle_session_resources(id).await;
         Ok(summary)
     }
 
@@ -814,6 +916,8 @@ impl SessionManager {
                 activity_timestamp_ms,
             )
             .await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
         Ok(event)
     }
 
@@ -844,6 +948,8 @@ impl SessionManager {
                 activity_timestamp_ms,
             )
             .await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
         Ok(Some(event))
     }
 
@@ -895,12 +1001,14 @@ impl SessionManager {
         if handle.client_count() != 0 {
             return Err(SessionError::ConnectedClients(session_id));
         }
-        self.inner
-            .lock()
-            .await
-            .sessions
-            .remove(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
+        let _lease = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .sessions
+                .remove(&session_id)
+                .ok_or(SessionError::NotFound(session_id))?;
+            inner.leases.remove(&session_id)
+        };
         if let Some(store) = &self.store {
             let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
             catalog.delete_session(session_id).await?;
@@ -1375,7 +1483,11 @@ impl SessionManager {
             .get(&session_id)
             .cloned()
             .ok_or(SessionError::NotFound(session_id))?;
-        handle.release_idle_resources().await
+        let released = handle.release_idle_resources().await?;
+        if released {
+            self.inner.lock().await.leases.remove(&session_id);
+        }
+        Ok(released)
     }
 
     /// Append a user message to a session.
@@ -1395,9 +1507,12 @@ impl SessionManager {
         self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        handle
+        let events = handle
             .append_user_message(client_id, text, activity_timestamp_ms)
-            .await
+            .await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        Ok(events)
     }
 
     /// Append an assistant streaming delta to a session.
@@ -1812,6 +1927,8 @@ impl SessionManager {
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let event = handle.append_event(kind, activity_timestamp_ms).await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
         Ok(event)
     }
 
@@ -1835,6 +1952,8 @@ impl SessionManager {
         let event = handle
             .append_event_with_provenance(kind, provenance, activity_timestamp_ms)
             .await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
         Ok(event)
     }
 

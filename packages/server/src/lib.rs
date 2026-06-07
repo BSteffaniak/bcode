@@ -30,7 +30,7 @@ use bcode_model::{
     OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent,
     ReasoningEffort, StartTurnResponse, TokenUsage,
 };
-use bcode_session::{CatalogLoadStatus, SessionManager};
+use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
@@ -1226,8 +1226,18 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             .join("metrics")
             .join("events.jsonl"),
     );
-    let sessions =
-        SessionManager::persistent_lazy_with_metrics(default_session_store_dir(), metrics.clone());
+    let sessions = SessionManager::persistent_lazy_with_metrics_and_lease_owner(
+        default_session_store_dir(),
+        metrics.clone(),
+        SessionLeaseOwnerContext {
+            daemon_namespace: Some(daemon_status.namespace.clone()),
+            build_fingerprint: Some(daemon_status.build_fingerprint.clone()),
+            protocol_version: Some(daemon_status.protocol_version),
+            endpoint: Some(format!("{endpoint:?}")),
+            executable_path: std::env::current_exe().ok(),
+            daemon_instance_id: Some(daemon_status.instance_id.clone()),
+        },
+    );
     tracing::debug!(target: "bcode_server::startup", "lazy session services ready");
     let resolved_model = config.resolved_model_selection();
     tracing::debug!(
@@ -2287,7 +2297,7 @@ async fn handle_session_history(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await
         }
@@ -2322,7 +2332,7 @@ async fn handle_session_history_page(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await
         }
@@ -2345,6 +2355,35 @@ async fn send_incompatible_active_session_response(
         )),
     )
     .await
+}
+
+fn server_session_error_response(error: &ServerError) -> ErrorResponse {
+    match error {
+        ServerError::Session(error) => session_error_response(error),
+        ServerError::SessionDb(error) if database_error_requires_repair(error) => {
+            ErrorResponse::new("session_repair_required", error.to_string())
+        }
+        _ => ErrorResponse::new("session_not_found", error.to_string()),
+    }
+}
+
+fn session_error_response(error: &bcode_session::SessionError) -> ErrorResponse {
+    match error {
+        bcode_session::SessionError::Lease(
+            bcode_session::lease::SessionLeaseError::OwnedByOtherDaemon { .. },
+        ) => ErrorResponse::new("session_active_elsewhere", error.to_string()),
+        bcode_session::SessionError::Db(error) if database_error_requires_repair(error) => {
+            ErrorResponse::new("session_repair_required", error.to_string())
+        }
+        _ => ErrorResponse::new("session_not_found", error.to_string()),
+    }
+}
+
+fn database_error_requires_repair(error: &bcode_session::db::SessionDbError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("short read on wal frame")
+        || message.contains("database disk image is malformed")
+        || message.contains("file is not a database")
 }
 
 async fn handle_attach_session(
@@ -2398,7 +2437,7 @@ async fn handle_attach_session(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await?;
             state
@@ -2482,7 +2521,7 @@ async fn handle_attach_session_recent(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await?;
             state
@@ -2567,7 +2606,7 @@ async fn handle_attach_session_projection_window(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await?;
             state
@@ -3072,7 +3111,7 @@ async fn handle_invoke_skill(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(server_session_error_response(&error)),
             )
             .await
         }
@@ -3116,7 +3155,7 @@ async fn handle_user_message(
                 send_response(
                     writer,
                     request_id,
-                    Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                    Response::Err(session_error_response(&error)),
                 )
                 .await
             }
@@ -3140,7 +3179,7 @@ async fn handle_user_message(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(server_session_error_response(&error)),
             )
             .await
         }
@@ -3227,7 +3266,7 @@ async fn handle_set_session_model(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await
         }
@@ -3613,7 +3652,7 @@ async fn handle_set_session_agent(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await
         }
@@ -3897,7 +3936,7 @@ async fn handle_compact_session(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                Response::Err(session_error_response(&error)),
             )
             .await
         }

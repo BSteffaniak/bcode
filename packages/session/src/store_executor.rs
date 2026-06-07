@@ -1,6 +1,9 @@
 //! Async adapter for blocking session store operations.
 
-use super::{SessionId, SessionState, SessionStore, SessionStoreError, spawn_blocking};
+use super::{
+    SessionId, SessionState, SessionStore, SessionStoreError, lease::SessionLeaseOwnerContext,
+    spawn_blocking,
+};
 use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Debug, Clone)]
@@ -19,6 +22,10 @@ impl SessionStoreExecutor {
 
     pub(crate) fn metrics(&self) -> bcode_metrics::MetricsRegistry {
         self.store.metrics.clone()
+    }
+
+    pub(crate) const fn lease_owner(&self) -> &SessionLeaseOwnerContext {
+        self.store.lease_owner()
     }
 
     pub async fn load_catalog(

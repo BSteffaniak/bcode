@@ -51,6 +51,9 @@ pub enum SessionDbError {
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Cross-process lease operation failed.
+    #[error(transparent)]
+    Lease(#[from] crate::lease::SessionLeaseError),
     /// Event serialization failed.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
@@ -207,6 +210,7 @@ pub struct TranscriptItem {
 #[derive(Debug, Clone)]
 pub struct GlobalSessionDb {
     db: Arc<Box<dyn Database>>,
+    _catalog_lock: Arc<crate::lease::CatalogLockGuard>,
 }
 
 impl GlobalSessionDb {
@@ -229,9 +233,14 @@ impl GlobalSessionDb {
     /// * the Turso connection cannot be opened after bounded lock retries
     /// * schema migrations fail
     pub async fn open_turso(path: &Path) -> SessionDbResult<Self> {
+        let root = path.parent().unwrap_or_else(|| Path::new("."));
+        let catalog_lock = crate::lease::acquire_catalog_lock(root)?;
         let db = init_turso_local_with_retry(path).await?;
         run_global_migrations(&*db).await?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            _catalog_lock: Arc::new(catalog_lock),
+        })
     }
 
     /// Upsert one session catalog row.
