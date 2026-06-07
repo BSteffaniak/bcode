@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared code review models for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "code-review", "models"]
+license     = { workspace = true }
+name        = "bcode_code_review_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled GitHub review publisher plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "github", "code-review", "plugin"]
+license     = { workspace = true }
+name        = "bcode_github_review_publisher_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_code_review_models = { workspace = true }
+bcode_plugin_sdk         = { workspace = true }
+reqwest                  = { workspace = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+serde_json               = { workspace = true }
+thiserror                = { workspace = true }
+tokio                    = { workspace = true, features = ["rt", "time"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

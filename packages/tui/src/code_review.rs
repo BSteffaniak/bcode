@@ -5,6 +5,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use bcode_client::BcodeClient;
+use bcode_code_review_models::{
+    CODE_REVIEW_SERVICE_INTERFACE_ID, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
+    OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
+    OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, REVIEW_PUBLISHER_INTERFACE_ID,
+};
 use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -18,21 +23,20 @@ use serde::{Deserialize, Serialize};
 use super::terminal_events::TuiInput;
 use super::{TuiError, helpers};
 
-const SERVICE_INTERFACE_ID: &str = "bcode.code_review/v1";
+const SERVICE_INTERFACE_ID: &str = CODE_REVIEW_SERVICE_INTERFACE_ID;
 const CREATE_REVIEW_OPERATION: &str = "create_review";
 const LIST_DRAFTS_OPERATION: &str = "draft.list";
 const SAVE_DRAFT_OPERATION: &str = "draft.save";
 const DELETE_DRAFT_OPERATION: &str = "draft.delete";
 const UPDATE_DRAFT_OPERATION: &str = "draft.update";
 const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
-const PUBLISH_SUBMIT_OPERATION: &str = "review.publish.submit";
-const PUBLISHERS_LIST_OPERATION: &str = "review.publishers.list";
-const PUBLISH_PREVIEW_OPERATION: &str = "review.publish.preview";
-const REVIEW_BUNDLE_GET_OPERATION: &str = "review.bundle.get";
-const REVIEW_PUBLISHER_INTERFACE_ID: &str = "bcode.review_publisher/v1";
-const REVIEW_PUBLISHER_MANIFEST_OPERATION: &str = "review.publisher.manifest";
-const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = "review.publisher.preview";
-const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = "review.publisher.submit";
+const PUBLISH_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISH_SUBMIT;
+const PUBLISHERS_LIST_OPERATION: &str = OP_REVIEW_PUBLISHERS_LIST;
+const PUBLISH_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISH_PREVIEW;
+const REVIEW_BUNDLE_GET_OPERATION: &str = OP_REVIEW_BUNDLE_GET;
+const REVIEW_PUBLISHER_MANIFEST_OPERATION: &str = OP_REVIEW_PUBLISHER_MANIFEST;
+const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISHER_PREVIEW;
+const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISHER_SUBMIT;
 const DEFAULT_PUBLISHER_ID: &str = "markdown_file";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 

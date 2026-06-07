@@ -1,0 +1,20 @@
+id      = "bcode.github_review_publisher"
+name    = "Bcode GitHub Review Publisher"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Publishes Bcode review threads to GitHub pull requests"
+interface_id = "bcode.review_publisher/v1"
+name         = "GitHub Review Publisher"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_github_review_publisher_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

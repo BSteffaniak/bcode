@@ -4,6 +4,15 @@
 
 //! Bundled local Git code review plugin for Bcode.
 
+use bcode_code_review_models::{
+    DeleteDraftRequest, DeleteDraftResponse, DraftAnchor, DraftComment, GetReviewDiffRequest,
+    GetReviewThreadRequest, LinkThreadSessionRequest, LinkThreadSessionResponse, ListDraftsRequest,
+    ListDraftsResponse, ListReviewPublishersResponse, PublishReviewPreviewResponse,
+    PublishReviewRequest, PublishReviewResponse, ReviewBundle, ReviewBundleLine,
+    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
+    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublisherCapabilities, ReviewPublisherManifest,
+    ReviewTarget, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse,
+};
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -108,233 +117,19 @@ pub struct CreateReviewRequest {
     pub target: ReviewTarget,
 }
 
-/// Supported local Git review target.
+/// Ephemeral review summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ReviewTarget {
-    /// Review unstaged working-tree changes.
-    WorkingTreeUnstaged,
-    /// Review staged index changes.
-    IndexStaged,
-    /// Review both staged and unstaged changes.
-    WorkingTreeAndIndex,
-    /// Review the last commit.
-    LastCommit,
-    /// Review an explicit commit range.
-    CommitRange {
-        /// Base revision.
-        base: String,
-        /// Head revision.
-        head: String,
-        /// Whether to use merge-base `...` semantics.
-        #[serde(default)]
-        merge_base: bool,
-    },
-    /// Review a branch comparison.
-    BranchCompare {
-        /// Base branch.
-        base_branch: String,
-        /// Head branch.
-        head_branch: String,
-        /// Whether to use merge-base `...` semantics.
-        #[serde(default = "default_true")]
-        merge_base: bool,
-    },
-}
-
-/// Request payload for `draft.list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListDraftsRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Local Git target whose drafts should be listed.
-    pub target: ReviewTarget,
-}
-
-/// Request payload for `draft.save`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SaveDraftRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Local Git target whose draft should be saved.
-    pub target: ReviewTarget,
-    /// Comment anchor.
-    pub anchor: DraftAnchor,
-    /// Draft body.
-    pub body: String,
-}
-
-/// Request payload for `draft.delete`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeleteDraftRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Comment id to delete.
-    pub comment_id: String,
-}
-
-/// Request payload for `draft.update`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdateDraftRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Comment id to update.
-    pub comment_id: String,
-    /// Updated draft body.
-    pub body: String,
-}
-
-/// Request payload for `thread.link_session`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LinkThreadSessionRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Review target for the thread.
-    pub target: ReviewTarget,
-    /// Thread anchor.
-    pub anchor: DraftAnchor,
-    /// Bcode session id.
-    pub session_id: String,
-}
-
-/// Request payload for review context operations scoped to a target.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewContextRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Review target.
-    pub target: ReviewTarget,
-}
-
-/// Request payload for `review.thread.get`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetReviewThreadRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Review target.
-    pub target: ReviewTarget,
-    /// Thread id to fetch, if known.
-    pub thread_id: Option<String>,
-    /// Thread anchor to fetch, if thread id is not known.
-    pub anchor: Option<DraftAnchor>,
-}
-
-/// Request payload for `review.diff.get`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetReviewDiffRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Review target.
-    pub target: ReviewTarget,
-    /// File path to fetch, or all files when absent.
-    pub file_path: Option<String>,
-}
-
-/// Persisted draft anchor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DraftAnchor {
-    /// File path in the review.
-    pub file_path: String,
-    /// Rendered diff row.
-    pub diff_row: u64,
-    /// Start rendered diff row for range comments.
-    #[serde(default)]
-    pub start_diff_row: Option<u64>,
-    /// End rendered diff row for range comments.
-    #[serde(default)]
-    pub end_diff_row: Option<u64>,
-    /// Old range start line, when present.
-    #[serde(default)]
-    pub old_start: Option<u32>,
-    /// Old range end line, when present.
-    #[serde(default)]
-    pub old_end: Option<u32>,
-    /// New range start line, when present.
-    #[serde(default)]
-    pub new_start: Option<u32>,
-    /// New range end line, when present.
-    #[serde(default)]
-    pub new_end: Option<u32>,
-    /// Old line number, when present.
-    pub old_line: Option<u32>,
-    /// New line number, when present.
-    pub new_line: Option<u32>,
-    /// Line kind.
-    pub line_kind: ReviewLineKind,
-}
-
-/// Persisted draft comment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DraftComment {
-    /// Comment id.
-    pub comment_id: String,
-    /// Thread id.
-    pub thread_id: String,
-    /// Comment anchor.
-    pub anchor: DraftAnchor,
-    /// Draft body.
-    pub body: String,
-    /// Creation timestamp in milliseconds since Unix epoch.
-    pub created_at_ms: u64,
-    /// Last update timestamp in milliseconds since Unix epoch.
-    pub updated_at_ms: u64,
-    /// Linked Bcode session id, when present.
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
-
-/// Response payload for `draft.list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListDraftsResponse {
-    /// Draft comments.
-    pub drafts: Vec<DraftComment>,
-}
-
-/// Response payload for `draft.save`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SaveDraftResponse {
-    /// Saved draft comment.
-    pub draft: DraftComment,
-}
-
-/// Response payload for `draft.delete`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeleteDraftResponse {
-    /// Whether a persisted draft was deleted.
-    pub deleted: bool,
-}
-
-/// Response payload for `draft.update`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdateDraftResponse {
-    /// Whether a persisted draft was updated.
-    pub updated: bool,
-    /// Updated timestamp in milliseconds since Unix epoch, when updated.
-    pub updated_at_ms: Option<u64>,
-}
-
-/// Response payload for `thread.link_session`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LinkThreadSessionResponse {
-    /// Linked thread id.
-    pub thread_id: String,
-}
-
-/// Compact file summary for review context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewFileSummary {
-    /// Display path.
-    pub path: String,
-    /// File status.
-    pub status: ReviewFileStatus,
-    /// Added lines.
+pub struct ReviewSummary {
+    /// Human-readable target label.
+    pub title: String,
+    /// Repository root resolved by Git.
+    pub repo_root: PathBuf,
+    /// Parsed review files.
+    pub files: Vec<ReviewFile>,
+    /// Total added lines.
     pub additions: u32,
-    /// Removed lines.
+    /// Total removed lines.
     pub deletions: u32,
-    /// Hunk count.
-    pub hunks: usize,
-    /// Whether Git reported a binary patch.
-    pub is_binary: bool,
 }
 
 /// Response payload for `review.context.get`.
@@ -405,225 +200,6 @@ pub struct ReviewFileDiff {
 pub struct ReviewDiffResponse {
     /// Matching file diffs.
     pub files: Vec<ReviewFileDiff>,
-}
-
-/// Provider-neutral review bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewBundle {
-    /// Stable review id for this repository and target.
-    pub review_id: String,
-    /// Human-readable review title.
-    pub title: String,
-    /// Repository root.
-    pub repo_root: PathBuf,
-    /// Review target.
-    pub target: ReviewTarget,
-    /// Files in review order.
-    pub files: Vec<ReviewFileSummary>,
-    /// Review threads.
-    pub threads: Vec<ReviewBundleThread>,
-    /// Generated timestamp in milliseconds since Unix epoch.
-    pub generated_at_ms: u64,
-}
-
-/// Provider-neutral review thread bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewBundleThread {
-    /// Thread id.
-    pub thread_id: String,
-    /// Thread anchor.
-    pub anchor: DraftAnchor,
-    /// Draft comments.
-    pub comments: Vec<DraftComment>,
-    /// Linked Bcode session id, when present.
-    pub session_id: Option<String>,
-    /// Selected diff lines.
-    pub selected_diff_lines: Vec<String>,
-    /// Hunk context.
-    pub hunk_context: Vec<String>,
-}
-
-/// Review publisher capabilities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct ReviewPublisherCapabilities {
-    /// Whether preview is supported.
-    pub preview: bool,
-    /// Whether submit is supported.
-    pub submit: bool,
-    /// Whether existing output can be updated.
-    pub update_existing: bool,
-    /// Whether threaded comments are supported.
-    pub supports_threads: bool,
-    /// Whether range anchors are supported.
-    pub supports_ranges: bool,
-    /// Whether inline comments are supported.
-    pub supports_inline_comments: bool,
-    /// Whether a summary comment is supported.
-    pub supports_summary_comment: bool,
-}
-
-/// Review publisher manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewPublisherManifest {
-    /// Publisher id.
-    pub id: String,
-    /// Human-readable label.
-    pub label: String,
-    /// Human-readable description.
-    pub description: String,
-    /// Publisher capabilities.
-    pub capabilities: ReviewPublisherCapabilities,
-    /// JSON-schema-like option description.
-    pub options_schema: serde_json::Value,
-}
-
-/// Response payload for `review.publishers.list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListReviewPublishersResponse {
-    /// Available publishers.
-    pub publishers: Vec<ReviewPublisherManifest>,
-}
-
-/// Request payload for publish operations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishReviewRequest {
-    /// Repository path where Git commands should run.
-    pub repo_path: PathBuf,
-    /// Review target.
-    pub target: ReviewTarget,
-    /// Publisher id.
-    pub publisher_id: String,
-    /// Publisher-specific options.
-    #[serde(default)]
-    pub options: serde_json::Value,
-}
-
-/// Response payload for publish preview operations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishReviewPreviewResponse {
-    /// Publisher id.
-    pub publisher_id: String,
-    /// Human-readable preview content.
-    pub preview: String,
-}
-
-/// Response payload for publish submit operations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishReviewResponse {
-    /// Publisher id.
-    pub publisher_id: String,
-    /// Whether publish succeeded.
-    pub submitted: bool,
-    /// Output location or provider URL, when available.
-    pub output: Option<String>,
-    /// Human-readable message.
-    pub message: String,
-}
-
-/// Structured review response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewSummary {
-    /// Human-readable target label.
-    pub title: String,
-    /// Repository root resolved by Git.
-    pub repo_root: PathBuf,
-    /// Files in review order.
-    pub files: Vec<ReviewFile>,
-    /// Total added lines.
-    pub additions: u32,
-    /// Total removed lines.
-    pub deletions: u32,
-}
-
-/// A changed file in a review.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewFile {
-    /// Old path for deleted/renamed files.
-    pub old_path: Option<String>,
-    /// New path for added/modified/renamed files.
-    pub new_path: Option<String>,
-    /// File status.
-    pub status: ReviewFileStatus,
-    /// Added lines.
-    pub additions: u32,
-    /// Removed lines.
-    pub deletions: u32,
-    /// Parsed hunks.
-    pub hunks: Vec<ReviewHunk>,
-    /// Whether Git reported a binary patch.
-    pub is_binary: bool,
-}
-
-impl ReviewFile {
-    /// Return display path for the file.
-    #[must_use]
-    pub fn display_path(&self) -> &str {
-        self.new_path
-            .as_deref()
-            .or(self.old_path.as_deref())
-            .unwrap_or("<unknown>")
-    }
-}
-
-/// File status in a review.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewFileStatus {
-    /// Modified file.
-    Modified,
-    /// Added file.
-    Added,
-    /// Deleted file.
-    Deleted,
-    /// Renamed file.
-    Renamed,
-    /// Copied file.
-    Copied,
-    /// Unknown or unsupported status.
-    Unknown,
-}
-
-/// Unified diff hunk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewHunk {
-    /// Old start line.
-    pub old_start: u32,
-    /// Old line count.
-    pub old_count: u32,
-    /// New start line.
-    pub new_start: u32,
-    /// New line count.
-    pub new_count: u32,
-    /// Optional hunk heading.
-    pub heading: Option<String>,
-    /// Diff lines in this hunk.
-    pub lines: Vec<ReviewLine>,
-}
-
-/// A line in a unified diff hunk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewLine {
-    /// Line kind.
-    pub kind: ReviewLineKind,
-    /// Old file line number, when present.
-    pub old_line: Option<u32>,
-    /// New file line number, when present.
-    pub new_line: Option<u32>,
-    /// Line content without the leading unified diff marker.
-    pub content: String,
-}
-
-/// Diff line kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewLineKind {
-    /// Context line.
-    Context,
-    /// Added line.
-    Added,
-    /// Removed line.
-    Removed,
 }
 
 #[derive(Debug, Error)]
@@ -885,7 +461,11 @@ fn review_thread_for_request(
     });
     let (selected_lines, hunk_context) = thread.as_ref().map_or_else(
         || (Vec::new(), Vec::new()),
-        |thread| diff_context_for_anchor(&summary, &thread.anchor),
+        |thread| {
+            let (_, selected_lines, hunk_context) =
+                diff_context_for_anchor(&summary, &thread.anchor);
+            (selected_lines, hunk_context)
+        },
     );
     Ok(ReviewThreadResponse {
         thread,
@@ -934,12 +514,14 @@ fn review_bundle_for_request(request: ReviewContextRequest) -> Result<ReviewBund
     )
     .into_iter()
     .map(|thread| {
-        let (selected_diff_lines, hunk_context) = diff_context_for_anchor(&summary, &thread.anchor);
+        let (selected_lines, selected_diff_lines, hunk_context) =
+            diff_context_for_anchor(&summary, &thread.anchor);
         ReviewBundleThread {
             thread_id: thread.thread_id,
             anchor: thread.anchor,
             comments: thread.comments,
             session_id: thread.session_id,
+            selected_lines,
             selected_diff_lines,
             hunk_context,
         }
@@ -993,6 +575,7 @@ impl ReviewPublisher for MarkdownFilePublisher {
             description: "Write a local Markdown review export".to_string(),
             capabilities: file_publisher_capabilities(),
             options_schema: file_publisher_options_schema(),
+            route: None,
         }
     }
 
@@ -1029,6 +612,7 @@ impl ReviewPublisher for JsonFilePublisher {
             description: "Write a local JSON review bundle".to_string(),
             capabilities: file_publisher_capabilities(),
             options_schema: file_publisher_options_schema(),
+            route: None,
         }
     }
 
@@ -1339,19 +923,27 @@ fn anchors_match(left: &DraftAnchor, right: &DraftAnchor) -> bool {
 fn diff_context_for_anchor(
     summary: &ReviewSummary,
     anchor: &DraftAnchor,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<ReviewBundleLine>, Vec<String>, Vec<String>) {
     let Some(file) = summary
         .files
         .iter()
         .find(|file| file.display_path() == anchor.file_path)
     else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
-    let lines = rendered_diff_lines(file);
+    let lines = bundle_diff_lines(file);
+    let rendered_lines: Vec<String> = lines.iter().map(render_bundle_line).collect();
     let start =
         usize::try_from(anchor.start_diff_row.unwrap_or(anchor.diff_row)).unwrap_or(usize::MAX);
     let end = usize::try_from(anchor.end_diff_row.unwrap_or(anchor.diff_row)).unwrap_or(start);
-    let selected_lines = lines
+    let selected_structured_lines = lines
+        .iter()
+        .filter(|line| {
+            usize::try_from(line.diff_row).is_ok_and(|index| (start..=end).contains(&index))
+        })
+        .cloned()
+        .collect();
+    let selected_lines = rendered_lines
         .iter()
         .enumerate()
         .filter_map(|(index, line)| (start..=end).contains(&index).then_some(line.clone()))
@@ -1364,11 +956,57 @@ fn diff_context_for_anchor(
             .saturating_add(hunk_lines.len())
             .saturating_sub(1);
         if start <= hunk_end && end >= hunk_start {
-            return (selected_lines, hunk_lines);
+            return (selected_structured_lines, selected_lines, hunk_lines);
         }
         row = row.saturating_add(hunk_lines.len());
     }
-    (selected_lines, Vec::new())
+    (selected_structured_lines, selected_lines, Vec::new())
+}
+
+fn bundle_diff_lines(file: &ReviewFile) -> Vec<ReviewBundleLine> {
+    let mut diff_row = 0_u64;
+    let mut lines = Vec::new();
+    for hunk in &file.hunks {
+        lines.push(ReviewBundleLine {
+            file_path: file.display_path().to_string(),
+            kind: ReviewLineKind::Context,
+            old_line: None,
+            new_line: None,
+            diff_row,
+            content: format!(
+                "@@ -{},{} +{},{} @@{}",
+                hunk.old_start,
+                hunk.old_count,
+                hunk.new_start,
+                hunk.new_count,
+                hunk.heading
+                    .as_ref()
+                    .map_or(String::new(), |heading| format!(" {heading}")),
+            ),
+        });
+        diff_row = diff_row.saturating_add(1);
+        for line in &hunk.lines {
+            lines.push(ReviewBundleLine {
+                file_path: file.display_path().to_string(),
+                kind: line.kind,
+                old_line: line.old_line,
+                new_line: line.new_line,
+                diff_row,
+                content: line.content.clone(),
+            });
+            diff_row = diff_row.saturating_add(1);
+        }
+    }
+    lines
+}
+
+fn render_bundle_line(line: &ReviewBundleLine) -> String {
+    let marker = match line.kind {
+        ReviewLineKind::Context => ' ',
+        ReviewLineKind::Added => '+',
+        ReviewLineKind::Removed => '-',
+    };
+    format!("{marker}{}", line.content)
 }
 
 fn rendered_diff_lines(file: &ReviewFile) -> Vec<String> {
@@ -2280,10 +1918,6 @@ fn strip_diff_path_prefix(path: &str) -> &str {
     path.strip_prefix("a/")
         .or_else(|| path.strip_prefix("b/"))
         .unwrap_or(path)
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {

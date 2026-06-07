@@ -4,6 +4,7 @@ members = [
     "plugins/filesystem-plugin",
     "plugins/git-plugin",
     "plugins/code-review-plugin",
+    "plugins/github-review-publisher-plugin",
     "plugins/document-plugin",
     "plugins/bedrock-provider-plugin",
     "plugins/blims-plugin",
@@ -16,6 +17,7 @@ members = [
     "plugins/web-search-plugin",
     "packages/agent-policy",
     "packages/agent-policy/models",
+    "packages/code-review/models",
     "packages/agent-profile",
     "packages/bcode",
     "packages/cli",
@@ -64,6 +66,7 @@ bcode_bedrock_provider_plugin           = { version = "0.0.1-alpha.0", default-f
 bcode_blims_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/blims-plugin" }
 bcode_cli                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bcode_client                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bcode_code_review_models                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/code-review/models" }
 bcode_code_review_plugin                = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/code-review-plugin" }
 bcode_command                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
 bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
@@ -73,6 +76,7 @@ bcode_document_plugin                   = { version = "0.0.1-alpha.0", default-f
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
 bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }
+bcode_github_review_publisher_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/github-review-publisher-plugin" }
 bcode_ipc                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
 bcode_metrics                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/metrics" }
