@@ -531,7 +531,7 @@ fn review_diff_get(context: &NativeServiceContext) -> ServiceResponse {
 }
 
 fn review_bundle_get(context: &NativeServiceContext) -> ServiceResponse {
-    let request = match context.request.payload_json::<ReviewContextRequest>() {
+    let request = match context.request.payload_json::<PublishReviewRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
@@ -712,18 +712,34 @@ fn review_diff_for_request(
 }
 
 fn review_bundle_for_request(
-    request: ReviewContextRequest,
+    request: PublishReviewRequest,
     config: &CodeReviewPluginConfig,
 ) -> Result<ReviewBundle, ReviewError> {
-    let summary = create_review_summary(&CreateReviewRequest {
-        repo_path: request.repo_path.clone(),
-        target: request.target.clone(),
-    })?;
+    let (summary, surfaces) = if let Some(workspace) = request.workspace.clone() {
+        let materialization =
+            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
+                repo_path: request.repo_path.clone(),
+                workspace,
+            })?
+            .materialization;
+        (
+            review_summary_from_materialization(&materialization),
+            materialization.surfaces,
+        )
+    } else {
+        (
+            create_review_summary(&CreateReviewRequest {
+                repo_path: request.repo_path.clone(),
+                target: request.target.clone(),
+            })?,
+            Vec::new(),
+        )
+    };
     let review_key = review_key(&summary.repo_root, &request.target)?;
     let threads = threads_from_drafts(
         list_drafts_for_request(
             &ListDraftsRequest {
-                repo_path: request.repo_path,
+                repo_path: request.repo_path.clone(),
                 target: request.target.clone(),
             },
             config,
@@ -751,6 +767,7 @@ fn review_bundle_for_request(
         title: summary.title,
         repo_root: summary.repo_root,
         target: request.target,
+        surfaces,
         files: summary
             .files
             .iter()
@@ -766,6 +783,22 @@ fn review_bundle_for_request(
         threads,
         generated_at_ms: now_ms(),
     })
+}
+
+fn review_summary_from_materialization(
+    materialization: &ReviewWorkspaceMaterialization,
+) -> ReviewSummary {
+    ReviewSummary {
+        title: materialization.workspace.title.clone(),
+        repo_root: materialization.workspace.repo_root.clone(),
+        files: materialization
+            .surfaces
+            .iter()
+            .filter_map(|surface| surface.file.clone())
+            .collect(),
+        additions: materialization.additions,
+        deletions: materialization.deletions,
+    }
 }
 
 trait ReviewPublisher {
@@ -895,15 +928,10 @@ fn publish_preview_for_request(
     config: &CodeReviewPluginConfig,
 ) -> Result<PublishReviewPreviewResponse, ReviewError> {
     let publisher_id = request.publisher_id.clone();
-    let bundle = review_bundle_for_request(
-        ReviewContextRequest {
-            repo_path: request.repo_path,
-            target: request.target,
-        },
-        config,
-    )?;
+    let options = request.options.clone();
+    let bundle = review_bundle_for_request(request, config)?;
     let preview = with_publisher(&publisher_id, |publisher| {
-        publisher.preview(&bundle, &request.options)
+        publisher.preview(&bundle, &options)
     })?;
     Ok(PublishReviewPreviewResponse {
         publisher_id,
@@ -915,16 +943,11 @@ fn publish_submit_for_request(
     request: PublishReviewRequest,
     config: &CodeReviewPluginConfig,
 ) -> Result<PublishReviewResponse, ReviewError> {
-    let publisher_id = request.publisher_id;
-    let bundle = review_bundle_for_request(
-        ReviewContextRequest {
-            repo_path: request.repo_path,
-            target: request.target,
-        },
-        config,
-    )?;
+    let publisher_id = request.publisher_id.clone();
+    let options = request.options.clone();
+    let bundle = review_bundle_for_request(request, config)?;
     with_publisher(&publisher_id, |publisher| {
-        publisher.submit(&bundle, &request.options)
+        publisher.submit(&bundle, &options)
     })
 }
 
@@ -991,7 +1014,23 @@ fn publish_markdown(bundle: &ReviewBundle) -> String {
     let _ = writeln!(output, "* Review id: `{}`", bundle.review_id);
     let _ = writeln!(output, "* Repository: `{}`", bundle.repo_root.display());
     let _ = writeln!(output, "* Generated: `{}`", bundle.generated_at_ms);
+    if !bundle.surfaces.is_empty() {
+        let _ = writeln!(output, "* Surfaces: `{}`", bundle.surfaces.len());
+    }
     let _ = write!(output, "* Threads: `{}`\n\n", bundle.threads.len());
+    if !bundle.surfaces.is_empty() {
+        output.push_str("## Review surfaces\n\n");
+        for surface in &bundle.surfaces {
+            let _ = writeln!(
+                output,
+                "* `{}` `{}` from source `{}`",
+                surface_kind_label(surface.kind),
+                surface.path,
+                surface.source_id
+            );
+        }
+        output.push('\n');
+    }
     for thread in &bundle.threads {
         let _ = write!(
             output,
@@ -999,6 +1038,15 @@ fn publish_markdown(bundle: &ReviewBundle) -> String {
             thread.anchor.file_path,
             anchor_label(&thread.anchor)
         );
+        if let Some(surface_id) = &thread.anchor.surface_id {
+            let _ = writeln!(output, "* Surface: `{surface_id}`");
+        }
+        if let Some(source_id) = &thread.anchor.source_id {
+            let _ = writeln!(output, "* Source: `{source_id}`");
+        }
+        if thread.anchor.is_file_anchor {
+            output.push_str("* Anchor kind: `file`\n");
+        }
         if let Some(session_id) = &thread.session_id {
             let _ = write!(output, "* Bcode session: `{session_id}`\n\n");
         }
@@ -1016,6 +1064,13 @@ fn publish_markdown(bundle: &ReviewBundle) -> String {
         }
     }
     output
+}
+
+const fn surface_kind_label(kind: ReviewSurfaceKind) -> &'static str {
+    match kind {
+        ReviewSurfaceKind::Diff => "diff",
+        ReviewSurfaceKind::File => "file",
+    }
 }
 
 fn anchor_label(anchor: &DraftAnchor) -> String {
@@ -2933,6 +2988,7 @@ mod tests {
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
             target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
             files: Vec::new(),
             threads: Vec::new(),
             generated_at_ms: 1,
@@ -2956,6 +3012,7 @@ mod tests {
                     title: "Review".to_string(),
                     repo_root: PathBuf::from("/repo"),
                     target: ReviewTarget::WorkingTreeUnstaged,
+                    surfaces: Vec::new(),
                     files: Vec::new(),
                     threads: Vec::new(),
                     generated_at_ms: 1,
@@ -2975,6 +3032,7 @@ mod tests {
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
             target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
             files: Vec::new(),
             threads: Vec::new(),
             generated_at_ms: 1,

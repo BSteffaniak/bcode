@@ -758,6 +758,7 @@ mod tests {
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
             target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
             files: Vec::new(),
             threads: vec![review_thread(bundle_line(
                 "src/lib.rs",
@@ -871,6 +872,7 @@ mod tests {
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
             target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
             files: Vec::new(),
             threads: Vec::new(),
             generated_at_ms: 1,

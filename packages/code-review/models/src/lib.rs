@@ -757,6 +757,9 @@ pub struct ReviewBundle {
     pub target: ReviewTarget,
     /// Files in review order.
     pub files: Vec<ReviewFileSummary>,
+    /// Materialized review surfaces in review order.
+    #[serde(default)]
+    pub surfaces: Vec<ReviewSurface>,
     /// Review threads.
     pub threads: Vec<ReviewBundleThread>,
     /// Generated timestamp in milliseconds since Unix epoch.
@@ -844,6 +847,9 @@ pub struct PublishReviewRequest {
     pub repo_path: PathBuf,
     /// Review target.
     pub target: ReviewTarget,
+    /// Review workspace, when publishing a durable mixed-source workspace.
+    #[serde(default)]
+    pub workspace: Option<ReviewWorkspace>,
     /// Publisher id.
     pub publisher_id: String,
     /// Publisher options.

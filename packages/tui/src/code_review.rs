@@ -391,6 +391,7 @@ async fn handle_publish_request(
             client,
             repo_path,
             target,
+            Some(app.workspace.clone()),
             app.publisher_for_id(&publisher_id)
                 .and_then(|publisher| publisher.route.clone()),
             publisher_id,
@@ -408,6 +409,7 @@ async fn handle_publish_request(
             client,
             repo_path,
             target,
+            Some(app.workspace.clone()),
             app.publisher_for_id(&publisher_id)
                 .and_then(|publisher| publisher.route.clone()),
             publisher_id,
@@ -445,13 +447,14 @@ async fn preview_review(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    workspace: Option<ReviewWorkspace>,
     route: Option<ReviewPublisherRoute>,
     publisher_id: String,
     options: Vec<ReviewPublishOption>,
 ) -> Result<PublishReviewPreviewResponse, TuiError> {
     let options = options_json(options);
     if let Some(route) = route {
-        let bundle = load_review_bundle(client, repo_path, target).await?;
+        let bundle = load_review_bundle(client, repo_path, target, workspace.clone()).await?;
         let response = invoke_external_publisher(
             client,
             route,
@@ -471,6 +474,7 @@ async fn preview_review(
     let request = PublishReviewRequest {
         repo_path,
         target,
+        workspace,
         publisher_id,
         options,
     };
@@ -495,13 +499,14 @@ async fn publish_review(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    workspace: Option<ReviewWorkspace>,
     route: Option<ReviewPublisherRoute>,
     publisher_id: String,
     options: Vec<ReviewPublishOption>,
 ) -> Result<PublishReviewResponse, TuiError> {
     let options = options_json(options);
     if let Some(route) = route {
-        let bundle = load_review_bundle(client, repo_path, target).await?;
+        let bundle = load_review_bundle(client, repo_path, target, workspace.clone()).await?;
         let response = invoke_external_publisher(
             client,
             route,
@@ -521,6 +526,7 @@ async fn publish_review(
     let request = PublishReviewRequest {
         repo_path,
         target,
+        workspace,
         publisher_id,
         options,
     };
@@ -643,8 +649,13 @@ async fn load_review_bundle(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    workspace: Option<ReviewWorkspace>,
 ) -> Result<serde_json::Value, TuiError> {
-    let request = ReviewContextRequest { repo_path, target };
+    let request = ReviewBundleRequest {
+        repo_path,
+        target,
+        workspace,
+    };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
         .call_plugin_service(
@@ -1310,15 +1321,19 @@ struct PublishReviewPreviewResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ReviewContextRequest {
+struct ReviewBundleRequest {
     repo_path: PathBuf,
     target: ReviewTarget,
+    #[serde(default)]
+    workspace: Option<ReviewWorkspace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PublishReviewRequest {
     repo_path: PathBuf,
     target: ReviewTarget,
+    #[serde(default)]
+    workspace: Option<ReviewWorkspace>,
     publisher_id: String,
     #[serde(default)]
     options: serde_json::Value,
