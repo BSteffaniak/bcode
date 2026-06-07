@@ -1394,6 +1394,7 @@ dependencies = [
  "bcode_fake_provider_plugin",
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
+ "bcode_github_review_publisher_plugin",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",

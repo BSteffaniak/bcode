@@ -1009,6 +1009,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
             bcode_git_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-github-review-publisher-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/github-review-publisher-plugin/bcode-plugin.toml"),
+            bcode_github_review_publisher_plugin::static_plugin(),
+        ),
         #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),

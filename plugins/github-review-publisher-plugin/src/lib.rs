@@ -65,7 +65,8 @@ fn github_manifest() -> ReviewPublisherManifest {
                 "pull_request": { "type": "string", "description": "Pull request number" },
                 "token_env": { "type": "string", "description": "GitHub token env var, default GITHUB_TOKEN" },
                 "submit_event": { "type": "string", "description": "COMMENT, REQUEST_CHANGES, or APPROVE" },
-                "summary": { "type": "string", "description": "Optional review summary body" }
+                "summary": { "type": "string", "description": "Optional review summary body" },
+                "fallback_unmapped_to_summary": { "type": "string", "description": "Set to true to include unmappable inline comments in the review summary instead of failing submit" }
             }
         }),
         route: None,
@@ -136,9 +137,12 @@ fn submit_for_request(
 ) -> Result<PublishReviewResponse, GitHubPublisherError> {
     let options = GitHubPublishOptions::from_json(&request.options)?;
     let token = options.token()?;
-    let draft = github_review_draft(&request.bundle, &options);
-    if !draft.warnings.is_empty() {
+    let mut draft = github_review_draft(&request.bundle, &options);
+    if !draft.warnings.is_empty() && !options.fallback_unmapped_to_summary {
         return Err(GitHubPublisherError::UnmappableComments(draft.warnings));
+    }
+    if options.fallback_unmapped_to_summary && !draft.warnings.is_empty() {
+        append_unmapped_to_summary(&mut draft);
     }
     let payload = GitHubCreateReviewRequest {
         body: draft.body.unwrap_or_else(|| "Bcode review".to_string()),
@@ -214,20 +218,69 @@ fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) ->
     }
 }
 
+fn append_unmapped_to_summary(draft: &mut GitHubReviewDraft) {
+    let mut body = draft
+        .body
+        .take()
+        .unwrap_or_else(|| "Bcode review".to_string());
+    body.push_str("\n\n## Unmapped Bcode comments\n\n");
+    for warning in &draft.warnings {
+        let _ = writeln!(body, "* {warning}");
+    }
+    draft.body = Some(body);
+}
+
 fn github_comment_for_thread(thread: &ReviewBundleThread) -> Option<GitHubReviewComment> {
     let line = best_anchor_line(thread)?;
-    let (side, line_number) = match line.kind {
-        ReviewLineKind::Added | ReviewLineKind::Context => ("RIGHT", line.new_line?),
-        ReviewLineKind::Removed => ("LEFT", line.old_line?),
-    };
+    let side = side_for_line(&line)?.to_string();
+    let line_number = github_line_number(&line)?;
+    let range = github_range_for_thread(thread, &side);
+    let (start_line, start_side) = range.map_or((None, None), |range| {
+        (Some(range.start_line), Some(range.start_side))
+    });
     Some(GitHubReviewComment {
         path: line.file_path,
         body: String::new(),
         line: line_number,
-        side: side.to_string(),
-        start_line: None,
-        start_side: None,
+        side,
+        start_line,
+        start_side,
     })
+}
+
+fn github_range_for_thread(
+    thread: &ReviewBundleThread,
+    end_side: &str,
+) -> Option<GitHubReviewRange> {
+    let first = thread
+        .selected_lines
+        .iter()
+        .find(|line| side_for_line(line).is_some_and(|side| side == end_side))?;
+    let last = thread
+        .selected_lines
+        .iter()
+        .rev()
+        .find(|line| side_for_line(line).is_some_and(|side| side == end_side))?;
+    let start_line = github_line_number(first)?;
+    let end_line = github_line_number(last)?;
+    (start_line != end_line).then(|| GitHubReviewRange {
+        start_line,
+        start_side: end_side.to_string(),
+    })
+}
+
+fn side_for_line(line: &ReviewBundleLine) -> Option<&'static str> {
+    match line.kind {
+        ReviewLineKind::Added | ReviewLineKind::Context => line.new_line.map(|_| "RIGHT"),
+        ReviewLineKind::Removed => line.old_line.map(|_| "LEFT"),
+    }
+}
+
+const fn github_line_number(line: &ReviewBundleLine) -> Option<u32> {
+    match line.kind {
+        ReviewLineKind::Added | ReviewLineKind::Context => line.new_line,
+        ReviewLineKind::Removed => line.old_line,
+    }
 }
 
 fn best_anchor_line(thread: &ReviewBundleThread) -> Option<ReviewBundleLine> {
@@ -259,6 +312,7 @@ struct GitHubPublishOptions {
     token_env: String,
     submit_event: String,
     summary: Option<String>,
+    fallback_unmapped_to_summary: bool,
 }
 
 impl GitHubPublishOptions {
@@ -293,6 +347,7 @@ impl GitHubPublishOptions {
             token_env,
             submit_event,
             summary: string_option(value, "summary"),
+            fallback_unmapped_to_summary: bool_option(value, "fallback_unmapped_to_summary"),
         })
     }
 
@@ -311,11 +366,27 @@ fn string_option(value: &serde_json::Value, key: &'static str) -> Option<String>
         .map(ToString::to_string)
 }
 
+fn bool_option(value: &serde_json::Value, key: &'static str) -> bool {
+    value.get(key).is_some_and(|value| {
+        value.as_bool().unwrap_or_else(|| {
+            value
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        })
+    })
+}
+
 #[derive(Debug)]
 struct GitHubReviewDraft {
     body: Option<String>,
     comments: Vec<GitHubReviewComment>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubReviewRange {
+    start_line: u32,
+    start_side: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -461,7 +532,74 @@ mod tests {
         assert!(response.preview.contains("Warnings"));
     }
 
+    #[test]
+    fn maps_range_to_github_start_line() {
+        let thread = review_thread_with_lines(vec![
+            ReviewBundleLine {
+                file_path: "src/lib.rs".to_string(),
+                kind: ReviewLineKind::Added,
+                old_line: None,
+                new_line: Some(40),
+                diff_row: 1,
+                content: "first".to_string(),
+            },
+            ReviewBundleLine {
+                file_path: "src/lib.rs".to_string(),
+                kind: ReviewLineKind::Added,
+                old_line: None,
+                new_line: Some(42),
+                diff_row: 2,
+                content: "last".to_string(),
+            },
+        ]);
+
+        let comment = github_comment_for_thread(&thread).expect("comment");
+
+        assert_eq!(comment.line, 42);
+        assert_eq!(comment.start_line, Some(40));
+        assert_eq!(comment.start_side.as_deref(), Some("RIGHT"));
+    }
+
+    #[test]
+    fn serializes_github_payload_for_comment_event() {
+        let payload = GitHubCreateReviewRequest {
+            body: "summary".to_string(),
+            event: "COMMENT".to_string(),
+            comments: vec![GitHubReviewComment {
+                path: "src/lib.rs".to_string(),
+                body: "body".to_string(),
+                line: 42,
+                side: "RIGHT".to_string(),
+                start_line: Some(40),
+                start_side: Some("RIGHT".to_string()),
+            }],
+        };
+
+        let value = serde_json::to_value(&payload).expect("payload json");
+
+        assert_eq!(value["event"], "COMMENT");
+        assert_eq!(value["comments"][0]["start_line"], 40);
+        assert_eq!(value["comments"][0]["side"], "RIGHT");
+    }
+
+    #[test]
+    fn parses_fallback_unmapped_option() {
+        let options = GitHubPublishOptions::from_json(&serde_json::json!({
+            "repository": "owner/repo",
+            "pull_request": "123",
+            "fallback_unmapped_to_summary": "true"
+        }))
+        .expect("parse options");
+
+        assert!(options.fallback_unmapped_to_summary);
+    }
+
     fn review_thread(line: ReviewBundleLine) -> ReviewBundleThread {
+        review_thread_with_lines(vec![line])
+    }
+
+    fn review_thread_with_lines(lines: Vec<ReviewBundleLine>) -> ReviewBundleThread {
+        let line = lines.first().expect("at least one line").clone();
         ReviewBundleThread {
             thread_id: "thread".to_string(),
             anchor: DraftAnchor {
@@ -499,7 +637,7 @@ mod tests {
                 session_id: None,
             }],
             session_id: None,
-            selected_lines: vec![line],
+            selected_lines: lines,
             selected_diff_lines: Vec::new(),
             hunk_context: Vec::new(),
         }
