@@ -1419,7 +1419,7 @@ impl ReviewApp {
                 .is_some_and(|comments| !comments.is_empty()),
         ));
         format!(
-            "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nDiff rows: {}-{}\nOld range: {}-{}\nNew range: {}-{}\nLine kind: {:?}\nOther draft comment threads in this review: {}\n\nCurrent draft/comment:\n{}\n\nSelected diff lines:\n```diff\n{}\n```\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nPlease analyze this review thread. Keep the anchored file and line context in mind. If broader context is needed, inspect the repository from the session working directory.",
+            "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nDiff rows: {}-{}\nOld range: {}-{}\nNew range: {}-{}\nLine kind: {:?}\nOther draft comment threads in this review: {}\n\nCurrent draft/comment:\n{}\n\nSelected diff lines:\n```diff\n{}\n```\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nReview context is also available through the bundled code-review plugin service. The relevant interface is `bcode.code_review/v1`; useful operations are `review.context.get`, `review.comments.list`, `review.thread.get`, and `review.diff.get`. Request payloads include `repo_path` plus the review `target`; `review.thread.get` accepts `thread_id` or `anchor`, and `review.diff.get` accepts optional `file_path`.\n\nPlease analyze this review thread. Keep the anchored file and line context in mind. If broader context is needed, inspect the repository from the session working directory.",
             self.review.title,
             self.review.repo_root.display(),
             ask.anchor.path,
@@ -1525,6 +1525,17 @@ impl ReviewApp {
         let comments = self.draft_comments.get(&anchor)?;
         let latest = comments.last()?;
         Some(format!("{} draft: {}", comments.len(), latest.body))
+    }
+
+    /// Return linked session id for the selected line's latest draft comment.
+    #[must_use]
+    pub fn selected_draft_session_id(&self) -> Option<&str> {
+        let anchor = self.selected_comment_anchor()?;
+        self.draft_comments
+            .get(&anchor)?
+            .last()?
+            .session_id
+            .as_deref()
     }
 
     /// Load persisted draft comments into local state.

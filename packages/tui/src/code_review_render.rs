@@ -122,7 +122,10 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 return format!(" {range}  c comment  a ask Bcode  esc clear ");
             }
             if let Some(preview) = app.selected_draft_preview() {
-                return format!(" {preview}  a ask Bcode  e edit  D delete latest draft ");
+                let linked = app
+                    .selected_draft_session_id()
+                    .map_or(String::new(), |_| "  🤖 session linked".to_string());
+                return format!(" {preview}{linked}  a ask Bcode  e edit  D delete latest draft ");
             }
             format!(
                 " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  e edit  D delete draft  b sidebar:{sidebar}  ? {help}  q exit "

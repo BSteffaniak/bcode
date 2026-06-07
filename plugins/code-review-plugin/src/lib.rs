@@ -7,6 +7,7 @@
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,14 @@ pub const OP_DRAFT_DELETE: &str = "draft.delete";
 pub const OP_DRAFT_UPDATE: &str = "draft.update";
 /// Operation that links a review thread to a Bcode session.
 pub const OP_THREAD_LINK_SESSION: &str = "thread.link_session";
+/// Operation that returns review context metadata.
+pub const OP_REVIEW_CONTEXT_GET: &str = "review.context.get";
+/// Operation that lists review comments.
+pub const OP_REVIEW_COMMENTS_LIST: &str = "review.comments.list";
+/// Operation that returns one review thread.
+pub const OP_REVIEW_THREAD_GET: &str = "review.thread.get";
+/// Operation that returns file diff context.
+pub const OP_REVIEW_DIFF_GET: &str = "review.diff.get";
 
 const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
 const DEFAULT_STATE_ROOT: &str = ".bcode/code-review";
@@ -65,6 +74,10 @@ impl RustPlugin for CodeReviewPlugin {
             OP_DRAFT_DELETE => delete_draft(&context.request),
             OP_DRAFT_UPDATE => update_draft(&context.request),
             OP_THREAD_LINK_SESSION => link_thread_session(&context.request),
+            OP_REVIEW_CONTEXT_GET => review_context_get(&context.request),
+            OP_REVIEW_COMMENTS_LIST => review_comments_list(&context.request),
+            OP_REVIEW_THREAD_GET => review_thread_get(&context.request),
+            OP_REVIEW_DIFF_GET => review_diff_get(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -171,6 +184,39 @@ pub struct LinkThreadSessionRequest {
     pub session_id: String,
 }
 
+/// Request payload for review context operations scoped to a target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewContextRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+}
+
+/// Request payload for `review.thread.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewThreadRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Thread id to fetch, if known.
+    pub thread_id: Option<String>,
+    /// Thread anchor to fetch, if thread id is not known.
+    pub anchor: Option<DraftAnchor>,
+}
+
+/// Request payload for `review.diff.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewDiffRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// File path to fetch, or all files when absent.
+    pub file_path: Option<String>,
+}
+
 /// Persisted draft anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftAnchor {
@@ -259,6 +305,93 @@ pub struct UpdateDraftResponse {
 pub struct LinkThreadSessionResponse {
     /// Linked thread id.
     pub thread_id: String,
+}
+
+/// Compact file summary for review context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFileSummary {
+    /// Display path.
+    pub path: String,
+    /// File status.
+    pub status: ReviewFileStatus,
+    /// Added lines.
+    pub additions: u32,
+    /// Removed lines.
+    pub deletions: u32,
+    /// Hunk count.
+    pub hunks: usize,
+    /// Whether Git reported a binary patch.
+    pub is_binary: bool,
+}
+
+/// Response payload for `review.context.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewContextResponse {
+    /// Human-readable target label.
+    pub title: String,
+    /// Repository root resolved by Git.
+    pub repo_root: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Files in review order.
+    pub files: Vec<ReviewFileSummary>,
+    /// Total added lines.
+    pub additions: u32,
+    /// Total removed lines.
+    pub deletions: u32,
+    /// Total draft comments.
+    pub draft_count: usize,
+    /// Total draft threads.
+    pub thread_count: usize,
+}
+
+/// A review thread with its draft comments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewThread {
+    /// Thread id.
+    pub thread_id: String,
+    /// Thread anchor.
+    pub anchor: DraftAnchor,
+    /// Linked Bcode session id, when present.
+    pub session_id: Option<String>,
+    /// Draft comments in the thread.
+    pub comments: Vec<DraftComment>,
+}
+
+/// Response payload for `review.comments.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCommentsResponse {
+    /// Draft threads in review order.
+    pub threads: Vec<ReviewThread>,
+}
+
+/// Response payload for `review.thread.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewThreadResponse {
+    /// Requested thread, if found.
+    pub thread: Option<ReviewThread>,
+    /// Selected diff lines for the thread.
+    pub selected_lines: Vec<String>,
+    /// Full hunk context for the thread.
+    pub hunk_context: Vec<String>,
+}
+
+/// File diff context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFileDiff {
+    /// File path.
+    pub path: String,
+    /// File status.
+    pub status: ReviewFileStatus,
+    /// Rendered diff lines.
+    pub lines: Vec<String>,
+}
+
+/// Response payload for `review.diff.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDiffResponse {
+    /// Matching file diffs.
+    pub files: Vec<ReviewFileDiff>,
 }
 
 /// Structured review response.
@@ -460,6 +593,161 @@ fn link_thread_session(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn review_context_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ReviewContextRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match review_context_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("review_context_failed", error.to_string()),
+    }
+}
+
+fn review_comments_list(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ReviewContextRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match review_comments_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("review_comments_failed", error.to_string()),
+    }
+}
+
+fn review_thread_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<GetReviewThreadRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match review_thread_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("review_thread_failed", error.to_string()),
+    }
+}
+
+fn review_diff_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<GetReviewDiffRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match review_diff_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("review_diff_failed", error.to_string()),
+    }
+}
+
+fn review_context_for_request(
+    request: ReviewContextRequest,
+) -> Result<ReviewContextResponse, ReviewError> {
+    let summary = create_review_summary(&CreateReviewRequest {
+        repo_path: request.repo_path.clone(),
+        target: request.target.clone(),
+    })?;
+    let drafts = list_drafts_for_request(&ListDraftsRequest {
+        repo_path: request.repo_path,
+        target: request.target.clone(),
+    })?
+    .drafts;
+    let thread_count = drafts
+        .iter()
+        .map(|draft| draft.thread_id.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
+    Ok(ReviewContextResponse {
+        title: summary.title,
+        repo_root: summary.repo_root,
+        target: request.target,
+        files: summary
+            .files
+            .iter()
+            .map(|file| ReviewFileSummary {
+                path: file.display_path().to_string(),
+                status: file.status,
+                additions: file.additions,
+                deletions: file.deletions,
+                hunks: file.hunks.len(),
+                is_binary: file.is_binary,
+            })
+            .collect(),
+        additions: summary.additions,
+        deletions: summary.deletions,
+        draft_count: drafts.len(),
+        thread_count,
+    })
+}
+
+fn review_comments_for_request(
+    request: ReviewContextRequest,
+) -> Result<ReviewCommentsResponse, ReviewError> {
+    let drafts = list_drafts_for_request(&ListDraftsRequest {
+        repo_path: request.repo_path,
+        target: request.target,
+    })?
+    .drafts;
+    Ok(ReviewCommentsResponse {
+        threads: threads_from_drafts(drafts),
+    })
+}
+
+fn review_thread_for_request(
+    request: GetReviewThreadRequest,
+) -> Result<ReviewThreadResponse, ReviewError> {
+    let summary = create_review_summary(&CreateReviewRequest {
+        repo_path: request.repo_path.clone(),
+        target: request.target.clone(),
+    })?;
+    let drafts = list_drafts_for_request(&ListDraftsRequest {
+        repo_path: request.repo_path,
+        target: request.target,
+    })?
+    .drafts;
+    let thread = threads_from_drafts(drafts).into_iter().find(|thread| {
+        request
+            .thread_id
+            .as_ref()
+            .is_some_and(|thread_id| thread.thread_id == *thread_id)
+            || request
+                .anchor
+                .as_ref()
+                .is_some_and(|anchor| anchors_match(&thread.anchor, anchor))
+    });
+    let (selected_lines, hunk_context) = thread.as_ref().map_or_else(
+        || (Vec::new(), Vec::new()),
+        |thread| diff_context_for_anchor(&summary, &thread.anchor),
+    );
+    Ok(ReviewThreadResponse {
+        thread,
+        selected_lines,
+        hunk_context,
+    })
+}
+
+fn review_diff_for_request(
+    request: GetReviewDiffRequest,
+) -> Result<ReviewDiffResponse, ReviewError> {
+    let summary = create_review_summary(&CreateReviewRequest {
+        repo_path: request.repo_path,
+        target: request.target,
+    })?;
+    let files = summary
+        .files
+        .iter()
+        .filter(|file| {
+            request
+                .file_path
+                .as_ref()
+                .is_none_or(|path| file.display_path() == path)
+        })
+        .map(|file| ReviewFileDiff {
+            path: file.display_path().to_string(),
+            status: file.status,
+            lines: rendered_diff_lines(file),
+        })
+        .collect();
+    Ok(ReviewDiffResponse { files })
+}
+
 fn list_drafts_for_request(request: &ListDraftsRequest) -> Result<ListDraftsResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let review_key = review_key(&repo_root, &request.target)?;
@@ -543,6 +831,95 @@ fn link_thread_session_for_request(
         })
     })?;
     Ok(response)
+}
+
+fn threads_from_drafts(drafts: Vec<DraftComment>) -> Vec<ReviewThread> {
+    let mut threads: BTreeMap<String, ReviewThread> = BTreeMap::new();
+    for draft in drafts {
+        let entry = threads
+            .entry(draft.thread_id.clone())
+            .or_insert_with(|| ReviewThread {
+                thread_id: draft.thread_id.clone(),
+                anchor: draft.anchor.clone(),
+                session_id: draft.session_id.clone(),
+                comments: Vec::new(),
+            });
+        if entry.session_id.is_none() {
+            entry.session_id.clone_from(&draft.session_id);
+        }
+        entry.comments.push(draft);
+    }
+    threads.into_values().collect()
+}
+
+fn anchors_match(left: &DraftAnchor, right: &DraftAnchor) -> bool {
+    left.file_path == right.file_path
+        && left.diff_row == right.diff_row
+        && left.end_diff_row == right.end_diff_row
+        && left.old_line == right.old_line
+        && left.new_line == right.new_line
+}
+
+fn diff_context_for_anchor(
+    summary: &ReviewSummary,
+    anchor: &DraftAnchor,
+) -> (Vec<String>, Vec<String>) {
+    let Some(file) = summary
+        .files
+        .iter()
+        .find(|file| file.display_path() == anchor.file_path)
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let lines = rendered_diff_lines(file);
+    let start =
+        usize::try_from(anchor.start_diff_row.unwrap_or(anchor.diff_row)).unwrap_or(usize::MAX);
+    let end = usize::try_from(anchor.end_diff_row.unwrap_or(anchor.diff_row)).unwrap_or(start);
+    let selected_lines = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (start..=end).contains(&index).then_some(line.clone()))
+        .collect();
+    let mut row = 0usize;
+    for hunk in &file.hunks {
+        let hunk_start = row;
+        let hunk_lines = rendered_hunk_lines(hunk);
+        let hunk_end = hunk_start
+            .saturating_add(hunk_lines.len())
+            .saturating_sub(1);
+        if start <= hunk_end && end >= hunk_start {
+            return (selected_lines, hunk_lines);
+        }
+        row = row.saturating_add(hunk_lines.len());
+    }
+    (selected_lines, Vec::new())
+}
+
+fn rendered_diff_lines(file: &ReviewFile) -> Vec<String> {
+    file.hunks.iter().flat_map(rendered_hunk_lines).collect()
+}
+
+fn rendered_hunk_lines(hunk: &ReviewHunk) -> Vec<String> {
+    let mut lines = Vec::with_capacity(hunk.lines.len().saturating_add(1));
+    lines.push(format!(
+        "@@ -{},{} +{},{} @@{}",
+        hunk.old_start,
+        hunk.old_count,
+        hunk.new_start,
+        hunk.new_count,
+        hunk.heading
+            .as_ref()
+            .map_or(String::new(), |heading| format!(" {heading}")),
+    ));
+    lines.extend(hunk.lines.iter().map(|line| {
+        let marker = match line.kind {
+            ReviewLineKind::Context => ' ',
+            ReviewLineKind::Added => '+',
+            ReviewLineKind::Removed => '-',
+        };
+        format!("{marker}{}", line.content)
+    }));
+    lines
 }
 
 fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
