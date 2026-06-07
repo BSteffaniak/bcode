@@ -166,9 +166,13 @@ pub async fn run_code_review(
     };
 
     match result {
-        Ok(()) => {
+        Ok(session_id) => {
             let _writer = guard.leave()?;
-            Ok(())
+            if let Some(session_id) = session_id {
+                run(Some(session_id)).await
+            } else {
+                Ok(())
+            }
         }
         Err(error) => Err(error),
     }

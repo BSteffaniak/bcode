@@ -66,7 +66,7 @@ pub async fn run<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
     target: ReviewOpenTarget,
-) -> Result<(), TuiError> {
+) -> Result<Option<SessionId>, TuiError> {
     let client = BcodeClient::default_endpoint();
     let review_target: ReviewTarget = target.into();
     let review = load_review(&client, repo_path.clone(), review_target.clone()).await?;
@@ -134,28 +134,55 @@ pub async fn run<W: Write>(
             needs_redraw = true;
         }
         if let Some(ask) = app.take_pending_agent_session() {
-            match create_agent_session(
+            handle_pending_agent_session(
                 &client,
                 repo_path.clone(),
                 review_target.clone(),
-                &app,
-                ask.clone(),
+                &mut app,
+                ask,
             )
-            .await
-            {
-                Ok(session_id) => {
-                    app.mark_thread_session(&ask.anchor, session_id.to_string());
-                    app.status_message = Some(format!("created Bcode session {session_id}"));
-                }
-                Err(error) => {
-                    app.status_message = Some(format!("failed to create Bcode session: {error}"));
-                }
-            }
+            .await;
             needs_redraw = true;
         }
     }
 
-    Ok(())
+    Ok(app.take_session_to_open())
+}
+
+async fn handle_pending_agent_session(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    review_target: ReviewTarget,
+    app: &mut ReviewApp,
+    ask: PendingAgentSession,
+) {
+    if let Some(session_id) = app.session_id_for_anchor(&ask.anchor) {
+        if let Ok(session_id) = session_id.parse::<SessionId>() {
+            let prompt = app.agent_session_prompt(&ask);
+            match client.send_user_message(session_id, prompt).await {
+                Ok(_) => {
+                    app.status_message = Some(format!(
+                        "sent review follow-up to linked session {session_id}"
+                    ));
+                }
+                Err(error) => {
+                    app.status_message = Some(format!("failed to send review follow-up: {error}"));
+                }
+            }
+        } else {
+            app.status_message = Some("linked session id is invalid".to_string());
+        }
+    } else {
+        match create_agent_session(client, repo_path, review_target, app, ask.clone()).await {
+            Ok(session_id) => {
+                app.mark_thread_session(&ask.anchor, session_id.to_string());
+                app.status_message = Some(format!("created Bcode session {session_id}"));
+            }
+            Err(error) => {
+                app.status_message = Some(format!("failed to create Bcode session: {error}"));
+            }
+        }
+    }
 }
 
 async fn load_review(
@@ -444,6 +471,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
         KeyCode::Char('a') => app.ask_bcode_about_selection(),
+        KeyCode::Char('o') => app.open_linked_session_at_selection(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
             true
@@ -954,6 +982,8 @@ pub struct ReviewApp {
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
     pub range_selection_start: Option<usize>,
+    /// Session id to open after leaving review mode.
+    pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
 }
@@ -979,6 +1009,7 @@ impl ReviewApp {
             pending_draft_update: None,
             pending_agent_session: None,
             range_selection_start: None,
+            session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
         }
@@ -1350,6 +1381,16 @@ impl ReviewApp {
         self.pending_agent_session.take()
     }
 
+    /// Return linked session id for an anchor.
+    #[must_use]
+    pub fn session_id_for_anchor(&self, anchor: &ReviewCommentAnchor) -> Option<&str> {
+        self.draft_comments
+            .get(anchor)?
+            .last()?
+            .session_id
+            .as_deref()
+    }
+
     /// Mark the latest draft at an anchor as linked to a Bcode session.
     pub fn mark_thread_session(&mut self, anchor: &ReviewCommentAnchor, session_id: String) {
         if let Some(comment) = self
@@ -1358,6 +1399,18 @@ impl ReviewApp {
             .and_then(|comments| comments.last_mut())
         {
             comment.session_id = Some(session_id);
+        } else {
+            self.draft_comments
+                .entry(anchor.clone())
+                .or_default()
+                .push(ReviewDraftComment {
+                    id: None,
+                    body: String::new(),
+                    persisted: false,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    session_id: Some(session_id),
+                });
         }
     }
 
@@ -1392,19 +1445,50 @@ impl ReviewApp {
         comment.persisted = false;
     }
 
+    /// Take pending linked session open request.
+    pub const fn take_session_to_open(&mut self) -> Option<SessionId> {
+        self.session_to_open.take()
+    }
+
+    /// Open linked session for the selected thread.
+    pub fn open_linked_session_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a linked review thread to open".to_string());
+            return true;
+        };
+        let Some(session_id) = self.session_id_for_anchor(&anchor) else {
+            self.status_message = Some("no linked session for selected thread".to_string());
+            return true;
+        };
+        match session_id.parse::<SessionId>() {
+            Ok(session_id) => {
+                self.session_to_open = Some(session_id);
+                self.should_exit = true;
+            }
+            Err(_) => {
+                self.status_message = Some("linked session id is invalid".to_string());
+            }
+        }
+        true
+    }
+
     /// Ask Bcode about the selected review line/thread.
     pub fn ask_bcode_about_selection(&mut self) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
             self.status_message = Some("select a diff line to ask Bcode".to_string());
             return true;
         };
+        let existing_session = self.session_id_for_anchor(&anchor).map(ToString::to_string);
         let draft_body = self
             .draft_comments
             .get(&anchor)
             .and_then(|comments| comments.last())
             .map(|comment| comment.body.clone());
         self.pending_agent_session = Some(PendingAgentSession { anchor, draft_body });
-        self.status_message = Some("creating Bcode session for review thread".to_string());
+        self.status_message = Some(existing_session.map_or_else(
+            || "creating Bcode session for review thread".to_string(),
+            |session_id| format!("sending review follow-up to linked session {session_id}"),
+        ));
         true
     }
 

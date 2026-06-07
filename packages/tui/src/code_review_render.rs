@@ -125,10 +125,10 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 let linked = app
                     .selected_draft_session_id()
                     .map_or(String::new(), |_| "  🤖 session linked".to_string());
-                return format!(" {preview}{linked}  a ask Bcode  e edit  D delete latest draft ");
+                return format!(" {preview}{linked}  a ask/follow up  o open  e edit  D delete latest draft ");
             }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  e edit  D delete draft  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  o open session  e edit  D delete draft  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -343,7 +343,7 @@ fn render_diff_line(line: &ReviewLine) -> RenderedRow {
 
 fn render_help(area: Rect, frame: &mut Frame<'_>) {
     let width = area.width.min(68);
-    let height = 16;
+    let height = 17;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
     let y = area
         .y
@@ -367,6 +367,7 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " c                   create draft comment",
         " v                   select/clear line range",
         " a                   ask Bcode about selected line",
+        " o                   open linked Bcode session",
         " e                   edit latest draft on line",
         " D                   delete latest draft on line",
         " ?                   toggle this help",
