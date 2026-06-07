@@ -957,7 +957,9 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Char('N') => app.search_previous_match(),
         KeyCode::Enter => {
-            if app.sidebar_mode == ReviewSidebarMode::Files && app.review.is_repository_review() {
+            if app.sidebar_mode == ReviewSidebarMode::Repository
+                && app.review.is_repository_review()
+            {
                 app.activate_selected_tree_row()
             } else {
                 app.jump_to_selected_thread()
@@ -1827,10 +1829,27 @@ impl ReviewCommentEditor {
 /// Review sidebar mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewSidebarMode {
-    /// File list sidebar.
-    Files,
+    /// Included review workspace sources/sidebar.
+    Included,
+    /// Full repository file browser.
+    Repository,
     /// Review thread list sidebar.
     Threads,
+    /// Review source list sidebar.
+    Sources,
+}
+
+impl ReviewSidebarMode {
+    /// Return a user-facing sidebar label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Included => "included",
+            Self::Repository => "repo",
+            Self::Threads => "threads",
+            Self::Sources => "sources",
+        }
+    }
 }
 
 /// Review thread row summary.
@@ -2035,7 +2054,7 @@ impl ReviewApp {
             diff_scroll: 0,
             selected_diff_line: 0,
             sidebar_visible: true,
-            sidebar_mode: ReviewSidebarMode::Files,
+            sidebar_mode: ReviewSidebarMode::Included,
             selected_thread: 0,
             thread_scroll: 0,
             help_visible: false,
@@ -2430,17 +2449,16 @@ impl ReviewApp {
         self.review.files.get(self.selected_file)
     }
 
-    /// Toggle sidebar between files and threads.
+    /// Toggle sidebar between included, repository, threads, and sources.
     pub fn toggle_sidebar_mode(&mut self) -> bool {
         self.sidebar_mode = match self.sidebar_mode {
-            ReviewSidebarMode::Files => ReviewSidebarMode::Threads,
-            ReviewSidebarMode::Threads => ReviewSidebarMode::Files,
+            ReviewSidebarMode::Included => ReviewSidebarMode::Repository,
+            ReviewSidebarMode::Repository => ReviewSidebarMode::Threads,
+            ReviewSidebarMode::Threads => ReviewSidebarMode::Sources,
+            ReviewSidebarMode::Sources => ReviewSidebarMode::Included,
         };
         self.sidebar_visible = true;
-        self.status_message = Some(match self.sidebar_mode {
-            ReviewSidebarMode::Files => "sidebar: files".to_string(),
-            ReviewSidebarMode::Threads => "sidebar: threads".to_string(),
-        });
+        self.status_message = Some(format!("sidebar: {}", self.sidebar_mode.label()));
         true
     }
 
@@ -2451,7 +2469,7 @@ impl ReviewApp {
         } else if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
             self.select_next_thread(rows)
         } else if self.review.is_repository_review()
-            && self.sidebar_mode == ReviewSidebarMode::Files
+            && self.sidebar_mode == ReviewSidebarMode::Repository
             && self.sidebar_visible
         {
             self.select_next_tree_row(rows)
@@ -2467,7 +2485,7 @@ impl ReviewApp {
         } else if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
             self.select_previous_thread(rows)
         } else if self.review.is_repository_review()
-            && self.sidebar_mode == ReviewSidebarMode::Files
+            && self.sidebar_mode == ReviewSidebarMode::Repository
             && self.sidebar_visible
         {
             self.select_previous_tree_row(rows)
@@ -2678,7 +2696,7 @@ impl ReviewApp {
         self.diff_scroll = 0;
         self.selected_diff_line = 0;
         self.range_selection_start = None;
-        self.sidebar_mode = ReviewSidebarMode::Files;
+        self.sidebar_mode = ReviewSidebarMode::Included;
         self.queue_selected_file_load();
         self.expand_selected_file_dirs();
         self.sync_tree_row_to_selected_file();

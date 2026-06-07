@@ -41,8 +41,10 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
         let file_area = Rect::new(body.x, body.y, sidebar_width, body.height);
         app.set_file_area(Some(file_area));
         match app.sidebar_mode {
-            ReviewSidebarMode::Files => render_files(app, file_area, frame),
+            ReviewSidebarMode::Included => render_included(app, file_area, frame),
+            ReviewSidebarMode::Repository => render_files(app, file_area, frame),
             ReviewSidebarMode::Threads => render_threads(app, file_area, frame),
+            ReviewSidebarMode::Sources => render_sources(app, file_area, frame),
         }
         let separator = Rect::new(file_area.right(), body.y, 1, body.height);
         render_separator(separator, frame);
@@ -182,15 +184,15 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 });
             }
             if app.ux_mode == super::code_review::ReviewUxMode::Build {
-                return " build mode  j/k move  + add selected file  A add by path  - remove selected source  m review mode  f picker  enter inspect/open  t threads  b sidebar  ? help  q exit ".to_string();
+                return " build mode  j/k move  + add selected file  A add by path  - remove selected source  m review mode  f picker  enter inspect/open  t sidebar-tab  b sidebar  ? help  q exit ".to_string();
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  c comment  v range  x publish  a ask Bcode  t threads  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  c comment  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -210,6 +212,77 @@ fn render_separator(area: Rect, frame: &mut Frame<'_>) {
         frame.write_line(
             Rect::new(area.x, y, 1, 1),
             &Line::from_spans(vec![Span::styled("│", Style::new().fg(Color::BrightBlack))]),
+        );
+    }
+}
+
+fn render_included(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.is_empty() {
+        return;
+    }
+    frame.write_line(
+        Rect::new(area.x, area.y, area.width, 1),
+        &Line::from_spans(vec![Span::styled(
+            " Included",
+            Style::new().fg(Color::Cyan).bg(Color::Black),
+        )]),
+    );
+    let visible_rows = usize::from(area.height.saturating_sub(1));
+    for row in 0..visible_rows {
+        let Some(source) = app.workspace.sources.get(row) else {
+            break;
+        };
+        let marker = if source.included { "✓" } else { " " };
+        let text = format!(" [{marker}] {}", source.label);
+        frame.write_line(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(1)
+                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                area.width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&text, usize::from(area.width)),
+                Style::new().fg(Color::White).bg(Color::Black),
+            )]),
+        );
+    }
+}
+
+fn render_sources(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.is_empty() {
+        return;
+    }
+    frame.write_line(
+        Rect::new(area.x, area.y, area.width, 1),
+        &Line::from_spans(vec![Span::styled(
+            " Sources",
+            Style::new().fg(Color::Cyan).bg(Color::Black),
+        )]),
+    );
+    for (row, source) in app
+        .workspace
+        .sources
+        .iter()
+        .enumerate()
+        .take(usize::from(area.height.saturating_sub(1)))
+    {
+        let text = format!(" {}", source.label);
+        frame.write_line(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(1)
+                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                area.width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&text, usize::from(area.width)),
+                Style::new().fg(Color::White).bg(Color::Black),
+            )]),
         );
     }
 }
@@ -780,7 +853,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " -                   remove selected source",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",
-        " t                   toggle files/threads sidebar",
+        " t                   cycle included/repo/threads/sources",
         " b                   toggle sidebar",
         " ?                   toggle this help",
         " q or esc            exit review",
@@ -799,7 +872,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " c                   create draft comment",
         " a                   ask Bcode about selected line",
         " x                   publish/export review",
-        " t                   toggle files/threads sidebar",
+        " t                   cycle included/repo/threads/sources",
         " b                   toggle sidebar",
         " ?                   toggle this help",
         " q or esc            exit review",
@@ -812,7 +885,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " J/K                 next/previous hunk",
         " g/G                 top/bottom of file diff",
         " b                   toggle sidebar",
-        " t                   toggle files/threads sidebar",
+        " t                   cycle included/repo/threads/sources",
         " mouse wheel         scroll diff",
         " click file          open file",
         " c                   create draft comment",
