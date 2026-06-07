@@ -20,6 +20,16 @@ pub const OP_REVIEW_PUBLISHERS_LIST: &str = "review.publishers.list";
 pub const OP_REVIEW_PUBLISH_PREVIEW: &str = "review.publish.preview";
 /// Operation that submits a review publish operation.
 pub const OP_REVIEW_PUBLISH_SUBMIT: &str = "review.publish.submit";
+/// Operation that lists durable review workspaces.
+pub const OP_REVIEW_WORKSPACE_LIST: &str = "review.workspace.list";
+/// Operation that creates a durable review workspace.
+pub const OP_REVIEW_WORKSPACE_CREATE: &str = "review.workspace.create";
+/// Operation that fetches a durable review workspace.
+pub const OP_REVIEW_WORKSPACE_GET: &str = "review.workspace.get";
+/// Operation that updates a durable review workspace.
+pub const OP_REVIEW_WORKSPACE_UPDATE: &str = "review.workspace.update";
+/// Operation that archives a durable review workspace.
+pub const OP_REVIEW_WORKSPACE_ARCHIVE: &str = "review.workspace.archive";
 /// Operation that returns repository file content for review browsing.
 pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 /// Operation that returns an external publisher manifest.
@@ -82,6 +92,9 @@ pub struct ReviewWorkspace {
     /// Updated timestamp in milliseconds since Unix epoch, when known.
     #[serde(default)]
     pub updated_at_ms: Option<u64>,
+    /// Archived timestamp in milliseconds since Unix epoch, when archived.
+    #[serde(default)]
+    pub archived_at_ms: Option<u64>,
 }
 
 impl ReviewWorkspace {
@@ -102,6 +115,7 @@ impl ReviewWorkspace {
             }],
             created_at_ms: None,
             updated_at_ms: None,
+            archived_at_ms: None,
         }
     }
 }
@@ -258,6 +272,91 @@ pub struct ReviewSurface {
     pub path: String,
     /// Surface kind.
     pub kind: ReviewSurfaceKind,
+}
+
+/// Request payload for `review.workspace.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReviewWorkspacesRequest {
+    /// Repository path whose review workspaces should be listed.
+    pub repo_path: PathBuf,
+    /// Whether archived workspaces should be included.
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// Response payload for `review.workspace.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReviewWorkspacesResponse {
+    /// Matching review workspaces.
+    pub workspaces: Vec<ReviewWorkspace>,
+}
+
+/// Request payload for `review.workspace.create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReviewWorkspaceRequest {
+    /// Repository path where the review workspace should be created.
+    pub repo_path: PathBuf,
+    /// Optional workspace title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Initial workspace sources.
+    #[serde(default)]
+    pub sources: Vec<ReviewSource>,
+}
+
+/// Response payload for `review.workspace.create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReviewWorkspaceResponse {
+    /// Created review workspace.
+    pub workspace: ReviewWorkspace,
+}
+
+/// Request payload for `review.workspace.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewWorkspaceRequest {
+    /// Repository path where the workspace lives.
+    pub repo_path: PathBuf,
+    /// Workspace id.
+    pub workspace_id: String,
+}
+
+/// Response payload for `review.workspace.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewWorkspaceResponse {
+    /// Requested workspace, when found.
+    pub workspace: Option<ReviewWorkspace>,
+}
+
+/// Request payload for `review.workspace.update`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateReviewWorkspaceRequest {
+    /// Repository path where the workspace lives.
+    pub repo_path: PathBuf,
+    /// Updated workspace.
+    pub workspace: ReviewWorkspace,
+}
+
+/// Response payload for `review.workspace.update`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateReviewWorkspaceResponse {
+    /// Updated workspace.
+    pub workspace: ReviewWorkspace,
+}
+
+/// Request payload for `review.workspace.archive`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReviewWorkspaceRequest {
+    /// Repository path where the workspace lives.
+    pub repo_path: PathBuf,
+    /// Workspace id.
+    pub workspace_id: String,
+}
+
+/// Response payload for `review.workspace.archive`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReviewWorkspaceResponse {
+    /// Whether a workspace was archived.
+    pub archived: bool,
 }
 
 /// Request payload for `draft.list`.

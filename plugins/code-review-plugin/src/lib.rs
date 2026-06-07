@@ -5,14 +5,20 @@
 //! Bundled local Git code review plugin for Bcode.
 
 use bcode_code_review_models::{
-    DeleteDraftRequest, DeleteDraftResponse, DraftAnchor, DraftComment, GetReviewDiffRequest,
-    GetReviewThreadRequest, LinkThreadSessionRequest, LinkThreadSessionResponse, ListDraftsRequest,
-    ListDraftsResponse, ListReviewPublishersResponse, OP_REVIEW_REPO_FILE_GET,
-    PublishReviewPreviewResponse, PublishReviewRequest, PublishReviewResponse,
-    RepositoryFileRequest, RepositoryFileResponse, ReviewBundle, ReviewBundleLine,
-    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
-    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublisherCapabilities, ReviewPublisherManifest,
-    ReviewTarget, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse,
+    ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,
+    CreateReviewWorkspaceResponse, DeleteDraftRequest, DeleteDraftResponse, DraftAnchor,
+    DraftComment, GetReviewDiffRequest, GetReviewThreadRequest, GetReviewWorkspaceRequest,
+    GetReviewWorkspaceResponse, LinkThreadSessionRequest, LinkThreadSessionResponse,
+    ListDraftsRequest, ListDraftsResponse, ListReviewPublishersResponse,
+    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_REPO_FILE_GET,
+    OP_REVIEW_WORKSPACE_ARCHIVE, OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET,
+    OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse,
+    PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
+    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
+    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
+    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewSource, ReviewTarget,
+    ReviewWorkspace, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse,
+    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -123,6 +129,11 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_DIFF_GET => review_diff_get(&context),
             OP_REVIEW_BUNDLE_GET => review_bundle_get(&context),
             OP_REVIEW_REPO_FILE_GET => review_repo_file_get(&context.request),
+            OP_REVIEW_WORKSPACE_LIST => review_workspace_list(&context),
+            OP_REVIEW_WORKSPACE_CREATE => review_workspace_create(&context),
+            OP_REVIEW_WORKSPACE_GET => review_workspace_get(&context),
+            OP_REVIEW_WORKSPACE_UPDATE => review_workspace_update(&context),
+            OP_REVIEW_WORKSPACE_ARCHIVE => review_workspace_archive(&context),
             OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
             OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
             OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
@@ -260,6 +271,93 @@ fn review_repo_file_get(request: &ServiceRequest) -> ServiceResponse {
     match repository_file_get(&request) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("repo_file_get_failed", error.to_string()),
+    }
+}
+
+fn review_workspace_list(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<ListReviewWorkspacesRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match list_review_workspaces_for_request(&request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("workspace_list_failed", error.to_string()),
+    }
+}
+
+fn review_workspace_create(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<CreateReviewWorkspaceRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match create_review_workspace_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("workspace_create_failed", error.to_string()),
+    }
+}
+
+fn review_workspace_get(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<GetReviewWorkspaceRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match get_review_workspace_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("workspace_get_failed", error.to_string()),
+    }
+}
+
+fn review_workspace_update(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<UpdateReviewWorkspaceRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match update_review_workspace_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("workspace_update_failed", error.to_string()),
+    }
+}
+
+fn review_workspace_archive(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<ArchiveReviewWorkspaceRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match archive_review_workspace_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("workspace_archive_failed", error.to_string()),
     }
 }
 
@@ -919,6 +1017,96 @@ fn safe_review_id(review_id: &str) -> String {
         .collect()
 }
 
+fn list_review_workspaces_for_request(
+    request: &ListReviewWorkspacesRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ListReviewWorkspacesResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let include_archived = request.include_archived;
+    let db_repo_root = repo_root.clone();
+    let workspaces = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .list_workspaces(&db_repo_root, include_archived)
+                .await
+        })
+    })?;
+    Ok(ListReviewWorkspacesResponse { workspaces })
+}
+
+fn create_review_workspace_for_request(
+    request: CreateReviewWorkspaceRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<CreateReviewWorkspaceResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let now = now_ms();
+    let title = request
+        .title
+        .unwrap_or_else(|| "Untitled review".to_string());
+    let id = workspace_id(&repo_root, &title, now);
+    let workspace = ReviewWorkspace {
+        id,
+        title,
+        repo_root: repo_root.clone(),
+        sources: request.sources,
+        created_at_ms: Some(now),
+        updated_at_ms: Some(now),
+        archived_at_ms: None,
+    };
+    let saved = workspace.clone();
+    with_database(&repo_root, config, move |database| {
+        Box::pin(async move { CodeReviewDb::new(database).save_workspace(&saved).await })
+    })?;
+    Ok(CreateReviewWorkspaceResponse { workspace })
+}
+
+fn get_review_workspace_for_request(
+    request: GetReviewWorkspaceRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<GetReviewWorkspaceResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let workspace_id = request.workspace_id;
+    let workspace = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .get_workspace(&workspace_id)
+                .await
+        })
+    })?;
+    Ok(GetReviewWorkspaceResponse { workspace })
+}
+
+fn update_review_workspace_for_request(
+    request: UpdateReviewWorkspaceRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<UpdateReviewWorkspaceResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let mut workspace = request.workspace;
+    workspace.repo_root.clone_from(&repo_root);
+    workspace.updated_at_ms = Some(now_ms());
+    let saved = workspace.clone();
+    with_database(&repo_root, config, move |database| {
+        Box::pin(async move { CodeReviewDb::new(database).save_workspace(&saved).await })
+    })?;
+    Ok(UpdateReviewWorkspaceResponse { workspace })
+}
+
+fn archive_review_workspace_for_request(
+    request: ArchiveReviewWorkspaceRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ArchiveReviewWorkspaceResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let workspace_id = request.workspace_id;
+    let archived = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .archive_workspace(&workspace_id, now_ms())
+                .await
+        })
+    })?;
+    Ok(ArchiveReviewWorkspaceResponse { archived })
+}
+
 fn list_drafts_for_request(
     request: &ListDraftsRequest,
     config: &CodeReviewPluginConfig,
@@ -1253,6 +1441,118 @@ struct CodeReviewDb<'a> {
 impl<'a> CodeReviewDb<'a> {
     const fn new(db: &'a dyn Database) -> Self {
         Self { db }
+    }
+
+    async fn list_workspaces(
+        &self,
+        repo_root: &Path,
+        include_archived: bool,
+    ) -> Result<Vec<ReviewWorkspace>, ReviewError> {
+        let rows = self
+            .db
+            .select("review_workspaces")
+            .columns(&[
+                "workspace_id",
+                "repo_root",
+                "title",
+                "sources_json",
+                "created_at_ms",
+                "updated_at_ms",
+                "archived_at_ms",
+            ])
+            .filter(Box::new(where_eq(
+                "repo_root",
+                repo_root.display().to_string(),
+            )))
+            .execute(self.db)
+            .await?;
+        let mut workspaces = Vec::new();
+        for row in rows {
+            let archived_at_ms = optional_i64(&row, "archived_at_ms").map(i64_to_u64);
+            if archived_at_ms.is_some() && !include_archived {
+                continue;
+            }
+            workspaces.push(workspace_from_row(&row)?);
+        }
+        workspaces.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        Ok(workspaces)
+    }
+
+    async fn get_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<ReviewWorkspace>, ReviewError> {
+        let Some(row) = self
+            .db
+            .select("review_workspaces")
+            .columns(&[
+                "workspace_id",
+                "repo_root",
+                "title",
+                "sources_json",
+                "created_at_ms",
+                "updated_at_ms",
+                "archived_at_ms",
+            ])
+            .filter(Box::new(where_eq("workspace_id", workspace_id)))
+            .execute_first(self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(workspace_from_row(&row)?))
+    }
+
+    async fn save_workspace(&self, workspace: &ReviewWorkspace) -> Result<(), ReviewError> {
+        let sources_json = serde_json::to_string(&workspace.sources)?;
+        if self.get_workspace(&workspace.id).await?.is_some() {
+            self.db
+                .update("review_workspaces")
+                .value("repo_root", workspace.repo_root.display().to_string())
+                .value("title", workspace.title.clone())
+                .value("sources_json", sources_json)
+                .value(
+                    "updated_at_ms",
+                    u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
+                )
+                .value("archived_at_ms", optional_u64(workspace.archived_at_ms))
+                .filter(Box::new(where_eq("workspace_id", workspace.id.clone())))
+                .execute(self.db)
+                .await?;
+            return Ok(());
+        }
+        self.db
+            .insert("review_workspaces")
+            .value("workspace_id", workspace.id.clone())
+            .value("repo_root", workspace.repo_root.display().to_string())
+            .value("title", workspace.title.clone())
+            .value("sources_json", sources_json)
+            .value(
+                "created_at_ms",
+                u64_to_i64(workspace.created_at_ms.unwrap_or_else(now_ms)),
+            )
+            .value(
+                "updated_at_ms",
+                u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
+            )
+            .value("archived_at_ms", optional_u64(workspace.archived_at_ms))
+            .execute(self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn archive_workspace(&self, workspace_id: &str, now: u64) -> Result<bool, ReviewError> {
+        if self.get_workspace(workspace_id).await?.is_none() {
+            return Ok(false);
+        }
+        self.db
+            .update("review_workspaces")
+            .value("archived_at_ms", u64_to_i64(now))
+            .value("updated_at_ms", u64_to_i64(now))
+            .filter(Box::new(where_eq("workspace_id", workspace_id.to_string())))
+            .execute(self.db)
+            .await?;
+        Ok(true)
     }
 
     async fn list_drafts(&self, review_key: &str) -> Result<Vec<DraftComment>, ReviewError> {
@@ -1627,6 +1927,25 @@ async fn run_migrations(database: &dyn Database) -> Result<(), ReviewError> {
     Ok(())
 }
 
+fn workspace_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "006_review_workspaces_table".to_string(),
+        Box::new(
+            create_table("review_workspaces")
+                .if_not_exists(true)
+                .column(text_column("workspace_id"))
+                .column(text_column("repo_root"))
+                .column(text_column("title"))
+                .column(text_column("sources_json"))
+                .column(int_column("created_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .column(nullable_int_column("archived_at_ms"))
+                .primary_key("workspace_id"),
+        ),
+        None,
+    )
+}
+
 fn code_review_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
     source.add_migration(CodeMigration::new(
@@ -1716,6 +2035,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
         )),
         None,
     ));
+    source.add_migration(workspace_table_migration());
     source
 }
 
@@ -1757,6 +2077,19 @@ fn nullable_int_column(name: &str) -> Column {
         data_type: DataType::BigInt,
         default: None,
     }
+}
+
+fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
+    let sources: Vec<ReviewSource> = serde_json::from_str(&required_text(row, "sources_json")?)?;
+    Ok(ReviewWorkspace {
+        id: required_text(row, "workspace_id")?,
+        title: required_text(row, "title")?,
+        repo_root: PathBuf::from(required_text(row, "repo_root")?),
+        sources,
+        created_at_ms: Some(i64_to_u64(required_i64(row, "created_at_ms")?)),
+        updated_at_ms: Some(i64_to_u64(required_i64(row, "updated_at_ms")?)),
+        archived_at_ms: optional_i64(row, "archived_at_ms").map(i64_to_u64),
+    })
 }
 
 fn comment_from_row(
@@ -1801,6 +2134,16 @@ fn optional_bool(row: &Row, column: &'static str) -> bool {
     row.get(column)
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+fn workspace_id(repo_root: &Path, title: &str, now: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(repo_root.display().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(title.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_string().as_bytes());
+    format!("workspace-{:x}", hasher.finalize())
 }
 
 fn review_key(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewError> {
