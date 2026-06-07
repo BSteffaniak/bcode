@@ -1,9 +1,9 @@
 //! Full-screen local code review TUI mode.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
@@ -835,6 +835,7 @@ fn handle_prompt_event(app: &mut ReviewApp, event: &Event) -> bool {
         Event::Paste(text) => {
             if let Some(prompt) = &mut app.prompt_state {
                 prompt.buffer.insert_str(text);
+                prompt.selected = 0;
                 return true;
             }
             false
@@ -855,13 +856,23 @@ fn handle_prompt_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         app.submit_prompt();
         return true;
     }
+    if matches!(stroke.key, KeyCode::Down | KeyCode::Char('j')) && stroke.modifiers.is_empty() {
+        return app.move_prompt_selection_down();
+    }
+    if matches!(stroke.key, KeyCode::Up | KeyCode::Char('k')) && stroke.modifiers.is_empty() {
+        return app.move_prompt_selection_up();
+    }
     if let Some(prompt) = &mut app.prompt_state {
+        let outcome = helpers::handle_default_text_key(
+            &mut prompt.buffer,
+            stroke,
+            TextInputEnterBehavior::Submit,
+        );
+        if matches!(outcome, TextInputKeyOutcome::Edited) {
+            prompt.selected = 0;
+        }
         return matches!(
-            helpers::handle_default_text_key(
-                &mut prompt.buffer,
-                stroke,
-                TextInputEnterBehavior::Submit,
-            ),
+            outcome,
             TextInputKeyOutcome::Edited | TextInputKeyOutcome::Submitted
         );
     }
@@ -914,6 +925,9 @@ fn handle_comment_editor_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
 
 fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
     if !stroke.modifiers.is_empty() {
+        if stroke.key == KeyCode::Char('p') && stroke.modifiers.ctrl {
+            return app.open_file_picker();
+        }
         return false;
     }
     match stroke.key {
@@ -936,12 +950,25 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('f') => app.open_file_picker(),
         KeyCode::Char(':') => app.open_jump_to_line_prompt(),
         KeyCode::Char('/') => app.open_file_search_prompt(),
-        KeyCode::Enter => app.jump_to_selected_thread(),
+        KeyCode::Char('N') => app.search_previous_match(),
+        KeyCode::Enter => {
+            if app.sidebar_mode == ReviewSidebarMode::Files && app.review.is_repository_review() {
+                app.activate_selected_tree_row()
+            } else {
+                app.jump_to_selected_thread()
+            }
+        }
         KeyCode::Char('j') | KeyCode::Down => app.move_down(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(1),
         KeyCode::Char('g') => app.scroll_to_top(),
         KeyCode::Char('G') => app.scroll_to_bottom(),
-        KeyCode::Char('n') | KeyCode::Right => app.select_next_file(),
+        KeyCode::Char('n') | KeyCode::Right => {
+            if app.has_active_search() {
+                app.search_next_match()
+            } else {
+                app.select_next_file()
+            }
+        }
         KeyCode::Char('p') | KeyCode::Left => app.select_previous_file(),
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
@@ -991,6 +1018,14 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
                         app.select_thread(index);
                         app.jump_to_selected_thread()
                     })
+            } else if app.review.is_repository_review() {
+                match app.file_tree_row_at(mouse.position.x, mouse.position.y) {
+                    Some(ReviewFileTreeRow::Directory { path, .. }) => {
+                        app.toggle_file_tree_directory(&path)
+                    }
+                    Some(ReviewFileTreeRow::File { index, .. }) => app.select_file(index),
+                    None => false,
+                }
             } else if let Some(index) = app.file_index_at(mouse.position.x, mouse.position.y) {
                 app.select_file(index)
             } else if let Some(index) = app.diff_line_index_at(mouse.position.x, mouse.position.y) {
@@ -1392,6 +1427,58 @@ impl ReviewFileCache {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchDirection {
+    Next,
+    Previous,
+}
+
+fn find_file_match(
+    file: &CachedReviewFile,
+    query: &str,
+    selected_line: usize,
+    direction: SearchDirection,
+) -> Option<usize> {
+    let len = file.line_spans.len();
+    if len == 0 {
+        return None;
+    }
+    match direction {
+        SearchDirection::Next => {
+            let start = selected_line.saturating_add(1).min(len);
+            (start..len)
+                .chain(0..start)
+                .find(|index| file.line(*index).is_some_and(|line| line.contains(query)))
+        }
+        SearchDirection::Previous => {
+            let start = selected_line.min(len.saturating_sub(1));
+            (0..=start)
+                .rev()
+                .chain((start.saturating_add(1)..len).rev())
+                .find(|index| file.line(*index).is_some_and(|line| line.contains(query)))
+        }
+    }
+}
+
+/// Sidebar file-tree row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewFileTreeRow {
+    /// Directory row.
+    Directory {
+        /// Directory path.
+        path: PathBuf,
+        /// Nesting depth.
+        depth: usize,
+    },
+    /// File row.
+    File {
+        /// File index in review files.
+        index: usize,
+        /// Nesting depth.
+        depth: usize,
+    },
 }
 
 /// Changed file displayed by the TUI.
@@ -1819,6 +1906,10 @@ pub struct ReviewApp {
     pub publish_state: Option<ReviewPublishState>,
     /// Active one-line prompt, if any.
     pub prompt_state: Option<ReviewPromptState>,
+    /// Last current-file search query.
+    pub last_search_query: Option<String>,
+    /// Expanded repository sidebar directories.
+    pub expanded_dirs: BTreeSet<PathBuf>,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -1858,6 +1949,8 @@ impl ReviewApp {
             selected_publisher: 0,
             publish_state: None,
             prompt_state: None,
+            last_search_query: None,
+            expanded_dirs: BTreeSet::new(),
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
@@ -1900,14 +1993,19 @@ impl ReviewApp {
         };
         let text = prompt.buffer.text().trim().to_string();
         match prompt.kind {
-            ReviewPromptKind::FilePicker => self.submit_file_picker(&text),
+            ReviewPromptKind::FilePicker => self.submit_file_picker(&text, prompt.selected),
             ReviewPromptKind::JumpToLine => self.submit_jump_to_line(&text),
             ReviewPromptKind::FileSearch => self.submit_file_search(&text),
         }
     }
 
-    fn submit_file_picker(&mut self, query: &str) -> bool {
-        let Some(index) = self.file_picker_matches(query).first().copied() else {
+    fn submit_file_picker(&mut self, query: &str, selected: usize) -> bool {
+        let matches = self.file_picker_matches(query);
+        let Some(index) = matches
+            .get(selected)
+            .copied()
+            .or_else(|| matches.first().copied())
+        else {
             self.status_message = Some(format!("no file matches `{query}`"));
             return true;
         };
@@ -1941,17 +2039,89 @@ impl ReviewApp {
             self.status_message = Some("current file is not loaded".to_string());
             return true;
         };
-        let start = self.selected_diff_line.saturating_add(1);
-        let next = (start..cached.line_spans.len())
-            .chain(0..start.min(cached.line_spans.len()))
-            .find(|index| cached.line(*index).is_some_and(|line| line.contains(query)));
+        let next = find_file_match(
+            cached,
+            query,
+            self.selected_diff_line,
+            SearchDirection::Next,
+        );
         match next {
+            Some(index) => {
+                self.last_search_query = Some(query.to_string());
+                self.select_diff_line(index);
+                self.status_message = Some(format!("found `{query}`"));
+            }
+            None => self.status_message = Some(format!("no match for `{query}`")),
+        }
+        true
+    }
+
+    /// Return true when file search has an active query.
+    #[must_use]
+    pub const fn has_active_search(&self) -> bool {
+        self.last_search_query.is_some()
+    }
+
+    /// Jump to next current-file search match.
+    pub fn search_next_match(&mut self) -> bool {
+        self.search_match(SearchDirection::Next)
+    }
+
+    /// Jump to previous current-file search match.
+    pub fn search_previous_match(&mut self) -> bool {
+        self.search_match(SearchDirection::Previous)
+    }
+
+    fn search_match(&mut self, direction: SearchDirection) -> bool {
+        let Some(query) = self.last_search_query.clone() else {
+            self.status_message = Some("no active search; press / first".to_string());
+            return true;
+        };
+        let Some(file) = self.selected_file_data() else {
+            return false;
+        };
+        let Some(cached) = self.file_cache.get(file.display_path()) else {
+            self.status_message = Some("current file is not loaded".to_string());
+            return true;
+        };
+        match find_file_match(cached, &query, self.selected_diff_line, direction) {
             Some(index) => {
                 self.select_diff_line(index);
                 self.status_message = Some(format!("found `{query}`"));
             }
             None => self.status_message = Some(format!("no match for `{query}`")),
         }
+        true
+    }
+
+    /// Move prompt selected row down.
+    pub fn move_prompt_selection_down(&mut self) -> bool {
+        let Some(prompt) = &self.prompt_state else {
+            return false;
+        };
+        if prompt.kind != ReviewPromptKind::FilePicker {
+            return false;
+        }
+        let max = self
+            .file_picker_matches(prompt.buffer.text())
+            .len()
+            .saturating_sub(1);
+        let Some(prompt) = &mut self.prompt_state else {
+            return false;
+        };
+        prompt.selected = prompt.selected.saturating_add(1).min(max);
+        true
+    }
+
+    /// Move prompt selected row up.
+    pub fn move_prompt_selection_up(&mut self) -> bool {
+        let Some(prompt) = &mut self.prompt_state else {
+            return false;
+        };
+        if prompt.kind != ReviewPromptKind::FilePicker {
+            return false;
+        }
+        prompt.selected = prompt.selected.saturating_sub(1);
         true
     }
 
@@ -1969,6 +2139,75 @@ impl ReviewApp {
             })
             .take(12)
             .collect()
+    }
+
+    /// Return visible file-tree rows for repository review.
+    #[must_use]
+    pub fn file_tree_rows(&self) -> Vec<ReviewFileTreeRow> {
+        let mut rows = Vec::new();
+        self.push_tree_rows(Path::new(""), 0, &mut rows);
+        rows
+    }
+
+    fn push_tree_rows(&self, prefix: &Path, depth: usize, rows: &mut Vec<ReviewFileTreeRow>) {
+        let mut dirs = BTreeSet::new();
+        let mut files = Vec::new();
+        for (index, file) in self.review.files.iter().enumerate() {
+            let path = Path::new(file.display_path());
+            let rest = if prefix.as_os_str().is_empty() {
+                path
+            } else if let Ok(rest) = path.strip_prefix(prefix) {
+                rest
+            } else {
+                continue;
+            };
+            let mut components = rest.components();
+            let Some(first) = components.next() else {
+                continue;
+            };
+            if components.next().is_some() {
+                dirs.insert(prefix.join(first.as_os_str()));
+            } else {
+                files.push(index);
+            }
+        }
+        for dir in dirs {
+            rows.push(ReviewFileTreeRow::Directory {
+                path: dir.clone(),
+                depth,
+            });
+            if self.expanded_dirs.contains(&dir) {
+                self.push_tree_rows(&dir, depth.saturating_add(1), rows);
+            }
+        }
+        for index in files {
+            rows.push(ReviewFileTreeRow::File { index, depth });
+        }
+    }
+
+    /// Activate the selected repository tree row.
+    pub fn activate_selected_tree_row(&mut self) -> bool {
+        let rows = self.file_tree_rows();
+        let selected_row = rows
+            .iter()
+            .position(|row| matches!(row, ReviewFileTreeRow::File { index, .. } if *index == self.selected_file))
+            .unwrap_or(0);
+        match rows.get(selected_row).cloned() {
+            Some(ReviewFileTreeRow::Directory { path, .. }) => {
+                self.toggle_file_tree_directory(&path)
+            }
+            Some(ReviewFileTreeRow::File { index, .. }) => self.select_file(index),
+            None => false,
+        }
+    }
+
+    /// Toggle a directory in the repository sidebar.
+    pub fn toggle_file_tree_directory(&mut self, path: &Path) -> bool {
+        if self.expanded_dirs.remove(path) {
+            return true;
+        }
+        self.expanded_dirs.insert(path.to_path_buf());
+        true
     }
 
     /// Store the current file hit area.
@@ -2098,6 +2337,7 @@ impl ReviewApp {
         self.range_selection_start = None;
         self.sidebar_mode = ReviewSidebarMode::Files;
         self.queue_selected_file_load();
+        self.expand_selected_file_dirs();
         true
     }
 
@@ -2109,6 +2349,24 @@ impl ReviewApp {
     /// Store a lazily loaded repository file.
     pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
         self.file_cache.insert(file);
+    }
+
+    /// Expand ancestor directories for the selected file.
+    pub fn expand_selected_file_dirs(&mut self) {
+        let Some(path) = self
+            .selected_file_data()
+            .map(|file| file.display_path().to_string())
+        else {
+            return;
+        };
+        let path = Path::new(&path);
+        let mut prefix = PathBuf::new();
+        if let Some(parent) = path.parent() {
+            for component in parent.components() {
+                prefix.push(component.as_os_str());
+                self.expanded_dirs.insert(prefix.clone());
+            }
+        }
     }
 
     /// Queue selected repository file for loading when needed.
@@ -2254,6 +2512,17 @@ impl ReviewApp {
     pub fn file_area_contains(&self, x: u16, y: u16) -> bool {
         self.last_file_area
             .is_some_and(|area| x >= area.x && x < area.right() && y >= area.y && y < area.bottom())
+    }
+
+    /// Return visible file tree row under terminal coordinates.
+    #[must_use]
+    pub fn file_tree_row_at(&self, x: u16, y: u16) -> Option<ReviewFileTreeRow> {
+        let area = self.last_file_area?;
+        if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+            return None;
+        }
+        let index = self.file_scroll + usize::from(y.saturating_sub(area.y));
+        self.file_tree_rows().get(index).cloned()
     }
 
     /// Return visible file index under terminal coordinates.

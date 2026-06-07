@@ -182,6 +182,10 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     }
     let visible_rows = usize::from(area.height);
+    if app.review.is_repository_review() {
+        render_file_tree(app, area, frame, visible_rows);
+        return;
+    }
     if app.selected_file < app.file_scroll {
         app.file_scroll = app.selected_file;
     }
@@ -207,6 +211,104 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             );
         }
     }
+}
+
+fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visible_rows: usize) {
+    let rows = app.file_tree_rows();
+    let selected_row = rows
+        .iter()
+        .position(|row| matches!(row, super::code_review::ReviewFileTreeRow::File { index, .. } if *index == app.selected_file))
+        .unwrap_or(0);
+    if selected_row < app.file_scroll {
+        app.file_scroll = selected_row;
+    }
+    if selected_row >= app.file_scroll.saturating_add(visible_rows) {
+        app.file_scroll = selected_row.saturating_sub(visible_rows.saturating_sub(1));
+    }
+    for row in 0..visible_rows {
+        let y = area
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        let index = app.file_scroll.saturating_add(row);
+        let line_area = Rect::new(area.x, y, area.width, 1);
+        let Some(tree_row) = rows.get(index) else {
+            continue;
+        };
+        match tree_row {
+            super::code_review::ReviewFileTreeRow::Directory { path, depth } => {
+                let selected = index == selected_row;
+                let style = if selected {
+                    Style::new().fg(Color::Black).bg(Color::White)
+                } else {
+                    Style::new().fg(Color::Cyan).bg(Color::Black)
+                };
+                let expanded = if app.expanded_dirs.contains(path) {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_else(|| path.to_str().unwrap_or_default());
+                let text = format!(" {}{expanded} {name}/", "  ".repeat(*depth));
+                frame.write_line_with_fallback_style(
+                    line_area,
+                    &Line::from_spans(vec![Span::styled(
+                        truncate_to_display_width(&text, usize::from(area.width)),
+                        style,
+                    )]),
+                    style,
+                );
+            }
+            super::code_review::ReviewFileTreeRow::File { index, depth } => {
+                if let Some(file) = app.review.files.get(*index) {
+                    render_file_tree_file_row(
+                        file,
+                        *index == app.selected_file,
+                        app.draft_comment_count_for_file(*index),
+                        *depth,
+                        line_area,
+                        frame,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn render_file_tree_file_row(
+    file: &ReviewFile,
+    selected: bool,
+    draft_comments: usize,
+    depth: usize,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let style = if selected {
+        Style::new().fg(Color::Black).bg(Color::White)
+    } else {
+        Style::new().fg(Color::White).bg(Color::Black)
+    };
+    let path = std::path::Path::new(file.display_path());
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| file.display_path());
+    let comments = if draft_comments == 0 {
+        String::new()
+    } else {
+        format!(" 💬{draft_comments}")
+    };
+    let text = format!(" {}  {name}{comments}", "  ".repeat(depth));
+    frame.write_line_with_fallback_style(
+        area,
+        &Line::from_spans(vec![Span::styled(
+            truncate_to_display_width(&text, usize::from(area.width)),
+            style,
+        )]),
+        style,
+    );
 }
 
 fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
