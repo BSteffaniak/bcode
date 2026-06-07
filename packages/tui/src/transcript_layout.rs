@@ -45,6 +45,20 @@ pub struct VisibleTranscriptLine {
     source: VisibleTranscriptSource,
 }
 
+impl VisibleTranscriptLine {
+    /// Return the cached entry index for this row.
+    #[must_use]
+    pub const fn entry_index(self) -> usize {
+        self.entry_index
+    }
+
+    /// Return the cached entry source for this row.
+    #[must_use]
+    pub const fn source(self) -> VisibleTranscriptSource {
+        self.source
+    }
+}
+
 /// Cached transcript entry source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisibleTranscriptSource {
@@ -140,6 +154,25 @@ impl TranscriptLayoutCache {
     #[must_use]
     pub fn line(&self, visible: VisibleTranscriptLine) -> Option<&Line> {
         self.entries.line(&RetainedSectionedListLine::from(visible))
+    }
+
+    /// Return visible cached row metadata for one global row index.
+    #[must_use]
+    pub fn line_at_row(&self, row: usize) -> Option<VisibleTranscriptLine> {
+        self.visible_lines_from_top(row, 1).into_iter().next()
+    }
+
+    /// Return whether a distinct cached transcript entry starts at or after `row`.
+    #[must_use]
+    pub fn entry_starts_at_or_after_row(&self, row: usize) -> bool {
+        (row..self.total_rows()).any(|candidate| self.entry_starts_at_row(candidate))
+    }
+
+    /// Return whether a distinct cached transcript entry starts at `row`.
+    #[must_use]
+    pub fn entry_starts_at_row(&self, row: usize) -> bool {
+        self.line_at_row(row)
+            .is_some_and(|line| line.row_in_entry == 0)
     }
 
     /// Return the global start row for a cached transcript entry.

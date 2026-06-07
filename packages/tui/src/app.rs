@@ -640,12 +640,16 @@ impl BmuxApp {
         self.viewport.bottom_overscroll()
     }
 
-    /// Return whether there is newer transcript content below the viewport.
+    /// Return whether there is a newer transcript entry fully below the viewport.
     #[must_use]
     pub fn newer_transcript_content_below(&self) -> bool {
-        self.viewport
-            .bottom_row(self.transcript_layout.total_rows())
-            < self.transcript_layout.total_rows()
+        let total_rows = self.transcript_layout.total_rows();
+        let viewport_bottom = self.viewport.bottom_row(total_rows);
+        if viewport_bottom >= total_rows {
+            return false;
+        }
+        self.transcript_layout
+            .entry_starts_at_or_after_row(viewport_bottom)
     }
 
     /// Return the most recent time hidden transcript content changed.

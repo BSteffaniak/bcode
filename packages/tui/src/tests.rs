@@ -589,8 +589,8 @@ fn status_line_includes_scroll_offset_when_scrolled() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(app.scroll_offset(), 2);
-    assert!(rendered_text(&buffer).contains("2 rows from bottom"));
+    assert_eq!(app.scroll_offset(), 1);
+    assert!(rendered_text(&buffer).contains("1 rows from bottom"));
 }
 
 #[test]
@@ -1766,6 +1766,60 @@ fn scroll_up_requests_older_history_only_after_top() {
 
     assert!(app.scroll_transcript_up(usize::MAX / 2));
     assert!(app.should_load_older_history());
+}
+
+#[test]
+fn latest_bar_ignores_hidden_continuation_of_visible_message() {
+    let session_id = SessionId::new();
+    let long_message = (0..30)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let history = [event(
+        session_id,
+        0,
+        SessionEventKind::AssistantMessage { text: long_message },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(app.scroll_transcript_up(usize::MAX / 2));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(!app.newer_transcript_content_below());
+    assert!(!rendered_text(&buffer).contains("New messages below"));
+}
+
+#[test]
+fn latest_bar_shows_for_distinct_hidden_entry_below_visible_message() {
+    let session_id = SessionId::new();
+    let history = (0..20)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(app.scroll_transcript_up(4));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert!(app.newer_transcript_content_below());
+    assert!(rendered_text(&buffer).contains("New messages below"));
 }
 
 #[test]
