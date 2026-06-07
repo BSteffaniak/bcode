@@ -99,7 +99,7 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         format!("  💬 {drafts} draft")
     };
     let text = if app.ux_mode == super::code_review::ReviewUxMode::Build {
-        let workspace = app.review.workspace();
+        let workspace = &app.workspace;
         format!(
             " bcode review build  {}  {} included source(s)  {} file(s) ",
             workspace.title,
@@ -181,7 +181,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 });
             }
             if app.ux_mode == super::code_review::ReviewUxMode::Build {
-                return " build mode  sources are included review inputs  m review mode  f picker  enter inspect/open  t threads  b sidebar  ? help  q exit ".to_string();
+                return " build mode  j/k move  + add selected file  - remove selected source  m review mode  f picker  enter inspect/open  t threads  b sidebar  ? help  q exit ".to_string();
             }
             if app.review.is_repository_review() {
                 return format!(
@@ -471,42 +471,64 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let workspace = app.review.workspace();
+    let workspace = &app.workspace;
     let surfaces = app.review.surfaces();
-    let mut lines = Vec::new();
-    lines.push(format!("Review workspace: {}", workspace.title));
-    lines.push(String::new());
-    lines.push("Included sources".to_string());
+    let mut rows = Vec::new();
+    rows.push((
+        "Review workspace".to_string(),
+        format!(": {}", workspace.title),
+        false,
+    ));
+    rows.push((String::new(), String::new(), false));
+    rows.push(("Included sources".to_string(), String::new(), false));
     for source in &workspace.sources {
         let marker = if source.included { "✓" } else { " " };
-        lines.push(format!("  [{marker}] {}", source.label));
+        rows.push((format!("  [{marker}]"), source.label.clone(), true));
     }
-    lines.push(String::new());
-    lines.push("Review surfaces".to_string());
-    for surface in surfaces
-        .iter()
-        .take(usize::from(area.height).saturating_sub(lines.len()))
-    {
+    rows.push((String::new(), String::new(), false));
+    rows.push(("Review surfaces".to_string(), String::new(), false));
+    for surface in &surfaces {
         let kind = match surface.kind {
             ReviewSurfaceKind::Diff => "diff",
             ReviewSurfaceKind::File => "file",
         };
-        lines.push(format!("  {kind:4}  {}", surface.path));
+        rows.push((format!("  {kind:4}"), surface.path.clone(), true));
     }
-    lines.push(String::new());
-    lines.push(
-        "Next: add/remove sources here, while Repo browsing remains always available.".to_string(),
-    );
-    for (row, text) in lines.into_iter().take(usize::from(area.height)).enumerate() {
+    rows.push((String::new(), String::new(), false));
+    rows.push((
+        "+ add selected file   - remove selected source   m review mode".to_string(),
+        String::new(),
+        false,
+    ));
+
+    let mut selectable_index = 0usize;
+    for (row, (prefix, text, selectable)) in
+        rows.into_iter().take(usize::from(area.height)).enumerate()
+    {
+        let selected = selectable && selectable_index == app.selected_build_row;
+        if selectable {
+            selectable_index = selectable_index.saturating_add(1);
+        }
+        let style = if selected {
+            Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::new().fg(Color::White).bg(Color::Black)
+        };
+        let line = if text.is_empty() {
+            prefix
+        } else {
+            format!("{prefix} {text}")
+        };
         let y = area
             .y
             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        frame.write_line(
+        frame.write_line_with_fallback_style(
             Rect::new(area.x, y, area.width, 1),
             &Line::from_spans(vec![Span::styled(
-                truncate_to_display_width(&text, usize::from(area.width)),
-                Style::new().fg(Color::White).bg(Color::Black),
+                truncate_to_display_width(&line, usize::from(area.width)),
+                style,
             )]),
+            style,
         );
     }
 }
@@ -750,6 +772,9 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " Build Review Help",
         "",
         " m                   switch to review mode",
+        " j/k or arrows       move selection",
+        " +                   add selected file source",
+        " -                   remove selected source",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",
         " t                   toggle files/threads sidebar",

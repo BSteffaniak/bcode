@@ -10,7 +10,8 @@ use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
-    REVIEW_PUBLISHER_INTERFACE_ID, ReviewSurface, ReviewSurfaceKind, ReviewWorkspace,
+    REVIEW_PUBLISHER_INTERFACE_ID, ReviewSource, ReviewSourceKind, ReviewSurface,
+    ReviewSurfaceKind, ReviewWorkspace,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
@@ -947,6 +948,8 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             true
         }
         KeyCode::Char('m') => app.toggle_ux_mode(),
+        KeyCode::Char('+') => app.add_selected_file_to_workspace(),
+        KeyCode::Char('-') => app.remove_selected_build_source(),
         KeyCode::Char('t') => app.toggle_sidebar_mode(),
         KeyCode::Char('f') => app.open_file_picker(),
         KeyCode::Char(':') => app.open_jump_to_line_prompt(),
@@ -1939,6 +1942,8 @@ pub enum ReviewPublishState {
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ReviewApp {
+    /// Workspace that owns this review session.
+    pub workspace: ReviewWorkspace,
     /// Review data.
     pub review: ReviewSummary,
     /// Current review UX mode.
@@ -1995,6 +2000,8 @@ pub struct ReviewApp {
     pub expanded_dirs: BTreeSet<PathBuf>,
     /// Selected repository file-tree row.
     pub selected_tree_row: usize,
+    /// Active build-mode row.
+    pub selected_build_row: usize,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -2009,7 +2016,9 @@ impl ReviewApp {
     /// Create a new review app.
     #[must_use]
     pub fn new(review: ReviewSummary) -> Self {
+        let workspace = review.workspace();
         Self {
+            workspace,
             review,
             ux_mode: ReviewUxMode::Review,
             selected_file: 0,
@@ -2038,6 +2047,7 @@ impl ReviewApp {
             last_search_query: None,
             expanded_dirs: BTreeSet::new(),
             selected_tree_row: 0,
+            selected_build_row: 0,
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
@@ -2338,7 +2348,9 @@ impl ReviewApp {
 
     /// Move the active selection down.
     pub fn move_down(&mut self, rows: usize) -> bool {
-        if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
+        if self.ux_mode == ReviewUxMode::Build {
+            self.select_next_build_row(rows)
+        } else if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
             self.select_next_thread(rows)
         } else if self.review.is_repository_review()
             && self.sidebar_mode == ReviewSidebarMode::Files
@@ -2352,7 +2364,9 @@ impl ReviewApp {
 
     /// Move the active selection up.
     pub fn move_up(&mut self, rows: usize) -> bool {
-        if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
+        if self.ux_mode == ReviewUxMode::Build {
+            self.select_previous_build_row(rows)
+        } else if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
             self.select_previous_thread(rows)
         } else if self.review.is_repository_review()
             && self.sidebar_mode == ReviewSidebarMode::Files
@@ -2362,6 +2376,79 @@ impl ReviewApp {
         } else {
             self.scroll_up(rows)
         }
+    }
+
+    /// Return number of rows in build mode.
+    #[must_use]
+    pub const fn build_row_count(&self) -> usize {
+        self.workspace
+            .sources
+            .len()
+            .saturating_add(self.review.files.len())
+    }
+
+    /// Select next build row.
+    pub fn select_next_build_row(&mut self, rows: usize) -> bool {
+        let max = self.build_row_count().saturating_sub(1);
+        let next = self.selected_build_row.saturating_add(rows).min(max);
+        if next == self.selected_build_row {
+            return false;
+        }
+        self.selected_build_row = next;
+        true
+    }
+
+    /// Select previous build row.
+    pub const fn select_previous_build_row(&mut self, rows: usize) -> bool {
+        let next = self.selected_build_row.saturating_sub(rows);
+        if next == self.selected_build_row {
+            return false;
+        }
+        self.selected_build_row = next;
+        true
+    }
+
+    /// Add the selected file as an included workspace source.
+    pub fn add_selected_file_to_workspace(&mut self) -> bool {
+        let Some(path) = self
+            .selected_file_data()
+            .map(|file| file.display_path().to_string())
+        else {
+            return false;
+        };
+        if self.workspace.sources.iter().any(|source| {
+            matches!(&source.kind, ReviewSourceKind::File { path: source_path } if source_path == &path)
+        }) {
+            self.status_message = Some(format!("{path} is already included"));
+            return true;
+        }
+        let source_id = format!("source-{}", self.workspace.sources.len().saturating_add(1));
+        let kind = ReviewSourceKind::File { path: path.clone() };
+        self.workspace.sources.push(ReviewSource {
+            id: source_id,
+            label: kind.label(),
+            kind,
+            included: true,
+        });
+        self.status_message = Some(format!("added {path} to review workspace"));
+        true
+    }
+
+    /// Remove selected build source from the workspace.
+    pub fn remove_selected_build_source(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.selected_build_row >= self.workspace.sources.len() {
+            self.status_message = Some("select an included source to remove".to_string());
+            return true;
+        }
+        let source = self.workspace.sources.remove(self.selected_build_row);
+        self.selected_build_row = self
+            .selected_build_row
+            .min(self.build_row_count().saturating_sub(1));
+        self.status_message = Some(format!("removed {}", source.label));
+        true
     }
 
     /// Select next repository tree row.
