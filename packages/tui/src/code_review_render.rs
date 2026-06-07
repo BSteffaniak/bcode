@@ -622,6 +622,10 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
+    if selected_surface_kind(app) == Some(ReviewSurfaceKind::File) {
+        render_materialized_file_surface(app, area, frame);
+        return;
+    }
     if app.review.is_repository_review() {
         render_repository_file(app, area, frame);
         return;
@@ -680,6 +684,80 @@ fn render_empty(area: Rect, text: &str, frame: &mut Frame<'_>) {
             Style::new().fg(Color::BrightBlack),
         )]),
     );
+}
+
+fn selected_surface_kind(app: &ReviewApp) -> Option<ReviewSurfaceKind> {
+    app.review
+        .surfaces()
+        .get(app.selected_file)
+        .map(|surface| surface.kind)
+}
+
+fn render_materialized_file_surface(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some(file) = app.selected_file_data() else {
+        render_empty(area, "No file surface", frame);
+        return;
+    };
+    if file.is_binary {
+        render_empty(area, "Binary file content not available", frame);
+        return;
+    }
+    let rows = file_surface_rows(file);
+    if rows.is_empty() {
+        render_empty(area, "No file content", frame);
+        return;
+    }
+    let visible = usize::from(area.height);
+    for row in 0..visible {
+        let index = app.diff_scroll.saturating_add(row);
+        let y = area
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        if y >= area.bottom() {
+            break;
+        }
+        let Some((line_number, content)) = rows.get(index) else {
+            break;
+        };
+        let mut style = if index == app.selected_diff_line {
+            Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else if app.is_row_in_range_selection(app.selected_file, index) {
+            Style::new().fg(Color::White).bg(Color::Blue)
+        } else if app.has_draft_comment_at(app.selected_file, index) {
+            Style::new().fg(Color::White).bg(Color::BrightBlack)
+        } else {
+            Style::new()
+        };
+        let line_number =
+            line_number.map_or_else(|| "      ".to_string(), |number| format!("{number:>5} "));
+        let mut line = Line::from_spans(vec![
+            Span::styled(line_number, Style::new().fg(Color::BrightBlack)),
+            Span::styled(content.clone(), style),
+        ]);
+        if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
+            line.spans
+                .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
+            style = style.bg(style.bg.unwrap_or(Color::BrightBlack));
+        }
+        frame.write_line_with_fallback_style(Rect::new(area.x, y, area.width, 1), &line, style);
+    }
+}
+
+fn file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, String)> {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| {
+            let heading = hunk
+                .heading
+                .iter()
+                .map(|heading| (None, format!("# {heading}")));
+            heading.chain(
+                hunk.lines
+                    .iter()
+                    .map(|line| (line.new_line.or(line.old_line), line.content.clone())),
+            )
+        })
+        .collect()
 }
 
 fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
