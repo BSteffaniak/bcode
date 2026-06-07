@@ -1118,6 +1118,7 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn auth_status() -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let selection = config.resolved_model_selection();
@@ -1157,6 +1158,61 @@ fn auth_status() -> Result<(), CliError> {
             println!("  {key}: {}", format_provider_request_value(value));
         }
     }
+    println!("Auth vault security:");
+    let policy = bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
+    let vault_path = auth_profile
+        .settings
+        .get("vault")
+        .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
+    let storage_profile = auth_profile
+        .settings
+        .get("profile")
+        .map_or(auth_profile_name.as_str(), String::as_str);
+    let security_status = bcode_provider_auth::security::inspect_auth_vault_security(
+        &vault_path,
+        storage_profile,
+        policy,
+    );
+    println!("  Vault: {}", security_status.vault_path.display());
+    println!("  Vault exists: {}", security_status.vault_exists);
+    match security_status.vault_version {
+        Some(version) => println!("  Vault format: v{version}"),
+        None => println!("  Vault format: unknown"),
+    }
+    println!(
+        "  Profile: {} ({})",
+        security_status.profile,
+        if security_status.profile_exists {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  Profile keys: {}",
+        if security_status.profile_keys_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("  Configured device_seal: {policy:?}");
+    println!(
+        "  Profile device seal: {}",
+        if security_status.profile_device_sealed {
+            "enabled"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  Policy status: {}",
+        if security_status.policy_satisfied {
+            "satisfied"
+        } else {
+            "not satisfied"
+        }
+    );
     if resolved.auth.storage.is_empty() {
         println!("Credentials: no mapped credentials");
     } else {
@@ -1171,8 +1227,19 @@ fn auth_status() -> Result<(), CliError> {
             );
         }
     }
-    if !resolved.auth.diagnostics.is_empty() {
+    if !security_status.diagnostics.is_empty() || !resolved.auth.diagnostics.is_empty() {
         println!("Auth security diagnostics:");
+        for diagnostic in &security_status.diagnostics {
+            println!(
+                "  {} [{}]: {}",
+                diagnostic.severity.as_str(),
+                diagnostic.code,
+                diagnostic.message
+            );
+            if let Some(remediation) = &diagnostic.remediation {
+                println!("    remediation: {remediation}");
+            }
+        }
         for diagnostic in &resolved.auth.diagnostics {
             println!(
                 "  {} [{}]: {}",

@@ -84,8 +84,117 @@ pub struct AuthSecurityReconcileReport {
     pub diagnostics: Vec<AuthSecurityDiagnostic>,
 }
 
+/// Read-only auth vault security status.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSecurityStatus {
+    /// Vault path inspected.
+    pub vault_path: PathBuf,
+    /// Auth profile inspected inside the vault.
+    pub profile: String,
+    /// Configured device-seal policy.
+    pub policy: AuthDeviceSealPolicy,
+    /// Whether the vault file exists.
+    pub vault_exists: bool,
+    /// Vault format version when readable.
+    #[serde(default)]
+    pub vault_version: Option<u8>,
+    /// Whether profile-key mode is enabled.
+    pub profile_keys_enabled: bool,
+    /// Whether the named profile exists in plaintext or profile-entry form.
+    pub profile_exists: bool,
+    /// Whether the profile policy requires device seal.
+    pub profile_device_sealed: bool,
+    /// Whether the current config policy is satisfied by this vault state.
+    pub policy_satisfied: bool,
+    /// Structured diagnostics for this status.
+    pub diagnostics: Vec<AuthSecurityDiagnostic>,
+}
+
+/// Inspect auth vault security state without mutating the vault.
+#[must_use]
+pub fn inspect_auth_vault_security(
+    vault_path: &Path,
+    profile: &str,
+    policy: AuthDeviceSealPolicy,
+) -> AuthSecurityStatus {
+    let mut status = AuthSecurityStatus {
+        vault_path: vault_path.to_path_buf(),
+        profile: profile.to_string(),
+        policy,
+        vault_exists: vault_path.exists(),
+        vault_version: None,
+        profile_keys_enabled: false,
+        profile_exists: false,
+        profile_device_sealed: false,
+        policy_satisfied: policy != AuthDeviceSealPolicy::Required,
+        diagnostics: Vec::new(),
+    };
+    if !status.vault_exists {
+        status.diagnostics.push(AuthSecurityDiagnostic::warning(
+            "auth_vault_missing",
+            format!("Auth vault does not exist: {}", vault_path.display()),
+            "Run `bcode login` for the selected provider.",
+        ));
+        return status;
+    }
+
+    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(
+        vault_path.to_path_buf(),
+    ));
+    let Ok((vault, _data_key)) = store.load_and_unlock() else {
+        status.diagnostics.push(AuthSecurityDiagnostic::warning(
+            "auth_vault_unlock_failed",
+            format!("Auth vault could not be unlocked: {}", vault_path.display()),
+            "Ensure the SSH identity used for this vault is available, then retry.",
+        ));
+        return status;
+    };
+
+    status.vault_version = Some(vault.header.version);
+    status.profile_keys_enabled = vault.profile_keys_enabled();
+    status.profile_exists = vault.profiles.profiles.contains_key(profile)
+        || vault.profiles.profile_entries.contains_key(profile);
+    status.profile_device_sealed = profile_has_device_seal(&vault, profile);
+    status.policy_satisfied = match policy {
+        AuthDeviceSealPolicy::Off | AuthDeviceSealPolicy::Preferred => true,
+        AuthDeviceSealPolicy::Required => status.profile_device_sealed,
+    };
+
+    if !status.profile_exists {
+        status.diagnostics.push(AuthSecurityDiagnostic::warning(
+            "auth_vault_profile_missing",
+            format!("Auth vault profile {profile} does not exist."),
+            "Run `bcode login` for this auth profile.",
+        ));
+    } else if policy != AuthDeviceSealPolicy::Off && !status.profile_device_sealed {
+        let severity = if policy == AuthDeviceSealPolicy::Required {
+            AuthSecurityDiagnosticSeverity::Error
+        } else {
+            AuthSecurityDiagnosticSeverity::Warning
+        };
+        status.diagnostics.push(AuthSecurityDiagnostic {
+            severity,
+            code: "auth_vault_device_seal_missing".to_string(),
+            message: format!("Auth vault profile {profile} is not device-sealed."),
+            remediation: Some(
+                "Add settings.recipient_key for the auth profile if migration is needed, then run `bcode auth status` or `bcode login`.".to_string(),
+            ),
+        });
+    } else if policy == AuthDeviceSealPolicy::Off && status.profile_device_sealed {
+        status.diagnostics.push(AuthSecurityDiagnostic::info(
+            "auth_vault_stronger_than_config",
+            format!(
+                "Auth vault profile {profile} is device-sealed even though config sets device_seal=off; stronger vault policy is unchanged."
+            ),
+        ));
+    }
+
+    status
+}
+
 /// Desired device-seal policy for an sshenv-backed auth profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthDeviceSealPolicy {
     /// Do not add a device seal automatically.
     Off,
