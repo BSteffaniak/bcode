@@ -1,6 +1,7 @@
 //! Full-screen local code review TUI mode.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -400,14 +401,41 @@ fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
                         .get("type")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
-                    (option_type == "string").then(|| ReviewPublishOption {
-                        name: name.clone(),
-                        label: schema
+                    (option_type == "string").then(|| {
+                        let mut label = schema
                             .get("description")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or(name)
-                            .to_string(),
-                        value: String::new(),
+                            .to_string();
+                        if schema
+                            .get("required")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            label.push_str(" [required]");
+                        }
+                        if let Some(values) =
+                            schema.get("enum").and_then(serde_json::Value::as_array)
+                        {
+                            let choices = values
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("|");
+                            if !choices.is_empty() {
+                                let _ = write!(label, " [{choices}]");
+                            }
+                        }
+                        let value = schema
+                            .get("default")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        ReviewPublishOption {
+                            name: name.clone(),
+                            label,
+                            value,
+                        }
                     })
                 })
                 .collect()

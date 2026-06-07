@@ -61,12 +61,12 @@ fn github_manifest() -> ReviewPublisherManifest {
         options_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "repository": { "type": "string", "description": "GitHub repository, owner/repo" },
-                "pull_request": { "type": "string", "description": "Pull request number" },
-                "token_env": { "type": "string", "description": "GitHub token env var, default GITHUB_TOKEN" },
-                "submit_event": { "type": "string", "description": "COMMENT, REQUEST_CHANGES, or APPROVE" },
+                "repository": { "type": "string", "description": "GitHub repository, owner/repo", "required": true },
+                "pull_request": { "type": "string", "description": "Pull request number", "required": true },
+                "token_env": { "type": "string", "description": "GitHub token env var", "default": "GITHUB_TOKEN" },
+                "submit_event": { "type": "string", "description": "GitHub review event", "default": "COMMENT", "enum": ["COMMENT", "REQUEST_CHANGES", "APPROVE"] },
                 "summary": { "type": "string", "description": "Optional review summary body" },
-                "fallback_unmapped_to_summary": { "type": "string", "description": "Set to true to include unmappable inline comments in the review summary instead of failing submit" }
+                "fallback_unmapped_to_summary": { "type": "string", "description": "Set to true to include unmappable inline comments in the review summary instead of failing submit", "default": "false" }
             }
         }),
         route: None,

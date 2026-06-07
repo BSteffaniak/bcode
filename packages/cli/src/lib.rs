@@ -9,6 +9,11 @@ mod blims;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
+use bcode_code_review_models::{
+    CODE_REVIEW_SERVICE_INTERFACE_ID, ExternalPublishReviewRequest, OP_REVIEW_BUNDLE_GET,
+    OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, REVIEW_PUBLISHER_INTERFACE_ID,
+    ReviewBundle, ReviewContextRequest, ReviewTarget,
+};
 use bcode_config::AuthMode;
 use bcode_ipc::{Event, PermissionSummary, ServerStatus, default_endpoint};
 use bcode_session_import::{
@@ -69,6 +74,8 @@ pub enum CliError {
     Blims(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
+    #[error("plugin service error {code}: {message}")]
+    PluginService { code: String, message: String },
 }
 
 /// Parse CLI arguments and run the requested command.
@@ -370,6 +377,72 @@ enum ReviewCommand {
         #[arg(long)]
         two_dot: bool,
     },
+    /// Publish a review to GitHub without opening the TUI.
+    PublishGithub {
+        /// GitHub repository in owner/repo form.
+        #[arg(long)]
+        github_repo: Option<String>,
+        /// GitHub pull request number.
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// GitHub token environment variable.
+        #[arg(long, default_value = "GITHUB_TOKEN")]
+        token_env: String,
+        /// GitHub review event.
+        #[arg(long, value_enum, default_value_t = GithubSubmitEvent::Comment)]
+        submit_event: GithubSubmitEvent,
+        /// Optional review summary body.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Include unmappable comments in summary instead of failing submit.
+        #[arg(long)]
+        fallback_unmapped_to_summary: bool,
+        /// Submit the review. Defaults to preview-only.
+        #[arg(long)]
+        submit: bool,
+        /// Target to publish.
+        #[arg(long, value_enum, default_value_t = ReviewTargetArg::Unstaged)]
+        target: ReviewTargetArg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GithubSubmitEvent {
+    Comment,
+    RequestChanges,
+    Approve,
+}
+
+impl GithubSubmitEvent {
+    const fn as_github_event(self) -> &'static str {
+        match self {
+            Self::Comment => "COMMENT",
+            Self::RequestChanges => "REQUEST_CHANGES",
+            Self::Approve => "APPROVE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReviewTargetArg {
+    Unstaged,
+    Staged,
+    All,
+    LastCommit,
+}
+
+impl From<ReviewTargetArg> for ReviewTarget {
+    fn from(value: ReviewTargetArg) -> Self {
+        match value {
+            ReviewTargetArg::Unstaged => Self::WorkingTreeUnstaged,
+            ReviewTargetArg::Staged => Self::IndexStaged,
+            ReviewTargetArg::All => Self::WorkingTreeAndIndex,
+            ReviewTargetArg::LastCommit => Self::LastCommit,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -783,9 +856,183 @@ async fn handle_review_command(command: ReviewCommand) -> Result<(), CliError> {
                 merge_base: !two_dot,
             },
         ),
+        ReviewCommand::PublishGithub {
+            github_repo,
+            pr,
+            repo,
+            token_env,
+            submit_event,
+            summary,
+            fallback_unmapped_to_summary,
+            submit,
+            target,
+        } => {
+            publish_github_review(GithubPublishCliRequest {
+                github_repo,
+                pr,
+                repo,
+                token_env,
+                submit_event,
+                summary,
+                fallback_unmapped_to_summary,
+                submit,
+                target: target.into(),
+            })
+            .await?;
+            return Ok(());
+        }
     };
     bcode_tui::run_code_review(repo, target).await?;
     Ok(())
+}
+
+struct GithubPublishCliRequest {
+    github_repo: Option<String>,
+    pr: Option<u64>,
+    repo: PathBuf,
+    token_env: String,
+    submit_event: GithubSubmitEvent,
+    summary: Option<String>,
+    fallback_unmapped_to_summary: bool,
+    submit: bool,
+    target: ReviewTarget,
+}
+
+async fn publish_github_review(request: GithubPublishCliRequest) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let client = BcodeClient::default_endpoint();
+    let bundle_payload = serde_json::to_vec(&ReviewContextRequest {
+        repo_path: request.repo.clone(),
+        target: request.target,
+    })?;
+    let bundle_response = client
+        .call_plugin_service(
+            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_BUNDLE_GET.to_string(),
+            bundle_payload,
+        )
+        .await?;
+    let bundle = plugin_response_json::<ReviewBundle>(bundle_response)?;
+    let repository = match request.github_repo {
+        Some(repository) => repository,
+        None => detect_github_repository(&request.repo)?,
+    };
+    let pull_request = match request.pr {
+        Some(pull_request) => pull_request,
+        None => detect_pull_request_number(&request.repo)?,
+    };
+    let mut options = serde_json::json!({
+        "repository": repository,
+        "pull_request": pull_request.to_string(),
+        "token_env": request.token_env,
+        "submit_event": request.submit_event.as_github_event(),
+    });
+    if let Some(summary) = request.summary {
+        options["summary"] = serde_json::Value::String(summary);
+    }
+    if request.fallback_unmapped_to_summary {
+        options["fallback_unmapped_to_summary"] = serde_json::Value::Bool(true);
+    }
+    let publish_payload = serde_json::to_vec(&ExternalPublishReviewRequest { bundle, options })?;
+    let operation = if request.submit {
+        OP_REVIEW_PUBLISHER_SUBMIT
+    } else {
+        OP_REVIEW_PUBLISHER_PREVIEW
+    };
+    let response = client
+        .call_plugin_service(
+            REVIEW_PUBLISHER_INTERFACE_ID.to_string(),
+            operation.to_string(),
+            publish_payload,
+        )
+        .await?;
+    let value = plugin_response_json::<serde_json::Value>(response)?;
+    if request.submit {
+        println!("{}", value["message"].as_str().unwrap_or("submitted"));
+        if let Some(output) = value["output"].as_str() {
+            println!("{output}");
+        }
+    } else if let Some(preview) = value["preview"].as_str() {
+        println!("{preview}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+    Ok(())
+}
+
+fn plugin_response_json<T: for<'de> Deserialize<'de>>(
+    response: bcode_ipc::PluginServiceResponse,
+) -> Result<T, CliError> {
+    if let Some(error) = response.error {
+        return Err(CliError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    serde_json::from_slice(&response.payload).map_err(CliError::Json)
+}
+
+fn detect_github_repository(repo: &Path) -> Result<String, CliError> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo)
+        .output()?;
+    if !output.status.success() {
+        return Err(CliError::Blims(
+            "failed to detect GitHub repository from origin remote; pass --github-repo".to_string(),
+        ));
+    }
+    let remote = String::from_utf8_lossy(&output.stdout);
+    parse_github_remote_url(remote.trim()).ok_or_else(|| {
+        CliError::Blims(
+            "origin remote is not a GitHub owner/repo URL; pass --github-repo".to_string(),
+        )
+    })
+}
+
+fn parse_github_remote_url(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    if let Some(path) = trimmed.strip_prefix("git@github.com:") {
+        return owner_repo_from_path(path);
+    }
+    if let Some(path) = trimmed.strip_prefix("https://github.com/") {
+        return owner_repo_from_path(path);
+    }
+    if let Some(path) = trimmed.strip_prefix("ssh://git@github.com/") {
+        return owner_repo_from_path(path);
+    }
+    None
+}
+
+fn owner_repo_from_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+}
+
+fn detect_pull_request_number(repo: &Path) -> Result<u64, CliError> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(repo)
+        .output()?;
+    if !output.status.success() {
+        return Err(CliError::Blims(
+            "failed to detect current branch; pass --pr".to_string(),
+        ));
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_pull_request_from_branch(&branch).ok_or_else(|| {
+        CliError::Blims("failed to detect pull request number from branch; pass --pr".to_string())
+    })
+}
+
+fn parse_pull_request_from_branch(branch: &str) -> Option<u64> {
+    branch
+        .strip_prefix("pull/")
+        .and_then(|rest| rest.split('/').next())
+        .or_else(|| branch.strip_prefix("pr/"))
+        .and_then(|value| value.parse().ok())
 }
 
 async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
