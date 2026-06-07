@@ -65,6 +65,201 @@ pub enum ReviewTarget {
     Repository,
 }
 
+/// Durable review workspace assembled from one or more review sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewWorkspace {
+    /// Stable workspace id.
+    pub id: String,
+    /// Human-readable review title.
+    pub title: String,
+    /// Repository path for the workspace.
+    pub repo_root: PathBuf,
+    /// Sources intentionally included in the review.
+    pub sources: Vec<ReviewSource>,
+    /// Created timestamp in milliseconds since Unix epoch, when known.
+    #[serde(default)]
+    pub created_at_ms: Option<u64>,
+    /// Updated timestamp in milliseconds since Unix epoch, when known.
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
+}
+
+impl ReviewWorkspace {
+    /// Create a transient workspace from an entry-point review target.
+    #[must_use]
+    pub fn from_target(repo_root: PathBuf, target: ReviewTarget) -> Self {
+        let source_kind = ReviewSourceKind::from(target);
+        let title = source_kind.label();
+        Self {
+            id: "transient-review-workspace".to_string(),
+            title: title.clone(),
+            repo_root,
+            sources: vec![ReviewSource {
+                id: "source-1".to_string(),
+                kind: source_kind,
+                label: title,
+                included: true,
+            }],
+            created_at_ms: None,
+            updated_at_ms: None,
+        }
+    }
+}
+
+/// One source of reviewable content in a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSource {
+    /// Stable source id within the workspace.
+    pub id: String,
+    /// Source kind.
+    pub kind: ReviewSourceKind,
+    /// Human-readable source label.
+    pub label: String,
+    /// Whether this source is included in the review output.
+    pub included: bool,
+}
+
+/// Supported source kinds for building a review workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewSourceKind {
+    /// Unstaged working-tree changes.
+    WorkingTreeUnstaged,
+    /// Staged index changes.
+    IndexStaged,
+    /// Staged and unstaged working-tree changes together.
+    WorkingTreeAndIndex,
+    /// Last commit reachable from `HEAD`.
+    LastCommit,
+    /// Explicit commit.
+    Commit {
+        /// Commit revision.
+        rev: String,
+    },
+    /// Explicit commit range.
+    CommitRange {
+        /// Base revision.
+        base: String,
+        /// Head revision.
+        head: String,
+        /// Whether to use merge-base semantics.
+        #[serde(default)]
+        merge_base: bool,
+    },
+    /// Branch comparison.
+    BranchCompare {
+        /// Base branch.
+        base_branch: String,
+        /// Head branch.
+        head_branch: String,
+        /// Whether to use merge-base semantics.
+        #[serde(default = "default_true")]
+        merge_base: bool,
+    },
+    /// Specific repository file.
+    File {
+        /// Repository-relative file path.
+        path: String,
+    },
+    /// Specific repository file range.
+    FileRange {
+        /// Repository-relative file path.
+        path: String,
+        /// Start line.
+        start: u32,
+        /// End line.
+        end: u32,
+    },
+    /// Full repository browser context.
+    Repository,
+}
+
+impl ReviewSourceKind {
+    /// Return a human-readable source label.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::WorkingTreeUnstaged => "Unstaged changes".to_string(),
+            Self::IndexStaged => "Staged changes".to_string(),
+            Self::WorkingTreeAndIndex => "Working tree and index".to_string(),
+            Self::LastCommit => "Last commit".to_string(),
+            Self::Commit { rev } => format!("Commit {rev}"),
+            Self::CommitRange {
+                base,
+                head,
+                merge_base,
+            } => {
+                let separator = if *merge_base { "..." } else { ".." };
+                format!("Range {base}{separator}{head}")
+            }
+            Self::BranchCompare {
+                base_branch,
+                head_branch,
+                merge_base,
+            } => {
+                let separator = if *merge_base { "..." } else { ".." };
+                format!("Compare {base_branch}{separator}{head_branch}")
+            }
+            Self::File { path } => format!("File {path}"),
+            Self::FileRange { path, start, end } => format!("File {path}:{start}-{end}"),
+            Self::Repository => "Repository browser".to_string(),
+        }
+    }
+}
+
+impl From<ReviewTarget> for ReviewSourceKind {
+    fn from(target: ReviewTarget) -> Self {
+        match target {
+            ReviewTarget::WorkingTreeUnstaged => Self::WorkingTreeUnstaged,
+            ReviewTarget::IndexStaged => Self::IndexStaged,
+            ReviewTarget::WorkingTreeAndIndex => Self::WorkingTreeAndIndex,
+            ReviewTarget::LastCommit => Self::LastCommit,
+            ReviewTarget::CommitRange {
+                base,
+                head,
+                merge_base,
+            } => Self::CommitRange {
+                base,
+                head,
+                merge_base,
+            },
+            ReviewTarget::BranchCompare {
+                base_branch,
+                head_branch,
+                merge_base,
+            } => Self::BranchCompare {
+                base_branch,
+                head_branch,
+                merge_base,
+            },
+            ReviewTarget::Repository => Self::Repository,
+        }
+    }
+}
+
+/// Normalized review surface kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSurfaceKind {
+    /// Diff surface.
+    Diff,
+    /// Full-file surface.
+    File,
+}
+
+/// Normalized reviewable surface produced by workspace sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSurface {
+    /// Stable surface id.
+    pub id: String,
+    /// Source id that produced this surface.
+    pub source_id: String,
+    /// Repository-relative path.
+    pub path: String,
+    /// Surface kind.
+    pub kind: ReviewSurfaceKind,
+}
+
 /// Request payload for `draft.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListDraftsRequest {

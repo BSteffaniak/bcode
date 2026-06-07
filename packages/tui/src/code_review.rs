@@ -10,7 +10,7 @@ use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
-    REVIEW_PUBLISHER_INTERFACE_ID,
+    REVIEW_PUBLISHER_INTERFACE_ID, ReviewSurface, ReviewSurfaceKind, ReviewWorkspace,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
@@ -946,6 +946,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             app.sidebar_visible = !app.sidebar_visible;
             true
         }
+        KeyCode::Char('m') => app.toggle_ux_mode(),
         KeyCode::Char('t') => app.toggle_sidebar_mode(),
         KeyCode::Char('f') => app.open_file_picker(),
         KeyCode::Char(':') => app.open_jump_to_line_prompt(),
@@ -1195,6 +1196,40 @@ impl From<ReviewOpenTarget> for ReviewTarget {
     }
 }
 
+impl ReviewTarget {
+    fn to_model(&self) -> bcode_code_review_models::ReviewTarget {
+        match self {
+            Self::WorkingTreeUnstaged => {
+                bcode_code_review_models::ReviewTarget::WorkingTreeUnstaged
+            }
+            Self::IndexStaged => bcode_code_review_models::ReviewTarget::IndexStaged,
+            Self::WorkingTreeAndIndex => {
+                bcode_code_review_models::ReviewTarget::WorkingTreeAndIndex
+            }
+            Self::LastCommit => bcode_code_review_models::ReviewTarget::LastCommit,
+            Self::CommitRange {
+                base,
+                head,
+                merge_base,
+            } => bcode_code_review_models::ReviewTarget::CommitRange {
+                base: base.clone(),
+                head: head.clone(),
+                merge_base: *merge_base,
+            },
+            Self::BranchCompare {
+                base_branch,
+                head_branch,
+                merge_base,
+            } => bcode_code_review_models::ReviewTarget::BranchCompare {
+                base_branch: base_branch.clone(),
+                head_branch: head_branch.clone(),
+                merge_base: *merge_base,
+            },
+            Self::Repository => bcode_code_review_models::ReviewTarget::Repository,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ListDraftsRequest {
     repo_path: PathBuf,
@@ -1304,6 +1339,15 @@ impl From<ReviewCommentAnchor> for DraftAnchor {
     }
 }
 
+/// Review interaction mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewUxMode {
+    /// Build the review by adding/removing sources.
+    Build,
+    /// Review/comment/publish included and context files.
+    Review,
+}
+
 /// Full review summary displayed by the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ReviewSummary {
@@ -1317,6 +1361,9 @@ pub struct ReviewSummary {
     pub additions: u32,
     /// Total deletions.
     pub deletions: u32,
+    /// Workspace that owns this review session.
+    #[serde(default)]
+    pub workspace: Option<ReviewWorkspace>,
 }
 
 impl ReviewSummary {
@@ -1324,6 +1371,38 @@ impl ReviewSummary {
     #[must_use]
     pub fn is_repository_review(&self) -> bool {
         self.title == "Repository Review"
+    }
+
+    /// Return workspace, creating a transient workspace for legacy single-target reviews.
+    #[must_use]
+    pub fn workspace(&self) -> ReviewWorkspace {
+        self.workspace.clone().unwrap_or_else(|| {
+            let target = if self.is_repository_review() {
+                ReviewTarget::Repository.to_model()
+            } else {
+                ReviewTarget::WorkingTreeAndIndex.to_model()
+            };
+            ReviewWorkspace::from_target(self.repo_root.clone(), target)
+        })
+    }
+
+    /// Return normalized surfaces visible for this review.
+    #[must_use]
+    pub fn surfaces(&self) -> Vec<ReviewSurface> {
+        self.files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| ReviewSurface {
+                id: format!("surface-{index}"),
+                source_id: "source-1".to_string(),
+                path: file.display_path().to_string(),
+                kind: if self.is_repository_review() {
+                    ReviewSurfaceKind::File
+                } else {
+                    ReviewSurfaceKind::Diff
+                },
+            })
+            .collect()
     }
 }
 
@@ -1862,6 +1941,8 @@ pub enum ReviewPublishState {
 pub struct ReviewApp {
     /// Review data.
     pub review: ReviewSummary,
+    /// Current review UX mode.
+    pub ux_mode: ReviewUxMode,
     /// Selected file index.
     pub selected_file: usize,
     /// Top visible file row.
@@ -1930,6 +2011,7 @@ impl ReviewApp {
     pub fn new(review: ReviewSummary) -> Self {
         Self {
             review,
+            ux_mode: ReviewUxMode::Review,
             selected_file: 0,
             file_scroll: 0,
             diff_scroll: 0,
@@ -1962,6 +2044,19 @@ impl ReviewApp {
             last_file_area: None,
             last_diff_area: None,
         }
+    }
+
+    /// Toggle between build and review UX modes.
+    pub fn toggle_ux_mode(&mut self) -> bool {
+        self.ux_mode = match self.ux_mode {
+            ReviewUxMode::Build => ReviewUxMode::Review,
+            ReviewUxMode::Review => ReviewUxMode::Build,
+        };
+        self.status_message = Some(match self.ux_mode {
+            ReviewUxMode::Build => "build mode: assemble review sources".to_string(),
+            ReviewUxMode::Review => "review mode: comment, ask, publish".to_string(),
+        });
+        true
     }
 
     /// Open fuzzy file picker prompt.
@@ -3601,6 +3696,7 @@ mod tests {
             repo_root: PathBuf::from("/repo"),
             additions: 2,
             deletions: 1,
+            workspace: None,
             files: vec![
                 ReviewFile {
                     old_path: Some("a.rs".to_string()),

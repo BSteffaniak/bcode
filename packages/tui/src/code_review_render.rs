@@ -1,5 +1,6 @@
 //! Rendering for full-screen code review mode.
 
+use bcode_code_review_models::ReviewSurfaceKind;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
@@ -55,7 +56,11 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
         body
     };
     app.set_diff_area(diff_area);
-    render_diff(app, diff_area, frame);
+    if app.ux_mode == super::code_review::ReviewUxMode::Build {
+        render_build_workspace(app, diff_area, frame);
+    } else {
+        render_diff(app, diff_area, frame);
+    }
 
     if app.help_visible {
         render_help(app, area, frame);
@@ -93,7 +98,19 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         format!("  💬 {drafts} draft")
     };
-    let text = if app.review.is_repository_review() {
+    let text = if app.ux_mode == super::code_review::ReviewUxMode::Build {
+        let workspace = app.review.workspace();
+        format!(
+            " bcode review build  {}  {} included source(s)  {} file(s) ",
+            workspace.title,
+            workspace
+                .sources
+                .iter()
+                .filter(|source| source.included)
+                .count(),
+            app.review.files.len()
+        )
+    } else if app.review.is_repository_review() {
         format!(
             " bcode review  {}  {}  File {}  Line {}{} ",
             app.review.title,
@@ -162,6 +179,9 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 return app.selected_thread_preview().unwrap_or_else(|| {
                     " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
                 });
+            }
+            if app.ux_mode == super::code_review::ReviewUxMode::Build {
+                return " build mode  sources are included review inputs  m review mode  f picker  enter inspect/open  t threads  b sidebar  ? help  q exit ".to_string();
             }
             if app.review.is_repository_review() {
                 return format!(
@@ -447,6 +467,50 @@ fn render_file_row(
     frame.write_line_with_fallback_style(area, &line, style);
 }
 
+fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.is_empty() {
+        return;
+    }
+    let workspace = app.review.workspace();
+    let surfaces = app.review.surfaces();
+    let mut lines = Vec::new();
+    lines.push(format!("Review workspace: {}", workspace.title));
+    lines.push(String::new());
+    lines.push("Included sources".to_string());
+    for source in &workspace.sources {
+        let marker = if source.included { "✓" } else { " " };
+        lines.push(format!("  [{marker}] {}", source.label));
+    }
+    lines.push(String::new());
+    lines.push("Review surfaces".to_string());
+    for surface in surfaces
+        .iter()
+        .take(usize::from(area.height).saturating_sub(lines.len()))
+    {
+        let kind = match surface.kind {
+            ReviewSurfaceKind::Diff => "diff",
+            ReviewSurfaceKind::File => "file",
+        };
+        lines.push(format!("  {kind:4}  {}", surface.path));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Next: add/remove sources here, while Repo browsing remains always available.".to_string(),
+    );
+    for (row, text) in lines.into_iter().take(usize::from(area.height)).enumerate() {
+        let y = area
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        frame.write_line(
+            Rect::new(area.x, y, area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&text, usize::from(area.width)),
+                Style::new().fg(Color::White).bg(Color::Black),
+            )]),
+        );
+    }
+}
+
 fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -682,6 +746,17 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " ",
         Style::new().fg(Color::White).bg(Color::BrightBlack),
     );
+    let build_lines = [
+        " Build Review Help",
+        "",
+        " m                   switch to review mode",
+        " f or ctrl-p         fuzzy file picker",
+        " enter               inspect/open selected item",
+        " t                   toggle files/threads sidebar",
+        " b                   toggle sidebar",
+        " ?                   toggle this help",
+        " q or esc            exit review",
+    ];
     let repo_lines = [
         " Repository Review Help",
         "",
@@ -722,7 +797,9 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " ?                   toggle this help",
         " q or esc            exit review",
     ];
-    let lines: &[&str] = if app.review.is_repository_review() {
+    let lines: &[&str] = if app.ux_mode == super::code_review::ReviewUxMode::Build {
+        &build_lines
+    } else if app.review.is_repository_review() {
         &repo_lines
     } else {
         &diff_lines
