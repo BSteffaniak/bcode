@@ -1807,6 +1807,8 @@ impl<'a> CodeReviewDb<'a> {
                 "new_line",
                 "line_kind",
                 "is_file_anchor",
+                "surface_id",
+                "source_id",
             ])
             .filter(Box::new(where_eq("review_key", review_key)))
             .execute(self.db)
@@ -1828,8 +1830,8 @@ impl<'a> CodeReviewDb<'a> {
                 new_line: optional_i64(&thread, "new_line").map(i64_to_u32),
                 line_kind: line_kind_from_str(&required_text(&thread, "line_kind")?)?,
                 is_file_anchor: optional_bool(&thread, "is_file_anchor"),
-                surface_id: None,
-                source_id: None,
+                surface_id: optional_text(&thread, "surface_id"),
+                source_id: optional_text(&thread, "source_id"),
             };
             let comment_rows = self
                 .db
@@ -2054,6 +2056,8 @@ impl<'a> CodeReviewDb<'a> {
             .value("new_line", optional_u32(anchor.new_line))
             .value("line_kind", line_kind_str(anchor.line_kind))
             .value("is_file_anchor", anchor.is_file_anchor)
+            .value("surface_id", anchor.surface_id.clone())
+            .value("source_id", anchor.source_id.clone())
             .value("created_at_ms", u64_to_i64(now))
             .value("updated_at_ms", u64_to_i64(now))
             .execute(self.db)
@@ -2217,6 +2221,8 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
                 .column(nullable_int_column("new_line"))
                 .column(text_column("line_kind"))
                 .column(bool_column("is_file_anchor"))
+                .column(nullable_text_column("surface_id"))
+                .column(nullable_text_column("source_id"))
                 .column(int_column("created_at_ms"))
                 .column(int_column("updated_at_ms"))
                 .primary_key("thread_id"),
@@ -2270,14 +2276,37 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
         )),
         None,
     ));
+    source.add_migration(thread_surface_anchor_columns_migration());
     source.add_migration(workspace_table_migration());
     source
+}
+
+fn thread_surface_anchor_columns_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "007_thread_surface_anchor_columns".to_string(),
+        Box::new(
+            alter_table("draft_threads")
+                .add_column("surface_id".to_string(), DataType::Text, true, None)
+                .add_column("source_id".to_string(), DataType::Text, true, None),
+        ),
+        None,
+    )
 }
 
 fn text_column(name: &str) -> Column {
     Column {
         name: name.to_string(),
         nullable: false,
+        auto_increment: false,
+        data_type: DataType::Text,
+        default: None,
+    }
+}
+
+fn nullable_text_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        nullable: true,
         auto_increment: false,
         data_type: DataType::Text,
         default: None,
