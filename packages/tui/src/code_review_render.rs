@@ -7,8 +7,11 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::truncate_to_display_width;
 
 use super::code_review::{
-    ReviewApp, ReviewFile, ReviewLine, ReviewLineKind, ReviewPublishState, ReviewSidebarMode,
-    sidebar_width,
+    ReviewApp, ReviewFile, ReviewLineKind, ReviewPublishState, ReviewSidebarMode, sidebar_width,
+};
+use super::code_review_display::{
+    ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment,
+    ReviewDisplayTextRole,
 };
 
 /// Render one full-screen code review frame.
@@ -386,47 +389,103 @@ fn render_empty(area: Rect, text: &str, frame: &mut Frame<'_>) {
 }
 
 fn rendered_rows(file: &ReviewFile) -> Vec<RenderedRow> {
-    let mut rows = Vec::new();
-    for hunk in &file.hunks {
-        let heading = hunk.heading.as_deref().unwrap_or_default();
-        rows.push(RenderedRow {
-            line: Line::from_spans(vec![Span::styled(
-                format!(
-                    "@@ -{},{} +{},{} @@ {}",
-                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count, heading
-                ),
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            )]),
-            style: Style::new().fg(Color::Magenta),
-        });
-        rows.extend(hunk.lines.iter().map(render_diff_line));
-    }
-    rows
+    ReviewDisplayBuilder::new()
+        .syntax_highlighting(true)
+        .build_file(file)
+        .rows
+        .iter()
+        .map(render_display_row)
+        .collect()
 }
 
-fn render_diff_line(line: &ReviewLine) -> RenderedRow {
-    let (marker, style) = match line.kind {
-        ReviewLineKind::Context => (' ', Style::new().fg(Color::White)),
-        ReviewLineKind::Added => ('+', Style::new().fg(Color::Green)),
-        ReviewLineKind::Removed => ('-', Style::new().fg(Color::Red)),
-    };
-    let old = line
-        .old_line
-        .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
-    let new = line
-        .new_line
-        .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
-    RenderedRow {
-        line: Line::from_spans(vec![
-            Span::styled(
-                format!(" {old} {new} "),
-                Style::new().fg(Color::BrightBlack),
+fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
+    match row.source {
+        ReviewDisplayRowSource::HunkHeader => RenderedRow {
+            line: Line::from_spans(
+                row.segments
+                    .iter()
+                    .map(render_display_segment)
+                    .collect::<Vec<_>>(),
             ),
-            Span::styled(marker.to_string(), style),
-            Span::styled(line.content.clone(), style),
-        ]),
-        style,
+            style: row_style(row.source),
+        },
+        ReviewDisplayRowSource::Context
+        | ReviewDisplayRowSource::Added
+        | ReviewDisplayRowSource::Removed => {
+            let old = row
+                .old_line
+                .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
+            let new = row
+                .new_line
+                .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
+            let marker_style = row_style(row.source);
+            let marker = row.source.diff_marker().unwrap_or(' ');
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {old} {new} "),
+                    Style::new().fg(Color::BrightBlack),
+                ),
+                Span::styled(marker.to_string(), marker_style),
+            ];
+            spans.extend(row.segments.iter().map(render_display_segment));
+            RenderedRow {
+                line: Line::from_spans(spans),
+                style: marker_style,
+            }
+        }
     }
+}
+
+fn render_display_segment(segment: &ReviewDisplaySegment) -> Span {
+    Span::styled(segment.text.clone(), style_for_segment(segment))
+}
+
+fn style_for_segment(segment: &ReviewDisplaySegment) -> Style {
+    let mut style = Style::new();
+    for role in &segment.roles {
+        style = style.patch(style_for_role(role));
+    }
+    style
+}
+
+const fn style_for_role(role: &ReviewDisplayTextRole) -> Style {
+    match role {
+        ReviewDisplayTextRole::Code => Style::new().fg(Color::White),
+        ReviewDisplayTextRole::Syntax(style) => syntax_style_to_tui(*style),
+        ReviewDisplayTextRole::DiffContext
+        | ReviewDisplayTextRole::DiffAdded
+        | ReviewDisplayTextRole::DiffRemoved => Style::new(),
+        ReviewDisplayTextRole::HunkHeader => {
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        }
+    }
+}
+
+const fn row_style(source: ReviewDisplayRowSource) -> Style {
+    match source {
+        ReviewDisplayRowSource::HunkHeader => Style::new().fg(Color::Magenta),
+        ReviewDisplayRowSource::Context => Style::new().fg(Color::White),
+        ReviewDisplayRowSource::Added => Style::new().fg(Color::Green),
+        ReviewDisplayRowSource::Removed => Style::new().fg(Color::Red),
+    }
+}
+
+const fn syntax_style_to_tui(style: bcode_syntax_render::SyntaxStyle) -> Style {
+    let mut output = Style::new().fg(Color::Rgb(
+        style.foreground_r,
+        style.foreground_g,
+        style.foreground_b,
+    ));
+    if style.bold {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        output = output.add_modifier(Modifier::UNDERLINE);
+    }
+    output
 }
 
 fn render_help(area: Rect, frame: &mut Frame<'_>) {

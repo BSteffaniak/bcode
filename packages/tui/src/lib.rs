@@ -9,6 +9,7 @@ pub(crate) mod app;
 pub(crate) mod chat_loop;
 pub(crate) mod clipboard_image;
 pub mod code_review;
+pub(crate) mod code_review_display;
 pub(crate) mod code_review_render;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;

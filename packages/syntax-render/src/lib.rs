@@ -11,9 +11,44 @@ use bmux_tui::prelude::{Color, Modifier, Span, Style};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::util::LinesWithEndings;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<Theme> = OnceLock::new();
+
+/// Renderer-neutral syntax-highlighted text span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxSpan {
+    /// Span text.
+    pub content: String,
+    /// Renderer-neutral syntax style.
+    pub style: SyntaxStyle,
+}
+
+impl SyntaxSpan {
+    /// Create a syntax span.
+    #[must_use]
+    pub const fn new(content: String, style: SyntaxStyle) -> Self {
+        Self { content, style }
+    }
+}
+
+/// Renderer-neutral syntax style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxStyle {
+    /// Foreground red channel.
+    pub foreground_r: u8,
+    /// Foreground green channel.
+    pub foreground_g: u8,
+    /// Foreground blue channel.
+    pub foreground_b: u8,
+    /// Whether text should be bold.
+    pub bold: bool,
+    /// Whether text should be italic.
+    pub italic: bool,
+    /// Whether text should be underlined.
+    pub underline: bool,
+}
 
 /// Terminal syntax highlighter backed by syntect's bundled syntaxes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,24 +70,48 @@ impl SyntaxHighlighter {
     /// Highlight one line using a path or language hint.
     #[must_use]
     pub fn highlight_line(&self, path_or_language: &str, line: &str) -> Vec<Span> {
+        self.highlight_line_tokens(path_or_language, line)
+            .into_iter()
+            .map(syntax_span_to_tui)
+            .collect()
+    }
+
+    /// Highlight one line into renderer-neutral syntax spans.
+    #[must_use]
+    pub fn highlight_line_tokens(&self, path_or_language: &str, line: &str) -> Vec<SyntaxSpan> {
         let Some(syntax) = syntax_for(path_or_language) else {
-            return plain_spans(line);
+            return plain_syntax_spans(line);
         };
         let mut highlighter = HighlightLines::new(syntax, theme());
-        highlight_line_with(&mut highlighter, line).unwrap_or_else(|| plain_spans(line))
+        highlight_line_tokens_with(&mut highlighter, line)
+            .unwrap_or_else(|| plain_syntax_spans(line))
     }
 
     /// Highlight multiple lines using a path or language hint.
     #[must_use]
     pub fn highlight_lines(&self, path_or_language: &str, lines: &[&str]) -> Vec<Vec<Span>> {
+        self.highlight_lines_tokens(path_or_language, lines)
+            .into_iter()
+            .map(|line| line.into_iter().map(syntax_span_to_tui).collect())
+            .collect()
+    }
+
+    /// Highlight multiple lines into renderer-neutral syntax spans.
+    #[must_use]
+    pub fn highlight_lines_tokens(
+        &self,
+        path_or_language: &str,
+        lines: &[&str],
+    ) -> Vec<Vec<SyntaxSpan>> {
         let Some(syntax) = syntax_for(path_or_language) else {
-            return lines.iter().map(|line| plain_spans(line)).collect();
+            return lines.iter().map(|line| plain_syntax_spans(line)).collect();
         };
         let mut highlighter = HighlightLines::new(syntax, theme());
         lines
             .iter()
             .map(|line| {
-                highlight_line_with(&mut highlighter, line).unwrap_or_else(|| plain_spans(line))
+                highlight_line_tokens_with(&mut highlighter, line)
+                    .unwrap_or_else(|| plain_syntax_spans(line))
             })
             .collect()
     }
@@ -98,37 +157,77 @@ fn syntax_for(path_or_language: &str) -> Option<&'static SyntaxReference> {
         })
 }
 
-fn highlight_line_with(highlighter: &mut HighlightLines<'_>, line: &str) -> Option<Vec<Span>> {
+fn highlight_line_tokens_with(
+    highlighter: &mut HighlightLines<'_>,
+    line: &str,
+) -> Option<Vec<SyntaxSpan>> {
     let ranges = highlighter.highlight_line(line, syntax_set()).ok()?;
     let spans = ranges
         .into_iter()
-        .filter(|(_, content)| !content.is_empty())
-        .map(|(style, content)| Span::styled(content.to_owned(), syntect_style_to_tui(style)))
+        .flat_map(|(style, content)| {
+            LinesWithEndings::from(content).filter_map(move |line| {
+                let content = line.trim_end_matches(['\r', '\n']);
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(SyntaxSpan::new(
+                        content.to_owned(),
+                        syntect_style_to_syntax(style),
+                    ))
+                }
+            })
+        })
         .collect::<Vec<_>>();
     Some(if spans.is_empty() {
-        plain_spans(line)
+        plain_syntax_spans(line)
     } else {
         spans
     })
 }
 
-fn plain_spans(line: &str) -> Vec<Span> {
-    vec![Span::raw(line.to_owned())]
+fn plain_syntax_spans(line: &str) -> Vec<SyntaxSpan> {
+    vec![SyntaxSpan::new(line.to_owned(), default_syntax_style())]
 }
 
-const fn syntect_style_to_tui(style: syntect::highlighting::Style) -> Style {
+const fn default_syntax_style() -> SyntaxStyle {
+    SyntaxStyle {
+        foreground_r: 255,
+        foreground_g: 255,
+        foreground_b: 255,
+        bold: false,
+        italic: false,
+        underline: false,
+    }
+}
+
+fn syntax_span_to_tui(span: SyntaxSpan) -> Span {
+    Span::styled(span.content, syntax_style_to_tui(span.style))
+}
+
+const fn syntect_style_to_syntax(style: syntect::highlighting::Style) -> SyntaxStyle {
+    SyntaxStyle {
+        foreground_r: style.foreground.r,
+        foreground_g: style.foreground.g,
+        foreground_b: style.foreground.b,
+        bold: style.font_style.contains(FontStyle::BOLD),
+        italic: style.font_style.contains(FontStyle::ITALIC),
+        underline: style.font_style.contains(FontStyle::UNDERLINE),
+    }
+}
+
+const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
     let mut output = Style::new().fg(Color::Rgb(
-        style.foreground.r,
-        style.foreground.g,
-        style.foreground.b,
+        style.foreground_r,
+        style.foreground_g,
+        style.foreground_b,
     ));
-    if style.font_style.contains(FontStyle::BOLD) {
+    if style.bold {
         output = output.add_modifier(Modifier::BOLD);
     }
-    if style.font_style.contains(FontStyle::ITALIC) {
+    if style.italic {
         output = output.add_modifier(Modifier::ITALIC);
     }
-    if style.font_style.contains(FontStyle::UNDERLINE) {
+    if style.underline {
         output = output.add_modifier(Modifier::UNDERLINE);
     }
     output
