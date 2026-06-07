@@ -708,9 +708,11 @@ async fn load_workspace_review(
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     let materialization = response.materialization;
     let mut files = Vec::new();
+    let mut surfaces = Vec::new();
     for surface in materialization.surfaces {
-        if let Some(file) = surface.file {
+        if let Some(file) = surface.file.clone() {
             files.push(ReviewFile::from_model(file));
+            surfaces.push(surface);
         }
     }
     if files.is_empty() {
@@ -723,6 +725,7 @@ async fn load_workspace_review(
         additions: materialization.additions,
         deletions: materialization.deletions,
         workspace: Some(materialization.workspace),
+        surfaces,
     })
 }
 
@@ -746,7 +749,10 @@ async fn load_review(
             message: error.message,
         });
     }
-    serde_json::from_slice(&response.payload).map_err(TuiError::Json)
+    let mut summary: ReviewSummary =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    summary.surfaces = summary.surfaces();
+    Ok(summary)
 }
 
 async fn load_repository_file(
@@ -1597,6 +1603,9 @@ pub struct ReviewSummary {
     /// Workspace that owns this review session.
     #[serde(default)]
     pub workspace: Option<ReviewWorkspace>,
+    /// Materialized review surfaces corresponding to files.
+    #[serde(default)]
+    pub surfaces: Vec<ReviewSurface>,
 }
 
 impl ReviewSummary {
@@ -1622,6 +1631,9 @@ impl ReviewSummary {
     /// Return normalized surfaces visible for this review.
     #[must_use]
     pub fn surfaces(&self) -> Vec<ReviewSurface> {
+        if !self.surfaces.is_empty() {
+            return self.surfaces.clone();
+        }
         self.files
             .iter()
             .enumerate()
@@ -4270,6 +4282,7 @@ mod tests {
             additions: 2,
             deletions: 1,
             workspace: None,
+            surfaces: Vec::new(),
             files: vec![
                 ReviewFile {
                     old_path: Some("a.rs".to_string()),

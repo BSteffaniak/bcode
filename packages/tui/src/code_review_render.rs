@@ -101,6 +101,14 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         format!("  💬 {drafts} draft")
     };
+    let surface_kind = app
+        .review
+        .surfaces()
+        .get(app.selected_file)
+        .map_or("diff", |surface| match surface.kind {
+            ReviewSurfaceKind::Diff => "diff",
+            ReviewSurfaceKind::File => "file",
+        });
     let text = if app.ux_mode == super::code_review::ReviewUxMode::Build {
         let workspace = &app.workspace;
         format!(
@@ -115,20 +123,22 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         )
     } else if app.review.is_repository_review() {
         format!(
-            " bcode review  {}  {}  File {}  Line {}{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Line {}{} ",
             app.review.title,
             file_label,
             file_position,
+            surface_kind,
             app.selected_diff_line.saturating_add(1),
             draft_label
         )
     } else {
         let (hunk, hunk_total) = app.hunk_position();
         format!(
-            " bcode review  {}  {}  File {}  Hunk {}/{}{}  +{} -{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}  +{} -{} ",
             app.review.title,
             file_label,
             file_position,
+            surface_kind,
             hunk,
             hunk_total,
             draft_label,
