@@ -736,6 +736,12 @@ pub struct ReviewBundleLine {
     pub diff_row: u64,
     /// Line content without diff marker.
     pub content: String,
+    /// Surface id that owns this selected line, when known.
+    #[serde(default)]
+    pub surface_id: Option<String>,
+    /// Source id that owns this selected line, when known.
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 /// Provider-neutral review bundle.

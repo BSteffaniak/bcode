@@ -732,8 +732,9 @@ fn review_bundle_for_request(
     )
     .into_iter()
     .map(|thread| {
-        let (selected_lines, selected_diff_lines, hunk_context) =
+        let (mut selected_lines, selected_diff_lines, hunk_context) =
             diff_context_for_anchor(&summary, &thread.anchor);
+        hydrate_bundle_line_anchor_metadata(&mut selected_lines, &thread.anchor);
         ReviewBundleThread {
             thread_id: thread.thread_id,
             anchor: thread.anchor,
@@ -1504,6 +1505,13 @@ fn diff_context_for_anchor(
     (selected_structured_lines, selected_lines, Vec::new())
 }
 
+fn hydrate_bundle_line_anchor_metadata(lines: &mut [ReviewBundleLine], anchor: &DraftAnchor) {
+    for line in lines {
+        line.surface_id.clone_from(&anchor.surface_id);
+        line.source_id.clone_from(&anchor.source_id);
+    }
+}
+
 fn bundle_diff_lines(file: &ReviewFile) -> Vec<ReviewBundleLine> {
     let mut diff_row = 0_u64;
     let mut lines = Vec::new();
@@ -1524,6 +1532,8 @@ fn bundle_diff_lines(file: &ReviewFile) -> Vec<ReviewBundleLine> {
                     .as_ref()
                     .map_or(String::new(), |heading| format!(" {heading}")),
             ),
+            surface_id: None,
+            source_id: None,
         });
         diff_row = diff_row.saturating_add(1);
         for line in &hunk.lines {
@@ -1534,6 +1544,8 @@ fn bundle_diff_lines(file: &ReviewFile) -> Vec<ReviewBundleLine> {
                 new_line: line.new_line,
                 diff_row,
                 content: line.content.clone(),
+                surface_id: None,
+                source_id: None,
             });
             diff_row = diff_row.saturating_add(1);
         }

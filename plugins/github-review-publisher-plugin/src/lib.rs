@@ -735,14 +735,14 @@ mod tests {
 
     #[test]
     fn maps_added_line_to_right_side_comment() {
-        let thread = review_thread(ReviewBundleLine {
-            file_path: "src/lib.rs".to_string(),
-            kind: ReviewLineKind::Added,
-            old_line: None,
-            new_line: Some(42),
-            diff_row: 1,
-            content: "added".to_string(),
-        });
+        let thread = review_thread(bundle_line(
+            "src/lib.rs",
+            ReviewLineKind::Added,
+            None,
+            Some(42),
+            1,
+            "added",
+        ));
 
         let comment = github_comment_for_thread(&thread).expect("comment");
 
@@ -759,14 +759,14 @@ mod tests {
             repo_root: PathBuf::from("/repo"),
             target: ReviewTarget::WorkingTreeUnstaged,
             files: Vec::new(),
-            threads: vec![review_thread(ReviewBundleLine {
-                file_path: "src/lib.rs".to_string(),
-                kind: ReviewLineKind::Context,
-                old_line: None,
-                new_line: None,
-                diff_row: 0,
-                content: "@@".to_string(),
-            })],
+            threads: vec![review_thread(bundle_line(
+                "src/lib.rs",
+                ReviewLineKind::Context,
+                None,
+                None,
+                0,
+                "@@",
+            ))],
             generated_at_ms: 1,
         };
         let request = ExternalPublishReviewRequest {
@@ -785,22 +785,22 @@ mod tests {
     #[test]
     fn maps_range_to_github_start_line() {
         let thread = review_thread_with_lines(vec![
-            ReviewBundleLine {
-                file_path: "src/lib.rs".to_string(),
-                kind: ReviewLineKind::Added,
-                old_line: None,
-                new_line: Some(40),
-                diff_row: 1,
-                content: "first".to_string(),
-            },
-            ReviewBundleLine {
-                file_path: "src/lib.rs".to_string(),
-                kind: ReviewLineKind::Added,
-                old_line: None,
-                new_line: Some(42),
-                diff_row: 2,
-                content: "last".to_string(),
-            },
+            bundle_line(
+                "src/lib.rs",
+                ReviewLineKind::Added,
+                None,
+                Some(40),
+                1,
+                "first",
+            ),
+            bundle_line(
+                "src/lib.rs",
+                ReviewLineKind::Added,
+                None,
+                Some(42),
+                2,
+                "last",
+            ),
         ]);
 
         let comment = github_comment_for_thread(&thread).expect("comment");
@@ -874,6 +874,26 @@ mod tests {
             files: Vec::new(),
             threads: Vec::new(),
             generated_at_ms: 1,
+        }
+    }
+
+    fn bundle_line(
+        file_path: &str,
+        kind: ReviewLineKind,
+        old_line: Option<u32>,
+        new_line: Option<u32>,
+        diff_row: u64,
+        content: &str,
+    ) -> ReviewBundleLine {
+        ReviewBundleLine {
+            file_path: file_path.to_string(),
+            kind,
+            old_line,
+            new_line,
+            diff_row,
+            content: content.to_string(),
+            surface_id: None,
+            source_id: None,
         }
     }
 
