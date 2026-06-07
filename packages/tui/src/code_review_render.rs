@@ -506,10 +506,14 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     );
     match state {
         ReviewPublishState::Picker => render_publisher_picker(app, popup, frame),
+        ReviewPublishState::Options {
+            options, selected, ..
+        } => render_publish_options(options, *selected, popup, frame),
         ReviewPublishState::Preview {
             publisher_id,
             preview,
             scroll,
+            ..
         } => render_publish_preview(publisher_id, preview, *scroll, popup, frame),
     }
 }
@@ -546,6 +550,54 @@ fn render_publisher_picker(app: &ReviewApp, popup: Rect, frame: &mut Frame<'_>) 
             " {}  {}  [{}]",
             publisher.label, publisher.description, caps
         );
+        let y = popup
+            .y
+            .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                popup.x.saturating_add(1),
+                y,
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&text, usize::from(popup.width.saturating_sub(2))),
+                style,
+            )]),
+            style,
+        );
+    }
+}
+
+fn render_publish_options(
+    options: &[super::code_review::ReviewPublishOption],
+    selected: usize,
+    popup: Rect,
+    frame: &mut Frame<'_>,
+) {
+    frame.write_line(
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup.y,
+            popup.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            " Publisher options  Enter preview  Tab next  Esc cancel ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    );
+    let rows = usize::from(popup.height.saturating_sub(2));
+    for (row, option) in options.iter().take(rows).enumerate() {
+        let style = if row == selected {
+            Style::new().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::new().fg(Color::White).bg(Color::BrightBlack)
+        };
+        let text = format!(" {}: {}", option.label, option.value);
         let y = popup
             .y
             .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));

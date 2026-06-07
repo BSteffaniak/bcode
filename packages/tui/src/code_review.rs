@@ -212,18 +212,20 @@ async fn handle_publish_request(
             Ok(publishers) => app.show_publishers(publishers),
             Err(error) => app.status_message = Some(format!("publisher list failed: {error}")),
         },
-        PendingPublishRequest::Preview { publisher_id } => {
-            match preview_review(client, repo_path, target, publisher_id).await {
-                Ok(response) => app.show_publish_preview(response.publisher_id, response.preview),
-                Err(error) => app.status_message = Some(format!("publish preview failed: {error}")),
-            }
-        }
-        PendingPublishRequest::Submit { publisher_id } => {
-            match publish_review(client, repo_path, target, publisher_id).await {
-                Ok(response) => app.finish_publish(response),
-                Err(error) => app.status_message = Some(format!("publish failed: {error}")),
-            }
-        }
+        PendingPublishRequest::Preview {
+            publisher_id,
+            options,
+        } => match preview_review(client, repo_path, target, publisher_id, options).await {
+            Ok(response) => app.show_publish_preview(response.publisher_id, response.preview),
+            Err(error) => app.status_message = Some(format!("publish preview failed: {error}")),
+        },
+        PendingPublishRequest::Submit {
+            publisher_id,
+            options,
+        } => match publish_review(client, repo_path, target, publisher_id, options).await {
+            Ok(response) => app.finish_publish(response),
+            Err(error) => app.status_message = Some(format!("publish failed: {error}")),
+        },
     }
 }
 
@@ -252,12 +254,13 @@ async fn preview_review(
     repo_path: PathBuf,
     target: ReviewTarget,
     publisher_id: String,
+    options: Vec<ReviewPublishOption>,
 ) -> Result<PublishReviewPreviewResponse, TuiError> {
     let request = PublishReviewRequest {
         repo_path,
         target,
         publisher_id,
-        options: serde_json::Value::Object(serde_json::Map::new()),
+        options: options_json(options),
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
@@ -281,12 +284,13 @@ async fn publish_review(
     repo_path: PathBuf,
     target: ReviewTarget,
     publisher_id: String,
+    options: Vec<ReviewPublishOption>,
 ) -> Result<PublishReviewResponse, TuiError> {
     let request = PublishReviewRequest {
         repo_path,
         target,
         publisher_id,
-        options: serde_json::Value::Object(serde_json::Map::new()),
+        options: options_json(options),
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
@@ -303,6 +307,43 @@ async fn publish_review(
         });
     }
     serde_json::from_slice(&response.payload).map_err(TuiError::Json)
+}
+
+fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter_map(|(name, schema)| {
+                    let option_type = schema
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    (option_type == "string").then(|| ReviewPublishOption {
+                        name: name.clone(),
+                        label: schema
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(name)
+                            .to_string(),
+                        value: String::new(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn options_json(options: Vec<ReviewPublishOption>) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for option in options {
+        if !option.value.is_empty() {
+            object.insert(option.name, serde_json::Value::String(option.value));
+        }
+    }
+    serde_json::Value::Object(object)
 }
 
 async fn load_review(
@@ -496,23 +537,42 @@ async fn link_thread_session(
 
 fn handle_publish_event(app: &mut ReviewApp, event: &Event) -> bool {
     match event {
-        Event::Key(stroke) if stroke.modifiers.is_empty() => match stroke.key {
-            KeyCode::Escape => {
-                app.publish_state = None;
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down => app.publish_down(1),
-            KeyCode::Char('k') | KeyCode::Up => app.publish_up(1),
-            KeyCode::Enter => app.confirm_publish_selection(),
-            _ => false,
-        },
-        Event::Resize(_)
-        | Event::Paste(_)
-        | Event::Focus(_)
-        | Event::Mouse(_)
-        | Event::Key(_)
-        | Event::Tick
-        | Event::User(_) => false,
+        Event::Key(stroke) => handle_publish_key(app, *stroke),
+        Event::Paste(text) => app.insert_publish_option_text(text),
+        Event::Resize(_) | Event::Focus(_) | Event::Tick => true,
+        Event::Mouse(_) | Event::User(_) => false,
+    }
+}
+
+fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
+    if app.publish_options_active() {
+        if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
+            app.publish_state = None;
+            return true;
+        }
+        if stroke.key == KeyCode::Enter && stroke.modifiers.is_empty() {
+            return app.confirm_publish_selection();
+        }
+        if stroke.key == KeyCode::Tab && stroke.modifiers.is_empty() {
+            return app.publish_down(1);
+        }
+        if stroke.key == KeyCode::Tab && stroke.modifiers.shift {
+            return app.publish_up(1);
+        }
+        return app.edit_publish_option(stroke);
+    }
+    if !stroke.modifiers.is_empty() {
+        return false;
+    }
+    match stroke.key {
+        KeyCode::Escape => {
+            app.publish_state = None;
+            true
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.publish_down(1),
+        KeyCode::Char('k') | KeyCode::Up => app.publish_up(1),
+        KeyCode::Enter => app.confirm_publish_selection(),
+        _ => false,
     }
 }
 
@@ -691,6 +751,8 @@ pub struct ReviewPublisherManifest {
     pub description: String,
     /// Publisher capabilities.
     pub capabilities: ReviewPublisherCapabilities,
+    /// Publisher option schema.
+    pub options_schema: serde_json::Value,
 }
 
 impl ReviewPublisherManifest {
@@ -1213,12 +1275,27 @@ pub enum PendingPublishRequest {
     Preview {
         /// Publisher id.
         publisher_id: String,
+        /// Publisher options.
+        options: Vec<ReviewPublishOption>,
     },
     /// Submit publisher output.
     Submit {
         /// Publisher id.
         publisher_id: String,
+        /// Publisher options.
+        options: Vec<ReviewPublishOption>,
     },
+}
+
+/// Publish option field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPublishOption {
+    /// Option name.
+    pub name: String,
+    /// Option label.
+    pub label: String,
+    /// Option value.
+    pub value: String,
 }
 
 /// Publish modal state.
@@ -1226,10 +1303,21 @@ pub enum PendingPublishRequest {
 pub enum ReviewPublishState {
     /// Publisher picker.
     Picker,
+    /// Options editor.
+    Options {
+        /// Publisher id.
+        publisher_id: String,
+        /// Options.
+        options: Vec<ReviewPublishOption>,
+        /// Selected option index.
+        selected: usize,
+    },
     /// Preview content.
     Preview {
         /// Publisher id.
         publisher_id: String,
+        /// Publisher options.
+        options: Vec<ReviewPublishOption>,
         /// Preview text.
         preview: String,
         /// Top visible preview line.
@@ -1942,6 +2030,7 @@ impl ReviewApp {
     pub fn show_publish_preview(&mut self, publisher_id: String, preview: String) {
         self.publish_state = Some(ReviewPublishState::Preview {
             publisher_id,
+            options: self.current_publish_options(),
             preview,
             scroll: 0,
         });
@@ -1964,6 +2053,17 @@ impl ReviewApp {
                     return false;
                 }
                 self.selected_publisher = next;
+                true
+            }
+            Some(ReviewPublishState::Options {
+                selected, options, ..
+            }) => {
+                let max = options.len().saturating_sub(1);
+                let next = selected.saturating_add(rows).min(max);
+                if next == *selected {
+                    return false;
+                }
+                *selected = next;
                 true
             }
             Some(ReviewPublishState::Preview {
@@ -1992,6 +2092,14 @@ impl ReviewApp {
                 self.selected_publisher = next;
                 true
             }
+            Some(ReviewPublishState::Options { selected, .. }) => {
+                let next = selected.saturating_sub(rows);
+                if next == *selected {
+                    return false;
+                }
+                *selected = next;
+                true
+            }
             Some(ReviewPublishState::Preview { scroll, .. }) => {
                 let next = scroll.saturating_sub(rows);
                 if next == *scroll {
@@ -2004,6 +2112,70 @@ impl ReviewApp {
         }
     }
 
+    /// Return true when publisher options are active.
+    #[must_use]
+    pub const fn publish_options_active(&self) -> bool {
+        matches!(self.publish_state, Some(ReviewPublishState::Options { .. }))
+    }
+
+    /// Return selected publisher option index.
+    #[must_use]
+    pub const fn selected_publish_option_index(&self) -> usize {
+        match &self.publish_state {
+            Some(ReviewPublishState::Options { selected, .. }) => *selected,
+            _ => 0,
+        }
+    }
+
+    /// Insert text into the selected publisher option.
+    pub fn insert_publish_option_text(&mut self, text: &str) -> bool {
+        let Some(ReviewPublishState::Options {
+            options, selected, ..
+        }) = &mut self.publish_state
+        else {
+            return false;
+        };
+        let Some(option) = options.get_mut(*selected) else {
+            return false;
+        };
+        option.value.push_str(text);
+        true
+    }
+
+    /// Edit selected publisher option.
+    pub fn edit_publish_option(&mut self, stroke: KeyStroke) -> bool {
+        let Some(ReviewPublishState::Options {
+            options, selected, ..
+        }) = &mut self.publish_state
+        else {
+            return false;
+        };
+        let Some(option) = options.get_mut(*selected) else {
+            return false;
+        };
+        match stroke.key {
+            KeyCode::Char(ch) if stroke.modifiers.is_empty() => {
+                option.value.push(ch);
+                true
+            }
+            KeyCode::Backspace if stroke.modifiers.is_empty() => {
+                option.value.pop();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn current_publish_options(&self) -> Vec<ReviewPublishOption> {
+        match &self.publish_state {
+            Some(
+                ReviewPublishState::Options { options, .. }
+                | ReviewPublishState::Preview { options, .. },
+            ) => options.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Confirm current publish UI selection.
     pub fn confirm_publish_selection(&mut self) -> bool {
         match &self.publish_state {
@@ -2012,15 +2184,43 @@ impl ReviewApp {
                     self.status_message = Some("no publisher selected".to_string());
                     return true;
                 };
-                self.pending_publish_request = Some(PendingPublishRequest::Preview {
-                    publisher_id: publisher.id.clone(),
-                });
-                self.status_message = Some(format!("previewing publisher {}", publisher.label));
+                let options = options_from_schema(&publisher.options_schema);
+                if options.is_empty() {
+                    self.pending_publish_request = Some(PendingPublishRequest::Preview {
+                        publisher_id: publisher.id.clone(),
+                        options,
+                    });
+                    self.status_message = Some(format!("previewing publisher {}", publisher.label));
+                } else {
+                    self.publish_state = Some(ReviewPublishState::Options {
+                        publisher_id: publisher.id.clone(),
+                        options,
+                        selected: 0,
+                    });
+                    self.status_message = None;
+                }
                 true
             }
-            Some(ReviewPublishState::Preview { publisher_id, .. }) => {
+            Some(ReviewPublishState::Options {
+                publisher_id,
+                options,
+                ..
+            }) => {
+                self.pending_publish_request = Some(PendingPublishRequest::Preview {
+                    publisher_id: publisher_id.clone(),
+                    options: options.clone(),
+                });
+                self.status_message = Some(format!("previewing publisher {publisher_id}"));
+                true
+            }
+            Some(ReviewPublishState::Preview {
+                publisher_id,
+                options,
+                ..
+            }) => {
                 self.pending_publish_request = Some(PendingPublishRequest::Submit {
                     publisher_id: publisher_id.clone(),
+                    options: options.clone(),
                 });
                 self.status_message = Some(format!("submitting review via {publisher_id}"));
                 true
