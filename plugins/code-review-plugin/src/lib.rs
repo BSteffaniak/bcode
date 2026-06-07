@@ -1273,6 +1273,7 @@ impl<'a> CodeReviewDb<'a> {
                 "old_line",
                 "new_line",
                 "line_kind",
+                "is_file_anchor",
             ])
             .filter(Box::new(where_eq("review_key", review_key)))
             .execute(self.db)
@@ -1293,7 +1294,7 @@ impl<'a> CodeReviewDb<'a> {
                 old_line: optional_i64(&thread, "old_line").map(i64_to_u32),
                 new_line: optional_i64(&thread, "new_line").map(i64_to_u32),
                 line_kind: line_kind_from_str(&required_text(&thread, "line_kind")?)?,
-                is_file_anchor: false,
+                is_file_anchor: optional_bool(&thread, "is_file_anchor"),
             };
             let comment_rows = self
                 .db
@@ -1517,6 +1518,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("old_line", optional_u32(anchor.old_line))
             .value("new_line", optional_u32(anchor.new_line))
             .value("line_kind", line_kind_str(anchor.line_kind))
+            .value("is_file_anchor", anchor.is_file_anchor)
             .value("created_at_ms", u64_to_i64(now))
             .value("updated_at_ms", u64_to_i64(now))
             .execute(self.db)
@@ -1660,6 +1662,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
                 .column(nullable_int_column("old_line"))
                 .column(nullable_int_column("new_line"))
                 .column(text_column("line_kind"))
+                .column(bool_column("is_file_anchor"))
                 .column(int_column("created_at_ms"))
                 .column(int_column("updated_at_ms"))
                 .primary_key("thread_id"),
@@ -1703,6 +1706,16 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
         ),
         None,
     ));
+    source.add_migration(CodeMigration::new(
+        "006_thread_file_anchor_column".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "is_file_anchor".to_string(),
+            DataType::Bool,
+            false,
+            Some(DatabaseValue::Bool(false)),
+        )),
+        None,
+    ));
     source
 }
 
@@ -1713,6 +1726,16 @@ fn text_column(name: &str) -> Column {
         auto_increment: false,
         data_type: DataType::Text,
         default: None,
+    }
+}
+
+fn bool_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        nullable: false,
+        auto_increment: false,
+        data_type: DataType::Bool,
+        default: Some(DatabaseValue::Bool(false)),
     }
 }
 
@@ -1772,6 +1795,12 @@ fn required_i64(row: &Row, column: &'static str) -> Result<i64, ReviewError> {
 
 fn optional_i64(row: &Row, column: &'static str) -> Option<i64> {
     row.get(column).and_then(|value| value.as_i64())
+}
+
+fn optional_bool(row: &Row, column: &'static str) -> bool {
+    row.get(column)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn review_key(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewError> {

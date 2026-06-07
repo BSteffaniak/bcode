@@ -119,11 +119,23 @@ fn preview_for_request(
     );
     let _ = writeln!(output, "* Auth: {auth_source}");
     let _ = writeln!(output, "* Event: `{}`", options.submit_event);
-    let _ = write!(output, "* Inline comments: `{}`\n\n", draft.comments.len());
+    let _ = writeln!(output, "* Inline comments: `{}`", draft.comments.len());
+    let _ = write!(
+        output,
+        "* Repository comments in summary: `{}`\n\n",
+        draft.summary_comments.len()
+    );
     if let Some(summary) = &draft.body {
         output.push_str("## Summary\n\n");
         output.push_str(summary);
         output.push_str("\n\n");
+    }
+    if !draft.summary_comments.is_empty() {
+        output.push_str("## Repository comments\n\n");
+        for comment in &draft.summary_comments {
+            let _ = writeln!(output, "* {comment}");
+        }
+        output.push('\n');
     }
     if !draft.warnings.is_empty() {
         output.push_str("## Warnings\n\n");
@@ -156,7 +168,9 @@ fn submit_for_request(
     if !draft.warnings.is_empty() && !options.fallback_unmapped_to_summary {
         return Err(GitHubPublisherError::UnmappableComments(draft.warnings));
     }
-    if options.fallback_unmapped_to_summary && !draft.warnings.is_empty() {
+    if options.fallback_unmapped_to_summary
+        && (!draft.warnings.is_empty() || !draft.summary_comments.is_empty())
+    {
         append_unmapped_to_summary(&mut draft);
     }
     let payload = GitHubCreateReviewRequest {
@@ -214,7 +228,12 @@ async fn create_github_review(
 fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) -> GitHubReviewDraft {
     let mut comments = Vec::new();
     let mut warnings = Vec::new();
+    let mut summary_comments = Vec::new();
     for thread in &bundle.threads {
+        if thread.anchor.is_file_anchor {
+            summary_comments.push(summary_comment_for_thread(thread));
+            continue;
+        }
         match github_comment_for_thread(thread) {
             Some(mut comment) => {
                 comment.body = thread_body(thread);
@@ -230,7 +249,24 @@ fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) ->
         body: options.summary.clone(),
         comments,
         warnings,
+        summary_comments,
     }
+}
+
+fn summary_comment_for_thread(thread: &ReviewBundleThread) -> String {
+    let line = thread
+        .anchor
+        .new_line
+        .or(thread.anchor.new_start)
+        .or(thread.anchor.old_line)
+        .or(thread.anchor.old_start)
+        .map_or_else(String::new, |line| format!(":{line}"));
+    format!(
+        "{}{} — {}",
+        thread.anchor.file_path,
+        line,
+        thread_body(thread).replace('\n', " ")
+    )
 }
 
 fn append_unmapped_to_summary(draft: &mut GitHubReviewDraft) {
@@ -241,6 +277,12 @@ fn append_unmapped_to_summary(draft: &mut GitHubReviewDraft) {
     body.push_str("\n\n## Unmapped Bcode comments\n\n");
     for warning in &draft.warnings {
         let _ = writeln!(body, "* {warning}");
+    }
+    if !draft.summary_comments.is_empty() {
+        body.push_str("\n## Repository Bcode comments\n\n");
+        for comment in &draft.summary_comments {
+            let _ = writeln!(body, "* {comment}");
+        }
     }
     draft.body = Some(body);
 }
@@ -577,6 +619,7 @@ struct GitHubReviewDraft {
     body: Option<String>,
     comments: Vec<GitHubReviewComment>,
     warnings: Vec<String>,
+    summary_comments: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
