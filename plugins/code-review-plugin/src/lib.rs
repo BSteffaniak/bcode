@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use switchy::database::query::{FilterableQuery as _, where_eq};
-use switchy::database::schema::{Column, DataType, create_table};
+use switchy::database::schema::{Column, DataType, alter_table, create_table};
 use switchy::database::{Database, DatabaseError, DatabaseValue, Row};
 use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
 use switchy::schema::runner::MigrationRunner;
@@ -33,6 +33,8 @@ pub const OP_DRAFT_SAVE: &str = "draft.save";
 pub const OP_DRAFT_DELETE: &str = "draft.delete";
 /// Operation that updates a persisted draft comment.
 pub const OP_DRAFT_UPDATE: &str = "draft.update";
+/// Operation that links a review thread to a Bcode session.
+pub const OP_THREAD_LINK_SESSION: &str = "thread.link_session";
 
 const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
 const DEFAULT_STATE_ROOT: &str = ".bcode/code-review";
@@ -62,6 +64,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_DRAFT_SAVE => save_draft(&context.request),
             OP_DRAFT_DELETE => delete_draft(&context.request),
             OP_DRAFT_UPDATE => update_draft(&context.request),
+            OP_THREAD_LINK_SESSION => link_thread_session(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -155,6 +158,19 @@ pub struct UpdateDraftRequest {
     pub body: String,
 }
 
+/// Request payload for `thread.link_session`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkThreadSessionRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target for the thread.
+    pub target: ReviewTarget,
+    /// Thread anchor.
+    pub anchor: DraftAnchor,
+    /// Bcode session id.
+    pub session_id: String,
+}
+
 /// Persisted draft anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftAnchor {
@@ -185,6 +201,9 @@ pub struct DraftComment {
     pub created_at_ms: u64,
     /// Last update timestamp in milliseconds since Unix epoch.
     pub updated_at_ms: u64,
+    /// Linked Bcode session id, when present.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Response payload for `draft.list`.
@@ -215,6 +234,13 @@ pub struct UpdateDraftResponse {
     pub updated: bool,
     /// Updated timestamp in milliseconds since Unix epoch, when updated.
     pub updated_at_ms: Option<u64>,
+}
+
+/// Response payload for `thread.link_session`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkThreadSessionResponse {
+    /// Linked thread id.
+    pub thread_id: String,
 }
 
 /// Structured review response.
@@ -404,6 +430,18 @@ fn update_draft(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn link_thread_session(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<LinkThreadSessionRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+
+    match link_thread_session_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("thread_link_session_failed", error.to_string()),
+    }
+}
+
 fn list_drafts_for_request(request: &ListDraftsRequest) -> Result<ListDraftsResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let review_key = review_key(&repo_root, &request.target)?;
@@ -464,6 +502,31 @@ fn update_draft_for_request(
     Ok(result)
 }
 
+fn link_thread_session_for_request(
+    request: LinkThreadSessionRequest,
+) -> Result<LinkThreadSessionResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let db_repo_root = repo_root.clone();
+    let review_key = review_key(&repo_root, &request.target)?;
+    let target_kind = target_kind(&request.target).to_string();
+    let target_json = serde_json::to_string(&request.target)?;
+    let response = with_database(&repo_root, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .link_thread_session(
+                    &review_key,
+                    &db_repo_root,
+                    &target_kind,
+                    &target_json,
+                    &request.anchor,
+                    &request.session_id,
+                )
+                .await
+        })
+    })?;
+    Ok(response)
+}
+
 fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
     if !repo_path.is_dir() {
         return Err(ReviewError::InvalidRequest(format!(
@@ -506,6 +569,7 @@ impl<'a> CodeReviewDb<'a> {
             .select("draft_threads")
             .columns(&[
                 "thread_id",
+                "session_id",
                 "file_path",
                 "diff_row",
                 "old_line",
@@ -518,6 +582,7 @@ impl<'a> CodeReviewDb<'a> {
         let mut drafts = Vec::new();
         for thread in thread_rows {
             let thread_id = required_text(&thread, "thread_id")?;
+            let session_id = optional_text(&thread, "session_id");
             let anchor = DraftAnchor {
                 file_path: required_text(&thread, "file_path")?,
                 diff_row: i64_to_u64(required_i64(&thread, "diff_row")?),
@@ -535,7 +600,7 @@ impl<'a> CodeReviewDb<'a> {
             drafts.extend(
                 comment_rows
                     .into_iter()
-                    .map(|row| comment_from_row(&row, &thread_id, &anchor))
+                    .map(|row| comment_from_row(&row, &thread_id, &anchor, session_id.clone()))
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -574,6 +639,7 @@ impl<'a> CodeReviewDb<'a> {
             body: body.to_string(),
             created_at_ms: now,
             updated_at_ms: now,
+            session_id: None,
         })
     }
 
@@ -609,6 +675,31 @@ impl<'a> CodeReviewDb<'a> {
                 .await?;
         }
         Ok(true)
+    }
+
+    async fn link_thread_session(
+        &self,
+        review_key: &str,
+        repo_root: &Path,
+        target_kind: &str,
+        target_json: &str,
+        anchor: &DraftAnchor,
+        session_id: &str,
+    ) -> Result<LinkThreadSessionResponse, ReviewError> {
+        let now = now_ms();
+        let thread_id = thread_id(review_key, anchor)?;
+        self.ensure_review(review_key, repo_root, target_kind, target_json, now)
+            .await?;
+        self.ensure_thread(review_key, &thread_id, anchor, now)
+            .await?;
+        self.db
+            .update("draft_threads")
+            .value("session_id", session_id.to_string())
+            .value("updated_at_ms", u64_to_i64(now))
+            .filter(Box::new(where_eq("thread_id", thread_id.clone())))
+            .execute(self.db)
+            .await?;
+        Ok(LinkThreadSessionResponse { thread_id })
     }
 
     async fn update_draft(
@@ -856,6 +947,16 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
         ),
         None,
     ));
+    source.add_migration(CodeMigration::new(
+        "004_thread_session_column".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "session_id".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    ));
     source
 }
 
@@ -893,6 +994,7 @@ fn comment_from_row(
     row: &Row,
     thread_id: &str,
     anchor: &DraftAnchor,
+    session_id: Option<String>,
 ) -> Result<DraftComment, ReviewError> {
     Ok(DraftComment {
         comment_id: required_text(row, "comment_id")?,
@@ -901,6 +1003,7 @@ fn comment_from_row(
         body: required_text(row, "body")?,
         created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
         updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+        session_id,
     })
 }
 
@@ -908,6 +1011,11 @@ fn required_text(row: &Row, column: &'static str) -> Result<String, ReviewError>
     row.get(column)
         .and_then(|value| value.as_str().map(ToString::to_string))
         .ok_or(ReviewError::MissingColumn(column))
+}
+
+fn optional_text(row: &Row, column: &'static str) -> Option<String> {
+    row.get(column)
+        .and_then(|value| value.as_str().map(ToString::to_string))
 }
 
 fn required_i64(row: &Row, column: &'static str) -> Result<i64, ReviewError> {

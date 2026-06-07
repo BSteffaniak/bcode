@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use bcode_client::BcodeClient;
+use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -22,6 +23,7 @@ const LIST_DRAFTS_OPERATION: &str = "draft.list";
 const SAVE_DRAFT_OPERATION: &str = "draft.save";
 const DELETE_DRAFT_OPERATION: &str = "draft.delete";
 const UPDATE_DRAFT_OPERATION: &str = "draft.update";
+const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
 /// Local Git target to open in review mode.
@@ -127,6 +129,26 @@ pub async fn run<W: Write>(
                     app.restore_updated_draft(update);
                     app.status_message =
                         Some(format!("update failed; restored local draft: {error}"));
+                }
+            }
+            needs_redraw = true;
+        }
+        if let Some(ask) = app.take_pending_agent_session() {
+            match create_agent_session(
+                &client,
+                repo_path.clone(),
+                review_target.clone(),
+                &app,
+                ask.clone(),
+            )
+            .await
+            {
+                Ok(session_id) => {
+                    app.mark_thread_session(&ask.anchor, session_id.to_string());
+                    app.status_message = Some(format!("created Bcode session {session_id}"));
+                }
+                Err(error) => {
+                    app.status_message = Some(format!("failed to create Bcode session: {error}"));
                 }
             }
             needs_redraw = true;
@@ -274,6 +296,57 @@ async fn update_draft(
     Ok(())
 }
 
+async fn create_agent_session(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    app: &ReviewApp,
+    ask: PendingAgentSession,
+) -> Result<SessionId, TuiError> {
+    let session = client
+        .create_session_in_working_directory(
+            Some(format!("Review: {}", ask.anchor.path)),
+            app.review.repo_root.clone(),
+        )
+        .await?;
+    let prompt = app.agent_session_prompt(&ask);
+    client.send_user_message(session.id, prompt).await?;
+    link_thread_session(client, repo_path, target, ask.anchor, session.id).await?;
+    Ok(session.id)
+}
+
+async fn link_thread_session(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    anchor: ReviewCommentAnchor,
+    session_id: SessionId,
+) -> Result<(), TuiError> {
+    let request = LinkThreadSessionRequest {
+        repo_path,
+        target,
+        anchor: anchor.into(),
+        session_id: session_id.to_string(),
+    };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            LINK_THREAD_SESSION_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let _: LinkThreadSessionResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(())
+}
+
 fn handle_event<W: Write>(
     app: &mut ReviewApp,
     terminal: &mut Terminal<&mut W>,
@@ -362,6 +435,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
+        KeyCode::Char('a') => app.ask_bcode_about_selection(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
             true
@@ -498,6 +572,19 @@ struct UpdateDraftResponse {
     updated_at_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LinkThreadSessionRequest {
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    anchor: DraftAnchor,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct LinkThreadSessionResponse {
+    thread_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DraftAnchor {
     file_path: String,
@@ -515,6 +602,8 @@ struct DraftComment {
     body: String,
     created_at_ms: u64,
     updated_at_ms: u64,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -689,6 +778,8 @@ pub struct ReviewDraftComment {
     pub created_at_ms: Option<u64>,
     /// Last update timestamp in milliseconds since Unix epoch.
     pub updated_at_ms: Option<u64>,
+    /// Linked Bcode session id.
+    pub session_id: Option<String>,
 }
 
 /// Pending draft comment persistence request.
@@ -720,6 +811,15 @@ pub struct PendingDraftUpdate {
     pub previous_body: String,
     /// New body.
     pub new_body: String,
+}
+
+/// Pending Bcode agent session request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgentSession {
+    /// Thread anchor.
+    pub anchor: ReviewCommentAnchor,
+    /// Optional selected draft body.
+    pub draft_body: Option<String>,
 }
 
 /// Draft comment editor mode.
@@ -803,6 +903,8 @@ pub struct ReviewApp {
     pub pending_draft_delete: Option<PendingDraftDelete>,
     /// Draft comment awaiting update.
     pub pending_draft_update: Option<PendingDraftUpdate>,
+    /// Review thread awaiting Bcode session creation.
+    pub pending_agent_session: Option<PendingAgentSession>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
 }
@@ -826,6 +928,7 @@ impl ReviewApp {
             pending_draft_save: None,
             pending_draft_delete: None,
             pending_draft_update: None,
+            pending_agent_session: None,
             last_file_area: None,
             last_diff_area: None,
         }
@@ -1096,6 +1199,7 @@ impl ReviewApp {
                         persisted: false,
                         created_at_ms: None,
                         updated_at_ms: None,
+                        session_id: None,
                     });
                 self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
                 let count = self.draft_comment_count();
@@ -1133,6 +1237,22 @@ impl ReviewApp {
         self.pending_draft_update.take()
     }
 
+    /// Take the pending Bcode agent session request, if present.
+    pub const fn take_pending_agent_session(&mut self) -> Option<PendingAgentSession> {
+        self.pending_agent_session.take()
+    }
+
+    /// Mark the latest draft at an anchor as linked to a Bcode session.
+    pub fn mark_thread_session(&mut self, anchor: &ReviewCommentAnchor, session_id: String) {
+        if let Some(comment) = self
+            .draft_comments
+            .get_mut(anchor)
+            .and_then(|comments| comments.last_mut())
+        {
+            comment.session_id = Some(session_id);
+        }
+    }
+
     /// Restore a locally updated draft after persistence failure.
     pub fn restore_updated_draft(&mut self, update: PendingDraftUpdate) {
         self.update_local_draft_body(&update.anchor, &update.comment_id, update.previous_body);
@@ -1162,6 +1282,87 @@ impl ReviewApp {
         };
         comment.body = body;
         comment.persisted = false;
+    }
+
+    /// Ask Bcode about the selected review line/thread.
+    pub fn ask_bcode_about_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a diff line to ask Bcode".to_string());
+            return true;
+        };
+        let draft_body = self
+            .draft_comments
+            .get(&anchor)
+            .and_then(|comments| comments.last())
+            .map(|comment| comment.body.clone());
+        self.pending_agent_session = Some(PendingAgentSession { anchor, draft_body });
+        self.status_message = Some("creating Bcode session for review thread".to_string());
+        true
+    }
+
+    /// Return a prompt for a pending Bcode agent session.
+    #[must_use]
+    pub fn agent_session_prompt(&self, ask: &PendingAgentSession) -> String {
+        let hunk = self.hunk_context_for_anchor(&ask.anchor);
+        let other_comment_count = self.draft_comment_count().saturating_sub(usize::from(
+            self.draft_comments
+                .get(&ask.anchor)
+                .is_some_and(|comments| !comments.is_empty()),
+        ));
+        format!(
+            "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nDiff row: {}\nOld line: {}\nNew line: {}\nLine kind: {:?}\nOther draft comment threads in this review: {}\n\nCurrent draft/comment:\n{}\n\nNearby diff hunk/context:\n```diff\n{}\n```\n\nPlease analyze this review thread. Keep the anchored file and line context in mind. If broader context is needed, inspect the repository from the session working directory.",
+            self.review.title,
+            self.review.repo_root.display(),
+            ask.anchor.path,
+            ask.anchor.diff_row,
+            ask.anchor
+                .old_line
+                .map_or_else(|| "none".to_string(), |line| line.to_string()),
+            ask.anchor
+                .new_line
+                .map_or_else(|| "none".to_string(), |line| line.to_string()),
+            ask.anchor.line_kind,
+            other_comment_count,
+            ask.draft_body.as_deref().unwrap_or("(no draft body yet)"),
+            hunk,
+        )
+    }
+
+    fn hunk_context_for_anchor(&self, anchor: &ReviewCommentAnchor) -> String {
+        let Some(file) = self.review.files.get(anchor.file_index) else {
+            return String::new();
+        };
+        let mut row = 0usize;
+        for hunk in &file.hunks {
+            let hunk_start_row = row;
+            row = row.saturating_add(1);
+            let hunk_end_row = row.saturating_add(hunk.lines.len());
+            if anchor.diff_row < hunk_start_row || anchor.diff_row >= hunk_end_row {
+                row = hunk_end_row;
+                continue;
+            }
+            let mut lines = Vec::with_capacity(hunk.lines.len().saturating_add(1));
+            lines.push(format!(
+                "@@ -{},{} +{},{} @@{}",
+                hunk.old_start,
+                hunk.old_count,
+                hunk.new_start,
+                hunk.new_count,
+                hunk.heading
+                    .as_ref()
+                    .map_or(String::new(), |heading| format!(" {heading}")),
+            ));
+            lines.extend(hunk.lines.iter().map(|line| {
+                let marker = match line.kind {
+                    ReviewLineKind::Context => ' ',
+                    ReviewLineKind::Added => '+',
+                    ReviewLineKind::Removed => '-',
+                };
+                format!("{marker}{}", line.content)
+            }));
+            return lines.join("\n");
+        }
+        String::new()
     }
 
     /// Delete the latest draft comment at the selected line.
@@ -1208,6 +1409,7 @@ impl ReviewApp {
                         persisted: true,
                         created_at_ms: Some(draft.created_at_ms),
                         updated_at_ms: Some(draft.updated_at_ms),
+                        session_id: draft.session_id,
                     });
             }
         }
@@ -1499,6 +1701,7 @@ mod tests {
             body: "Before".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            session_id: None,
         }]);
 
         assert!(app.open_latest_draft_editor());
@@ -1535,6 +1738,7 @@ mod tests {
             body: "Persisted".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            session_id: None,
         }]);
 
         assert_eq!(app.draft_comment_count(), 1);

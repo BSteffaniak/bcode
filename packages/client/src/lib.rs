@@ -525,10 +525,24 @@ impl BcodeClient {
         &self,
         name: Option<String>,
     ) -> Result<SessionSummary, ClientError> {
+        self.create_session_in_working_directory(name, current_working_directory())
+            .await
+    }
+
+    /// Create a session in a specific working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn create_session_in_working_directory(
+        &self,
+        name: Option<String>,
+        working_directory: std::path::PathBuf,
+    ) -> Result<SessionSummary, ClientError> {
         match self
             .send_request(Request::CreateSession {
                 name,
-                working_directory: current_working_directory(),
+                working_directory,
             })
             .await?
         {
