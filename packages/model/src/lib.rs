@@ -216,6 +216,20 @@ impl From<ProviderRequestValue> for serde_json::Value {
     }
 }
 
+/// Auth/security diagnostic surfaced while resolving provider credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthDiagnostic {
+    /// Severity level, for example `info`, `warning`, or `error`.
+    pub severity: String,
+    /// Stable diagnostic code.
+    pub code: String,
+    /// Human-readable diagnostic message.
+    pub message: String,
+    /// Optional remediation guidance.
+    #[serde(default)]
+    pub remediation: Option<String>,
+}
+
 /// Provider-neutral authentication material resolved by the client from the selected auth profile.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAuthContext {
@@ -237,6 +251,9 @@ pub struct ProviderAuthContext {
     /// Optional persistence references for credentials that can be refreshed/updated.
     #[serde(default)]
     pub storage: BTreeMap<String, ProviderAuthStorageRef>,
+    /// Non-secret diagnostics produced while materializing auth.
+    #[serde(default)]
+    pub diagnostics: Vec<ProviderAuthDiagnostic>,
 }
 
 /// Secret credential value supplied to a provider plugin.

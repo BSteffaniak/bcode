@@ -1377,6 +1377,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_config",
  "bcode_model",
+ "serde",
  "sha2 0.10.9",
  "sshenv_vault",
 ]
@@ -1532,6 +1533,7 @@ dependencies = [
  "bcode_ipc",
  "bcode_markdown_render",
  "bcode_model",
+ "bcode_provider_auth",
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_syntax_render",

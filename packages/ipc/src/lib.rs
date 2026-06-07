@@ -1287,6 +1287,7 @@ mod tests {
                                 vault: Some("/tmp/vault".to_string()),
                             },
                         )]),
+                        diagnostics: Vec::new(),
                     }),
                     ..bcode_model::ProviderRequestContext::default()
                 },

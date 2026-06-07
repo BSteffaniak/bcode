@@ -30,6 +30,7 @@ pub fn resolve_auth_profile(
     let mut storage_profile = auth_profile_name.to_string();
     let mut storage_vault = None;
 
+    let mut diagnostics = Vec::new();
     match auth_profile.backend.as_str() {
         "sshenv" => {
             let vault = auth_profile
@@ -45,7 +46,7 @@ pub fn resolve_auth_profile(
             let store =
                 sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault.clone()));
             let policy = security::device_seal_policy_for_auth_profile(auth_profile);
-            match security::reconcile_auth_vault_security(
+            let report = security::reconcile_auth_vault_security_report(
                 &vault,
                 profile,
                 policy,
@@ -53,21 +54,8 @@ pub fn resolve_auth_profile(
                     .settings
                     .get("recipient_key")
                     .map(String::as_str),
-            ) {
-                Ok(actions) => {
-                    for action in actions {
-                        eprintln!("Auth vault security: {action}");
-                    }
-                }
-                Err(error) if policy == security::AuthDeviceSealPolicy::Preferred => {
-                    eprintln!("Auth vault security refresh skipped for profile {profile}: {error}");
-                }
-                Err(error) => {
-                    eprintln!(
-                        "Auth vault security requirement is not satisfied for profile {profile}: {error}"
-                    );
-                }
-            }
+            );
+            diagnostics.extend(report.diagnostics);
             if let Ok(Some(profile_env)) = store.get_profile(profile) {
                 for (key, value) in profile_env {
                     env.entry(key).or_insert_with(|| value.to_string());
@@ -87,6 +75,7 @@ pub fn resolve_auth_profile(
         &storage_profile,
         storage_vault.as_deref(),
         &env,
+        diagnostics,
     );
     ResolvedProviderAuth { auth, env }
 }
@@ -179,6 +168,7 @@ fn provider_auth_context(
     storage_profile: &str,
     storage_vault: Option<&str>,
     env: &BTreeMap<String, String>,
+    diagnostics: Vec<security::AuthSecurityDiagnostic>,
 ) -> bcode_model::ProviderAuthContext {
     let source_keys = auth_credential_source_keys(auth_profile);
     let credentials = source_keys
@@ -222,6 +212,15 @@ fn provider_auth_context(
         credentials,
         attributes: auth_profile.settings.clone(),
         storage,
+        diagnostics: diagnostics
+            .into_iter()
+            .map(|diagnostic| bcode_model::ProviderAuthDiagnostic {
+                severity: diagnostic.severity.as_str().to_string(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+                remediation: diagnostic.remediation,
+            })
+            .collect(),
     }
 }
 

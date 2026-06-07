@@ -1171,6 +1171,18 @@ fn auth_status() -> Result<(), CliError> {
             );
         }
     }
+    if !resolved.auth.diagnostics.is_empty() {
+        println!("Auth security diagnostics:");
+        for diagnostic in &resolved.auth.diagnostics {
+            println!(
+                "  {} [{}]: {}",
+                diagnostic.severity, diagnostic.code, diagnostic.message
+            );
+            if let Some(remediation) = &diagnostic.remediation {
+                println!("    remediation: {remediation}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1562,27 +1574,39 @@ fn apply_auth_device_seal_policy(
     policy: bcode_provider_auth::security::AuthDeviceSealPolicy,
     recipient_key: Option<&str>,
 ) -> Result<(), CliError> {
-    match bcode_provider_auth::security::reconcile_auth_vault_security(
+    match bcode_provider_auth::security::reconcile_auth_vault_security_report(
         vault_path,
         profile,
         policy,
         recipient_key,
-    ) {
-        Ok(actions) => {
-            for action in actions {
-                eprintln!("Auth vault security: {action}");
+    )
+    .diagnostics
+    .as_slice()
+    {
+        [] => Ok(()),
+        diagnostics => {
+            for diagnostic in diagnostics {
+                println!(
+                    "Auth vault security {} [{}]: {}",
+                    diagnostic.severity.as_str(),
+                    diagnostic.code,
+                    diagnostic.message
+                );
+                if let Some(remediation) = &diagnostic.remediation {
+                    println!("  remediation: {remediation}");
+                }
             }
-            Ok(())
+            if diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity
+                    == bcode_provider_auth::security::AuthSecurityDiagnosticSeverity::Error
+            }) {
+                Err(CliError::BundledPluginInstallFailed(
+                    "auth vault security requirement is not satisfied".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
         }
-        Err(error) if policy == bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred => {
-            eprintln!(
-                "Auth vault security refresh skipped for profile {profile}; continuing because device_seal is preferred: {error}"
-            );
-            Ok(())
-        }
-        Err(error) => Err(CliError::BundledPluginInstallFailed(format!(
-            "auth vault security requirement is not satisfied for profile {profile}: {error}"
-        ))),
     }
 }
 
