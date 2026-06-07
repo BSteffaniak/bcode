@@ -14,6 +14,8 @@ use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt::Write as _;
+use std::path::Path;
+use std::process::Command;
 use thiserror::Error;
 
 const PUBLISHER_ID: &str = "github_pr_review";
@@ -61,8 +63,8 @@ fn github_manifest() -> ReviewPublisherManifest {
         options_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "repository": { "type": "string", "description": "GitHub repository, owner/repo", "required": true },
-                "pull_request": { "type": "string", "description": "Pull request number", "required": true },
+                "repository": { "type": "string", "description": "GitHub repository, owner/repo. Defaults to gh repo view, then origin remote." },
+                "pull_request": { "type": "string", "description": "Pull request number. Defaults to gh pr view, then branch patterns like pr/123." },
                 "token_env": { "type": "string", "description": "GitHub token env var", "default": "GITHUB_TOKEN" },
                 "submit_event": { "type": "string", "description": "GitHub review event", "default": "COMMENT", "enum": ["COMMENT", "REQUEST_CHANGES", "APPROVE"] },
                 "summary": { "type": "string", "description": "Optional review summary body" },
@@ -98,12 +100,24 @@ fn submit(request: &ServiceRequest) -> ServiceResponse {
 fn preview_for_request(
     request: &ExternalPublishReviewRequest,
 ) -> Result<PublishReviewPreviewResponse, GitHubPublisherError> {
-    let options = GitHubPublishOptions::from_json(&request.options)?;
+    let options = GitHubPublishOptions::from_json(&request.options, &request.bundle)?;
+    let repository = options.resolve_repository()?;
+    let pull_request = options.resolve_pull_request()?;
+    let auth_source = options.auth_source_for_preview();
     let draft = github_review_draft(&request.bundle, &options);
     let mut output = String::new();
     output.push_str("# GitHub PR review preview\n\n");
-    let _ = writeln!(output, "* Repository: `{}`", options.repository);
-    let _ = writeln!(output, "* Pull request: `#{}`", options.pull_request);
+    let _ = writeln!(
+        output,
+        "* Repository: `{}` ({})",
+        repository.value, repository.source
+    );
+    let _ = writeln!(
+        output,
+        "* Pull request: `#{}` ({})",
+        pull_request.value, pull_request.source
+    );
+    let _ = writeln!(output, "* Auth: {auth_source}");
     let _ = writeln!(output, "* Event: `{}`", options.submit_event);
     let _ = write!(output, "* Inline comments: `{}`\n\n", draft.comments.len());
     if let Some(summary) = &draft.body {
@@ -135,8 +149,9 @@ fn preview_for_request(
 fn submit_for_request(
     request: &ExternalPublishReviewRequest,
 ) -> Result<PublishReviewResponse, GitHubPublisherError> {
-    let options = GitHubPublishOptions::from_json(&request.options)?;
-    let token = options.token()?;
+    let options = GitHubPublishOptions::from_json(&request.options, &request.bundle)?;
+    let resolved = options.resolve()?;
+    let token = resolved.auth.token;
     let mut draft = github_review_draft(&request.bundle, &options);
     if !draft.warnings.is_empty() && !options.fallback_unmapped_to_summary {
         return Err(GitHubPublisherError::UnmappableComments(draft.warnings));
@@ -153,8 +168,8 @@ fn submit_for_request(
         .enable_all()
         .build()?
         .block_on(create_github_review(
-            &options.repository,
-            options.pull_request,
+            &resolved.repository.value,
+            resolved.pull_request.value,
             &token,
             &payload,
         ))?;
@@ -165,7 +180,7 @@ fn submit_for_request(
         message: format!(
             "published {} review comments to GitHub PR #{}",
             payload.comments.len(),
-            options.pull_request
+            resolved.pull_request.value
         ),
     })
 }
@@ -307,8 +322,9 @@ fn thread_body(thread: &ReviewBundleThread) -> String {
 
 #[derive(Debug, Clone)]
 struct GitHubPublishOptions {
-    repository: String,
-    pull_request: u64,
+    repository: Option<String>,
+    pull_request: Option<u64>,
+    repo_root: std::path::PathBuf,
     token_env: String,
     submit_event: String,
     summary: Option<String>,
@@ -316,18 +332,26 @@ struct GitHubPublishOptions {
 }
 
 impl GitHubPublishOptions {
-    fn from_json(value: &serde_json::Value) -> Result<Self, GitHubPublisherError> {
-        let repository = string_option(value, "repository")
-            .ok_or(GitHubPublisherError::MissingOption("repository"))?;
-        if !repository.contains('/') {
+    fn from_json(
+        value: &serde_json::Value,
+        bundle: &ReviewBundle,
+    ) -> Result<Self, GitHubPublisherError> {
+        let repository = string_option(value, "repository");
+        if repository
+            .as_ref()
+            .is_some_and(|repository| !repository.contains('/'))
+        {
             return Err(GitHubPublisherError::InvalidOption(
                 "repository must be owner/repo".to_string(),
             ));
         }
         let pull_request = string_option(value, "pull_request")
-            .ok_or(GitHubPublisherError::MissingOption("pull_request"))?
-            .parse::<u64>()
-            .map_err(|error| GitHubPublisherError::InvalidOption(error.to_string()))?;
+            .map(|pull_request| {
+                pull_request
+                    .parse::<u64>()
+                    .map_err(|error| GitHubPublisherError::InvalidOption(error.to_string()))
+            })
+            .transpose()?;
         let token_env =
             string_option(value, "token_env").unwrap_or_else(|| DEFAULT_TOKEN_ENV.to_string());
         let submit_event = string_option(value, "submit_event")
@@ -344,6 +368,7 @@ impl GitHubPublishOptions {
         Ok(Self {
             repository,
             pull_request,
+            repo_root: bundle.repo_root.clone(),
             token_env,
             submit_event,
             summary: string_option(value, "summary"),
@@ -351,11 +376,182 @@ impl GitHubPublishOptions {
         })
     }
 
-    fn token(&self) -> Result<String, GitHubPublisherError> {
-        env::var(&self.token_env).map_err(|_| GitHubPublisherError::MissingToken {
-            env_var: self.token_env.clone(),
+    fn resolve(&self) -> Result<ResolvedGitHubPublishOptions, GitHubPublisherError> {
+        Ok(ResolvedGitHubPublishOptions {
+            repository: self.resolve_repository()?,
+            pull_request: self.resolve_pull_request()?,
+            auth: self.resolve_auth()?,
         })
     }
+
+    fn resolve_repository(&self) -> Result<ResolvedValue<String>, GitHubPublisherError> {
+        if let Some(repository) = &self.repository {
+            return Ok(ResolvedValue::new(repository.clone(), "options"));
+        }
+        if let Some(repository) = gh_output(
+            &[
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "-q",
+                ".nameWithOwner",
+            ],
+            &self.repo_root,
+        )
+        .ok()
+        .filter(|value| !value.is_empty())
+        {
+            return Ok(ResolvedValue::new(repository, "gh repo view"));
+        }
+        let remote = command_output("git", &["remote", "get-url", "origin"], &self.repo_root)?;
+        parse_github_remote_url(&remote)
+            .map(|repository| ResolvedValue::new(repository, "origin remote"))
+            .ok_or(GitHubPublisherError::MissingRepository)
+    }
+
+    fn resolve_pull_request(&self) -> Result<ResolvedValue<u64>, GitHubPublisherError> {
+        if let Some(pull_request) = self.pull_request {
+            return Ok(ResolvedValue::new(pull_request, "options"));
+        }
+        if let Some(pull_request) = gh_output(
+            &["pr", "view", "--json", "number", "-q", ".number"],
+            &self.repo_root,
+        )
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        {
+            return Ok(ResolvedValue::new(pull_request, "gh pr view"));
+        }
+        let branch = command_output("git", &["branch", "--show-current"], &self.repo_root)?;
+        parse_pull_request_from_branch(&branch)
+            .map(|pull_request| ResolvedValue::new(pull_request, "branch name"))
+            .ok_or(GitHubPublisherError::MissingPullRequest)
+    }
+
+    fn auth_source_for_preview(&self) -> String {
+        if env_token(&self.token_env).is_some() {
+            return format!("{} env var", self.token_env);
+        }
+        if self.token_env != DEFAULT_TOKEN_ENV && env_token(DEFAULT_TOKEN_ENV).is_some() {
+            return "GITHUB_TOKEN env var".to_string();
+        }
+        if env_token("GH_TOKEN").is_some() {
+            return "GH_TOKEN env var".to_string();
+        }
+        if gh_output(&["auth", "status"], &self.repo_root).is_ok() {
+            return "GitHub CLI".to_string();
+        }
+        "unresolved; submit requires token_env, GITHUB_TOKEN, GH_TOKEN, or gh auth login"
+            .to_string()
+    }
+
+    fn resolve_auth(&self) -> Result<ResolvedAuth, GitHubPublisherError> {
+        if let Some(token) = env_token(&self.token_env) {
+            return Ok(ResolvedAuth::new(token));
+        }
+        if self.token_env != DEFAULT_TOKEN_ENV
+            && let Some(token) = env_token(DEFAULT_TOKEN_ENV)
+        {
+            return Ok(ResolvedAuth::new(token));
+        }
+        if let Some(token) = env_token("GH_TOKEN") {
+            return Ok(ResolvedAuth::new(token));
+        }
+        let token = gh_output(&["auth", "token"], &self.repo_root)
+            .map_err(|_| GitHubPublisherError::MissingToken)?;
+        if token.trim().is_empty() {
+            return Err(GitHubPublisherError::MissingToken);
+        }
+        Ok(ResolvedAuth::new(token))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedGitHubPublishOptions {
+    repository: ResolvedValue<String>,
+    pull_request: ResolvedValue<u64>,
+    auth: ResolvedAuth,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedValue<T> {
+    value: T,
+    source: &'static str,
+}
+
+impl<T> ResolvedValue<T> {
+    const fn new(value: T, source: &'static str) -> Self {
+        Self { value, source }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAuth {
+    token: String,
+}
+
+impl ResolvedAuth {
+    const fn new(token: String) -> Self {
+        Self { token }
+    }
+}
+
+fn env_token(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn gh_output(args: &[&str], cwd: &Path) -> Result<String, GitHubPublisherError> {
+    command_output("gh", args, cwd)
+}
+
+fn command_output(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+) -> Result<String, GitHubPublisherError> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(GitHubPublisherError::Command)?;
+    if !output.status.success() {
+        return Err(GitHubPublisherError::CommandFailed {
+            program: program.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_github_remote_url(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    if let Some(path) = trimmed.strip_prefix("git@github.com:") {
+        return owner_repo_from_path(path);
+    }
+    if let Some(path) = trimmed.strip_prefix("https://github.com/") {
+        return owner_repo_from_path(path);
+    }
+    if let Some(path) = trimmed.strip_prefix("ssh://git@github.com/") {
+        return owner_repo_from_path(path);
+    }
+    None
+}
+
+fn owner_repo_from_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+}
+
+fn parse_pull_request_from_branch(branch: &str) -> Option<u64> {
+    branch
+        .trim()
+        .strip_prefix("pull/")
+        .and_then(|rest| rest.split('/').next())
+        .or_else(|| branch.trim().strip_prefix("pr/"))
+        .and_then(|value| value.parse().ok())
 }
 
 fn string_option(value: &serde_json::Value, key: &'static str) -> Option<String> {
@@ -415,20 +611,28 @@ struct GitHubCreateReviewResponse {
 
 #[derive(Debug, Error)]
 enum GitHubPublisherError {
-    #[error("missing required option: {0}")]
-    MissingOption(&'static str),
+    #[error(
+        "missing GitHub repository; pass repository option or run from a GitHub repo with gh/git configured"
+    )]
+    MissingRepository,
+    #[error(
+        "missing GitHub pull request; pass pull_request option or run from a PR branch with gh/git configured"
+    )]
+    MissingPullRequest,
+    #[error("missing GitHub token; set token_env/GITHUB_TOKEN/GH_TOKEN or run gh auth login")]
+    MissingToken,
     #[error("invalid option: {0}")]
     InvalidOption(String),
-    #[error("missing GitHub token env var: {env_var}")]
-    MissingToken { env_var: String },
+    #[error("command failed to start: {0}")]
+    Command(#[from] std::io::Error),
+    #[error("command {program} failed: {stderr}")]
+    CommandFailed { program: String, stderr: String },
     #[error("unmappable comments: {0:?}")]
     UnmappableComments(Vec<String>),
     #[error("GitHub API error: {0}")]
     Api(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("runtime error: {0}")]
-    Runtime(#[from] std::io::Error),
     #[error("serialization failed: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -471,14 +675,17 @@ mod tests {
 
     #[test]
     fn parses_required_options() {
-        let options = GitHubPublishOptions::from_json(&serde_json::json!({
-            "repository": "owner/repo",
-            "pull_request": "123"
-        }))
+        let options = GitHubPublishOptions::from_json(
+            &serde_json::json!({
+                "repository": "owner/repo",
+                "pull_request": "123"
+            }),
+            &empty_bundle(),
+        )
         .expect("parse options");
 
-        assert_eq!(options.repository, "owner/repo");
-        assert_eq!(options.pull_request, 123);
+        assert_eq!(options.repository.as_deref(), Some("owner/repo"));
+        assert_eq!(options.pull_request, Some(123));
         assert_eq!(options.token_env, DEFAULT_TOKEN_ENV);
         assert_eq!(options.submit_event, DEFAULT_SUBMIT_EVENT);
     }
@@ -584,14 +791,47 @@ mod tests {
 
     #[test]
     fn parses_fallback_unmapped_option() {
-        let options = GitHubPublishOptions::from_json(&serde_json::json!({
-            "repository": "owner/repo",
-            "pull_request": "123",
-            "fallback_unmapped_to_summary": "true"
-        }))
+        let options = GitHubPublishOptions::from_json(
+            &serde_json::json!({
+                "repository": "owner/repo",
+                "pull_request": "123",
+                "fallback_unmapped_to_summary": "true"
+            }),
+            &empty_bundle(),
+        )
         .expect("parse options");
 
         assert!(options.fallback_unmapped_to_summary);
+    }
+
+    #[test]
+    fn parses_github_remote_urls() {
+        assert_eq!(
+            parse_github_remote_url("git@github.com:owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            parse_github_remote_url("https://github.com/owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+    }
+
+    #[test]
+    fn parses_pull_request_branch_names() {
+        assert_eq!(parse_pull_request_from_branch("pull/123/head"), Some(123));
+        assert_eq!(parse_pull_request_from_branch("pr/456"), Some(456));
+    }
+
+    fn empty_bundle() -> ReviewBundle {
+        ReviewBundle {
+            review_id: "review".to_string(),
+            title: "Review".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            target: ReviewTarget::WorkingTreeUnstaged,
+            files: Vec::new(),
+            threads: Vec::new(),
+            generated_at_ms: 1,
+        }
     }
 
     fn review_thread(line: ReviewBundleLine) -> ReviewBundleThread {
