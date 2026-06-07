@@ -9,7 +9,8 @@ use bcode_client::BcodeClient;
 use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
-    OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, REVIEW_PUBLISHER_INTERFACE_ID,
+    OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
+    REVIEW_PUBLISHER_INTERFACE_ID,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
@@ -35,6 +36,7 @@ const PUBLISH_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISH_SUBMIT;
 const PUBLISHERS_LIST_OPERATION: &str = OP_REVIEW_PUBLISHERS_LIST;
 const PUBLISH_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISH_PREVIEW;
 const REVIEW_BUNDLE_GET_OPERATION: &str = OP_REVIEW_BUNDLE_GET;
+const REVIEW_REPO_FILE_GET_OPERATION: &str = OP_REVIEW_REPO_FILE_GET;
 const REVIEW_PUBLISHER_MANIFEST_OPERATION: &str = OP_REVIEW_PUBLISHER_MANIFEST;
 const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISHER_PREVIEW;
 const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISHER_SUBMIT;
@@ -70,6 +72,8 @@ pub enum ReviewOpenTarget {
         /// Whether to use merge-base semantics.
         merge_base: bool,
     },
+    /// Browse and review repository files.
+    Repository,
 }
 
 /// Run a full-screen local Git review.
@@ -88,6 +92,7 @@ pub async fn run<W: Write>(
     let drafts = load_drafts(&client, repo_path.clone(), review_target.clone()).await;
     let mut input = TuiInput::start();
     let mut app = ReviewApp::new(review);
+    app.queue_selected_file_load();
     match drafts {
         Ok(drafts) => app.load_persisted_drafts(drafts),
         Err(error) => {
@@ -108,6 +113,13 @@ pub async fn run<W: Write>(
             continue;
         };
         if handle_event(&mut app, terminal, &event) {
+            needs_redraw = true;
+        }
+        if let Some(path) = app.take_pending_file_load() {
+            match load_repository_file(&client, repo_path.clone(), path.clone()).await {
+                Ok(file) => app.store_loaded_file(file),
+                Err(error) => app.status_message = Some(format!("failed to load {path}: {error}")),
+            }
             needs_redraw = true;
         }
         if let Some(save) = app.take_pending_draft_save() {
@@ -552,6 +564,34 @@ async fn load_review(
         });
     }
     serde_json::from_slice(&response.payload).map_err(TuiError::Json)
+}
+
+async fn load_repository_file(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    file_path: String,
+) -> Result<CachedReviewFile, TuiError> {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "repo_path": repo_path,
+        "file_path": file_path,
+    }))
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            REVIEW_REPO_FILE_GET_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: RepositoryFileResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(CachedReviewFile::from_response(response))
 }
 
 async fn load_drafts(
@@ -1040,6 +1080,7 @@ enum ReviewTarget {
         #[serde(default)]
         merge_base: bool,
     },
+    Repository,
 }
 
 impl From<ReviewOpenTarget> for ReviewTarget {
@@ -1067,6 +1108,7 @@ impl From<ReviewOpenTarget> for ReviewTarget {
                 head_branch,
                 merge_base,
             },
+            ReviewOpenTarget::Repository => Self::Repository,
         }
     }
 }
@@ -1135,6 +1177,8 @@ struct DraftAnchor {
     new_end: Option<u32>,
     new_line: Option<u32>,
     line_kind: ReviewLineKind,
+    #[serde(default)]
+    is_file_anchor: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1173,6 +1217,7 @@ impl From<ReviewCommentAnchor> for DraftAnchor {
             old_line: anchor.old_line,
             new_line: anchor.new_line,
             line_kind: anchor.line_kind,
+            is_file_anchor: anchor.is_file_anchor,
         }
     }
 }
@@ -1190,6 +1235,118 @@ pub struct ReviewSummary {
     pub additions: u32,
     /// Total deletions.
     pub deletions: u32,
+}
+
+impl ReviewSummary {
+    /// Return true when this review is browsing repository files instead of a diff.
+    #[must_use]
+    pub fn is_repository_review(&self) -> bool {
+        self.title == "Repository Review"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RepositoryFileResponse {
+    file_path: String,
+    content: Option<String>,
+    size_bytes: u64,
+    #[serde(default)]
+    mtime_ms: Option<u64>,
+    is_binary: bool,
+    #[serde(default)]
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedReviewFile {
+    pub path: String,
+    pub content: String,
+    pub line_spans: Vec<(usize, usize)>,
+    pub size_bytes: u64,
+    pub mtime_ms: Option<u64>,
+    pub is_binary: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl CachedReviewFile {
+    #[must_use]
+    fn from_response(response: RepositoryFileResponse) -> Self {
+        let content = response.content.unwrap_or_default();
+        let line_spans = line_spans(&content);
+        Self {
+            path: response.file_path,
+            content,
+            line_spans,
+            size_bytes: response.size_bytes,
+            mtime_ms: response.mtime_ms,
+            is_binary: response.is_binary,
+            unavailable_reason: response.unavailable_reason,
+        }
+    }
+
+    #[must_use]
+    pub fn line(&self, index: usize) -> Option<&str> {
+        let (start, end) = *self.line_spans.get(index)?;
+        self.content.get(start..end)
+    }
+}
+
+fn line_spans(content: &str) -> Vec<(usize, usize)> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for line in content.split_inclusive('\n') {
+        let end = start + line.trim_end_matches('\n').trim_end_matches('\r').len();
+        spans.push((start, end));
+        start += line.len();
+    }
+    if !content.ends_with('\n') && spans.is_empty() {
+        spans.push((0, content.len()));
+    }
+    spans
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReviewFileCache {
+    entries: BTreeMap<String, CachedReviewFile>,
+    lru: Vec<String>,
+    total_bytes: usize,
+}
+
+impl ReviewFileCache {
+    const MAX_FILES: usize = 128;
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
+
+    #[must_use]
+    pub fn get(&self, path: &str) -> Option<&CachedReviewFile> {
+        self.entries.get(path)
+    }
+
+    pub fn insert(&mut self, file: CachedReviewFile) {
+        let path = file.path.clone();
+        if let Some(existing) = self.entries.remove(&path) {
+            self.total_bytes = self.total_bytes.saturating_sub(existing.content.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(file.content.len());
+        self.entries.insert(path.clone(), file);
+        self.lru.retain(|entry| entry != &path);
+        self.lru.push(path);
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > Self::MAX_FILES || self.total_bytes > Self::MAX_BYTES {
+            let Some(path) = self.lru.first().cloned() else {
+                break;
+            };
+            self.lru.remove(0);
+            if let Some(existing) = self.entries.remove(&path) {
+                self.total_bytes = self.total_bytes.saturating_sub(existing.content.len());
+            }
+        }
+    }
 }
 
 /// Changed file displayed by the TUI.
@@ -1322,6 +1479,8 @@ pub struct ReviewCommentAnchor {
     pub new_end: Option<u32>,
     /// Anchored diff line kind.
     pub line_kind: ReviewLineKind,
+    /// Whether this comment points at a repository file line rather than a diff row.
+    pub is_file_anchor: bool,
 }
 
 impl ReviewCommentAnchor {
@@ -1571,6 +1730,10 @@ pub struct ReviewApp {
     pub pending_publish_request: Option<PendingPublishRequest>,
     /// Available publishers.
     pub publishers: Vec<ReviewPublisherManifest>,
+    /// Repository file cache for read-only file browsing.
+    pub file_cache: ReviewFileCache,
+    /// Repository file path awaiting lazy load.
+    pub pending_file_load: Option<String>,
     /// Selected publisher index.
     pub selected_publisher: usize,
     /// Active publish UI state.
@@ -1588,7 +1751,7 @@ pub struct ReviewApp {
 impl ReviewApp {
     /// Create a new review app.
     #[must_use]
-    pub const fn new(review: ReviewSummary) -> Self {
+    pub fn new(review: ReviewSummary) -> Self {
         Self {
             review,
             selected_file: 0,
@@ -1609,6 +1772,8 @@ impl ReviewApp {
             pending_draft_update: None,
             pending_publish_request: None,
             publishers: Vec::new(),
+            file_cache: ReviewFileCache::default(),
+            pending_file_load: None,
             selected_publisher: 0,
             publish_state: None,
             pending_agent_session: None,
@@ -1736,7 +1901,7 @@ impl ReviewApp {
     }
 
     /// Select a file by index.
-    pub const fn select_file(&mut self, index: usize) -> bool {
+    pub fn select_file(&mut self, index: usize) -> bool {
         if index >= self.review.files.len() || index == self.selected_file {
             return false;
         }
@@ -1745,7 +1910,34 @@ impl ReviewApp {
         self.selected_diff_line = 0;
         self.range_selection_start = None;
         self.sidebar_mode = ReviewSidebarMode::Files;
+        self.queue_selected_file_load();
         true
+    }
+
+    /// Take pending repository file load request.
+    pub const fn take_pending_file_load(&mut self) -> Option<String> {
+        self.pending_file_load.take()
+    }
+
+    /// Store a lazily loaded repository file.
+    pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
+        self.file_cache.insert(file);
+    }
+
+    /// Queue selected repository file for loading when needed.
+    pub fn queue_selected_file_load(&mut self) {
+        if !self.review.is_repository_review() {
+            return;
+        }
+        let Some(path) = self
+            .selected_file_data()
+            .map(|file| file.display_path().to_string())
+        else {
+            return;
+        };
+        if self.file_cache.get(&path).is_none() {
+            self.pending_file_load = Some(path);
+        }
     }
 
     /// Select next file.
@@ -1778,7 +1970,7 @@ impl ReviewApp {
     }
 
     /// Select previous file.
-    pub const fn select_previous_file(&mut self) -> bool {
+    pub fn select_previous_file(&mut self) -> bool {
         self.select_file(self.selected_file.saturating_sub(1))
     }
 
@@ -2689,6 +2881,7 @@ impl ReviewApp {
             new_start: draft.anchor.new_start.or(draft.anchor.new_line),
             new_end: draft.anchor.new_end.or(draft.anchor.new_line),
             line_kind: draft.anchor.line_kind,
+            is_file_anchor: draft.anchor.is_file_anchor,
         })
     }
 
@@ -2702,6 +2895,23 @@ impl ReviewApp {
     #[must_use]
     pub fn comment_anchor_for_row(&self, diff_row: usize) -> Option<ReviewCommentAnchor> {
         let file = self.selected_file_data()?;
+        if self.review.is_repository_review() {
+            let line = u32::try_from(diff_row.saturating_add(1)).ok()?;
+            return Some(ReviewCommentAnchor {
+                file_index: self.selected_file,
+                path: file.display_path().to_string(),
+                diff_row,
+                end_diff_row: None,
+                old_line: None,
+                new_line: Some(line),
+                old_start: None,
+                old_end: None,
+                new_start: Some(line),
+                new_end: Some(line),
+                line_kind: ReviewLineKind::Context,
+                is_file_anchor: true,
+            });
+        }
         let (start_row, end_row) = self.selected_range_bounds().unwrap_or((diff_row, diff_row));
         let start_line = self.diff_line_for_render_row(start_row)?;
         let end_line = self.diff_line_for_render_row(end_row)?;
@@ -2717,6 +2927,7 @@ impl ReviewApp {
             new_start: start_line.new_line.or(end_line.new_line),
             new_end: end_line.new_line.or(start_line.new_line),
             line_kind: start_line.kind,
+            is_file_anchor: self.review.is_repository_review(),
         })
     }
 
@@ -2778,6 +2989,12 @@ impl ReviewApp {
         let Some(file) = self.selected_file_data() else {
             return 1;
         };
+        if self.review.is_repository_review() {
+            return self
+                .file_cache
+                .get(file.display_path())
+                .map_or(1, |file| file.line_spans.len().max(1));
+        }
         if file.is_binary {
             return 1;
         }
@@ -2995,6 +3212,7 @@ mod tests {
                 old_line: None,
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,
+                is_file_anchor: false,
             },
             body: "Before".to_string(),
             created_at_ms: 1,
@@ -3038,6 +3256,7 @@ mod tests {
                 old_line: None,
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,
+                is_file_anchor: false,
             },
             body: "Persisted".to_string(),
             created_at_ms: 1,

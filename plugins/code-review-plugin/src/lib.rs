@@ -7,8 +7,9 @@
 use bcode_code_review_models::{
     DeleteDraftRequest, DeleteDraftResponse, DraftAnchor, DraftComment, GetReviewDiffRequest,
     GetReviewThreadRequest, LinkThreadSessionRequest, LinkThreadSessionResponse, ListDraftsRequest,
-    ListDraftsResponse, ListReviewPublishersResponse, PublishReviewPreviewResponse,
-    PublishReviewRequest, PublishReviewResponse, ReviewBundle, ReviewBundleLine,
+    ListDraftsResponse, ListReviewPublishersResponse, OP_REVIEW_REPO_FILE_GET,
+    PublishReviewPreviewResponse, PublishReviewRequest, PublishReviewResponse,
+    RepositoryFileRequest, RepositoryFileResponse, ReviewBundle, ReviewBundleLine,
     ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
     ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublisherCapabilities, ReviewPublisherManifest,
     ReviewTarget, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse,
@@ -72,6 +73,7 @@ const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REPOSITORY_FILE_BYTES: u64 = 1_000_000;
 
 /// Code review state location preference.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +122,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_THREAD_GET => review_thread_get(&context),
             OP_REVIEW_DIFF_GET => review_diff_get(&context),
             OP_REVIEW_BUNDLE_GET => review_bundle_get(&context),
+            OP_REVIEW_REPO_FILE_GET => review_repo_file_get(&context.request),
             OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
             OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
             OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
@@ -247,6 +250,17 @@ enum ReviewError {
     Io(#[from] std::io::Error),
     #[error("unsupported review publisher: {0}")]
     UnsupportedPublisher(String),
+}
+
+fn review_repo_file_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<RepositoryFileRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match repository_file_get(&request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("repo_file_get_failed", error.to_string()),
+    }
 }
 
 fn create_review(request: &ServiceRequest) -> ServiceResponse {
@@ -1153,10 +1167,73 @@ fn resolve_repo_root(repo_path: &Path) -> Result<PathBuf, ReviewError> {
     Ok(PathBuf::from(repo_root.trim()))
 }
 
+fn repository_file_get(
+    request: &RepositoryFileRequest,
+) -> Result<RepositoryFileResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let relative_path = Path::new(&request.file_path);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ReviewError::InvalidRequest(
+            "file_path must be repository-relative".to_string(),
+        ));
+    }
+    let path = repo_root.join(relative_path);
+    let metadata = std::fs::metadata(&path)?;
+    let size_bytes = metadata.len();
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    if size_bytes > MAX_REPOSITORY_FILE_BYTES {
+        return Ok(RepositoryFileResponse {
+            file_path: request.file_path.clone(),
+            content: None,
+            size_bytes,
+            mtime_ms,
+            is_binary: false,
+            unavailable_reason: Some(format!(
+                "file is larger than {MAX_REPOSITORY_FILE_BYTES} bytes"
+            )),
+        });
+    }
+    let bytes = std::fs::read(&path)?;
+    let is_binary = bytes.contains(&0);
+    if is_binary {
+        return Ok(RepositoryFileResponse {
+            file_path: request.file_path.clone(),
+            content: None,
+            size_bytes,
+            mtime_ms,
+            is_binary: true,
+            unavailable_reason: Some("binary file".to_string()),
+        });
+    }
+    let content = String::from_utf8(bytes).map_err(|error| {
+        ReviewError::InvalidRequest(format!("file is not valid UTF-8: {error}"))
+    })?;
+    Ok(RepositoryFileResponse {
+        file_path: request.file_path.clone(),
+        content: Some(content),
+        size_bytes,
+        mtime_ms,
+        is_binary: false,
+        unavailable_reason: None,
+    })
+}
+
 fn create_review_summary(request: &CreateReviewRequest) -> Result<ReviewSummary, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
-    let diff = diff_for_target(&repo_root, &request.target)?;
-    let files = parse_unified_diff(&diff)?;
+    let files = if matches!(request.target, ReviewTarget::Repository) {
+        repository_review_files(&repo_root)?
+    } else {
+        let diff = diff_for_target(&repo_root, &request.target)?;
+        parse_unified_diff(&diff)?
+    };
     let additions = files.iter().map(|file| file.additions).sum();
     let deletions = files.iter().map(|file| file.deletions).sum();
 
@@ -1216,6 +1293,7 @@ impl<'a> CodeReviewDb<'a> {
                 old_line: optional_i64(&thread, "old_line").map(i64_to_u32),
                 new_line: optional_i64(&thread, "new_line").map(i64_to_u32),
                 line_kind: line_kind_from_str(&required_text(&thread, "line_kind")?)?,
+                is_file_anchor: false,
             };
             let comment_rows = self
                 .db
@@ -1730,6 +1808,7 @@ const fn target_kind(target: &ReviewTarget) -> &'static str {
         ReviewTarget::LastCommit => "last_commit",
         ReviewTarget::CommitRange { .. } => "commit_range",
         ReviewTarget::BranchCompare { .. } => "branch_compare",
+        ReviewTarget::Repository => "repository",
     }
 }
 
@@ -1780,6 +1859,23 @@ fn i64_to_u32(value: i64) -> u32 {
     u32::try_from(value).unwrap_or(0)
 }
 
+fn repository_review_files(repo_root: &Path) -> Result<Vec<ReviewFile>, ReviewError> {
+    let output = git_output(repo_root, &["ls-files"])?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|path| ReviewFile {
+            old_path: None,
+            new_path: Some(path.to_string()),
+            status: ReviewFileStatus::Unknown,
+            additions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            is_binary: false,
+        })
+        .collect())
+}
+
 fn diff_for_target(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewError> {
     match target {
         ReviewTarget::WorkingTreeUnstaged => git_output(repo_root, &["diff", "--find-renames"]),
@@ -1814,6 +1910,7 @@ fn diff_for_target(repo_root: &Path, target: &ReviewTarget) -> Result<String, Re
                 &range_spec(base_branch, head_branch, *merge_base),
             ],
         ),
+        ReviewTarget::Repository => Ok(String::new()),
     }
 }
 
@@ -1836,6 +1933,7 @@ fn target_title(target: &ReviewTarget) -> String {
             "{base_branch}{}{head_branch}",
             if *merge_base { "..." } else { ".." }
         ),
+        ReviewTarget::Repository => "Repository Review".to_string(),
     }
 }
 

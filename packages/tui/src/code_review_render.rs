@@ -332,6 +332,10 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
+    if app.review.is_repository_review() {
+        render_repository_file(app, area, frame);
+        return;
+    }
     let Some(file) = app.selected_file_data() else {
         render_empty(area, "No changed files", frame);
         return;
@@ -386,6 +390,55 @@ fn render_empty(area: Rect, text: &str, frame: &mut Frame<'_>) {
             Style::new().fg(Color::BrightBlack),
         )]),
     );
+}
+
+fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some(file) = app.selected_file_data() else {
+        render_empty(area, "No files", frame);
+        return;
+    };
+    let path = file.display_path();
+    let Some(cached) = app.file_cache.get(path) else {
+        render_empty(area, "Loading file…", frame);
+        return;
+    };
+    if let Some(reason) = &cached.unavailable_reason {
+        render_empty(area, reason, frame);
+        return;
+    }
+    let visible = usize::from(area.height);
+    for row in 0..visible {
+        let index = app.diff_scroll.saturating_add(row);
+        let y = area
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        if y >= area.bottom() {
+            break;
+        }
+        let Some(content) = cached.line(index) else {
+            break;
+        };
+        let style = if index == app.selected_diff_line {
+            Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::new()
+        };
+        let line_number = format!("{:>5} ", index.saturating_add(1));
+        let line = Line::from_spans(vec![
+            Span::styled(line_number, Style::new().fg(Color::BrightBlack)),
+            Span::styled(content.to_string(), style),
+        ]);
+        frame.write_line_with_fallback_style(
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+            &line,
+            style,
+        );
+    }
 }
 
 fn rendered_rows(file: &ReviewFile) -> Vec<RenderedRow> {

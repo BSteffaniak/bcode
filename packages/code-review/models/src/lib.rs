@@ -20,6 +20,8 @@ pub const OP_REVIEW_PUBLISHERS_LIST: &str = "review.publishers.list";
 pub const OP_REVIEW_PUBLISH_PREVIEW: &str = "review.publish.preview";
 /// Operation that submits a review publish operation.
 pub const OP_REVIEW_PUBLISH_SUBMIT: &str = "review.publish.submit";
+/// Operation that returns repository file content for review browsing.
+pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 /// Operation that returns an external publisher manifest.
 pub const OP_REVIEW_PUBLISHER_MANIFEST: &str = "review.publisher.manifest";
 /// Operation that previews an external publisher request.
@@ -59,6 +61,8 @@ pub enum ReviewTarget {
         #[serde(default = "default_true")]
         merge_base: bool,
     },
+    /// Review the repository as browsable read-only files.
+    Repository,
 }
 
 /// Request payload for `draft.list`.
@@ -223,6 +227,9 @@ pub struct DraftAnchor {
     pub new_line: Option<u32>,
     /// Anchor line kind.
     pub line_kind: ReviewLineKind,
+    /// Whether this anchor points at a full repository file line rather than a diff row.
+    #[serde(default)]
+    pub is_file_anchor: bool,
 }
 
 /// Persisted draft comment.
@@ -320,6 +327,34 @@ pub struct ReviewLine {
     pub new_line: Option<u32>,
     /// Line content without the leading unified diff marker.
     pub content: String,
+}
+
+/// Request payload for repository file browsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryFileRequest {
+    /// Repository path where the file should be read.
+    pub repo_path: PathBuf,
+    /// Repository-relative file path.
+    pub file_path: String,
+}
+
+/// Response payload for repository file browsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryFileResponse {
+    /// Repository-relative file path.
+    pub file_path: String,
+    /// UTF-8 file content when available.
+    pub content: Option<String>,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// File modification timestamp in milliseconds since Unix epoch, when available.
+    #[serde(default)]
+    pub mtime_ms: Option<u64>,
+    /// Whether the file appears binary.
+    pub is_binary: bool,
+    /// Optional unavailable reason.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
 }
 
 /// Parsed review file.

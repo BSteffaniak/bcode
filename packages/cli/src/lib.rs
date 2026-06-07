@@ -377,6 +377,12 @@ enum ReviewCommand {
         #[arg(long)]
         two_dot: bool,
     },
+    /// Browse repository files and comment anywhere.
+    Repo {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Publish a review to GitHub without opening the TUI.
     PublishGithub {
         /// GitHub repository in owner/repo form.
@@ -856,6 +862,9 @@ async fn handle_review_command(command: ReviewCommand) -> Result<(), CliError> {
                 merge_base: !two_dot,
             },
         ),
+        ReviewCommand::Repo { repo } => {
+            (repo, bcode_tui::code_review::ReviewOpenTarget::Repository)
+        }
         ReviewCommand::PublishGithub {
             github_repo,
             pr,

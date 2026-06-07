@@ -854,6 +854,7 @@ mod tests {
                 old_line: line.old_line,
                 new_line: line.new_line,
                 line_kind: line.kind,
+                is_file_anchor: false,
             },
             comments: vec![DraftComment {
                 comment_id: "comment".to_string(),
@@ -870,6 +871,7 @@ mod tests {
                     old_line: line.old_line,
                     new_line: line.new_line,
                     line_kind: line.kind,
+                    is_file_anchor: false,
                 },
                 body: "comment body".to_string(),
                 created_at_ms: 1,
