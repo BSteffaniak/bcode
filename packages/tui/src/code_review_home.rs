@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
@@ -699,12 +700,7 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         } else {
             Style::new().fg(Color::White).bg(Color::Black)
         };
-        let source_count = workspace
-            .sources
-            .iter()
-            .filter(|source| source.included)
-            .count();
-        let text = format!(" {}  {} source(s)", workspace.title, source_count);
+        let text = workspace_row_text(workspace);
         frame.write_line(
             Rect::new(
                 area.x,
@@ -715,6 +711,50 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
             ),
             &Line::from_spans(vec![Span::styled(text, style)]),
         );
+    }
+}
+
+fn workspace_row_text(workspace: &ReviewWorkspace) -> String {
+    let source_count = workspace
+        .sources
+        .iter()
+        .filter(|source| source.included)
+        .count();
+    let updated = workspace
+        .updated_at_ms
+        .or(workspace.created_at_ms)
+        .map_or_else(|| "unknown".to_string(), relative_time_label);
+    let sources = workspace
+        .sources
+        .iter()
+        .filter(|source| source.included)
+        .take(3)
+        .map(|source| source.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if sources.is_empty() {
+        format!("{source_count} source(s)")
+    } else if source_count > 3 {
+        format!("{source_count} source(s): {sources}, …")
+    } else {
+        format!("{source_count} source(s): {sources}")
+    };
+    format!(" {}  · {}  · {}", workspace.title, updated, suffix)
+}
+
+fn relative_time_label(timestamp_ms: u64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    let elapsed_seconds = now_ms.saturating_sub(timestamp_ms) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", elapsed_seconds / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed_seconds / 3_600),
+        86_400..=604_799 => format!("{}d ago", elapsed_seconds / 86_400),
+        _ => format!("{}w ago", elapsed_seconds / 604_800),
     }
 }
 
