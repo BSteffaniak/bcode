@@ -968,81 +968,113 @@ fn review_bundle_for_request(request: ReviewContextRequest) -> Result<ReviewBund
 }
 
 fn builtin_publishers() -> Vec<ReviewPublisherManifest> {
-    vec![ReviewPublisherManifest {
-        id: "markdown_file".to_string(),
-        label: "Markdown file".to_string(),
-        description: "Write a local Markdown review export".to_string(),
-        capabilities: ReviewPublisherCapabilities {
-            preview: true,
-            submit: true,
-            update_existing: true,
-            supports_threads: true,
-            supports_ranges: true,
-            supports_inline_comments: true,
-            supports_summary_comment: true,
+    vec![
+        ReviewPublisherManifest {
+            id: "markdown_file".to_string(),
+            label: "Markdown file".to_string(),
+            description: "Write a local Markdown review export".to_string(),
+            capabilities: file_publisher_capabilities(),
+            options_schema: file_publisher_options_schema(),
         },
-        options_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "output_path": { "type": "string", "description": "Optional output path" }
-            }
-        }),
-    }]
+        ReviewPublisherManifest {
+            id: "json_file".to_string(),
+            label: "JSON file".to_string(),
+            description: "Write a local JSON review bundle".to_string(),
+            capabilities: file_publisher_capabilities(),
+            options_schema: file_publisher_options_schema(),
+        },
+    ]
+}
+
+const fn file_publisher_capabilities() -> ReviewPublisherCapabilities {
+    ReviewPublisherCapabilities {
+        preview: true,
+        submit: true,
+        update_existing: true,
+        supports_threads: true,
+        supports_ranges: true,
+        supports_inline_comments: true,
+        supports_summary_comment: true,
+    }
+}
+
+fn file_publisher_options_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "output_path": { "type": "string", "description": "Optional output path" }
+        }
+    })
 }
 
 fn publish_preview_for_request(
     request: PublishReviewRequest,
 ) -> Result<PublishReviewPreviewResponse, ReviewError> {
-    ensure_publisher_supported(&request.publisher_id)?;
     let publisher_id = request.publisher_id.clone();
     let bundle = review_bundle_for_request(ReviewContextRequest {
         repo_path: request.repo_path,
         target: request.target,
     })?;
     Ok(PublishReviewPreviewResponse {
+        preview: render_publisher_output(&publisher_id, &bundle)?,
         publisher_id,
-        preview: publish_markdown(&bundle),
     })
 }
 
 fn publish_submit_for_request(
     request: PublishReviewRequest,
 ) -> Result<PublishReviewResponse, ReviewError> {
-    ensure_publisher_supported(&request.publisher_id)?;
     let output_path = request
         .options
         .get("output_path")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from);
+    let publisher_id = request.publisher_id;
     let bundle = review_bundle_for_request(ReviewContextRequest {
         repo_path: request.repo_path,
         target: request.target,
     })?;
-    let markdown = publish_markdown(&bundle);
+    let rendered = render_publisher_output(&publisher_id, &bundle)?;
+    let extension = publisher_file_extension(&publisher_id)?;
     let path = output_path.unwrap_or_else(|| {
         bundle
             .repo_root
             .join(".bcode")
             .join("reviews")
-            .join(format!("{}.md", safe_review_id(&bundle.review_id)))
+            .join(format!(
+                "{}.{}",
+                safe_review_id(&bundle.review_id),
+                extension
+            ))
     });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, markdown)?;
+    std::fs::write(&path, rendered)?;
     Ok(PublishReviewResponse {
-        publisher_id: request.publisher_id,
+        publisher_id,
         submitted: true,
         output: Some(path.display().to_string()),
         message: format!("wrote review export to {}", path.display()),
     })
 }
 
-fn ensure_publisher_supported(publisher_id: &str) -> Result<(), ReviewError> {
-    if publisher_id == "markdown_file" {
-        Ok(())
-    } else {
-        Err(ReviewError::UnsupportedPublisher(publisher_id.to_string()))
+fn render_publisher_output(
+    publisher_id: &str,
+    bundle: &ReviewBundle,
+) -> Result<String, ReviewError> {
+    match publisher_id {
+        "markdown_file" => Ok(publish_markdown(bundle)),
+        "json_file" => serde_json::to_string_pretty(bundle).map_err(ReviewError::Json),
+        _ => Err(ReviewError::UnsupportedPublisher(publisher_id.to_string())),
+    }
+}
+
+fn publisher_file_extension(publisher_id: &str) -> Result<&'static str, ReviewError> {
+    match publisher_id {
+        "markdown_file" => Ok("md"),
+        "json_file" => Ok("json"),
+        _ => Err(ReviewError::UnsupportedPublisher(publisher_id.to_string())),
     }
 }
 
