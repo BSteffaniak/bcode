@@ -172,7 +172,13 @@ serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
 ] }
 sha2 = { version = "0.10.9", default-features = false }
-sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", rev = "87973bb7681c68cb9c787931b0ab402468adb517", default-features = false }
+sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", branch = "master", default-features = false, features = [
+    "device-seal",
+    "linux-secret-service",
+    "macos-keychain",
+    "profile-keys",
+    "windows-dpapi",
+] }
 switchy = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 switchy_database = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
     "schema",
