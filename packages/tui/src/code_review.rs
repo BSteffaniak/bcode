@@ -808,6 +808,9 @@ fn handle_event<W: Write>(
     terminal: &mut Terminal<&mut W>,
     event: &Event,
 ) -> bool {
+    if app.prompt_state.is_some() {
+        return handle_prompt_event(app, event);
+    }
     if app.publish_state.is_some() {
         return handle_publish_event(app, event);
     }
@@ -824,6 +827,45 @@ fn handle_event<W: Write>(
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => true,
         Event::Paste(_) | Event::User(_) => false,
     }
+}
+
+fn handle_prompt_event(app: &mut ReviewApp, event: &Event) -> bool {
+    match event {
+        Event::Key(stroke) => handle_prompt_key(app, *stroke),
+        Event::Paste(text) => {
+            if let Some(prompt) = &mut app.prompt_state {
+                prompt.buffer.insert_str(text);
+                return true;
+            }
+            false
+        }
+        Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::Resize(_) => {
+            true
+        }
+        Event::Mouse(_) | Event::User(_) => false,
+    }
+}
+
+fn handle_prompt_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
+    if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
+        app.cancel_prompt();
+        return true;
+    }
+    if stroke.key == KeyCode::Enter && stroke.modifiers.is_empty() {
+        app.submit_prompt();
+        return true;
+    }
+    if let Some(prompt) = &mut app.prompt_state {
+        return matches!(
+            helpers::handle_default_text_key(
+                &mut prompt.buffer,
+                stroke,
+                TextInputEnterBehavior::Submit,
+            ),
+            TextInputKeyOutcome::Edited | TextInputKeyOutcome::Submitted
+        );
+    }
+    false
 }
 
 fn handle_comment_editor_event(app: &mut ReviewApp, event: &Event) -> bool {
@@ -891,6 +933,9 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             true
         }
         KeyCode::Char('t') => app.toggle_sidebar_mode(),
+        KeyCode::Char('f') => app.open_file_picker(),
+        KeyCode::Char(':') => app.open_jump_to_line_prompt(),
+        KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Enter => app.jump_to_selected_thread(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(1),
@@ -1661,6 +1706,40 @@ pub struct ReviewPublishOption {
     pub value: String,
 }
 
+/// Active review prompt kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewPromptKind {
+    /// Fuzzy file picker.
+    FilePicker,
+    /// Jump to a line number.
+    JumpToLine,
+    /// Search within the current file.
+    FileSearch,
+}
+
+/// Active one-line prompt state.
+#[derive(Debug, Clone)]
+pub struct ReviewPromptState {
+    /// Prompt kind.
+    pub kind: ReviewPromptKind,
+    /// Editable prompt buffer.
+    pub buffer: TextEditBuffer,
+    /// Selected match index.
+    pub selected: usize,
+}
+
+impl ReviewPromptState {
+    /// Create a prompt.
+    #[must_use]
+    pub const fn new(kind: ReviewPromptKind) -> Self {
+        Self {
+            kind,
+            buffer: TextEditBuffer::new(),
+            selected: 0,
+        }
+    }
+}
+
 /// Publish modal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewPublishState {
@@ -1738,6 +1817,8 @@ pub struct ReviewApp {
     pub selected_publisher: usize,
     /// Active publish UI state.
     pub publish_state: Option<ReviewPublishState>,
+    /// Active one-line prompt, if any.
+    pub prompt_state: Option<ReviewPromptState>,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -1776,12 +1857,118 @@ impl ReviewApp {
             pending_file_load: None,
             selected_publisher: 0,
             publish_state: None,
+            prompt_state: None,
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
         }
+    }
+
+    /// Open fuzzy file picker prompt.
+    pub fn open_file_picker(&mut self) -> bool {
+        self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::FilePicker));
+        self.status_message = Some("file picker: type path, enter open, esc cancel".to_string());
+        true
+    }
+
+    /// Open jump-to-line prompt.
+    pub fn open_jump_to_line_prompt(&mut self) -> bool {
+        self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::JumpToLine));
+        self.status_message = Some("jump to line".to_string());
+        true
+    }
+
+    /// Open current-file search prompt.
+    pub fn open_file_search_prompt(&mut self) -> bool {
+        self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::FileSearch));
+        self.status_message = Some("search current file".to_string());
+        true
+    }
+
+    /// Cancel active prompt.
+    pub fn cancel_prompt(&mut self) {
+        self.prompt_state = None;
+        self.status_message = Some("prompt canceled".to_string());
+    }
+
+    /// Submit active prompt.
+    pub fn submit_prompt(&mut self) -> bool {
+        let Some(prompt) = self.prompt_state.take() else {
+            return false;
+        };
+        let text = prompt.buffer.text().trim().to_string();
+        match prompt.kind {
+            ReviewPromptKind::FilePicker => self.submit_file_picker(&text),
+            ReviewPromptKind::JumpToLine => self.submit_jump_to_line(&text),
+            ReviewPromptKind::FileSearch => self.submit_file_search(&text),
+        }
+    }
+
+    fn submit_file_picker(&mut self, query: &str) -> bool {
+        let Some(index) = self.file_picker_matches(query).first().copied() else {
+            self.status_message = Some(format!("no file matches `{query}`"));
+            return true;
+        };
+        self.select_file(index);
+        self.status_message = Some(format!(
+            "opened {}",
+            self.review.files[index].display_path()
+        ));
+        true
+    }
+
+    fn submit_jump_to_line(&mut self, text: &str) -> bool {
+        let Ok(line) = text.parse::<usize>() else {
+            self.status_message = Some(format!("invalid line number `{text}`"));
+            return true;
+        };
+        self.select_diff_line(line.saturating_sub(1));
+        self.status_message = Some(format!("jumped to line {line}"));
+        true
+    }
+
+    fn submit_file_search(&mut self, query: &str) -> bool {
+        if query.is_empty() {
+            self.status_message = Some("empty search query".to_string());
+            return true;
+        }
+        let Some(file) = self.selected_file_data() else {
+            return false;
+        };
+        let Some(cached) = self.file_cache.get(file.display_path()) else {
+            self.status_message = Some("current file is not loaded".to_string());
+            return true;
+        };
+        let start = self.selected_diff_line.saturating_add(1);
+        let next = (start..cached.line_spans.len())
+            .chain(0..start.min(cached.line_spans.len()))
+            .find(|index| cached.line(*index).is_some_and(|line| line.contains(query)));
+        match next {
+            Some(index) => {
+                self.select_diff_line(index);
+                self.status_message = Some(format!("found `{query}`"));
+            }
+            None => self.status_message = Some(format!("no match for `{query}`")),
+        }
+        true
+    }
+
+    /// Return file picker matches for a query.
+    #[must_use]
+    pub fn file_picker_matches(&self, query: &str) -> Vec<usize> {
+        let query = query.to_lowercase();
+        self.review
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                let path = file.display_path().to_lowercase();
+                (query.is_empty() || path.contains(&query)).then_some(index)
+            })
+            .take(12)
+            .collect()
     }
 
     /// Store the current file hit area.
@@ -2896,18 +3083,20 @@ impl ReviewApp {
     pub fn comment_anchor_for_row(&self, diff_row: usize) -> Option<ReviewCommentAnchor> {
         let file = self.selected_file_data()?;
         if self.review.is_repository_review() {
-            let line = u32::try_from(diff_row.saturating_add(1)).ok()?;
+            let (start_row, end_row) = self.selected_range_bounds().unwrap_or((diff_row, diff_row));
+            let start_line = u32::try_from(start_row.saturating_add(1)).ok()?;
+            let end_line = u32::try_from(end_row.saturating_add(1)).ok()?;
             return Some(ReviewCommentAnchor {
                 file_index: self.selected_file,
                 path: file.display_path().to_string(),
-                diff_row,
-                end_diff_row: None,
+                diff_row: start_row,
+                end_diff_row: (end_row != start_row).then_some(end_row),
                 old_line: None,
-                new_line: Some(line),
+                new_line: Some(start_line),
                 old_start: None,
                 old_end: None,
-                new_start: Some(line),
-                new_end: Some(line),
+                new_start: Some(start_line),
+                new_end: Some(end_line),
                 line_kind: ReviewLineKind::Context,
                 is_file_anchor: true,
             });

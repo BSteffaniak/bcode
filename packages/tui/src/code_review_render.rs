@@ -63,6 +63,9 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     if app.comment_editor.is_some() {
         render_comment_editor(app, area, frame);
     }
+    if app.prompt_state.is_some() {
+        render_prompt(app, area, frame);
+    }
     if app.publish_state.is_some() {
         render_publish_modal(app, area, frame);
     }
@@ -150,7 +153,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 });
             }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  f picker  : line  / search  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -863,6 +866,98 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         ),
         &Line::from_spans(vec![Span::styled(
             " enter/ctrl+s save  esc cancel ",
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        )]),
+    );
+}
+
+fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some(prompt) = &app.prompt_state else {
+        return;
+    };
+    let width = area.width.min(80);
+    let height = match prompt.kind {
+        super::code_review::ReviewPromptKind::FilePicker => area.height.min(16),
+        super::code_review::ReviewPromptKind::JumpToLine
+        | super::code_review::ReviewPromptKind::FileSearch => area.height.min(5),
+    };
+    if width < 20 || height < 3 {
+        return;
+    }
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
+    let popup = Rect::new(x, y, width, height);
+    frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
+    let title = match prompt.kind {
+        super::code_review::ReviewPromptKind::FilePicker => " Open file ",
+        super::code_review::ReviewPromptKind::JumpToLine => " Jump to line ",
+        super::code_review::ReviewPromptKind::FileSearch => " Search file ",
+    };
+    frame.write_line(
+        Rect::new(popup.x, popup.y, popup.width, 1),
+        &Line::from_spans(vec![Span::styled(
+            title,
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    );
+    let query = prompt.buffer.text();
+    frame.write_line(
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup.y.saturating_add(1),
+            popup.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            truncate_to_display_width(query, usize::from(popup.width.saturating_sub(2))),
+            Style::new().fg(Color::White).bg(Color::Black),
+        )]),
+    );
+    if prompt.kind == super::code_review::ReviewPromptKind::FilePicker {
+        let matches = app.file_picker_matches(query);
+        for (row, index) in matches
+            .into_iter()
+            .take(usize::from(height.saturating_sub(3)))
+            .enumerate()
+        {
+            let style = if row == prompt.selected {
+                Style::new().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::new().fg(Color::White).bg(Color::Black)
+            };
+            frame.write_line(
+                Rect::new(
+                    popup.x.saturating_add(1),
+                    popup
+                        .y
+                        .saturating_add(2 + u16::try_from(row).unwrap_or(u16::MAX)),
+                    popup.width.saturating_sub(2),
+                    1,
+                ),
+                &Line::from_spans(vec![Span::styled(
+                    truncate_to_display_width(
+                        app.review.files[index].display_path(),
+                        usize::from(popup.width.saturating_sub(2)),
+                    ),
+                    style,
+                )]),
+            );
+        }
+    }
+    frame.write_line(
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup.bottom().saturating_sub(1),
+            popup.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            " enter submit  esc cancel ",
             Style::new().fg(Color::Black).bg(Color::Yellow),
         )]),
     );
