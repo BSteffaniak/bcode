@@ -311,67 +311,119 @@ pub async fn run<W: Write>(
             continue;
         };
         if let Event::Key(key) = event {
-            needs_redraw = if app.new_review_buffer.is_some() {
-                match app.handle_new_review_key(key.key) {
-                    ReviewHomeKeyOutcome::Redraw => true,
-                    ReviewHomeKeyOutcome::SubmitNewReview => {
-                        match submit_new_review(&client, &mut app).await {
-                            Ok(redraw) => redraw,
-                            Err(error) => {
-                                app.status_message =
-                                    Some(format!("failed to create workspace: {error}"));
-                                true
-                            }
-                        }
-                    }
-                    ReviewHomeKeyOutcome::SubmitRename | ReviewHomeKeyOutcome::Ignored => false,
-                }
-            } else if app.rename_buffer.is_some() {
-                match app.handle_rename_key(key.key) {
-                    ReviewHomeKeyOutcome::Redraw => true,
-                    ReviewHomeKeyOutcome::SubmitRename => {
-                        match submit_rename_workspace(&client, &mut app).await {
-                            Ok(redraw) => redraw,
-                            Err(error) => {
-                                app.status_message =
-                                    Some(format!("failed to rename workspace: {error}"));
-                                true
-                            }
-                        }
-                    }
-                    ReviewHomeKeyOutcome::SubmitNewReview | ReviewHomeKeyOutcome::Ignored => false,
-                }
-            } else if app.search_active {
-                app.handle_search_key(key.key)
-            } else {
-                match key.key {
-                    KeyCode::Char('q') | KeyCode::Escape => {
-                        app.outcome = Some(ReviewHomeOutcome::Exit);
-                        app.should_exit = true;
-                        true
-                    }
-                    KeyCode::Char('/') => app.toggle_search(),
-                    KeyCode::Char('r') => app.start_rename(),
-                    KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-                    KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-                    KeyCode::Enter => app.open_selected(),
-                    KeyCode::Char('x') => match archive_selected_workspace(&client, &mut app).await
-                    {
-                        Ok(archived) => archived,
-                        Err(error) => {
-                            app.status_message =
-                                Some(format!("failed to archive workspace: {error}"));
-                            true
-                        }
-                    },
-                    KeyCode::Char('n') => app.start_new_review(),
-                    _ => false,
-                }
-            };
+            needs_redraw = handle_key_event(&client, &mut app, key.key).await;
         }
     }
 
     Ok(app.outcome.unwrap_or(ReviewHomeOutcome::Exit))
+}
+
+async fn handle_key_event(client: &BcodeClient, app: &mut ReviewHomeApp, key: KeyCode) -> bool {
+    if app.new_review_buffer.is_some() {
+        return handle_new_review_key(client, app, key).await;
+    }
+    if app.rename_buffer.is_some() {
+        return handle_rename_key(client, app, key).await;
+    }
+    if app.search_active {
+        return app.handle_search_key(key);
+    }
+    handle_normal_key(client, app, key).await
+}
+
+async fn handle_new_review_key(
+    client: &BcodeClient,
+    app: &mut ReviewHomeApp,
+    key: KeyCode,
+) -> bool {
+    match app.handle_new_review_key(key) {
+        ReviewHomeKeyOutcome::Redraw => true,
+        ReviewHomeKeyOutcome::SubmitNewReview => match submit_new_review(client, app).await {
+            Ok(redraw) => redraw,
+            Err(error) => {
+                app.status_message = Some(format!("failed to create workspace: {error}"));
+                true
+            }
+        },
+        ReviewHomeKeyOutcome::SubmitRename | ReviewHomeKeyOutcome::Ignored => false,
+    }
+}
+
+async fn handle_rename_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: KeyCode) -> bool {
+    match app.handle_rename_key(key) {
+        ReviewHomeKeyOutcome::Redraw => true,
+        ReviewHomeKeyOutcome::SubmitRename => match submit_rename_workspace(client, app).await {
+            Ok(redraw) => redraw,
+            Err(error) => {
+                app.status_message = Some(format!("failed to rename workspace: {error}"));
+                true
+            }
+        },
+        ReviewHomeKeyOutcome::SubmitNewReview | ReviewHomeKeyOutcome::Ignored => false,
+    }
+}
+
+async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: KeyCode) -> bool {
+    match key {
+        KeyCode::Char('q') | KeyCode::Escape => {
+            app.outcome = Some(ReviewHomeOutcome::Exit);
+            app.should_exit = true;
+            true
+        }
+        KeyCode::Char('/') => app.toggle_search(),
+        KeyCode::Char('r') => app.start_rename(),
+        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Enter => app.open_selected(),
+        KeyCode::Char('x') => match archive_selected_workspace(client, app).await {
+            Ok(archived) => archived,
+            Err(error) => {
+                app.status_message = Some(format!("failed to archive workspace: {error}"));
+                true
+            }
+        },
+        KeyCode::Char('n') => app.start_new_review(),
+        KeyCode::Char('u') => {
+            create_and_open_preset_workspace(
+                client,
+                app,
+                "Unstaged changes",
+                vec![ReviewSourceKind::WorkingTreeUnstaged],
+            )
+            .await
+        }
+        KeyCode::Char('s') => {
+            create_and_open_preset_workspace(
+                client,
+                app,
+                "Staged changes",
+                vec![ReviewSourceKind::IndexStaged],
+            )
+            .await
+        }
+        KeyCode::Char('w') => {
+            create_and_open_preset_workspace(
+                client,
+                app,
+                "Working tree review",
+                vec![ReviewSourceKind::WorkingTreeAndIndex],
+            )
+            .await
+        }
+        KeyCode::Char('l') => {
+            create_and_open_preset_workspace(
+                client,
+                app,
+                "Last commit review",
+                vec![ReviewSourceKind::LastCommit],
+            )
+            .await
+        }
+        KeyCode::Char('e') => {
+            create_and_open_preset_workspace(client, app, "Empty review", Vec::new()).await
+        }
+        _ => false,
+    }
 }
 
 async fn load_workspaces(
@@ -401,6 +453,28 @@ async fn load_workspaces(
     Ok(response.workspaces)
 }
 
+async fn create_and_open_preset_workspace(
+    client: &BcodeClient,
+    app: &mut ReviewHomeApp,
+    title: &str,
+    source_kinds: Vec<ReviewSourceKind>,
+) -> bool {
+    match create_workspace_with_sources(
+        client,
+        app.repo_path.clone(),
+        title.to_string(),
+        source_kinds,
+    )
+    .await
+    {
+        Ok(workspace) => app.open_workspace(workspace),
+        Err(error) => {
+            app.status_message = Some(format!("failed to create workspace: {error}"));
+            true
+        }
+    }
+}
+
 async fn submit_new_review(
     client: &BcodeClient,
     app: &mut ReviewHomeApp,
@@ -416,7 +490,13 @@ async fn submit_new_review(
     } else {
         title
     };
-    let workspace = create_workspace(client, app.repo_path.clone(), title).await?;
+    let workspace = create_workspace_with_sources(
+        client,
+        app.repo_path.clone(),
+        title,
+        vec![ReviewSourceKind::WorkingTreeAndIndex],
+    )
+    .await?;
     app.open_workspace(workspace);
     Ok(true)
 }
@@ -510,20 +590,25 @@ async fn archive_selected_workspace(
     Ok(true)
 }
 
-async fn create_workspace(
+async fn create_workspace_with_sources(
     client: &BcodeClient,
     repo_path: PathBuf,
     title: String,
+    source_kinds: Vec<ReviewSourceKind>,
 ) -> Result<ReviewWorkspace, TuiError> {
     let payload = serde_json::to_vec(&CreateReviewWorkspaceRequest {
         repo_path,
         title: Some(title),
-        sources: vec![ReviewSource {
-            id: "source-working-tree-and-index".to_string(),
-            label: ReviewSourceKind::WorkingTreeAndIndex.label(),
-            kind: ReviewSourceKind::WorkingTreeAndIndex,
-            included: true,
-        }],
+        sources: source_kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| ReviewSource {
+                id: format!("source-{}", index.saturating_add(1)),
+                label: kind.label(),
+                kind,
+                included: true,
+            })
+            .collect(),
     })
     .map_err(TuiError::Json)?;
     let response = client
@@ -572,7 +657,7 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n new   / search   r rename   x archive   j/k move   q exit ",
+            " enter open   n named   u unstaged   s staged   w worktree   l last   e empty   / search ",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
@@ -642,7 +727,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n new, / search, r rename, x archive"
+                            "review home: enter open, n named, u/s/w/l/e presets, / search, r rename"
                                 .to_string()
                         })
                     }
