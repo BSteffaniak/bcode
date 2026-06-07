@@ -1388,8 +1388,12 @@ fn target_from_source_kind(kind: &ReviewSourceKind) -> ReviewOpenTarget {
             head_branch: head_branch.clone(),
             merge_base: *merge_base,
         },
-        ReviewSourceKind::Commit { .. }
-        | ReviewSourceKind::File { .. }
+        ReviewSourceKind::Commit { rev } => ReviewOpenTarget::CommitRange {
+            base: format!("{rev}^"),
+            head: rev.clone(),
+            merge_base: false,
+        },
+        ReviewSourceKind::File { .. }
         | ReviewSourceKind::FileRange { .. }
         | ReviewSourceKind::Repository => ReviewOpenTarget::Repository,
     }

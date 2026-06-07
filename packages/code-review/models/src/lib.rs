@@ -147,7 +147,7 @@ pub enum ReviewSourceKind {
     WorkingTreeAndIndex,
     /// Last commit reachable from `HEAD`.
     LastCommit,
-    /// Explicit commit.
+    /// Specific commit.
     Commit {
         /// Commit revision.
         rev: String,
