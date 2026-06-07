@@ -64,9 +64,6 @@ pub const OP_REVIEW_PUBLISH_PREVIEW: &str = "review.publish.preview";
 pub const OP_REVIEW_PUBLISH_SUBMIT: &str = "review.publish.submit";
 
 const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
-const BCODE_STATE_DIR_ENV: &str = "BCODE_STATE_DIR";
-const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
-const HOME_ENV: &str = "HOME";
 const DEFAULT_REPO_STATE_ROOT: &str = ".bcode/code-review";
 const DEFAULT_STATE_SUBDIR: &str = "code-review";
 const DATABASE_FILE_NAME: &str = "code-review.db";
@@ -1474,25 +1471,11 @@ fn configured_state_root(repo_root: &Path, config: &CodeReviewPluginConfig) -> P
         return repo_root.join(state_dir);
     }
     match config.state_location {
-        CodeReviewStateLocation::User => default_bcode_state_dir().join(DEFAULT_STATE_SUBDIR),
+        CodeReviewStateLocation::User => {
+            bcode_config::default_state_dir().join(DEFAULT_STATE_SUBDIR)
+        }
         CodeReviewStateLocation::Repo => repo_root.join(DEFAULT_REPO_STATE_ROOT),
     }
-}
-
-fn default_bcode_state_dir() -> PathBuf {
-    if let Ok(path) = env::var(BCODE_STATE_DIR_ENV) {
-        return PathBuf::from(path);
-    }
-    if let Ok(state_home) = env::var(XDG_STATE_HOME_ENV) {
-        return PathBuf::from(state_home).join("bcode");
-    }
-    if let Ok(home) = env::var(HOME_ENV) {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("bcode");
-    }
-    env::temp_dir().join("bcode")
 }
 
 fn with_database<T>(
@@ -2085,7 +2068,7 @@ mod tests {
 
         assert_eq!(
             state_paths.state_root,
-            default_bcode_state_dir().join(DEFAULT_STATE_SUBDIR)
+            bcode_config::default_state_dir().join(DEFAULT_STATE_SUBDIR)
         );
     }
 
