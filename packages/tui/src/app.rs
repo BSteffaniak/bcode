@@ -47,8 +47,8 @@ const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
-const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(750);
+const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(1200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
@@ -1044,10 +1044,11 @@ impl BmuxApp {
             }
             return;
         };
-        let overflowed = total_rows > previous_bottom;
-        if overflowed && self.newer_transcript_content_below() {
-            self.record_latest_hidden_activity(now);
+        let overflow_rows = total_rows.saturating_sub(previous_bottom);
+        if overflow_rows > 0 && self.newer_transcript_content_below() {
+            self.record_latest_hidden_activity(now, overflow_rows);
         }
+        let overflowed = overflow_rows > 0;
         if self.manual_transcript_scroll_active()
             || self.transcript_scroll_animation.is_some()
             || !self.scroll_mode.allows_overflow_catch()
@@ -1068,10 +1069,19 @@ impl BmuxApp {
         self.viewport.scroll_to_bottom(&mut self.older_history);
     }
 
-    fn record_latest_hidden_activity(&mut self, now: Instant) {
+    fn record_latest_hidden_activity(&mut self, now: Instant, changed_rows: usize) {
+        if self
+            .latest_hidden_activity_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= LATEST_BAR_ACTIVE_WINDOW)
+        {
+            self.latest_hidden_activity_burst = 0;
+        }
         self.latest_hidden_activity_at = Some(now);
-        self.latest_hidden_activity_burst =
-            self.latest_hidden_activity_burst.saturating_add(1).min(8);
+        let activity = u8::try_from(changed_rows.min(8)).unwrap_or(8);
+        self.latest_hidden_activity_burst = self
+            .latest_hidden_activity_burst
+            .saturating_add(activity.max(1))
+            .min(8);
     }
 
     /// Resolve deferred user-message and live-stream top anchoring against the latest cached layout.

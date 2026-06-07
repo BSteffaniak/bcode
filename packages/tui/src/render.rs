@@ -45,7 +45,7 @@ const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(750);
 const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
 /// Prepared geometry for one TUI frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,19 +179,30 @@ fn latest_bar_line(
     animation_started_at: Instant,
     now: Instant,
 ) -> Line {
-    let active = latest_hidden_activity_at
-        .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW);
-    if active {
-        active_latest_bar_line(
-            width,
-            key_label,
-            latest_hidden_activity_burst,
-            animation_started_at,
-            now,
-        )
-    } else {
-        stale_latest_bar_line(width, key_label, animation_started_at, now)
-    }
+    let active_age = latest_hidden_activity_at.and_then(|at| {
+        let age = now.saturating_duration_since(at);
+        (age < LATEST_BAR_ACTIVE_WINDOW).then_some(age)
+    });
+    active_age.map_or_else(
+        || stale_latest_bar_line(width, key_label, animation_started_at, now),
+        |active_age| {
+            active_latest_bar_line(
+                width,
+                key_label,
+                latest_bar_effective_burst(latest_hidden_activity_burst, active_age),
+                animation_started_at,
+                now,
+            )
+        },
+    )
+}
+
+fn latest_bar_effective_burst(burst: u8, active_age: Duration) -> u8 {
+    let age_ms = active_age.as_millis();
+    let window_ms = LATEST_BAR_ACTIVE_WINDOW.as_millis().max(1);
+    let remaining = window_ms.saturating_sub(age_ms);
+    let scaled = (u128::from(burst) * remaining).div_ceil(window_ms);
+    u8::try_from(scaled.clamp(1, 8)).unwrap_or(1)
 }
 
 fn active_latest_bar_line(
