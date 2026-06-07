@@ -1535,6 +1535,12 @@ struct DraftAnchor {
     line_kind: ReviewLineKind,
     #[serde(default)]
     is_file_anchor: bool,
+    /// Surface id for normalized mixed-surface anchors.
+    #[serde(default)]
+    surface_id: Option<String>,
+    /// Source id for normalized mixed-surface anchors.
+    #[serde(default)]
+    source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1574,6 +1580,8 @@ impl From<ReviewCommentAnchor> for DraftAnchor {
             new_line: anchor.new_line,
             line_kind: anchor.line_kind,
             is_file_anchor: anchor.is_file_anchor,
+            surface_id: anchor.surface_id,
+            source_id: anchor.source_id,
         }
     }
 }
@@ -1995,8 +2003,12 @@ pub struct ReviewCommentAnchor {
     pub new_end: Option<u32>,
     /// Anchored diff line kind.
     pub line_kind: ReviewLineKind,
-    /// Whether this comment points at a repository file line rather than a diff row.
+    /// Whether this comment points at a file surface line rather than a diff row.
     pub is_file_anchor: bool,
+    /// Surface id for normalized mixed-surface anchors.
+    pub surface_id: Option<String>,
+    /// Source id for normalized mixed-surface anchors.
+    pub source_id: Option<String>,
 }
 
 impl ReviewCommentAnchor {
@@ -2800,6 +2812,18 @@ impl ReviewApp {
     /// Store the current diff hit area.
     pub const fn set_diff_area(&mut self, area: Rect) {
         self.last_diff_area = Some(area);
+    }
+
+    /// Return currently selected surface.
+    #[must_use]
+    pub fn selected_surface(&self) -> Option<ReviewSurface> {
+        self.review.surfaces().get(self.selected_file).cloned()
+    }
+
+    fn selected_surface_ids(&self) -> (Option<String>, Option<String>) {
+        self.selected_surface().map_or((None, None), |surface| {
+            (Some(surface.id), Some(surface.source_id))
+        })
     }
 
     /// Return currently selected file.
@@ -4097,6 +4121,8 @@ impl ReviewApp {
             new_end: draft.anchor.new_end.or(draft.anchor.new_line),
             line_kind: draft.anchor.line_kind,
             is_file_anchor: draft.anchor.is_file_anchor,
+            surface_id: draft.anchor.surface_id.clone(),
+            source_id: draft.anchor.source_id.clone(),
         })
     }
 
@@ -4110,7 +4136,12 @@ impl ReviewApp {
     #[must_use]
     pub fn comment_anchor_for_row(&self, diff_row: usize) -> Option<ReviewCommentAnchor> {
         let file = self.selected_file_data()?;
-        if self.review.is_repository_review() {
+        let (surface_id, source_id) = self.selected_surface_ids();
+        if self.review.is_repository_review()
+            || self
+                .selected_surface()
+                .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
+        {
             let (start_row, end_row) = self.selected_range_bounds().unwrap_or((diff_row, diff_row));
             let start_line = u32::try_from(start_row.saturating_add(1)).ok()?;
             let end_line = u32::try_from(end_row.saturating_add(1)).ok()?;
@@ -4127,11 +4158,14 @@ impl ReviewApp {
                 new_end: Some(end_line),
                 line_kind: ReviewLineKind::Context,
                 is_file_anchor: true,
+                surface_id,
+                source_id,
             });
         }
         let (start_row, end_row) = self.selected_range_bounds().unwrap_or((diff_row, diff_row));
         let start_line = self.diff_line_for_render_row(start_row)?;
         let end_line = self.diff_line_for_render_row(end_row)?;
+        let (surface_id, source_id) = self.selected_surface_ids();
         Some(ReviewCommentAnchor {
             file_index: self.selected_file,
             path: file.display_path().to_string(),
@@ -4144,7 +4178,9 @@ impl ReviewApp {
             new_start: start_line.new_line.or(end_line.new_line),
             new_end: end_line.new_line.or(start_line.new_line),
             line_kind: start_line.kind,
-            is_file_anchor: self.review.is_repository_review(),
+            is_file_anchor: false,
+            surface_id,
+            source_id,
         })
     }
 
@@ -4432,6 +4468,8 @@ mod tests {
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,
                 is_file_anchor: false,
+                surface_id: None,
+                source_id: None,
             },
             body: "Before".to_string(),
             created_at_ms: 1,
@@ -4476,6 +4514,8 @@ mod tests {
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,
                 is_file_anchor: false,
+                surface_id: None,
+                source_id: None,
             },
             body: "Persisted".to_string(),
             created_at_ms: 1,

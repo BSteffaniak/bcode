@@ -555,9 +555,15 @@ pub struct DraftAnchor {
     pub new_line: Option<u32>,
     /// Anchor line kind.
     pub line_kind: ReviewLineKind,
-    /// Whether this anchor points at a full repository file line rather than a diff row.
+    /// Whether this anchor points at a file surface line rather than a diff row.
     #[serde(default)]
     pub is_file_anchor: bool,
+    /// Surface id for normalized mixed-surface anchors.
+    #[serde(default)]
+    pub surface_id: Option<String>,
+    /// Source id for normalized mixed-surface anchors.
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 /// Persisted draft comment.

@@ -1828,6 +1828,8 @@ impl<'a> CodeReviewDb<'a> {
                 new_line: optional_i64(&thread, "new_line").map(i64_to_u32),
                 line_kind: line_kind_from_str(&required_text(&thread, "line_kind")?)?,
                 is_file_anchor: optional_bool(&thread, "is_file_anchor"),
+                surface_id: None,
+                source_id: None,
             };
             let comment_rows = self
                 .db
