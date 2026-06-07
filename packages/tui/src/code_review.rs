@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
-    CODE_REVIEW_SERVICE_INTERFACE_ID, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
+    CODE_REVIEW_SERVICE_INTERFACE_ID, MaterializeReviewWorkspaceRequest,
+    MaterializeReviewWorkspaceResponse, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
-    OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID, ReviewSource, ReviewSourceKind,
-    ReviewSurface, ReviewSurfaceKind, ReviewWorkspace, UpdateReviewWorkspaceRequest,
+    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
+    ReviewSource, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind, ReviewWorkspace,
+    UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
@@ -38,6 +40,7 @@ const PUBLISHERS_LIST_OPERATION: &str = OP_REVIEW_PUBLISHERS_LIST;
 const PUBLISH_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISH_PREVIEW;
 const REVIEW_BUNDLE_GET_OPERATION: &str = OP_REVIEW_BUNDLE_GET;
 const REVIEW_REPO_FILE_GET_OPERATION: &str = OP_REVIEW_REPO_FILE_GET;
+const REVIEW_WORKSPACE_MATERIALIZE_OPERATION: &str = OP_REVIEW_WORKSPACE_MATERIALIZE;
 const REVIEW_WORKSPACE_UPDATE_OPERATION: &str = OP_REVIEW_WORKSPACE_UPDATE;
 const REVIEW_PUBLISHER_MANIFEST_OPERATION: &str = OP_REVIEW_PUBLISHER_MANIFEST;
 const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISHER_PREVIEW;
@@ -245,10 +248,16 @@ async fn load_review_app(
     review_target: ReviewTarget,
     workspace: Option<ReviewWorkspace>,
 ) -> Result<ReviewApp, TuiError> {
-    let review = load_review(client, repo_path.clone(), review_target.clone()).await?;
+    let review = if let Some(workspace) = workspace.clone() {
+        load_workspace_review(client, repo_path.clone(), review_target.clone(), workspace).await?
+    } else {
+        load_review(client, repo_path.clone(), review_target.clone()).await?
+    };
     let drafts = load_drafts(client, repo_path, review_target).await;
     let mut app = ReviewApp::new(review);
-    if let Some(workspace) = workspace {
+    if app.workspace.sources.is_empty()
+        && let Some(workspace) = workspace
+    {
         app.workspace = workspace;
     }
     app.queue_selected_file_load();
@@ -637,6 +646,52 @@ async fn invoke_external_publisher(
         .invoke_plugin_service(route.plugin_id, route.interface_id, operation, payload)
         .await
         .map_err(TuiError::from)
+}
+
+async fn load_workspace_review(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    fallback_target: ReviewTarget,
+    workspace: ReviewWorkspace,
+) -> Result<ReviewSummary, TuiError> {
+    let payload = serde_json::to_vec(&MaterializeReviewWorkspaceRequest {
+        repo_path: repo_path.clone(),
+        workspace,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            REVIEW_WORKSPACE_MATERIALIZE_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: MaterializeReviewWorkspaceResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    let materialization = response.materialization;
+    let mut files = Vec::new();
+    for surface in materialization.surfaces {
+        if let Some(file) = surface.file {
+            files.push(ReviewFile::from_model(file));
+        }
+    }
+    if files.is_empty() {
+        return load_review(client, repo_path, fallback_target).await;
+    }
+    Ok(ReviewSummary {
+        title: materialization.workspace.title.clone(),
+        repo_root: materialization.workspace.repo_root.clone(),
+        files,
+        additions: materialization.additions,
+        deletions: materialization.deletions,
+        workspace: Some(materialization.workspace),
+    })
 }
 
 async fn load_review(
@@ -1725,6 +1780,18 @@ pub struct ReviewFile {
 }
 
 impl ReviewFile {
+    fn from_model(file: bcode_code_review_models::ReviewFile) -> Self {
+        Self {
+            old_path: file.old_path,
+            new_path: file.new_path,
+            status: ReviewFileStatus::from_model(file.status),
+            additions: file.additions,
+            deletions: file.deletions,
+            hunks: file.hunks.into_iter().map(ReviewHunk::from_model).collect(),
+            is_binary: file.is_binary,
+        }
+    }
+
     /// Return the display path.
     #[must_use]
     pub fn display_path(&self) -> &str {
@@ -1754,6 +1821,17 @@ pub enum ReviewFileStatus {
 }
 
 impl ReviewFileStatus {
+    const fn from_model(status: bcode_code_review_models::ReviewFileStatus) -> Self {
+        match status {
+            bcode_code_review_models::ReviewFileStatus::Modified => Self::Modified,
+            bcode_code_review_models::ReviewFileStatus::Added => Self::Added,
+            bcode_code_review_models::ReviewFileStatus::Deleted => Self::Deleted,
+            bcode_code_review_models::ReviewFileStatus::Renamed => Self::Renamed,
+            bcode_code_review_models::ReviewFileStatus::Copied => Self::Copied,
+            bcode_code_review_models::ReviewFileStatus::Unknown => Self::Unknown,
+        }
+    }
+
     /// Return a compact status label.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -1785,6 +1863,19 @@ pub struct ReviewHunk {
     pub lines: Vec<ReviewLine>,
 }
 
+impl ReviewHunk {
+    fn from_model(hunk: bcode_code_review_models::ReviewHunk) -> Self {
+        Self {
+            old_start: hunk.old_start,
+            old_count: hunk.old_count,
+            new_start: hunk.new_start,
+            new_count: hunk.new_count,
+            heading: hunk.heading,
+            lines: hunk.lines.into_iter().map(ReviewLine::from_model).collect(),
+        }
+    }
+}
+
 /// Review diff line.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ReviewLine {
@@ -1798,6 +1889,17 @@ pub struct ReviewLine {
     pub content: String,
 }
 
+impl ReviewLine {
+    fn from_model(line: bcode_code_review_models::ReviewLine) -> Self {
+        Self {
+            kind: ReviewLineKind::from_model(line.kind),
+            old_line: line.old_line,
+            new_line: line.new_line,
+            content: line.content,
+        }
+    }
+}
+
 /// Review diff line kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1808,6 +1910,16 @@ pub enum ReviewLineKind {
     Added,
     /// Removed line.
     Removed,
+}
+
+impl ReviewLineKind {
+    const fn from_model(kind: bcode_code_review_models::ReviewLineKind) -> Self {
+        match kind {
+            bcode_code_review_models::ReviewLineKind::Context => Self::Context,
+            bcode_code_review_models::ReviewLineKind::Added => Self::Added,
+            bcode_code_review_models::ReviewLineKind::Removed => Self::Removed,
+        }
+    }
 }
 
 /// Draft comment line anchor.
