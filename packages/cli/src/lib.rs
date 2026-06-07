@@ -1246,15 +1246,27 @@ fn auth_login(
     let vault_path = vault
         .or_else(|| auth_profile.settings.get("vault").map(PathBuf::from))
         .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let recipient_key_hint = recipient_key.clone().or_else(|| {
+        auth_profile
+            .settings
+            .get("recipient_key")
+            .map(String::to_string)
+    });
     let store = open_auth_store(&vault_path, recipient_key)?;
-    let device_seal_policy = device_seal_policy_for_auth_profile(auth_profile);
+    let device_seal_policy =
+        bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
     let api_key = rpassword::prompt_password(format!("{api_key_env}: "))?;
     store
         .set_secret(&storage_profile, &api_key_env, Zeroizing::new(api_key))
         .map_err(|error| {
             CliError::BundledPluginInstallFailed(format!("failed to store API key: {error}"))
         })?;
-    apply_auth_device_seal_policy(&store, &vault_path, &storage_profile, device_seal_policy)?;
+    apply_auth_device_seal_policy(
+        &vault_path,
+        &storage_profile,
+        device_seal_policy,
+        recipient_key_hint.as_deref(),
+    )?;
     println!("API key saved");
     println!("Auth profile: {auth_profile_name}");
     println!("Credentials saved to sshenv vault profile: {storage_profile}");
@@ -1332,7 +1344,12 @@ struct XaiLoginOptions {
 }
 
 async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
-    let target = resolve_login_target(LoginProvider::OpenAi, options.profile, options.vault)?;
+    let target = resolve_login_target(
+        LoginProvider::OpenAi,
+        options.profile,
+        options.vault,
+        options.recipient_key.as_deref(),
+    )?;
     let store = open_auth_store(&target.vault_path, options.recipient_key)?;
     if options.api_key.is_some() || (options.base_url.is_some() && !options.chatgpt) {
         login_openai_api_key(
@@ -1408,13 +1425,6 @@ enum LoginConfigUpdate {
     Writable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeviceSealPolicy {
-    Off,
-    Preferred,
-    Required,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoginTarget {
     auth_profile: String,
@@ -1422,13 +1432,15 @@ struct LoginTarget {
     vault_path: PathBuf,
     api_key_env: Option<String>,
     config_update: LoginConfigUpdate,
-    device_seal_policy: DeviceSealPolicy,
+    device_seal_policy: bcode_provider_auth::security::AuthDeviceSealPolicy,
+    recipient_key: Option<String>,
 }
 
 fn resolve_login_target(
     provider: LoginProvider,
     explicit_profile: Option<String>,
     explicit_vault: Option<PathBuf>,
+    explicit_recipient_key: Option<&str>,
 ) -> Result<LoginTarget, CliError> {
     if let Some(profile) = explicit_profile {
         let config = bcode_config::load_config().ok();
@@ -1441,6 +1453,7 @@ fn resolve_login_target(
                 &profile,
                 auth_profile,
                 explicit_vault,
+                explicit_recipient_key,
             );
         }
         let vault_path = explicit_vault.unwrap_or_else(bcode_config::default_auth_vault_path);
@@ -1450,7 +1463,8 @@ fn resolve_login_target(
             vault_path,
             api_key_env: None,
             config_update: LoginConfigUpdate::Writable,
-            device_seal_policy: DeviceSealPolicy::Preferred,
+            device_seal_policy: bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
+            recipient_key: explicit_recipient_key.map(ToString::to_string),
         });
     }
 
@@ -1475,6 +1489,7 @@ fn resolve_login_target(
         &auth_profile,
         configured_auth_profile,
         explicit_vault,
+        explicit_recipient_key,
     )
 }
 
@@ -1490,6 +1505,7 @@ fn login_target_from_declarative_auth_profile(
     auth_profile_name: &str,
     auth_profile: &bcode_config::AuthProfileConfig,
     explicit_vault: Option<PathBuf>,
+    explicit_recipient_key: Option<&str>,
 ) -> Result<LoginTarget, CliError> {
     if auth_profile.backend != "sshenv" {
         return Err(CliError::LoginProfile(format!(
@@ -1524,76 +1540,50 @@ fn login_target_from_declarative_auth_profile(
         .map(PathBuf::from)
         .or(explicit_vault)
         .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let recipient_key = explicit_recipient_key
+        .map(ToString::to_string)
+        .or_else(|| auth_profile.settings.get("recipient_key").cloned());
     Ok(LoginTarget {
         auth_profile: auth_profile_name.to_string(),
         storage_profile,
         vault_path,
         api_key_env,
         config_update: LoginConfigUpdate::Declarative,
-        device_seal_policy: device_seal_policy_for_auth_profile(auth_profile),
+        device_seal_policy: bcode_provider_auth::security::device_seal_policy_for_auth_profile(
+            auth_profile,
+        ),
+        recipient_key,
     })
-}
-
-fn device_seal_policy_for_auth_profile(
-    auth_profile: &bcode_config::AuthProfileConfig,
-) -> DeviceSealPolicy {
-    auth_profile.settings.get("device_seal").map_or(
-        DeviceSealPolicy::Preferred,
-        |value| match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "false" | "disabled" | "never" => DeviceSealPolicy::Off,
-            "required" | "require" | "true" | "on" => DeviceSealPolicy::Required,
-            _ => DeviceSealPolicy::Preferred,
-        },
-    )
 }
 
 fn apply_auth_device_seal_policy(
-    store: &sshenv_vault::SshenvStore,
     vault_path: &Path,
     profile: &str,
-    policy: DeviceSealPolicy,
+    policy: bcode_provider_auth::security::AuthDeviceSealPolicy,
+    recipient_key: Option<&str>,
 ) -> Result<(), CliError> {
-    match policy {
-        DeviceSealPolicy::Off => Ok(()),
-        DeviceSealPolicy::Preferred => {
-            if let Err(error) = require_auth_device_seal(store, vault_path, profile) {
-                eprintln!(
-                    "Device seal is unavailable for auth profile {profile}; continuing because device_seal is preferred: {error}"
-                );
+    match bcode_provider_auth::security::reconcile_auth_vault_security(
+        vault_path,
+        profile,
+        policy,
+        recipient_key,
+    ) {
+        Ok(actions) => {
+            for action in actions {
+                eprintln!("Auth vault security: {action}");
             }
             Ok(())
         }
-        DeviceSealPolicy::Required => require_auth_device_seal(store, vault_path, profile),
+        Err(error) if policy == bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred => {
+            eprintln!(
+                "Auth vault security refresh skipped for profile {profile}; continuing because device_seal is preferred: {error}"
+            );
+            Ok(())
+        }
+        Err(error) => Err(CliError::BundledPluginInstallFailed(format!(
+            "auth vault security requirement is not satisfied for profile {profile}: {error}"
+        ))),
     }
-}
-
-fn require_auth_device_seal(
-    store: &sshenv_vault::SshenvStore,
-    vault_path: &Path,
-    profile: &str,
-) -> Result<(), CliError> {
-    let (mut vault, data_key) = store.load_and_unlock().map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!(
-            "failed to unlock auth vault for device seal: {error}"
-        ))
-    })?;
-    vault.enable_profile_keys().map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!(
-            "failed to enable auth profile keys for device seal: {error}"
-        ))
-    })?;
-    vault
-        .require_profile_device_seal(profile)
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!(
-                "failed to bind auth profile {profile} to this device: {error}"
-            ))
-        })?;
-    vault.save(vault_path, &data_key).map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!(
-            "failed to save device-sealed auth vault: {error}"
-        ))
-    })
 }
 
 fn open_auth_store(
@@ -1692,10 +1682,10 @@ fn login_compatible_api_key(
             })?;
     }
     apply_auth_device_seal_policy(
-        store,
         &target.vault_path,
         &target.storage_profile,
         target.device_seal_policy,
+        target.recipient_key.as_deref(),
     )?;
 
     // Always route through the shared OpenAI-compatible provider plugin.
@@ -1742,7 +1732,12 @@ fn login_openai_api_key(
 }
 
 fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
-    let target = resolve_login_target(LoginProvider::Xai, options.profile, options.vault)?;
+    let target = resolve_login_target(
+        LoginProvider::Xai,
+        options.profile,
+        options.vault,
+        options.recipient_key.as_deref(),
+    )?;
     let store = open_auth_store(&target.vault_path, options.recipient_key)?;
     login_compatible_api_key(
         &store,
@@ -1836,10 +1831,10 @@ async fn login_openai_chatgpt(
             })?;
     }
     apply_auth_device_seal_policy(
-        store,
         &target.vault_path,
         &target.storage_profile,
         target.device_seal_policy,
+        target.recipient_key.as_deref(),
     )?;
 
     report_login_completion(

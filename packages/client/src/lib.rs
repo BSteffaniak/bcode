@@ -283,6 +283,15 @@ fn merge_legacy_openai_auth_profile_env(
         .vault
         .clone()
         .unwrap_or_else(bcode_config::default_auth_vault_path);
+    let policy = bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred;
+    if let Err(error) = bcode_provider_auth::security::reconcile_auth_vault_security(
+        &vault,
+        &auth.profile,
+        policy,
+        None,
+    ) {
+        eprintln!("Auth vault security refresh skipped for legacy OpenAI profile: {error}");
+    }
     let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
     let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
         return;

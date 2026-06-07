@@ -1374,8 +1374,10 @@ dependencies = [
 name = "bcode_provider_auth"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "base64 0.22.1",
  "bcode_config",
  "bcode_model",
+ "sha2 0.10.9",
  "sshenv_vault",
 ]
 

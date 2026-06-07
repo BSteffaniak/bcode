@@ -8,6 +8,8 @@
 //! material for provider plugins, plus compatibility env values for providers
 //! that still consume environment-shaped credentials.
 
+pub mod security;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -42,6 +44,30 @@ pub fn resolve_auth_profile(
             storage_vault = Some(vault.display().to_string());
             let store =
                 sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault.clone()));
+            let policy = security::device_seal_policy_for_auth_profile(auth_profile);
+            match security::reconcile_auth_vault_security(
+                &vault,
+                profile,
+                policy,
+                auth_profile
+                    .settings
+                    .get("recipient_key")
+                    .map(String::as_str),
+            ) {
+                Ok(actions) => {
+                    for action in actions {
+                        eprintln!("Auth vault security: {action}");
+                    }
+                }
+                Err(error) if policy == security::AuthDeviceSealPolicy::Preferred => {
+                    eprintln!("Auth vault security refresh skipped for profile {profile}: {error}");
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Auth vault security requirement is not satisfied for profile {profile}: {error}"
+                    );
+                }
+            }
             if let Ok(Some(profile_env)) = store.get_profile(profile) {
                 for (key, value) in profile_env {
                     env.entry(key).or_insert_with(|| value.to_string());
