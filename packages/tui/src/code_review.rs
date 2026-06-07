@@ -153,6 +153,9 @@ async fn run_with_workspace<W: Write>(
             }
             needs_redraw = true;
         }
+        if handle_pending_workspace_reload(&client, &repo_path, &review_target, &mut app).await {
+            needs_redraw = true;
+        }
         if handle_pending_draft_save(&client, &repo_path, &review_target, &mut app).await {
             needs_redraw = true;
         }
@@ -207,6 +210,35 @@ async fn run_with_workspace<W: Write>(
     }
 
     Ok(app.take_session_to_open())
+}
+
+async fn handle_pending_workspace_reload(
+    client: &BcodeClient,
+    repo_path: &Path,
+    fallback_target: &ReviewTarget,
+    app: &mut ReviewApp,
+) -> bool {
+    if !app.take_pending_workspace_reload() {
+        return false;
+    }
+    match load_workspace_review(
+        client,
+        repo_path.to_path_buf(),
+        fallback_target.clone(),
+        app.workspace.clone(),
+    )
+    .await
+    {
+        Ok(review) => {
+            app.replace_review(review);
+            app.status_message = Some("updated review content".to_string());
+        }
+        Err(error) => {
+            app.pending_workspace_reload = true;
+            app.status_message = Some(format!("review reload failed: {error}"));
+        }
+    }
+    true
 }
 
 async fn handle_pending_draft_save(
@@ -2283,6 +2315,8 @@ pub struct ReviewApp {
     pub selected_build_row: usize,
     /// Whether workspace changes should be persisted.
     pub pending_workspace_save: bool,
+    /// Whether workspace content should be rematerialized.
+    pub pending_workspace_reload: bool,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -2330,6 +2364,7 @@ impl ReviewApp {
             selected_tree_row: 0,
             selected_build_row: 0,
             pending_workspace_save: false,
+            pending_workspace_reload: false,
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
@@ -2529,6 +2564,7 @@ impl ReviewApp {
             included: true,
         });
         self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
         self.status_message = Some(format!("added {label}"));
         true
     }
@@ -2756,6 +2792,19 @@ impl ReviewApp {
         self.review.files.get(self.selected_file)
     }
 
+    /// Replace review content after rematerialization.
+    pub fn replace_review(&mut self, review: ReviewSummary) {
+        self.review = review;
+        self.workspace = self.review.workspace();
+        self.selected_file = self
+            .selected_file
+            .min(self.review.files.len().saturating_sub(1));
+        self.file_scroll = self.file_scroll.min(self.selected_file);
+        self.diff_scroll = 0;
+        self.selected_diff_line = 0;
+        self.queue_selected_file_load();
+    }
+
     /// Toggle sidebar between included, repository, threads, and sources.
     pub fn toggle_sidebar_mode(&mut self) -> bool {
         self.sidebar_mode = match self.sidebar_mode {
@@ -2838,6 +2887,13 @@ impl ReviewApp {
         pending
     }
 
+    /// Take pending workspace reload flag.
+    pub const fn take_pending_workspace_reload(&mut self) -> bool {
+        let pending = self.pending_workspace_reload;
+        self.pending_workspace_reload = false;
+        pending
+    }
+
     /// Add the selected file as an included workspace source.
     pub fn add_selected_file_to_workspace(&mut self) -> bool {
         let Some(path) = self
@@ -2873,6 +2929,7 @@ impl ReviewApp {
             .min(self.build_row_count().saturating_sub(1));
         self.status_message = Some(format!("removed {}", source.label));
         self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
         true
     }
 
