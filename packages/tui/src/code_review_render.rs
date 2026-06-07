@@ -8,7 +8,8 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::truncate_to_display_width;
 
 use super::code_review::{
-    ReviewApp, ReviewFile, ReviewLineKind, ReviewPublishState, ReviewSidebarMode, sidebar_width,
+    ReviewApp, ReviewFile, ReviewLineKind, ReviewPromptKind, ReviewPublishState, ReviewSidebarMode,
+    sidebar_width,
 };
 use super::code_review_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment,
@@ -181,7 +182,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 });
             }
             if app.ux_mode == super::code_review::ReviewUxMode::Build {
-                return " build mode  j/k move  + add selected file  - remove selected source  m review mode  f picker  enter inspect/open  t threads  b sidebar  ? help  q exit ".to_string();
+                return " build mode  j/k move  + add selected file  A add by path  - remove selected source  m review mode  f picker  enter inspect/open  t threads  b sidebar  ? help  q exit ".to_string();
             }
             if app.review.is_repository_review() {
                 return format!(
@@ -496,7 +497,8 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
     rows.push((String::new(), String::new(), false));
     rows.push((
-        "+ add selected file   - remove selected source   m review mode".to_string(),
+        "+ add selected file   A add by path   - remove selected source   m review mode"
+            .to_string(),
         String::new(),
         false,
     ));
@@ -774,6 +776,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " m                   switch to review mode",
         " j/k or arrows       move selection",
         " +                   add selected file source",
+        " A                   add source by path",
         " -                   remove selected source",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",
@@ -1128,9 +1131,13 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     };
     let width = area.width.min(80);
     let height = match prompt.kind {
-        super::code_review::ReviewPromptKind::FilePicker => area.height.min(16),
-        super::code_review::ReviewPromptKind::JumpToLine
-        | super::code_review::ReviewPromptKind::FileSearch => area.height.min(5),
+        ReviewPromptKind::FilePicker => area.height.min(16),
+        ReviewPromptKind::JumpToLine
+        | ReviewPromptKind::FileSearch
+        | ReviewPromptKind::AddCommitSource
+        | ReviewPromptKind::AddCommitRangeSource
+        | ReviewPromptKind::AddFileSource
+        | ReviewPromptKind::AddFileRangeSource => area.height.min(5),
     };
     if width < 20 || height < 3 {
         return;
@@ -1142,9 +1149,13 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let popup = Rect::new(x, y, width, height);
     frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
     let title = match prompt.kind {
-        super::code_review::ReviewPromptKind::FilePicker => " Open file ",
-        super::code_review::ReviewPromptKind::JumpToLine => " Jump to line ",
-        super::code_review::ReviewPromptKind::FileSearch => " Search file ",
+        ReviewPromptKind::FilePicker => " Open file ",
+        ReviewPromptKind::JumpToLine => " Jump to line ",
+        ReviewPromptKind::FileSearch => " Search file ",
+        ReviewPromptKind::AddCommitSource => " Add commit ",
+        ReviewPromptKind::AddCommitRangeSource => " Add range ",
+        ReviewPromptKind::AddFileSource => " Add file ",
+        ReviewPromptKind::AddFileRangeSource => " Add file range ",
     };
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),
@@ -1169,7 +1180,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::White).bg(Color::Black),
         )]),
     );
-    if prompt.kind == super::code_review::ReviewPromptKind::FilePicker {
+    if prompt.kind == ReviewPromptKind::FilePicker {
         let matches = app.file_picker_matches(query);
         for (row, index) in matches
             .into_iter()

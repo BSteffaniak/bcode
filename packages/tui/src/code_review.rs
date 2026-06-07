@@ -949,6 +949,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         }
         KeyCode::Char('m') => app.toggle_ux_mode(),
         KeyCode::Char('+') => app.add_selected_file_to_workspace(),
+        KeyCode::Char('A') => app.open_add_source_prompt(),
         KeyCode::Char('-') => app.remove_selected_build_source(),
         KeyCode::Char('t') => app.toggle_sidebar_mode(),
         KeyCode::Char('f') => app.open_file_picker(),
@@ -1886,6 +1887,14 @@ pub enum ReviewPromptKind {
     JumpToLine,
     /// Search within the current file.
     FileSearch,
+    /// Add a commit source to the workspace.
+    AddCommitSource,
+    /// Add a commit range source to the workspace.
+    AddCommitRangeSource,
+    /// Add a file source to the workspace.
+    AddFileSource,
+    /// Add a file range source to the workspace.
+    AddFileRangeSource,
 }
 
 /// Active one-line prompt state.
@@ -2069,6 +2078,17 @@ impl ReviewApp {
         true
     }
 
+    /// Open add-source prompt appropriate for the selected build row.
+    pub fn open_add_source_prompt(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            self.status_message = Some("switch to build mode with m to add sources".to_string());
+            return true;
+        }
+        self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddFileSource));
+        self.status_message = Some("add source: enter a repo file path".to_string());
+        true
+    }
+
     /// Open fuzzy file picker prompt.
     pub fn open_file_picker(&mut self) -> bool {
         self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::FilePicker));
@@ -2106,7 +2126,85 @@ impl ReviewApp {
             ReviewPromptKind::FilePicker => self.submit_file_picker(&text, prompt.selected),
             ReviewPromptKind::JumpToLine => self.submit_jump_to_line(&text),
             ReviewPromptKind::FileSearch => self.submit_file_search(&text),
+            ReviewPromptKind::AddCommitSource => self.submit_add_commit_source(&text),
+            ReviewPromptKind::AddCommitRangeSource => self.submit_add_commit_range_source(&text),
+            ReviewPromptKind::AddFileSource => self.submit_add_file_source(&text),
+            ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
         }
+    }
+
+    fn submit_add_commit_source(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            self.status_message = Some("enter a commit revision".to_string());
+            return true;
+        }
+        self.push_workspace_source(ReviewSourceKind::Commit {
+            rev: text.to_string(),
+        })
+    }
+
+    fn submit_add_commit_range_source(&mut self, text: &str) -> bool {
+        let Some((base, head)) = text.split_once("...").or_else(|| text.split_once("..")) else {
+            self.status_message = Some("enter range as base..head or base...head".to_string());
+            return true;
+        };
+        let merge_base = text.contains("...");
+        self.push_workspace_source(ReviewSourceKind::CommitRange {
+            base: base.trim().to_string(),
+            head: head.trim().to_string(),
+            merge_base,
+        })
+    }
+
+    fn submit_add_file_source(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return self.add_selected_file_to_workspace();
+        }
+        self.push_workspace_source(ReviewSourceKind::File {
+            path: text.to_string(),
+        })
+    }
+
+    fn submit_add_file_range_source(&mut self, text: &str) -> bool {
+        let Some((path, range)) = text.rsplit_once(':') else {
+            self.status_message = Some("enter file range as path:start-end".to_string());
+            return true;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            self.status_message = Some("enter file range as path:start-end".to_string());
+            return true;
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) else {
+            self.status_message = Some("file range line numbers must be numeric".to_string());
+            return true;
+        };
+        self.push_workspace_source(ReviewSourceKind::FileRange {
+            path: path.to_string(),
+            start,
+            end,
+        })
+    }
+
+    fn push_workspace_source(&mut self, kind: ReviewSourceKind) -> bool {
+        if self
+            .workspace
+            .sources
+            .iter()
+            .any(|source| source.kind == kind)
+        {
+            self.status_message = Some(format!("{} is already included", kind.label()));
+            return true;
+        }
+        let label = kind.label();
+        let source_id = format!("source-{}", self.workspace.sources.len().saturating_add(1));
+        self.workspace.sources.push(ReviewSource {
+            id: source_id,
+            kind,
+            label: label.clone(),
+            included: true,
+        });
+        self.status_message = Some(format!("added {label}"));
+        true
     }
 
     fn submit_file_picker(&mut self, query: &str, selected: usize) -> bool {
@@ -2416,22 +2514,16 @@ impl ReviewApp {
         else {
             return false;
         };
-        if self.workspace.sources.iter().any(|source| {
-            matches!(&source.kind, ReviewSourceKind::File { path: source_path } if source_path == &path)
-        }) {
+        if self
+            .workspace
+            .sources
+            .iter()
+            .any(|source| matches!(&source.kind, ReviewSourceKind::File { path: source_path } if source_path == &path))
+        {
             self.status_message = Some(format!("{path} is already included"));
             return true;
         }
-        let source_id = format!("source-{}", self.workspace.sources.len().saturating_add(1));
-        let kind = ReviewSourceKind::File { path: path.clone() };
-        self.workspace.sources.push(ReviewSource {
-            id: source_id,
-            label: kind.label(),
-            kind,
-            included: true,
-        });
-        self.status_message = Some(format!("added {path} to review workspace"));
-        true
+        self.push_workspace_source(ReviewSourceKind::File { path })
     }
 
     /// Remove selected build source from the workspace.
