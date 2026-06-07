@@ -45,6 +45,7 @@ struct ReviewHomeApp {
     search_active: bool,
     rename_buffer: Option<String>,
     new_review_buffer: Option<String>,
+    include_archived: bool,
     should_exit: bool,
     outcome: Option<ReviewHomeOutcome>,
 }
@@ -60,6 +61,7 @@ impl ReviewHomeApp {
             search_active: false,
             rename_buffer: None,
             new_review_buffer: None,
+            include_archived: false,
             should_exit: false,
             outcome: None,
         }
@@ -73,6 +75,9 @@ impl ReviewHomeApp {
             .filter_map(|(index, workspace)| {
                 if query.is_empty()
                     || workspace.title.to_ascii_lowercase().contains(&query)
+                    || workspace
+                        .archived_at_ms
+                        .is_some_and(|archived_at_ms| archived_at_ms.to_string().contains(&query))
                     || workspace
                         .repo_root
                         .display()
@@ -420,6 +425,7 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             )
             .await
         }
+        KeyCode::Char('a') => toggle_archived(client, app).await,
         KeyCode::Char('e') => {
             create_and_open_preset_workspace(client, app, "Empty review", Vec::new()).await
         }
@@ -427,13 +433,41 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
     }
 }
 
+async fn toggle_archived(client: &BcodeClient, app: &mut ReviewHomeApp) -> bool {
+    app.include_archived = !app.include_archived;
+    match load_workspaces_with_archived(client, app.repo_path.clone(), app.include_archived).await {
+        Ok(workspaces) => {
+            app.workspaces = workspaces;
+            app.clamp_selection();
+            app.status_message = Some(if app.include_archived {
+                "showing archived reviews".to_string()
+            } else {
+                "hiding archived reviews".to_string()
+            });
+        }
+        Err(error) => {
+            app.include_archived = !app.include_archived;
+            app.status_message = Some(format!("failed to toggle archived reviews: {error}"));
+        }
+    }
+    true
+}
+
 async fn load_workspaces(
     client: &BcodeClient,
     repo_path: PathBuf,
 ) -> Result<Vec<ReviewWorkspace>, TuiError> {
+    load_workspaces_with_archived(client, repo_path, false).await
+}
+
+async fn load_workspaces_with_archived(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    include_archived: bool,
+) -> Result<Vec<ReviewWorkspace>, TuiError> {
     let payload = serde_json::to_vec(&ListReviewWorkspacesRequest {
         repo_path,
-        include_archived: false,
+        include_archived,
     })
     .map_err(TuiError::Json)?;
     let response = client
@@ -658,7 +692,7 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n named   u unstaged   s staged   w worktree   l last   e empty   / search ",
+            " enter open   n named   u/s/w/l/e presets   a archived   / search   r rename   x archive ",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
@@ -739,7 +773,15 @@ fn workspace_row_text(workspace: &ReviewWorkspace) -> String {
     } else {
         format!("{source_count} source(s): {sources}")
     };
-    format!(" {}  · {}  · {}", workspace.title, updated, suffix)
+    let archived = if workspace.archived_at_ms.is_some() {
+        "  · archived"
+    } else {
+        ""
+    };
+    format!(
+        " {}  · {}  · {}{}",
+        workspace.title, updated, suffix, archived
+    )
 }
 
 fn relative_time_label(timestamp_ms: u64) -> String {
@@ -767,7 +809,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n named, u/s/w/l/e presets, / search, r rename"
+                            "review home: enter open, n named, u/s/w/l/e presets, a archived, / search, r rename"
                                 .to_string()
                         })
                     }
