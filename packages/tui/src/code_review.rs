@@ -458,8 +458,10 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             app.sidebar_visible = !app.sidebar_visible;
             true
         }
-        KeyCode::Char('j') | KeyCode::Down => app.scroll_down(1),
-        KeyCode::Char('k') | KeyCode::Up => app.scroll_up(1),
+        KeyCode::Char('t') => app.toggle_sidebar_mode(),
+        KeyCode::Enter => app.jump_to_selected_thread(),
+        KeyCode::Char('j') | KeyCode::Down => app.move_down(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_up(1),
         KeyCode::Char('g') => app.scroll_to_top(),
         KeyCode::Char('G') => app.scroll_to_bottom(),
         KeyCode::Char('n') | KeyCode::Right => app.select_next_file(),
@@ -947,6 +949,28 @@ impl ReviewCommentEditor {
     }
 }
 
+/// Review sidebar mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSidebarMode {
+    /// File list sidebar.
+    Files,
+    /// Review thread list sidebar.
+    Threads,
+}
+
+/// Review thread row summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThreadSummary {
+    /// Thread anchor.
+    pub anchor: ReviewCommentAnchor,
+    /// Number of draft comments.
+    pub draft_count: usize,
+    /// Latest draft body.
+    pub latest_body: String,
+    /// Linked Bcode session id, when present.
+    pub session_id: Option<String>,
+}
+
 /// Stateful review app model.
 #[derive(Debug, Clone)]
 pub struct ReviewApp {
@@ -962,6 +986,12 @@ pub struct ReviewApp {
     pub selected_diff_line: usize,
     /// Whether the file sidebar is visible.
     pub sidebar_visible: bool,
+    /// Active sidebar mode.
+    pub sidebar_mode: ReviewSidebarMode,
+    /// Selected review thread index.
+    pub selected_thread: usize,
+    /// Top visible review thread row.
+    pub thread_scroll: usize,
     /// Whether help is visible.
     pub help_visible: bool,
     /// Whether to exit.
@@ -999,6 +1029,9 @@ impl ReviewApp {
             diff_scroll: 0,
             selected_diff_line: 0,
             sidebar_visible: true,
+            sidebar_mode: ReviewSidebarMode::Files,
+            selected_thread: 0,
+            thread_scroll: 0,
             help_visible: false,
             should_exit: false,
             status_message: None,
@@ -1031,6 +1064,97 @@ impl ReviewApp {
         self.review.files.get(self.selected_file)
     }
 
+    /// Toggle sidebar between files and threads.
+    pub fn toggle_sidebar_mode(&mut self) -> bool {
+        self.sidebar_mode = match self.sidebar_mode {
+            ReviewSidebarMode::Files => ReviewSidebarMode::Threads,
+            ReviewSidebarMode::Threads => ReviewSidebarMode::Files,
+        };
+        self.sidebar_visible = true;
+        self.status_message = Some(match self.sidebar_mode {
+            ReviewSidebarMode::Files => "sidebar: files".to_string(),
+            ReviewSidebarMode::Threads => "sidebar: threads".to_string(),
+        });
+        true
+    }
+
+    /// Move the active selection down.
+    pub fn move_down(&mut self, rows: usize) -> bool {
+        if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
+            self.select_next_thread(rows)
+        } else {
+            self.scroll_down(rows)
+        }
+    }
+
+    /// Move the active selection up.
+    pub fn move_up(&mut self, rows: usize) -> bool {
+        if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
+            self.select_previous_thread(rows)
+        } else {
+            self.scroll_up(rows)
+        }
+    }
+
+    /// Return review thread summaries in deterministic order.
+    #[must_use]
+    pub fn thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        self.draft_comments
+            .iter()
+            .filter_map(|(anchor, comments)| {
+                let latest = comments.last()?;
+                Some(ReviewThreadSummary {
+                    anchor: anchor.clone(),
+                    draft_count: comments.len(),
+                    latest_body: latest.body.clone(),
+                    session_id: latest.session_id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Select next thread.
+    pub fn select_next_thread(&mut self, rows: usize) -> bool {
+        let max = self.thread_summaries().len().saturating_sub(1);
+        let next = self.selected_thread.saturating_add(rows).min(max);
+        if next == self.selected_thread {
+            return false;
+        }
+        self.selected_thread = next;
+        true
+    }
+
+    /// Select previous thread.
+    pub const fn select_previous_thread(&mut self, rows: usize) -> bool {
+        let next = self.selected_thread.saturating_sub(rows);
+        if next == self.selected_thread {
+            return false;
+        }
+        self.selected_thread = next;
+        true
+    }
+
+    /// Jump to the selected thread in the diff.
+    pub fn jump_to_selected_thread(&mut self) -> bool {
+        if self.sidebar_mode != ReviewSidebarMode::Threads {
+            return false;
+        }
+        let Some(thread) = self.thread_summaries().get(self.selected_thread).cloned() else {
+            self.status_message = Some("no review thread selected".to_string());
+            return true;
+        };
+        self.select_anchor(&thread.anchor);
+        self.status_message = Some("jumped to review thread".to_string());
+        true
+    }
+
+    /// Select an anchor in the diff.
+    pub fn select_anchor(&mut self, anchor: &ReviewCommentAnchor) {
+        self.selected_file = anchor.file_index;
+        self.selected_diff_line = anchor.diff_row;
+        self.ensure_selected_diff_line_visible();
+    }
+
     /// Select a file by index.
     pub const fn select_file(&mut self, index: usize) -> bool {
         if index >= self.review.files.len() || index == self.selected_file {
@@ -1040,6 +1164,7 @@ impl ReviewApp {
         self.diff_scroll = 0;
         self.selected_diff_line = 0;
         self.range_selection_start = None;
+        self.sidebar_mode = ReviewSidebarMode::Files;
         true
     }
 
@@ -1282,6 +1407,7 @@ impl ReviewApp {
             return true;
         };
         self.comment_editor = Some(ReviewCommentEditor::new(anchor));
+        self.sync_selected_thread_to_anchor();
         self.status_message =
             Some("editing draft comment; enter/ctrl+s saves, esc cancels".to_string());
         true
@@ -1311,6 +1437,7 @@ impl ReviewApp {
             comment_id,
             comment.body.clone(),
         ));
+        self.sync_selected_thread_to_anchor();
         self.status_message =
             Some("editing draft comment; enter/ctrl+s saves, esc cancels".to_string());
         true
@@ -1341,6 +1468,7 @@ impl ReviewApp {
                         session_id: None,
                     });
                 self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
+                self.sync_selected_thread_to_anchor();
                 let count = self.draft_comment_count();
                 self.status_message = Some(format!("saved draft comment ({count} total)"));
             }
@@ -1417,6 +1545,7 @@ impl ReviewApp {
     /// Restore a locally updated draft after persistence failure.
     pub fn restore_updated_draft(&mut self, update: PendingDraftUpdate) {
         self.update_local_draft_body(&update.anchor, &update.comment_id, update.previous_body);
+        self.sync_selected_thread_to_anchor();
     }
 
     /// Restore a locally deleted draft after persistence failure.
@@ -1425,6 +1554,7 @@ impl ReviewApp {
             .entry(delete.anchor)
             .or_default()
             .push(delete.comment);
+        self.sync_selected_thread_to_anchor();
     }
 
     fn update_local_draft_body(
@@ -1443,6 +1573,19 @@ impl ReviewApp {
         };
         comment.body = body;
         comment.persisted = false;
+    }
+
+    fn sync_selected_thread_to_anchor(&mut self) {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            return;
+        };
+        if let Some(index) = self
+            .thread_summaries()
+            .iter()
+            .position(|thread| thread.anchor == anchor)
+        {
+            self.selected_thread = index;
+        }
     }
 
     /// Take pending linked session open request.

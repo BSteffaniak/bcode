@@ -6,7 +6,9 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::truncate_to_display_width;
 
-use super::code_review::{ReviewApp, ReviewFile, ReviewLine, ReviewLineKind, sidebar_width};
+use super::code_review::{
+    ReviewApp, ReviewFile, ReviewLine, ReviewLineKind, ReviewSidebarMode, sidebar_width,
+};
 
 /// Render one full-screen code review frame.
 pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
@@ -32,7 +34,10 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     let diff_area = if sidebar_width > 0 {
         let file_area = Rect::new(body.x, body.y, sidebar_width, body.height);
         app.set_file_area(Some(file_area));
-        render_files(app, file_area, frame);
+        match app.sidebar_mode {
+            ReviewSidebarMode::Files => render_files(app, file_area, frame),
+            ReviewSidebarMode::Threads => render_threads(app, file_area, frame),
+        }
         let separator = Rect::new(file_area.right(), body.y, 1, body.height);
         render_separator(separator, frame);
         Rect::new(
@@ -127,8 +132,11 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                     .map_or(String::new(), |_| "  🤖 session linked".to_string());
                 return format!(" {preview}{linked}  a ask/follow up  o open  e edit  D delete latest draft ");
             }
+            if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
+                return " j/k thread  Enter jump  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string();
+            }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  o open session  e edit  D delete draft  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -179,6 +187,75 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 app.draft_comment_count_for_file(index),
                 line_area,
                 frame,
+            );
+        }
+    }
+}
+
+fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.is_empty() {
+        return;
+    }
+    let threads = app.thread_summaries();
+    let visible_rows = usize::from(area.height);
+    if threads.is_empty() {
+        frame.write_line(
+            area,
+            &Line::from_spans(vec![Span::styled(
+                " no review threads",
+                Style::new().fg(Color::BrightBlack),
+            )]),
+        );
+        return;
+    }
+    app.selected_thread = app.selected_thread.min(threads.len().saturating_sub(1));
+    if app.selected_thread < app.thread_scroll {
+        app.thread_scroll = app.selected_thread;
+    }
+    if app.selected_thread >= app.thread_scroll.saturating_add(visible_rows) {
+        app.thread_scroll = app
+            .selected_thread
+            .saturating_sub(visible_rows.saturating_sub(1));
+    }
+
+    for row in 0..visible_rows {
+        let y = area
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        let index = app.thread_scroll.saturating_add(row);
+        let line_area = Rect::new(area.x, y, area.width, 1);
+        if let Some(thread) = threads.get(index) {
+            let selected = index == app.selected_thread;
+            let style = if selected {
+                Style::new().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::new().fg(Color::White).bg(Color::Black)
+            };
+            let marker = if thread.session_id.is_some() {
+                "🤖💬"
+            } else {
+                "💬"
+            };
+            let line_label = thread
+                .anchor
+                .new_start
+                .or(thread.anchor.old_start)
+                .map_or_else(
+                    || format!("@{}", thread.anchor.diff_row),
+                    |line| format!("+{line}"),
+                );
+            let body = thread.latest_body.lines().next().unwrap_or_default();
+            let text = format!(
+                " {marker} {} {line_label} x{}  {body}",
+                thread.anchor.path, thread.draft_count
+            );
+            frame.write_line_with_fallback_style(
+                line_area,
+                &Line::from_spans(vec![Span::styled(
+                    truncate_to_display_width(&text, usize::from(area.width)),
+                    style,
+                )]),
+                style,
             );
         }
     }
@@ -343,7 +420,7 @@ fn render_diff_line(line: &ReviewLine) -> RenderedRow {
 
 fn render_help(area: Rect, frame: &mut Frame<'_>) {
     let width = area.width.min(68);
-    let height = 17;
+    let height = 18;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
     let y = area
         .y
@@ -361,7 +438,8 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " n/p or left/right   next/previous file",
         " J/K                 next/previous hunk",
         " g/G                 top/bottom of file diff",
-        " b                   toggle file sidebar",
+        " b                   toggle sidebar",
+        " t                   toggle files/threads sidebar",
         " mouse wheel         scroll diff",
         " click file          open file",
         " c                   create draft comment",
