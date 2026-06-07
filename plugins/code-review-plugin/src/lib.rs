@@ -1186,30 +1186,123 @@ fn materialize_source(
                 });
             }
         }
-        None => materialize_context_source(source, surfaces),
+        None => materialize_context_source(repo_root, source, surfaces)?,
     }
     Ok(())
 }
 
-fn materialize_context_source(source: &ReviewSource, surfaces: &mut Vec<ReviewSurface>) {
-    let path = match &source.kind {
-        ReviewSourceKind::File { path } | ReviewSourceKind::FileRange { path, .. } => path.clone(),
-        ReviewSourceKind::Commit { rev } => rev.clone(),
-        ReviewSourceKind::Repository => "repository".to_string(),
+fn materialize_context_source(
+    repo_root: &Path,
+    source: &ReviewSource,
+    surfaces: &mut Vec<ReviewSurface>,
+) -> Result<(), ReviewError> {
+    match &source.kind {
+        ReviewSourceKind::File { path } => {
+            surfaces.push(file_surface_for_path(repo_root, source, path, None)?);
+        }
+        ReviewSourceKind::FileRange { path, start, end } => {
+            surfaces.push(file_surface_for_path(
+                repo_root,
+                source,
+                path,
+                Some((*start, *end)),
+            )?);
+        }
+        ReviewSourceKind::Repository => {
+            for file in repository_review_files(repo_root)? {
+                let path = file.display_path().to_string();
+                surfaces.push(ReviewSurface {
+                    id: surface_id(&source.id, &path, ReviewSurfaceKind::File),
+                    source_id: source.id.clone(),
+                    path,
+                    kind: ReviewSurfaceKind::File,
+                    file: Some(file),
+                });
+            }
+        }
+        ReviewSourceKind::Commit { rev } => surfaces.push(ReviewSurface {
+            id: surface_id(&source.id, rev, ReviewSurfaceKind::File),
+            source_id: source.id.clone(),
+            path: rev.clone(),
+            kind: ReviewSurfaceKind::File,
+            file: None,
+        }),
         ReviewSourceKind::WorkingTreeUnstaged
         | ReviewSourceKind::IndexStaged
         | ReviewSourceKind::WorkingTreeAndIndex
         | ReviewSourceKind::LastCommit
         | ReviewSourceKind::CommitRange { .. }
-        | ReviewSourceKind::BranchCompare { .. } => return,
-    };
-    surfaces.push(ReviewSurface {
-        id: surface_id(&source.id, &path, ReviewSurfaceKind::File),
+        | ReviewSourceKind::BranchCompare { .. } => {}
+    }
+    Ok(())
+}
+
+fn file_surface_for_path(
+    repo_root: &Path,
+    source: &ReviewSource,
+    path: &str,
+    range: Option<(u32, u32)>,
+) -> Result<ReviewSurface, ReviewError> {
+    let file = review_file_for_repository_path(repo_root, path, range)?;
+    Ok(ReviewSurface {
+        id: surface_id(&source.id, path, ReviewSurfaceKind::File),
         source_id: source.id.clone(),
-        path,
+        path: path.to_string(),
         kind: ReviewSurfaceKind::File,
-        file: None,
-    });
+        file: Some(file),
+    })
+}
+
+fn review_file_for_repository_path(
+    repo_root: &Path,
+    path: &str,
+    range: Option<(u32, u32)>,
+) -> Result<ReviewFile, ReviewError> {
+    let response = repository_file_get(&RepositoryFileRequest {
+        repo_path: repo_root.to_path_buf(),
+        file_path: path.to_string(),
+    })?;
+    let lines = response
+        .content
+        .as_deref()
+        .map_or_else(Vec::new, |content| file_review_lines(content, range));
+    Ok(ReviewFile {
+        old_path: None,
+        new_path: Some(path.to_string()),
+        status: ReviewFileStatus::Unknown,
+        additions: 0,
+        deletions: 0,
+        hunks: vec![ReviewHunk {
+            old_start: range.map_or(1, |(start, _)| start),
+            old_count: u32::try_from(lines.len()).unwrap_or(u32::MAX),
+            new_start: range.map_or(1, |(start, _)| start),
+            new_count: u32::try_from(lines.len()).unwrap_or(u32::MAX),
+            heading: response.unavailable_reason,
+            lines,
+        }],
+        is_binary: response.is_binary,
+    })
+}
+
+fn file_review_lines(content: &str, range: Option<(u32, u32)>) -> Vec<ReviewLine> {
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_number = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
+            if let Some((start, end)) = range
+                && (line_number < start || line_number > end)
+            {
+                return None;
+            }
+            Some(ReviewLine {
+                kind: ReviewLineKind::Context,
+                old_line: Some(line_number),
+                new_line: Some(line_number),
+                content: line.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn review_target_from_source_kind(kind: &ReviewSourceKind) -> Option<ReviewTarget> {
