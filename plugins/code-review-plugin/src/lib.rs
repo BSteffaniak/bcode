@@ -967,23 +967,103 @@ fn review_bundle_for_request(request: ReviewContextRequest) -> Result<ReviewBund
     })
 }
 
-fn builtin_publishers() -> Vec<ReviewPublisherManifest> {
-    vec![
+trait ReviewPublisher {
+    fn manifest(&self) -> ReviewPublisherManifest;
+
+    fn preview(
+        &self,
+        bundle: &ReviewBundle,
+        options: &serde_json::Value,
+    ) -> Result<String, ReviewError>;
+
+    fn submit(
+        &self,
+        bundle: &ReviewBundle,
+        options: &serde_json::Value,
+    ) -> Result<PublishReviewResponse, ReviewError>;
+}
+
+struct MarkdownFilePublisher;
+
+impl ReviewPublisher for MarkdownFilePublisher {
+    fn manifest(&self) -> ReviewPublisherManifest {
         ReviewPublisherManifest {
             id: "markdown_file".to_string(),
             label: "Markdown file".to_string(),
             description: "Write a local Markdown review export".to_string(),
             capabilities: file_publisher_capabilities(),
             options_schema: file_publisher_options_schema(),
-        },
+        }
+    }
+
+    fn preview(
+        &self,
+        bundle: &ReviewBundle,
+        _options: &serde_json::Value,
+    ) -> Result<String, ReviewError> {
+        Ok(publish_markdown(bundle))
+    }
+
+    fn submit(
+        &self,
+        bundle: &ReviewBundle,
+        options: &serde_json::Value,
+    ) -> Result<PublishReviewResponse, ReviewError> {
+        write_file_publish(
+            self.manifest().id,
+            bundle,
+            options,
+            "md",
+            publish_markdown(bundle),
+        )
+    }
+}
+
+struct JsonFilePublisher;
+
+impl ReviewPublisher for JsonFilePublisher {
+    fn manifest(&self) -> ReviewPublisherManifest {
         ReviewPublisherManifest {
             id: "json_file".to_string(),
             label: "JSON file".to_string(),
             description: "Write a local JSON review bundle".to_string(),
             capabilities: file_publisher_capabilities(),
             options_schema: file_publisher_options_schema(),
-        },
-    ]
+        }
+    }
+
+    fn preview(
+        &self,
+        bundle: &ReviewBundle,
+        _options: &serde_json::Value,
+    ) -> Result<String, ReviewError> {
+        serde_json::to_string_pretty(bundle).map_err(ReviewError::Json)
+    }
+
+    fn submit(
+        &self,
+        bundle: &ReviewBundle,
+        options: &serde_json::Value,
+    ) -> Result<PublishReviewResponse, ReviewError> {
+        write_file_publish(
+            self.manifest().id,
+            bundle,
+            options,
+            "json",
+            serde_json::to_string_pretty(bundle)?,
+        )
+    }
+}
+
+fn builtin_review_publishers() -> Vec<Box<dyn ReviewPublisher>> {
+    vec![Box::new(MarkdownFilePublisher), Box::new(JsonFilePublisher)]
+}
+
+fn builtin_publishers() -> Vec<ReviewPublisherManifest> {
+    builtin_review_publishers()
+        .into_iter()
+        .map(|publisher| publisher.manifest())
+        .collect()
 }
 
 const fn file_publisher_capabilities() -> ReviewPublisherCapabilities {
@@ -1015,42 +1095,52 @@ fn publish_preview_for_request(
         repo_path: request.repo_path,
         target: request.target,
     })?;
+    let preview = with_publisher(&publisher_id, |publisher| {
+        publisher.preview(&bundle, &request.options)
+    })?;
     Ok(PublishReviewPreviewResponse {
-        preview: render_publisher_output(&publisher_id, &bundle)?,
         publisher_id,
+        preview,
     })
 }
 
 fn publish_submit_for_request(
     request: PublishReviewRequest,
 ) -> Result<PublishReviewResponse, ReviewError> {
-    let output_path = request
-        .options
-        .get("output_path")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from);
     let publisher_id = request.publisher_id;
     let bundle = review_bundle_for_request(ReviewContextRequest {
         repo_path: request.repo_path,
         target: request.target,
     })?;
-    let rendered = render_publisher_output(&publisher_id, &bundle)?;
-    let extension = publisher_file_extension(&publisher_id)?;
-    let path = output_path.unwrap_or_else(|| {
-        bundle
-            .repo_root
-            .join(".bcode")
-            .join("reviews")
-            .join(format!(
-                "{}.{}",
-                safe_review_id(&bundle.review_id),
-                extension
-            ))
-    });
+    with_publisher(&publisher_id, |publisher| {
+        publisher.submit(&bundle, &request.options)
+    })
+}
+
+fn with_publisher<T>(
+    publisher_id: &str,
+    operation: impl FnOnce(&dyn ReviewPublisher) -> Result<T, ReviewError>,
+) -> Result<T, ReviewError> {
+    for publisher in builtin_review_publishers() {
+        if publisher.manifest().id == publisher_id {
+            return operation(publisher.as_ref());
+        }
+    }
+    Err(ReviewError::UnsupportedPublisher(publisher_id.to_string()))
+}
+
+fn write_file_publish(
+    publisher_id: String,
+    bundle: &ReviewBundle,
+    options: &serde_json::Value,
+    extension: &str,
+    contents: String,
+) -> Result<PublishReviewResponse, ReviewError> {
+    let path = publish_output_path(bundle, options, extension);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, rendered)?;
+    std::fs::write(&path, contents)?;
     Ok(PublishReviewResponse {
         publisher_id,
         submitted: true,
@@ -1059,23 +1149,29 @@ fn publish_submit_for_request(
     })
 }
 
-fn render_publisher_output(
-    publisher_id: &str,
+fn publish_output_path(
     bundle: &ReviewBundle,
-) -> Result<String, ReviewError> {
-    match publisher_id {
-        "markdown_file" => Ok(publish_markdown(bundle)),
-        "json_file" => serde_json::to_string_pretty(bundle).map_err(ReviewError::Json),
-        _ => Err(ReviewError::UnsupportedPublisher(publisher_id.to_string())),
-    }
-}
-
-fn publisher_file_extension(publisher_id: &str) -> Result<&'static str, ReviewError> {
-    match publisher_id {
-        "markdown_file" => Ok("md"),
-        "json_file" => Ok("json"),
-        _ => Err(ReviewError::UnsupportedPublisher(publisher_id.to_string())),
-    }
+    options: &serde_json::Value,
+    extension: &str,
+) -> PathBuf {
+    options
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map_or_else(
+            || {
+                bundle
+                    .repo_root
+                    .join(".bcode")
+                    .join("reviews")
+                    .join(format!(
+                        "{}.{}",
+                        safe_review_id(&bundle.review_id),
+                        extension
+                    ))
+            },
+            PathBuf::from,
+        )
 }
 
 fn publish_markdown(bundle: &ReviewBundle) -> String {
@@ -2249,5 +2345,84 @@ mod tests {
         assert_eq!(hunk.new_start, 4);
         assert_eq!(hunk.new_count, 2);
         assert_eq!(hunk.heading.as_deref(), Some("fn main()"));
+    }
+
+    #[test]
+    fn publisher_registry_lists_builtin_publishers() {
+        let publishers = builtin_publishers();
+
+        assert_eq!(publishers.len(), 2);
+        assert!(
+            publishers
+                .iter()
+                .any(|publisher| publisher.id == "markdown_file")
+        );
+        assert!(
+            publishers
+                .iter()
+                .any(|publisher| publisher.id == "json_file")
+        );
+    }
+
+    #[test]
+    fn json_publisher_preview_is_review_bundle_json() {
+        let bundle = ReviewBundle {
+            review_id: "review-1".to_string(),
+            title: "Review".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            target: ReviewTarget::WorkingTreeUnstaged,
+            files: Vec::new(),
+            threads: Vec::new(),
+            generated_at_ms: 1,
+        };
+
+        let preview = with_publisher("json_file", |publisher| {
+            publisher.preview(&bundle, &serde_json::json!({}))
+        })
+        .expect("json preview");
+        let decoded: ReviewBundle = serde_json::from_str(&preview).expect("valid bundle json");
+
+        assert_eq!(decoded.review_id, "review-1");
+    }
+
+    #[test]
+    fn unsupported_publisher_returns_error() {
+        let error = with_publisher("missing", |publisher| {
+            publisher.preview(
+                &ReviewBundle {
+                    review_id: "review-1".to_string(),
+                    title: "Review".to_string(),
+                    repo_root: PathBuf::from("/repo"),
+                    target: ReviewTarget::WorkingTreeUnstaged,
+                    files: Vec::new(),
+                    threads: Vec::new(),
+                    generated_at_ms: 1,
+                },
+                &serde_json::json!({}),
+            )
+        })
+        .expect_err("missing publisher should fail");
+
+        assert!(matches!(error, ReviewError::UnsupportedPublisher(_)));
+    }
+
+    #[test]
+    fn output_path_override_is_used() {
+        let bundle = ReviewBundle {
+            review_id: "review-1".to_string(),
+            title: "Review".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            target: ReviewTarget::WorkingTreeUnstaged,
+            files: Vec::new(),
+            threads: Vec::new(),
+            generated_at_ms: 1,
+        };
+        let path = publish_output_path(
+            &bundle,
+            &serde_json::json!({ "output_path": "custom/review.json" }),
+            "json",
+        );
+
+        assert_eq!(path, PathBuf::from("custom/review.json"));
     }
 }
