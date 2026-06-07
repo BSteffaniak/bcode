@@ -162,14 +162,13 @@ pub async fn repair_session(
         }
     };
 
-    if validate_session_db(root, session_id).await.is_ok() {
-        report.status = RepairStatus::Ok;
-        return Ok(report);
-    }
-    let initial_error = validate_session_db(root, session_id)
-        .await
-        .expect_err("validated as error above")
-        .to_string();
+    let initial_error = match validate_session_db(root, session_id).await {
+        Ok(()) => {
+            report.status = RepairStatus::Ok;
+            return Ok(report);
+        }
+        Err(error) => error.to_string(),
+    };
     report.initial_error = Some(initial_error.clone());
     repair_db_files(
         root,
@@ -219,14 +218,13 @@ pub async fn repair_catalog(
         Some(lease::acquire_catalog_lock(root)?)
     };
 
-    if validate_catalog_db(root).await.is_ok() {
-        report.status = RepairStatus::Ok;
-        return Ok(report);
-    }
-    let initial_error = validate_catalog_db(root)
-        .await
-        .expect_err("validated as error above")
-        .to_string();
+    let initial_error = match validate_catalog_db(root).await {
+        Ok(()) => {
+            report.status = RepairStatus::Ok;
+            return Ok(report);
+        }
+        Err(error) => error.to_string(),
+    };
     report.initial_error = Some(initial_error.clone());
     repair_db_files(
         root,
