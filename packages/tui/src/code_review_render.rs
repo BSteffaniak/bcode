@@ -58,7 +58,7 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     render_diff(app, diff_area, frame);
 
     if app.help_visible {
-        render_help(area, frame);
+        render_help(app, area, frame);
     }
     if app.comment_editor.is_some() {
         render_comment_editor(app, area, frame);
@@ -87,24 +87,35 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             app.review.files.len()
         )
     };
-    let (hunk, hunk_total) = app.hunk_position();
     let drafts = app.draft_comment_count();
     let draft_label = if drafts == 0 {
         String::new()
     } else {
         format!("  💬 {drafts} draft")
     };
-    let text = format!(
-        " bcode review  {}  {}  File {}  Hunk {}/{}{}  +{} -{} ",
-        app.review.title,
-        file_label,
-        file_position,
-        hunk,
-        hunk_total,
-        draft_label,
-        app.review.additions,
-        app.review.deletions
-    );
+    let text = if app.review.is_repository_review() {
+        format!(
+            " bcode review  {}  {}  File {}  Line {}{} ",
+            app.review.title,
+            file_label,
+            file_position,
+            app.selected_diff_line.saturating_add(1),
+            draft_label
+        )
+    } else {
+        let (hunk, hunk_total) = app.hunk_position();
+        format!(
+            " bcode review  {}  {}  File {}  Hunk {}/{}{}  +{} -{} ",
+            app.review.title,
+            file_label,
+            file_position,
+            hunk,
+            hunk_total,
+            draft_label,
+            app.review.additions,
+            app.review.deletions
+        )
+    };
     frame.write_line_with_fallback_style(
         area,
         &Line::from_spans(vec![Span::styled(
@@ -152,8 +163,13 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                     " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
                 });
             }
+            if app.review.is_repository_review() {
+                return format!(
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  c comment  v range  x publish  a ask Bcode  t threads  b sidebar:{sidebar}  ? {help}  q exit "
+                );
+            }
             format!(
-                " j/k scroll  n/p file  f picker  : line  / search  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -215,10 +231,8 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
 
 fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visible_rows: usize) {
     let rows = app.file_tree_rows();
-    let selected_row = rows
-        .iter()
-        .position(|row| matches!(row, super::code_review::ReviewFileTreeRow::File { index, .. } if *index == app.selected_file))
-        .unwrap_or(0);
+    let selected_row = app.selected_tree_row.min(rows.len().saturating_sub(1));
+    app.selected_tree_row = selected_row;
     if selected_row < app.file_scroll {
         app.file_scroll = selected_row;
     }
@@ -523,16 +537,25 @@ fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         let Some(content) = cached.line(index) else {
             break;
         };
-        let style = if index == app.selected_diff_line {
+        let mut style = if index == app.selected_diff_line {
             Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else if app.is_row_in_range_selection(app.selected_file, index) {
+            Style::new().fg(Color::White).bg(Color::Blue)
+        } else if app.has_draft_comment_at(app.selected_file, index) {
+            Style::new().fg(Color::White).bg(Color::BrightBlack)
         } else {
             Style::new()
         };
         let line_number = format!("{:>5} ", index.saturating_add(1));
-        let line = Line::from_spans(vec![
+        let mut line = Line::from_spans(vec![
             Span::styled(line_number, Style::new().fg(Color::BrightBlack)),
             Span::styled(content.to_string(), style),
         ]);
+        if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
+            line.spans
+                .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
+            style = style.bg(style.bg.unwrap_or(Color::BrightBlack));
+        }
         frame.write_line_with_fallback_style(
             Rect {
                 x: area.x,
@@ -646,7 +669,7 @@ const fn syntax_style_to_tui(style: bcode_syntax_render::SyntaxStyle) -> Style {
     output
 }
 
-fn render_help(area: Rect, frame: &mut Frame<'_>) {
+fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let width = area.width.min(68);
     let height = 18;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
@@ -659,11 +682,30 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " ",
         Style::new().fg(Color::White).bg(Color::BrightBlack),
     );
-    let lines = [
+    let repo_lines = [
+        " Repository Review Help",
+        "",
+        " j/k or arrows       move tree selection",
+        " enter/right         open file or expand directory",
+        " left                collapse directory/parent",
+        " f or ctrl-p         fuzzy file picker",
+        " :                   jump to line",
+        " /                   search current file",
+        " n/N                 next/previous search match",
+        " v                   select/clear line range",
+        " c                   create draft comment",
+        " a                   ask Bcode about selected line",
+        " x                   publish/export review",
+        " t                   toggle files/threads sidebar",
+        " b                   toggle sidebar",
+        " ?                   toggle this help",
+        " q or esc            exit review",
+    ];
+    let diff_lines = [
         " Code Review Help",
         "",
         " j/k or arrows       scroll diff",
-        " n/p or left/right   next/previous file",
+        " n/p                 next/previous file",
         " J/K                 next/previous hunk",
         " g/G                 top/bottom of file diff",
         " b                   toggle sidebar",
@@ -680,6 +722,11 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " ?                   toggle this help",
         " q or esc            exit review",
     ];
+    let lines: &[&str] = if app.review.is_repository_review() {
+        &repo_lines
+    } else {
+        &diff_lines
+    };
     for (index, text) in lines.iter().enumerate() {
         let y = popup
             .y

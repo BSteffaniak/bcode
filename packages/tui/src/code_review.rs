@@ -962,14 +962,16 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('k') | KeyCode::Up => app.move_up(1),
         KeyCode::Char('g') => app.scroll_to_top(),
         KeyCode::Char('G') => app.scroll_to_bottom(),
-        KeyCode::Char('n') | KeyCode::Right => {
+        KeyCode::Char('n') => {
             if app.has_active_search() {
                 app.search_next_match()
             } else {
                 app.select_next_file()
             }
         }
-        KeyCode::Char('p') | KeyCode::Left => app.select_previous_file(),
+        KeyCode::Right => app.expand_selected_tree_row(),
+        KeyCode::Char('p') => app.select_previous_file(),
+        KeyCode::Left => app.collapse_selected_tree_row(),
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
         KeyCode::Char('v') => app.toggle_range_selection(),
@@ -1910,6 +1912,8 @@ pub struct ReviewApp {
     pub last_search_query: Option<String>,
     /// Expanded repository sidebar directories.
     pub expanded_dirs: BTreeSet<PathBuf>,
+    /// Selected repository file-tree row.
+    pub selected_tree_row: usize,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -1951,6 +1955,7 @@ impl ReviewApp {
             prompt_state: None,
             last_search_query: None,
             expanded_dirs: BTreeSet::new(),
+            selected_tree_row: 0,
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
@@ -2188,11 +2193,7 @@ impl ReviewApp {
     /// Activate the selected repository tree row.
     pub fn activate_selected_tree_row(&mut self) -> bool {
         let rows = self.file_tree_rows();
-        let selected_row = rows
-            .iter()
-            .position(|row| matches!(row, ReviewFileTreeRow::File { index, .. } if *index == self.selected_file))
-            .unwrap_or(0);
-        match rows.get(selected_row).cloned() {
+        match rows.get(self.selected_tree_row).cloned() {
             Some(ReviewFileTreeRow::Directory { path, .. }) => {
                 self.toggle_file_tree_directory(&path)
             }
@@ -2244,6 +2245,11 @@ impl ReviewApp {
     pub fn move_down(&mut self, rows: usize) -> bool {
         if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
             self.select_next_thread(rows)
+        } else if self.review.is_repository_review()
+            && self.sidebar_mode == ReviewSidebarMode::Files
+            && self.sidebar_visible
+        {
+            self.select_next_tree_row(rows)
         } else {
             self.scroll_down(rows)
         }
@@ -2253,8 +2259,71 @@ impl ReviewApp {
     pub fn move_up(&mut self, rows: usize) -> bool {
         if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
             self.select_previous_thread(rows)
+        } else if self.review.is_repository_review()
+            && self.sidebar_mode == ReviewSidebarMode::Files
+            && self.sidebar_visible
+        {
+            self.select_previous_tree_row(rows)
         } else {
             self.scroll_up(rows)
+        }
+    }
+
+    /// Select next repository tree row.
+    pub fn select_next_tree_row(&mut self, rows: usize) -> bool {
+        let max = self.file_tree_rows().len().saturating_sub(1);
+        let next = self.selected_tree_row.saturating_add(rows).min(max);
+        if next == self.selected_tree_row {
+            return false;
+        }
+        self.selected_tree_row = next;
+        self.select_tree_row_file_if_present();
+        true
+    }
+
+    /// Select previous repository tree row.
+    pub fn select_previous_tree_row(&mut self, rows: usize) -> bool {
+        let next = self.selected_tree_row.saturating_sub(rows);
+        if next == self.selected_tree_row {
+            return false;
+        }
+        self.selected_tree_row = next;
+        self.select_tree_row_file_if_present();
+        true
+    }
+
+    fn select_tree_row_file_if_present(&mut self) {
+        if let Some(ReviewFileTreeRow::File { index, .. }) =
+            self.file_tree_rows().get(self.selected_tree_row).cloned()
+        {
+            let _ = self.select_file(index);
+        }
+    }
+
+    /// Expand selected directory row.
+    pub fn expand_selected_tree_row(&mut self) -> bool {
+        match self.file_tree_rows().get(self.selected_tree_row).cloned() {
+            Some(ReviewFileTreeRow::Directory { path, .. }) => self.expanded_dirs.insert(path),
+            _ => false,
+        }
+    }
+
+    /// Collapse selected directory row or selected file parent.
+    pub fn collapse_selected_tree_row(&mut self) -> bool {
+        match self.file_tree_rows().get(self.selected_tree_row).cloned() {
+            Some(ReviewFileTreeRow::Directory { path, .. }) => self.expanded_dirs.remove(&path),
+            Some(ReviewFileTreeRow::File { .. }) => {
+                let parent = self.selected_file_data().and_then(|file| {
+                    Path::new(file.display_path())
+                        .parent()
+                        .map(Path::to_path_buf)
+                });
+                let Some(parent) = parent else {
+                    return false;
+                };
+                self.expanded_dirs.remove(&parent)
+            }
+            None => false,
         }
     }
 
@@ -2338,6 +2407,7 @@ impl ReviewApp {
         self.sidebar_mode = ReviewSidebarMode::Files;
         self.queue_selected_file_load();
         self.expand_selected_file_dirs();
+        self.sync_tree_row_to_selected_file();
         true
     }
 
@@ -2349,6 +2419,15 @@ impl ReviewApp {
     /// Store a lazily loaded repository file.
     pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
         self.file_cache.insert(file);
+    }
+
+    /// Sync selected tree row to selected file.
+    pub fn sync_tree_row_to_selected_file(&mut self) {
+        if let Some(row) = self.file_tree_rows().iter().position(|row| {
+            matches!(row, ReviewFileTreeRow::File { index, .. } if *index == self.selected_file)
+        }) {
+            self.selected_tree_row = row;
+        }
     }
 
     /// Expand ancestor directories for the selected file.
