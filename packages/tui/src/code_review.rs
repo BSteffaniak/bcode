@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use bcode_client::BcodeClient;
+use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
@@ -27,6 +28,11 @@ const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
 const PUBLISH_SUBMIT_OPERATION: &str = "review.publish.submit";
 const PUBLISHERS_LIST_OPERATION: &str = "review.publishers.list";
 const PUBLISH_PREVIEW_OPERATION: &str = "review.publish.preview";
+const REVIEW_BUNDLE_GET_OPERATION: &str = "review.bundle.get";
+const REVIEW_PUBLISHER_INTERFACE_ID: &str = "bcode.review_publisher/v1";
+const REVIEW_PUBLISHER_MANIFEST_OPERATION: &str = "review.publisher.manifest";
+const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = "review.publisher.preview";
+const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = "review.publisher.submit";
 const DEFAULT_PUBLISHER_ID: &str = "markdown_file";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
@@ -209,20 +215,49 @@ async fn handle_publish_request(
 ) {
     match request {
         PendingPublishRequest::ListPublishers => match list_publishers(client).await {
-            Ok(publishers) => app.show_publishers(publishers),
+            Ok(mut publishers) => {
+                match list_external_publishers(client).await {
+                    Ok(external) => publishers.extend(external),
+                    Err(error) => {
+                        app.status_message =
+                            Some(format!("external publisher discovery failed: {error}"));
+                    }
+                }
+                app.show_publishers(publishers);
+            }
             Err(error) => app.status_message = Some(format!("publisher list failed: {error}")),
         },
         PendingPublishRequest::Preview {
             publisher_id,
             options,
-        } => match preview_review(client, repo_path, target, publisher_id, options).await {
+        } => match preview_review(
+            client,
+            repo_path,
+            target,
+            app.publisher_for_id(&publisher_id)
+                .and_then(|publisher| publisher.route.clone()),
+            publisher_id,
+            options,
+        )
+        .await
+        {
             Ok(response) => app.show_publish_preview(response.publisher_id, response.preview),
             Err(error) => app.status_message = Some(format!("publish preview failed: {error}")),
         },
         PendingPublishRequest::Submit {
             publisher_id,
             options,
-        } => match publish_review(client, repo_path, target, publisher_id, options).await {
+        } => match publish_review(
+            client,
+            repo_path,
+            target,
+            app.publisher_for_id(&publisher_id)
+                .and_then(|publisher| publisher.route.clone()),
+            publisher_id,
+            options,
+        )
+        .await
+        {
             Ok(response) => app.finish_publish(response),
             Err(error) => app.status_message = Some(format!("publish failed: {error}")),
         },
@@ -253,14 +288,34 @@ async fn preview_review(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    route: Option<ReviewPublisherRoute>,
     publisher_id: String,
     options: Vec<ReviewPublishOption>,
 ) -> Result<PublishReviewPreviewResponse, TuiError> {
+    let options = options_json(options);
+    if let Some(route) = route {
+        let bundle = load_review_bundle(client, repo_path, target).await?;
+        let response = invoke_external_publisher(
+            client,
+            route,
+            REVIEW_PUBLISHER_PREVIEW_OPERATION.to_string(),
+            bundle,
+            options,
+        )
+        .await?;
+        if let Some(error) = response.error {
+            return Err(TuiError::PluginService {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        return serde_json::from_slice(&response.payload).map_err(TuiError::Json);
+    }
     let request = PublishReviewRequest {
         repo_path,
         target,
         publisher_id,
-        options: options_json(options),
+        options,
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
@@ -283,14 +338,34 @@ async fn publish_review(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    route: Option<ReviewPublisherRoute>,
     publisher_id: String,
     options: Vec<ReviewPublishOption>,
 ) -> Result<PublishReviewResponse, TuiError> {
+    let options = options_json(options);
+    if let Some(route) = route {
+        let bundle = load_review_bundle(client, repo_path, target).await?;
+        let response = invoke_external_publisher(
+            client,
+            route,
+            REVIEW_PUBLISHER_SUBMIT_OPERATION.to_string(),
+            bundle,
+            options,
+        )
+        .await?;
+        if let Some(error) = response.error {
+            return Err(TuiError::PluginService {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        return serde_json::from_slice(&response.payload).map_err(TuiError::Json);
+    }
     let request = PublishReviewRequest {
         repo_path,
         target,
         publisher_id,
-        options: options_json(options),
+        options,
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
@@ -344,6 +419,81 @@ fn options_json(options: Vec<ReviewPublishOption>) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(object)
+}
+
+async fn list_external_publishers(
+    client: &BcodeClient,
+) -> Result<Vec<ReviewPublisherManifest>, TuiError> {
+    let services = client.plugin_services().await?;
+    let mut publishers = Vec::new();
+    for service in services
+        .into_iter()
+        .filter(|service| service.interface_id == REVIEW_PUBLISHER_INTERFACE_ID)
+    {
+        let response = client
+            .invoke_plugin_service(
+                service.plugin_id.clone(),
+                service.interface_id.clone(),
+                REVIEW_PUBLISHER_MANIFEST_OPERATION.to_string(),
+                serde_json::to_vec(&serde_json::json!({})).map_err(TuiError::Json)?,
+            )
+            .await?;
+        if let Some(error) = response.error {
+            return Err(TuiError::PluginService {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        let mut publisher: ReviewPublisherManifest =
+            serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+        publisher.route = Some(ReviewPublisherRoute {
+            plugin_id: service.plugin_id,
+            interface_id: service.interface_id,
+        });
+        publishers.push(publisher);
+    }
+    Ok(publishers)
+}
+
+async fn load_review_bundle(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+) -> Result<serde_json::Value, TuiError> {
+    let request = ReviewContextRequest { repo_path, target };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            REVIEW_BUNDLE_GET_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    serde_json::from_slice(&response.payload).map_err(TuiError::Json)
+}
+
+async fn invoke_external_publisher(
+    client: &BcodeClient,
+    route: ReviewPublisherRoute,
+    operation: String,
+    bundle: serde_json::Value,
+    options: serde_json::Value,
+) -> Result<PluginServiceResponse, TuiError> {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "bundle": bundle,
+        "options": options,
+    }))
+    .map_err(TuiError::Json)?;
+    client
+        .invoke_plugin_service(route.plugin_id, route.interface_id, operation, payload)
+        .await
+        .map_err(TuiError::from)
 }
 
 async fn load_review(
@@ -753,6 +903,17 @@ pub struct ReviewPublisherManifest {
     pub capabilities: ReviewPublisherCapabilities,
     /// Publisher option schema.
     pub options_schema: serde_json::Value,
+    /// Optional external plugin route.
+    #[serde(default)]
+    pub route: Option<ReviewPublisherRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ReviewPublisherRoute {
+    /// Plugin id for external publisher.
+    pub plugin_id: String,
+    /// Service interface id.
+    pub interface_id: String,
 }
 
 impl ReviewPublisherManifest {
@@ -792,6 +953,12 @@ pub struct ReviewPublisherCapabilities {
 struct PublishReviewPreviewResponse {
     publisher_id: String,
     preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ReviewContextRequest {
+    repo_path: PathBuf,
+    target: ReviewTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2024,6 +2191,14 @@ impl ReviewApp {
             .unwrap_or(0);
         self.publish_state = Some(ReviewPublishState::Picker);
         self.status_message = None;
+    }
+
+    /// Return publisher for id.
+    #[must_use]
+    pub fn publisher_for_id(&self, publisher_id: &str) -> Option<&ReviewPublisherManifest> {
+        self.publishers
+            .iter()
+            .find(|publisher| publisher.id == publisher_id)
     }
 
     /// Show publisher preview.
