@@ -10,8 +10,8 @@ use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
-    REVIEW_PUBLISHER_INTERFACE_ID, ReviewSource, ReviewSourceKind, ReviewSurface,
-    ReviewSurfaceKind, ReviewWorkspace,
+    OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID, ReviewSource, ReviewSourceKind,
+    ReviewSurface, ReviewSurfaceKind, ReviewWorkspace, UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
@@ -38,6 +38,7 @@ const PUBLISHERS_LIST_OPERATION: &str = OP_REVIEW_PUBLISHERS_LIST;
 const PUBLISH_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISH_PREVIEW;
 const REVIEW_BUNDLE_GET_OPERATION: &str = OP_REVIEW_BUNDLE_GET;
 const REVIEW_REPO_FILE_GET_OPERATION: &str = OP_REVIEW_REPO_FILE_GET;
+const REVIEW_WORKSPACE_UPDATE_OPERATION: &str = OP_REVIEW_WORKSPACE_UPDATE;
 const REVIEW_PUBLISHER_MANIFEST_OPERATION: &str = OP_REVIEW_PUBLISHER_MANIFEST;
 const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISHER_PREVIEW;
 const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISHER_SUBMIT;
@@ -77,6 +78,25 @@ pub enum ReviewOpenTarget {
     Repository,
 }
 
+/// Run a full-screen local Git review from a durable workspace.
+///
+/// # Errors
+///
+/// Returns an error when review data cannot be loaded or terminal I/O fails.
+pub async fn run_workspace<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    workspace: ReviewWorkspace,
+) -> Result<Option<SessionId>, TuiError> {
+    let target = target_from_workspace(&workspace);
+    run_with_workspace(
+        terminal,
+        workspace.repo_root.clone(),
+        target,
+        Some(workspace),
+    )
+    .await
+}
+
 /// Run a full-screen local Git review.
 ///
 /// # Errors
@@ -87,19 +107,20 @@ pub async fn run<W: Write>(
     repo_path: PathBuf,
     target: ReviewOpenTarget,
 ) -> Result<Option<SessionId>, TuiError> {
+    run_with_workspace(terminal, repo_path, target, None).await
+}
+
+async fn run_with_workspace<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    repo_path: PathBuf,
+    target: ReviewOpenTarget,
+    workspace: Option<ReviewWorkspace>,
+) -> Result<Option<SessionId>, TuiError> {
     let client = BcodeClient::default_endpoint();
     let review_target: ReviewTarget = target.into();
-    let review = load_review(&client, repo_path.clone(), review_target.clone()).await?;
-    let drafts = load_drafts(&client, repo_path.clone(), review_target.clone()).await;
     let mut input = TuiInput::start();
-    let mut app = ReviewApp::new(review);
-    app.queue_selected_file_load();
-    match drafts {
-        Ok(drafts) => app.load_persisted_drafts(drafts),
-        Err(error) => {
-            app.status_message = Some(format!("failed to load persisted drafts: {error}"));
-        }
-    }
+    let mut app =
+        load_review_app(&client, repo_path.clone(), review_target.clone(), workspace).await?;
     let mut needs_redraw = true;
 
     while !app.should_exit {
@@ -116,23 +137,20 @@ pub async fn run<W: Write>(
         if handle_event(&mut app, terminal, &event) {
             needs_redraw = true;
         }
-        if let Some(path) = app.take_pending_file_load() {
-            match load_repository_file(&client, repo_path.clone(), path.clone()).await {
-                Ok(file) => app.store_loaded_file(file),
-                Err(error) => app.status_message = Some(format!("failed to load {path}: {error}")),
+        if handle_pending_file_load(&client, &repo_path, &mut app).await {
+            needs_redraw = true;
+        }
+        if app.take_pending_workspace_save() {
+            match save_workspace(&client, app.workspace.clone()).await {
+                Ok(()) => app.status_message = Some("saved review workspace".to_string()),
+                Err(error) => {
+                    app.pending_workspace_save = true;
+                    app.status_message = Some(format!("workspace save failed: {error}"));
+                }
             }
             needs_redraw = true;
         }
-        if let Some(save) = app.take_pending_draft_save() {
-            match save_draft(&client, repo_path.clone(), review_target.clone(), save).await {
-                Ok(()) => {
-                    app.status_message = Some("saved draft comment".to_string());
-                }
-                Err(error) => {
-                    app.status_message =
-                        Some(format!("saved locally; draft persistence failed: {error}"));
-                }
-            }
+        if handle_pending_draft_save(&client, &repo_path, &review_target, &mut app).await {
             needs_redraw = true;
         }
         if let Some(delete) = app.take_pending_draft_delete() {
@@ -186,6 +204,83 @@ pub async fn run<W: Write>(
     }
 
     Ok(app.take_session_to_open())
+}
+
+async fn handle_pending_draft_save(
+    client: &BcodeClient,
+    repo_path: &Path,
+    review_target: &ReviewTarget,
+    app: &mut ReviewApp,
+) -> bool {
+    let Some(save) = app.take_pending_draft_save() else {
+        return false;
+    };
+    match save_draft(client, repo_path.to_path_buf(), review_target.clone(), save).await {
+        Ok(()) => app.status_message = Some("saved draft comment".to_string()),
+        Err(error) => {
+            app.status_message = Some(format!("saved locally; draft persistence failed: {error}"));
+        }
+    }
+    true
+}
+
+async fn handle_pending_file_load(
+    client: &BcodeClient,
+    repo_path: &Path,
+    app: &mut ReviewApp,
+) -> bool {
+    let Some(path) = app.take_pending_file_load() else {
+        return false;
+    };
+    match load_repository_file(client, repo_path.to_path_buf(), path.clone()).await {
+        Ok(file) => app.store_loaded_file(file),
+        Err(error) => app.status_message = Some(format!("failed to load {path}: {error}")),
+    }
+    true
+}
+
+async fn load_review_app(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    review_target: ReviewTarget,
+    workspace: Option<ReviewWorkspace>,
+) -> Result<ReviewApp, TuiError> {
+    let review = load_review(client, repo_path.clone(), review_target.clone()).await?;
+    let drafts = load_drafts(client, repo_path, review_target).await;
+    let mut app = ReviewApp::new(review);
+    if let Some(workspace) = workspace {
+        app.workspace = workspace;
+    }
+    app.queue_selected_file_load();
+    match drafts {
+        Ok(drafts) => app.load_persisted_drafts(drafts),
+        Err(error) => {
+            app.status_message = Some(format!("failed to load persisted drafts: {error}"));
+        }
+    }
+    Ok(app)
+}
+
+async fn save_workspace(client: &BcodeClient, workspace: ReviewWorkspace) -> Result<(), TuiError> {
+    let payload = serde_json::to_vec(&UpdateReviewWorkspaceRequest {
+        repo_path: workspace.repo_root.clone(),
+        workspace,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            REVIEW_WORKSPACE_UPDATE_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    Ok(())
 }
 
 async fn handle_pending_agent_session(
@@ -1172,6 +1267,47 @@ enum ReviewTarget {
     Repository,
 }
 
+fn target_from_workspace(workspace: &ReviewWorkspace) -> ReviewOpenTarget {
+    workspace
+        .sources
+        .iter()
+        .find(|source| source.included)
+        .map_or(ReviewOpenTarget::Repository, |source| {
+            target_from_source_kind(&source.kind)
+        })
+}
+
+fn target_from_source_kind(kind: &ReviewSourceKind) -> ReviewOpenTarget {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => ReviewOpenTarget::WorkingTreeUnstaged,
+        ReviewSourceKind::IndexStaged => ReviewOpenTarget::IndexStaged,
+        ReviewSourceKind::WorkingTreeAndIndex => ReviewOpenTarget::WorkingTreeAndIndex,
+        ReviewSourceKind::LastCommit => ReviewOpenTarget::LastCommit,
+        ReviewSourceKind::CommitRange {
+            base,
+            head,
+            merge_base,
+        } => ReviewOpenTarget::CommitRange {
+            base: base.clone(),
+            head: head.clone(),
+            merge_base: *merge_base,
+        },
+        ReviewSourceKind::BranchCompare {
+            base_branch,
+            head_branch,
+            merge_base,
+        } => ReviewOpenTarget::BranchCompare {
+            base_branch: base_branch.clone(),
+            head_branch: head_branch.clone(),
+            merge_base: *merge_base,
+        },
+        ReviewSourceKind::Commit { .. }
+        | ReviewSourceKind::File { .. }
+        | ReviewSourceKind::FileRange { .. }
+        | ReviewSourceKind::Repository => ReviewOpenTarget::Repository,
+    }
+}
+
 impl From<ReviewOpenTarget> for ReviewTarget {
     fn from(target: ReviewOpenTarget) -> Self {
         match target {
@@ -2032,6 +2168,8 @@ pub struct ReviewApp {
     pub selected_tree_row: usize,
     /// Active build-mode row.
     pub selected_build_row: usize,
+    /// Whether workspace changes should be persisted.
+    pub pending_workspace_save: bool,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -2078,6 +2216,7 @@ impl ReviewApp {
             expanded_dirs: BTreeSet::new(),
             selected_tree_row: 0,
             selected_build_row: 0,
+            pending_workspace_save: false,
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
@@ -2276,6 +2415,7 @@ impl ReviewApp {
             label: label.clone(),
             included: true,
         });
+        self.pending_workspace_save = true;
         self.status_message = Some(format!("added {label}"));
         true
     }
@@ -2578,6 +2718,13 @@ impl ReviewApp {
         true
     }
 
+    /// Take pending workspace save flag.
+    pub const fn take_pending_workspace_save(&mut self) -> bool {
+        let pending = self.pending_workspace_save;
+        self.pending_workspace_save = false;
+        pending
+    }
+
     /// Add the selected file as an included workspace source.
     pub fn add_selected_file_to_workspace(&mut self) -> bool {
         let Some(path) = self
@@ -2612,6 +2759,7 @@ impl ReviewApp {
             .selected_build_row
             .min(self.build_row_count().saturating_sub(1));
         self.status_message = Some(format!("removed {}", source.label));
+        self.pending_workspace_save = true;
         true
     }
 

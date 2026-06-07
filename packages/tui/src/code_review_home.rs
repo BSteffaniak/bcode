@@ -7,7 +7,7 @@ use bcode_client::BcodeClient;
 use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, CreateReviewWorkspaceRequest, CreateReviewWorkspaceResponse,
     ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_WORKSPACE_CREATE,
-    OP_REVIEW_WORKSPACE_LIST, ReviewSourceKind, ReviewWorkspace,
+    OP_REVIEW_WORKSPACE_LIST, ReviewWorkspace,
 };
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
@@ -17,7 +17,6 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::terminal::Terminal;
 
-use super::code_review::ReviewOpenTarget;
 use super::terminal_events::TuiInput;
 use super::{TuiError, helpers};
 
@@ -25,11 +24,9 @@ use super::{TuiError, helpers};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewHomeOutcome {
     /// Open an existing or newly created review target.
-    OpenTarget {
-        /// Repository path.
-        repo_path: PathBuf,
-        /// Review target to open.
-        target: ReviewOpenTarget,
+    OpenWorkspace {
+        /// Review workspace to open.
+        workspace: ReviewWorkspace,
     },
     /// Exit without opening a review.
     Exit,
@@ -84,25 +81,24 @@ impl ReviewHomeApp {
                 Some("no review workspace selected; press n to create one".to_string());
             return true;
         };
-        let target = workspace
-            .sources
-            .iter()
-            .find(|source| source.included)
-            .map_or(ReviewOpenTarget::Repository, |source| {
-                target_from_source(&source.kind)
-            });
-        self.outcome = Some(ReviewHomeOutcome::OpenTarget {
-            repo_path: workspace.repo_root.clone(),
-            target,
+        self.outcome = Some(ReviewHomeOutcome::OpenWorkspace {
+            workspace: workspace.clone(),
         });
         self.should_exit = true;
         true
     }
 
     fn create_new(&mut self) -> bool {
-        self.outcome = Some(ReviewHomeOutcome::OpenTarget {
-            repo_path: self.repo_path.clone(),
-            target: ReviewOpenTarget::Repository,
+        self.outcome = Some(ReviewHomeOutcome::OpenWorkspace {
+            workspace: ReviewWorkspace {
+                id: "transient-new-review-workspace".to_string(),
+                title: "Untitled review".to_string(),
+                repo_root: self.repo_path.clone(),
+                sources: Vec::new(),
+                created_at_ms: None,
+                updated_at_ms: None,
+                archived_at_ms: None,
+            },
         });
         self.should_exit = true;
         true
@@ -227,37 +223,6 @@ async fn create_workspace(
     let response: CreateReviewWorkspaceResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     Ok(response.workspace)
-}
-
-fn target_from_source(kind: &ReviewSourceKind) -> ReviewOpenTarget {
-    match kind {
-        ReviewSourceKind::WorkingTreeUnstaged => ReviewOpenTarget::WorkingTreeUnstaged,
-        ReviewSourceKind::IndexStaged => ReviewOpenTarget::IndexStaged,
-        ReviewSourceKind::WorkingTreeAndIndex => ReviewOpenTarget::WorkingTreeAndIndex,
-        ReviewSourceKind::LastCommit => ReviewOpenTarget::LastCommit,
-        ReviewSourceKind::CommitRange {
-            base,
-            head,
-            merge_base,
-        } => ReviewOpenTarget::CommitRange {
-            base: base.clone(),
-            head: head.clone(),
-            merge_base: *merge_base,
-        },
-        ReviewSourceKind::BranchCompare {
-            base_branch,
-            head_branch,
-            merge_base,
-        } => ReviewOpenTarget::BranchCompare {
-            base_branch: base_branch.clone(),
-            head_branch: head_branch.clone(),
-            merge_base: *merge_base,
-        },
-        ReviewSourceKind::Commit { .. }
-        | ReviewSourceKind::File { .. }
-        | ReviewSourceKind::FileRange { .. }
-        | ReviewSourceKind::Repository => ReviewOpenTarget::Repository,
-    }
 }
 
 fn render(app: &ReviewHomeApp, frame: &mut Frame<'_>) {

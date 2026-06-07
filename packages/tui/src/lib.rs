@@ -165,13 +165,46 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
     };
 
     match result {
-        Ok(code_review_home::ReviewHomeOutcome::OpenTarget { repo_path, target }) => {
+        Ok(code_review_home::ReviewHomeOutcome::OpenWorkspace { workspace }) => {
             let _writer = guard.leave()?;
-            run_code_review(repo_path, target).await
+            run_code_review_workspace(workspace).await
         }
         Ok(code_review_home::ReviewHomeOutcome::Exit) => {
             let _writer = guard.leave()?;
             Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Run the full-screen local code review interface for an existing workspace.
+///
+/// # Errors
+///
+/// Returns I/O, client, or plugin service errors.
+pub async fn run_code_review_workspace(
+    workspace: bcode_code_review_models::ReviewWorkspace,
+) -> Result<(), TuiError> {
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        code_review::run_workspace(&mut terminal, workspace).await
+    };
+
+    match result {
+        Ok(session_id) => {
+            let _writer = guard.leave()?;
+            if let Some(session_id) = session_id {
+                run(Some(session_id)).await
+            } else {
+                Ok(())
+            }
         }
         Err(error) => Err(error),
     }
