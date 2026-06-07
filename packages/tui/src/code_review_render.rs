@@ -128,7 +128,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
                 return app.selected_thread_preview().unwrap_or_else(|| {
-                    " j/k thread  Enter jump  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
+                    " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
                 });
             }
             if let Some(preview) = app.selected_draft_preview() {
@@ -139,11 +139,11 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
                 return app.selected_thread_preview().unwrap_or_else(|| {
-                    " j/k thread  Enter jump  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
+                    " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
                 });
             }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k scroll  n/p file  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -450,6 +450,7 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
         " mouse wheel         scroll diff",
         " click file          open file",
         " c                   create draft comment",
+        " x                   publish/export review",
         " v                   select/clear line range",
         " a                   ask Bcode about selected line",
         " o                   open linked Bcode session",

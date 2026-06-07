@@ -24,6 +24,8 @@ const SAVE_DRAFT_OPERATION: &str = "draft.save";
 const DELETE_DRAFT_OPERATION: &str = "draft.delete";
 const UPDATE_DRAFT_OPERATION: &str = "draft.update";
 const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
+const PUBLISH_SUBMIT_OPERATION: &str = "review.publish.submit";
+const DEFAULT_PUBLISHER_ID: &str = "markdown_file";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
 /// Local Git target to open in review mode.
@@ -144,6 +146,17 @@ pub async fn run<W: Write>(
             .await;
             needs_redraw = true;
         }
+        if app.take_pending_publish() {
+            match publish_review(&client, repo_path.clone(), review_target.clone()).await {
+                Ok(response) => {
+                    app.status_message = Some(response.message);
+                }
+                Err(error) => {
+                    app.status_message = Some(format!("publish failed: {error}"));
+                }
+            }
+            needs_redraw = true;
+        }
     }
 
     Ok(app.take_session_to_open())
@@ -183,6 +196,34 @@ async fn handle_pending_agent_session(
             }
         }
     }
+}
+
+async fn publish_review(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+) -> Result<PublishReviewResponse, TuiError> {
+    let request = PublishReviewRequest {
+        repo_path,
+        target,
+        publisher_id: DEFAULT_PUBLISHER_ID.to_string(),
+        options: serde_json::Value::Object(serde_json::Map::new()),
+    };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            PUBLISH_SUBMIT_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    serde_json::from_slice(&response.payload).map_err(TuiError::Json)
 }
 
 async fn load_review(
@@ -472,6 +513,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
+        KeyCode::Char('x') => app.publish_review(),
         KeyCode::Char('a') => app.ask_bcode_about_selection(),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
         KeyCode::Char('?') => {
@@ -528,6 +570,23 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => false,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PublishReviewRequest {
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    publisher_id: String,
+    #[serde(default)]
+    options: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct PublishReviewResponse {
+    publisher_id: String,
+    submitted: bool,
+    output: Option<String>,
+    message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -987,6 +1046,7 @@ pub struct ReviewThreadSummary {
 
 /// Stateful review app model.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ReviewApp {
     /// Review data.
     pub review: ReviewSummary,
@@ -1022,6 +1082,8 @@ pub struct ReviewApp {
     pub pending_draft_delete: Option<PendingDraftDelete>,
     /// Draft comment awaiting update.
     pub pending_draft_update: Option<PendingDraftUpdate>,
+    /// Review publish awaiting submit.
+    pub pending_publish: bool,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -1054,6 +1116,7 @@ impl ReviewApp {
             pending_draft_save: None,
             pending_draft_delete: None,
             pending_draft_update: None,
+            pending_publish: false,
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
@@ -1652,6 +1715,20 @@ impl ReviewApp {
         {
             self.selected_thread = index;
         }
+    }
+
+    /// Queue generic review publish.
+    pub fn publish_review(&mut self) -> bool {
+        self.pending_publish = true;
+        self.status_message = Some("publishing review via markdown_file".to_string());
+        true
+    }
+
+    /// Take pending review publish flag.
+    pub const fn take_pending_publish(&mut self) -> bool {
+        let pending = self.pending_publish;
+        self.pending_publish = false;
+        pending
     }
 
     /// Take pending linked session open request.

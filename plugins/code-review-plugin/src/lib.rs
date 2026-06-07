@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -44,6 +45,14 @@ pub const OP_REVIEW_COMMENTS_LIST: &str = "review.comments.list";
 pub const OP_REVIEW_THREAD_GET: &str = "review.thread.get";
 /// Operation that returns file diff context.
 pub const OP_REVIEW_DIFF_GET: &str = "review.diff.get";
+/// Operation that returns a provider-neutral review bundle.
+pub const OP_REVIEW_BUNDLE_GET: &str = "review.bundle.get";
+/// Operation that lists review publishers.
+pub const OP_REVIEW_PUBLISHERS_LIST: &str = "review.publishers.list";
+/// Operation that previews a review publish operation.
+pub const OP_REVIEW_PUBLISH_PREVIEW: &str = "review.publish.preview";
+/// Operation that submits a review publish operation.
+pub const OP_REVIEW_PUBLISH_SUBMIT: &str = "review.publish.submit";
 
 const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
 const DEFAULT_STATE_ROOT: &str = ".bcode/code-review";
@@ -78,6 +87,10 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_COMMENTS_LIST => review_comments_list(&context.request),
             OP_REVIEW_THREAD_GET => review_thread_get(&context.request),
             OP_REVIEW_DIFF_GET => review_diff_get(&context.request),
+            OP_REVIEW_BUNDLE_GET => review_bundle_get(&context.request),
+            OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
+            OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context.request),
+            OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -394,6 +407,120 @@ pub struct ReviewDiffResponse {
     pub files: Vec<ReviewFileDiff>,
 }
 
+/// Provider-neutral review bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewBundle {
+    /// Stable review id for this repository and target.
+    pub review_id: String,
+    /// Human-readable review title.
+    pub title: String,
+    /// Repository root.
+    pub repo_root: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Files in review order.
+    pub files: Vec<ReviewFileSummary>,
+    /// Review threads.
+    pub threads: Vec<ReviewBundleThread>,
+    /// Generated timestamp in milliseconds since Unix epoch.
+    pub generated_at_ms: u64,
+}
+
+/// Provider-neutral review thread bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewBundleThread {
+    /// Thread id.
+    pub thread_id: String,
+    /// Thread anchor.
+    pub anchor: DraftAnchor,
+    /// Draft comments.
+    pub comments: Vec<DraftComment>,
+    /// Linked Bcode session id, when present.
+    pub session_id: Option<String>,
+    /// Selected diff lines.
+    pub selected_diff_lines: Vec<String>,
+    /// Hunk context.
+    pub hunk_context: Vec<String>,
+}
+
+/// Review publisher capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ReviewPublisherCapabilities {
+    /// Whether preview is supported.
+    pub preview: bool,
+    /// Whether submit is supported.
+    pub submit: bool,
+    /// Whether existing output can be updated.
+    pub update_existing: bool,
+    /// Whether threaded comments are supported.
+    pub supports_threads: bool,
+    /// Whether range anchors are supported.
+    pub supports_ranges: bool,
+    /// Whether inline comments are supported.
+    pub supports_inline_comments: bool,
+    /// Whether a summary comment is supported.
+    pub supports_summary_comment: bool,
+}
+
+/// Review publisher manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPublisherManifest {
+    /// Publisher id.
+    pub id: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Publisher capabilities.
+    pub capabilities: ReviewPublisherCapabilities,
+    /// JSON-schema-like option description.
+    pub options_schema: serde_json::Value,
+}
+
+/// Response payload for `review.publishers.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReviewPublishersResponse {
+    /// Available publishers.
+    pub publishers: Vec<ReviewPublisherManifest>,
+}
+
+/// Request payload for publish operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishReviewRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Publisher id.
+    pub publisher_id: String,
+    /// Publisher-specific options.
+    #[serde(default)]
+    pub options: serde_json::Value,
+}
+
+/// Response payload for publish preview operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishReviewPreviewResponse {
+    /// Publisher id.
+    pub publisher_id: String,
+    /// Human-readable preview content.
+    pub preview: String,
+}
+
+/// Response payload for publish submit operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishReviewResponse {
+    /// Publisher id.
+    pub publisher_id: String,
+    /// Whether publish succeeded.
+    pub submitted: bool,
+    /// Output location or provider URL, when available.
+    pub output: Option<String>,
+    /// Human-readable message.
+    pub message: String,
+}
+
 /// Structured review response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewSummary {
@@ -519,6 +646,8 @@ enum ReviewError {
     MissingColumn(&'static str),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("unsupported review publisher: {0}")]
+    UnsupportedPublisher(String),
 }
 
 fn create_review(request: &ServiceRequest) -> ServiceResponse {
@@ -637,6 +766,48 @@ fn review_diff_get(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+fn review_bundle_get(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ReviewContextRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match review_bundle_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("review_bundle_failed", error.to_string()),
+    }
+}
+
+fn review_publishers_list(request: &ServiceRequest) -> ServiceResponse {
+    if let Err(error) = request.payload_json::<serde_json::Value>() {
+        return ServiceResponse::error("invalid_request", error.to_string());
+    }
+    json_response(&ListReviewPublishersResponse {
+        publishers: builtin_publishers(),
+    })
+}
+
+fn review_publish_preview(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<PublishReviewRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match publish_preview_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("review_publish_preview_failed", error.to_string()),
+    }
+}
+
+fn review_publish_submit(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<PublishReviewRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match publish_submit_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("review_publish_submit_failed", error.to_string()),
+    }
+}
+
 fn review_context_for_request(
     request: ReviewContextRequest,
 ) -> Result<ReviewContextResponse, ReviewError> {
@@ -746,6 +917,183 @@ fn review_diff_for_request(
         })
         .collect();
     Ok(ReviewDiffResponse { files })
+}
+
+fn review_bundle_for_request(request: ReviewContextRequest) -> Result<ReviewBundle, ReviewError> {
+    let summary = create_review_summary(&CreateReviewRequest {
+        repo_path: request.repo_path.clone(),
+        target: request.target.clone(),
+    })?;
+    let review_key = review_key(&summary.repo_root, &request.target)?;
+    let threads = threads_from_drafts(
+        list_drafts_for_request(&ListDraftsRequest {
+            repo_path: request.repo_path,
+            target: request.target.clone(),
+        })?
+        .drafts,
+    )
+    .into_iter()
+    .map(|thread| {
+        let (selected_diff_lines, hunk_context) = diff_context_for_anchor(&summary, &thread.anchor);
+        ReviewBundleThread {
+            thread_id: thread.thread_id,
+            anchor: thread.anchor,
+            comments: thread.comments,
+            session_id: thread.session_id,
+            selected_diff_lines,
+            hunk_context,
+        }
+    })
+    .collect();
+    Ok(ReviewBundle {
+        review_id: review_key,
+        title: summary.title,
+        repo_root: summary.repo_root,
+        target: request.target,
+        files: summary
+            .files
+            .iter()
+            .map(|file| ReviewFileSummary {
+                path: file.display_path().to_string(),
+                status: file.status,
+                additions: file.additions,
+                deletions: file.deletions,
+                hunks: file.hunks.len(),
+                is_binary: file.is_binary,
+            })
+            .collect(),
+        threads,
+        generated_at_ms: now_ms(),
+    })
+}
+
+fn builtin_publishers() -> Vec<ReviewPublisherManifest> {
+    vec![ReviewPublisherManifest {
+        id: "markdown_file".to_string(),
+        label: "Markdown file".to_string(),
+        description: "Write a local Markdown review export".to_string(),
+        capabilities: ReviewPublisherCapabilities {
+            preview: true,
+            submit: true,
+            update_existing: true,
+            supports_threads: true,
+            supports_ranges: true,
+            supports_inline_comments: true,
+            supports_summary_comment: true,
+        },
+        options_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "output_path": { "type": "string", "description": "Optional output path" }
+            }
+        }),
+    }]
+}
+
+fn publish_preview_for_request(
+    request: PublishReviewRequest,
+) -> Result<PublishReviewPreviewResponse, ReviewError> {
+    ensure_publisher_supported(&request.publisher_id)?;
+    let publisher_id = request.publisher_id.clone();
+    let bundle = review_bundle_for_request(ReviewContextRequest {
+        repo_path: request.repo_path,
+        target: request.target,
+    })?;
+    Ok(PublishReviewPreviewResponse {
+        publisher_id,
+        preview: publish_markdown(&bundle),
+    })
+}
+
+fn publish_submit_for_request(
+    request: PublishReviewRequest,
+) -> Result<PublishReviewResponse, ReviewError> {
+    ensure_publisher_supported(&request.publisher_id)?;
+    let output_path = request
+        .options
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let bundle = review_bundle_for_request(ReviewContextRequest {
+        repo_path: request.repo_path,
+        target: request.target,
+    })?;
+    let markdown = publish_markdown(&bundle);
+    let path = output_path.unwrap_or_else(|| {
+        bundle
+            .repo_root
+            .join(".bcode")
+            .join("reviews")
+            .join(format!("{}.md", safe_review_id(&bundle.review_id)))
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, markdown)?;
+    Ok(PublishReviewResponse {
+        publisher_id: request.publisher_id,
+        submitted: true,
+        output: Some(path.display().to_string()),
+        message: format!("wrote review export to {}", path.display()),
+    })
+}
+
+fn ensure_publisher_supported(publisher_id: &str) -> Result<(), ReviewError> {
+    if publisher_id == "markdown_file" {
+        Ok(())
+    } else {
+        Err(ReviewError::UnsupportedPublisher(publisher_id.to_string()))
+    }
+}
+
+fn publish_markdown(bundle: &ReviewBundle) -> String {
+    let mut output = String::new();
+    let _ = write!(output, "# {}\n\n", bundle.title);
+    let _ = writeln!(output, "* Review id: `{}`", bundle.review_id);
+    let _ = writeln!(output, "* Repository: `{}`", bundle.repo_root.display());
+    let _ = writeln!(output, "* Generated: `{}`", bundle.generated_at_ms);
+    let _ = write!(output, "* Threads: `{}`\n\n", bundle.threads.len());
+    for thread in &bundle.threads {
+        let _ = write!(
+            output,
+            "## {} @ {}\n\n",
+            thread.anchor.file_path,
+            anchor_label(&thread.anchor)
+        );
+        if let Some(session_id) = &thread.session_id {
+            let _ = write!(output, "* Bcode session: `{session_id}`\n\n");
+        }
+        for comment in &thread.comments {
+            let _ = write!(
+                output,
+                "### Comment `{}`\n\n{}\n\n",
+                comment.comment_id, comment.body
+            );
+        }
+        if !thread.selected_diff_lines.is_empty() {
+            output.push_str("Selected diff lines:\n\n```diff\n");
+            output.push_str(&thread.selected_diff_lines.join("\n"));
+            output.push_str("\n```\n\n");
+        }
+    }
+    output
+}
+
+fn anchor_label(anchor: &DraftAnchor) -> String {
+    let start = anchor.start_diff_row.unwrap_or(anchor.diff_row);
+    let end = anchor.end_diff_row.unwrap_or(anchor.diff_row);
+    if start == end {
+        format!("row {start}")
+    } else {
+        format!("rows {start}-{end}")
+    }
+}
+
+fn safe_review_id(review_id: &str) -> String {
+    review_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
 }
 
 fn list_drafts_for_request(request: &ListDraftsRequest) -> Result<ListDraftsResponse, ReviewError> {
