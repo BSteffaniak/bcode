@@ -39,6 +39,8 @@ struct ReviewHomeApp {
     workspaces: Vec<ReviewWorkspace>,
     selected: usize,
     status_message: Option<String>,
+    search_query: String,
+    search_active: bool,
     should_exit: bool,
     outcome: Option<ReviewHomeOutcome>,
 }
@@ -50,16 +52,51 @@ impl ReviewHomeApp {
             workspaces,
             selected: 0,
             status_message: None,
+            search_query: String::new(),
+            search_active: false,
             should_exit: false,
             outcome: None,
         }
+    }
+
+    fn visible_indices(&self) -> Vec<usize> {
+        let query = self.search_query.trim().to_ascii_lowercase();
+        self.workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, workspace)| {
+                if query.is_empty()
+                    || workspace.title.to_ascii_lowercase().contains(&query)
+                    || workspace
+                        .repo_root
+                        .display()
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains(&query)
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn selected_workspace_index(&self) -> Option<usize> {
+        self.visible_indices().get(self.selected).copied()
+    }
+
+    fn clamp_selection(&mut self) {
+        self.selected = self
+            .selected
+            .min(self.visible_indices().len().saturating_sub(1));
     }
 
     fn move_down(&mut self) -> bool {
         let next = self
             .selected
             .saturating_add(1)
-            .min(self.workspaces.len().saturating_sub(1));
+            .min(self.visible_indices().len().saturating_sub(1));
         if next == self.selected {
             return false;
         }
@@ -83,12 +120,57 @@ impl ReviewHomeApp {
     }
 
     fn open_selected(&mut self) -> bool {
-        let Some(workspace) = self.workspaces.get(self.selected) else {
+        let Some(workspace_index) = self.selected_workspace_index() else {
             self.status_message =
-                Some("no review workspace selected; press n to create one".to_string());
+                Some("no matching review workspace selected; press n to create one".to_string());
+            return true;
+        };
+        let Some(workspace) = self.workspaces.get(workspace_index) else {
+            self.status_message = Some("selected review workspace is unavailable".to_string());
             return true;
         };
         self.open_workspace(workspace.clone())
+    }
+    fn toggle_search(&mut self) -> bool {
+        self.search_active = !self.search_active;
+        self.status_message = Some(if self.search_active {
+            "search reviews".to_string()
+        } else {
+            "search closed".to_string()
+        });
+        true
+    }
+
+    fn clear_search(&mut self) -> bool {
+        if self.search_query.is_empty() && !self.search_active {
+            return false;
+        }
+        self.search_query.clear();
+        self.search_active = false;
+        self.selected = 0;
+        self.status_message = Some("search cleared".to_string());
+        true
+    }
+
+    fn handle_search_key(&mut self, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Char(ch) => {
+                self.search_query.push(ch);
+                self.selected = 0;
+                true
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.clamp_selection();
+                true
+            }
+            KeyCode::Enter => {
+                self.search_active = false;
+                self.open_selected()
+            }
+            KeyCode::Escape => self.clear_search(),
+            _ => false,
+        }
     }
 }
 
@@ -125,33 +207,40 @@ pub async fn run<W: Write>(
             continue;
         };
         if let Event::Key(key) = event {
-            needs_redraw = match key.key {
-                KeyCode::Char('q') | KeyCode::Escape => {
-                    app.outcome = Some(ReviewHomeOutcome::Exit);
-                    app.should_exit = true;
-                    true
-                }
-                KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-                KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-                KeyCode::Enter => app.open_selected(),
-                KeyCode::Char('x') => match archive_selected_workspace(&client, &mut app).await {
-                    Ok(archived) => archived,
-                    Err(error) => {
-                        app.status_message = Some(format!("failed to archive workspace: {error}"));
+            needs_redraw = if app.search_active {
+                app.handle_search_key(key.key)
+            } else {
+                match key.key {
+                    KeyCode::Char('q') | KeyCode::Escape => {
+                        app.outcome = Some(ReviewHomeOutcome::Exit);
+                        app.should_exit = true;
                         true
                     }
-                },
-                KeyCode::Char('n') => {
-                    match create_workspace(&client, app.repo_path.clone()).await {
-                        Ok(workspace) => app.open_workspace(workspace),
+                    KeyCode::Char('/') => app.toggle_search(),
+                    KeyCode::Char('j') | KeyCode::Down => app.move_down(),
+                    KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+                    KeyCode::Enter => app.open_selected(),
+                    KeyCode::Char('x') => match archive_selected_workspace(&client, &mut app).await
+                    {
+                        Ok(archived) => archived,
                         Err(error) => {
                             app.status_message =
-                                Some(format!("failed to create workspace: {error}"));
+                                Some(format!("failed to archive workspace: {error}"));
                             true
                         }
+                    },
+                    KeyCode::Char('n') => {
+                        match create_workspace(&client, app.repo_path.clone()).await {
+                            Ok(workspace) => app.open_workspace(workspace),
+                            Err(error) => {
+                                app.status_message =
+                                    Some(format!("failed to create workspace: {error}"));
+                                true
+                            }
+                        }
                     }
+                    _ => false,
                 }
-                _ => false,
             };
         }
     }
@@ -190,7 +279,11 @@ async fn archive_selected_workspace(
     client: &BcodeClient,
     app: &mut ReviewHomeApp,
 ) -> Result<bool, TuiError> {
-    let Some(workspace) = app.workspaces.get(app.selected) else {
+    let Some(workspace_index) = app.selected_workspace_index() else {
+        app.status_message = Some("no matching review workspace selected".to_string());
+        return Ok(true);
+    };
+    let Some(workspace) = app.workspaces.get(workspace_index) else {
         app.status_message = Some("no review workspace selected".to_string());
         return Ok(true);
     };
@@ -215,8 +308,8 @@ async fn archive_selected_workspace(
     let response: ArchiveReviewWorkspaceResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     if response.archived {
-        let archived = app.workspaces.remove(app.selected);
-        app.selected = app.selected.min(app.workspaces.len().saturating_sub(1));
+        let archived = app.workspaces.remove(workspace_index);
+        app.clamp_selection();
         app.status_message = Some(format!("archived {}", archived.title));
     } else {
         app.status_message = Some("workspace was not found".to_string());
@@ -280,13 +373,14 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n new   x archive   j/k move   q exit ",
+            " enter open   n new   / search   x archive   j/k move   q exit ",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
 }
 
 fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+    let visible = app.visible_indices();
     if app.workspaces.is_empty() {
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
@@ -297,12 +391,24 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         );
         return;
     }
-    for (row, workspace) in app
-        .workspaces
-        .iter()
+    if visible.is_empty() {
+        frame.write_line(
+            Rect::new(area.x, area.y, area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                " No matching review workspaces.",
+                Style::new().fg(Color::White).bg(Color::Black),
+            )]),
+        );
+        return;
+    }
+    for (row, workspace_index) in visible
+        .into_iter()
         .take(usize::from(area.height))
         .enumerate()
     {
+        let Some(workspace) = app.workspaces.get(workspace_index) else {
+            continue;
+        };
         let selected = row == app.selected;
         let style = if selected {
             Style::new().fg(Color::Black).bg(Color::Yellow)
@@ -329,14 +435,17 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
-    let text = app
-        .status_message
-        .as_deref()
-        .unwrap_or("review home: enter open, n new, x archive");
+    let text = if app.search_active || !app.search_query.is_empty() {
+        format!("search: {}", app.search_query)
+    } else {
+        app.status_message
+            .clone()
+            .unwrap_or_else(|| "review home: enter open, n new, / search, x archive".to_string())
+    };
     frame.write_line(
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            text,
+            text.as_str(),
             Style::new().fg(Color::White).bg(Color::BrightBlack),
         )]),
     );
