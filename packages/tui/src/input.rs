@@ -16,7 +16,10 @@ pub enum KeyRequest {
     #[default]
     None,
     /// Submit staged composer text.
-    Submit,
+    Submit {
+        /// Placement behavior for the submitted prompt.
+        placement: bcode_ipc::PromptPlacement,
+    },
     /// Interrupt the active turn.
     Interrupt,
     /// Cycle to the next available agent.
@@ -60,7 +63,7 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
         TextInputEnterBehavior::Submit,
     );
     match outcome {
-        TextInputKeyOutcome::Submitted => submit(app),
+        TextInputKeyOutcome::Submitted => submit(app, bcode_ipc::PromptPlacement::Steering),
         TextInputKeyOutcome::Edited => {
             app.reset_input_history_navigation();
             app.wake_cursor();
@@ -93,7 +96,8 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
             redraw: true,
             request: KeyRequest::Interrupt,
         },
-        BmuxAction::InputSubmit => submit(app),
+        BmuxAction::InputSubmitSteering => submit(app, bcode_ipc::PromptPlacement::Steering),
+        BmuxAction::InputSubmitFollowUp => submit(app, bcode_ipc::PromptPlacement::FollowUp),
         BmuxAction::AgentCycle => KeyOutcome {
             redraw: true,
             request: KeyRequest::CycleAgent,
@@ -184,11 +188,11 @@ fn history_next(app: &mut BmuxApp) -> KeyOutcome {
     }
 }
 
-fn submit(app: &mut BmuxApp) -> KeyOutcome {
+fn submit(app: &mut BmuxApp, placement: bcode_ipc::PromptPlacement) -> KeyOutcome {
     app.stage_submission();
     app.wake_cursor();
     KeyOutcome {
         redraw: true,
-        request: KeyRequest::Submit,
+        request: KeyRequest::Submit { placement },
     }
 }

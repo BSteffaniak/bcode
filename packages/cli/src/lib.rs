@@ -4267,7 +4267,9 @@ async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
 
 async fn send_message(session_id: SessionId, message: String) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    client.send_user_message(session_id, message).await?;
+    client
+        .send_user_message(session_id, message, bcode_ipc::PromptPlacement::FollowUp)
+        .await?;
     Ok(())
 }
 

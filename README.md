@@ -8,7 +8,8 @@ TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.
 
 ```toml
 [tui.keybindings.chat]
-"enter" = "tui.input.submit"
+"enter" = "tui.input.submitSteering"
+"ctrl+shift+enter" = "tui.input.submitFollowUp"
 "shift+enter" = "tui.input.newLine"
 "up" = "tui.input.historyPrevious"
 "down" = "tui.input.historyNext"

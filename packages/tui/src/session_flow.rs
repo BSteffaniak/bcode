@@ -680,7 +680,8 @@ fn handle_picker_filter_key(
                 picker.select_next();
                 PickerKeyOutcome::Continue
             }
-            BmuxAction::InputSubmit
+            BmuxAction::InputSubmitSteering
+            | BmuxAction::InputSubmitFollowUp
             | BmuxAction::InputHistoryPrevious
             | BmuxAction::InputHistoryNext
             | BmuxAction::AppExit

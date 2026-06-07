@@ -185,7 +185,10 @@ async fn handle_pending_agent_session(
     if let Some(session_id) = app.session_id_for_anchor(&ask.anchor) {
         if let Ok(session_id) = session_id.parse::<SessionId>() {
             let prompt = app.agent_session_prompt(&ask);
-            match client.send_user_message(session_id, prompt).await {
+            match client
+                .send_user_message(session_id, prompt, bcode_ipc::PromptPlacement::FollowUp)
+                .await
+            {
                 Ok(_) => {
                     app.status_message = Some(format!(
                         "sent review follow-up to linked session {session_id}"
@@ -680,7 +683,9 @@ async fn create_agent_session(
         )
         .await?;
     let prompt = app.agent_session_prompt(&ask);
-    client.send_user_message(session.id, prompt).await?;
+    client
+        .send_user_message(session.id, prompt, bcode_ipc::PromptPlacement::FollowUp)
+        .await?;
     link_thread_session(client, repo_path, target, ask.anchor, session.id).await?;
     Ok(session.id)
 }

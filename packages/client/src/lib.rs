@@ -796,9 +796,14 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
         text: String,
+        placement: bcode_ipc::PromptPlacement,
     ) -> Result<MessageAcceptance, ClientError> {
         match self
-            .send_request(Request::SendUserMessage { session_id, text })
+            .send_request(Request::SendUserMessageWithPlacement {
+                session_id,
+                text,
+                placement,
+            })
             .await?
         {
             ResponsePayload::MessageAccepted {
@@ -1628,9 +1633,14 @@ impl ClientConnection {
         &mut self,
         session_id: SessionId,
         text: String,
+        placement: bcode_ipc::PromptPlacement,
     ) -> Result<MessageAcceptance, ClientError> {
         match self
-            .send_request(Request::SendUserMessage { session_id, text })
+            .send_request(Request::SendUserMessageWithPlacement {
+                session_id,
+                text,
+                placement,
+            })
             .await?
         {
             ResponsePayload::MessageAccepted {

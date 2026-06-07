@@ -232,7 +232,8 @@ fn handle_skill_picker_action(
             skill_picker::SkillPickerAction::Continue,
             skill_picker::SkillPickerAction::Help,
         ),
-        BmuxAction::InputSubmit
+        BmuxAction::InputSubmitSteering
+        | BmuxAction::InputSubmitFollowUp
         | BmuxAction::InputHistoryPrevious
         | BmuxAction::InputHistoryNext
         | BmuxAction::AppExit

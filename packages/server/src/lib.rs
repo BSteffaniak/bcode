@@ -1556,7 +1556,26 @@ async fn handle_request(
             .await
         }
         Request::SendUserMessage { session_id, text } => {
-            handle_user_message(request_id, client_id, state, writer, session_id, text).await
+            handle_user_message(
+                request_id,
+                client_id,
+                state,
+                writer,
+                session_id,
+                text,
+                bcode_ipc::PromptPlacement::Steering,
+            )
+            .await
+        }
+        Request::SendUserMessageWithPlacement {
+            session_id,
+            text,
+            placement,
+        } => {
+            handle_user_message(
+                request_id, client_id, state, writer, session_id, text, placement,
+            )
+            .await
         }
         Request::InvokeSkill {
             session_id,
@@ -3067,6 +3086,7 @@ async fn handle_user_message(
     writer: &SharedWriter,
     session_id: SessionId,
     text: String,
+    placement: bcode_ipc::PromptPlacement,
 ) -> Result<(), ServerError> {
     if let Some(active_namespace) = state
         .active_session_namespace_mismatch(session_id, client_id)
@@ -3074,6 +3094,33 @@ async fn handle_user_message(
     {
         return send_incompatible_active_session_response(writer, request_id, &active_namespace)
             .await;
+    }
+    if placement == bcode_ipc::PromptPlacement::Steering
+        && state.active_turns.lock().await.contains_key(&session_id)
+    {
+        return match append_steering_user_message(state, session_id, client_id, text).await {
+            Ok(()) => {
+                send_message_acceptance_response(
+                    state,
+                    writer,
+                    request_id,
+                    client_id,
+                    MessageQueueStatus {
+                        queued: false,
+                        queue_position: None,
+                    },
+                )
+                .await
+            }
+            Err(error) => {
+                send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new("session_not_found", error.to_string())),
+                )
+                .await
+            }
+        };
     }
     match enqueue_session_command(
         state,
@@ -3098,6 +3145,27 @@ async fn handle_user_message(
             .await
         }
     }
+}
+
+async fn append_steering_user_message(
+    state: &ServerState,
+    session_id: SessionId,
+    client_id: ClientId,
+    text: String,
+) -> Result<(), bcode_session::SessionError> {
+    let events = state
+        .sessions
+        .append_user_message(session_id, client_id, text)
+        .await?;
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    if !events.is_empty()
+        && let Ok(session) = state.sessions.session_summary(session_id).await
+    {
+        state.session_catalog.upsert_native_session(session).await;
+    }
+    Ok(())
 }
 
 fn reasoning_capabilities_from_config(

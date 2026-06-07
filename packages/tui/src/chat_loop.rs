@@ -470,9 +470,9 @@ async fn handle_chat_key<W: Write>(
         KeyRequest::None => {}
         KeyRequest::Interrupt => request_turn_cancellation(context.services.client, chat).await,
         KeyRequest::CycleAgent => cycle_session_agent(context.services.client, chat).await,
-        KeyRequest::Submit => {
+        KeyRequest::Submit { placement } => {
             let (mut io, services) = context.flow_context();
-            match composer_flow::submit_composer(&mut io, &services, chat).await {
+            match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
                 Ok(Some(dialog)) => {
                     modals.thinking_dialog = Some(dialog);
                 }

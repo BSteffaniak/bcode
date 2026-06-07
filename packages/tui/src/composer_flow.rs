@@ -207,6 +207,7 @@ pub async fn submit_composer<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
+    placement: bcode_ipc::PromptPlacement,
 ) -> Result<SubmitComposerOutcome, TuiError> {
     let session_id = chat.app.session_id();
     let message = chat.app.take_pending_submission();
@@ -229,7 +230,7 @@ pub async fn submit_composer<W: Write>(
         session_flow::persist_draft_session(io.terminal, services.client, chat).await?;
     match services
         .client
-        .send_user_message(session_id, message.clone())
+        .send_user_message(session_id, message.clone(), placement)
         .await
     {
         Ok(acceptance) => {

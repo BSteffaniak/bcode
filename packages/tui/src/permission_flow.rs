@@ -47,7 +47,8 @@ pub async fn handle_permission_key(
             let approved = dialog.focused_approval();
             resolve_permission_dialog(client, chat, permission_dialog, approved).await
         }
-        BmuxAction::InputSubmit
+        BmuxAction::InputSubmitSteering
+        | BmuxAction::InputSubmitFollowUp
         | BmuxAction::InputHistoryPrevious
         | BmuxAction::InputHistoryNext
         | BmuxAction::AppExit

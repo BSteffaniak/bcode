@@ -66,7 +66,13 @@ pub async fn handle_slash_palette_key<W: Write>(
         KeyCode::Enter if stroke.modifiers.is_empty() => {
             if active_palette.selected_matches(chat.app.composer().text()) {
                 *slash_palette = None;
-                let outcome = submit_from_slash_palette(io, services, chat).await;
+                let outcome = submit_from_slash_palette(
+                    io,
+                    services,
+                    chat,
+                    bcode_ipc::PromptPlacement::Steering,
+                )
+                .await;
                 match outcome {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) => {
@@ -89,8 +95,8 @@ pub async fn handle_slash_palette_key<W: Write>(
             match outcome.request {
                 KeyRequest::None | KeyRequest::CycleAgent => {}
                 KeyRequest::Interrupt => request_turn_cancellation(services.client, chat).await,
-                KeyRequest::Submit => {
-                    let outcome = submit_from_slash_palette(io, services, chat).await;
+                KeyRequest::Submit { placement } => {
+                    let outcome = submit_from_slash_palette(io, services, chat, placement).await;
                     match outcome {
                         Ok(outcome) => return Ok(Some(outcome)),
                         Err(error) => {
@@ -142,8 +148,9 @@ async fn submit_from_slash_palette<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
+    placement: bcode_ipc::PromptPlacement,
 ) -> Result<composer_flow::SubmitComposerOutcome, TuiError> {
-    composer_flow::submit_composer(io, services, chat).await
+    composer_flow::submit_composer(io, services, chat, placement).await
 }
 
 async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) {

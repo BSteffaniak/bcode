@@ -98,6 +98,25 @@ impl Default for ProtocolVersion {
     }
 }
 
+/// Placement behavior for submitted user prompts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptPlacement {
+    /// Inject the prompt into the active conversation at the next safe model boundary.
+    #[default]
+    Steering,
+    /// Queue the prompt to run as a follow-up turn after the active turn finishes.
+    FollowUp,
+}
+
+impl PromptPlacement {
+    /// Return whether this placement is the wire-compatible default.
+    #[must_use]
+    pub const fn is_steering(placement: &Self) -> bool {
+        matches!(placement, Self::Steering)
+    }
+}
+
 /// Envelope discriminant for payload interpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +203,11 @@ pub enum Request {
     SendUserMessage {
         session_id: SessionId,
         text: String,
+    },
+    SendUserMessageWithPlacement {
+        session_id: SessionId,
+        text: String,
+        placement: PromptPlacement,
     },
     InvokeSkill {
         session_id: SessionId,

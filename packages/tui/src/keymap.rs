@@ -21,7 +21,8 @@ pub enum BmuxScope {
 /// Actions used by the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BmuxAction {
-    InputSubmit,
+    InputSubmitSteering,
+    InputSubmitFollowUp,
     InputHistoryPrevious,
     InputHistoryNext,
     AppExit,
@@ -72,7 +73,8 @@ pub enum BmuxAction {
 impl BmuxAction {
     fn from_id(id: &str) -> Option<Self> {
         Some(match id {
-            "tui.input.submit" => Self::InputSubmit,
+            "tui.input.submit" | "tui.input.submitSteering" => Self::InputSubmitSteering,
+            "tui.input.submitFollowUp" => Self::InputSubmitFollowUp,
             "tui.input.historyPrevious" => Self::InputHistoryPrevious,
             "tui.input.historyNext" => Self::InputHistoryNext,
             "app.exit" => Self::AppExit,
@@ -167,7 +169,7 @@ impl BmuxKeyMap {
     #[must_use]
     pub fn chat_hints(&self) -> String {
         [
-            (BmuxAction::InputSubmit, "send"),
+            (BmuxAction::InputSubmitSteering, "send"),
             (BmuxAction::AppInterrupt, "interrupt"),
             (BmuxAction::AppExit, "exit"),
             (BmuxAction::ClipboardPasteImage, "paste image"),
@@ -221,7 +223,8 @@ impl BmuxKeyMap {
             BmuxAction::EditorDeleteWordForward => TextEditCommand::Delete(TextDelete::WordForward),
             BmuxAction::EditorDeleteToStart => TextEditCommand::Delete(TextDelete::ToStart),
             BmuxAction::EditorDeleteToEnd => TextEditCommand::Delete(TextDelete::ToEnd),
-            BmuxAction::InputSubmit
+            BmuxAction::InputSubmitSteering
+            | BmuxAction::InputSubmitFollowUp
             | BmuxAction::InputHistoryPrevious
             | BmuxAction::InputHistoryNext
             | BmuxAction::AppExit
@@ -272,7 +275,8 @@ impl BmuxKeyMap {
             BmuxAction::EditorSelectWordRight => TextMotion::WordRight,
             BmuxAction::EditorSelectUp => TextMotion::VisualUp,
             BmuxAction::EditorSelectDown => TextMotion::VisualDown,
-            BmuxAction::InputSubmit
+            BmuxAction::InputSubmitSteering
+            | BmuxAction::InputSubmitFollowUp
             | BmuxAction::InputHistoryPrevious
             | BmuxAction::InputHistoryNext
             | BmuxAction::AppExit
@@ -363,7 +367,8 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
         (
             BmuxScope::Chat,
             vec![
-                bind("enter", BmuxAction::InputSubmit),
+                bind("enter", BmuxAction::InputSubmitSteering),
+                bind("ctrl+shift+enter", BmuxAction::InputSubmitFollowUp),
                 bind("shift+enter", BmuxAction::InputNewLine),
                 bind("up", BmuxAction::InputHistoryPrevious),
                 bind("down", BmuxAction::InputHistoryNext),

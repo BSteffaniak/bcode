@@ -174,7 +174,10 @@ fn escape_interrupt_does_not_exit_chat() {
 fn configured_ctrl_enter_submits_while_enter_inserts_newline() {
     let mut config = bcode_config::TuiConfig::default();
     config.keybindings.chat = BTreeMap::from([
-        ("ctrl+enter".to_owned(), "tui.input.submit".to_owned()),
+        (
+            "ctrl+enter".to_owned(),
+            "tui.input.submitSteering".to_owned(),
+        ),
         ("enter".to_owned(), "tui.input.newLine".to_owned()),
     ]);
     let keymap = BmuxKeyMap::from_config(&config);
@@ -183,11 +186,16 @@ fn configured_ctrl_enter_submits_while_enter_inserts_newline() {
 
     let enter = input::handle_key(&mut app, &keymap, key(KeyCode::Enter));
     assert!(enter.redraw);
-    assert_ne!(enter.request, KeyRequest::Submit);
+    assert!(!matches!(enter.request, KeyRequest::Submit { .. }));
     assert_eq!(app.composer().text(), "draft\n");
 
     let ctrl_enter = input::handle_key(&mut app, &keymap, ctrl_key_code(KeyCode::Enter));
-    assert_eq!(ctrl_enter.request, KeyRequest::Submit);
+    assert_eq!(
+        ctrl_enter.request,
+        KeyRequest::Submit {
+            placement: bcode_ipc::PromptPlacement::Steering,
+        }
+    );
 }
 
 #[test]
@@ -205,7 +213,7 @@ fn default_tab_requests_agent_cycle_in_chat_input() {
 
     assert!(outcome.redraw);
     assert_eq!(outcome.request, KeyRequest::CycleAgent);
-    assert_ne!(outcome.request, KeyRequest::Submit);
+    assert!(!matches!(outcome.request, KeyRequest::Submit { .. }));
     assert_eq!(app.composer().text(), "draft");
 }
 
@@ -289,7 +297,10 @@ fn configured_bindings_can_keep_multiple_keys_for_same_action() {
     config.keybindings.chat = BTreeMap::from([
         ("enter".to_owned(), "tui.input.newLine".to_owned()),
         ("shift+enter".to_owned(), "tui.input.newLine".to_owned()),
-        ("ctrl+enter".to_owned(), "tui.input.submit".to_owned()),
+        (
+            "ctrl+enter".to_owned(),
+            "tui.input.submitSteering".to_owned(),
+        ),
     ]);
     let keymap = BmuxKeyMap::from_config(&config);
 
@@ -303,7 +314,7 @@ fn configured_bindings_can_keep_multiple_keys_for_same_action() {
     );
     assert_eq!(
         keymap.action_for_key(BmuxScope::Chat, ctrl_key_code(KeyCode::Enter)),
-        Some(BmuxAction::InputSubmit)
+        Some(BmuxAction::InputSubmitSteering)
     );
 }
 

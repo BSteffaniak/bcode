@@ -1093,7 +1093,11 @@ async fn handle_blims_tui_conversation_key(
                 conversation.status = "Type a message first.".to_string();
             } else {
                 BcodeClient::default_endpoint()
-                    .send_user_message(conversation.handle.session, text.clone())
+                    .send_user_message(
+                        conversation.handle.session,
+                        text.clone(),
+                        bcode_ipc::PromptPlacement::FollowUp,
+                    )
                     .await?;
                 let _operation = submit_blims_command(&serde_json::json!({
                     "type": "record_conversation_message",
@@ -3457,7 +3461,11 @@ async fn create_agent_talk_session(
         .create_session(Some(format!("Blims talk: {}", prompt.agent_id)))
         .await?;
     BcodeClient::default_endpoint()
-        .send_user_message(session.id, prompt.prompt.clone())
+        .send_user_message(
+            session.id,
+            prompt.prompt.clone(),
+            bcode_ipc::PromptPlacement::FollowUp,
+        )
         .await?;
     record_blims_conversation(prompt, &session.id).await?;
     Ok(session)
@@ -3490,7 +3498,11 @@ async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
         CliError::Blims("task worktree creation did not return a session".to_string())
     })?;
     BcodeClient::default_endpoint()
-        .send_user_message(session.id, prompt.prompt.clone())
+        .send_user_message(
+            session.id,
+            prompt.prompt.clone(),
+            bcode_ipc::PromptPlacement::FollowUp,
+        )
         .await?;
     println!(
         "task work session for {} as {}: {}",
@@ -3942,7 +3954,11 @@ async fn create_blims_prepared_ai_work_session(
         .create_session(Some(format!("Blims AI work: {}", work.id)))
         .await?;
     BcodeClient::default_endpoint()
-        .send_user_message(session.id, work.prompt.clone())
+        .send_user_message(
+            session.id,
+            work.prompt.clone(),
+            bcode_ipc::PromptPlacement::FollowUp,
+        )
         .await?;
     Ok((work, session))
 }
@@ -4599,7 +4615,11 @@ async fn start_blims_initiative_plan(initiative_id: String) -> Result<(), CliErr
         .create_session(Some(format!("Blims plan: {}", prompt.initiative_id)))
         .await?;
     BcodeClient::default_endpoint()
-        .send_user_message(session.id, prompt.prompt)
+        .send_user_message(
+            session.id,
+            prompt.prompt,
+            bcode_ipc::PromptPlacement::FollowUp,
+        )
         .await?;
     println!("planning session: {}", session.id);
     println!(
