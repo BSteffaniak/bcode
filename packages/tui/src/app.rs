@@ -29,7 +29,7 @@ use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::runtime_work_view::RuntimeWorkViewState;
-use super::temporal::next_elapsed_invalidation;
+use super::temporal::next_elapsed_invalidation_capped;
 use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
@@ -1608,8 +1608,14 @@ impl BmuxApp {
             else {
                 return None;
             };
-            next_elapsed_invalidation(*started_at_ms, *finished_at_ms, now, now_system)
-                .map(|at| InvalidationRequest::new(tool_elapsed_invalidation_key(tool_call_id), at))
+            next_elapsed_invalidation_capped(
+                *started_at_ms,
+                *finished_at_ms,
+                now,
+                now_system,
+                TOOL_ELAPSED_INVALIDATION_FRAME,
+            )
+            .map(|at| InvalidationRequest::new(tool_elapsed_invalidation_key(tool_call_id), at))
         })
     }
 
@@ -2380,6 +2386,7 @@ pub const fn composer_policy() -> TextInputPolicy {
 }
 
 const TOOL_ELAPSED_INVALIDATION_PREFIX: &str = "tool-elapsed:";
+const TOOL_ELAPSED_INVALIDATION_FRAME: Duration = Duration::from_millis(16);
 
 fn tool_elapsed_invalidation_key(tool_call_id: &str) -> InvalidationKey {
     InvalidationKey::new(format!("{TOOL_ELAPSED_INVALIDATION_PREFIX}{tool_call_id}"))

@@ -1,6 +1,9 @@
 //! TUI tests.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime},
+};
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
@@ -24,10 +27,26 @@ use super::{
     keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
     pending_submissions::PendingSubmissions,
     render, slash_palette, slash_palette_render,
+    temporal::next_elapsed_invalidation_capped,
     time_format::{format_duration_nanos, format_millis},
     transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
     transcript_document::TranscriptDocument,
 };
+
+#[test]
+fn running_tool_elapsed_invalidations_are_frame_capped() {
+    let now = std::time::Instant::now();
+    let next = next_elapsed_invalidation_capped(
+        0,
+        None,
+        now,
+        SystemTime::UNIX_EPOCH + Duration::from_millis(1_200),
+        Duration::from_millis(16),
+    )
+    .expect("running tool schedules elapsed invalidation");
+
+    assert!(next <= now + Duration::from_millis(16));
+}
 
 #[test]
 fn transcript_document_mutations_bump_revision() {

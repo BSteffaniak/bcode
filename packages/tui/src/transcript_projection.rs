@@ -122,7 +122,10 @@ impl<'a> TranscriptLayoutInput<'a> {
         let transcript = self
             .transcript
             .iter()
-            .map(|item| format!("{}:{}", item.id().get(), item.revision()))
+            .map(|item| {
+                let elapsed = render::terminal_elapsed_signature_fragment(item).unwrap_or_default();
+                format!("{}:{}:{elapsed}", item.id().get(), item.revision())
+            })
             .collect::<Vec<_>>()
             .join(",");
         let pending = self

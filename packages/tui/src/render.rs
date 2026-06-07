@@ -594,7 +594,7 @@ pub fn transcript_item_signature(
     ))
 }
 
-fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> {
+pub fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> {
     let TranscriptItemKind::TerminalOutput {
         started_at_ms: Some(started_at_ms),
         finished_at_ms: None,
