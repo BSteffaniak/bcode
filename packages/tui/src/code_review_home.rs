@@ -8,8 +8,8 @@ use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse,
     CODE_REVIEW_SERVICE_INTERFACE_ID, CreateReviewWorkspaceRequest, CreateReviewWorkspaceResponse,
     ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_WORKSPACE_ARCHIVE,
-    OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_UPDATE,
-    ReviewWorkspace, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_UPDATE, ReviewSource,
+    ReviewSourceKind, ReviewWorkspace, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
@@ -43,6 +43,7 @@ struct ReviewHomeApp {
     search_query: String,
     search_active: bool,
     rename_buffer: Option<String>,
+    new_review_buffer: Option<String>,
     should_exit: bool,
     outcome: Option<ReviewHomeOutcome>,
 }
@@ -57,6 +58,7 @@ impl ReviewHomeApp {
             search_query: String::new(),
             search_active: false,
             rename_buffer: None,
+            new_review_buffer: None,
             should_exit: false,
             outcome: None,
         }
@@ -134,6 +136,48 @@ impl ReviewHomeApp {
         };
         self.open_workspace(workspace.clone())
     }
+    fn start_new_review(&mut self) -> bool {
+        self.new_review_buffer = Some("Untitled review".to_string());
+        self.status_message = Some("new review title".to_string());
+        true
+    }
+
+    fn cancel_new_review(&mut self) -> bool {
+        if self.new_review_buffer.is_none() {
+            return false;
+        }
+        self.new_review_buffer = None;
+        self.status_message = Some("new review canceled".to_string());
+        true
+    }
+
+    fn handle_new_review_key(&mut self, key: KeyCode) -> ReviewHomeKeyOutcome {
+        match key {
+            KeyCode::Char(ch) => {
+                self.new_review_buffer
+                    .as_mut()
+                    .map_or(ReviewHomeKeyOutcome::Ignored, |buffer| {
+                        buffer.push(ch);
+                        ReviewHomeKeyOutcome::Redraw
+                    })
+            }
+            KeyCode::Backspace => {
+                self.new_review_buffer
+                    .as_mut()
+                    .map_or(ReviewHomeKeyOutcome::Ignored, |buffer| {
+                        buffer.pop();
+                        ReviewHomeKeyOutcome::Redraw
+                    })
+            }
+            KeyCode::Enter => ReviewHomeKeyOutcome::SubmitNewReview,
+            KeyCode::Escape => {
+                self.cancel_new_review();
+                ReviewHomeKeyOutcome::Redraw
+            }
+            _ => ReviewHomeKeyOutcome::Ignored,
+        }
+    }
+
     fn start_rename(&mut self) -> bool {
         let Some(workspace_index) = self.selected_workspace_index() else {
             self.status_message = Some("no matching review workspace selected".to_string());
@@ -230,6 +274,7 @@ impl ReviewHomeApp {
 enum ReviewHomeKeyOutcome {
     Redraw,
     SubmitRename,
+    SubmitNewReview,
     Ignored,
 }
 
@@ -266,7 +311,22 @@ pub async fn run<W: Write>(
             continue;
         };
         if let Event::Key(key) = event {
-            needs_redraw = if app.rename_buffer.is_some() {
+            needs_redraw = if app.new_review_buffer.is_some() {
+                match app.handle_new_review_key(key.key) {
+                    ReviewHomeKeyOutcome::Redraw => true,
+                    ReviewHomeKeyOutcome::SubmitNewReview => {
+                        match submit_new_review(&client, &mut app).await {
+                            Ok(redraw) => redraw,
+                            Err(error) => {
+                                app.status_message =
+                                    Some(format!("failed to create workspace: {error}"));
+                                true
+                            }
+                        }
+                    }
+                    ReviewHomeKeyOutcome::SubmitRename | ReviewHomeKeyOutcome::Ignored => false,
+                }
+            } else if app.rename_buffer.is_some() {
                 match app.handle_rename_key(key.key) {
                     ReviewHomeKeyOutcome::Redraw => true,
                     ReviewHomeKeyOutcome::SubmitRename => {
@@ -279,7 +339,7 @@ pub async fn run<W: Write>(
                             }
                         }
                     }
-                    ReviewHomeKeyOutcome::Ignored => false,
+                    ReviewHomeKeyOutcome::SubmitNewReview | ReviewHomeKeyOutcome::Ignored => false,
                 }
             } else if app.search_active {
                 app.handle_search_key(key.key)
@@ -304,16 +364,7 @@ pub async fn run<W: Write>(
                             true
                         }
                     },
-                    KeyCode::Char('n') => {
-                        match create_workspace(&client, app.repo_path.clone()).await {
-                            Ok(workspace) => app.open_workspace(workspace),
-                            Err(error) => {
-                                app.status_message =
-                                    Some(format!("failed to create workspace: {error}"));
-                                true
-                            }
-                        }
-                    }
+                    KeyCode::Char('n') => app.start_new_review(),
                     _ => false,
                 }
             };
@@ -348,6 +399,26 @@ async fn load_workspaces(
     let response: ListReviewWorkspacesResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     Ok(response.workspaces)
+}
+
+async fn submit_new_review(
+    client: &BcodeClient,
+    app: &mut ReviewHomeApp,
+) -> Result<bool, TuiError> {
+    let title = app
+        .new_review_buffer
+        .take()
+        .unwrap_or_else(|| "Untitled review".to_string())
+        .trim()
+        .to_string();
+    let title = if title.is_empty() {
+        "Untitled review".to_string()
+    } else {
+        title
+    };
+    let workspace = create_workspace(client, app.repo_path.clone(), title).await?;
+    app.open_workspace(workspace);
+    Ok(true)
 }
 
 async fn submit_rename_workspace(
@@ -442,11 +513,17 @@ async fn archive_selected_workspace(
 async fn create_workspace(
     client: &BcodeClient,
     repo_path: PathBuf,
+    title: String,
 ) -> Result<ReviewWorkspace, TuiError> {
     let payload = serde_json::to_vec(&CreateReviewWorkspaceRequest {
         repo_path,
-        title: Some("Untitled review".to_string()),
-        sources: Vec::new(),
+        title: Some(title),
+        sources: vec![ReviewSource {
+            id: "source-working-tree-and-index".to_string(),
+            label: ReviewSourceKind::WorkingTreeAndIndex.label(),
+            kind: ReviewSourceKind::WorkingTreeAndIndex,
+            included: true,
+        }],
     })
     .map_err(TuiError::Json)?;
     let response = client
@@ -557,17 +634,23 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
-    let text = app.rename_buffer.as_ref().map_or_else(
+    let text = app.new_review_buffer.as_ref().map_or_else(
         || {
-            if app.search_active || !app.search_query.is_empty() {
-                format!("search: {}", app.search_query)
-            } else {
-                app.status_message.clone().unwrap_or_else(|| {
-                    "review home: enter open, n new, / search, r rename, x archive".to_string()
-                })
-            }
+            app.rename_buffer.as_ref().map_or_else(
+                || {
+                    if app.search_active || !app.search_query.is_empty() {
+                        format!("search: {}", app.search_query)
+                    } else {
+                        app.status_message.clone().unwrap_or_else(|| {
+                            "review home: enter open, n new, / search, r rename, x archive"
+                                .to_string()
+                        })
+                    }
+                },
+                |rename| format!("rename: {rename}"),
+            )
         },
-        |rename| format!("rename: {rename}"),
+        |title| format!("new review: {title}"),
     );
     frame.write_line(
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
