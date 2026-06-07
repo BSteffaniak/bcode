@@ -1582,7 +1582,7 @@ fn push_file_edit_preview_rows(
 
     let preview = inline_diff_preview(&diff_lines, MAX_INLINE_DIFF_ROWS);
     let card_width = inline_diff_card_width(&preview, width.saturating_sub(2), inline_diff_config);
-    rows.push(inline_diff_card_border('╭', '─', '╮', card_width));
+    rows.push(inline_diff_card_border('┌', '─', '┐', card_width));
     for row in preview {
         match row {
             InlineDiffPreviewRow::Line(line) => {
@@ -1593,7 +1593,7 @@ fn push_file_edit_preview_rows(
             }
         }
     }
-    rows.push(inline_diff_card_border('╰', '─', '╯', card_width));
+    rows.push(inline_diff_card_border('└', '─', '┘', card_width));
 }
 
 const fn file_edit_phase_style(phase: FileEditPhase) -> Style {

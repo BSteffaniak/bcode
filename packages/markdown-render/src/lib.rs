@@ -388,7 +388,7 @@ impl TerminalMarkdownRenderer {
         self.ensure_blank_line();
         let border_style = self.theme.code_block_border;
         let language = container.data.get("language").map(String::as_str);
-        let header = language.map_or_else(|| "╭─".to_owned(), |language| format!("╭─ {language}"));
+        let header = language.map_or_else(|| "┌─".to_owned(), |language| format!("┌─ {language}"));
         self.rows
             .push(Line::from_spans(vec![Span::styled(header, border_style)]));
 
@@ -415,7 +415,7 @@ impl TerminalMarkdownRenderer {
             self.rows.push(Line::from_spans(spans));
         }
         self.rows
-            .push(Line::from_spans(vec![Span::styled("╰─", border_style)]));
+            .push(Line::from_spans(vec![Span::styled("└─", border_style)]));
         self.ensure_blank_line();
     }
 
@@ -873,9 +873,9 @@ mod tests {
     fn renders_code_block_frame_with_language() {
         let output = rendered_text("```rust\nfn main() {}\n```");
 
-        assert!(output.contains("╭─ rust"));
+        assert!(output.contains("┌─ rust"));
         assert!(output.contains("│ fn main() {}"));
-        assert!(output.contains("╰─"));
+        assert!(output.contains("└─"));
     }
 
     #[test]
@@ -973,7 +973,7 @@ mod tests {
         let output = rendered_text("1. example\n\n   ```rust\n   fn main() {}\n   ```");
 
         assert!(output.contains("1.  example"));
-        assert!(output.contains("    ╭─ rust"));
+        assert!(output.contains("    ┌─ rust"));
         assert!(output.contains("    │ fn main() {}"));
     }
 
@@ -1019,7 +1019,7 @@ mod tests {
         );
 
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
-            span.content.contains("╭─ rust") && span.style == Style::new().fg(Color::Magenta)
+            span.content.contains("┌─ rust") && span.style == Style::new().fg(Color::Magenta)
         }));
     }
 

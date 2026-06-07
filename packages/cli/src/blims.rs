@@ -922,7 +922,7 @@ fn render_blims_loading(frame: &mut Frame<'_>) {
     frame.fill(area, " ", Style::new().bg(Color::Rgb(12, 10, 18)));
     let modal = centered(area, Size::new(52, 7));
     let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightMagenta)))
+        .border(Border::single().style(Style::new().fg(Color::BrightMagenta)))
         .title(" Blims ")
         .background(Style::new().bg(Color::Rgb(19, 16, 30)));
     panel.render(modal, frame);
@@ -2141,7 +2141,7 @@ fn conversation_line_from_session_event(
 
 fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightMagenta)))
+        .border(Border::single().style(Style::new().fg(Color::BrightMagenta)))
         .background(Style::new().bg(Color::Rgb(19, 16, 30)))
         .render(area, frame);
     let title = Line::from_spans(vec![
@@ -2171,7 +2171,7 @@ fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
 
 fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightBlue)))
+        .border(Border::single().style(Style::new().fg(Color::BrightBlue)))
         .background(Style::new().bg(Color::Rgb(10, 14, 24)))
         .render(area, frame);
     let line = Line::from_spans(vec![
@@ -2235,7 +2235,7 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
 
 fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightCyan)))
+        .border(Border::single().style(Style::new().fg(Color::BrightCyan)))
         .title(" Pixel office ")
         .background(Style::new().bg(Color::Rgb(8, 18, 24)));
     panel.render(area, frame);
@@ -2406,7 +2406,7 @@ fn room_symbol(room: &BlimsRoomSnapshot) -> &'static str {
 
 fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightGreen)))
+        .border(Border::single().style(Style::new().fg(Color::BrightGreen)))
         .title(" CEO console ")
         .background(Style::new().bg(Color::Rgb(13, 20, 18)));
     panel.render(area, frame);
@@ -2602,7 +2602,7 @@ fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
 fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     let picker = centered(area, Size::new(76, 18));
     let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightYellow)))
+        .border(Border::single().style(Style::new().fg(Color::BrightYellow)))
         .title(" Choose your Blims office ")
         .background(Style::new().bg(Color::Rgb(32, 24, 42)));
     panel.render(picker, frame);
@@ -2677,7 +2677,7 @@ fn render_ceo_dashboard_modal(
 ) {
     let modal = centered(area, Size::new(96, 30));
     let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightYellow)))
+        .border(Border::single().style(Style::new().fg(Color::BrightYellow)))
         .title(" CEO operating dashboard ")
         .background(Style::new().bg(Color::Rgb(16, 17, 28)));
     panel.render(modal, frame);
@@ -2936,7 +2936,7 @@ fn render_conversation_modal(
 ) {
     let modal = centered(area, Size::new(86, 24));
     let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightMagenta)))
+        .border(Border::single().style(Style::new().fg(Color::BrightMagenta)))
         .title(format!(" Talking with {} ", conversation.agent_name))
         .background(Style::new().bg(Color::Rgb(18, 14, 28)));
     panel.render(modal, frame);
@@ -3001,7 +3001,7 @@ fn render_conversation_modal(
 fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
     let modal = centered(area, Size::new(70, 10));
     let panel = Panel::new()
-        .border(Border::rounded().style(Style::new().fg(Color::BrightBlue)))
+        .border(Border::single().style(Style::new().fg(Color::BrightBlue)))
         .title(" Blims controls ")
         .background(Style::new().bg(Color::Rgb(18, 20, 38)));
     panel.render(modal, frame);
