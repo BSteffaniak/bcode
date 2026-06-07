@@ -30,6 +30,8 @@ pub const OP_REVIEW_WORKSPACE_GET: &str = "review.workspace.get";
 pub const OP_REVIEW_WORKSPACE_UPDATE: &str = "review.workspace.update";
 /// Operation that archives a durable review workspace.
 pub const OP_REVIEW_WORKSPACE_ARCHIVE: &str = "review.workspace.archive";
+/// Operation that materializes review workspace sources into reviewable surfaces.
+pub const OP_REVIEW_WORKSPACE_MATERIALIZE: &str = "review.workspace.materialize";
 /// Operation that returns repository file content for review browsing.
 pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 /// Operation that returns an external publisher manifest.
@@ -272,6 +274,38 @@ pub struct ReviewSurface {
     pub path: String,
     /// Surface kind.
     pub kind: ReviewSurfaceKind,
+    /// Materialized review file, when this is a diff surface.
+    #[serde(default)]
+    pub file: Option<ReviewFile>,
+}
+
+/// Materialized workspace review data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewWorkspaceMaterialization {
+    /// Source workspace.
+    pub workspace: ReviewWorkspace,
+    /// Reviewable surfaces produced from included sources.
+    pub surfaces: Vec<ReviewSurface>,
+    /// Total added lines across diff surfaces.
+    pub additions: u32,
+    /// Total removed lines across diff surfaces.
+    pub deletions: u32,
+}
+
+/// Request payload for `review.workspace.materialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializeReviewWorkspaceRequest {
+    /// Repository path where the workspace lives.
+    pub repo_path: PathBuf,
+    /// Workspace to materialize.
+    pub workspace: ReviewWorkspace,
+}
+
+/// Response payload for `review.workspace.materialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializeReviewWorkspaceResponse {
+    /// Materialized workspace review data.
+    pub materialization: ReviewWorkspaceMaterialization,
 }
 
 /// Request payload for `review.workspace.list`.

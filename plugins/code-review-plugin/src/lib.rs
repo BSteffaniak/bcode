@@ -10,15 +10,17 @@ use bcode_code_review_models::{
     DraftComment, GetReviewDiffRequest, GetReviewThreadRequest, GetReviewWorkspaceRequest,
     GetReviewWorkspaceResponse, LinkThreadSessionRequest, LinkThreadSessionResponse,
     ListDraftsRequest, ListDraftsResponse, ListReviewPublishersResponse,
-    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_REPO_FILE_GET,
-    OP_REVIEW_WORKSPACE_ARCHIVE, OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET,
-    OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse,
+    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, MaterializeReviewWorkspaceRequest,
+    MaterializeReviewWorkspaceResponse, OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_ARCHIVE,
+    OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST,
+    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse,
     PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
     ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
     ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewSource, ReviewTarget,
-    ReviewWorkspace, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse,
-    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewSource, ReviewSourceKind,
+    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewWorkspace,
+    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest,
+    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -134,6 +136,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_WORKSPACE_GET => review_workspace_get(&context),
             OP_REVIEW_WORKSPACE_UPDATE => review_workspace_update(&context),
             OP_REVIEW_WORKSPACE_ARCHIVE => review_workspace_archive(&context),
+            OP_REVIEW_WORKSPACE_MATERIALIZE => review_workspace_materialize(&context),
             OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
             OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
             OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
@@ -358,6 +361,20 @@ fn review_workspace_archive(context: &NativeServiceContext) -> ServiceResponse {
     match archive_review_workspace_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("workspace_archive_failed", error.to_string()),
+    }
+}
+
+fn review_workspace_materialize(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<MaterializeReviewWorkspaceRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match materialize_review_workspace_for_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("workspace_materialize_failed", error.to_string()),
     }
 }
 
@@ -1105,6 +1122,125 @@ fn archive_review_workspace_for_request(
         })
     })?;
     Ok(ArchiveReviewWorkspaceResponse { archived })
+}
+
+fn materialize_review_workspace_for_request(
+    request: MaterializeReviewWorkspaceRequest,
+) -> Result<MaterializeReviewWorkspaceResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let mut surfaces = Vec::new();
+    let mut additions = 0_u32;
+    let mut deletions = 0_u32;
+    for source in request
+        .workspace
+        .sources
+        .iter()
+        .filter(|source| source.included)
+    {
+        materialize_source(
+            &repo_root,
+            source,
+            &mut surfaces,
+            &mut additions,
+            &mut deletions,
+        )?;
+    }
+    Ok(MaterializeReviewWorkspaceResponse {
+        materialization: ReviewWorkspaceMaterialization {
+            workspace: request.workspace,
+            surfaces,
+            additions,
+            deletions,
+        },
+    })
+}
+
+fn materialize_source(
+    repo_root: &Path,
+    source: &ReviewSource,
+    surfaces: &mut Vec<ReviewSurface>,
+    additions: &mut u32,
+    deletions: &mut u32,
+) -> Result<(), ReviewError> {
+    match review_target_from_source_kind(&source.kind) {
+        Some(target) => {
+            let request = CreateReviewRequest {
+                repo_path: repo_root.to_path_buf(),
+                target,
+            };
+            let summary = create_review_summary(&request)?;
+            for file in summary.files {
+                *additions = additions.saturating_add(file.additions);
+                *deletions = deletions.saturating_add(file.deletions);
+                let path = file
+                    .new_path
+                    .clone()
+                    .or_else(|| file.old_path.clone())
+                    .unwrap_or_default();
+                surfaces.push(ReviewSurface {
+                    id: surface_id(&source.id, &path, ReviewSurfaceKind::Diff),
+                    source_id: source.id.clone(),
+                    path,
+                    kind: ReviewSurfaceKind::Diff,
+                    file: Some(file),
+                });
+            }
+        }
+        None => materialize_context_source(source, surfaces),
+    }
+    Ok(())
+}
+
+fn materialize_context_source(source: &ReviewSource, surfaces: &mut Vec<ReviewSurface>) {
+    let path = match &source.kind {
+        ReviewSourceKind::File { path } | ReviewSourceKind::FileRange { path, .. } => path.clone(),
+        ReviewSourceKind::Commit { rev } => rev.clone(),
+        ReviewSourceKind::Repository => "repository".to_string(),
+        ReviewSourceKind::WorkingTreeUnstaged
+        | ReviewSourceKind::IndexStaged
+        | ReviewSourceKind::WorkingTreeAndIndex
+        | ReviewSourceKind::LastCommit
+        | ReviewSourceKind::CommitRange { .. }
+        | ReviewSourceKind::BranchCompare { .. } => return,
+    };
+    surfaces.push(ReviewSurface {
+        id: surface_id(&source.id, &path, ReviewSurfaceKind::File),
+        source_id: source.id.clone(),
+        path,
+        kind: ReviewSurfaceKind::File,
+        file: None,
+    });
+}
+
+fn review_target_from_source_kind(kind: &ReviewSourceKind) -> Option<ReviewTarget> {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => Some(ReviewTarget::WorkingTreeUnstaged),
+        ReviewSourceKind::IndexStaged => Some(ReviewTarget::IndexStaged),
+        ReviewSourceKind::WorkingTreeAndIndex => Some(ReviewTarget::WorkingTreeAndIndex),
+        ReviewSourceKind::LastCommit => Some(ReviewTarget::LastCommit),
+        ReviewSourceKind::CommitRange {
+            base,
+            head,
+            merge_base,
+        } => Some(ReviewTarget::CommitRange {
+            base: base.clone(),
+            head: head.clone(),
+            merge_base: *merge_base,
+        }),
+        ReviewSourceKind::BranchCompare {
+            base_branch,
+            head_branch,
+            merge_base,
+        } => Some(ReviewTarget::BranchCompare {
+            base_branch: base_branch.clone(),
+            head_branch: head_branch.clone(),
+            merge_base: *merge_base,
+        }),
+        ReviewSourceKind::Commit { .. }
+        | ReviewSourceKind::File { .. }
+        | ReviewSourceKind::FileRange { .. }
+        | ReviewSourceKind::Repository => None,
+    }
 }
 
 fn list_drafts_for_request(
@@ -2134,6 +2270,16 @@ fn optional_bool(row: &Row, column: &'static str) -> bool {
     row.get(column)
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+fn surface_id(source_id: &str, path: &str, kind: ReviewSurfaceKind) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{kind:?}").as_bytes());
+    format!("surface-{:x}", hasher.finalize())
 }
 
 fn workspace_id(repo_root: &Path, title: &str, now: u64) -> String {

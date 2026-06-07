@@ -1543,6 +1543,7 @@ impl ReviewSummary {
                 } else {
                     ReviewSurfaceKind::Diff
                 },
+                file: None,
             })
             .collect()
     }
