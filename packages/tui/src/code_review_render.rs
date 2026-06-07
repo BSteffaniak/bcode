@@ -1207,6 +1207,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         ReviewPromptKind::FilePicker => area.height.min(16),
         ReviewPromptKind::JumpToLine
         | ReviewPromptKind::FileSearch
+        | ReviewPromptKind::AddSourceKind
         | ReviewPromptKind::AddCommitSource
         | ReviewPromptKind::AddCommitRangeSource
         | ReviewPromptKind::AddFileSource
@@ -1225,6 +1226,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         ReviewPromptKind::FilePicker => " Open file ",
         ReviewPromptKind::JumpToLine => " Jump to line ",
         ReviewPromptKind::FileSearch => " Search file ",
+        ReviewPromptKind::AddSourceKind => " Add source ",
         ReviewPromptKind::AddCommitSource => " Add commit ",
         ReviewPromptKind::AddCommitRangeSource => " Add range ",
         ReviewPromptKind::AddFileSource => " Add file ",

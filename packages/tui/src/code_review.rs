@@ -1906,6 +1906,8 @@ pub enum ReviewPromptKind {
     JumpToLine,
     /// Search within the current file.
     FileSearch,
+    /// Add a source to the workspace.
+    AddSourceKind,
     /// Add a commit source to the workspace.
     AddCommitSource,
     /// Add a commit range source to the workspace.
@@ -2103,8 +2105,11 @@ impl ReviewApp {
             self.status_message = Some("switch to build mode with m to add sources".to_string());
             return true;
         }
-        self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddFileSource));
-        self.status_message = Some("add source: enter a repo file path".to_string());
+        self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddSourceKind));
+        self.status_message = Some(
+            "add source kind: file, range, commit, file-range, staged, unstaged, working-tree"
+                .to_string(),
+        );
         true
     }
 
@@ -2145,11 +2150,60 @@ impl ReviewApp {
             ReviewPromptKind::FilePicker => self.submit_file_picker(&text, prompt.selected),
             ReviewPromptKind::JumpToLine => self.submit_jump_to_line(&text),
             ReviewPromptKind::FileSearch => self.submit_file_search(&text),
+            ReviewPromptKind::AddSourceKind => self.submit_add_source_kind(&text),
             ReviewPromptKind::AddCommitSource => self.submit_add_commit_source(&text),
             ReviewPromptKind::AddCommitRangeSource => self.submit_add_commit_range_source(&text),
             ReviewPromptKind::AddFileSource => self.submit_add_file_source(&text),
             ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
         }
+    }
+
+    fn submit_add_source_kind(&mut self, text: &str) -> bool {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "file" | "f" => {
+                self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddFileSource));
+                self.status_message = Some(
+                    "add file source: enter repo path, or empty for selected file".to_string(),
+                );
+            }
+            "file-range" | "range-file" | "fr" => {
+                self.prompt_state =
+                    Some(ReviewPromptState::new(ReviewPromptKind::AddFileRangeSource));
+                self.status_message = Some("add file range: path:start-end".to_string());
+            }
+            "commit" | "c" => {
+                self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddCommitSource));
+                self.status_message = Some("add commit: enter revision".to_string());
+            }
+            "range" | "commit-range" | "r" => {
+                self.prompt_state = Some(ReviewPromptState::new(
+                    ReviewPromptKind::AddCommitRangeSource,
+                ));
+                self.status_message =
+                    Some("add commit range: base..head or base...head".to_string());
+            }
+            "staged" | "index" => {
+                return self.push_workspace_source(ReviewSourceKind::IndexStaged);
+            }
+            "unstaged" => {
+                return self.push_workspace_source(ReviewSourceKind::WorkingTreeUnstaged);
+            }
+            "working-tree" | "worktree" | "working" | "all" => {
+                return self.push_workspace_source(ReviewSourceKind::WorkingTreeAndIndex);
+            }
+            "last" | "last-commit" => {
+                return self.push_workspace_source(ReviewSourceKind::LastCommit);
+            }
+            "repo" | "repository" => {
+                return self.push_workspace_source(ReviewSourceKind::Repository);
+            }
+            _ => {
+                self.status_message = Some(
+                    "unknown source kind; use file, file-range, commit, range, staged, unstaged, working-tree".to_string(),
+                );
+            }
+        }
+        true
     }
 
     fn submit_add_commit_source(&mut self, text: &str) -> bool {
