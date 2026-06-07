@@ -25,6 +25,8 @@ const DELETE_DRAFT_OPERATION: &str = "draft.delete";
 const UPDATE_DRAFT_OPERATION: &str = "draft.update";
 const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
 const PUBLISH_SUBMIT_OPERATION: &str = "review.publish.submit";
+const PUBLISHERS_LIST_OPERATION: &str = "review.publishers.list";
+const PUBLISH_PREVIEW_OPERATION: &str = "review.publish.preview";
 const DEFAULT_PUBLISHER_ID: &str = "markdown_file";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
 
@@ -146,15 +148,15 @@ pub async fn run<W: Write>(
             .await;
             needs_redraw = true;
         }
-        if app.take_pending_publish() {
-            match publish_review(&client, repo_path.clone(), review_target.clone()).await {
-                Ok(response) => {
-                    app.status_message = Some(response.message);
-                }
-                Err(error) => {
-                    app.status_message = Some(format!("publish failed: {error}"));
-                }
-            }
+        if let Some(request) = app.take_publish_request() {
+            handle_publish_request(
+                &client,
+                repo_path.clone(),
+                review_target.clone(),
+                &mut app,
+                request,
+            )
+            .await;
             needs_redraw = true;
         }
     }
@@ -198,15 +200,92 @@ async fn handle_pending_agent_session(
     }
 }
 
+async fn handle_publish_request(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    app: &mut ReviewApp,
+    request: PendingPublishRequest,
+) {
+    match request {
+        PendingPublishRequest::ListPublishers => match list_publishers(client).await {
+            Ok(publishers) => app.show_publishers(publishers),
+            Err(error) => app.status_message = Some(format!("publisher list failed: {error}")),
+        },
+        PendingPublishRequest::Preview { publisher_id } => {
+            match preview_review(client, repo_path, target, publisher_id).await {
+                Ok(response) => app.show_publish_preview(response.publisher_id, response.preview),
+                Err(error) => app.status_message = Some(format!("publish preview failed: {error}")),
+            }
+        }
+        PendingPublishRequest::Submit { publisher_id } => {
+            match publish_review(client, repo_path, target, publisher_id).await {
+                Ok(response) => app.finish_publish(response),
+                Err(error) => app.status_message = Some(format!("publish failed: {error}")),
+            }
+        }
+    }
+}
+
+async fn list_publishers(client: &BcodeClient) -> Result<Vec<ReviewPublisherManifest>, TuiError> {
+    let payload = serde_json::to_vec(&serde_json::json!({})).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            PUBLISHERS_LIST_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ListReviewPublishersResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.publishers)
+}
+
+async fn preview_review(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    target: ReviewTarget,
+    publisher_id: String,
+) -> Result<PublishReviewPreviewResponse, TuiError> {
+    let request = PublishReviewRequest {
+        repo_path,
+        target,
+        publisher_id,
+        options: serde_json::Value::Object(serde_json::Map::new()),
+    };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            PUBLISH_PREVIEW_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    serde_json::from_slice(&response.payload).map_err(TuiError::Json)
+}
+
 async fn publish_review(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    publisher_id: String,
 ) -> Result<PublishReviewResponse, TuiError> {
     let request = PublishReviewRequest {
         repo_path,
         target,
-        publisher_id: DEFAULT_PUBLISHER_ID.to_string(),
+        publisher_id,
         options: serde_json::Value::Object(serde_json::Map::new()),
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
@@ -415,11 +494,36 @@ async fn link_thread_session(
     Ok(())
 }
 
+fn handle_publish_event(app: &mut ReviewApp, event: &Event) -> bool {
+    match event {
+        Event::Key(stroke) if stroke.modifiers.is_empty() => match stroke.key {
+            KeyCode::Escape => {
+                app.publish_state = None;
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => app.publish_down(1),
+            KeyCode::Char('k') | KeyCode::Up => app.publish_up(1),
+            KeyCode::Enter => app.confirm_publish_selection(),
+            _ => false,
+        },
+        Event::Resize(_)
+        | Event::Paste(_)
+        | Event::Focus(_)
+        | Event::Mouse(_)
+        | Event::Key(_)
+        | Event::Tick
+        | Event::User(_) => false,
+    }
+}
+
 fn handle_event<W: Write>(
     app: &mut ReviewApp,
     terminal: &mut Terminal<&mut W>,
     event: &Event,
 ) -> bool {
+    if app.publish_state.is_some() {
+        return handle_publish_event(app, event);
+    }
     if app.comment_editor.is_some() {
         return handle_comment_editor_event(app, event);
     }
@@ -572,6 +676,62 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ListReviewPublishersResponse {
+    publishers: Vec<ReviewPublisherManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReviewPublisherManifest {
+    /// Publisher id.
+    pub id: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Publisher capabilities.
+    pub capabilities: ReviewPublisherCapabilities,
+}
+
+impl ReviewPublisherManifest {
+    /// Return compact capability labels.
+    #[must_use]
+    pub fn capability_labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        if self.capabilities.preview {
+            labels.push("preview");
+        }
+        if self.capabilities.supports_threads {
+            labels.push("threads");
+        }
+        if self.capabilities.supports_ranges {
+            labels.push("ranges");
+        }
+        if self.capabilities.supports_inline_comments {
+            labels.push("inline");
+        }
+        labels
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ReviewPublisherCapabilities {
+    preview: bool,
+    submit: bool,
+    update_existing: bool,
+    supports_threads: bool,
+    supports_ranges: bool,
+    supports_inline_comments: bool,
+    supports_summary_comment: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct PublishReviewPreviewResponse {
+    publisher_id: String,
+    preview: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PublishReviewRequest {
     repo_path: PathBuf,
@@ -582,7 +742,7 @@ struct PublishReviewRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct PublishReviewResponse {
+pub struct PublishReviewResponse {
     publisher_id: String,
     submitted: bool,
     output: Option<String>,
@@ -1044,6 +1204,39 @@ pub struct ReviewThreadSummary {
     pub session_id: Option<String>,
 }
 
+/// Pending publish request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingPublishRequest {
+    /// List available publishers.
+    ListPublishers,
+    /// Preview a publisher output.
+    Preview {
+        /// Publisher id.
+        publisher_id: String,
+    },
+    /// Submit publisher output.
+    Submit {
+        /// Publisher id.
+        publisher_id: String,
+    },
+}
+
+/// Publish modal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewPublishState {
+    /// Publisher picker.
+    Picker,
+    /// Preview content.
+    Preview {
+        /// Publisher id.
+        publisher_id: String,
+        /// Preview text.
+        preview: String,
+        /// Top visible preview line.
+        scroll: usize,
+    },
+}
+
 /// Stateful review app model.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1082,8 +1275,14 @@ pub struct ReviewApp {
     pub pending_draft_delete: Option<PendingDraftDelete>,
     /// Draft comment awaiting update.
     pub pending_draft_update: Option<PendingDraftUpdate>,
-    /// Review publish awaiting submit.
-    pub pending_publish: bool,
+    /// Pending publish request.
+    pub pending_publish_request: Option<PendingPublishRequest>,
+    /// Available publishers.
+    pub publishers: Vec<ReviewPublisherManifest>,
+    /// Selected publisher index.
+    pub selected_publisher: usize,
+    /// Active publish UI state.
+    pub publish_state: Option<ReviewPublishState>,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
@@ -1116,7 +1315,10 @@ impl ReviewApp {
             pending_draft_save: None,
             pending_draft_delete: None,
             pending_draft_update: None,
-            pending_publish: false,
+            pending_publish_request: None,
+            publishers: Vec::new(),
+            selected_publisher: 0,
+            publish_state: None,
             pending_agent_session: None,
             range_selection_start: None,
             session_to_open: None,
@@ -1719,16 +1921,117 @@ impl ReviewApp {
 
     /// Queue generic review publish.
     pub fn publish_review(&mut self) -> bool {
-        self.pending_publish = true;
-        self.status_message = Some("publishing review via markdown_file".to_string());
+        self.pending_publish_request = Some(PendingPublishRequest::ListPublishers);
+        self.status_message = Some("loading review publishers".to_string());
         true
     }
 
-    /// Take pending review publish flag.
-    pub const fn take_pending_publish(&mut self) -> bool {
-        let pending = self.pending_publish;
-        self.pending_publish = false;
-        pending
+    /// Show loaded publishers.
+    pub fn show_publishers(&mut self, publishers: Vec<ReviewPublisherManifest>) {
+        self.publishers = publishers;
+        self.selected_publisher = self
+            .publishers
+            .iter()
+            .position(|publisher| publisher.id == DEFAULT_PUBLISHER_ID)
+            .unwrap_or(0);
+        self.publish_state = Some(ReviewPublishState::Picker);
+        self.status_message = None;
+    }
+
+    /// Show publisher preview.
+    pub fn show_publish_preview(&mut self, publisher_id: String, preview: String) {
+        self.publish_state = Some(ReviewPublishState::Preview {
+            publisher_id,
+            preview,
+            scroll: 0,
+        });
+        self.status_message = None;
+    }
+
+    /// Finish publish flow.
+    pub fn finish_publish(&mut self, response: PublishReviewResponse) {
+        self.publish_state = None;
+        self.status_message = Some(response.message);
+    }
+
+    /// Move publish UI selection down.
+    pub fn publish_down(&mut self, rows: usize) -> bool {
+        match &mut self.publish_state {
+            Some(ReviewPublishState::Picker) => {
+                let max = self.publishers.len().saturating_sub(1);
+                let next = self.selected_publisher.saturating_add(rows).min(max);
+                if next == self.selected_publisher {
+                    return false;
+                }
+                self.selected_publisher = next;
+                true
+            }
+            Some(ReviewPublishState::Preview {
+                scroll, preview, ..
+            }) => {
+                let max = preview.lines().count().saturating_sub(1);
+                let next = scroll.saturating_add(rows).min(max);
+                if next == *scroll {
+                    return false;
+                }
+                *scroll = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move publish UI selection up.
+    pub const fn publish_up(&mut self, rows: usize) -> bool {
+        match &mut self.publish_state {
+            Some(ReviewPublishState::Picker) => {
+                let next = self.selected_publisher.saturating_sub(rows);
+                if next == self.selected_publisher {
+                    return false;
+                }
+                self.selected_publisher = next;
+                true
+            }
+            Some(ReviewPublishState::Preview { scroll, .. }) => {
+                let next = scroll.saturating_sub(rows);
+                if next == *scroll {
+                    return false;
+                }
+                *scroll = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Confirm current publish UI selection.
+    pub fn confirm_publish_selection(&mut self) -> bool {
+        match &self.publish_state {
+            Some(ReviewPublishState::Picker) => {
+                let Some(publisher) = self.publishers.get(self.selected_publisher) else {
+                    self.status_message = Some("no publisher selected".to_string());
+                    return true;
+                };
+                self.pending_publish_request = Some(PendingPublishRequest::Preview {
+                    publisher_id: publisher.id.clone(),
+                });
+                self.status_message = Some(format!("previewing publisher {}", publisher.label));
+                true
+            }
+            Some(ReviewPublishState::Preview { publisher_id, .. }) => {
+                self.pending_publish_request = Some(PendingPublishRequest::Submit {
+                    publisher_id: publisher_id.clone(),
+                });
+                self.status_message = Some(format!("submitting review via {publisher_id}"));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Take pending review publish request.
+    pub const fn take_publish_request(&mut self) -> Option<PendingPublishRequest> {
+        self.pending_publish_request.take()
     }
 
     /// Take pending linked session open request.

@@ -7,7 +7,8 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::truncate_to_display_width;
 
 use super::code_review::{
-    ReviewApp, ReviewFile, ReviewLine, ReviewLineKind, ReviewSidebarMode, sidebar_width,
+    ReviewApp, ReviewFile, ReviewLine, ReviewLineKind, ReviewPublishState, ReviewSidebarMode,
+    sidebar_width,
 };
 
 /// Render one full-screen code review frame.
@@ -58,6 +59,9 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     }
     if app.comment_editor.is_some() {
         render_comment_editor(app, area, frame);
+    }
+    if app.publish_state.is_some() {
+        render_publish_modal(app, area, frame);
     }
 }
 
@@ -475,6 +479,128 @@ fn render_help(area: Rect, frame: &mut Frame<'_>) {
             ),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(text, usize::from(popup.width.saturating_sub(2))),
+                Style::new().fg(Color::White).bg(Color::BrightBlack),
+            )]),
+        );
+    }
+}
+
+fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some(state) = &app.publish_state else {
+        return;
+    };
+    let width = area.width.min(96);
+    let height = area.height.min(24);
+    if width < 30 || height < 8 {
+        return;
+    }
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
+    let popup = Rect::new(x, y, width, height);
+    frame.fill(
+        popup,
+        " ",
+        Style::new().fg(Color::White).bg(Color::BrightBlack),
+    );
+    match state {
+        ReviewPublishState::Picker => render_publisher_picker(app, popup, frame),
+        ReviewPublishState::Preview {
+            publisher_id,
+            preview,
+            scroll,
+        } => render_publish_preview(publisher_id, preview, *scroll, popup, frame),
+    }
+}
+
+fn render_publisher_picker(app: &ReviewApp, popup: Rect, frame: &mut Frame<'_>) {
+    frame.write_line(
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup.y,
+            popup.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            " Publish review  Enter preview  Esc cancel ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    );
+    let rows = usize::from(popup.height.saturating_sub(2));
+    for row in 0..rows {
+        let Some(publisher) = app.publishers.get(row) else {
+            break;
+        };
+        let selected = row == app.selected_publisher;
+        let style = if selected {
+            Style::new().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::new().fg(Color::White).bg(Color::BrightBlack)
+        };
+        let caps = publisher.capability_labels().join(",");
+        let text = format!(
+            " {}  {}  [{}]",
+            publisher.label, publisher.description, caps
+        );
+        let y = popup
+            .y
+            .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                popup.x.saturating_add(1),
+                y,
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&text, usize::from(popup.width.saturating_sub(2))),
+                style,
+            )]),
+            style,
+        );
+    }
+}
+
+fn render_publish_preview(
+    publisher_id: &str,
+    preview: &str,
+    scroll: usize,
+    popup: Rect,
+    frame: &mut Frame<'_>,
+) {
+    frame.write_line(
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup.y,
+            popup.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            format!(" Preview {publisher_id}  Enter submit  Esc cancel "),
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    );
+    let rows = usize::from(popup.height.saturating_sub(2));
+    for (row, line) in preview.lines().skip(scroll).take(rows).enumerate() {
+        let y = popup
+            .y
+            .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
+        frame.write_line(
+            Rect::new(
+                popup.x.saturating_add(1),
+                y,
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(line, usize::from(popup.width.saturating_sub(2))),
                 Style::new().fg(Color::White).bg(Color::BrightBlack),
             )]),
         );
