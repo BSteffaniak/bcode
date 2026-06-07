@@ -2,6 +2,9 @@ id      = "bcode.code_review"
 name    = "Bcode Code Review Plugin"
 version = "0.0.1"
 
+[config]
+section = "code_review"
+
 [[services]]
 class        = "service"
 description  = "Local Git code review services"

@@ -64,13 +64,39 @@ pub const OP_REVIEW_PUBLISH_PREVIEW: &str = "review.publish.preview";
 pub const OP_REVIEW_PUBLISH_SUBMIT: &str = "review.publish.submit";
 
 const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
-const DEFAULT_STATE_ROOT: &str = ".bcode/code-review";
+const BCODE_STATE_DIR_ENV: &str = "BCODE_STATE_DIR";
+const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
+const HOME_ENV: &str = "HOME";
+const DEFAULT_REPO_STATE_ROOT: &str = ".bcode/code-review";
+const DEFAULT_STATE_SUBDIR: &str = "code-review";
 const DATABASE_FILE_NAME: &str = "code-review.db";
 const MIGRATIONS_TABLE: &str = "__bcode_code_review_migrations";
 const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Code review state location preference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewStateLocation {
+    /// Store code review state under the user's Bcode state directory.
+    #[default]
+    User,
+    /// Store code review state under the repository-local `.bcode/code-review` directory.
+    Repo,
+}
+
+/// Resolved code review plugin configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeReviewPluginConfig {
+    /// State location preference. Defaults to the user's Bcode state directory.
+    #[serde(default)]
+    pub state_location: CodeReviewStateLocation,
+    /// Explicit state directory path. Relative paths are resolved against the repository root.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+}
 
 /// Bundled local code review plugin.
 #[derive(Default)]
@@ -87,19 +113,19 @@ impl RustPlugin for CodeReviewPlugin {
 
         match context.request.operation.as_str() {
             OP_CREATE_REVIEW => create_review(&context.request),
-            OP_DRAFT_LIST => list_drafts(&context.request),
-            OP_DRAFT_SAVE => save_draft(&context.request),
-            OP_DRAFT_DELETE => delete_draft(&context.request),
-            OP_DRAFT_UPDATE => update_draft(&context.request),
-            OP_THREAD_LINK_SESSION => link_thread_session(&context.request),
-            OP_REVIEW_CONTEXT_GET => review_context_get(&context.request),
-            OP_REVIEW_COMMENTS_LIST => review_comments_list(&context.request),
-            OP_REVIEW_THREAD_GET => review_thread_get(&context.request),
-            OP_REVIEW_DIFF_GET => review_diff_get(&context.request),
-            OP_REVIEW_BUNDLE_GET => review_bundle_get(&context.request),
+            OP_DRAFT_LIST => list_drafts(&context),
+            OP_DRAFT_SAVE => save_draft(&context),
+            OP_DRAFT_DELETE => delete_draft(&context),
+            OP_DRAFT_UPDATE => update_draft(&context),
+            OP_THREAD_LINK_SESSION => link_thread_session(&context),
+            OP_REVIEW_CONTEXT_GET => review_context_get(&context),
+            OP_REVIEW_COMMENTS_LIST => review_comments_list(&context),
+            OP_REVIEW_THREAD_GET => review_thread_get(&context),
+            OP_REVIEW_DIFF_GET => review_diff_get(&context),
+            OP_REVIEW_BUNDLE_GET => review_bundle_get(&context),
             OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
-            OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context.request),
-            OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context.request),
+            OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
+            OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -238,101 +264,137 @@ fn create_review(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn list_drafts(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ListDraftsRequest>() {
+fn plugin_config(context: &NativeServiceContext) -> Result<CodeReviewPluginConfig, ReviewError> {
+    context.config_or_default().map_err(ReviewError::Json)
+}
+
+fn list_drafts(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ListDraftsRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
 
-    match list_drafts_for_request(&request) {
+    match list_drafts_for_request(&request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("draft_list_failed", error.to_string()),
     }
 }
 
-fn save_draft(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<SaveDraftRequest>() {
+fn save_draft(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<SaveDraftRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
 
-    match save_draft_for_request(request) {
+    match save_draft_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("draft_save_failed", error.to_string()),
     }
 }
 
-fn delete_draft(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<DeleteDraftRequest>() {
+fn delete_draft(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<DeleteDraftRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
 
-    match delete_draft_for_request(request) {
+    match delete_draft_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("draft_delete_failed", error.to_string()),
     }
 }
 
-fn update_draft(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<UpdateDraftRequest>() {
+fn update_draft(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<UpdateDraftRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
 
-    match update_draft_for_request(request) {
+    match update_draft_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("draft_update_failed", error.to_string()),
     }
 }
 
-fn link_thread_session(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<LinkThreadSessionRequest>() {
+fn link_thread_session(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<LinkThreadSessionRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
 
-    match link_thread_session_for_request(request) {
+    match link_thread_session_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("thread_link_session_failed", error.to_string()),
     }
 }
 
-fn review_context_get(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ReviewContextRequest>() {
+fn review_context_get(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ReviewContextRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    match review_context_for_request(request) {
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match review_context_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("review_context_failed", error.to_string()),
     }
 }
 
-fn review_comments_list(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ReviewContextRequest>() {
+fn review_comments_list(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ReviewContextRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    match review_comments_for_request(request) {
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match review_comments_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("review_comments_failed", error.to_string()),
     }
 }
 
-fn review_thread_get(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<GetReviewThreadRequest>() {
+fn review_thread_get(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<GetReviewThreadRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    match review_thread_for_request(request) {
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match review_thread_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("review_thread_failed", error.to_string()),
     }
 }
 
-fn review_diff_get(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<GetReviewDiffRequest>() {
+fn review_diff_get(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<GetReviewDiffRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
@@ -342,12 +404,16 @@ fn review_diff_get(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-fn review_bundle_get(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ReviewContextRequest>() {
+fn review_bundle_get(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ReviewContextRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    match review_bundle_for_request(request) {
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match review_bundle_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("review_bundle_failed", error.to_string()),
     }
@@ -362,23 +428,31 @@ fn review_publishers_list(request: &ServiceRequest) -> ServiceResponse {
     })
 }
 
-fn review_publish_preview(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<PublishReviewRequest>() {
+fn review_publish_preview(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<PublishReviewRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    match publish_preview_for_request(request) {
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match publish_preview_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("review_publish_preview_failed", error.to_string()),
     }
 }
 
-fn review_publish_submit(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<PublishReviewRequest>() {
+fn review_publish_submit(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<PublishReviewRequest>() {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    match publish_submit_for_request(request) {
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match publish_submit_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("review_publish_submit_failed", error.to_string()),
     }
@@ -386,15 +460,19 @@ fn review_publish_submit(request: &ServiceRequest) -> ServiceResponse {
 
 fn review_context_for_request(
     request: ReviewContextRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<ReviewContextResponse, ReviewError> {
     let summary = create_review_summary(&CreateReviewRequest {
         repo_path: request.repo_path.clone(),
         target: request.target.clone(),
     })?;
-    let drafts = list_drafts_for_request(&ListDraftsRequest {
-        repo_path: request.repo_path,
-        target: request.target.clone(),
-    })?
+    let drafts = list_drafts_for_request(
+        &ListDraftsRequest {
+            repo_path: request.repo_path,
+            target: request.target.clone(),
+        },
+        config,
+    )?
     .drafts;
     let thread_count = drafts
         .iter()
@@ -426,11 +504,15 @@ fn review_context_for_request(
 
 fn review_comments_for_request(
     request: ReviewContextRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<ReviewCommentsResponse, ReviewError> {
-    let drafts = list_drafts_for_request(&ListDraftsRequest {
-        repo_path: request.repo_path,
-        target: request.target,
-    })?
+    let drafts = list_drafts_for_request(
+        &ListDraftsRequest {
+            repo_path: request.repo_path,
+            target: request.target,
+        },
+        config,
+    )?
     .drafts;
     Ok(ReviewCommentsResponse {
         threads: threads_from_drafts(drafts),
@@ -439,15 +521,19 @@ fn review_comments_for_request(
 
 fn review_thread_for_request(
     request: GetReviewThreadRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<ReviewThreadResponse, ReviewError> {
     let summary = create_review_summary(&CreateReviewRequest {
         repo_path: request.repo_path.clone(),
         target: request.target.clone(),
     })?;
-    let drafts = list_drafts_for_request(&ListDraftsRequest {
-        repo_path: request.repo_path,
-        target: request.target,
-    })?
+    let drafts = list_drafts_for_request(
+        &ListDraftsRequest {
+            repo_path: request.repo_path,
+            target: request.target,
+        },
+        config,
+    )?
     .drafts;
     let thread = threads_from_drafts(drafts).into_iter().find(|thread| {
         request
@@ -499,17 +585,23 @@ fn review_diff_for_request(
     Ok(ReviewDiffResponse { files })
 }
 
-fn review_bundle_for_request(request: ReviewContextRequest) -> Result<ReviewBundle, ReviewError> {
+fn review_bundle_for_request(
+    request: ReviewContextRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ReviewBundle, ReviewError> {
     let summary = create_review_summary(&CreateReviewRequest {
         repo_path: request.repo_path.clone(),
         target: request.target.clone(),
     })?;
     let review_key = review_key(&summary.repo_root, &request.target)?;
     let threads = threads_from_drafts(
-        list_drafts_for_request(&ListDraftsRequest {
-            repo_path: request.repo_path,
-            target: request.target.clone(),
-        })?
+        list_drafts_for_request(
+            &ListDraftsRequest {
+                repo_path: request.repo_path,
+                target: request.target.clone(),
+            },
+            config,
+        )?
         .drafts,
     )
     .into_iter()
@@ -673,12 +765,16 @@ fn file_publisher_options_schema() -> serde_json::Value {
 
 fn publish_preview_for_request(
     request: PublishReviewRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<PublishReviewPreviewResponse, ReviewError> {
     let publisher_id = request.publisher_id.clone();
-    let bundle = review_bundle_for_request(ReviewContextRequest {
-        repo_path: request.repo_path,
-        target: request.target,
-    })?;
+    let bundle = review_bundle_for_request(
+        ReviewContextRequest {
+            repo_path: request.repo_path,
+            target: request.target,
+        },
+        config,
+    )?;
     let preview = with_publisher(&publisher_id, |publisher| {
         publisher.preview(&bundle, &request.options)
     })?;
@@ -690,12 +786,16 @@ fn publish_preview_for_request(
 
 fn publish_submit_for_request(
     request: PublishReviewRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<PublishReviewResponse, ReviewError> {
     let publisher_id = request.publisher_id;
-    let bundle = review_bundle_for_request(ReviewContextRequest {
-        repo_path: request.repo_path,
-        target: request.target,
-    })?;
+    let bundle = review_bundle_for_request(
+        ReviewContextRequest {
+            repo_path: request.repo_path,
+            target: request.target,
+        },
+        config,
+    )?;
     with_publisher(&publisher_id, |publisher| {
         publisher.submit(&bundle, &request.options)
     })
@@ -808,22 +908,28 @@ fn safe_review_id(review_id: &str) -> String {
         .collect()
 }
 
-fn list_drafts_for_request(request: &ListDraftsRequest) -> Result<ListDraftsResponse, ReviewError> {
+fn list_drafts_for_request(
+    request: &ListDraftsRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ListDraftsResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let review_key = review_key(&repo_root, &request.target)?;
-    let drafts = with_database(&repo_root, move |database| {
+    let drafts = with_database(&repo_root, config, move |database| {
         Box::pin(async move { CodeReviewDb::new(database).list_drafts(&review_key).await })
     })?;
     Ok(ListDraftsResponse { drafts })
 }
 
-fn save_draft_for_request(request: SaveDraftRequest) -> Result<SaveDraftResponse, ReviewError> {
+fn save_draft_for_request(
+    request: SaveDraftRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<SaveDraftResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let db_repo_root = repo_root.clone();
     let review_key = review_key(&repo_root, &request.target)?;
     let target_kind = target_kind(&request.target).to_string();
     let target_json = serde_json::to_string(&request.target)?;
-    let draft = with_database(&repo_root, move |database| {
+    let draft = with_database(&repo_root, config, move |database| {
         Box::pin(async move {
             CodeReviewDb::new(database)
                 .save_draft(
@@ -842,9 +948,10 @@ fn save_draft_for_request(request: SaveDraftRequest) -> Result<SaveDraftResponse
 
 fn delete_draft_for_request(
     request: DeleteDraftRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<DeleteDraftResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
-    let deleted = with_database(&repo_root, move |database| {
+    let deleted = with_database(&repo_root, config, move |database| {
         Box::pin(async move {
             CodeReviewDb::new(database)
                 .delete_draft(&request.comment_id)
@@ -856,9 +963,10 @@ fn delete_draft_for_request(
 
 fn update_draft_for_request(
     request: UpdateDraftRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<UpdateDraftResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
-    let result = with_database(&repo_root, move |database| {
+    let result = with_database(&repo_root, config, move |database| {
         Box::pin(async move {
             CodeReviewDb::new(database)
                 .update_draft(&request.comment_id, &request.body)
@@ -870,13 +978,14 @@ fn update_draft_for_request(
 
 fn link_thread_session_for_request(
     request: LinkThreadSessionRequest,
+    config: &CodeReviewPluginConfig,
 ) -> Result<LinkThreadSessionResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let db_repo_root = repo_root.clone();
     let review_key = review_key(&repo_root, &request.target)?;
     let target_kind = target_kind(&request.target).to_string();
     let target_json = serde_json::to_string(&request.target)?;
-    let response = with_database(&repo_root, move |database| {
+    let response = with_database(&repo_root, config, move |database| {
         Box::pin(async move {
             CodeReviewDb::new(database)
                 .link_thread_session(
@@ -1347,9 +1456,9 @@ struct StatePaths {
     database_path: PathBuf,
 }
 
-fn state_paths(repo_root: &Path) -> StatePaths {
+fn state_paths(repo_root: &Path, config: &CodeReviewPluginConfig) -> StatePaths {
     let state_root = env::var_os(CODE_REVIEW_STATE_DIR_ENV)
-        .map_or_else(|| repo_root.join(DEFAULT_STATE_ROOT), PathBuf::from);
+        .map_or_else(|| configured_state_root(repo_root, config), PathBuf::from);
     let database_path = state_root.join(DATABASE_FILE_NAME);
     StatePaths {
         state_root,
@@ -1357,8 +1466,38 @@ fn state_paths(repo_root: &Path) -> StatePaths {
     }
 }
 
+fn configured_state_root(repo_root: &Path, config: &CodeReviewPluginConfig) -> PathBuf {
+    if let Some(state_dir) = &config.state_dir {
+        if state_dir.is_absolute() {
+            return state_dir.clone();
+        }
+        return repo_root.join(state_dir);
+    }
+    match config.state_location {
+        CodeReviewStateLocation::User => default_bcode_state_dir().join(DEFAULT_STATE_SUBDIR),
+        CodeReviewStateLocation::Repo => repo_root.join(DEFAULT_REPO_STATE_ROOT),
+    }
+}
+
+fn default_bcode_state_dir() -> PathBuf {
+    if let Ok(path) = env::var(BCODE_STATE_DIR_ENV) {
+        return PathBuf::from(path);
+    }
+    if let Ok(state_home) = env::var(XDG_STATE_HOME_ENV) {
+        return PathBuf::from(state_home).join("bcode");
+    }
+    if let Ok(home) = env::var(HOME_ENV) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("bcode");
+    }
+    env::temp_dir().join("bcode")
+}
+
 fn with_database<T>(
     repo_root: &Path,
+    config: &CodeReviewPluginConfig,
     operation: impl for<'a> FnOnce(
         &'a dyn Database,
     ) -> Pin<Box<dyn Future<Output = Result<T, ReviewError>> + 'a>>
@@ -1368,7 +1507,7 @@ fn with_database<T>(
 where
     T: Send + 'static,
 {
-    let paths = state_paths(repo_root);
+    let paths = state_paths(repo_root, config);
     std::fs::create_dir_all(&paths.state_root)?;
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1938,6 +2077,56 @@ bcode_plugin_sdk::export_plugin!(CodeReviewPlugin, include_str!("../bcode-plugin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_state_path_uses_user_bcode_state_dir() {
+        let config = CodeReviewPluginConfig::default();
+        let state_paths = state_paths(Path::new("/repo"), &config);
+
+        assert_eq!(
+            state_paths.state_root,
+            default_bcode_state_dir().join(DEFAULT_STATE_SUBDIR)
+        );
+    }
+
+    #[test]
+    fn repo_state_location_uses_repo_local_directory() {
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::Repo,
+            state_dir: None,
+        };
+        let state_paths = state_paths(Path::new("/repo"), &config);
+
+        assert_eq!(
+            state_paths.state_root,
+            PathBuf::from("/repo/.bcode/code-review")
+        );
+    }
+
+    #[test]
+    fn explicit_relative_state_dir_is_repo_relative() {
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(PathBuf::from(".bcode/code-review")),
+        };
+        let state_paths = state_paths(Path::new("/repo"), &config);
+
+        assert_eq!(
+            state_paths.state_root,
+            PathBuf::from("/repo/.bcode/code-review")
+        );
+    }
+
+    #[test]
+    fn explicit_absolute_state_dir_is_used() {
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(PathBuf::from("/state/code-review")),
+        };
+        let state_paths = state_paths(Path::new("/repo"), &config);
+
+        assert_eq!(state_paths.state_root, PathBuf::from("/state/code-review"));
+    }
 
     #[test]
     fn parses_modified_file_diff() {
