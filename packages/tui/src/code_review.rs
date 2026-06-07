@@ -486,20 +486,34 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             if app.file_area_contains(mouse.position.x, mouse.position.y) {
-                app.scroll_files_up(3)
+                if app.sidebar_mode == ReviewSidebarMode::Threads {
+                    app.select_previous_thread(3)
+                } else {
+                    app.scroll_files_up(3)
+                }
             } else {
                 app.scroll_up(3)
             }
         }
         MouseEventKind::ScrollDown => {
             if app.file_area_contains(mouse.position.x, mouse.position.y) {
-                app.scroll_files_down(3)
+                if app.sidebar_mode == ReviewSidebarMode::Threads {
+                    app.select_next_thread(3)
+                } else {
+                    app.scroll_files_down(3)
+                }
             } else {
                 app.scroll_down(3)
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(index) = app.file_index_at(mouse.position.x, mouse.position.y) {
+            if app.sidebar_mode == ReviewSidebarMode::Threads {
+                app.thread_index_at(mouse.position.x, mouse.position.y)
+                    .is_some_and(|index| {
+                        app.select_thread(index);
+                        app.jump_to_selected_thread()
+                    })
+            } else if let Some(index) = app.file_index_at(mouse.position.x, mouse.position.y) {
                 app.select_file(index)
             } else if let Some(index) = app.diff_line_index_at(mouse.position.x, mouse.position.y) {
                 app.select_diff_line(index)
@@ -1124,6 +1138,15 @@ impl ReviewApp {
         true
     }
 
+    /// Select a thread by absolute index.
+    pub fn select_thread(&mut self, index: usize) -> bool {
+        if index >= self.thread_summaries().len() || index == self.selected_thread {
+            return false;
+        }
+        self.selected_thread = index;
+        true
+    }
+
     /// Select previous thread.
     pub const fn select_previous_thread(&mut self, rows: usize) -> bool {
         let next = self.selected_thread.saturating_sub(rows);
@@ -1308,6 +1331,17 @@ impl ReviewApp {
         (index < self.review.files.len()).then_some(index)
     }
 
+    /// Return visible thread index under terminal coordinates.
+    #[must_use]
+    pub fn thread_index_at(&self, x: u16, y: u16) -> Option<usize> {
+        let area = self.last_file_area?;
+        if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+            return None;
+        }
+        let index = self.thread_scroll + usize::from(y.saturating_sub(area.y));
+        (index < self.thread_summaries().len()).then_some(index)
+    }
+
     /// Return visible diff row index under terminal coordinates.
     #[must_use]
     pub fn diff_line_index_at(&self, x: u16, y: u16) -> Option<usize> {
@@ -1394,9 +1428,41 @@ impl ReviewApp {
     /// Return true when a diff row has draft comments.
     #[must_use]
     pub fn has_draft_comment_at(&self, file_index: usize, diff_row: usize) -> bool {
-        self.draft_comments
-            .keys()
-            .any(|anchor| anchor.file_index == file_index && anchor.diff_row == diff_row)
+        self.draft_comments.keys().any(|anchor| {
+            anchor.file_index == file_index
+                && (anchor.start_diff_row()..=anchor.end_diff_row()).contains(&diff_row)
+        })
+    }
+
+    /// Return the draft marker for a rendered diff row.
+    #[must_use]
+    pub fn draft_marker_at(&self, file_index: usize, diff_row: usize) -> Option<String> {
+        let mut count = 0usize;
+        let mut linked = false;
+        for (anchor, comments) in &self.draft_comments {
+            if anchor.file_index != file_index
+                || !(anchor.start_diff_row()..=anchor.end_diff_row()).contains(&diff_row)
+            {
+                continue;
+            }
+            count = count.saturating_add(comments.len());
+            linked |= comments.iter().any(|comment| comment.session_id.is_some());
+        }
+        if count == 0 {
+            None
+        } else if linked {
+            Some(if count > 1 {
+                format!("🤖💬{count}")
+            } else {
+                "🤖💬".to_string()
+            })
+        } else {
+            Some(if count > 1 {
+                format!("💬{count}")
+            } else {
+                "💬".to_string()
+            })
+        }
     }
 
     /// Open the draft comment editor for the selected diff line.
@@ -1743,6 +1809,29 @@ impl ReviewApp {
         self.pending_draft_delete = Some(PendingDraftDelete { anchor, comment });
         self.status_message = Some("deleted draft comment".to_string());
         true
+    }
+
+    /// Return a footer preview for the selected thread.
+    #[must_use]
+    pub fn selected_thread_preview(&self) -> Option<String> {
+        let thread = self.thread_summaries().get(self.selected_thread)?.clone();
+        let range = if thread.anchor.start_diff_row() == thread.anchor.end_diff_row() {
+            format!("@{}", thread.anchor.start_diff_row())
+        } else {
+            format!(
+                "@{}-{}",
+                thread.anchor.start_diff_row(),
+                thread.anchor.end_diff_row()
+            )
+        };
+        let linked = thread
+            .session_id
+            .as_deref()
+            .map_or(String::new(), |session_id| format!("  🤖 {session_id}"));
+        Some(format!(
+            " thread {} {range} x{}:{linked} {}  Enter jump  a ask/follow up  o open ",
+            thread.anchor.path, thread.draft_count, thread.latest_body
+        ))
     }
 
     /// Return a short preview for the selected line's latest draft comment.
@@ -2166,5 +2255,46 @@ mod tests {
 
         assert_eq!(app.draft_comment_count(), 1);
         assert!(app.has_draft_comment_at(0, 2));
+    }
+
+    #[test]
+    fn thread_sidebar_toggle_and_jump() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor should open")
+            .buffer
+            .insert_str("Needs a test");
+        assert!(app.save_comment_editor());
+        assert!(app.toggle_sidebar_mode());
+
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Threads);
+        assert_eq!(app.thread_summaries().len(), 1);
+        app.selected_diff_line = 0;
+        assert!(app.jump_to_selected_thread());
+        assert_eq!(app.selected_diff_line, 2);
+    }
+
+    #[test]
+    fn thread_preview_shows_linked_session() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor should open")
+            .buffer
+            .insert_str("Needs a test");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        app.mark_thread_session(&anchor, SessionId::new().to_string());
+        app.toggle_sidebar_mode();
+
+        let preview = app.selected_thread_preview().expect("thread preview");
+        assert!(preview.contains("🤖"));
+        assert!(preview.contains("Needs a test"));
     }
 }

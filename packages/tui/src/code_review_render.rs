@@ -126,6 +126,11 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             if let Some(range) = app.range_selection_label() {
                 return format!(" {range}  c comment  a ask Bcode  esc clear ");
             }
+            if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
+                return app.selected_thread_preview().unwrap_or_else(|| {
+                    " j/k thread  Enter jump  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
+                });
+            }
             if let Some(preview) = app.selected_draft_preview() {
                 let linked = app
                     .selected_draft_session_id()
@@ -133,7 +138,9 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 return format!(" {preview}{linked}  a ask/follow up  o open  e edit  D delete latest draft ");
             }
             if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
-                return " j/k thread  Enter jump  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string();
+                return app.selected_thread_preview().unwrap_or_else(|| {
+                    " j/k thread  Enter jump  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
+                });
             }
             format!(
                 " j/k scroll  n/p file  J/K hunk  c comment  v range  a ask Bcode  o open session  e edit  D delete draft  t threads  b sidebar:{sidebar}  ? {help}  q exit "
@@ -340,9 +347,9 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         let row_area = Rect::new(area.x, y, area.width, 1);
         if let Some(rendered) = rows.get(index) {
             let mut line = rendered.line.clone();
-            if app.has_draft_comment_at(app.selected_file, index) {
+            if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
                 line.spans
-                    .insert(0, Span::styled("💬", Style::new().fg(Color::Yellow)));
+                    .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
             }
             let (line, style) = if index == app.selected_diff_line {
                 (selected_line(&line), rendered.style.bg(Color::BrightBlack))
