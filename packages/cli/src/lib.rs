@@ -276,7 +276,7 @@ enum Commands {
     },
     Review {
         #[command(subcommand)]
-        command: ReviewCommand,
+        command: Option<ReviewCommand>,
     },
     Plugin {
         #[command(subcommand)]
@@ -844,7 +844,11 @@ enum PluginCommand {
     },
 }
 
-async fn handle_review_command(command: ReviewCommand) -> Result<(), CliError> {
+async fn handle_review_command(command: Option<ReviewCommand>) -> Result<(), CliError> {
+    let Some(command) = command else {
+        bcode_tui::run_code_review_home(PathBuf::from(".")).await?;
+        return Ok(());
+    };
     let (repo, target) = match command {
         ReviewCommand::Unstaged { repo } => (
             repo,

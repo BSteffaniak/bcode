@@ -10,6 +10,7 @@ pub(crate) mod chat_loop;
 pub(crate) mod clipboard_image;
 pub mod code_review;
 pub(crate) mod code_review_display;
+pub mod code_review_home;
 pub(crate) mod code_review_render;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
@@ -138,6 +139,37 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
 
     match result {
         Ok(()) => {
+            let _writer = guard.leave()?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Run the full-screen review home/picker.
+///
+/// # Errors
+///
+/// Returns I/O, client, or plugin service errors.
+pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        code_review_home::run(&mut terminal, repo_path).await
+    };
+
+    match result {
+        Ok(code_review_home::ReviewHomeOutcome::OpenTarget { repo_path, target }) => {
+            let _writer = guard.leave()?;
+            run_code_review(repo_path, target).await
+        }
+        Ok(code_review_home::ReviewHomeOutcome::Exit) => {
             let _writer = guard.leave()?;
             Ok(())
         }
