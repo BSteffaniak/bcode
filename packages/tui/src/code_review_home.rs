@@ -5,9 +5,10 @@ use std::path::PathBuf;
 
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
+    ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse,
     CODE_REVIEW_SERVICE_INTERFACE_ID, CreateReviewWorkspaceRequest, CreateReviewWorkspaceResponse,
-    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_WORKSPACE_CREATE,
-    OP_REVIEW_WORKSPACE_LIST, ReviewWorkspace,
+    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_WORKSPACE_ARCHIVE,
+    OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_LIST, ReviewWorkspace,
 };
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
@@ -75,33 +76,19 @@ impl ReviewHomeApp {
         true
     }
 
+    fn open_workspace(&mut self, workspace: ReviewWorkspace) -> bool {
+        self.outcome = Some(ReviewHomeOutcome::OpenWorkspace { workspace });
+        self.should_exit = true;
+        true
+    }
+
     fn open_selected(&mut self) -> bool {
         let Some(workspace) = self.workspaces.get(self.selected) else {
             self.status_message =
                 Some("no review workspace selected; press n to create one".to_string());
             return true;
         };
-        self.outcome = Some(ReviewHomeOutcome::OpenWorkspace {
-            workspace: workspace.clone(),
-        });
-        self.should_exit = true;
-        true
-    }
-
-    fn create_new(&mut self) -> bool {
-        self.outcome = Some(ReviewHomeOutcome::OpenWorkspace {
-            workspace: ReviewWorkspace {
-                id: "transient-new-review-workspace".to_string(),
-                title: "Untitled review".to_string(),
-                repo_root: self.repo_path.clone(),
-                sources: Vec::new(),
-                created_at_ms: None,
-                updated_at_ms: None,
-                archived_at_ms: None,
-            },
-        });
-        self.should_exit = true;
-        true
+        self.open_workspace(workspace.clone())
     }
 }
 
@@ -147,14 +134,16 @@ pub async fn run<W: Write>(
                 KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                 KeyCode::Char('k') | KeyCode::Up => app.move_up(),
                 KeyCode::Enter => app.open_selected(),
+                KeyCode::Char('x') => match archive_selected_workspace(&client, &mut app).await {
+                    Ok(archived) => archived,
+                    Err(error) => {
+                        app.status_message = Some(format!("failed to archive workspace: {error}"));
+                        true
+                    }
+                },
                 KeyCode::Char('n') => {
                     match create_workspace(&client, app.repo_path.clone()).await {
-                        Ok(workspace) => {
-                            app.workspaces.insert(0, workspace);
-                            app.selected = 0;
-                            app.status_message = Some("created review workspace".to_string());
-                            app.create_new()
-                        }
+                        Ok(workspace) => app.open_workspace(workspace),
                         Err(error) => {
                             app.status_message =
                                 Some(format!("failed to create workspace: {error}"));
@@ -195,6 +184,44 @@ async fn load_workspaces(
     let response: ListReviewWorkspacesResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     Ok(response.workspaces)
+}
+
+async fn archive_selected_workspace(
+    client: &BcodeClient,
+    app: &mut ReviewHomeApp,
+) -> Result<bool, TuiError> {
+    let Some(workspace) = app.workspaces.get(app.selected) else {
+        app.status_message = Some("no review workspace selected".to_string());
+        return Ok(true);
+    };
+    let payload = serde_json::to_vec(&ArchiveReviewWorkspaceRequest {
+        repo_path: app.repo_path.clone(),
+        workspace_id: workspace.id.clone(),
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_WORKSPACE_ARCHIVE.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ArchiveReviewWorkspaceResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    if response.archived {
+        let archived = app.workspaces.remove(app.selected);
+        app.selected = app.selected.min(app.workspaces.len().saturating_sub(1));
+        app.status_message = Some(format!("archived {}", archived.title));
+    } else {
+        app.status_message = Some("workspace was not found".to_string());
+    }
+    Ok(true)
 }
 
 async fn create_workspace(
@@ -253,7 +280,7 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n new   j/k move   q exit ",
+            " enter open   n new   x archive   j/k move   q exit ",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
@@ -305,7 +332,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     let text = app
         .status_message
         .as_deref()
-        .unwrap_or("review home: open an existing workspace or create a new one");
+        .unwrap_or("review home: enter open, n new, x archive");
     frame.write_line(
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
