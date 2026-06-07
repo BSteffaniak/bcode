@@ -12,6 +12,7 @@ mod actor;
 pub mod db;
 pub mod lease;
 pub mod projection;
+pub mod repair;
 mod store_executor;
 
 use actor::{AttachMode, SessionHandle};

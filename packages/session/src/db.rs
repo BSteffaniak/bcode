@@ -210,7 +210,7 @@ pub struct TranscriptItem {
 #[derive(Debug, Clone)]
 pub struct GlobalSessionDb {
     db: Arc<Box<dyn Database>>,
-    _catalog_lock: Arc<crate::lease::CatalogLockGuard>,
+    _catalog_lock: Option<Arc<crate::lease::CatalogLockGuard>>,
 }
 
 impl GlobalSessionDb {
@@ -239,7 +239,24 @@ impl GlobalSessionDb {
         run_global_migrations(&*db).await?;
         Ok(Self {
             db: Arc::new(db),
-            _catalog_lock: Arc::new(catalog_lock),
+            _catalog_lock: Some(Arc::new(catalog_lock)),
+        })
+    }
+
+    /// Open the global session catalog database at `path` without acquiring the catalog lock.
+    ///
+    /// This is intended for maintenance code that already holds the catalog lock or is running in
+    /// dry-run diagnostic mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Turso connection cannot be opened or schema migrations fail.
+    pub async fn open_turso_without_catalog_lock(path: &Path) -> SessionDbResult<Self> {
+        let db = init_turso_local_with_retry(path).await?;
+        run_global_migrations(&*db).await?;
+        Ok(Self {
+            db: Arc::new(db),
+            _catalog_lock: None,
         })
     }
 

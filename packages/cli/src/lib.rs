@@ -33,6 +33,7 @@ use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,8 @@ pub enum CliError {
     Server(#[from] bcode_server::ServerError),
     #[error("session store error: {0}")]
     SessionStore(#[from] bcode_session::SessionStoreError),
+    #[error("session repair error: {0}")]
+    SessionRepair(#[from] bcode_session::repair::SessionRepairError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("TUI error: {0}")]
@@ -76,6 +79,8 @@ pub enum CliError {
     BundledPluginInstallFailed(String),
     #[error("plugin service error {code}: {message}")]
     PluginService { code: String, message: String },
+    #[error("session repair usage error: {0}")]
+    SessionRepairUsage(String),
 }
 
 /// Parse CLI arguments and run the requested command.
@@ -107,21 +112,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     }
     match cli.command.unwrap_or_default() {
         Commands::Server { command } => handle_server_command(command).await?,
-        Commands::Session { command } => match command {
-            SessionCommand::Create { name } => create_session(name).await?,
-            SessionCommand::List => list_sessions().await?,
-            SessionCommand::Rename { session_id, name } => rename_session(session_id, name).await?,
-            SessionCommand::Delete { session_id } => delete_session(session_id).await?,
-            SessionCommand::History { session_id } => session_history(session_id).await?,
-            SessionCommand::Export { session_id, format } => {
-                session_export(session_id, format).await?;
-            }
-            SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
-            SessionCommand::Diagnose { session_id, json } => {
-                session_diagnose(session_id, json).await?;
-            }
-            SessionCommand::Import { command } => handle_session_import_command(command).await?,
-        },
+        Commands::Session { command } => handle_session_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Review { command } => handle_review_command(command).await?,
@@ -589,6 +580,26 @@ enum SessionCommand {
     },
     Diagnose {
         session_id: SessionId,
+        #[arg(long)]
+        json: bool,
+    },
+    Doctor {
+        session_id: Option<SessionId>,
+        #[arg(long)]
+        catalog: bool,
+        #[arg(long)]
+        scan: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Repair {
+        session_id: Option<SessionId>,
+        #[arg(long)]
+        catalog: bool,
+        #[arg(long)]
+        scan: bool,
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1064,6 +1075,52 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         ServerCommand::Stop => server_stop().await?,
         ServerCommand::Cleanup => server_cleanup(false).await?,
         ServerCommand::StopAll => server_cleanup(true).await?,
+    }
+    Ok(())
+}
+
+async fn handle_session_command(command: SessionCommand) -> Result<(), CliError> {
+    match command {
+        SessionCommand::Create { name } => create_session(name).await?,
+        SessionCommand::List => list_sessions().await?,
+        SessionCommand::Rename { session_id, name } => rename_session(session_id, name).await?,
+        SessionCommand::Delete { session_id } => delete_session(session_id).await?,
+        SessionCommand::History { session_id } => session_history(session_id).await?,
+        SessionCommand::Export { session_id, format } => {
+            session_export(session_id, format).await?;
+        }
+        SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
+        SessionCommand::Diagnose { session_id, json } => {
+            session_diagnose(session_id, json).await?;
+        }
+        SessionCommand::Doctor {
+            session_id,
+            catalog,
+            scan,
+            json,
+        } => {
+            run_session_repair_command(SessionRepairCliOptions {
+                target: repair_cli_target(session_id, catalog, scan),
+                mode: SessionRepairCliMode::DryRun,
+                output: repair_cli_output(json),
+            })
+            .await?;
+        }
+        SessionCommand::Repair {
+            session_id,
+            catalog,
+            scan,
+            dry_run,
+            json,
+        } => {
+            run_session_repair_command(SessionRepairCliOptions {
+                target: repair_cli_target(session_id, catalog, scan),
+                mode: repair_cli_mode(dry_run),
+                output: repair_cli_output(json),
+            })
+            .await?;
+        }
+        SessionCommand::Import { command } => handle_session_import_command(command).await?,
     }
     Ok(())
 }
@@ -4122,6 +4179,184 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
         print_session_diagnosis(&diagnosis);
     }
     Ok(())
+}
+
+struct SessionRepairCliOptions {
+    target: SessionRepairCliTarget,
+    mode: SessionRepairCliMode,
+    output: SessionRepairCliOutput,
+}
+
+enum SessionRepairCliTarget {
+    Explicit {
+        session_id: Option<SessionId>,
+        catalog: bool,
+    },
+    Scan,
+}
+
+enum SessionRepairCliMode {
+    DryRun,
+    Repair,
+}
+
+enum SessionRepairCliOutput {
+    Text,
+    Json,
+}
+
+const fn repair_cli_target(
+    session_id: Option<SessionId>,
+    catalog: bool,
+    scan: bool,
+) -> SessionRepairCliTarget {
+    if scan {
+        SessionRepairCliTarget::Scan
+    } else {
+        SessionRepairCliTarget::Explicit {
+            session_id,
+            catalog,
+        }
+    }
+}
+
+const fn repair_cli_mode(dry_run: bool) -> SessionRepairCliMode {
+    if dry_run {
+        SessionRepairCliMode::DryRun
+    } else {
+        SessionRepairCliMode::Repair
+    }
+}
+
+const fn repair_cli_output(json: bool) -> SessionRepairCliOutput {
+    if json {
+        SessionRepairCliOutput::Json
+    } else {
+        SessionRepairCliOutput::Text
+    }
+}
+
+async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<(), CliError> {
+    let root = bcode_config::default_state_dir().join("sessions");
+    let dry_run = matches!(options.mode, SessionRepairCliMode::DryRun);
+    let mut reports = Vec::new();
+    match options.target {
+        SessionRepairCliTarget::Scan => {
+            reports.push(repair_catalog_report(&root, dry_run).await?);
+            for session_id in discover_session_ids(&root)? {
+                reports.push(repair_session_report(&root, session_id, dry_run).await?);
+            }
+        }
+        SessionRepairCliTarget::Explicit {
+            session_id,
+            catalog,
+        } => {
+            if catalog {
+                reports.push(repair_catalog_report(&root, dry_run).await?);
+            }
+            if let Some(session_id) = session_id {
+                reports.push(repair_session_report(&root, session_id, dry_run).await?);
+            }
+        }
+    }
+    if reports.is_empty() {
+        return Err(CliError::SessionRepairUsage(
+            "provide a session id, --catalog, or --scan".to_string(),
+        ));
+    }
+    if matches!(options.output, SessionRepairCliOutput::Json) {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        for report in &reports {
+            print_repair_report(report);
+        }
+    }
+    Ok(())
+}
+
+async fn repair_session_report(
+    root: &Path,
+    session_id: SessionId,
+    dry_run: bool,
+) -> Result<bcode_session::repair::RepairReport, CliError> {
+    if dry_run {
+        Ok(bcode_session::repair::doctor_session(root, session_id).await?)
+    } else {
+        Ok(bcode_session::repair::repair_session(
+            root,
+            session_id,
+            bcode_session::repair::RepairOptions { dry_run },
+        )
+        .await?)
+    }
+}
+
+async fn repair_catalog_report(
+    root: &Path,
+    dry_run: bool,
+) -> Result<bcode_session::repair::RepairReport, CliError> {
+    if dry_run {
+        Ok(bcode_session::repair::doctor_catalog(root).await?)
+    } else {
+        Ok(bcode_session::repair::repair_catalog(
+            root,
+            bcode_session::repair::RepairOptions { dry_run },
+        )
+        .await?)
+    }
+}
+
+fn discover_session_ids(root: &Path) -> Result<Vec<SessionId>, CliError> {
+    let mut ids = Vec::new();
+    if !root.exists() {
+        return Ok(ids);
+    }
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(session_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<SessionId>().ok())
+        {
+            ids.push(session_id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn print_repair_report(report: &bcode_session::repair::RepairReport) {
+    println!("target: {}", repair_target_label(&report.target));
+    println!("status: {:?}", report.status);
+    println!("db: {}", report.db_path.display());
+    if let Some(backup_path) = &report.backup_path {
+        println!("backup: {}", backup_path.display());
+    }
+    if let Some(error) = &report.initial_error {
+        println!("initial error: {error}");
+    }
+    if let Some(error) = &report.final_error {
+        println!("final error: {error}");
+    }
+    for action in &report.actions {
+        println!("action: {} — {}", action.kind, action.detail);
+    }
+    for note in &report.notes {
+        println!("note: {note}");
+    }
+    println!();
+}
+
+fn repair_target_label(target: &bcode_session::repair::RepairTarget) -> String {
+    match target {
+        bcode_session::repair::RepairTarget::Session { session_id } => {
+            format!("session {session_id}")
+        }
+        bcode_session::repair::RepairTarget::Catalog => "catalog".to_string(),
+    }
 }
 
 impl SessionDiagnosis {

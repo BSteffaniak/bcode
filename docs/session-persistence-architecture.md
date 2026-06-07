@@ -66,11 +66,15 @@ The TUI uses a recent-page attach path for initial load and requests/prepends ol
 
 CLI maintenance commands provide explicit repair ergonomics. These commands may scan canonical event logs and rebuild sidecars:
 
-* `bcode session doctor [session-id]` reports index freshness, event counts, offsets, and issue counts.
-* `bcode session reindex [session-id]` rebuilds sidecar indexes from canonical event logs.
-* `bcode session repair <session-id>` backs up and truncates only unreadable tails, then rebuilds indexes.
+* `bcode session doctor [session-id]` diagnoses a session database with Bcode's native Turso stack without mutating files.
+* `bcode session doctor --catalog` diagnoses the global catalog database.
+* `bcode session doctor --scan` diagnoses the catalog and all discovered session databases.
+* `bcode session repair <session-id>` acquires the session lease, backs up the session directory, removes stale WAL index sidecars, and truncates only clearly incomplete final WAL frames.
+* `bcode session repair --catalog` backs up and repairs the global catalog database with the same stale-sidecar/truncated-tail limits.
+* `bcode session repair --scan --dry-run` reports planned repair actions across the catalog and all discovered sessions.
+* Future `bcode session reindex [session-id]` support may rebuild sidecar indexes from canonical event logs.
 
-Do not invoke these repair paths implicitly from catalog listing, session picker display, normal attach, or paged history reads.
+Repair must use Bcode's native Turso open path for validation. Do not invoke stock SQLite checkpoint/repair as the primary repair path. Do not invoke these repair paths implicitly from catalog listing, session picker display, normal attach, or paged history reads.
 
 ## Architecture guardrails
 
