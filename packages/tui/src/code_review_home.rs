@@ -864,7 +864,7 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y, area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " Bcode Reviews ",
+            format!(" Bcode Reviews  {} ", review_home_summary_label(app)),
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -881,6 +881,28 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
+}
+
+fn review_home_summary_label(app: &ReviewHomeApp) -> String {
+    let visible_count = app.visible_indices().len();
+    let active_count = app
+        .workspace_items
+        .iter()
+        .filter(|item| item.workspace.archived_at_ms.is_none())
+        .count();
+    let draft_count = app
+        .workspace_items
+        .iter()
+        .filter(|item| item.draft_count != 0)
+        .count();
+    let setup_count = app
+        .workspace_items
+        .iter()
+        .filter(|item| workspace_health_label(item) == "setup")
+        .count();
+    format!(
+        "{visible_count} visible · {active_count} active · {draft_count} with drafts · {setup_count} setup"
+    )
 }
 
 fn active_filter_label(app: &ReviewHomeApp) -> String {
@@ -944,16 +966,59 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
+fn render_empty_review_home(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+    let lines = [
+        "No review workspaces yet.",
+        "",
+        "Start fast:",
+        "  u  unstaged changes",
+        "  s  staged changes",
+        "  w  working tree review",
+        "  l  last commit review",
+        "",
+        "Or press n to name a custom review, then attach sources in build mode.",
+    ];
+    for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
+        let style = if row == 0 {
+            Style::new()
+                .fg(Color::Cyan)
+                .bg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::White).bg(Color::Black)
+        };
+        frame.write_line(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                area.width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(format!(" {line}"), style)]),
+        );
+    }
+    if let Some(message) = &app.status_message {
+        let y = area
+            .y
+            .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX))
+            .saturating_add(1);
+        if y < area.bottom() {
+            frame.write_line(
+                Rect::new(area.x, y, area.width, 1),
+                &Line::from_spans(vec![Span::styled(
+                    format!(" {message}"),
+                    Style::new().fg(Color::Yellow).bg(Color::Black),
+                )]),
+            );
+        }
+    }
+}
+
 fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     let visible = app.visible_indices();
     if app.workspace_items.is_empty() {
-        frame.write_line(
-            Rect::new(area.x, area.y, area.width, 1),
-            &Line::from_spans(vec![Span::styled(
-                " No review workspaces yet. Press n for a custom review, or u/s/w/l for unstaged/staged/worktree/last-commit presets.",
-                Style::new().fg(Color::White).bg(Color::Black),
-            )]),
-        );
+        render_empty_review_home(app, area, frame);
         return;
     }
     if visible.is_empty() {
