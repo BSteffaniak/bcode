@@ -2772,6 +2772,8 @@ pub struct ReviewApp {
     pub selected_tree_row: usize,
     /// Active build-mode row.
     pub selected_build_row: usize,
+    /// Top visible build selectable row.
+    pub build_scroll: usize,
     /// Whether workspace changes should be persisted.
     pub pending_workspace_save: bool,
     /// Whether workspace content should be rematerialized.
@@ -2822,6 +2824,7 @@ impl ReviewApp {
             expanded_dirs: BTreeSet::new(),
             selected_tree_row: 0,
             selected_build_row: 0,
+            build_scroll: 0,
             pending_workspace_save: false,
             pending_workspace_reload: false,
             pending_agent_session: None,
@@ -3876,6 +3879,7 @@ impl ReviewApp {
         self.selected_build_row = self
             .selected_build_row
             .min(self.build_row_count().saturating_sub(1));
+        self.build_scroll = self.build_scroll.min(self.selected_build_row);
         self.file_scroll = self.file_scroll.min(self.selected_file);
         self.diff_scroll = 0;
         self.selected_diff_line = 0;
@@ -3964,7 +3968,7 @@ impl ReviewApp {
         if next == self.selected_build_row {
             return false;
         }
-        self.selected_build_row = next;
+        self.set_selected_build_row(next);
         true
     }
 
@@ -3978,8 +3982,13 @@ impl ReviewApp {
         if next == self.selected_build_row {
             return false;
         }
-        self.selected_build_row = next;
+        self.set_selected_build_row(next);
         true
+    }
+
+    fn set_selected_build_row(&mut self, row: usize) {
+        self.selected_build_row = row.min(self.build_row_count().saturating_sub(1));
+        self.build_scroll = self.build_scroll.min(self.selected_build_row);
     }
 
     fn selected_build_source_index(&self) -> Option<usize> {
@@ -4044,7 +4053,7 @@ impl ReviewApp {
             return true;
         };
         self.ux_mode = ReviewUxMode::Build;
-        self.selected_build_row = source_index;
+        self.set_selected_build_row(source_index);
         self.status_message = Some("selected source for current surface".to_string());
         true
     }
@@ -4224,9 +4233,7 @@ impl ReviewApp {
             self.status_message = Some("no excluded sources to remove".to_string());
             return true;
         }
-        self.selected_build_row = self
-            .selected_build_row
-            .min(self.build_row_count().saturating_sub(1));
+        self.set_selected_build_row(self.selected_build_row);
         self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
@@ -4273,7 +4280,7 @@ impl ReviewApp {
             return false;
         }
         self.workspace.sources.swap(index, index - 1);
-        self.selected_build_row = index - 1;
+        self.set_selected_build_row(index - 1);
         self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
@@ -4289,7 +4296,7 @@ impl ReviewApp {
             return false;
         }
         self.workspace.sources.swap(index, index + 1);
-        self.selected_build_row = index + 1;
+        self.set_selected_build_row(index + 1);
         self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
@@ -4306,9 +4313,7 @@ impl ReviewApp {
             return true;
         };
         let source = self.workspace.sources.remove(index);
-        self.selected_build_row = self
-            .selected_build_row
-            .min(self.build_row_count().saturating_sub(1));
+        self.set_selected_build_row(self.selected_build_row);
         self.status_message = Some(format!("removed {}", source.label));
         self.sync_review_workspace();
         self.pending_workspace_save = true;

@@ -616,19 +616,36 @@ fn render_file_row(
     frame.write_line_with_fallback_style(area, &line, style);
 }
 
-fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_build_workspace(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
     let rows = build_workspace_rows(app);
+    let visible_rows = usize::from(area.height);
+    if app.selected_build_row < app.build_scroll {
+        app.build_scroll = app.selected_build_row;
+    } else if app.selected_build_row >= app.build_scroll.saturating_add(visible_rows) {
+        app.build_scroll = app
+            .selected_build_row
+            .saturating_add(1)
+            .saturating_sub(visible_rows);
+    }
     let mut selectable_index = 0usize;
-    for (row, (prefix, text, selectable, warning)) in
-        rows.into_iter().take(usize::from(area.height)).enumerate()
-    {
-        let selected = selectable && selectable_index == app.selected_build_row;
-        if selectable {
-            selectable_index = selectable_index.saturating_add(1);
-        }
+    let visible_rows = rows
+        .into_iter()
+        .filter_map(|(prefix, text, selectable, warning)| {
+            let row_index = selectable.then_some(selectable_index);
+            if selectable {
+                selectable_index = selectable_index.saturating_add(1);
+            }
+            if row_index.is_some_and(|index| index < app.build_scroll) {
+                return None;
+            }
+            Some((prefix, text, selectable, warning, row_index))
+        })
+        .take(visible_rows);
+    for (row, (prefix, text, selectable, warning, row_index)) in visible_rows.enumerate() {
+        let selected = selectable && row_index == Some(app.selected_build_row);
         let style = if selected {
             Style::new().fg(Color::Black).bg(Color::Yellow)
         } else if warning {
