@@ -1015,6 +1015,7 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
             .count(),
         workspace.sources.len()
     ));
+    lines.push(format!(" next: {}", workspace_next_action(item)));
     lines.push(String::new());
     for source in workspace
         .sources
@@ -1130,6 +1131,31 @@ fn source_kind_search_text(kind: &ReviewSourceKind) -> String {
     }
 }
 
+fn workspace_next_action(item: &ReviewWorkspaceListItem) -> String {
+    let workspace = &item.workspace;
+    let included_count = workspace
+        .sources
+        .iter()
+        .filter(|source| source.included)
+        .count();
+    if workspace.archived_at_ms.is_some() {
+        return "restore review to continue".to_string();
+    }
+    if workspace.sources.is_empty() {
+        return "open and add sources".to_string();
+    }
+    if included_count == 0 {
+        return "open and include at least one source".to_string();
+    }
+    if item.draft_count > 0 && item.last_publish.is_none() {
+        return "open and publish drafts".to_string();
+    }
+    if item.draft_count > 0 {
+        return "open and continue draft review".to_string();
+    }
+    "open and continue review".to_string()
+}
+
 fn workspace_row_text(item: &ReviewWorkspaceListItem) -> String {
     let workspace = &item.workspace;
     let source_count = workspace
@@ -1169,16 +1195,10 @@ fn workspace_row_text(item: &ReviewWorkspaceListItem) -> String {
             item.draft_count, item.thread_count
         )
     };
-    let publish_suffix = item.last_publish.as_ref().map_or_else(
-        || "not published".to_string(),
-        |record| {
-            let destination = record.output.as_deref().unwrap_or("no output");
-            format!("published via {} to {destination}", record.publisher_id)
-        },
-    );
+    let next_action = workspace_next_action(item);
     format!(
-        " {}  · {}  · {}  · {}  · {}{}",
-        workspace.title, updated, draft_suffix, publish_suffix, suffix, archived
+        " {}  · {}  · {}  · next: {}  · {}{}",
+        workspace.title, updated, draft_suffix, next_action, suffix, archived
     )
 }
 
