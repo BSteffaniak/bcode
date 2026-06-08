@@ -167,6 +167,19 @@ impl ReviewHomeApp {
         true
     }
 
+    fn open_workspace_unless_archived(
+        &mut self,
+        workspace: ReviewWorkspace,
+        build_mode: bool,
+    ) -> bool {
+        if workspace.archived_at_ms.is_some() {
+            self.status_message =
+                Some("review is archived; press R to restore it first".to_string());
+            return true;
+        }
+        self.open_workspace(workspace, build_mode)
+    }
+
     fn open_most_recent(&mut self) -> bool {
         let Some(index) = self
             .visible_indices()
@@ -193,21 +206,21 @@ impl ReviewHomeApp {
             return true;
         };
         let build_mode = workspace_should_open_in_build_mode(&workspace);
-        self.open_workspace(workspace, build_mode)
+        self.open_workspace_unless_archived(workspace, build_mode)
     }
 
     fn open_selected_in_build_mode(&mut self) -> bool {
         let Some(workspace) = self.selected_workspace_or_status() else {
             return true;
         };
-        self.open_workspace(workspace, true)
+        self.open_workspace_unless_archived(workspace, true)
     }
 
     fn open_selected_in_review_mode(&mut self) -> bool {
         let Some(workspace) = self.selected_workspace_or_status() else {
             return true;
         };
-        self.open_workspace(workspace, false)
+        self.open_workspace_unless_archived(workspace, false)
     }
 
     fn select_review_by_health(&mut self, target: &str, forward: bool) -> bool {
@@ -1005,8 +1018,8 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " d                   show/hide details pane",
         " r                   rename selected review",
         " x                   archive selected review",
+        " archived             press R to restore before opening",
         " R                   restore selected archived review",
-        " ?                   toggle this help",
         " q or esc            exit",
     ]
 }
@@ -1554,6 +1567,27 @@ mod tests {
             draft_count: 0,
             last_publish: None,
         }
+    }
+
+    #[test]
+    fn selected_archived_review_must_be_restored_before_opening() {
+        let mut app = ReviewHomeApp::new(
+            PathBuf::from("/repo"),
+            vec![item(workspace(
+                "archived",
+                vec![source("source", true)],
+                true,
+            ))],
+        );
+
+        assert!(app.open_selected());
+
+        assert_eq!(app.outcome, None);
+        assert!(!app.should_exit);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("review is archived; press R to restore it first")
+        );
     }
 
     #[test]
