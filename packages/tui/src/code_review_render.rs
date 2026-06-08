@@ -9,7 +9,7 @@ use bmux_tui::text_width::truncate_to_display_width;
 
 use super::code_review::{
     ReviewApp, ReviewFile, ReviewLineKind, ReviewPromptKind, ReviewPublishState, ReviewSidebarMode,
-    sidebar_width,
+    add_source_menu_items, sidebar_width,
 };
 use super::code_review_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment,
@@ -1295,10 +1295,9 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
 
 fn prompt_popup_height(kind: ReviewPromptKind, area: Rect) -> u16 {
     match kind {
-        ReviewPromptKind::FilePicker => area.height.min(16),
+        ReviewPromptKind::FilePicker | ReviewPromptKind::AddSourceKind => area.height.min(16),
         ReviewPromptKind::JumpToLine
         | ReviewPromptKind::FileSearch
-        | ReviewPromptKind::AddSourceKind
         | ReviewPromptKind::AddCommitSource
         | ReviewPromptKind::AddCommitRangeSource
         | ReviewPromptKind::AddBranchCompareSource
@@ -1320,6 +1319,41 @@ const fn prompt_title(kind: ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddFileSource => " Add file ",
         ReviewPromptKind::AddFileRangeSource => " Add file range ",
         ReviewPromptKind::RenameSource => " Rename source ",
+    }
+}
+
+fn render_add_source_menu(
+    prompt: &super::code_review::ReviewPromptState,
+    popup: Rect,
+    height: u16,
+    frame: &mut Frame<'_>,
+) {
+    let items = add_source_menu_items();
+    for (row, item) in items
+        .iter()
+        .take(usize::from(height.saturating_sub(3)))
+        .enumerate()
+    {
+        let style = if row == prompt.selected {
+            Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::new().fg(Color::White).bg(Color::Black)
+        };
+        let text = format!(" {:<16} {}", item.label, item.help);
+        frame.write_line(
+            Rect::new(
+                popup.x.saturating_add(1),
+                popup
+                    .y
+                    .saturating_add(2 + u16::try_from(row).unwrap_or(u16::MAX)),
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&text, usize::from(popup.width.saturating_sub(2))),
+                style,
+            )]),
+        );
     }
 }
 
@@ -1362,6 +1396,9 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::White).bg(Color::Black),
         )]),
     );
+    if prompt.kind == ReviewPromptKind::AddSourceKind {
+        render_add_source_menu(prompt, popup, height, frame);
+    }
     if prompt.kind == ReviewPromptKind::FilePicker {
         let matches = app.file_picker_matches(query);
         for (row, index) in matches

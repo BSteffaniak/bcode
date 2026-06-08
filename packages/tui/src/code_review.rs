@@ -2365,6 +2365,99 @@ pub enum ReviewPromptKind {
     RenameSource,
 }
 
+/// Add-source menu item kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddSourceMenuKind {
+    /// File source.
+    File,
+    /// File range source.
+    FileRange,
+    /// Commit source.
+    Commit,
+    /// Commit range source.
+    CommitRange,
+    /// Branch compare source.
+    BranchCompare,
+    /// Staged changes source.
+    Staged,
+    /// Unstaged changes source.
+    Unstaged,
+    /// Working tree source.
+    WorkingTree,
+    /// Last commit source.
+    LastCommit,
+    /// Repository source.
+    Repository,
+}
+
+/// Add-source menu item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddSourceMenuItem {
+    /// Kind submitted by this menu item.
+    pub kind: AddSourceMenuKind,
+    /// Short label.
+    pub label: &'static str,
+    /// Help text.
+    pub help: &'static str,
+}
+
+/// Add-source menu items.
+#[must_use]
+pub const fn add_source_menu_items() -> &'static [AddSourceMenuItem] {
+    &[
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::WorkingTree,
+            label: "working-tree",
+            help: "all unstaged + staged changes",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::Unstaged,
+            label: "unstaged",
+            help: "working tree changes not staged",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::Staged,
+            label: "staged",
+            help: "index changes ready to commit",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::LastCommit,
+            label: "last-commit",
+            help: "changes introduced by HEAD",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::BranchCompare,
+            label: "branch-compare",
+            help: "compare base..head or base...head",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::CommitRange,
+            label: "commit-range",
+            help: "compare base..head or base...head",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::Commit,
+            label: "commit",
+            help: "single commit revision",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::File,
+            label: "file",
+            help: "whole file from repository tree",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::FileRange,
+            label: "file-range",
+            help: "file slice path:start-end",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::Repository,
+            label: "repository",
+            help: "repository overview source",
+        },
+    ]
+}
+
 /// Active one-line prompt state.
 #[derive(Debug, Clone)]
 pub struct ReviewPromptState {
@@ -2619,7 +2712,7 @@ impl ReviewApp {
             ReviewPromptKind::FilePicker => self.submit_file_picker(&text, prompt.selected),
             ReviewPromptKind::JumpToLine => self.submit_jump_to_line(&text),
             ReviewPromptKind::FileSearch => self.submit_file_search(&text),
-            ReviewPromptKind::AddSourceKind => self.submit_add_source_kind(&text),
+            ReviewPromptKind::AddSourceKind => self.submit_add_source_kind(&text, prompt.selected),
             ReviewPromptKind::AddCommitSource => self.submit_add_commit_source(&text),
             ReviewPromptKind::AddCommitRangeSource => self.submit_add_commit_range_source(&text),
             ReviewPromptKind::AddBranchCompareSource => {
@@ -2631,51 +2724,84 @@ impl ReviewApp {
         }
     }
 
-    fn submit_add_source_kind(&mut self, text: &str) -> bool {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "file" | "f" => {
+    fn start_add_source_kind(&mut self, kind: AddSourceMenuKind) -> bool {
+        match kind {
+            AddSourceMenuKind::File => {
                 self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddFileSource));
                 self.status_message = Some(
                     "add file source: enter repo path, or empty for selected file".to_string(),
                 );
             }
-            "file-range" | "range-file" | "fr" => {
+            AddSourceMenuKind::FileRange => {
                 self.prompt_state =
                     Some(ReviewPromptState::new(ReviewPromptKind::AddFileRangeSource));
                 self.status_message = Some("add file range: path:start-end".to_string());
             }
-            "commit" | "c" => {
+            AddSourceMenuKind::Commit => {
                 self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddCommitSource));
                 self.status_message = Some("add commit: enter revision".to_string());
             }
-            "range" | "commit-range" | "r" => {
+            AddSourceMenuKind::CommitRange => {
                 self.prompt_state = Some(ReviewPromptState::new(
                     ReviewPromptKind::AddCommitRangeSource,
                 ));
                 self.status_message =
                     Some("add commit range: base..head or base...head".to_string());
             }
-            "branch" | "branch-compare" | "compare" | "bc" => {
+            AddSourceMenuKind::BranchCompare => {
                 self.prompt_state = Some(ReviewPromptState::new(
                     ReviewPromptKind::AddBranchCompareSource,
                 ));
                 self.status_message =
                     Some("add branch compare: base...head or base..head".to_string());
             }
-            "staged" | "index" => {
+            AddSourceMenuKind::Staged => {
                 return self.push_workspace_source(ReviewSourceKind::IndexStaged);
             }
-            "unstaged" => {
+            AddSourceMenuKind::Unstaged => {
                 return self.push_workspace_source(ReviewSourceKind::WorkingTreeUnstaged);
             }
-            "working-tree" | "worktree" | "working" | "all" => {
+            AddSourceMenuKind::WorkingTree => {
                 return self.push_workspace_source(ReviewSourceKind::WorkingTreeAndIndex);
             }
-            "last" | "last-commit" => {
+            AddSourceMenuKind::LastCommit => {
                 return self.push_workspace_source(ReviewSourceKind::LastCommit);
             }
-            "repo" | "repository" => {
+            AddSourceMenuKind::Repository => {
                 return self.push_workspace_source(ReviewSourceKind::Repository);
+            }
+        }
+        true
+    }
+
+    fn submit_add_source_kind(&mut self, text: &str, selected: usize) -> bool {
+        if text.trim().is_empty()
+            && let Some(kind) = add_source_menu_items().get(selected).map(|item| item.kind)
+        {
+            return self.start_add_source_kind(kind);
+        }
+        match text.trim().to_ascii_lowercase().as_str() {
+            "file" | "f" => return self.start_add_source_kind(AddSourceMenuKind::File),
+            "file-range" | "range-file" | "fr" => {
+                return self.start_add_source_kind(AddSourceMenuKind::FileRange);
+            }
+            "commit" | "c" => return self.start_add_source_kind(AddSourceMenuKind::Commit),
+            "range" | "commit-range" | "r" => {
+                return self.start_add_source_kind(AddSourceMenuKind::CommitRange);
+            }
+            "branch" | "branch-compare" | "compare" | "bc" => {
+                return self.start_add_source_kind(AddSourceMenuKind::BranchCompare);
+            }
+            "staged" | "index" => return self.start_add_source_kind(AddSourceMenuKind::Staged),
+            "unstaged" => return self.start_add_source_kind(AddSourceMenuKind::Unstaged),
+            "working-tree" | "worktree" | "working" | "all" => {
+                return self.start_add_source_kind(AddSourceMenuKind::WorkingTree);
+            }
+            "last" | "last-commit" => {
+                return self.start_add_source_kind(AddSourceMenuKind::LastCommit);
+            }
+            "repo" | "repository" => {
+                return self.start_add_source_kind(AddSourceMenuKind::Repository);
             }
             _ => {
                 self.status_message = Some(
@@ -2894,13 +3020,19 @@ impl ReviewApp {
         let Some(prompt) = &self.prompt_state else {
             return false;
         };
-        if prompt.kind != ReviewPromptKind::FilePicker {
+        if !matches!(
+            prompt.kind,
+            ReviewPromptKind::FilePicker | ReviewPromptKind::AddSourceKind
+        ) {
             return false;
         }
-        let max = self
-            .file_picker_matches(prompt.buffer.text())
-            .len()
-            .saturating_sub(1);
+        let max = match prompt.kind {
+            ReviewPromptKind::AddSourceKind => add_source_menu_items().len().saturating_sub(1),
+            _ => self
+                .file_picker_matches(prompt.buffer.text())
+                .len()
+                .saturating_sub(1),
+        };
         let Some(prompt) = &mut self.prompt_state else {
             return false;
         };
@@ -2909,11 +3041,14 @@ impl ReviewApp {
     }
 
     /// Move prompt selected row up.
-    pub fn move_prompt_selection_up(&mut self) -> bool {
+    pub const fn move_prompt_selection_up(&mut self) -> bool {
         let Some(prompt) = &mut self.prompt_state else {
             return false;
         };
-        if prompt.kind != ReviewPromptKind::FilePicker {
+        if !matches!(
+            prompt.kind,
+            ReviewPromptKind::FilePicker | ReviewPromptKind::AddSourceKind
+        ) {
             return false;
         }
         prompt.selected = prompt.selected.saturating_sub(1);
