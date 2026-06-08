@@ -2812,13 +2812,22 @@ impl ReviewApp {
         true
     }
 
+    fn validate_non_empty_pair(&mut self, left: &str, right: &str, message: &str) -> bool {
+        if left.trim().is_empty() || right.trim().is_empty() {
+            self.status_message = Some(message.to_string());
+            return false;
+        }
+        true
+    }
+
     fn submit_add_commit_source(&mut self, text: &str) -> bool {
-        if text.is_empty() {
+        let rev = text.trim();
+        if rev.is_empty() {
             self.status_message = Some("enter a commit revision".to_string());
             return true;
         }
         self.push_workspace_source(ReviewSourceKind::Commit {
-            rev: text.to_string(),
+            rev: rev.to_string(),
         })
     }
 
@@ -2827,6 +2836,9 @@ impl ReviewApp {
             self.status_message = Some("enter range as base..head or base...head".to_string());
             return true;
         };
+        if !self.validate_non_empty_pair(base, head, "range endpoints cannot be empty") {
+            return true;
+        }
         let merge_base = text.contains("...");
         self.push_workspace_source(ReviewSourceKind::CommitRange {
             base: base.trim().to_string(),
@@ -2843,6 +2855,9 @@ impl ReviewApp {
                 Some("enter branch compare as base..head or base...head".to_string());
             return true;
         };
+        if !self.validate_non_empty_pair(base_branch, head_branch, "branch names cannot be empty") {
+            return true;
+        }
         let merge_base = text.contains("...");
         self.push_workspace_source(ReviewSourceKind::BranchCompare {
             base_branch: base_branch.trim().to_string(),
@@ -2852,11 +2867,12 @@ impl ReviewApp {
     }
 
     fn submit_add_file_source(&mut self, text: &str) -> bool {
-        if text.is_empty() {
+        let path = text.trim();
+        if path.is_empty() {
             return self.add_selected_file_to_workspace();
         }
         self.push_workspace_source(ReviewSourceKind::File {
-            path: text.to_string(),
+            path: path.to_string(),
         })
     }
 
@@ -2873,6 +2889,12 @@ impl ReviewApp {
             self.status_message = Some("file range line numbers must be numeric".to_string());
             return true;
         };
+        let path = path.trim();
+        if path.is_empty() || start == 0 || end == 0 || start > end {
+            self.status_message =
+                Some("file range must be path:start-end with start <= end".to_string());
+            return true;
+        }
         self.push_workspace_source(ReviewSourceKind::FileRange {
             path: path.to_string(),
             start,

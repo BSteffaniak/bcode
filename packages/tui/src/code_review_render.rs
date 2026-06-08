@@ -1481,10 +1481,24 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            " enter submit  esc cancel ",
+            prompt_footer_text(prompt.kind),
             Style::new().fg(Color::Black).bg(Color::Yellow),
         )]),
     );
+}
+
+const fn prompt_footer_text(kind: ReviewPromptKind) -> &'static str {
+    match kind {
+        ReviewPromptKind::AddSourceKind => {
+            " add source  ↑/↓ choose  enter select  type shortcut: worktree, staged, file, range, branch  esc cancel "
+        }
+        ReviewPromptKind::AddCommitRangeSource | ReviewPromptKind::AddBranchCompareSource => {
+            " enter base..head or base...head  esc cancel "
+        }
+        ReviewPromptKind::AddFileRangeSource => " enter path:start-end  esc cancel ",
+        ReviewPromptKind::FilePicker => " ↑/↓ choose  enter open  esc cancel ",
+        _ => " enter submit  esc cancel ",
+    }
 }
 
 struct RenderedRow {
