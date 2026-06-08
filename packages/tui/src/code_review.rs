@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::terminal_events::TuiInput;
 use super::{TuiError, helpers};
+use crate::code_review_render::materialized_file_surface_rows;
 
 const SERVICE_INTERFACE_ID: &str = CODE_REVIEW_SERVICE_INTERFACE_ID;
 const CREATE_REVIEW_OPERATION: &str = "create_review";
@@ -4152,14 +4153,34 @@ impl ReviewApp {
     pub fn comment_anchor_for_row(&self, diff_row: usize) -> Option<ReviewCommentAnchor> {
         let file = self.selected_file_data()?;
         let (surface_id, source_id) = self.selected_surface_ids();
-        if self.review.is_repository_review()
-            || self
-                .selected_surface()
-                .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
-        {
+        if self.review.is_repository_review() {
             let (start_row, end_row) = self.selected_range_bounds().unwrap_or((diff_row, diff_row));
             let start_line = u32::try_from(start_row.saturating_add(1)).ok()?;
             let end_line = u32::try_from(end_row.saturating_add(1)).ok()?;
+            return Some(ReviewCommentAnchor {
+                file_index: self.selected_file,
+                path: file.display_path().to_string(),
+                diff_row: start_row,
+                end_diff_row: (end_row != start_row).then_some(end_row),
+                old_line: None,
+                new_line: Some(start_line),
+                old_start: None,
+                old_end: None,
+                new_start: Some(start_line),
+                new_end: Some(end_line),
+                line_kind: ReviewLineKind::Context,
+                is_file_anchor: true,
+                surface_id,
+                source_id,
+            });
+        }
+        if self
+            .selected_surface()
+            .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
+        {
+            let (start_row, end_row) = self.selected_range_bounds().unwrap_or((diff_row, diff_row));
+            let start_line = self.materialized_file_line_number(start_row)?;
+            let end_line = self.materialized_file_line_number(end_row)?;
             return Some(ReviewCommentAnchor {
                 file_index: self.selected_file,
                 path: file.display_path().to_string(),
@@ -4197,6 +4218,12 @@ impl ReviewApp {
             surface_id,
             source_id,
         })
+    }
+
+    fn materialized_file_line_number(&self, diff_row: usize) -> Option<u32> {
+        let file = self.selected_file_data()?;
+        let rows = materialized_file_surface_rows(file);
+        rows.get(diff_row).and_then(|(line, _)| *line)
     }
 
     fn diff_line_for_render_row(&self, diff_row: usize) -> Option<&ReviewLine> {
@@ -4263,6 +4290,12 @@ impl ReviewApp {
                 .get(file.display_path())
                 .map_or(1, |file| file.line_spans.len().max(1));
         }
+        if self
+            .selected_surface()
+            .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
+        {
+            return materialized_file_surface_len(file).max(1);
+        }
         if file.is_binary {
             return 1;
         }
@@ -4278,6 +4311,20 @@ impl ReviewApp {
             return Vec::new();
         };
         let mut rows = Vec::new();
+        if self
+            .selected_surface()
+            .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
+        {
+            let mut row = 0usize;
+            for hunk in &file.hunks {
+                if hunk.heading.is_some() {
+                    rows.push(row);
+                    row = row.saturating_add(1);
+                }
+                row = row.saturating_add(hunk.lines.len());
+            }
+            return rows;
+        }
         let mut row = 0usize;
         for hunk in &file.hunks {
             rows.push(row);
@@ -4285,6 +4332,10 @@ impl ReviewApp {
         }
         rows
     }
+}
+
+fn materialized_file_surface_len(file: &ReviewFile) -> usize {
+    materialized_file_surface_rows(file).len()
 }
 
 /// Return current sidebar width for an app and terminal width.

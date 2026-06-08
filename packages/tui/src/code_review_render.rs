@@ -744,6 +744,10 @@ fn render_materialized_file_surface(app: &ReviewApp, area: Rect, frame: &mut Fra
 }
 
 fn file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, String)> {
+    materialized_file_surface_rows(file)
+}
+
+pub fn materialized_file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, String)> {
     file.hunks
         .iter()
         .flat_map(|hunk| {
