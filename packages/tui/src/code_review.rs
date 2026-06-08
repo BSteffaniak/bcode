@@ -1265,6 +1265,32 @@ fn handle_comment_editor_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
     false
 }
 
+fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
+    if app.ux_mode != ReviewUxMode::Build {
+        return None;
+    }
+    Some(match key {
+        KeyCode::Char('R') => app.rematerialize_workspace(),
+        KeyCode::Char('+') => app.open_add_file_source_picker(),
+        KeyCode::Char('A' | 'a') => app.open_add_source_prompt(),
+        KeyCode::Char('u') => app.add_quick_source(ReviewSourceKind::WorkingTreeUnstaged),
+        KeyCode::Char('s') => app.add_quick_source(ReviewSourceKind::IndexStaged),
+        KeyCode::Char('w') => app.add_quick_source(ReviewSourceKind::WorkingTreeAndIndex),
+        KeyCode::Char('l') => app.add_quick_source(ReviewSourceKind::LastCommit),
+        KeyCode::Char('I') => app.include_all_sources(),
+        KeyCode::Char('E') => app.exclude_all_sources(),
+        KeyCode::Char('V') => app.invert_source_inclusion(),
+        KeyCode::Char(' ') => app.toggle_selected_build_source(),
+        KeyCode::Char('T') => app.open_rename_workspace_prompt(),
+        KeyCode::Char('r') => app.open_rename_source_prompt(),
+        KeyCode::Char('[') => app.move_selected_source_up(),
+        KeyCode::Char(']') => app.move_selected_source_down(),
+        KeyCode::Char('-') => app.remove_selected_build_source(),
+        KeyCode::Enter => app.activate_selected_build_row(),
+        _ => return None,
+    })
+}
+
 fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
     if stroke.modifiers.ctrl {
         if stroke.key == KeyCode::Char('p') {
@@ -1280,6 +1306,9 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         return false;
     }
     let key = normalized_shortcut_key(stroke);
+    if let Some(handled) = handle_build_key(app, key) {
+        return handled;
+    }
     match key {
         KeyCode::Char('q') => {
             app.should_exit = true;
@@ -1298,36 +1327,13 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         }
         KeyCode::Char('B') => app.set_build_mode(),
         KeyCode::Char('m') => app.toggle_ux_mode(),
-        KeyCode::Char('R') if app.ux_mode == ReviewUxMode::Build => app.rematerialize_workspace(),
         KeyCode::Char('+') => app.open_add_file_source_picker(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
-        KeyCode::Char('a') if app.ux_mode == ReviewUxMode::Build => app.open_add_source_prompt(),
-        KeyCode::Char('u') if app.ux_mode == ReviewUxMode::Build => {
-            app.add_quick_source(ReviewSourceKind::WorkingTreeUnstaged)
-        }
-        KeyCode::Char('s') if app.ux_mode == ReviewUxMode::Build => {
-            app.add_quick_source(ReviewSourceKind::IndexStaged)
-        }
-        KeyCode::Char('w') if app.ux_mode == ReviewUxMode::Build => {
-            app.add_quick_source(ReviewSourceKind::WorkingTreeAndIndex)
-        }
-        KeyCode::Char('l') if app.ux_mode == ReviewUxMode::Build => {
-            app.add_quick_source(ReviewSourceKind::LastCommit)
-        }
-        KeyCode::Char(' ') => app.toggle_selected_build_source(),
-        KeyCode::Char('T') if app.ux_mode == ReviewUxMode::Build => {
-            app.open_rename_workspace_prompt()
-        }
-        KeyCode::Char('r') => app.open_rename_source_prompt(),
-        KeyCode::Char('[') => app.move_selected_source_up(),
-        KeyCode::Char(']') => app.move_selected_source_down(),
-        KeyCode::Char('-') => app.remove_selected_build_source(),
         KeyCode::Char('t') => app.toggle_sidebar_mode(),
         KeyCode::Char('f') => app.open_file_picker(),
         KeyCode::Char(':') => app.open_jump_to_line_prompt(),
         KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Char('N') => app.search_previous_match(),
-        KeyCode::Enter if app.ux_mode == ReviewUxMode::Build => app.activate_selected_build_row(),
         KeyCode::Enter => {
             if app.sidebar_mode == ReviewSidebarMode::Repository
                 && app.review.is_repository_review()
@@ -3857,6 +3863,69 @@ impl ReviewApp {
             return true;
         }
         self.push_workspace_source(ReviewSourceKind::File { path })
+    }
+
+    fn set_all_sources_included(&mut self, included: bool) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.workspace.sources.is_empty() {
+            self.status_message = Some("no sources yet; press A or u/s/w/l to add one".to_string());
+            return true;
+        }
+        let mut changed = false;
+        for source in &mut self.workspace.sources {
+            if source.included != included {
+                source.included = included;
+                changed = true;
+            }
+        }
+        if !changed {
+            self.status_message = Some(if included {
+                "all sources are already included".to_string()
+            } else {
+                "all sources are already excluded".to_string()
+            });
+            return true;
+        }
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(if included {
+            "included all sources".to_string()
+        } else {
+            "excluded all sources".to_string()
+        });
+        true
+    }
+
+    /// Include all workspace sources.
+    pub fn include_all_sources(&mut self) -> bool {
+        self.set_all_sources_included(true)
+    }
+
+    /// Exclude all workspace sources.
+    pub fn exclude_all_sources(&mut self) -> bool {
+        self.set_all_sources_included(false)
+    }
+
+    /// Invert source inclusion for all workspace sources.
+    pub fn invert_source_inclusion(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.workspace.sources.is_empty() {
+            self.status_message = Some("no sources yet; press A or u/s/w/l to add one".to_string());
+            return true;
+        }
+        for source in &mut self.workspace.sources {
+            source.included = !source.included;
+        }
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some("inverted source inclusion".to_string());
+        true
     }
 
     /// Toggle whether the selected workspace source is included.

@@ -744,7 +744,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "enter open/toggle   R refresh   T rename workspace   space toggle source   + file picker   A source menu   m review"
+        "enter open/toggle   I/E/V include/exclude/invert   T rename workspace   + file picker   A source menu   m review"
             .to_string(),
         String::new(),
         false,
@@ -1117,6 +1117,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " A                  add more source types",
         " T                  rename workspace",
         " R                  refresh/rematerialize sources",
+        " I/E/V              include all / exclude all / invert sources",
         " r                  rename selected source",
         " -                  remove selected source",
         " f or ctrl-p         fuzzy file picker",
