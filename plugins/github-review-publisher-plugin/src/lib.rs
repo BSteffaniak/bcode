@@ -230,7 +230,7 @@ fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) ->
     let mut warnings = Vec::new();
     let mut summary_comments = Vec::new();
     for thread in &bundle.threads {
-        if thread.anchor.is_file_anchor {
+        if should_summarize_thread(thread) {
             summary_comments.push(summary_comment_for_thread(thread));
             continue;
         }
@@ -251,6 +251,18 @@ fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) ->
         warnings,
         summary_comments,
     }
+}
+
+fn should_summarize_thread(thread: &ReviewBundleThread) -> bool {
+    thread.anchor.is_file_anchor
+        || thread
+            .selected_lines
+            .iter()
+            .any(|line| line.surface_id.is_some() && line.kind == ReviewLineKind::Context)
+        || thread
+            .selected_lines
+            .iter()
+            .all(|line| line.new_line.is_none() && line.old_line.is_none())
 }
 
 fn summary_comment_for_thread(thread: &ReviewBundleThread) -> String {
@@ -356,6 +368,12 @@ fn thread_body(thread: &ReviewBundleThread) -> String {
         .map(|comment| comment.body.as_str())
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
+    if let Some(surface_id) = &thread.anchor.surface_id {
+        let _ = write!(body, "\n\n_Bcode surface: `{surface_id}`_");
+    }
+    if let Some(source_id) = &thread.anchor.source_id {
+        let _ = write!(body, "\n\n_Bcode source: `{source_id}`_");
+    }
     if let Some(session_id) = &thread.session_id {
         let _ = write!(body, "\n\n_Bcode session: `{session_id}`_");
     }

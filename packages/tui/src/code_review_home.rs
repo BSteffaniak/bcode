@@ -36,6 +36,7 @@ pub enum ReviewHomeOutcome {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct ReviewHomeApp {
     repo_path: PathBuf,
     workspaces: Vec<ReviewWorkspace>,
@@ -46,6 +47,7 @@ struct ReviewHomeApp {
     rename_buffer: Option<String>,
     new_review_buffer: Option<String>,
     include_archived: bool,
+    details_visible: bool,
     should_exit: bool,
     outcome: Option<ReviewHomeOutcome>,
 }
@@ -62,6 +64,7 @@ impl ReviewHomeApp {
             rename_buffer: None,
             new_review_buffer: None,
             include_archived: false,
+            details_visible: true,
             should_exit: false,
             outcome: None,
         }
@@ -380,6 +383,10 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
         KeyCode::Char('r') => app.start_rename(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char('d') => {
+            app.details_visible = !app.details_visible;
+            true
+        }
         KeyCode::Enter => app.open_selected(),
         KeyCode::Char('x') => match archive_selected_workspace(client, app).await {
             Ok(archived) => archived,
@@ -742,13 +749,31 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n named   u/s/w/l/e presets   a archived   R restore   / search   x archive ",
+            " enter open   n named   u/s/w/l/e presets   a archived   d details   R restore   / search   x archive ",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
 }
 
 fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+    if app.details_visible && area.width >= 80 {
+        let details_width = (area.width / 3).clamp(28, 48);
+        let list_width = area.width.saturating_sub(details_width).saturating_sub(1);
+        let list_area = Rect::new(area.x, area.y, list_width, area.height);
+        let details_area = Rect::new(
+            area.x.saturating_add(list_width).saturating_add(1),
+            area.y,
+            details_width,
+            area.height,
+        );
+        render_workspace_list(app, list_area, frame);
+        render_workspace_details(app, details_area, frame);
+    } else {
+        render_workspace_list(app, area, frame);
+    }
+}
+
+fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     let visible = app.visible_indices();
     if app.workspaces.is_empty() {
         frame.write_line(
@@ -795,6 +820,96 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
             ),
             &Line::from_spans(vec![Span::styled(text, style)]),
         );
+    }
+}
+
+fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some(index) = app.selected_workspace_index() else {
+        frame.write_line(
+            Rect::new(area.x, area.y, area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                " No review selected",
+                Style::new().fg(Color::BrightBlack),
+            )]),
+        );
+        return;
+    };
+    let Some(workspace) = app.workspaces.get(index) else {
+        return;
+    };
+    let mut lines = vec![
+        format!(" {}", workspace.title),
+        format!(" id: {}", workspace.id),
+        format!(" repo: {}", workspace.repo_root.display()),
+        format!(
+            " updated: {}",
+            workspace
+                .updated_at_ms
+                .or(workspace.created_at_ms)
+                .map_or_else(|| "unknown".to_string(), relative_time_label)
+        ),
+    ];
+    if let Some(archived_at_ms) = workspace.archived_at_ms {
+        lines.push(format!(
+            " archived: {}",
+            relative_time_label(archived_at_ms)
+        ));
+    }
+    lines.push(format!(
+        " sources: {}/{} included",
+        workspace
+            .sources
+            .iter()
+            .filter(|source| source.included)
+            .count(),
+        workspace.sources.len()
+    ));
+    lines.push(String::new());
+    for source in workspace
+        .sources
+        .iter()
+        .take(usize::from(area.height).saturating_sub(8))
+    {
+        let included = if source.included { "✓" } else { " " };
+        lines.push(format!(
+            " [{included}] {} — {}",
+            source_kind_label(&source.kind),
+            source.label
+        ));
+    }
+    for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
+        frame.write_line(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                area.width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                line.clone(),
+                if row == 0 {
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(Color::BrightBlack)
+                },
+            )]),
+        );
+    }
+}
+
+const fn source_kind_label(kind: &ReviewSourceKind) -> &'static str {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => "unstaged",
+        ReviewSourceKind::IndexStaged => "staged",
+        ReviewSourceKind::WorkingTreeAndIndex => "worktree",
+        ReviewSourceKind::LastCommit => "last commit",
+        ReviewSourceKind::Commit { .. } => "commit",
+        ReviewSourceKind::CommitRange { .. } => "range",
+        ReviewSourceKind::BranchCompare { .. } => "branch",
+        ReviewSourceKind::File { .. } => "file",
+        ReviewSourceKind::FileRange { .. } => "file range",
+        ReviewSourceKind::Repository => "repository",
     }
 }
 
@@ -859,7 +974,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n named, u/s/w/l/e presets, a archived, R restore, / search, r rename"
+                            "review home: enter open, n named, u/s/w/l/e presets, a archived, d details, R restore, / search, r rename"
                                 .to_string()
                         })
                     }
