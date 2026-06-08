@@ -749,7 +749,7 @@ fn review_bundle_for_request(
     .into_iter()
     .map(|thread| {
         let (mut selected_lines, selected_diff_lines, hunk_context) =
-            diff_context_for_anchor(&summary, &thread.anchor);
+            context_for_anchor(&summary, &thread.anchor);
         hydrate_bundle_line_anchor_metadata(&mut selected_lines, &thread.anchor);
         ReviewBundleThread {
             thread_id: thread.thread_id,
@@ -1517,6 +1517,48 @@ fn anchors_match(left: &DraftAnchor, right: &DraftAnchor) -> bool {
         && left.new_line == right.new_line
 }
 
+fn context_for_anchor(
+    summary: &ReviewSummary,
+    anchor: &DraftAnchor,
+) -> (Vec<ReviewBundleLine>, Vec<String>, Vec<String>) {
+    if anchor.is_file_anchor {
+        file_context_for_anchor(summary, anchor)
+    } else {
+        diff_context_for_anchor(summary, anchor)
+    }
+}
+
+fn file_context_for_anchor(
+    summary: &ReviewSummary,
+    anchor: &DraftAnchor,
+) -> (Vec<ReviewBundleLine>, Vec<String>, Vec<String>) {
+    let Some(file) = summary
+        .files
+        .iter()
+        .find(|file| file.display_path() == anchor.file_path)
+    else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    let lines = bundle_file_lines(file);
+    let rendered_lines: Vec<String> = lines.iter().map(render_bundle_file_line).collect();
+    let start =
+        usize::try_from(anchor.start_diff_row.unwrap_or(anchor.diff_row)).unwrap_or(usize::MAX);
+    let end = usize::try_from(anchor.end_diff_row.unwrap_or(anchor.diff_row)).unwrap_or(start);
+    let selected_structured_lines = lines
+        .iter()
+        .filter(|line| {
+            usize::try_from(line.diff_row).is_ok_and(|index| (start..=end).contains(&index))
+        })
+        .cloned()
+        .collect();
+    let selected_lines = rendered_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (start..=end).contains(&index).then_some(line.clone()))
+        .collect();
+    (selected_structured_lines, selected_lines, rendered_lines)
+}
+
 fn diff_context_for_anchor(
     summary: &ReviewSummary,
     anchor: &DraftAnchor,
@@ -1565,6 +1607,48 @@ fn hydrate_bundle_line_anchor_metadata(lines: &mut [ReviewBundleLine], anchor: &
         line.surface_id.clone_from(&anchor.surface_id);
         line.source_id.clone_from(&anchor.source_id);
     }
+}
+
+fn bundle_file_lines(file: &ReviewFile) -> Vec<ReviewBundleLine> {
+    let mut diff_row = 0_u64;
+    let mut lines = Vec::new();
+    for hunk in &file.hunks {
+        if let Some(heading) = &hunk.heading {
+            lines.push(ReviewBundleLine {
+                file_path: file.display_path().to_string(),
+                kind: ReviewLineKind::Context,
+                old_line: None,
+                new_line: None,
+                diff_row,
+                content: format!("# {heading}"),
+                surface_id: None,
+                source_id: None,
+            });
+            diff_row = diff_row.saturating_add(1);
+        }
+        for line in &hunk.lines {
+            lines.push(ReviewBundleLine {
+                file_path: file.display_path().to_string(),
+                kind: ReviewLineKind::Context,
+                old_line: None,
+                new_line: line.new_line.or(line.old_line),
+                diff_row,
+                content: line.content.clone(),
+                surface_id: None,
+                source_id: None,
+            });
+            diff_row = diff_row.saturating_add(1);
+        }
+    }
+    lines
+}
+
+fn render_bundle_file_line(line: &ReviewBundleLine) -> String {
+    let line_number = line
+        .new_line
+        .or(line.old_line)
+        .map_or_else(|| "     ".to_string(), |line| format!("{line:>5}"));
+    format!("{line_number} {}", line.content)
 }
 
 fn bundle_diff_lines(file: &ReviewFile) -> Vec<ReviewBundleLine> {

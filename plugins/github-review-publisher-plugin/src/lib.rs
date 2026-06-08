@@ -68,6 +68,7 @@ fn github_manifest() -> ReviewPublisherManifest {
                 "token_env": { "type": "string", "description": "GitHub token env var", "default": "GITHUB_TOKEN" },
                 "submit_event": { "type": "string", "description": "GitHub review event", "default": "COMMENT", "enum": ["COMMENT", "REQUEST_CHANGES", "APPROVE"] },
                 "summary": { "type": "string", "description": "Optional review summary body" },
+                "fallback_file_comments_to_summary": { "type": "string", "description": "Set to false to fail submit when file/context comments cannot be published inline", "default": "true" },
                 "fallback_unmapped_to_summary": { "type": "string", "description": "Set to true to include unmappable inline comments in the review summary instead of failing submit", "default": "false" }
             }
         }),
@@ -168,8 +169,13 @@ fn submit_for_request(
     if !draft.warnings.is_empty() && !options.fallback_unmapped_to_summary {
         return Err(GitHubPublisherError::UnmappableComments(draft.warnings));
     }
-    if options.fallback_unmapped_to_summary
-        && (!draft.warnings.is_empty() || !draft.summary_comments.is_empty())
+    if !draft.summary_comments.is_empty() && !options.fallback_file_comments_to_summary {
+        return Err(GitHubPublisherError::UnmappableComments(
+            draft.summary_comments.clone(),
+        ));
+    }
+    if (options.fallback_unmapped_to_summary && !draft.warnings.is_empty())
+        || (options.fallback_file_comments_to_summary && !draft.summary_comments.is_empty())
     {
         append_unmapped_to_summary(&mut draft);
     }
@@ -388,6 +394,7 @@ struct GitHubPublishOptions {
     token_env: String,
     submit_event: String,
     summary: Option<String>,
+    fallback_file_comments_to_summary: bool,
     fallback_unmapped_to_summary: bool,
 }
 
@@ -432,6 +439,11 @@ impl GitHubPublishOptions {
             token_env,
             submit_event,
             summary: string_option(value, "summary"),
+            fallback_file_comments_to_summary: string_option(
+                value,
+                "fallback_file_comments_to_summary",
+            )
+            .is_none_or(|value| matches_bool_true(&value)),
             fallback_unmapped_to_summary: bool_option(value, "fallback_unmapped_to_summary"),
         })
     }
@@ -622,13 +634,15 @@ fn string_option(value: &serde_json::Value, key: &'static str) -> Option<String>
         .map(ToString::to_string)
 }
 
+const fn matches_bool_true(value: &str) -> bool {
+    value.eq_ignore_ascii_case("true")
+}
+
 fn bool_option(value: &serde_json::Value, key: &'static str) -> bool {
     value.get(key).is_some_and(|value| {
-        value.as_bool().unwrap_or_else(|| {
-            value
-                .as_str()
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        })
+        value
+            .as_bool()
+            .unwrap_or_else(|| value.as_str().is_some_and(matches_bool_true))
     })
 }
 
