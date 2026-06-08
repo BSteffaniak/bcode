@@ -1227,13 +1227,21 @@ fn handle_comment_editor_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
 }
 
 fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
-    if !stroke.modifiers.is_empty() {
-        if stroke.key == KeyCode::Char('p') && stroke.modifiers.ctrl {
+    if stroke.modifiers.ctrl {
+        if stroke.key == KeyCode::Char('p') {
             return app.open_file_picker();
         }
         return false;
     }
-    match stroke.key {
+    if stroke.modifiers.alt
+        || stroke.modifiers.super_key
+        || stroke.modifiers.hyper
+        || stroke.modifiers.meta
+    {
+        return false;
+    }
+    let key = normalized_shortcut_key(stroke);
+    match key {
         KeyCode::Char('q') => {
             app.should_exit = true;
             true
@@ -1252,6 +1260,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('m') => app.toggle_ux_mode(),
         KeyCode::Char('+') => app.add_selected_file_to_workspace(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
+        KeyCode::Char('a') if app.ux_mode == ReviewUxMode::Build => app.open_add_source_prompt(),
         KeyCode::Char('u') if app.ux_mode == ReviewUxMode::Build => {
             app.add_quick_source(ReviewSourceKind::WorkingTreeUnstaged)
         }
@@ -1311,6 +1320,18 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+const fn normalized_shortcut_key(stroke: KeyStroke) -> KeyCode {
+    if !stroke.modifiers.shift {
+        return stroke.key;
+    }
+    match stroke.key {
+        KeyCode::Char('=') => KeyCode::Char('+'),
+        KeyCode::Char('/') => KeyCode::Char('?'),
+        KeyCode::Char(ch) if ch.is_ascii_lowercase() => KeyCode::Char(ch.to_ascii_uppercase()),
+        key => key,
     }
 }
 
