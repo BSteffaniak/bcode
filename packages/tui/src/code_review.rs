@@ -773,7 +773,7 @@ async fn invoke_external_publisher(
 async fn load_workspace_review(
     client: &BcodeClient,
     repo_path: PathBuf,
-    fallback_target: ReviewTarget,
+    _fallback_target: ReviewTarget,
     workspace: ReviewWorkspace,
 ) -> Result<ReviewSummary, TuiError> {
     let payload = serde_json::to_vec(&MaterializeReviewWorkspaceRequest {
@@ -806,7 +806,15 @@ async fn load_workspace_review(
         }
     }
     if files.is_empty() {
-        return load_review(client, repo_path, fallback_target).await;
+        return Ok(ReviewSummary {
+            title: materialization.workspace.title.clone(),
+            repo_root: materialization.workspace.repo_root.clone(),
+            files,
+            additions: materialization.additions,
+            deletions: materialization.deletions,
+            workspace: Some(materialization.workspace),
+            surfaces,
+        });
     }
     Ok(ReviewSummary {
         title: materialization.workspace.title.clone(),
@@ -2646,6 +2654,18 @@ impl ReviewApp {
 
     /// Toggle between build and review UX modes.
     pub fn toggle_ux_mode(&mut self) -> bool {
+        if self.ux_mode == ReviewUxMode::Build && self.workspace.sources.is_empty() {
+            self.status_message =
+                Some("add at least one source before switching to review mode".to_string());
+            return true;
+        }
+        if self.ux_mode == ReviewUxMode::Build
+            && self.workspace.sources.iter().all(|source| !source.included)
+        {
+            self.status_message =
+                Some("include at least one source before switching to review mode".to_string());
+            return true;
+        }
         self.ux_mode = match self.ux_mode {
             ReviewUxMode::Build => ReviewUxMode::Review,
             ReviewUxMode::Review => ReviewUxMode::Build,
@@ -3259,14 +3279,15 @@ impl ReviewApp {
     /// Return number of rows in build mode.
     #[must_use]
     pub const fn build_row_count(&self) -> usize {
-        self.workspace
-            .sources
-            .len()
-            .saturating_add(self.review.files.len())
+        self.workspace.sources.len()
     }
 
     /// Select next build row.
     pub fn select_next_build_row(&mut self, rows: usize) -> bool {
+        if self.workspace.sources.is_empty() {
+            self.status_message = Some("no sources yet; press A or u/s/w/l to add one".to_string());
+            return true;
+        }
         let max = self.build_row_count().saturating_sub(1);
         let next = self.selected_build_row.saturating_add(rows).min(max);
         if next == self.selected_build_row {
@@ -3277,7 +3298,11 @@ impl ReviewApp {
     }
 
     /// Select previous build row.
-    pub const fn select_previous_build_row(&mut self, rows: usize) -> bool {
+    pub fn select_previous_build_row(&mut self, rows: usize) -> bool {
+        if self.workspace.sources.is_empty() {
+            self.status_message = Some("no sources yet; press A or u/s/w/l to add one".to_string());
+            return true;
+        }
         let next = self.selected_build_row.saturating_sub(rows);
         if next == self.selected_build_row {
             return false;
