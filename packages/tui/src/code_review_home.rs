@@ -103,6 +103,16 @@ impl ReviewHomeApp {
             .collect()
     }
 
+    fn visible_selection_bounds(&self, height: usize) -> (usize, usize) {
+        let visible = self.visible_indices();
+        if visible.is_empty() || height == 0 {
+            return (0, 0);
+        }
+        let first = self.selected.saturating_add(1).saturating_sub(height);
+        let last = first.saturating_add(height).min(visible.len());
+        (first, last)
+    }
+
     fn selected_workspace_index(&self) -> Option<usize> {
         self.visible_indices().get(self.selected).copied()
     }
@@ -1100,16 +1110,19 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         );
         return;
     }
+    let visible_height = usize::from(area.height);
+    let (first_visible_row, last_visible_row) = app.visible_selection_bounds(visible_height);
     for (row, workspace_index) in visible
         .into_iter()
-        .take(usize::from(area.height))
+        .skip(first_visible_row)
+        .take(last_visible_row.saturating_sub(first_visible_row))
         .enumerate()
     {
         let Some(item) = app.workspace_item(workspace_index) else {
             continue;
         };
         let workspace = &item.workspace;
-        let selected = row == app.selected;
+        let selected = first_visible_row.saturating_add(row) == app.selected;
         let style = if selected {
             Style::new().fg(Color::Black).bg(Color::Yellow)
         } else if workspace.archived_at_ms.is_some() {
@@ -1469,10 +1482,18 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                 || {
                     if app.search_active || !app.search_query.is_empty() {
                         format!("search: {}", app.search_query)
+                    } else if let Some(item) = app
+                        .selected_workspace_index()
+                        .and_then(|index| app.workspace_item(index))
+                    {
+                        format!(
+                            "{}: {}  · enter open  c latest  b build  o review  ? help",
+                            workspace_health_label(item),
+                            workspace_next_action(item)
+                        )
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter smart-open, c continue latest, b build, o review, n new, ? help"
-                                .to_string()
+                            "review home: n new, u/s/w/l presets, / search, ? help".to_string()
                         })
                     }
                 },
