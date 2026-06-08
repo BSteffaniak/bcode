@@ -18,10 +18,10 @@ use bcode_code_review_models::{
     ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
     ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
     ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope,
-    ReviewSource, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind, ReviewTarget,
-    ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest,
-    SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
-    UpdateReviewWorkspaceResponse,
+    ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind,
+    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem,
+    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest,
+    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1265,28 +1265,61 @@ fn materialize_review_workspace_for_request(
     let mut surfaces = Vec::new();
     let mut additions = 0_u32;
     let mut deletions = 0_u32;
+    let mut diagnostics = Vec::new();
     for source in request
         .workspace
         .sources
         .iter()
         .filter(|source| source.included)
     {
-        materialize_source(
+        let before = surfaces.len();
+        if let Err(error) = materialize_source(
             &repo_root,
             source,
             &mut surfaces,
             &mut additions,
             &mut deletions,
-        )?;
+        ) {
+            diagnostics.push(source_diagnostic(
+                source,
+                ReviewSourceDiagnosticSeverity::Error,
+                "materialize_failed",
+                error.to_string(),
+            ));
+            continue;
+        }
+        if surfaces.len() == before {
+            diagnostics.push(source_diagnostic(
+                source,
+                ReviewSourceDiagnosticSeverity::Info,
+                "no_surfaces",
+                "source produced no reviewable surfaces",
+            ));
+        }
     }
     Ok(MaterializeReviewWorkspaceResponse {
         materialization: ReviewWorkspaceMaterialization {
             workspace: request.workspace,
             surfaces,
+            diagnostics,
             additions,
             deletions,
         },
     })
+}
+
+fn source_diagnostic(
+    source: &ReviewSource,
+    severity: ReviewSourceDiagnosticSeverity,
+    code: &str,
+    message: impl Into<String>,
+) -> ReviewSourceDiagnostic {
+    ReviewSourceDiagnostic {
+        source_id: source.id.clone(),
+        severity,
+        code: code.to_string(),
+        message: message.into(),
+    }
 }
 
 fn materialize_source(

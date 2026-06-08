@@ -279,6 +279,31 @@ pub struct ReviewSurface {
     pub file: Option<ReviewFile>,
 }
 
+/// Severity for a source materialization diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSourceDiagnosticSeverity {
+    /// Informational diagnostic.
+    Info,
+    /// Warning diagnostic.
+    Warning,
+    /// Error diagnostic.
+    Error,
+}
+
+/// Diagnostic produced while materializing one review source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSourceDiagnostic {
+    /// Source id that produced this diagnostic.
+    pub source_id: String,
+    /// Diagnostic severity.
+    pub severity: ReviewSourceDiagnosticSeverity,
+    /// Stable diagnostic code.
+    pub code: String,
+    /// Human-readable diagnostic message.
+    pub message: String,
+}
+
 /// Materialized workspace review data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewWorkspaceMaterialization {
@@ -286,6 +311,9 @@ pub struct ReviewWorkspaceMaterialization {
     pub workspace: ReviewWorkspace,
     /// Reviewable surfaces produced from included sources.
     pub surfaces: Vec<ReviewSurface>,
+    /// Diagnostics produced while materializing sources.
+    #[serde(default)]
+    pub diagnostics: Vec<ReviewSourceDiagnostic>,
     /// Total added lines across diff surfaces.
     pub additions: u32,
     /// Total removed lines across diff surfaces.

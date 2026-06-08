@@ -12,8 +12,8 @@ use bcode_code_review_models::{
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
     OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceKind, ReviewSurface,
-    ReviewSurfaceKind, ReviewTarget as ModelReviewTarget, ReviewWorkspace,
+    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic, ReviewSourceKind,
+    ReviewSurface, ReviewSurfaceKind, ReviewTarget as ModelReviewTarget, ReviewWorkspace,
     UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
@@ -805,6 +805,7 @@ async fn load_workspace_review(
             surfaces.push(surface);
         }
     }
+    let diagnostics = materialization.diagnostics;
     if files.is_empty() {
         return Ok(ReviewSummary {
             title: materialization.workspace.title.clone(),
@@ -814,6 +815,7 @@ async fn load_workspace_review(
             deletions: materialization.deletions,
             workspace: Some(materialization.workspace),
             surfaces,
+            diagnostics,
         });
     }
     Ok(ReviewSummary {
@@ -824,6 +826,7 @@ async fn load_workspace_review(
         deletions: materialization.deletions,
         workspace: Some(materialization.workspace),
         surfaces,
+        diagnostics,
     })
 }
 
@@ -1781,6 +1784,9 @@ pub struct ReviewSummary {
     /// Materialized review surfaces corresponding to files.
     #[serde(default)]
     pub surfaces: Vec<ReviewSurface>,
+    /// Materialization diagnostics from workspace sources.
+    #[serde(default)]
+    pub diagnostics: Vec<ReviewSourceDiagnostic>,
 }
 
 impl ReviewSummary {
@@ -4853,6 +4859,7 @@ mod tests {
             deletions: 1,
             workspace: None,
             surfaces: Vec::new(),
+            diagnostics: Vec::new(),
             files: vec![
                 ReviewFile {
                     old_path: Some("a.rs".to_string()),

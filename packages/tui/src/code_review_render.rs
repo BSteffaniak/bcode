@@ -689,6 +689,17 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
             .filter(|surface| surface.source_id == source.id)
             .count();
         let status = source_status_label(source.included, surface_count);
+        let diagnostic = app
+            .review
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.source_id == source.id)
+            .map(|diagnostic| diagnostic.message.as_str());
+        let status = if let Some(message) = diagnostic {
+            format!("{status}: {message}")
+        } else {
+            status
+        };
         rows.push((
             format!("  [{marker}] {:<10}", source_kind_short_label(&source.kind)),
             format!("{}  · {status}", source.label),
