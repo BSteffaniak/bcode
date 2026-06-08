@@ -200,6 +200,58 @@ impl ReviewHomeApp {
         self.open_workspace(workspace, false)
     }
 
+    fn select_review_by_health(&mut self, target: &str, forward: bool) -> bool {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            self.status_message = Some("no matching review workspaces".to_string());
+            return true;
+        }
+        let step = if forward {
+            1
+        } else {
+            visible.len().saturating_sub(1)
+        };
+        let mut selected = self.selected % visible.len();
+        for _ in 0..visible.len() {
+            selected = selected.saturating_add(step) % visible.len();
+            let workspace_index = visible[selected];
+            if self
+                .workspace_item(workspace_index)
+                .is_some_and(|item| workspace_health_label(item) == target)
+            {
+                self.selected = selected;
+                self.status_message = Some(format!("selected {target} review"));
+                return true;
+            }
+        }
+        self.status_message = Some(format!("no {target} reviews in the current filter"));
+        true
+    }
+
+    fn select_next_setup_review(&mut self) -> bool {
+        self.select_review_by_health("setup", true)
+    }
+
+    fn select_previous_setup_review(&mut self) -> bool {
+        self.select_review_by_health("setup", false)
+    }
+
+    fn select_next_draft_review(&mut self) -> bool {
+        self.select_review_by_health("drafts", true)
+    }
+
+    fn select_previous_draft_review(&mut self) -> bool {
+        self.select_review_by_health("drafts", false)
+    }
+
+    fn select_next_published_review(&mut self) -> bool {
+        self.select_review_by_health("published", true)
+    }
+
+    fn select_previous_published_review(&mut self) -> bool {
+        self.select_review_by_health("published", false)
+    }
+
     fn start_new_review(&mut self) -> bool {
         self.new_review_buffer = Some(String::new());
         self.status_message = Some("new review title; enter uses Untitled review".to_string());
@@ -530,6 +582,12 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             )
             .await
         }
+        KeyCode::Char('S') => app.select_next_setup_review(),
+        KeyCode::Char('U') => app.select_previous_setup_review(),
+        KeyCode::Char('F') => app.select_next_draft_review(),
+        KeyCode::Char('B') => app.select_previous_draft_review(),
+        KeyCode::Char('p') => app.select_next_published_review(),
+        KeyCode::Char('P') => app.select_previous_published_review(),
         KeyCode::Char('a') => toggle_archived(client, app).await,
         KeyCode::Char('g') => {
             app.selected = 0;
@@ -876,7 +934,7 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
             format!(
-                " {filter_label}  enter open   c continue latest   n empty   u/s/w/l/e presets   a archived   d details   D drafts   / search   ? help "
+                " {filter_label}  enter open   c continue latest   S setup   F drafts   p published   n new   / search   ? help "
             ),
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
@@ -900,8 +958,13 @@ fn review_home_summary_label(app: &ReviewHomeApp) -> String {
         .iter()
         .filter(|item| workspace_health_label(item) == "setup")
         .count();
+    let published_count = app
+        .workspace_items
+        .iter()
+        .filter(|item| workspace_health_label(item) == "published")
+        .count();
     format!(
-        "{visible_count} visible · {active_count} active · {draft_count} with drafts · {setup_count} setup"
+        "{visible_count} visible · {active_count} active · {draft_count} drafts · {published_count} published · {setup_count} setup"
     )
 }
 
@@ -934,8 +997,10 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " build mode: attach sources, fix diagnostics, then m to review",
         " n                   new empty review: name it, then add sources",
         " u/s/w/l             quick-create unstaged/staged/worktree/last",
+        " S/U                 next/previous setup review",
+        " F/B                 next/previous draft review",
+        " p/P                 next/previous published review",
         " j/k or arrows       move selection",
-        " g/G                 first/last visible review",
         " /                   search title, source, branch, commit, file, id",
         " a                   show/hide archived reviews",
         " D                   show only reviews with drafts",
