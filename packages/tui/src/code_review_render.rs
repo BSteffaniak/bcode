@@ -1,6 +1,6 @@
 //! Rendering for full-screen code review mode.
 
-use bcode_code_review_models::ReviewSurfaceKind;
+use bcode_code_review_models::{ReviewSourceKind, ReviewSurfaceKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
@@ -194,7 +194,14 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 });
             }
             if app.ux_mode == super::code_review::ReviewUxMode::Build {
-                return " build mode  j/k move  space include/exclude  A add source  r rename  [/] reorder  - remove  m review mode  f picker  ? help  q exit ".to_string();
+                let source_hint = if app.workspace.sources.is_empty() {
+                    "no sources yet — press A to add one"
+                } else {
+                    "j/k move  space include/exclude  A add source  r rename  [/] reorder  - remove"
+                };
+                return format!(
+                    " build mode  {source_hint}  m review mode  f picker  ? help  q exit "
+                );
             }
             if app.review.is_repository_review() {
                 return format!(
@@ -272,6 +279,16 @@ fn render_sources(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::Cyan).bg(Color::Black),
         )]),
     );
+    if app.workspace.sources.is_empty() {
+        frame.write_line(
+            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                " A add source",
+                Style::new().fg(Color::BrightBlack).bg(Color::Black),
+            )]),
+        );
+        return;
+    }
     for (row, source) in app
         .workspace
         .sources
@@ -279,7 +296,18 @@ fn render_sources(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         .enumerate()
         .take(usize::from(area.height.saturating_sub(1)))
     {
-        let text = format!(" {}", source.label);
+        let marker = if source.included { "✓" } else { " " };
+        let kind = source_kind_short_label(&source.kind);
+        let text = format!(" {marker} {kind:<10} {}", source.label);
+        let style = if row == app.selected_build_row
+            && app.ux_mode == super::code_review::ReviewUxMode::Build
+        {
+            Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else if source.included {
+            Style::new().fg(Color::White).bg(Color::Black)
+        } else {
+            Style::new().fg(Color::BrightBlack).bg(Color::Black)
+        };
         frame.write_line(
             Rect::new(
                 area.x,
@@ -291,9 +319,24 @@ fn render_sources(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             ),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&text, usize::from(area.width)),
-                Style::new().fg(Color::White).bg(Color::Black),
+                style,
             )]),
         );
+    }
+}
+
+const fn source_kind_short_label(kind: &ReviewSourceKind) -> &'static str {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => "unstaged",
+        ReviewSourceKind::IndexStaged => "staged",
+        ReviewSourceKind::WorkingTreeAndIndex => "worktree",
+        ReviewSourceKind::LastCommit => "last",
+        ReviewSourceKind::Commit { .. } => "commit",
+        ReviewSourceKind::CommitRange { .. } => "range",
+        ReviewSourceKind::BranchCompare { .. } => "branch",
+        ReviewSourceKind::File { .. } => "file",
+        ReviewSourceKind::FileRange { .. } => "file-range",
+        ReviewSourceKind::Repository => "repo",
     }
 }
 
