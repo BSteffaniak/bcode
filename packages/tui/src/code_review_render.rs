@@ -1449,13 +1449,14 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
 
 fn prompt_popup_height(kind: ReviewPromptKind, area: Rect) -> u16 {
     match kind {
-        ReviewPromptKind::FilePicker | ReviewPromptKind::AddSourceKind => area.height.min(16),
+        ReviewPromptKind::FilePicker
+        | ReviewPromptKind::AddSourceKind
+        | ReviewPromptKind::AddFileSourcePicker => area.height.min(16),
         ReviewPromptKind::JumpToLine
         | ReviewPromptKind::FileSearch
         | ReviewPromptKind::AddCommitSource
         | ReviewPromptKind::AddCommitRangeSource
         | ReviewPromptKind::AddBranchCompareSource
-        | ReviewPromptKind::AddFileSource
         | ReviewPromptKind::AddFileRangeSource
         | ReviewPromptKind::RenameSource => area.height.min(5),
     }
@@ -1470,7 +1471,7 @@ const fn prompt_title(kind: ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddCommitSource => " Add commit ",
         ReviewPromptKind::AddCommitRangeSource => " Add range ",
         ReviewPromptKind::AddBranchCompareSource => " Add branch compare ",
-        ReviewPromptKind::AddFileSource => " Add file ",
+        ReviewPromptKind::AddFileSourcePicker => " Add file source ",
         ReviewPromptKind::AddFileRangeSource => " Add file range ",
         ReviewPromptKind::RenameSource => " Rename source ",
     }
@@ -1553,7 +1554,10 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if prompt.kind == ReviewPromptKind::AddSourceKind {
         render_add_source_menu(prompt, popup, height, frame);
     }
-    if prompt.kind == ReviewPromptKind::FilePicker {
+    if matches!(
+        prompt.kind,
+        ReviewPromptKind::FilePicker | ReviewPromptKind::AddFileSourcePicker
+    ) {
         let matches = app.file_picker_matches(query);
         for (row, index) in matches
             .into_iter()
@@ -1608,6 +1612,7 @@ const fn prompt_footer_text(kind: ReviewPromptKind) -> &'static str {
         }
         ReviewPromptKind::AddFileRangeSource => " enter path:start-end  esc cancel ",
         ReviewPromptKind::FilePicker => " ↑/↓ choose  enter open  esc cancel ",
+        ReviewPromptKind::AddFileSourcePicker => " ↑/↓ choose  enter add file source  esc cancel ",
         _ => " enter submit  esc cancel ",
     }
 }

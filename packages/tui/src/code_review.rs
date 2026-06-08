@@ -2404,8 +2404,8 @@ pub enum ReviewPromptKind {
     AddCommitRangeSource,
     /// Add a branch compare source to the workspace.
     AddBranchCompareSource,
-    /// Add a file source to the workspace.
-    AddFileSource,
+    /// Add a file source using the fuzzy file picker.
+    AddFileSourcePicker,
     /// Add a file range source to the workspace.
     AddFileRangeSource,
     /// Rename the selected source.
@@ -2777,7 +2777,9 @@ impl ReviewApp {
             ReviewPromptKind::AddBranchCompareSource => {
                 self.submit_add_branch_compare_source(&text)
             }
-            ReviewPromptKind::AddFileSource => self.submit_add_file_source(&text),
+            ReviewPromptKind::AddFileSourcePicker => {
+                self.submit_add_file_source_picker(&text, prompt.selected)
+            }
             ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
             ReviewPromptKind::RenameSource => self.submit_rename_source(&text),
         }
@@ -2786,10 +2788,11 @@ impl ReviewApp {
     fn start_add_source_kind(&mut self, kind: AddSourceMenuKind) -> bool {
         match kind {
             AddSourceMenuKind::File => {
-                self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddFileSource));
-                self.status_message = Some(
-                    "add file source: enter repo path, or empty for selected file".to_string(),
-                );
+                self.prompt_state = Some(ReviewPromptState::new(
+                    ReviewPromptKind::AddFileSourcePicker,
+                ));
+                self.status_message =
+                    Some("add file source: type to filter, enter add".to_string());
             }
             AddSourceMenuKind::FileRange => {
                 self.prompt_state =
@@ -2925,14 +2928,18 @@ impl ReviewApp {
         })
     }
 
-    fn submit_add_file_source(&mut self, text: &str) -> bool {
-        let path = text.trim();
-        if path.is_empty() {
-            return self.add_selected_file_to_workspace();
-        }
-        self.push_workspace_source(ReviewSourceKind::File {
-            path: path.to_string(),
-        })
+    fn submit_add_file_source_picker(&mut self, query: &str, selected: usize) -> bool {
+        let matches = self.file_picker_matches(query);
+        let Some(index) = matches
+            .get(selected)
+            .copied()
+            .or_else(|| matches.first().copied())
+        else {
+            self.status_message = Some(format!("no file matches `{query}`"));
+            return true;
+        };
+        let path = self.review.files[index].display_path().to_string();
+        self.push_workspace_source(ReviewSourceKind::File { path })
     }
 
     fn submit_add_file_range_source(&mut self, text: &str) -> bool {
@@ -3103,7 +3110,9 @@ impl ReviewApp {
         };
         if !matches!(
             prompt.kind,
-            ReviewPromptKind::FilePicker | ReviewPromptKind::AddSourceKind
+            ReviewPromptKind::FilePicker
+                | ReviewPromptKind::AddSourceKind
+                | ReviewPromptKind::AddFileSourcePicker
         ) {
             return false;
         }
@@ -3128,7 +3137,9 @@ impl ReviewApp {
         };
         if !matches!(
             prompt.kind,
-            ReviewPromptKind::FilePicker | ReviewPromptKind::AddSourceKind
+            ReviewPromptKind::FilePicker
+                | ReviewPromptKind::AddSourceKind
+                | ReviewPromptKind::AddFileSourcePicker
         ) {
             return false;
         }
