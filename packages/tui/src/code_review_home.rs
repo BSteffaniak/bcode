@@ -1516,3 +1516,142 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         )]),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_code_review_models::ReviewPublishRecord;
+
+    fn workspace(id: &str, sources: Vec<ReviewSource>, archived: bool) -> ReviewWorkspace {
+        ReviewWorkspace {
+            id: id.to_string(),
+            title: id.to_string(),
+            repo_root: PathBuf::from("/repo"),
+            sources,
+            created_at_ms: Some(1),
+            updated_at_ms: Some(2),
+            archived_at_ms: archived.then_some(3),
+        }
+    }
+
+    fn source(id: &str, included: bool) -> ReviewSource {
+        ReviewSource {
+            id: id.to_string(),
+            kind: ReviewSourceKind::LastCommit,
+            label: id.to_string(),
+            included,
+        }
+    }
+
+    fn item(workspace: ReviewWorkspace) -> ReviewWorkspaceListItem {
+        ReviewWorkspaceListItem {
+            workspace,
+            thread_count: 0,
+            draft_count: 0,
+            last_publish: None,
+        }
+    }
+
+    #[test]
+    fn health_labels_describe_picker_state() {
+        let setup = item(workspace("setup", Vec::new(), false));
+        let needs_sources = item(workspace("needs", vec![source("source", false)], false));
+        let mut drafts = item(workspace("drafts", vec![source("source", true)], false));
+        drafts.draft_count = 1;
+        let mut published = item(workspace("published", vec![source("source", true)], false));
+        published.last_publish = Some(ReviewPublishRecord {
+            id: "publish-1".to_string(),
+            workspace_id: Some("published".to_string()),
+            review_id: "review-1".to_string(),
+            publisher_id: "test".to_string(),
+            submitted: false,
+            output: None,
+            message: "ok".to_string(),
+            created_at_ms: 4,
+        });
+        let active = item(workspace("active", vec![source("source", true)], false));
+        let archived = item(workspace("archived", vec![source("source", true)], true));
+
+        assert_eq!(workspace_health_label(&setup), "setup");
+        assert_eq!(workspace_health_label(&needs_sources), "needs sources");
+        assert_eq!(workspace_health_label(&drafts), "drafts");
+        assert_eq!(workspace_health_label(&published), "published");
+        assert_eq!(workspace_health_label(&active), "active");
+        assert_eq!(workspace_health_label(&archived), "archived");
+    }
+
+    #[test]
+    fn smart_open_uses_build_mode_for_setup_reviews() {
+        assert!(workspace_should_open_in_build_mode(&workspace(
+            "empty",
+            Vec::new(),
+            false
+        )));
+        assert!(workspace_should_open_in_build_mode(&workspace(
+            "excluded",
+            vec![source("source", false)],
+            false,
+        )));
+        assert!(!workspace_should_open_in_build_mode(&workspace(
+            "included",
+            vec![source("source", true)],
+            false,
+        )));
+    }
+
+    #[test]
+    fn continue_latest_skips_archived_when_possible() {
+        let mut app = ReviewHomeApp::new(
+            PathBuf::from("/repo"),
+            vec![
+                item(workspace("archived", vec![source("source", true)], true)),
+                item(workspace("active", vec![source("source", true)], false)),
+            ],
+        );
+
+        assert!(app.open_most_recent());
+
+        assert!(app.should_exit);
+        assert_eq!(
+            app.outcome,
+            Some(ReviewHomeOutcome::OpenWorkspace {
+                workspace: workspace("active", vec![source("source", true)], false),
+                build_mode: false,
+            })
+        );
+    }
+
+    #[test]
+    fn category_navigation_wraps_visible_reviews() {
+        let mut draft = item(workspace("draft", vec![source("source", true)], false));
+        draft.draft_count = 1;
+        let mut app = ReviewHomeApp::new(
+            PathBuf::from("/repo"),
+            vec![
+                item(workspace("setup", Vec::new(), false)),
+                item(workspace("active", vec![source("source", true)], false)),
+                draft,
+            ],
+        );
+        app.selected = 2;
+
+        assert!(app.select_next_setup_review());
+        assert_eq!(app.selected, 0);
+        assert!(app.select_previous_draft_review());
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn visible_selection_bounds_keep_selection_visible() {
+        let app = ReviewHomeApp {
+            selected: 8,
+            workspace_items: (0..10)
+                .map(|index| item(workspace(&format!("review-{index}"), Vec::new(), false)))
+                .collect(),
+            ..ReviewHomeApp::new(PathBuf::from("/repo"), Vec::new())
+        };
+
+        assert_eq!(app.visible_selection_bounds(5), (4, 9));
+        assert_eq!(app.visible_selection_bounds(20), (0, 10));
+    }
+}
