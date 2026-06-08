@@ -76,18 +76,7 @@ impl ReviewHomeApp {
             .iter()
             .enumerate()
             .filter_map(|(index, workspace)| {
-                if query.is_empty()
-                    || workspace.title.to_ascii_lowercase().contains(&query)
-                    || workspace
-                        .archived_at_ms
-                        .is_some_and(|archived_at_ms| archived_at_ms.to_string().contains(&query))
-                    || workspace
-                        .repo_root
-                        .display()
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains(&query)
-                {
+                if query.is_empty() || workspace_matches_query(workspace, &query) {
                     Some(index)
                 } else {
                     None
@@ -433,6 +422,14 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             .await
         }
         KeyCode::Char('a') => toggle_archived(client, app).await,
+        KeyCode::Char('g') => {
+            app.selected = 0;
+            true
+        }
+        KeyCode::Char('G') => {
+            app.selected = app.visible_indices().len().saturating_sub(1);
+            true
+        }
         KeyCode::Char('R') => match restore_selected_workspace(client, app).await {
             Ok(restored) => restored,
             Err(error) => {
@@ -499,7 +496,9 @@ async fn load_workspaces_with_archived(
     }
     let response: ListReviewWorkspacesResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    Ok(response.workspaces)
+    let mut workspaces = response.workspaces;
+    sort_workspaces_recent_first(&mut workspaces);
+    Ok(workspaces)
 }
 
 async fn create_and_open_preset_workspace(
@@ -516,7 +515,11 @@ async fn create_and_open_preset_workspace(
     )
     .await
     {
-        Ok(workspace) => app.open_workspace(workspace),
+        Ok(workspace) => {
+            app.workspaces.push(workspace.clone());
+            sort_workspaces_recent_first(&mut app.workspaces);
+            app.open_workspace(workspace)
+        }
         Err(error) => {
             app.status_message = Some(format!("failed to create workspace: {error}"));
             true
@@ -749,7 +752,7 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n named   u/s/w/l/e presets   a archived   d details   R restore   / search   x archive ",
+            " enter open   n named   u/s/w/l/e presets   a archived   d details   g/G top/bottom   R restore   / search   x archive ",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
@@ -779,7 +782,7 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
             &Line::from_spans(vec![Span::styled(
-                " No review workspaces yet. Press n to create one.",
+                " No review workspaces yet. Press n to create a named review, or u/s/w/l for quick presets.",
                 Style::new().fg(Color::White).bg(Color::Black),
             )]),
         );
@@ -806,10 +809,17 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         let selected = row == app.selected;
         let style = if selected {
             Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else if workspace.archived_at_ms.is_some() {
+            Style::new().fg(Color::BrightBlack).bg(Color::Black)
         } else {
             Style::new().fg(Color::White).bg(Color::Black)
         };
-        let text = workspace_row_text(workspace);
+        let status = if workspace.archived_at_ms.is_some() {
+            "archived"
+        } else {
+            "active"
+        };
+        let text = format!("{status:8}  {}", workspace_row_text(workspace));
         frame.write_line(
             Rect::new(
                 area.x,
@@ -910,6 +920,66 @@ const fn source_kind_label(kind: &ReviewSourceKind) -> &'static str {
         ReviewSourceKind::File { .. } => "file",
         ReviewSourceKind::FileRange { .. } => "file range",
         ReviewSourceKind::Repository => "repository",
+    }
+}
+
+fn sort_workspaces_recent_first(workspaces: &mut [ReviewWorkspace]) {
+    workspaces.sort_by(|left, right| {
+        workspace_sort_timestamp(right)
+            .cmp(&workspace_sort_timestamp(left))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+}
+
+fn workspace_sort_timestamp(workspace: &ReviewWorkspace) -> u64 {
+    workspace
+        .updated_at_ms
+        .or(workspace.created_at_ms)
+        .unwrap_or(0)
+}
+
+fn workspace_matches_query(workspace: &ReviewWorkspace, query: &str) -> bool {
+    workspace.title.to_ascii_lowercase().contains(query)
+        || workspace.id.to_ascii_lowercase().contains(query)
+        || workspace
+            .repo_root
+            .display()
+            .to_string()
+            .to_ascii_lowercase()
+            .contains(query)
+        || workspace
+            .archived_at_ms
+            .is_some_and(|archived_at_ms| archived_at_ms.to_string().contains(query))
+        || workspace.sources.iter().any(|source| {
+            source.label.to_ascii_lowercase().contains(query)
+                || source.id.to_ascii_lowercase().contains(query)
+                || source_kind_search_text(&source.kind).contains(query)
+        })
+}
+
+fn source_kind_search_text(kind: &ReviewSourceKind) -> String {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => "unstaged working tree".to_string(),
+        ReviewSourceKind::IndexStaged => "staged index".to_string(),
+        ReviewSourceKind::WorkingTreeAndIndex => "working tree staged unstaged".to_string(),
+        ReviewSourceKind::LastCommit => "last commit".to_string(),
+        ReviewSourceKind::Commit { rev } => format!("commit {rev}").to_ascii_lowercase(),
+        ReviewSourceKind::CommitRange {
+            base,
+            head,
+            merge_base,
+        } => format!("range {base} {head} merge-base {merge_base}").to_ascii_lowercase(),
+        ReviewSourceKind::BranchCompare {
+            base_branch,
+            head_branch,
+            merge_base,
+        } => format!("branch compare {base_branch} {head_branch} merge-base {merge_base}")
+            .to_ascii_lowercase(),
+        ReviewSourceKind::File { path } => format!("file {path}").to_ascii_lowercase(),
+        ReviewSourceKind::FileRange { path, start, end } => {
+            format!("file range {path} {start} {end}").to_ascii_lowercase()
+        }
+        ReviewSourceKind::Repository => "repository".to_string(),
     }
 }
 
