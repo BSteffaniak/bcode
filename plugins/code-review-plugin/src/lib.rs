@@ -19,8 +19,9 @@ use bcode_code_review_models::{
     ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
     ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope, ReviewSource,
     ReviewSourceKind, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewWorkspace,
-    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest,
-    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse,
+    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
+    UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1109,7 +1110,24 @@ fn list_review_workspaces_for_request(
                 .await
         })
     })?;
-    Ok(ListReviewWorkspacesResponse { workspaces })
+    let items = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            let db = CodeReviewDb::new(database);
+            let mut items = Vec::new();
+            for workspace in workspaces {
+                let review_key = workspace_review_key(&workspace);
+                let (thread_count, draft_count) = db.draft_counts(&review_key).await?;
+                items.push(ReviewWorkspaceListItem {
+                    workspace,
+                    thread_count,
+                    draft_count,
+                });
+            }
+            Ok(items)
+        })
+    })?;
+    let workspaces = items.iter().map(|item| item.workspace.clone()).collect();
+    Ok(ListReviewWorkspacesResponse { workspaces, items })
 }
 
 fn create_review_workspace_for_request(
@@ -2006,6 +2024,31 @@ impl<'a> CodeReviewDb<'a> {
         Ok(drafts)
     }
 
+    async fn draft_counts(&self, review_key: &str) -> Result<(usize, usize), ReviewError> {
+        let thread_rows = self
+            .db
+            .select("draft_threads")
+            .columns(&["thread_id"])
+            .filter(Box::new(where_eq("review_key", review_key)))
+            .execute(self.db)
+            .await?;
+        let thread_count = thread_rows.len();
+        let mut draft_count = 0usize;
+        for thread in thread_rows {
+            let thread_id = required_text(&thread, "thread_id")?;
+            draft_count = draft_count.saturating_add(
+                self.db
+                    .select("draft_comments")
+                    .columns(&["comment_id"])
+                    .filter(Box::new(where_eq("thread_id", thread_id)))
+                    .execute(self.db)
+                    .await?
+                    .len(),
+            );
+        }
+        Ok((thread_count, draft_count))
+    }
+
     async fn save_draft(
         &self,
         review_key: &str,
@@ -2595,6 +2638,10 @@ fn workspace_id(repo_root: &Path, title: &str, now: u64) -> String {
     hasher.update(b"\0");
     hasher.update(now.to_string().as_bytes());
     format!("workspace-{:x}", hasher.finalize())
+}
+
+fn workspace_review_key(workspace: &ReviewWorkspace) -> String {
+    format!("review-workspace-{}", workspace.id)
 }
 
 fn review_key_for_scope(

@@ -318,11 +318,27 @@ pub struct ListReviewWorkspacesRequest {
     pub include_archived: bool,
 }
 
+/// Summary metadata for a review workspace picker row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewWorkspaceListItem {
+    /// Review workspace.
+    pub workspace: ReviewWorkspace,
+    /// Number of draft threads associated with this workspace.
+    #[serde(default)]
+    pub thread_count: usize,
+    /// Number of draft comments associated with this workspace.
+    #[serde(default)]
+    pub draft_count: usize,
+}
+
 /// Response payload for `review.workspace.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListReviewWorkspacesResponse {
     /// Matching review workspaces.
     pub workspaces: Vec<ReviewWorkspace>,
+    /// Matching review workspaces with picker metadata.
+    #[serde(default)]
+    pub items: Vec<ReviewWorkspaceListItem>,
 }
 
 /// Request payload for `review.workspace.create`.

@@ -10,7 +10,8 @@ use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, CreateReviewWorkspaceRequest, CreateReviewWorkspaceResponse,
     ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_WORKSPACE_ARCHIVE,
     OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_UPDATE, ReviewSource,
-    ReviewSourceKind, ReviewWorkspace, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ReviewSourceKind, ReviewWorkspace, ReviewWorkspaceListItem, UpdateReviewWorkspaceRequest,
+    UpdateReviewWorkspaceResponse,
 };
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
@@ -39,7 +40,7 @@ pub enum ReviewHomeOutcome {
 #[allow(clippy::struct_excessive_bools)]
 struct ReviewHomeApp {
     repo_path: PathBuf,
-    workspaces: Vec<ReviewWorkspace>,
+    workspace_items: Vec<ReviewWorkspaceListItem>,
     selected: usize,
     status_message: Option<String>,
     search_query: String,
@@ -53,10 +54,10 @@ struct ReviewHomeApp {
 }
 
 impl ReviewHomeApp {
-    const fn new(repo_path: PathBuf, workspaces: Vec<ReviewWorkspace>) -> Self {
+    const fn new(repo_path: PathBuf, workspace_items: Vec<ReviewWorkspaceListItem>) -> Self {
         Self {
             repo_path,
-            workspaces,
+            workspace_items,
             selected: 0,
             status_message: None,
             search_query: String::new(),
@@ -70,13 +71,21 @@ impl ReviewHomeApp {
         }
     }
 
+    fn workspace_item(&self, index: usize) -> Option<&ReviewWorkspaceListItem> {
+        self.workspace_items.get(index)
+    }
+
+    fn workspace(&self, index: usize) -> Option<&ReviewWorkspace> {
+        self.workspace_item(index).map(|item| &item.workspace)
+    }
+
     fn visible_indices(&self) -> Vec<usize> {
         let query = self.search_query.trim().to_ascii_lowercase();
-        self.workspaces
+        self.workspace_items
             .iter()
             .enumerate()
-            .filter_map(|(index, workspace)| {
-                if query.is_empty() || workspace_matches_query(workspace, &query) {
+            .filter_map(|(index, item)| {
+                if query.is_empty() || workspace_item_matches_query(item, &query) {
                     Some(index)
                 } else {
                     None
@@ -128,11 +137,11 @@ impl ReviewHomeApp {
                 Some("no matching review workspace selected; press n to create one".to_string());
             return true;
         };
-        let Some(workspace) = self.workspaces.get(workspace_index) else {
+        let Some(workspace) = self.workspace(workspace_index).cloned() else {
             self.status_message = Some("selected review workspace is unavailable".to_string());
             return true;
         };
-        self.open_workspace(workspace.clone())
+        self.open_workspace(workspace)
     }
     fn start_new_review(&mut self) -> bool {
         self.new_review_buffer = Some("Untitled review".to_string());
@@ -181,7 +190,7 @@ impl ReviewHomeApp {
             self.status_message = Some("no matching review workspace selected".to_string());
             return true;
         };
-        let Some(workspace) = self.workspaces.get(workspace_index) else {
+        let Some(workspace) = self.workspace(workspace_index) else {
             self.status_message = Some("selected review workspace is unavailable".to_string());
             return true;
         };
@@ -448,7 +457,7 @@ async fn toggle_archived(client: &BcodeClient, app: &mut ReviewHomeApp) -> bool 
     app.include_archived = !app.include_archived;
     match load_workspaces_with_archived(client, app.repo_path.clone(), app.include_archived).await {
         Ok(workspaces) => {
-            app.workspaces = workspaces;
+            app.workspace_items = workspaces;
             app.clamp_selection();
             app.status_message = Some(if app.include_archived {
                 "showing archived reviews".to_string()
@@ -467,7 +476,7 @@ async fn toggle_archived(client: &BcodeClient, app: &mut ReviewHomeApp) -> bool 
 async fn load_workspaces(
     client: &BcodeClient,
     repo_path: PathBuf,
-) -> Result<Vec<ReviewWorkspace>, TuiError> {
+) -> Result<Vec<ReviewWorkspaceListItem>, TuiError> {
     load_workspaces_with_archived(client, repo_path, false).await
 }
 
@@ -475,7 +484,7 @@ async fn load_workspaces_with_archived(
     client: &BcodeClient,
     repo_path: PathBuf,
     include_archived: bool,
-) -> Result<Vec<ReviewWorkspace>, TuiError> {
+) -> Result<Vec<ReviewWorkspaceListItem>, TuiError> {
     let payload = serde_json::to_vec(&ListReviewWorkspacesRequest {
         repo_path,
         include_archived,
@@ -496,9 +505,21 @@ async fn load_workspaces_with_archived(
     }
     let response: ListReviewWorkspacesResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    let mut workspaces = response.workspaces;
-    sort_workspaces_recent_first(&mut workspaces);
-    Ok(workspaces)
+    let mut items = if response.items.is_empty() {
+        response
+            .workspaces
+            .into_iter()
+            .map(|workspace| ReviewWorkspaceListItem {
+                workspace,
+                thread_count: 0,
+                draft_count: 0,
+            })
+            .collect()
+    } else {
+        response.items
+    };
+    sort_workspace_items_recent_first(&mut items);
+    Ok(items)
 }
 
 async fn create_and_open_preset_workspace(
@@ -516,8 +537,12 @@ async fn create_and_open_preset_workspace(
     .await
     {
         Ok(workspace) => {
-            app.workspaces.push(workspace.clone());
-            sort_workspaces_recent_first(&mut app.workspaces);
+            app.workspace_items.push(ReviewWorkspaceListItem {
+                workspace: workspace.clone(),
+                thread_count: 0,
+                draft_count: 0,
+            });
+            sort_workspace_items_recent_first(&mut app.workspace_items);
             app.open_workspace(workspace)
         }
         Err(error) => {
@@ -569,7 +594,7 @@ async fn submit_rename_workspace(
         app.status_message = Some("no matching review workspace selected".to_string());
         return Ok(true);
     };
-    let Some(existing) = app.workspaces.get(workspace_index) else {
+    let Some(existing) = app.workspace(workspace_index) else {
         app.status_message = Some("selected review workspace is unavailable".to_string());
         return Ok(true);
     };
@@ -595,7 +620,7 @@ async fn submit_rename_workspace(
     }
     let response: UpdateReviewWorkspaceResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    app.workspaces[workspace_index] = response.workspace;
+    app.workspace_items[workspace_index].workspace = response.workspace;
     app.status_message = Some(format!("renamed review to {new_title}"));
     Ok(true)
 }
@@ -608,7 +633,7 @@ async fn restore_selected_workspace(
         app.status_message = Some("no matching review workspace selected".to_string());
         return Ok(true);
     };
-    let Some(existing) = app.workspaces.get(workspace_index) else {
+    let Some(existing) = app.workspace(workspace_index) else {
         app.status_message = Some("no review workspace selected".to_string());
         return Ok(true);
     };
@@ -638,7 +663,7 @@ async fn restore_selected_workspace(
     }
     let response: UpdateReviewWorkspaceResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    app.workspaces[workspace_index] = response.workspace;
+    app.workspace_items[workspace_index].workspace = response.workspace;
     app.status_message = Some("restored review workspace".to_string());
     Ok(true)
 }
@@ -651,7 +676,7 @@ async fn archive_selected_workspace(
         app.status_message = Some("no matching review workspace selected".to_string());
         return Ok(true);
     };
-    let Some(workspace) = app.workspaces.get(workspace_index) else {
+    let Some(workspace) = app.workspace(workspace_index) else {
         app.status_message = Some("no review workspace selected".to_string());
         return Ok(true);
     };
@@ -676,9 +701,9 @@ async fn archive_selected_workspace(
     let response: ArchiveReviewWorkspaceResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     if response.archived {
-        let archived = app.workspaces.remove(workspace_index);
+        let archived = app.workspace_items.remove(workspace_index);
         app.clamp_selection();
-        app.status_message = Some(format!("archived {}", archived.title));
+        app.status_message = Some(format!("archived {}", archived.workspace.title));
     } else {
         app.status_message = Some("workspace was not found".to_string());
     }
@@ -778,7 +803,7 @@ fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
 
 fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     let visible = app.visible_indices();
-    if app.workspaces.is_empty() {
+    if app.workspace_items.is_empty() {
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
             &Line::from_spans(vec![Span::styled(
@@ -803,9 +828,10 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         .take(usize::from(area.height))
         .enumerate()
     {
-        let Some(workspace) = app.workspaces.get(workspace_index) else {
+        let Some(item) = app.workspace_item(workspace_index) else {
             continue;
         };
+        let workspace = &item.workspace;
         let selected = row == app.selected;
         let style = if selected {
             Style::new().fg(Color::Black).bg(Color::Yellow)
@@ -819,7 +845,7 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         } else {
             "active"
         };
-        let text = format!("{status:8}  {}", workspace_row_text(workspace));
+        let text = format!("{status:8}  {}", workspace_row_text(item));
         frame.write_line(
             Rect::new(
                 area.x,
@@ -844,9 +870,10 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
         );
         return;
     };
-    let Some(workspace) = app.workspaces.get(index) else {
+    let Some(item) = app.workspace_item(index) else {
         return;
     };
+    let workspace = &item.workspace;
     let mut lines = vec![
         format!(" {}", workspace.title),
         format!(" id: {}", workspace.id),
@@ -865,6 +892,10 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
             relative_time_label(archived_at_ms)
         ));
     }
+    lines.push(format!(
+        " drafts: {} comment(s) across {} thread(s)",
+        item.draft_count, item.thread_count
+    ));
     lines.push(format!(
         " sources: {}/{} included",
         workspace
@@ -923,11 +954,11 @@ const fn source_kind_label(kind: &ReviewSourceKind) -> &'static str {
     }
 }
 
-fn sort_workspaces_recent_first(workspaces: &mut [ReviewWorkspace]) {
-    workspaces.sort_by(|left, right| {
-        workspace_sort_timestamp(right)
-            .cmp(&workspace_sort_timestamp(left))
-            .then_with(|| left.title.cmp(&right.title))
+fn sort_workspace_items_recent_first(items: &mut [ReviewWorkspaceListItem]) {
+    items.sort_by(|left, right| {
+        workspace_sort_timestamp(&right.workspace)
+            .cmp(&workspace_sort_timestamp(&left.workspace))
+            .then_with(|| left.workspace.title.cmp(&right.workspace.title))
     });
 }
 
@@ -936,6 +967,12 @@ fn workspace_sort_timestamp(workspace: &ReviewWorkspace) -> u64 {
         .updated_at_ms
         .or(workspace.created_at_ms)
         .unwrap_or(0)
+}
+
+fn workspace_item_matches_query(item: &ReviewWorkspaceListItem, query: &str) -> bool {
+    item.thread_count.to_string().contains(query)
+        || item.draft_count.to_string().contains(query)
+        || workspace_matches_query(&item.workspace, query)
 }
 
 fn workspace_matches_query(workspace: &ReviewWorkspace, query: &str) -> bool {
@@ -983,7 +1020,8 @@ fn source_kind_search_text(kind: &ReviewSourceKind) -> String {
     }
 }
 
-fn workspace_row_text(workspace: &ReviewWorkspace) -> String {
+fn workspace_row_text(item: &ReviewWorkspaceListItem) -> String {
+    let workspace = &item.workspace;
     let source_count = workspace
         .sources
         .iter()
@@ -1013,9 +1051,17 @@ fn workspace_row_text(workspace: &ReviewWorkspace) -> String {
     } else {
         ""
     };
+    let draft_suffix = if item.draft_count == 0 {
+        "no drafts".to_string()
+    } else {
+        format!(
+            "{} draft(s)/{} thread(s)",
+            item.draft_count, item.thread_count
+        )
+    };
     format!(
-        " {}  · {}  · {}{}",
-        workspace.title, updated, suffix, archived
+        " {}  · {}  · {}  · {}{}",
+        workspace.title, updated, draft_suffix, suffix, archived
     )
 }
 
