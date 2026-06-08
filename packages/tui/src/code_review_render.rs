@@ -17,6 +17,7 @@ use super::code_review_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment,
     ReviewDisplayTextRole,
 };
+use bcode_code_review_models::ReviewSource;
 
 /// Render one full-screen code review frame.
 pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
@@ -244,7 +245,7 @@ fn build_footer_hint(app: &ReviewApp) -> String {
         (false, false) => "",
     };
     format!(
-        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  diag i/w/e {info_sources}/{warning_sources}/{error_sources}{pending}  n empty  z exclude empty  d diagnostic  C edit  m review "
+        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  diag i/w/e {info_sources}/{warning_sources}/{error_sources}{pending}  n empty  P dedupe  z exclude empty  C edit  m review "
     )
 }
 
@@ -721,6 +722,46 @@ fn push_source_rows(app: &ReviewApp, rows: &mut Vec<(String, String, bool, bool)
     }
 }
 
+fn push_build_workspace_summary_rows(
+    app: &ReviewApp,
+    surfaces: &[bcode_code_review_models::ReviewSurface],
+    rows: &mut Vec<(String, String, bool, bool)>,
+) {
+    let workspace = &app.workspace;
+    let duplicate_sources = duplicate_source_count(&workspace.sources);
+    let empty_sources = empty_included_source_count(app, surfaces);
+    rows.push((
+        "Summary".to_string(),
+        format!(
+            "{} source(s), {} included, {} surface(s), {} empty included, {} duplicate, {} diagnostic(s)",
+            workspace.sources.len(),
+            app.included_source_count(),
+            surfaces.len(),
+            empty_sources,
+            duplicate_sources,
+            app.review.diagnostics.len()
+        ),
+        false,
+        empty_sources != 0 || duplicate_sources != 0 || !app.review.diagnostics.is_empty(),
+    ));
+}
+
+fn empty_included_source_count(
+    app: &ReviewApp,
+    surfaces: &[bcode_code_review_models::ReviewSurface],
+) -> usize {
+    app.workspace
+        .sources
+        .iter()
+        .filter(|source| {
+            source.included
+                && !surfaces
+                    .iter()
+                    .any(|surface| surface.source_id == source.id)
+        })
+        .count()
+}
+
 fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     let workspace = &app.workspace;
     let surfaces = app.review.surfaces();
@@ -761,29 +802,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
         ));
         rows.push((String::new(), String::new(), false, false));
     }
-    let mut empty_sources = 0usize;
-    for source in &app.workspace.sources {
-        if source.included
-            && !surfaces
-                .iter()
-                .any(|surface| surface.source_id == source.id)
-        {
-            empty_sources = empty_sources.saturating_add(1);
-        }
-    }
-    rows.push((
-        "Summary".to_string(),
-        format!(
-            "{} source(s), {} included, {} surface(s), {} empty included source(s), {} diagnostic(s)",
-            workspace.sources.len(),
-            app.included_source_count(),
-            surfaces.len(),
-            empty_sources,
-            app.review.diagnostics.len()
-        ),
-        false,
-        empty_sources != 0 || !app.review.diagnostics.is_empty(),
-    ));
+    push_build_workspace_summary_rows(app, &surfaces, &mut rows);
     rows.push((String::new(), String::new(), false, false));
     rows.push(("Included sources".to_string(), String::new(), false, false));
     if workspace.sources.is_empty() {
@@ -822,6 +841,19 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     ));
 
     rows
+}
+
+fn duplicate_source_count(sources: &[ReviewSource]) -> usize {
+    let mut seen = Vec::new();
+    let mut duplicates = 0usize;
+    for source in sources {
+        if seen.contains(&source.kind) {
+            duplicates = duplicates.saturating_add(1);
+        } else {
+            seen.push(source.kind.clone());
+        }
+    }
+    duplicates
 }
 
 fn source_status_label(included: bool, surface_count: usize, diagnostic_count: usize) -> String {
@@ -1194,8 +1226,8 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " I/E/V              include all / exclude all / invert sources",
         " n/N/z              next / previous / exclude empty sources",
         " d/Z                next diagnostic source / exclude error sources",
+        " M/X/P              merge-base / remove excluded / remove duplicates",
         " O/Y                open source surface / source for surface",
-        " C                  change selected source spec",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",
         " t                   cycle included/repo/threads/sources",

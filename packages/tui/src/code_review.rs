@@ -1290,6 +1290,7 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
         KeyCode::Char('C') => app.open_edit_source_spec_prompt(),
         KeyCode::Char('M') => app.toggle_selected_source_merge_base(),
         KeyCode::Char('X') => app.remove_excluded_sources(),
+        KeyCode::Char('P') => app.remove_duplicate_sources(),
         KeyCode::Char(' ') => app.toggle_selected_build_source(),
         KeyCode::Char('T') => app.open_rename_workspace_prompt(),
         KeyCode::Char('r') => app.open_rename_source_prompt(),
@@ -4445,6 +4446,34 @@ impl ReviewApp {
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         self.status_message = Some(format!("removed {removed} excluded source(s)"));
+        true
+    }
+
+    /// Remove duplicate sources from the workspace, preserving the first occurrence.
+    pub fn remove_duplicate_sources(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let mut seen = Vec::new();
+        let before = self.workspace.sources.len();
+        self.workspace.sources.retain(|source| {
+            if seen.contains(&source.kind) {
+                false
+            } else {
+                seen.push(source.kind.clone());
+                true
+            }
+        });
+        let removed = before.saturating_sub(self.workspace.sources.len());
+        if removed == 0 {
+            self.status_message = Some("no duplicate sources to remove".to_string());
+            return true;
+        }
+        self.set_selected_build_row(self.selected_build_row);
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(format!("removed {removed} duplicate source(s)"));
         true
     }
 
