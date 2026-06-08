@@ -744,7 +744,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "enter open/toggle   R refresh   space toggle source   u/s/w/l quick add   + file picker   A source menu   m review"
+        "enter open/toggle   R refresh   T rename workspace   space toggle source   + file picker   A source menu   m review"
             .to_string(),
         String::new(),
         false,
@@ -1115,6 +1115,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " +                  add file source from repository picker",
         " u/s/w/l            quick add unstaged/staged/worktree/last commit",
         " A                  add more source types",
+        " T                  rename workspace",
         " R                  refresh/rematerialize sources",
         " r                  rename selected source",
         " -                  remove selected source",
@@ -1482,6 +1483,7 @@ fn prompt_popup_height(kind: &ReviewPromptKind, area: Rect) -> u16 {
         | ReviewPromptKind::AddCommitRangeSource
         | ReviewPromptKind::AddBranchCompareSource
         | ReviewPromptKind::AddFileRangeSource
+        | ReviewPromptKind::RenameWorkspace
         | ReviewPromptKind::RenameSource => area.height.min(5),
     }
 }
@@ -1504,6 +1506,7 @@ const fn prompt_title(kind: &ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddFileRangePathPicker | ReviewPromptKind::AddFileRangeSource => {
             " Add file range "
         }
+        ReviewPromptKind::RenameWorkspace => " Rename workspace ",
         ReviewPromptKind::RenameSource => " Rename source ",
     }
 }

@@ -1292,6 +1292,9 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             app.add_quick_source(ReviewSourceKind::LastCommit)
         }
         KeyCode::Char(' ') => app.toggle_selected_build_source(),
+        KeyCode::Char('T') if app.ux_mode == ReviewUxMode::Build => {
+            app.open_rename_workspace_prompt()
+        }
         KeyCode::Char('r') => app.open_rename_source_prompt(),
         KeyCode::Char('[') => app.move_selected_source_up(),
         KeyCode::Char(']') => app.move_selected_source_down(),
@@ -2445,6 +2448,8 @@ pub enum ReviewPromptKind {
     AddFileRangePathPicker,
     /// Add a file range source to the workspace.
     AddFileRangeSource,
+    /// Rename the review workspace.
+    RenameWorkspace,
     /// Rename the selected source.
     RenameSource,
 }
@@ -2770,6 +2775,18 @@ impl ReviewApp {
         true
     }
 
+    /// Open rename-workspace prompt.
+    pub fn open_rename_workspace_prompt(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let mut prompt = ReviewPromptState::new(ReviewPromptKind::RenameWorkspace);
+        prompt.buffer.insert_str(&self.workspace.title);
+        self.prompt_state = Some(prompt);
+        self.status_message = Some("rename review workspace".to_string());
+        true
+    }
+
     /// Open rename-source prompt for the selected workspace source.
     pub fn open_rename_source_prompt(&mut self) -> bool {
         if self.ux_mode != ReviewUxMode::Build {
@@ -2940,6 +2957,7 @@ impl ReviewApp {
                 self.submit_add_file_range_path_picker(&text, prompt.selected)
             }
             ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
+            ReviewPromptKind::RenameWorkspace => self.submit_rename_workspace(&text),
             ReviewPromptKind::RenameSource => self.submit_rename_source(&text),
         }
     }
@@ -3216,6 +3234,10 @@ impl ReviewApp {
         })
     }
 
+    fn sync_review_workspace(&mut self) {
+        self.review.workspace = Some(self.workspace.clone());
+    }
+
     fn next_source_id(&self) -> String {
         let mut next = self.workspace.sources.len().saturating_add(1);
         loop {
@@ -3260,9 +3282,24 @@ impl ReviewApp {
             label: label.clone(),
             included: true,
         });
+        self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         self.status_message = Some(format!("added {label}"));
+        true
+    }
+
+    fn submit_rename_workspace(&mut self, text: &str) -> bool {
+        let title = text.trim();
+        if title.is_empty() {
+            self.status_message = Some("workspace title cannot be empty".to_string());
+            return true;
+        }
+        self.workspace.title = title.to_string();
+        self.review.workspace = Some(self.workspace.clone());
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.status_message = Some(format!("renamed workspace to {title}"));
         true
     }
 
@@ -3281,6 +3318,7 @@ impl ReviewApp {
             return true;
         };
         source.label = label.to_string();
+        self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.status_message = Some(format!("renamed source to {label}"));
         true
@@ -3806,16 +3844,15 @@ impl ReviewApp {
             return true;
         };
         source.included = !source.included;
+        let included = source.included;
+        let label = source.label.clone();
+        self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         self.status_message = Some(format!(
             "{} {}",
-            if source.included {
-                "included"
-            } else {
-                "excluded"
-            },
-            source.label
+            if included { "included" } else { "excluded" },
+            label
         ));
         true
     }
@@ -3833,6 +3870,7 @@ impl ReviewApp {
         }
         self.workspace.sources.swap(index, index - 1);
         self.selected_build_row = index - 1;
+        self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         true
@@ -3848,6 +3886,7 @@ impl ReviewApp {
         }
         self.workspace.sources.swap(index, index + 1);
         self.selected_build_row = index + 1;
+        self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         true
@@ -3867,6 +3906,7 @@ impl ReviewApp {
             .selected_build_row
             .min(self.build_row_count().saturating_sub(1));
         self.status_message = Some(format!("removed {}", source.label));
+        self.sync_review_workspace();
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         true
