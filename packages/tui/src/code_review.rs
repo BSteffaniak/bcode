@@ -1270,7 +1270,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('B') => app.set_build_mode(),
         KeyCode::Char('m') => app.toggle_ux_mode(),
         KeyCode::Char('R') if app.ux_mode == ReviewUxMode::Build => app.rematerialize_workspace(),
-        KeyCode::Char('+') => app.add_selected_file_to_workspace(),
+        KeyCode::Char('+') => app.open_add_file_source_picker(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
         KeyCode::Char('a') if app.ux_mode == ReviewUxMode::Build => app.open_add_source_prompt(),
         KeyCode::Char('u') if app.ux_mode == ReviewUxMode::Build => {
@@ -2773,6 +2773,21 @@ impl ReviewApp {
         true
     }
 
+    /// Open add-file-source picker.
+    pub fn open_add_file_source_picker(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.review.repository_files.is_empty() {
+            return self.add_selected_file_to_workspace();
+        }
+        self.prompt_state = Some(ReviewPromptState::new(
+            ReviewPromptKind::AddFileSourcePicker,
+        ));
+        self.status_message = Some("add file source: type to filter, enter add".to_string());
+        true
+    }
+
     /// Open jump-to-line prompt.
     pub fn open_jump_to_line_prompt(&mut self) -> bool {
         self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::JumpToLine));
@@ -2819,13 +2834,7 @@ impl ReviewApp {
 
     fn start_add_source_kind(&mut self, kind: AddSourceMenuKind) -> bool {
         match kind {
-            AddSourceMenuKind::File => {
-                self.prompt_state = Some(ReviewPromptState::new(
-                    ReviewPromptKind::AddFileSourcePicker,
-                ));
-                self.status_message =
-                    Some("add file source: type to filter, enter add".to_string());
-            }
+            AddSourceMenuKind::File => return self.open_add_file_source_picker(),
             AddSourceMenuKind::FileRange => {
                 self.prompt_state =
                     Some(ReviewPromptState::new(ReviewPromptKind::AddFileRangeSource));

@@ -709,7 +709,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
         ));
         rows.push((
             "Choose".to_string(),
-            "A source menu   + selected file source".to_string(),
+            "A source menu   + repository file source".to_string(),
             false,
             false,
         ));
@@ -744,7 +744,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "enter open/toggle   R refresh   space toggle source   u/s/w/l quick add   + add file   A source menu   m review"
+        "enter open/toggle   R refresh   space toggle source   u/s/w/l quick add   + file picker   A source menu   m review"
             .to_string(),
         String::new(),
         false,
@@ -1112,7 +1112,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " m                   switch to review mode",
         " j/k or arrows       move selection",
         " space              include/exclude selected source",
-        " +                  add selected file source",
+        " +                  add file source from repository picker",
         " u/s/w/l            quick add unstaged/staged/worktree/last commit",
         " A                  add more source types",
         " R                  refresh/rematerialize sources",
