@@ -38,6 +38,7 @@ use switchy::database::schema::{Column, DataType, alter_table, create_table};
 use switchy::database::{Database, DatabaseError, DatabaseValue, Row};
 use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
 use switchy::schema::runner::MigrationRunner;
+use switchy::schema::version::VersionTracker;
 use thiserror::Error;
 
 /// Code review plugin service interface.
@@ -2315,9 +2316,59 @@ fn is_database_lock_error(error: &switchy::database_connection::InitTursoError) 
 }
 
 async fn run_migrations(database: &dyn Database) -> Result<(), ReviewError> {
+    reconcile_legacy_code_review_migrations(database).await?;
     let runner = MigrationRunner::new(Box::new(code_review_migrations()))
         .with_table_name(MIGRATIONS_TABLE.to_string());
     runner.run(database).await?;
+    Ok(())
+}
+
+async fn reconcile_legacy_code_review_migrations(
+    database: &dyn Database,
+) -> Result<(), ReviewError> {
+    if !database.table_exists("draft_threads").await? {
+        return Ok(());
+    }
+
+    let tracker = VersionTracker::with_table_name(MIGRATIONS_TABLE.to_string());
+    tracker.ensure_table_exists(database).await?;
+
+    if database
+        .column_exists("draft_threads", "start_diff_row")
+        .await?
+        && !tracker
+            .is_migration_applied(database, "005_thread_range_columns")
+            .await?
+    {
+        tracker
+            .record_migration(database, "005_thread_range_columns")
+            .await?;
+    }
+
+    if database
+        .column_exists("draft_threads", "is_file_anchor")
+        .await?
+        && !tracker
+            .is_migration_applied(database, "006_thread_file_anchor_column")
+            .await?
+    {
+        tracker
+            .record_migration(database, "006_thread_file_anchor_column")
+            .await?;
+    }
+
+    if database
+        .column_exists("draft_threads", "surface_id")
+        .await?
+        && !tracker
+            .is_migration_applied(database, "007_thread_surface_anchor_columns")
+            .await?
+    {
+        tracker
+            .record_migration(database, "007_thread_surface_anchor_columns")
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -2366,18 +2417,9 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
                 .column(text_column("review_key"))
                 .column(text_column("file_path"))
                 .column(int_column("diff_row"))
-                .column(nullable_int_column("start_diff_row"))
-                .column(nullable_int_column("end_diff_row"))
-                .column(nullable_int_column("old_start"))
-                .column(nullable_int_column("old_end"))
-                .column(nullable_int_column("new_start"))
-                .column(nullable_int_column("new_end"))
                 .column(nullable_int_column("old_line"))
                 .column(nullable_int_column("new_line"))
                 .column(text_column("line_kind"))
-                .column(bool_column("is_file_anchor"))
-                .column(nullable_text_column("surface_id"))
-                .column(nullable_text_column("source_id"))
                 .column(int_column("created_at_ms"))
                 .column(int_column("updated_at_ms"))
                 .primary_key("thread_id"),
@@ -2455,26 +2497,6 @@ fn text_column(name: &str) -> Column {
         auto_increment: false,
         data_type: DataType::Text,
         default: None,
-    }
-}
-
-fn nullable_text_column(name: &str) -> Column {
-    Column {
-        name: name.to_string(),
-        nullable: true,
-        auto_increment: false,
-        data_type: DataType::Text,
-        default: None,
-    }
-}
-
-fn bool_column(name: &str) -> Column {
-    Column {
-        name: name.to_string(),
-        nullable: false,
-        auto_increment: false,
-        data_type: DataType::Bool,
-        default: Some(DatabaseValue::Bool(false)),
     }
 }
 
