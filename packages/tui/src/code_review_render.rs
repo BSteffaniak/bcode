@@ -744,7 +744,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "enter open/toggle   space toggle source   u/s/w/l quick add   + add file   A source menu   r rename   [/] reorder   - remove   m review"
+        "enter open/toggle   R refresh   space toggle source   u/s/w/l quick add   + add file   A source menu   m review"
             .to_string(),
         String::new(),
         false,
@@ -1115,8 +1115,8 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " +                  add selected file source",
         " u/s/w/l            quick add unstaged/staged/worktree/last commit",
         " A                  add more source types",
+        " R                  refresh/rematerialize sources",
         " r                  rename selected source",
-        " [/]                move selected source up/down",
         " -                  remove selected source",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",

@@ -12,9 +12,9 @@ use bcode_code_review_models::{
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
     OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic, ReviewSourceKind,
-    ReviewSurface, ReviewSurfaceKind, ReviewTarget as ModelReviewTarget, ReviewWorkspace,
-    UpdateReviewWorkspaceRequest,
+    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
+    ReviewTarget as ModelReviewTarget, ReviewWorkspace, UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_session_models::SessionId;
@@ -281,7 +281,12 @@ async fn handle_pending_workspace_reload(
     {
         Ok(review) => {
             app.replace_review(review);
-            app.status_message = Some("updated review content".to_string());
+            let diagnostics = app.review.diagnostics.len();
+            app.status_message = Some(if diagnostics == 0 {
+                "updated review content".to_string()
+            } else {
+                format!("updated review content with {diagnostics} diagnostic(s)")
+            });
         }
         Err(error) => {
             app.pending_workspace_reload = true;
@@ -1264,6 +1269,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         }
         KeyCode::Char('B') => app.set_build_mode(),
         KeyCode::Char('m') => app.toggle_ux_mode(),
+        KeyCode::Char('R') if app.ux_mode == ReviewUxMode::Build => app.rematerialize_workspace(),
         KeyCode::Char('+') => app.add_selected_file_to_workspace(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
         KeyCode::Char('a') if app.ux_mode == ReviewUxMode::Build => app.open_add_source_prompt(),
@@ -2709,6 +2715,12 @@ impl ReviewApp {
                 Some("include at least one source before switching to review mode".to_string());
             return true;
         }
+        if self.has_materialization_errors() {
+            self.status_message = Some(
+                "review has source errors; fix or exclude them before review mode".to_string(),
+            );
+            return true;
+        }
         self.ux_mode = match self.ux_mode {
             ReviewUxMode::Build => ReviewUxMode::Review,
             ReviewUxMode::Review => ReviewUxMode::Build,
@@ -3363,6 +3375,13 @@ impl ReviewApp {
             .collect()
     }
 
+    fn has_materialization_errors(&self) -> bool {
+        self.review
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == ReviewSourceDiagnosticSeverity::Error)
+    }
+
     /// Return number of rows in build mode.
     #[must_use]
     pub fn build_row_count(&self) -> usize {
@@ -3437,6 +3456,13 @@ impl ReviewApp {
         let pending = self.pending_workspace_reload;
         self.pending_workspace_reload = false;
         pending
+    }
+
+    /// Rematerialize workspace content.
+    pub fn rematerialize_workspace(&mut self) -> bool {
+        self.pending_workspace_reload = true;
+        self.status_message = Some("refreshing review sources".to_string());
+        true
     }
 
     /// Add a quick source while in build mode.
