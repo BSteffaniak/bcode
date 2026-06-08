@@ -556,41 +556,8 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             }
         },
         KeyCode::Char('n' | 'e') => app.start_new_review(),
-        KeyCode::Char('u') => {
-            create_and_open_preset_workspace(
-                client,
-                app,
-                "Unstaged changes",
-                vec![ReviewSourceKind::WorkingTreeUnstaged],
-            )
-            .await
-        }
-        KeyCode::Char('s') => {
-            create_and_open_preset_workspace(
-                client,
-                app,
-                "Staged changes",
-                vec![ReviewSourceKind::IndexStaged],
-            )
-            .await
-        }
-        KeyCode::Char('w') => {
-            create_and_open_preset_workspace(
-                client,
-                app,
-                "Working tree review",
-                vec![ReviewSourceKind::WorkingTreeAndIndex],
-            )
-            .await
-        }
-        KeyCode::Char('l') => {
-            create_and_open_preset_workspace(
-                client,
-                app,
-                "Last commit review",
-                vec![ReviewSourceKind::LastCommit],
-            )
-            .await
+        KeyCode::Char('u' | 's' | 'w' | 'l' | 'v') => {
+            create_and_open_preset_for_key(client, app, key).await
         }
         KeyCode::Char('S') => app.select_next_setup_review(),
         KeyCode::Char('U') => app.select_previous_setup_review(),
@@ -616,6 +583,27 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
         },
         _ => false,
     }
+}
+
+async fn create_and_open_preset_for_key(
+    client: &BcodeClient,
+    app: &mut ReviewHomeApp,
+    key: KeyCode,
+) -> bool {
+    let KeyCode::Char(ch) = key else {
+        return false;
+    };
+    let Some((title, source_kind)) = (match ch {
+        'u' => Some(("Unstaged changes", ReviewSourceKind::WorkingTreeUnstaged)),
+        's' => Some(("Staged changes", ReviewSourceKind::IndexStaged)),
+        'w' => Some(("Working tree review", ReviewSourceKind::WorkingTreeAndIndex)),
+        'l' => Some(("Last commit review", ReviewSourceKind::LastCommit)),
+        'v' => Some(("Repository browser review", ReviewSourceKind::Repository)),
+        _ => None,
+    }) else {
+        return false;
+    };
+    create_and_open_preset_workspace(client, app, title, vec![source_kind]).await
 }
 
 async fn toggle_archived(client: &BcodeClient, app: &mut ReviewHomeApp) -> bool {
@@ -944,7 +932,7 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
             format!(
-                " {filter_label}  enter open   c continue latest   S setup   F drafts   p published   n new   / search   ? help "
+                " {filter_label}  enter open   c latest   n new   u/s/w/l/v presets   S setup   F drafts   / search   ? help "
             ),
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
@@ -1006,7 +994,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " o                   force-open selected review in review mode",
         " build mode: attach sources, fix diagnostics, then m to review",
         " n                   new empty review: name it, then add sources",
-        " u/s/w/l             quick-create unstaged/staged/worktree/last",
+        " u/s/w/l/v           quick-create unstaged/staged/worktree/last/repo",
         " S/U                 next/previous setup review",
         " F/B                 next/previous draft review",
         " p/P                 next/previous published review",
@@ -1049,7 +1037,7 @@ fn render_empty_review_home(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
         "  u  unstaged changes",
         "  s  staged changes",
         "  w  working tree review",
-        "  l  last commit review",
+        "  v  repository browser review",
         "",
         "Or press n to name a custom review, then attach sources in build mode.",
     ];
@@ -1508,7 +1496,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         )
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: n new, u/s/w/l presets, / search title/health/source/publish, ? help"
+                            "review home: n new, u/s/w/l/v presets, / search title/health/source/publish, ? help"
                         .to_string()
                         })
                     }
@@ -1566,6 +1554,22 @@ mod tests {
             draft_count: 0,
             last_publish: None,
         }
+    }
+
+    #[test]
+    fn repository_preset_opens_review_workspace() {
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), Vec::new());
+        let workspace = workspace("repo", vec![source("repo-source", true)], false);
+
+        assert!(app.open_workspace(workspace.clone(), false));
+
+        assert_eq!(
+            app.outcome,
+            Some(ReviewHomeOutcome::OpenWorkspace {
+                workspace,
+                build_mode: false,
+            })
+        );
     }
 
     #[test]
