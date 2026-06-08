@@ -937,15 +937,18 @@ fn rendered_rows(file: &ReviewFile) -> Vec<RenderedRow> {
 
 fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
     match row.source {
-        ReviewDisplayRowSource::HunkHeader => RenderedRow {
-            line: Line::from_spans(
-                row.segments
-                    .iter()
-                    .map(render_display_segment)
-                    .collect::<Vec<_>>(),
-            ),
-            style: row_style(row.source),
-        },
+        ReviewDisplayRowSource::HunkHeader => {
+            let style = row_style(row.source);
+            RenderedRow {
+                line: Line::from_spans(
+                    row.segments
+                        .iter()
+                        .map(|segment| render_display_segment(segment, style))
+                        .collect::<Vec<_>>(),
+                ),
+                style,
+            }
+        }
         ReviewDisplayRowSource::Context
         | ReviewDisplayRowSource::Added
         | ReviewDisplayRowSource::Removed => {
@@ -955,26 +958,36 @@ fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
             let new = row
                 .new_line
                 .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
-            let marker_style = row_style(row.source);
+            let row_style = row_style(row.source);
             let marker = row.source.diff_marker().unwrap_or(' ');
             let mut spans = vec![
                 Span::styled(
                     format!(" {old} {new} "),
-                    Style::new().fg(Color::BrightBlack),
+                    row_style.patch(Style::new().fg(Color::BrightBlack)),
                 ),
-                Span::styled(marker.to_string(), marker_style),
+                Span::styled(
+                    marker.to_string(),
+                    row_style.patch(marker_style(row.source).add_modifier(Modifier::BOLD)),
+                ),
             ];
-            spans.extend(row.segments.iter().map(render_display_segment));
+            spans.extend(
+                row.segments
+                    .iter()
+                    .map(|segment| render_display_segment(segment, row_style)),
+            );
             RenderedRow {
                 line: Line::from_spans(spans),
-                style: marker_style,
+                style: row_style,
             }
         }
     }
 }
 
-fn render_display_segment(segment: &ReviewDisplaySegment) -> Span {
-    Span::styled(segment.text.clone(), style_for_segment(segment))
+fn render_display_segment(segment: &ReviewDisplaySegment, base_style: Style) -> Span {
+    Span::styled(
+        segment.text.clone(),
+        base_style.patch(style_for_segment(segment)),
+    )
 }
 
 fn style_for_segment(segment: &ReviewDisplaySegment) -> Style {
@@ -989,9 +1002,9 @@ const fn style_for_role(role: &ReviewDisplayTextRole) -> Style {
     match role {
         ReviewDisplayTextRole::Code => Style::new().fg(Color::White),
         ReviewDisplayTextRole::Syntax(style) => syntax_style_to_tui(*style),
-        ReviewDisplayTextRole::DiffContext
-        | ReviewDisplayTextRole::DiffAdded
-        | ReviewDisplayTextRole::DiffRemoved => Style::new(),
+        ReviewDisplayTextRole::DiffAdded => Style::new().fg(Color::BrightGreen),
+        ReviewDisplayTextRole::DiffRemoved => Style::new().fg(Color::BrightRed),
+        ReviewDisplayTextRole::DiffContext => Style::new(),
         ReviewDisplayTextRole::HunkHeader => {
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
         }
@@ -1000,10 +1013,22 @@ const fn style_for_role(role: &ReviewDisplayTextRole) -> Style {
 
 const fn row_style(source: ReviewDisplayRowSource) -> Style {
     match source {
-        ReviewDisplayRowSource::HunkHeader => Style::new().fg(Color::Magenta),
+        ReviewDisplayRowSource::HunkHeader => Style::new()
+            .fg(Color::BrightMagenta)
+            .bg(Color::Rgb(24, 18, 34))
+            .add_modifier(Modifier::BOLD),
         ReviewDisplayRowSource::Context => Style::new().fg(Color::White),
-        ReviewDisplayRowSource::Added => Style::new().fg(Color::Green),
-        ReviewDisplayRowSource::Removed => Style::new().fg(Color::Red),
+        ReviewDisplayRowSource::Added => Style::new().fg(Color::White).bg(Color::Rgb(0, 24, 16)),
+        ReviewDisplayRowSource::Removed => Style::new().fg(Color::White).bg(Color::Rgb(32, 10, 10)),
+    }
+}
+
+const fn marker_style(source: ReviewDisplayRowSource) -> Style {
+    match source {
+        ReviewDisplayRowSource::Added => Style::new().fg(Color::BrightGreen),
+        ReviewDisplayRowSource::Removed => Style::new().fg(Color::BrightRed),
+        ReviewDisplayRowSource::HunkHeader => Style::new().fg(Color::BrightMagenta),
+        ReviewDisplayRowSource::Context => Style::new().fg(Color::BrightBlack),
     }
 }
 
