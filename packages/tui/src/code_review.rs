@@ -6113,8 +6113,8 @@ mod tests {
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,
                 is_file_anchor: false,
-                surface_id: None,
-                source_id: None,
+                surface_id: Some("surface-0".to_string()),
+                source_id: Some("source-1".to_string()),
             },
             body: "Before".to_string(),
             created_at_ms: 1,
@@ -6159,8 +6159,8 @@ mod tests {
                 new_line: Some(1),
                 line_kind: ReviewLineKind::Added,
                 is_file_anchor: false,
-                surface_id: None,
-                source_id: None,
+                surface_id: Some("surface-0".to_string()),
+                source_id: Some("source-1".to_string()),
             },
             body: "Persisted".to_string(),
             created_at_ms: 1,
@@ -6185,12 +6185,179 @@ mod tests {
             .insert_str("Needs a test");
         assert!(app.save_comment_editor());
         assert!(app.toggle_sidebar_mode());
+        assert!(app.toggle_sidebar_mode());
 
         assert_eq!(app.sidebar_mode, ReviewSidebarMode::Threads);
         assert_eq!(app.thread_summaries().len(), 1);
         app.selected_diff_line = 0;
         assert!(app.jump_to_selected_thread());
         assert_eq!(app.selected_diff_line, 2);
+    }
+
+    fn build_source(id: &str, kind: ReviewSourceKind, included: bool) -> ReviewSource {
+        ReviewSource {
+            id: id.to_string(),
+            label: kind.label(),
+            kind,
+            included,
+        }
+    }
+
+    fn build_workspace_app(
+        sources: Vec<ReviewSource>,
+        surfaces: Vec<ReviewSurface>,
+        diagnostics: Vec<ReviewSourceDiagnostic>,
+    ) -> ReviewApp {
+        ReviewApp::new(ReviewSummary {
+            title: "workspace".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            additions: 0,
+            deletions: 0,
+            workspace: Some(ReviewWorkspace {
+                id: "workspace-1".to_string(),
+                title: "Workspace".to_string(),
+                repo_root: PathBuf::from("/repo"),
+                sources,
+                created_at_ms: None,
+                updated_at_ms: None,
+                archived_at_ms: None,
+            }),
+            surfaces,
+            diagnostics,
+            repository_files: Vec::new(),
+            repository_branches: Vec::new(),
+            repository_commits: Vec::new(),
+            files: Vec::new(),
+        })
+    }
+
+    fn build_surface(id: &str, source_id: &str) -> ReviewSurface {
+        ReviewSurface {
+            id: id.to_string(),
+            source_id: source_id.to_string(),
+            path: "a.rs".to_string(),
+            kind: ReviewSurfaceKind::Diff,
+            file: None,
+        }
+    }
+
+    fn build_diagnostic(
+        source_id: &str,
+        severity: ReviewSourceDiagnosticSeverity,
+    ) -> ReviewSourceDiagnostic {
+        ReviewSourceDiagnostic {
+            source_id: source_id.to_string(),
+            severity,
+            code: "test".to_string(),
+            message: "diagnostic".to_string(),
+        }
+    }
+
+    #[test]
+    fn removes_duplicate_sources_preserving_first() {
+        let mut app = build_workspace_app(
+            vec![
+                build_source("source-1", ReviewSourceKind::LastCommit, true),
+                build_source("source-2", ReviewSourceKind::WorkingTreeUnstaged, true),
+                build_source("source-3", ReviewSourceKind::LastCommit, true),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        app.set_build_mode();
+        app.selected_build_row = 2;
+
+        assert!(app.remove_duplicate_sources());
+
+        assert_eq!(app.workspace.sources.len(), 2);
+        assert_eq!(app.workspace.sources[0].id, "source-1");
+        assert_eq!(app.workspace.sources[1].id, "source-2");
+        assert!(app.pending_workspace_save);
+        assert!(app.pending_workspace_reload);
+        assert_eq!(app.review.workspace, Some(app.workspace.clone()));
+    }
+
+    #[test]
+    fn excludes_empty_included_sources() {
+        let mut app = build_workspace_app(
+            vec![
+                build_source("source-1", ReviewSourceKind::LastCommit, true),
+                build_source("source-2", ReviewSourceKind::WorkingTreeUnstaged, true),
+                build_source("source-3", ReviewSourceKind::IndexStaged, false),
+            ],
+            vec![build_surface("surface-1", "source-1")],
+            Vec::new(),
+        );
+        app.set_build_mode();
+
+        assert!(app.exclude_empty_sources());
+
+        assert!(app.workspace.sources[0].included);
+        assert!(!app.workspace.sources[1].included);
+        assert!(!app.workspace.sources[2].included);
+        assert!(app.pending_workspace_save);
+        assert!(app.pending_workspace_reload);
+    }
+
+    #[test]
+    fn selects_empty_sources_with_wraparound() {
+        let mut app = build_workspace_app(
+            vec![
+                build_source("source-1", ReviewSourceKind::LastCommit, true),
+                build_source("source-2", ReviewSourceKind::WorkingTreeUnstaged, true),
+                build_source("source-3", ReviewSourceKind::IndexStaged, true),
+            ],
+            vec![build_surface("surface-1", "source-1")],
+            Vec::new(),
+        );
+        app.set_build_mode();
+        app.selected_build_row = 2;
+
+        assert!(app.select_next_empty_source());
+        assert_eq!(app.selected_build_row, 1);
+        assert!(app.select_previous_empty_source());
+        assert_eq!(app.selected_build_row, 2);
+    }
+
+    #[test]
+    fn diagnostic_source_actions_target_errors() {
+        let mut app = build_workspace_app(
+            vec![
+                build_source("source-1", ReviewSourceKind::LastCommit, true),
+                build_source("source-2", ReviewSourceKind::WorkingTreeUnstaged, true),
+                build_source("source-3", ReviewSourceKind::IndexStaged, true),
+            ],
+            Vec::new(),
+            vec![
+                build_diagnostic("source-2", ReviewSourceDiagnosticSeverity::Warning),
+                build_diagnostic("source-3", ReviewSourceDiagnosticSeverity::Error),
+            ],
+        );
+        app.set_build_mode();
+
+        assert!(app.select_next_diagnostic_source());
+        assert_eq!(app.selected_build_row, 1);
+        assert!(app.exclude_sources_with_errors());
+        assert!(app.workspace.sources[1].included);
+        assert!(!app.workspace.sources[2].included);
+        assert!(app.pending_workspace_save);
+        assert!(app.pending_workspace_reload);
+    }
+
+    #[test]
+    fn diagnostic_source_counts_are_grouped_by_source() {
+        let app = build_workspace_app(
+            vec![build_source("source-1", ReviewSourceKind::LastCommit, true)],
+            Vec::new(),
+            vec![
+                build_diagnostic("source-1", ReviewSourceDiagnosticSeverity::Info),
+                build_diagnostic("source-1", ReviewSourceDiagnosticSeverity::Info),
+                build_diagnostic("source-2", ReviewSourceDiagnosticSeverity::Warning),
+                build_diagnostic("source-3", ReviewSourceDiagnosticSeverity::Error),
+            ],
+        );
+
+        assert_eq!(app.diagnostic_source_counts(), (1, 1, 1));
     }
 
     #[test]
