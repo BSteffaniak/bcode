@@ -13,7 +13,7 @@ use bcode_code_review_models::{
     ReviewSourceKind, ReviewWorkspace, ReviewWorkspaceListItem, UpdateReviewWorkspaceRequest,
     UpdateReviewWorkspaceResponse,
 };
-use bmux_keyboard::KeyCode;
+use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -156,8 +156,8 @@ impl ReviewHomeApp {
         self.open_workspace(workspace, false)
     }
     fn start_new_review(&mut self) -> bool {
-        self.new_review_buffer = Some("Untitled review".to_string());
-        self.status_message = Some("new review title".to_string());
+        self.new_review_buffer = Some(String::new());
+        self.status_message = Some("new review title; enter uses Untitled review".to_string());
         true
     }
 
@@ -341,14 +341,27 @@ pub async fn run<W: Write>(
             continue;
         };
         if let Event::Key(key) = event {
-            needs_redraw = handle_key_event(&client, &mut app, key.key).await;
+            needs_redraw = handle_key_event(&client, &mut app, key).await;
         }
     }
 
     Ok(app.outcome.unwrap_or(ReviewHomeOutcome::Exit))
 }
 
-async fn handle_key_event(client: &BcodeClient, app: &mut ReviewHomeApp, key: KeyCode) -> bool {
+async fn handle_key_event(
+    client: &BcodeClient,
+    app: &mut ReviewHomeApp,
+    stroke: KeyStroke,
+) -> bool {
+    if stroke.modifiers.ctrl
+        || stroke.modifiers.alt
+        || stroke.modifiers.super_key
+        || stroke.modifiers.hyper
+        || stroke.modifiers.meta
+    {
+        return false;
+    }
+    let key = normalized_home_key(stroke);
     if app.new_review_buffer.is_some() {
         return handle_new_review_key(client, app, key).await;
     }
@@ -359,6 +372,17 @@ async fn handle_key_event(client: &BcodeClient, app: &mut ReviewHomeApp, key: Ke
         return app.handle_search_key(key);
     }
     handle_normal_key(client, app, key).await
+}
+
+const fn normalized_home_key(stroke: KeyStroke) -> KeyCode {
+    if !stroke.modifiers.shift {
+        return stroke.key;
+    }
+    match stroke.key {
+        KeyCode::Char('/') => KeyCode::Char('?'),
+        KeyCode::Char(ch) if ch.is_ascii_lowercase() => KeyCode::Char(ch.to_ascii_uppercase()),
+        key => key,
+    }
 }
 
 async fn handle_new_review_key(
@@ -421,7 +445,7 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
                 true
             }
         },
-        KeyCode::Char('n') => app.start_new_review(),
+        KeyCode::Char('n' | 'e') => app.start_new_review(),
         KeyCode::Char('u') => {
             create_and_open_preset_workspace(
                 client,
@@ -474,9 +498,6 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
                 true
             }
         },
-        KeyCode::Char('e') => {
-            create_and_open_preset_workspace(client, app, "Empty review", Vec::new()).await
-        }
         _ => false,
     }
 }
@@ -838,8 +859,8 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " Review Picker Help",
         "",
         " enter               open selected review",
-        " n                   create empty named review and start adding sources",
-        " u/s/w/l/e           create unstaged/staged/worktree/last/empty preset",
+        " n                   new empty review: name it, then add sources",
+        " u/s/w/l             quick-create unstaged/staged/worktree/last",
         " j/k or arrows       move selection",
         " g/G                 first/last visible review",
         " /                   search title, source, branch, commit, file, id",
@@ -1230,7 +1251,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n empty, D drafts, ? help, / search, r rename"
+                            "review home: enter open, n new, u/s/w/l quick create, D drafts, ? help"
                                 .to_string()
                         })
                     }
@@ -1238,7 +1259,13 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                 |rename| format!("rename: {rename}"),
             )
         },
-        |title| format!("new review: {title}"),
+        |title| {
+            if title.is_empty() {
+                "new review title: <enter for Untitled review>".to_string()
+            } else {
+                format!("new review title: {title}")
+            }
+        },
     );
     frame.write_line(
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),

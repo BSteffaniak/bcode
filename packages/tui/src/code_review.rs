@@ -2447,39 +2447,29 @@ pub struct AddSourceMenuItem {
 pub const fn add_source_menu_items() -> &'static [AddSourceMenuItem] {
     &[
         AddSourceMenuItem {
-            kind: AddSourceMenuKind::WorkingTree,
-            label: "working-tree",
-            help: "all unstaged + staged changes",
-        },
-        AddSourceMenuItem {
             kind: AddSourceMenuKind::Unstaged,
-            label: "unstaged",
-            help: "working tree changes not staged",
+            label: "unstaged changes",
+            help: "changes in the working tree that are not staged",
         },
         AddSourceMenuItem {
             kind: AddSourceMenuKind::Staged,
-            label: "staged",
+            label: "staged changes",
             help: "index changes ready to commit",
         },
         AddSourceMenuItem {
+            kind: AddSourceMenuKind::WorkingTree,
+            label: "working tree",
+            help: "all staged and unstaged changes",
+        },
+        AddSourceMenuItem {
             kind: AddSourceMenuKind::LastCommit,
-            label: "last-commit",
+            label: "last commit",
             help: "changes introduced by HEAD",
         },
         AddSourceMenuItem {
             kind: AddSourceMenuKind::BranchCompare,
-            label: "branch-compare",
-            help: "compare base..head or base...head",
-        },
-        AddSourceMenuItem {
-            kind: AddSourceMenuKind::CommitRange,
-            label: "commit-range",
-            help: "compare base..head or base...head",
-        },
-        AddSourceMenuItem {
-            kind: AddSourceMenuKind::Commit,
-            label: "commit",
-            help: "single commit revision",
+            label: "branch compare",
+            help: "compare base..head or base...head branches",
         },
         AddSourceMenuItem {
             kind: AddSourceMenuKind::File,
@@ -2488,13 +2478,23 @@ pub const fn add_source_menu_items() -> &'static [AddSourceMenuItem] {
         },
         AddSourceMenuItem {
             kind: AddSourceMenuKind::FileRange,
-            label: "file-range",
+            label: "file range",
             help: "file slice path:start-end",
         },
         AddSourceMenuItem {
+            kind: AddSourceMenuKind::Commit,
+            label: "commit",
+            help: "single commit revision",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::CommitRange,
+            label: "commit range",
+            help: "compare base..head or base...head revisions",
+        },
+        AddSourceMenuItem {
             kind: AddSourceMenuKind::Repository,
-            label: "repository",
-            help: "repository overview source",
+            label: "repository browser",
+            help: "browse repository files as review context",
         },
     ]
 }

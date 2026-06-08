@@ -658,12 +658,26 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
         false,
         false,
     ));
-    rows.push((String::new(), String::new(), false, false));
+    if workspace.sources.is_empty() {
+        rows.push((
+            "Quick add".to_string(),
+            "u unstaged   s staged   w worktree   l last commit".to_string(),
+            false,
+            false,
+        ));
+        rows.push((
+            "Choose".to_string(),
+            "A source menu   + selected file source".to_string(),
+            false,
+            false,
+        ));
+        rows.push((String::new(), String::new(), false, false));
+    }
     rows.push(("Included sources".to_string(), String::new(), false, false));
     if workspace.sources.is_empty() {
         rows.push((
             "  !".to_string(),
-            "no sources yet — press A or u/s/w/l to add one".to_string(),
+            "no sources yet — pick a quick source or open the source menu".to_string(),
             false,
             true,
         ));
