@@ -193,18 +193,9 @@ async fn run_with_workspace<W: Write>(
         if handle_pending_file_load(&client, &repo_path, &mut app).await {
             needs_redraw = true;
         }
-        if app.take_pending_workspace_save() {
-            match save_workspace(&client, app.workspace.clone()).await {
-                Ok(()) => app.status_message = Some("saved review workspace".to_string()),
-                Err(error) => {
-                    app.pending_workspace_save = true;
-                    app.status_message = Some(format!("workspace save failed: {error}"));
-                }
-            }
-            needs_redraw = true;
-        }
-        if handle_pending_workspace_reload(&client, &repo_path, &review_target, &mut app).await {
-            needs_redraw = true;
+        match drain_pending_workspace_changes(&client, &repo_path, &review_target, &mut app).await {
+            WorkspaceDrainOutcome::Idle => {}
+            WorkspaceDrainOutcome::Applied | WorkspaceDrainOutcome::Failed => needs_redraw = true,
         }
         if handle_pending_draft_save(&client, &repo_path, &review_target, &mut app).await {
             needs_redraw = true;
@@ -262,38 +253,70 @@ async fn run_with_workspace<W: Write>(
     Ok(app.take_session_to_open())
 }
 
-async fn handle_pending_workspace_reload(
+/// Result of draining pending workspace changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceDrainOutcome {
+    /// No workspace work was pending.
+    Idle,
+    /// Workspace was saved or reloaded successfully.
+    Applied,
+    /// Workspace save/reload failed and remains pending.
+    Failed,
+}
+
+async fn drain_pending_workspace_changes(
     client: &BcodeClient,
     repo_path: &Path,
     fallback_target: &ReviewTarget,
     app: &mut ReviewApp,
-) -> bool {
-    if !app.take_pending_workspace_reload() {
-        return false;
-    }
-    match load_workspace_review(
-        client,
-        repo_path.to_path_buf(),
-        fallback_target.clone(),
-        app.workspace.clone(),
-    )
-    .await
-    {
-        Ok(review) => {
-            app.replace_review(review);
-            let diagnostics = app.review.diagnostics.len();
-            app.status_message = Some(if diagnostics == 0 {
-                "updated review content".to_string()
-            } else {
-                format!("updated review content with {diagnostics} diagnostic(s)")
-            });
-        }
-        Err(error) => {
-            app.pending_workspace_reload = true;
-            app.status_message = Some(format!("review reload failed: {error}"));
+) -> WorkspaceDrainOutcome {
+    let mut changed = false;
+    if app.take_pending_workspace_save() {
+        match save_workspace(client, app.workspace.clone()).await {
+            Ok(()) => {
+                changed = true;
+                app.status_message = Some("saved review workspace".to_string());
+            }
+            Err(error) => {
+                app.pending_workspace_save = true;
+                app.status_message = Some(format!("workspace save failed: {error}"));
+                return WorkspaceDrainOutcome::Failed;
+            }
         }
     }
-    true
+
+    if app.take_pending_workspace_reload() {
+        match load_workspace_review(
+            client,
+            repo_path.to_path_buf(),
+            fallback_target.clone(),
+            app.workspace.clone(),
+        )
+        .await
+        {
+            Ok(review) => {
+                app.replace_review(review);
+                changed = true;
+                let diagnostics = app.review.diagnostics.len();
+                app.status_message = Some(if diagnostics == 0 {
+                    "updated review content".to_string()
+                } else {
+                    format!("updated review content with {diagnostics} diagnostic(s)")
+                });
+            }
+            Err(error) => {
+                app.pending_workspace_reload = true;
+                app.status_message = Some(format!("review reload failed: {error}"));
+                return WorkspaceDrainOutcome::Failed;
+            }
+        }
+    }
+
+    if changed {
+        WorkspaceDrainOutcome::Applied
+    } else {
+        WorkspaceDrainOutcome::Idle
+    }
 }
 
 async fn handle_pending_draft_save(
@@ -3646,11 +3669,16 @@ impl ReviewApp {
 
     /// Replace review content after rematerialization.
     pub fn replace_review(&mut self, review: ReviewSummary) {
+        let workspace = review.workspace();
         self.review = review;
-        self.workspace = self.review.workspace();
+        self.workspace = workspace;
+        self.sync_review_workspace();
         self.selected_file = self
             .selected_file
             .min(self.review.files.len().saturating_sub(1));
+        self.selected_build_row = self
+            .selected_build_row
+            .min(self.build_row_count().saturating_sub(1));
         self.file_scroll = self.file_scroll.min(self.selected_file);
         self.diff_scroll = 0;
         self.selected_diff_line = 0;
@@ -3725,6 +3753,7 @@ impl ReviewApp {
             .sources
             .len()
             .saturating_add(self.review.surfaces().len())
+            .max(1)
     }
 
     /// Select next build row.
