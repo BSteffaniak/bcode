@@ -244,7 +244,7 @@ fn build_footer_hint(app: &ReviewApp) -> String {
         (false, false) => "",
     };
     format!(
-        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  diag i/w/e {info_sources}/{warning_sources}/{error_sources}{pending}  n empty  d diagnostic  Z exclude errors  C edit  m review "
+        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  diag i/w/e {info_sources}/{warning_sources}/{error_sources}{pending}  n empty  z exclude empty  d diagnostic  C edit  m review "
     )
 }
 
@@ -1192,7 +1192,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " T                  rename workspace",
         " R                  refresh/rematerialize sources",
         " I/E/V              include all / exclude all / invert sources",
-        " n/N                next / previous empty included source",
+        " n/N/z              next / previous / exclude empty sources",
         " d/Z                next diagnostic source / exclude error sources",
         " O/Y                open source surface / source for surface",
         " C                  change selected source spec",

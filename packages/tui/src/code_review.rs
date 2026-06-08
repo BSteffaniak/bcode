@@ -1284,6 +1284,7 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
         KeyCode::Char('V') => app.invert_source_inclusion(),
         KeyCode::Char('n') => app.select_next_empty_source(),
         KeyCode::Char('N') => app.select_previous_empty_source(),
+        KeyCode::Char('z') => app.exclude_empty_sources(),
         KeyCode::Char('d') => app.select_next_diagnostic_source(),
         KeyCode::Char('Z') => app.exclude_sources_with_errors(),
         KeyCode::Char('C') => app.open_edit_source_spec_prompt(),
@@ -4292,6 +4293,35 @@ impl ReviewApp {
     /// Select previous included source that materialized no surfaces.
     pub fn select_previous_empty_source(&mut self) -> bool {
         self.select_empty_source(false)
+    }
+
+    /// Exclude included sources that currently materialize no surfaces.
+    pub fn exclude_empty_sources(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let surface_source_ids: BTreeSet<String> = self
+            .review
+            .surfaces()
+            .iter()
+            .map(|surface| surface.source_id.clone())
+            .collect();
+        let mut excluded = 0usize;
+        for source in &mut self.workspace.sources {
+            if source.included && !surface_source_ids.contains(&source.id) {
+                source.included = false;
+                excluded = excluded.saturating_add(1);
+            }
+        }
+        if excluded == 0 {
+            self.status_message = Some("no empty included sources to exclude".to_string());
+            return true;
+        }
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(format!("excluded {excluded} empty source(s)"));
+        true
     }
 
     /// Select the next source with diagnostics.
