@@ -49,6 +49,8 @@ struct ReviewHomeApp {
     new_review_buffer: Option<String>,
     include_archived: bool,
     details_visible: bool,
+    draft_filter_active: bool,
+    help_visible: bool,
     should_exit: bool,
     outcome: Option<ReviewHomeOutcome>,
 }
@@ -66,6 +68,8 @@ impl ReviewHomeApp {
             new_review_buffer: None,
             include_archived: false,
             details_visible: true,
+            draft_filter_active: false,
+            help_visible: false,
             should_exit: false,
             outcome: None,
         }
@@ -85,6 +89,9 @@ impl ReviewHomeApp {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
+                if self.draft_filter_active && item.draft_count == 0 {
+                    return None;
+                }
                 if query.is_empty() || workspace_item_matches_query(item, &query) {
                     Some(index)
                 } else {
@@ -235,6 +242,17 @@ impl ReviewHomeApp {
         }
     }
 
+    fn toggle_draft_filter(&mut self) -> bool {
+        self.draft_filter_active = !self.draft_filter_active;
+        self.clamp_selection();
+        self.status_message = Some(if self.draft_filter_active {
+            "showing reviews with drafts".to_string()
+        } else {
+            "showing all matching reviews".to_string()
+        });
+        true
+    }
+
     fn toggle_search(&mut self) -> bool {
         self.search_active = !self.search_active;
         self.status_message = Some(if self.search_active {
@@ -383,6 +401,11 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Char('d') => {
             app.details_visible = !app.details_visible;
+            true
+        }
+        KeyCode::Char('D') => app.toggle_draft_filter(),
+        KeyCode::Char('?') => {
+            app.help_visible = !app.help_visible;
             true
         }
         KeyCode::Enter => app.open_selected(),
@@ -752,7 +775,7 @@ async fn create_workspace_with_sources(
 fn render(app: &ReviewHomeApp, frame: &mut Frame<'_>) {
     let area = frame.area();
     frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-    render_header(area, frame);
+    render_header(app, area, frame);
     let body = Rect::new(
         area.x,
         area.y.saturating_add(2),
@@ -761,9 +784,12 @@ fn render(app: &ReviewHomeApp, frame: &mut Frame<'_>) {
     );
     render_workspaces(app, body, frame);
     render_footer(app, area, frame);
+    if app.help_visible {
+        render_help(area, frame);
+    }
 }
 
-fn render_header(area: Rect, frame: &mut Frame<'_>) {
+fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(area.x, area.y, area.width, 1),
         &Line::from_spans(vec![Span::styled(
@@ -774,13 +800,56 @@ fn render_header(area: Rect, frame: &mut Frame<'_>) {
                 .add_modifier(Modifier::BOLD),
         )]),
     );
+    let filter_label = active_filter_label(app);
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " enter open   n named   u/s/w/l/e presets   a archived   d details   g/G top/bottom   R restore   / search   x archive ",
+            format!(
+                " {filter_label}  enter open   n named   u/s/w/l/e presets   a archived   d details   D drafts   g/G top/bottom   R restore   / search   x archive "
+            ),
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
+}
+
+fn active_filter_label(app: &ReviewHomeApp) -> String {
+    let archived = if app.include_archived {
+        "archived:on"
+    } else {
+        "archived:off"
+    };
+    let drafts = if app.draft_filter_active {
+        "drafts:on"
+    } else {
+        "drafts:all"
+    };
+    let search = if app.search_query.trim().is_empty() {
+        "search:off".to_string()
+    } else {
+        format!("search:{}", app.search_query.trim())
+    };
+    format!("[{archived} {drafts} {search}]")
+}
+
+const fn review_home_help_lines() -> &'static [&'static str] {
+    &[
+        " Review Picker Help",
+        "",
+        " enter               open selected review",
+        " n                   create named review",
+        " u/s/w/l/e           create unstaged/staged/worktree/last/empty preset",
+        " j/k or arrows       move selection",
+        " g/G                 first/last visible review",
+        " /                   search title, source, branch, commit, file, id",
+        " a                   show/hide archived reviews",
+        " D                   show only reviews with drafts",
+        " d                   show/hide details pane",
+        " r                   rename selected review",
+        " x                   archive selected review",
+        " R                   restore selected archived review",
+        " ?                   toggle this help",
+        " q or esc            exit",
+    ]
 }
 
 fn render_workspaces(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
@@ -817,7 +886,11 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
             &Line::from_spans(vec![Span::styled(
-                " No matching review workspaces.",
+                if app.draft_filter_active {
+                    " No review workspaces with drafts match the active filters."
+                } else {
+                    " No matching review workspaces."
+                },
                 Style::new().fg(Color::White).bg(Color::Black),
             )]),
         );
@@ -1081,6 +1154,50 @@ fn relative_time_label(timestamp_ms: u64) -> String {
     }
 }
 
+fn render_help(area: Rect, frame: &mut Frame<'_>) {
+    let lines = review_home_help_lines();
+    let width = area.width.min(72);
+    let height = area.height.min(
+        u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2),
+    );
+    if width < 24 || height < 4 {
+        return;
+    }
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
+    let popup = Rect::new(x, y, width, height);
+    frame.fill(
+        popup,
+        " ",
+        Style::new().fg(Color::White).bg(Color::BrightBlack),
+    );
+    for (index, text) in lines.iter().enumerate() {
+        let y = popup
+            .y
+            .saturating_add(1)
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        if y >= popup.bottom() {
+            break;
+        }
+        frame.write_line(
+            Rect::new(
+                popup.x.saturating_add(1),
+                y,
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                text.to_string(),
+                Style::new().fg(Color::White).bg(Color::BrightBlack),
+            )]),
+        );
+    }
+}
+
 fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
     let text = app.new_review_buffer.as_ref().map_or_else(
         || {
@@ -1090,7 +1207,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n named, u/s/w/l/e presets, a archived, d details, R restore, / search, r rename"
+                            "review home: enter open, n named, D drafts, ? help, / search, r rename"
                                 .to_string()
                         })
                     }
