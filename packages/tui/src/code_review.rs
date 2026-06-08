@@ -3043,7 +3043,33 @@ impl ReviewApp {
         })
     }
 
+    fn next_source_id(&self) -> String {
+        let mut next = self.workspace.sources.len().saturating_add(1);
+        loop {
+            let source_id = format!("source-{next}");
+            if self
+                .workspace
+                .sources
+                .iter()
+                .all(|source| source.id != source_id)
+            {
+                return source_id;
+            }
+            next = next.saturating_add(1);
+        }
+    }
+
     fn push_workspace_source(&mut self, kind: ReviewSourceKind) -> bool {
+        if matches!(kind, ReviewSourceKind::Repository)
+            && self
+                .workspace
+                .sources
+                .iter()
+                .any(|source| matches!(source.kind, ReviewSourceKind::Repository))
+        {
+            self.status_message = Some("repository source is already included".to_string());
+            return true;
+        }
         if self
             .workspace
             .sources
@@ -3054,7 +3080,7 @@ impl ReviewApp {
             return true;
         }
         let label = kind.label();
-        let source_id = format!("source-{}", self.workspace.sources.len().saturating_add(1));
+        let source_id = self.next_source_id();
         self.workspace.sources.push(ReviewSource {
             id: source_id,
             kind,
@@ -3524,7 +3550,8 @@ impl ReviewApp {
             .selected_file_data()
             .map(|file| file.display_path().to_string())
         else {
-            return false;
+            self.status_message = Some("no selected file to add".to_string());
+            return true;
         };
         if self
             .workspace
