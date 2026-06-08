@@ -12,7 +12,8 @@ use bcode_code_review_models::{
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
     OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewSource, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind, ReviewWorkspace,
+    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceKind, ReviewSurface,
+    ReviewSurfaceKind, ReviewTarget as ModelReviewTarget, ReviewWorkspace,
     UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
@@ -80,6 +81,47 @@ pub enum ReviewOpenTarget {
     },
     /// Browse and review repository files.
     Repository,
+}
+
+fn model_target_from_source_kind(
+    kind: &ReviewSourceKind,
+) -> bcode_code_review_models::ReviewTarget {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => {
+            bcode_code_review_models::ReviewTarget::WorkingTreeUnstaged
+        }
+        ReviewSourceKind::IndexStaged => bcode_code_review_models::ReviewTarget::IndexStaged,
+        ReviewSourceKind::WorkingTreeAndIndex => {
+            bcode_code_review_models::ReviewTarget::WorkingTreeAndIndex
+        }
+        ReviewSourceKind::LastCommit => bcode_code_review_models::ReviewTarget::LastCommit,
+        ReviewSourceKind::Commit { rev } => bcode_code_review_models::ReviewTarget::CommitRange {
+            base: format!("{rev}^"),
+            head: rev.clone(),
+            merge_base: false,
+        },
+        ReviewSourceKind::CommitRange {
+            base,
+            head,
+            merge_base,
+        } => bcode_code_review_models::ReviewTarget::CommitRange {
+            base: base.clone(),
+            head: head.clone(),
+            merge_base: *merge_base,
+        },
+        ReviewSourceKind::BranchCompare {
+            base_branch,
+            head_branch,
+            merge_base,
+        } => bcode_code_review_models::ReviewTarget::BranchCompare {
+            base_branch: base_branch.clone(),
+            head_branch: head_branch.clone(),
+            merge_base: *merge_base,
+        },
+        ReviewSourceKind::File { .. }
+        | ReviewSourceKind::FileRange { .. }
+        | ReviewSourceKind::Repository => bcode_code_review_models::ReviewTarget::Repository,
+    }
 }
 
 /// Run a full-screen local Git review from a durable workspace.
@@ -251,7 +293,15 @@ async fn handle_pending_draft_save(
     let Some(save) = app.take_pending_draft_save() else {
         return false;
     };
-    match save_draft(client, repo_path.to_path_buf(), review_target.clone(), save).await {
+    match save_draft(
+        client,
+        repo_path.to_path_buf(),
+        review_target.clone(),
+        Some(review_scope_for_workspace(&app.workspace)),
+        save,
+    )
+    .await
+    {
         Ok(()) => app.status_message = Some("saved draft comment".to_string()),
         Err(error) => {
             app.status_message = Some(format!("saved locally; draft persistence failed: {error}"));
@@ -286,7 +336,13 @@ async fn load_review_app(
     } else {
         load_review(client, repo_path.clone(), review_target.clone()).await?
     };
-    let drafts = load_drafts(client, repo_path, review_target).await;
+    let drafts = load_drafts(
+        client,
+        repo_path,
+        review_target,
+        workspace.as_ref().map(review_scope_for_workspace),
+    )
+    .await;
     let mut app = ReviewApp::new(review);
     if app.workspace.sources.is_empty()
         && let Some(workspace) = workspace
@@ -301,6 +357,20 @@ async fn load_review_app(
         }
     }
     Ok(app)
+}
+
+fn review_scope_for_workspace(workspace: &ReviewWorkspace) -> ModelReviewScope {
+    ModelReviewScope::Workspace {
+        workspace_id: workspace.id.clone(),
+        target: workspace
+            .sources
+            .iter()
+            .find(|source| source.included)
+            .map_or(
+                bcode_code_review_models::ReviewTarget::Repository,
+                |source| model_target_from_source_kind(&source.kind),
+            ),
+    }
 }
 
 async fn save_workspace(client: &BcodeClient, workspace: ReviewWorkspace) -> Result<(), TuiError> {
@@ -746,7 +816,10 @@ async fn load_review(
     repo_path: PathBuf,
     target: ReviewTarget,
 ) -> Result<ReviewSummary, TuiError> {
-    let request = CreateReviewRequest { repo_path, target };
+    let request = CreateReviewRequest {
+        repo_path,
+        target: target.to_model(),
+    };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
         .call_plugin_service(
@@ -799,8 +872,13 @@ async fn load_drafts(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    scope: Option<ModelReviewScope>,
 ) -> Result<Vec<DraftComment>, TuiError> {
-    let request = ListDraftsRequest { repo_path, target };
+    let request = ListDraftsRequest {
+        repo_path,
+        target: target.to_model(),
+        scope,
+    };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
         .call_plugin_service(
@@ -824,11 +902,13 @@ async fn save_draft(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    scope: Option<ModelReviewScope>,
     save: PendingDraftSave,
 ) -> Result<(), TuiError> {
     let request = SaveDraftRequest {
         repo_path,
-        target,
+        target: target.to_model(),
+        scope,
         anchor: save.anchor.into(),
         body: save.body,
     };
@@ -860,6 +940,8 @@ async fn delete_draft(
     };
     let request = DeleteDraftRequest {
         repo_path,
+        target: delete.target,
+        scope: delete.scope,
         comment_id,
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
@@ -888,6 +970,8 @@ async fn update_draft(
 ) -> Result<(), TuiError> {
     let request = UpdateDraftRequest {
         repo_path,
+        target: update.target,
+        scope: update.scope,
         comment_id: update.comment_id,
         body: update.new_body,
     };
@@ -927,7 +1011,7 @@ async fn create_agent_session(
     client
         .send_user_message(session.id, prompt, bcode_ipc::PromptPlacement::FollowUp)
         .await?;
-    link_thread_session(client, repo_path, target, ask.anchor, session.id).await?;
+    link_thread_session(client, repo_path, target, app, ask.anchor, session.id).await?;
     Ok(session.id)
 }
 
@@ -935,12 +1019,14 @@ async fn link_thread_session(
     client: &BcodeClient,
     repo_path: PathBuf,
     target: ReviewTarget,
+    app: &ReviewApp,
     anchor: ReviewCommentAnchor,
     session_id: SessionId,
 ) -> Result<(), TuiError> {
     let request = LinkThreadSessionRequest {
         repo_path,
-        target,
+        target: target.to_model(),
+        scope: Some(review_scope_for_workspace(&app.workspace)),
         anchor: anchor.into(),
         session_id: session_id.to_string(),
     };
@@ -1351,7 +1437,7 @@ pub struct PublishReviewResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct CreateReviewRequest {
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: bcode_code_review_models::ReviewTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1488,13 +1574,17 @@ impl ReviewTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ListDraftsRequest {
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ModelReviewTarget,
+    #[serde(default)]
+    scope: Option<ModelReviewScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct SaveDraftRequest {
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ModelReviewTarget,
+    #[serde(default)]
+    scope: Option<ModelReviewScope>,
     anchor: DraftAnchor,
     body: String,
 }
@@ -1502,6 +1592,9 @@ struct SaveDraftRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DeleteDraftRequest {
     repo_path: PathBuf,
+    target: ModelReviewTarget,
+    #[serde(default)]
+    scope: Option<ModelReviewScope>,
     comment_id: String,
 }
 
@@ -1513,6 +1606,9 @@ struct DeleteDraftResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct UpdateDraftRequest {
     repo_path: PathBuf,
+    target: ModelReviewTarget,
+    #[serde(default)]
+    scope: Option<ModelReviewScope>,
     comment_id: String,
     body: String,
 }
@@ -1526,7 +1622,9 @@ struct UpdateDraftResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct LinkThreadSessionRequest {
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ModelReviewTarget,
+    #[serde(default)]
+    scope: Option<ModelReviewScope>,
     anchor: DraftAnchor,
     session_id: String,
 }
@@ -2073,6 +2171,10 @@ pub struct PendingDraftSave {
 /// Pending draft comment delete request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDraftDelete {
+    /// Review target for persistence scope.
+    pub target: ModelReviewTarget,
+    /// Review scope for persistence.
+    pub scope: Option<ModelReviewScope>,
     /// Deleted anchor.
     pub anchor: ReviewCommentAnchor,
     /// Deleted comment.
@@ -2082,6 +2184,10 @@ pub struct PendingDraftDelete {
 /// Pending draft comment update request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDraftUpdate {
+    /// Review target for persistence scope.
+    pub target: ModelReviewTarget,
+    /// Review scope for persistence.
+    pub scope: Option<ModelReviewScope>,
     /// Edited anchor.
     pub anchor: ReviewCommentAnchor,
     /// Persisted comment id.
@@ -3548,6 +3654,8 @@ impl ReviewApp {
             } => {
                 self.update_local_draft_body(&anchor, &comment_id, text.clone());
                 self.pending_draft_update = Some(PendingDraftUpdate {
+                    target: review_scope_for_workspace(&self.workspace).target().clone(),
+                    scope: Some(review_scope_for_workspace(&self.workspace)),
                     anchor,
                     comment_id,
                     previous_body,
@@ -4045,7 +4153,12 @@ impl ReviewApp {
         if comments.is_empty() {
             self.draft_comments.remove(&anchor);
         }
-        self.pending_draft_delete = Some(PendingDraftDelete { anchor, comment });
+        self.pending_draft_delete = Some(PendingDraftDelete {
+            target: review_scope_for_workspace(&self.workspace).target().clone(),
+            scope: Some(review_scope_for_workspace(&self.workspace)),
+            anchor,
+            comment,
+        });
         self.status_message = Some("deleted draft comment".to_string());
         true
     }

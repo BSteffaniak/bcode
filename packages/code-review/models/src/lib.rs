@@ -393,6 +393,34 @@ pub struct ArchiveReviewWorkspaceResponse {
     pub archived: bool,
 }
 
+/// Stable review scope used for draft persistence and publishing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewScope {
+    /// Legacy target-scoped review.
+    Target {
+        /// Review target.
+        target: ReviewTarget,
+    },
+    /// Durable workspace-scoped review.
+    Workspace {
+        /// Workspace id.
+        workspace_id: String,
+        /// Fallback target for provider operations.
+        target: ReviewTarget,
+    },
+}
+
+impl ReviewScope {
+    /// Return the target associated with this scope.
+    #[must_use]
+    pub const fn target(&self) -> &ReviewTarget {
+        match self {
+            Self::Target { target } | Self::Workspace { target, .. } => target,
+        }
+    }
+}
+
 /// Request payload for `draft.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListDraftsRequest {
@@ -400,6 +428,9 @@ pub struct ListDraftsRequest {
     pub repo_path: PathBuf,
     /// Local Git target whose drafts should be listed.
     pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped drafts.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
 }
 
 /// Request payload for `draft.save`.
@@ -409,6 +440,9 @@ pub struct SaveDraftRequest {
     pub repo_path: PathBuf,
     /// Review target.
     pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped drafts.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
     /// Draft anchor.
     pub anchor: DraftAnchor,
     /// Markdown body.
@@ -422,6 +456,9 @@ pub struct DeleteDraftRequest {
     pub repo_path: PathBuf,
     /// Review target.
     pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped drafts.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
     /// Comment id to delete.
     pub comment_id: String,
 }
@@ -433,6 +470,9 @@ pub struct UpdateDraftRequest {
     pub repo_path: PathBuf,
     /// Review target.
     pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped drafts.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
     /// Comment id to update.
     pub comment_id: String,
     /// Markdown body.
@@ -446,6 +486,9 @@ pub struct LinkThreadSessionRequest {
     pub repo_path: PathBuf,
     /// Review target for the thread.
     pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped drafts.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
     /// Thread anchor.
     pub anchor: DraftAnchor,
     /// Bcode session id.
@@ -459,6 +502,9 @@ pub struct GetReviewThreadRequest {
     pub repo_path: PathBuf,
     /// Review target.
     pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped drafts.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
     /// Thread id to fetch, if known.
     pub thread_id: Option<String>,
     /// Thread anchor to fetch, if thread id is not known.

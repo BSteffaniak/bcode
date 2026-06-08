@@ -17,8 +17,8 @@ use bcode_code_review_models::{
     PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
     ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
     ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewSource, ReviewSourceKind,
-    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewWorkspace,
+    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope, ReviewSource,
+    ReviewSourceKind, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewWorkspace,
     ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest,
     UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
@@ -596,6 +596,7 @@ fn review_context_for_request(
         &ListDraftsRequest {
             repo_path: request.repo_path,
             target: request.target.clone(),
+            scope: None,
         },
         config,
     )?
@@ -636,6 +637,7 @@ fn review_comments_for_request(
         &ListDraftsRequest {
             repo_path: request.repo_path,
             target: request.target,
+            scope: None,
         },
         config,
     )?
@@ -657,6 +659,7 @@ fn review_thread_for_request(
         &ListDraftsRequest {
             repo_path: request.repo_path,
             target: request.target,
+            scope: None,
         },
         config,
     )?
@@ -741,6 +744,7 @@ fn review_bundle_for_request(
             &ListDraftsRequest {
                 repo_path: request.repo_path.clone(),
                 target: request.target.clone(),
+                scope: None,
             },
             config,
         )?
@@ -1401,7 +1405,7 @@ fn list_drafts_for_request(
     config: &CodeReviewPluginConfig,
 ) -> Result<ListDraftsResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
-    let review_key = review_key(&repo_root, &request.target)?;
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
     let drafts = with_database(&repo_root, config, move |database| {
         Box::pin(async move { CodeReviewDb::new(database).list_drafts(&review_key).await })
     })?;
@@ -1414,7 +1418,7 @@ fn save_draft_for_request(
 ) -> Result<SaveDraftResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let db_repo_root = repo_root.clone();
-    let review_key = review_key(&repo_root, &request.target)?;
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
     let target_kind = target_kind(&request.target).to_string();
     let target_json = serde_json::to_string(&request.target)?;
     let draft = with_database(&repo_root, config, move |database| {
@@ -1470,7 +1474,7 @@ fn link_thread_session_for_request(
 ) -> Result<LinkThreadSessionResponse, ReviewError> {
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let db_repo_root = repo_root.clone();
-    let review_key = review_key(&repo_root, &request.target)?;
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
     let target_kind = target_kind(&request.target).to_string();
     let target_json = serde_json::to_string(&request.target)?;
     let response = with_database(&repo_root, config, move |database| {
@@ -2569,6 +2573,20 @@ fn workspace_id(repo_root: &Path, title: &str, now: u64) -> String {
     hasher.update(b"\0");
     hasher.update(now.to_string().as_bytes());
     format!("workspace-{:x}", hasher.finalize())
+}
+
+fn review_key_for_scope(
+    repo_root: &Path,
+    target: &ReviewTarget,
+    scope: Option<&ReviewScope>,
+) -> Result<String, ReviewError> {
+    match scope {
+        Some(ReviewScope::Workspace { workspace_id, .. }) => {
+            Ok(format!("review-workspace-{workspace_id}"))
+        }
+        Some(ReviewScope::Target { target }) => review_key(repo_root, target),
+        None => review_key(repo_root, target),
+    }
 }
 
 fn review_key(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewError> {
