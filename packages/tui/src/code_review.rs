@@ -1236,6 +1236,10 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('m') => app.toggle_ux_mode(),
         KeyCode::Char('+') => app.add_selected_file_to_workspace(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
+        KeyCode::Char(' ') => app.toggle_selected_build_source(),
+        KeyCode::Char('r') => app.open_rename_source_prompt(),
+        KeyCode::Char('[') => app.move_selected_source_up(),
+        KeyCode::Char(']') => app.move_selected_source_down(),
         KeyCode::Char('-') => app.remove_selected_build_source(),
         KeyCode::Char('t') => app.toggle_sidebar_mode(),
         KeyCode::Char('f') => app.open_file_picker(),
@@ -2347,6 +2351,8 @@ pub enum ReviewPromptKind {
     AddFileSource,
     /// Add a file range source to the workspace.
     AddFileRangeSource,
+    /// Rename the selected source.
+    RenameSource,
 }
 
 /// Active one-line prompt state.
@@ -2550,6 +2556,22 @@ impl ReviewApp {
         true
     }
 
+    /// Open rename-source prompt for the selected workspace source.
+    pub fn open_rename_source_prompt(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let Some(source) = self.workspace.sources.get(self.selected_build_row) else {
+            self.status_message = Some("select an included source to rename".to_string());
+            return true;
+        };
+        let mut prompt = ReviewPromptState::new(ReviewPromptKind::RenameSource);
+        prompt.buffer.insert_str(&source.label);
+        self.prompt_state = Some(prompt);
+        self.status_message = Some("rename source".to_string());
+        true
+    }
+
     /// Open fuzzy file picker prompt.
     pub fn open_file_picker(&mut self) -> bool {
         self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::FilePicker));
@@ -2592,6 +2614,7 @@ impl ReviewApp {
             ReviewPromptKind::AddCommitRangeSource => self.submit_add_commit_range_source(&text),
             ReviewPromptKind::AddFileSource => self.submit_add_file_source(&text),
             ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
+            ReviewPromptKind::RenameSource => self.submit_rename_source(&text),
         }
     }
 
@@ -2716,6 +2739,22 @@ impl ReviewApp {
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         self.status_message = Some(format!("added {label}"));
+        true
+    }
+
+    fn submit_rename_source(&mut self, text: &str) -> bool {
+        let label = text.trim();
+        if label.is_empty() {
+            self.status_message = Some("source label cannot be empty".to_string());
+            return true;
+        }
+        let Some(source) = self.workspace.sources.get_mut(self.selected_build_row) else {
+            self.status_message = Some("select an included source to rename".to_string());
+            return true;
+        };
+        source.label = label.to_string();
+        self.pending_workspace_save = true;
+        self.status_message = Some(format!("renamed source to {label}"));
         true
     }
 
@@ -3074,6 +3113,63 @@ impl ReviewApp {
             return true;
         }
         self.push_workspace_source(ReviewSourceKind::File { path })
+    }
+
+    /// Toggle whether the selected workspace source is included.
+    pub fn toggle_selected_build_source(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let Some(source) = self.workspace.sources.get_mut(self.selected_build_row) else {
+            self.status_message = Some("select an included source to toggle".to_string());
+            return true;
+        };
+        source.included = !source.included;
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(format!(
+            "{} {}",
+            if source.included {
+                "included"
+            } else {
+                "excluded"
+            },
+            source.label
+        ));
+        true
+    }
+
+    /// Move the selected workspace source earlier.
+    pub fn move_selected_source_up(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.selected_build_row == 0 || self.selected_build_row >= self.workspace.sources.len() {
+            return false;
+        }
+        self.workspace
+            .sources
+            .swap(self.selected_build_row, self.selected_build_row - 1);
+        self.selected_build_row -= 1;
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        true
+    }
+
+    /// Move the selected workspace source later.
+    pub fn move_selected_source_down(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build
+            || self.selected_build_row.saturating_add(1) >= self.workspace.sources.len()
+        {
+            return false;
+        }
+        self.workspace
+            .sources
+            .swap(self.selected_build_row, self.selected_build_row + 1);
+        self.selected_build_row += 1;
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        true
     }
 
     /// Remove selected build source from the workspace.

@@ -194,7 +194,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 });
             }
             if app.ux_mode == super::code_review::ReviewUxMode::Build {
-                return " build mode  j/k move  + add selected file  A add by path  - remove selected source  m review mode  f picker  enter inspect/open  t sidebar-tab  b sidebar  ? help  q exit ".to_string();
+                return " build mode  j/k move  space include/exclude  A add source  r rename  [/] reorder  - remove  m review mode  f picker  ? help  q exit ".to_string();
             }
             if app.review.is_repository_review() {
                 return format!(
@@ -580,7 +580,7 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
     rows.push((String::new(), String::new(), false));
     rows.push((
-        "+ add selected file   A add by path   - remove selected source   m review mode"
+        "toggle-space   + add selected file   A add source   r rename   [/] reorder   - remove source   m review mode"
             .to_string(),
         String::new(),
         false,
@@ -940,9 +940,12 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         "",
         " m                   switch to review mode",
         " j/k or arrows       move selection",
-        " +                   add selected file source",
-        " A                   add source by path",
-        " -                   remove selected source",
+        " space              include/exclude selected source",
+        " +                  add selected file source",
+        " A                  add source by kind/path/range",
+        " r                  rename selected source",
+        " [/]                move selected source up/down",
+        " -                  remove selected source",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",
         " t                   cycle included/repo/threads/sources",
@@ -1290,12 +1293,8 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
-fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
-    let Some(prompt) = &app.prompt_state else {
-        return;
-    };
-    let width = area.width.min(80);
-    let height = match prompt.kind {
+fn prompt_popup_height(kind: ReviewPromptKind, area: Rect) -> u16 {
+    match kind {
         ReviewPromptKind::FilePicker => area.height.min(16),
         ReviewPromptKind::JumpToLine
         | ReviewPromptKind::FileSearch
@@ -1303,8 +1302,31 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         | ReviewPromptKind::AddCommitSource
         | ReviewPromptKind::AddCommitRangeSource
         | ReviewPromptKind::AddFileSource
-        | ReviewPromptKind::AddFileRangeSource => area.height.min(5),
+        | ReviewPromptKind::AddFileRangeSource
+        | ReviewPromptKind::RenameSource => area.height.min(5),
+    }
+}
+
+const fn prompt_title(kind: ReviewPromptKind) -> &'static str {
+    match kind {
+        ReviewPromptKind::FilePicker => " Open file ",
+        ReviewPromptKind::JumpToLine => " Jump to line ",
+        ReviewPromptKind::FileSearch => " Search file ",
+        ReviewPromptKind::AddSourceKind => " Add source ",
+        ReviewPromptKind::AddCommitSource => " Add commit ",
+        ReviewPromptKind::AddCommitRangeSource => " Add range ",
+        ReviewPromptKind::AddFileSource => " Add file ",
+        ReviewPromptKind::AddFileRangeSource => " Add file range ",
+        ReviewPromptKind::RenameSource => " Rename source ",
+    }
+}
+
+fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some(prompt) = &app.prompt_state else {
+        return;
     };
+    let width = area.width.min(80);
+    let height = prompt_popup_height(prompt.kind, area);
     if width < 20 || height < 3 {
         return;
     }
@@ -1314,16 +1336,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
     frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
-    let title = match prompt.kind {
-        ReviewPromptKind::FilePicker => " Open file ",
-        ReviewPromptKind::JumpToLine => " Jump to line ",
-        ReviewPromptKind::FileSearch => " Search file ",
-        ReviewPromptKind::AddSourceKind => " Add source ",
-        ReviewPromptKind::AddCommitSource => " Add commit ",
-        ReviewPromptKind::AddCommitRangeSource => " Add range ",
-        ReviewPromptKind::AddFileSource => " Add file ",
-        ReviewPromptKind::AddFileRangeSource => " Add file range ",
-    };
+    let title = prompt_title(prompt.kind);
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),
         &Line::from_spans(vec![Span::styled(
