@@ -1244,6 +1244,18 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('m') => app.toggle_ux_mode(),
         KeyCode::Char('+') => app.add_selected_file_to_workspace(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
+        KeyCode::Char('u') if app.ux_mode == ReviewUxMode::Build => {
+            app.add_quick_source(ReviewSourceKind::WorkingTreeUnstaged)
+        }
+        KeyCode::Char('s') if app.ux_mode == ReviewUxMode::Build => {
+            app.add_quick_source(ReviewSourceKind::IndexStaged)
+        }
+        KeyCode::Char('w') if app.ux_mode == ReviewUxMode::Build => {
+            app.add_quick_source(ReviewSourceKind::WorkingTreeAndIndex)
+        }
+        KeyCode::Char('l') if app.ux_mode == ReviewUxMode::Build => {
+            app.add_quick_source(ReviewSourceKind::LastCommit)
+        }
         KeyCode::Char(' ') => app.toggle_selected_build_source(),
         KeyCode::Char('r') => app.open_rename_source_prompt(),
         KeyCode::Char('[') => app.move_selected_source_up(),
@@ -3286,6 +3298,14 @@ impl ReviewApp {
         let pending = self.pending_workspace_reload;
         self.pending_workspace_reload = false;
         pending
+    }
+
+    /// Add a quick source while in build mode.
+    pub fn add_quick_source(&mut self, kind: ReviewSourceKind) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        self.push_workspace_source(kind)
     }
 
     /// Add the selected file as an included workspace source.

@@ -197,7 +197,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 let source_hint = if app.workspace.sources.is_empty() {
                     "no sources yet — press A to add one"
                 } else {
-                    "j/k move  space include/exclude  A add source  r rename  [/] reorder  - remove"
+                    "j/k move  u/s/w/l quick add  space include/exclude  A more sources  r rename  [/] reorder  - remove"
                 };
                 return format!(
                     " build mode  {source_hint}  m review mode  f picker  ? help  q exit "
@@ -623,7 +623,7 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
     rows.push((String::new(), String::new(), false));
     rows.push((
-        "toggle-space   + add selected file   A add source   r rename   [/] reorder   - remove source   m review mode"
+        "toggle-space   u/s/w/l quick add   + add file   A more sources   r rename   [/] reorder   - remove source   m review mode"
             .to_string(),
         String::new(),
         false,
@@ -985,7 +985,8 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " j/k or arrows       move selection",
         " space              include/exclude selected source",
         " +                  add selected file source",
-        " A                  add source by kind/path/range",
+        " u/s/w/l            quick add unstaged/staged/worktree/last commit",
+        " A                  add more source types",
         " r                  rename selected source",
         " [/]                move selected source up/down",
         " -                  remove selected source",
