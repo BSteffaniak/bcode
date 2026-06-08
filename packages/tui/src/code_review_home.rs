@@ -1011,7 +1011,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " F/B                 next/previous draft review",
         " p/P                 next/previous published review",
         " j/k or arrows       move selection",
-        " /                   search title, source, branch, commit, file, id",
+        " /                   search title, health, source, branch, commit, publish, id",
         " a                   show/hide archived reviews",
         " D                   show only reviews with drafts",
         " d                   show/hide details pane",
@@ -1274,6 +1274,21 @@ fn workspace_sort_timestamp(workspace: &ReviewWorkspace) -> u64 {
 fn workspace_item_matches_query(item: &ReviewWorkspaceListItem, query: &str) -> bool {
     item.thread_count.to_string().contains(query)
         || item.draft_count.to_string().contains(query)
+        || workspace_health_label(item).contains(query)
+        || workspace_next_action(item).contains(query)
+        || item.last_publish.as_ref().is_some_and(|publish| {
+            publish.publisher_id.to_ascii_lowercase().contains(query)
+                || publish.review_id.to_ascii_lowercase().contains(query)
+                || publish
+                    .workspace_id
+                    .as_deref()
+                    .is_some_and(|workspace_id| workspace_id.to_ascii_lowercase().contains(query))
+                || publish
+                    .output
+                    .as_deref()
+                    .is_some_and(|output| output.to_ascii_lowercase().contains(query))
+                || publish.message.to_ascii_lowercase().contains(query)
+        })
         || workspace_matches_query(&item.workspace, query)
 }
 
@@ -1493,7 +1508,8 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         )
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: n new, u/s/w/l presets, / search, ? help".to_string()
+                            "review home: n new, u/s/w/l presets, / search title/health/source/publish, ? help"
+                        .to_string()
                         })
                     }
                 },
@@ -1550,6 +1566,28 @@ mod tests {
             draft_count: 0,
             last_publish: None,
         }
+    }
+
+    #[test]
+    fn search_matches_health_and_publish_metadata() {
+        let mut published = item(workspace("review", vec![source("source", true)], false));
+        published.last_publish = Some(ReviewPublishRecord {
+            id: "publish-1".to_string(),
+            workspace_id: Some("review".to_string()),
+            review_id: "github-review".to_string(),
+            publisher_id: "github".to_string(),
+            submitted: true,
+            output: Some("https://example.test/pr/1".to_string()),
+            message: "submitted".to_string(),
+            created_at_ms: 4,
+        });
+        let setup = item(workspace("new-review", Vec::new(), false));
+
+        assert!(workspace_item_matches_query(&setup, "setup"));
+        assert!(workspace_item_matches_query(&published, "published"));
+        assert!(workspace_item_matches_query(&published, "github"));
+        assert!(workspace_item_matches_query(&published, "example.test"));
+        assert!(workspace_item_matches_query(&published, "submitted"));
     }
 
     #[test]
