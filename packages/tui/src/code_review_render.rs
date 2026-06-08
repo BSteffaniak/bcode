@@ -1472,6 +1472,8 @@ fn prompt_popup_height(kind: &ReviewPromptKind, area: Rect) -> u16 {
         | ReviewPromptKind::AddFileSourcePicker
         | ReviewPromptKind::AddFileRangePathPicker
         | ReviewPromptKind::AddCommitPicker
+        | ReviewPromptKind::AddCommitRangeBasePicker
+        | ReviewPromptKind::AddCommitRangeHeadPicker { .. }
         | ReviewPromptKind::AddBranchCompareBasePicker
         | ReviewPromptKind::AddBranchCompareHeadPicker { .. } => area.height.min(16),
         ReviewPromptKind::JumpToLine
@@ -1492,6 +1494,8 @@ const fn prompt_title(kind: &ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddSourceKind => " Add source ",
         ReviewPromptKind::AddCommitPicker => " Pick commit ",
         ReviewPromptKind::AddCommitSource => " Add commit ",
+        ReviewPromptKind::AddCommitRangeBasePicker => " Pick base commit ",
+        ReviewPromptKind::AddCommitRangeHeadPicker { .. } => " Pick head commit ",
         ReviewPromptKind::AddCommitRangeSource => " Add range ",
         ReviewPromptKind::AddBranchCompareBasePicker => " Pick base branch ",
         ReviewPromptKind::AddBranchCompareHeadPicker { .. } => " Pick head branch ",
@@ -1583,7 +1587,9 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         ReviewPromptKind::AddFileSourcePicker | ReviewPromptKind::AddFileRangePathPicker => {
             render_add_repository_file_picker(app, prompt, popup, height, query, frame);
         }
-        ReviewPromptKind::AddCommitPicker => {
+        ReviewPromptKind::AddCommitPicker
+        | ReviewPromptKind::AddCommitRangeBasePicker
+        | ReviewPromptKind::AddCommitRangeHeadPicker { .. } => {
             render_add_repository_commit_picker(app, prompt, popup, height, query, frame);
         }
         ReviewPromptKind::AddBranchCompareBasePicker
@@ -1728,6 +1734,12 @@ const fn prompt_footer_text(kind: &ReviewPromptKind) -> &'static str {
         }
         ReviewPromptKind::AddCommitPicker => {
             " ↑/↓ choose commit  enter add commit source  esc cancel "
+        }
+        ReviewPromptKind::AddCommitRangeBasePicker => {
+            " ↑/↓ choose base commit  enter select  esc cancel "
+        }
+        ReviewPromptKind::AddCommitRangeHeadPicker { .. } => {
+            " ↑/↓ choose head commit  enter add range  esc cancel "
         }
         ReviewPromptKind::AddCommitRangeSource | ReviewPromptKind::AddBranchCompareSource => {
             " enter base..head or base...head  esc cancel "

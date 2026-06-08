@@ -2427,6 +2427,10 @@ pub enum ReviewPromptKind {
     AddCommitPicker,
     /// Add a commit source to the workspace.
     AddCommitSource,
+    /// Pick a base commit for a commit range source.
+    AddCommitRangeBasePicker,
+    /// Pick a head commit for a commit range source.
+    AddCommitRangeHeadPicker { base_rev: String },
     /// Add a commit range source to the workspace.
     AddCommitRangeSource,
     /// Pick a base branch for a branch compare source.
@@ -2808,6 +2812,25 @@ impl ReviewApp {
         true
     }
 
+    /// Open add-commit-range base picker.
+    pub fn open_add_commit_range_base_picker(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.review.repository_commits.is_empty() {
+            self.prompt_state = Some(ReviewPromptState::new(
+                ReviewPromptKind::AddCommitRangeSource,
+            ));
+            self.status_message = Some("add commit range: base..head or base...head".to_string());
+            return true;
+        }
+        self.prompt_state = Some(ReviewPromptState::new(
+            ReviewPromptKind::AddCommitRangeBasePicker,
+        ));
+        self.status_message = Some("add commit range: pick base commit".to_string());
+        true
+    }
+
     /// Open add-branch-compare base picker.
     pub fn open_add_branch_compare_base_picker(&mut self) -> bool {
         if self.ux_mode != ReviewUxMode::Build {
@@ -2894,6 +2917,12 @@ impl ReviewApp {
                 self.submit_add_commit_picker(&text, prompt.selected)
             }
             ReviewPromptKind::AddCommitSource => self.submit_add_commit_source(&text),
+            ReviewPromptKind::AddCommitRangeBasePicker => {
+                self.submit_add_commit_range_base_picker(&text, prompt.selected)
+            }
+            ReviewPromptKind::AddCommitRangeHeadPicker { base_rev } => {
+                self.submit_add_commit_range_head_picker(&base_rev, &text, prompt.selected)
+            }
             ReviewPromptKind::AddCommitRangeSource => self.submit_add_commit_range_source(&text),
             ReviewPromptKind::AddBranchCompareBasePicker => {
                 self.submit_add_branch_compare_base_picker(&text, prompt.selected)
@@ -2917,34 +2946,25 @@ impl ReviewApp {
 
     fn start_add_source_kind(&mut self, kind: AddSourceMenuKind) -> bool {
         match kind {
-            AddSourceMenuKind::File => return self.open_add_file_source_picker(),
-            AddSourceMenuKind::FileRange => return self.open_add_file_range_path_picker(),
-            AddSourceMenuKind::Commit => return self.open_add_commit_picker(),
-            AddSourceMenuKind::CommitRange => {
-                self.prompt_state = Some(ReviewPromptState::new(
-                    ReviewPromptKind::AddCommitRangeSource,
-                ));
-                self.status_message =
-                    Some("add commit range: base..head or base...head".to_string());
-            }
-            AddSourceMenuKind::BranchCompare => return self.open_add_branch_compare_base_picker(),
-            AddSourceMenuKind::Staged => {
-                return self.push_workspace_source(ReviewSourceKind::IndexStaged);
-            }
+            AddSourceMenuKind::File => self.open_add_file_source_picker(),
+            AddSourceMenuKind::FileRange => self.open_add_file_range_path_picker(),
+            AddSourceMenuKind::Commit => self.open_add_commit_picker(),
+            AddSourceMenuKind::CommitRange => self.open_add_commit_range_base_picker(),
+            AddSourceMenuKind::BranchCompare => self.open_add_branch_compare_base_picker(),
+            AddSourceMenuKind::Staged => self.push_workspace_source(ReviewSourceKind::IndexStaged),
             AddSourceMenuKind::Unstaged => {
-                return self.push_workspace_source(ReviewSourceKind::WorkingTreeUnstaged);
+                self.push_workspace_source(ReviewSourceKind::WorkingTreeUnstaged)
             }
             AddSourceMenuKind::WorkingTree => {
-                return self.push_workspace_source(ReviewSourceKind::WorkingTreeAndIndex);
+                self.push_workspace_source(ReviewSourceKind::WorkingTreeAndIndex)
             }
             AddSourceMenuKind::LastCommit => {
-                return self.push_workspace_source(ReviewSourceKind::LastCommit);
+                self.push_workspace_source(ReviewSourceKind::LastCommit)
             }
             AddSourceMenuKind::Repository => {
-                return self.push_workspace_source(ReviewSourceKind::Repository);
+                self.push_workspace_source(ReviewSourceKind::Repository)
             }
         }
-        true
     }
 
     fn submit_add_source_kind(&mut self, text: &str, selected: usize) -> bool {
@@ -3014,6 +3034,51 @@ impl ReviewApp {
         }
         self.push_workspace_source(ReviewSourceKind::Commit {
             rev: rev.to_string(),
+        })
+    }
+
+    fn submit_add_commit_range_base_picker(&mut self, query: &str, selected: usize) -> bool {
+        let matches = self.repository_commit_picker_matches(query);
+        let Some(commit) = matches
+            .get(selected)
+            .cloned()
+            .or_else(|| matches.first().cloned())
+        else {
+            self.status_message = Some(format!("no commit matches `{query}`"));
+            return true;
+        };
+        self.prompt_state = Some(ReviewPromptState::new(
+            ReviewPromptKind::AddCommitRangeHeadPicker {
+                base_rev: commit.rev,
+            },
+        ));
+        self.status_message = Some("add commit range: pick head commit".to_string());
+        true
+    }
+
+    fn submit_add_commit_range_head_picker(
+        &mut self,
+        base_rev: &str,
+        query: &str,
+        selected: usize,
+    ) -> bool {
+        let matches = self.repository_commit_picker_matches(query);
+        let Some(commit) = matches
+            .get(selected)
+            .cloned()
+            .or_else(|| matches.first().cloned())
+        else {
+            self.status_message = Some(format!("no commit matches `{query}`"));
+            return true;
+        };
+        if base_rev == commit.rev {
+            self.status_message = Some("base and head commit must differ".to_string());
+            return true;
+        }
+        self.push_workspace_source(ReviewSourceKind::CommitRange {
+            base: base_rev.to_string(),
+            head: commit.rev,
+            merge_base: true,
         })
     }
 
@@ -3326,6 +3391,8 @@ impl ReviewApp {
             ReviewPromptKind::FilePicker
                 | ReviewPromptKind::AddSourceKind
                 | ReviewPromptKind::AddCommitPicker
+                | ReviewPromptKind::AddCommitRangeBasePicker
+                | ReviewPromptKind::AddCommitRangeHeadPicker { .. }
                 | ReviewPromptKind::AddFileSourcePicker
                 | ReviewPromptKind::AddFileRangePathPicker
                 | ReviewPromptKind::AddBranchCompareBasePicker
@@ -3335,7 +3402,9 @@ impl ReviewApp {
         }
         let max = match &prompt.kind {
             ReviewPromptKind::AddSourceKind => add_source_menu_items().len().saturating_sub(1),
-            ReviewPromptKind::AddCommitPicker => self
+            ReviewPromptKind::AddCommitPicker
+            | ReviewPromptKind::AddCommitRangeBasePicker
+            | ReviewPromptKind::AddCommitRangeHeadPicker { .. } => self
                 .repository_commit_picker_matches(prompt.buffer.text())
                 .len()
                 .saturating_sub(1),
@@ -3371,6 +3440,8 @@ impl ReviewApp {
             ReviewPromptKind::FilePicker
                 | ReviewPromptKind::AddSourceKind
                 | ReviewPromptKind::AddCommitPicker
+                | ReviewPromptKind::AddCommitRangeBasePicker
+                | ReviewPromptKind::AddCommitRangeHeadPicker { .. }
                 | ReviewPromptKind::AddFileSourcePicker
                 | ReviewPromptKind::AddFileRangePathPicker
                 | ReviewPromptKind::AddBranchCompareBasePicker
