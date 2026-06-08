@@ -756,7 +756,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "enter open/toggle   I/E/V include/exclude/invert   M merge-base   X purge excluded   A source menu   m review"
+        "enter open/toggle   C edit source   I/E/V include/exclude/invert   M merge-base   X purge excluded   m review"
             .to_string(),
         String::new(),
         false,
@@ -1129,8 +1129,8 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " R                  refresh/rematerialize sources",
         " I/E/V              include all / exclude all / invert sources",
         " M/X                merge-base toggle / remove excluded",
-        " r                  rename selected source",
-        " -                  remove selected source",
+        " C                  change selected source spec",
+        " r/-                rename / remove selected source",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",
         " t                   cycle included/repo/threads/sources",
@@ -1496,6 +1496,7 @@ fn prompt_popup_height(kind: &ReviewPromptKind, area: Rect) -> u16 {
         | ReviewPromptKind::AddBranchCompareSource
         | ReviewPromptKind::AddFileRangeSource
         | ReviewPromptKind::RenameWorkspace
+        | ReviewPromptKind::EditSourceSpec { .. }
         | ReviewPromptKind::RenameSource => area.height.min(5),
     }
 }
@@ -1519,6 +1520,7 @@ const fn prompt_title(kind: &ReviewPromptKind) -> &'static str {
             " Add file range "
         }
         ReviewPromptKind::RenameWorkspace => " Rename workspace ",
+        ReviewPromptKind::EditSourceSpec { .. } => " Edit source ",
         ReviewPromptKind::RenameSource => " Rename source ",
     }
 }
@@ -1771,6 +1773,7 @@ const fn prompt_footer_text(kind: &ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddFileRangePathPicker => {
             " ↑/↓ choose file  enter pick file  esc cancel "
         }
+        ReviewPromptKind::EditSourceSpec { .. } => " enter update source  esc cancel ",
         _ => " enter submit  esc cancel ",
     }
 }

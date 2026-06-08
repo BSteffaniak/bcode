@@ -1280,6 +1280,7 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
         KeyCode::Char('I') => app.include_all_sources(),
         KeyCode::Char('E') => app.exclude_all_sources(),
         KeyCode::Char('V') => app.invert_source_inclusion(),
+        KeyCode::Char('C') => app.open_edit_source_spec_prompt(),
         KeyCode::Char('M') => app.toggle_selected_source_merge_base(),
         KeyCode::Char('X') => app.remove_excluded_sources(),
         KeyCode::Char(' ') => app.toggle_selected_build_source(),
@@ -2277,6 +2278,66 @@ pub struct ReviewDraftComment {
     pub session_id: Option<String>,
 }
 
+fn parse_range_spec(text: &str) -> Option<(&str, &str, bool)> {
+    text.split_once("...")
+        .map(|(base, head)| (base, head, true))
+        .or_else(|| {
+            text.split_once("..")
+                .map(|(base, head)| (base, head, false))
+        })
+}
+
+fn parse_file_range_spec(text: &str) -> Option<(String, u32, u32)> {
+    let (path, range) = text.rsplit_once(':')?;
+    let (start, end) = range.split_once('-')?;
+    let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) else {
+        return None;
+    };
+    let path = path.trim();
+    if path.is_empty() || start == 0 || end == 0 || start > end {
+        return None;
+    }
+    Some((path.to_string(), start, end))
+}
+
+fn edit_source_prompt_value(kind: &ReviewSourceKind) -> Option<(EditSourceTargetKind, String)> {
+    match kind {
+        ReviewSourceKind::Commit { rev } => Some((EditSourceTargetKind::Commit, rev.clone())),
+        ReviewSourceKind::CommitRange {
+            base,
+            head,
+            merge_base,
+        } => {
+            let separator = if *merge_base { "..." } else { ".." };
+            Some((
+                EditSourceTargetKind::CommitRange,
+                format!("{base}{separator}{head}"),
+            ))
+        }
+        ReviewSourceKind::BranchCompare {
+            base_branch,
+            head_branch,
+            merge_base,
+        } => {
+            let separator = if *merge_base { "..." } else { ".." };
+            Some((
+                EditSourceTargetKind::BranchCompare,
+                format!("{base_branch}{separator}{head_branch}"),
+            ))
+        }
+        ReviewSourceKind::File { path } => Some((EditSourceTargetKind::File, path.clone())),
+        ReviewSourceKind::FileRange { path, start, end } => Some((
+            EditSourceTargetKind::FileRange,
+            format!("{path}:{start}-{end}"),
+        )),
+        ReviewSourceKind::WorkingTreeUnstaged
+        | ReviewSourceKind::IndexStaged
+        | ReviewSourceKind::WorkingTreeAndIndex
+        | ReviewSourceKind::LastCommit
+        | ReviewSourceKind::Repository => None,
+    }
+}
+
 /// Pending draft comment persistence request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDraftSave {
@@ -2446,6 +2507,21 @@ pub struct ReviewPublishOption {
     pub value: String,
 }
 
+/// Source kind that should be edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditSourceTargetKind {
+    /// Commit source.
+    Commit,
+    /// Commit range source.
+    CommitRange,
+    /// Branch compare source.
+    BranchCompare,
+    /// File source.
+    File,
+    /// File range source.
+    FileRange,
+}
+
 /// Active review prompt kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewPromptKind {
@@ -2481,6 +2557,8 @@ pub enum ReviewPromptKind {
     AddFileRangeSource,
     /// Rename the review workspace.
     RenameWorkspace,
+    /// Edit the selected source specification.
+    EditSourceSpec { target_kind: EditSourceTargetKind },
     /// Rename the selected source.
     RenameSource,
 }
@@ -2818,6 +2896,30 @@ impl ReviewApp {
         true
     }
 
+    /// Open edit-source-spec prompt for the selected workspace source.
+    pub fn open_edit_source_spec_prompt(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let Some(index) = self.selected_build_source_index() else {
+            self.status_message = Some("select an editable source to change".to_string());
+            return true;
+        };
+        let Some(source) = self.workspace.sources.get(index) else {
+            self.status_message = Some("select an editable source to change".to_string());
+            return true;
+        };
+        let Some((target_kind, value)) = edit_source_prompt_value(&source.kind) else {
+            self.status_message = Some("selected source has no editable spec".to_string());
+            return true;
+        };
+        let mut prompt = ReviewPromptState::new(ReviewPromptKind::EditSourceSpec { target_kind });
+        prompt.buffer.insert_str(&value);
+        self.prompt_state = Some(prompt);
+        self.status_message = Some("edit source spec".to_string());
+        true
+    }
+
     /// Open rename-source prompt for the selected workspace source.
     pub fn open_rename_source_prompt(&mut self) -> bool {
         if self.ux_mode != ReviewUxMode::Build {
@@ -2988,6 +3090,9 @@ impl ReviewApp {
                 self.submit_add_file_range_path_picker(&text, prompt.selected)
             }
             ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
+            ReviewPromptKind::EditSourceSpec { target_kind } => {
+                self.submit_edit_source_spec(target_kind, &text)
+            }
             ReviewPromptKind::RenameWorkspace => self.submit_rename_workspace(&text),
             ReviewPromptKind::RenameSource => self.submit_rename_source(&text),
         }
@@ -3132,14 +3237,13 @@ impl ReviewApp {
     }
 
     fn submit_add_commit_range_source(&mut self, text: &str) -> bool {
-        let Some((base, head)) = text.split_once("...").or_else(|| text.split_once("..")) else {
+        let Some((base, head, merge_base)) = parse_range_spec(text) else {
             self.status_message = Some("enter range as base..head or base...head".to_string());
             return true;
         };
         if !self.validate_non_empty_pair(base, head, "range endpoints cannot be empty") {
             return true;
         }
-        let merge_base = text.contains("...");
         self.push_workspace_source(ReviewSourceKind::CommitRange {
             base: base.trim().to_string(),
             head: head.trim().to_string(),
@@ -3148,9 +3252,7 @@ impl ReviewApp {
     }
 
     fn submit_add_branch_compare_source(&mut self, text: &str) -> bool {
-        let Some((base_branch, head_branch)) =
-            text.split_once("...").or_else(|| text.split_once(".."))
-        else {
+        let Some((base_branch, head_branch, merge_base)) = parse_range_spec(text) else {
             self.status_message =
                 Some("enter branch compare as base..head or base...head".to_string());
             return true;
@@ -3158,7 +3260,6 @@ impl ReviewApp {
         if !self.validate_non_empty_pair(base_branch, head_branch, "branch names cannot be empty") {
             return true;
         }
-        let merge_base = text.contains("...");
         self.push_workspace_source(ReviewSourceKind::BranchCompare {
             base_branch: base_branch.trim().to_string(),
             head_branch: head_branch.trim().to_string(),
@@ -3240,29 +3341,11 @@ impl ReviewApp {
     }
 
     fn submit_add_file_range_source(&mut self, text: &str) -> bool {
-        let Some((path, range)) = text.rsplit_once(':') else {
+        let Some((path, start, end)) = parse_file_range_spec(text) else {
             self.status_message = Some("enter file range as path:start-end".to_string());
             return true;
         };
-        let Some((start, end)) = range.split_once('-') else {
-            self.status_message = Some("enter file range as path:start-end".to_string());
-            return true;
-        };
-        let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) else {
-            self.status_message = Some("file range line numbers must be numeric".to_string());
-            return true;
-        };
-        let path = path.trim();
-        if path.is_empty() || start == 0 || end == 0 || start > end {
-            self.status_message =
-                Some("file range must be path:start-end with start <= end".to_string());
-            return true;
-        }
-        self.push_workspace_source(ReviewSourceKind::FileRange {
-            path: path.to_string(),
-            start,
-            end,
-        })
+        self.push_workspace_source(ReviewSourceKind::FileRange { path, start, end })
     }
 
     fn sync_review_workspace(&mut self) {
@@ -3318,6 +3401,110 @@ impl ReviewApp {
         self.pending_workspace_reload = true;
         self.status_message = Some(format!("added {label}"));
         true
+    }
+
+    fn replace_selected_source_kind(&mut self, kind: ReviewSourceKind) -> bool {
+        let Some(index) = self.selected_build_source_index() else {
+            self.status_message = Some("select an editable source to change".to_string());
+            return true;
+        };
+        if self
+            .workspace
+            .sources
+            .iter()
+            .enumerate()
+            .any(|(source_index, source)| source_index != index && source.kind == kind)
+        {
+            self.status_message = Some(format!("{} is already included", kind.label()));
+            return true;
+        }
+        let label = kind.label();
+        let Some(source) = self.workspace.sources.get_mut(index) else {
+            self.status_message = Some("select an editable source to change".to_string());
+            return true;
+        };
+        source.kind = kind;
+        source.label.clone_from(&label);
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(format!("updated source to {label}"));
+        true
+    }
+
+    fn submit_edit_source_spec(&mut self, target_kind: EditSourceTargetKind, text: &str) -> bool {
+        match target_kind {
+            EditSourceTargetKind::Commit => self.submit_edit_commit_source(text),
+            EditSourceTargetKind::CommitRange => self.submit_edit_commit_range_source(text),
+            EditSourceTargetKind::BranchCompare => self.submit_edit_branch_compare_source(text),
+            EditSourceTargetKind::File => self.submit_edit_file_source(text),
+            EditSourceTargetKind::FileRange => self.submit_edit_file_range_source(text),
+        }
+    }
+
+    fn submit_edit_commit_source(&mut self, text: &str) -> bool {
+        let rev = text.trim();
+        if rev.is_empty() {
+            self.status_message = Some("commit revision cannot be empty".to_string());
+            return true;
+        }
+        self.replace_selected_source_kind(ReviewSourceKind::Commit {
+            rev: rev.to_string(),
+        })
+    }
+
+    fn submit_edit_commit_range_source(&mut self, text: &str) -> bool {
+        let Some((base, head, merge_base)) = parse_range_spec(text) else {
+            self.status_message = Some("enter range as base..head or base...head".to_string());
+            return true;
+        };
+        if !self.validate_non_empty_pair(base, head, "range endpoints cannot be empty") {
+            return true;
+        }
+        self.replace_selected_source_kind(ReviewSourceKind::CommitRange {
+            base: base.trim().to_string(),
+            head: head.trim().to_string(),
+            merge_base,
+        })
+    }
+
+    fn submit_edit_branch_compare_source(&mut self, text: &str) -> bool {
+        let Some((base_branch, head_branch, merge_base)) = parse_range_spec(text) else {
+            self.status_message =
+                Some("enter branch compare as base..head or base...head".to_string());
+            return true;
+        };
+        if !self.validate_non_empty_pair(
+            base_branch,
+            head_branch,
+            "branch compare endpoints cannot be empty",
+        ) {
+            return true;
+        }
+        self.replace_selected_source_kind(ReviewSourceKind::BranchCompare {
+            base_branch: base_branch.trim().to_string(),
+            head_branch: head_branch.trim().to_string(),
+            merge_base,
+        })
+    }
+
+    fn submit_edit_file_source(&mut self, text: &str) -> bool {
+        let path = text.trim();
+        if path.is_empty() {
+            self.status_message = Some("file path cannot be empty".to_string());
+            return true;
+        }
+        self.replace_selected_source_kind(ReviewSourceKind::File {
+            path: path.to_string(),
+        })
+    }
+
+    fn submit_edit_file_range_source(&mut self, text: &str) -> bool {
+        let Some((path, start, end)) = parse_file_range_spec(text) else {
+            self.status_message = Some("enter file range as path:start-end".to_string());
+            return true;
+        };
+        self.replace_selected_source_kind(ReviewSourceKind::FileRange { path, start, end })
     }
 
     fn submit_rename_workspace(&mut self, text: &str) -> bool {
