@@ -1000,11 +1000,11 @@ fn style_for_segment(segment: &ReviewDisplaySegment) -> Style {
 
 const fn style_for_role(role: &ReviewDisplayTextRole) -> Style {
     match role {
-        ReviewDisplayTextRole::Code => Style::new().fg(Color::White),
+        ReviewDisplayTextRole::Code
+        | ReviewDisplayTextRole::DiffAdded
+        | ReviewDisplayTextRole::DiffRemoved
+        | ReviewDisplayTextRole::DiffContext => Style::new(),
         ReviewDisplayTextRole::Syntax(style) => syntax_style_to_tui(*style),
-        ReviewDisplayTextRole::DiffAdded => Style::new().fg(Color::BrightGreen),
-        ReviewDisplayTextRole::DiffRemoved => Style::new().fg(Color::BrightRed),
-        ReviewDisplayTextRole::DiffContext => Style::new(),
         ReviewDisplayTextRole::HunkHeader => {
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
         }
@@ -1017,9 +1017,9 @@ const fn row_style(source: ReviewDisplayRowSource) -> Style {
             .fg(Color::BrightMagenta)
             .bg(Color::Rgb(24, 18, 34))
             .add_modifier(Modifier::BOLD),
-        ReviewDisplayRowSource::Context => Style::new().fg(Color::White),
-        ReviewDisplayRowSource::Added => Style::new().fg(Color::White).bg(Color::Rgb(0, 24, 16)),
-        ReviewDisplayRowSource::Removed => Style::new().fg(Color::White).bg(Color::Rgb(32, 10, 10)),
+        ReviewDisplayRowSource::Context => Style::new(),
+        ReviewDisplayRowSource::Added => Style::new().bg(Color::Rgb(0, 24, 16)),
+        ReviewDisplayRowSource::Removed => Style::new().bg(Color::Rgb(32, 10, 10)),
     }
 }
 
