@@ -1280,6 +1280,8 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
         KeyCode::Char('I') => app.include_all_sources(),
         KeyCode::Char('E') => app.exclude_all_sources(),
         KeyCode::Char('V') => app.invert_source_inclusion(),
+        KeyCode::Char('M') => app.toggle_selected_source_merge_base(),
+        KeyCode::Char('X') => app.remove_excluded_sources(),
         KeyCode::Char(' ') => app.toggle_selected_build_source(),
         KeyCode::Char('T') => app.open_rename_workspace_prompt(),
         KeyCode::Char('r') => app.open_rename_source_prompt(),
@@ -3925,6 +3927,64 @@ impl ReviewApp {
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         self.status_message = Some("inverted source inclusion".to_string());
+        true
+    }
+
+    /// Toggle merge-base semantics for selected range/compare source.
+    pub fn toggle_selected_source_merge_base(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let Some(index) = self.selected_build_source_index() else {
+            self.status_message =
+                Some("select a commit range or branch compare source".to_string());
+            return true;
+        };
+        let Some(source) = self.workspace.sources.get_mut(index) else {
+            self.status_message =
+                Some("select a commit range or branch compare source".to_string());
+            return true;
+        };
+        let status = match &mut source.kind {
+            ReviewSourceKind::CommitRange { merge_base, .. }
+            | ReviewSourceKind::BranchCompare { merge_base, .. } => {
+                *merge_base = !*merge_base;
+                if *merge_base { "merge-base" } else { "direct" }
+            }
+            _ => {
+                self.status_message =
+                    Some("selected source does not support merge-base toggling".to_string());
+                return true;
+            }
+        };
+        source.label = source.kind.label();
+        let label = source.label.clone();
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(format!("set {label} comparison to {status}"));
+        true
+    }
+
+    /// Remove all excluded sources from the workspace.
+    pub fn remove_excluded_sources(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let before = self.workspace.sources.len();
+        self.workspace.sources.retain(|source| source.included);
+        let removed = before.saturating_sub(self.workspace.sources.len());
+        if removed == 0 {
+            self.status_message = Some("no excluded sources to remove".to_string());
+            return true;
+        }
+        self.selected_build_row = self
+            .selected_build_row
+            .min(self.build_row_count().saturating_sub(1));
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(format!("removed {removed} excluded source(s)"));
         true
     }
 
