@@ -598,39 +598,9 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let workspace = &app.workspace;
-    let surfaces = app.review.surfaces();
-    let mut rows = Vec::new();
-    rows.push((
-        "Review workspace".to_string(),
-        format!(": {}", workspace.title),
-        false,
-    ));
-    rows.push((String::new(), String::new(), false));
-    rows.push(("Included sources".to_string(), String::new(), false));
-    for source in &workspace.sources {
-        let marker = if source.included { "✓" } else { " " };
-        rows.push((format!("  [{marker}]"), source.label.clone(), true));
-    }
-    rows.push((String::new(), String::new(), false));
-    rows.push(("Review surfaces".to_string(), String::new(), false));
-    for surface in &surfaces {
-        let kind = match surface.kind {
-            ReviewSurfaceKind::Diff => "diff",
-            ReviewSurfaceKind::File => "file",
-        };
-        rows.push((format!("  {kind:4}"), surface.path.clone(), true));
-    }
-    rows.push((String::new(), String::new(), false));
-    rows.push((
-        "toggle-space   u/s/w/l quick add   + add file   A more sources   r rename   [/] reorder   - remove source   m review mode"
-            .to_string(),
-        String::new(),
-        false,
-    ));
-
+    let rows = build_workspace_rows(app);
     let mut selectable_index = 0usize;
-    for (row, (prefix, text, selectable)) in
+    for (row, (prefix, text, selectable, warning)) in
         rows.into_iter().take(usize::from(area.height)).enumerate()
     {
         let selected = selectable && selectable_index == app.selected_build_row;
@@ -639,6 +609,8 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         }
         let style = if selected {
             Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else if warning {
+            Style::new().fg(Color::Yellow).bg(Color::Black)
         } else {
             Style::new().fg(Color::White).bg(Color::Black)
         };
@@ -659,6 +631,94 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             style,
         );
     }
+}
+
+fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
+    let workspace = &app.workspace;
+    let surfaces = app.review.surfaces();
+    let included_count = workspace
+        .sources
+        .iter()
+        .filter(|source| source.included)
+        .count();
+    let mut rows = Vec::new();
+    rows.push((
+        "Review workspace".to_string(),
+        format!(": {}", workspace.title),
+        false,
+        false,
+    ));
+    rows.push((
+        "Sources".to_string(),
+        format!(
+            ": {included_count}/{} included, {} materialized surface(s)",
+            workspace.sources.len(),
+            surfaces.len()
+        ),
+        false,
+        false,
+    ));
+    rows.push((String::new(), String::new(), false, false));
+    rows.push(("Included sources".to_string(), String::new(), false, false));
+    if workspace.sources.is_empty() {
+        rows.push((
+            "  !".to_string(),
+            "no sources yet — press A or u/s/w/l to add one".to_string(),
+            false,
+            true,
+        ));
+    }
+    for source in &workspace.sources {
+        let marker = if source.included { "✓" } else { " " };
+        let surface_count = surfaces
+            .iter()
+            .filter(|surface| surface.source_id == source.id)
+            .count();
+        let status = source_status_label(source.included, surface_count);
+        rows.push((
+            format!("  [{marker}] {:<10}", source_kind_short_label(&source.kind)),
+            format!("{}  · {status}", source.label),
+            true,
+            source.included && surface_count == 0,
+        ));
+    }
+    rows.push((String::new(), String::new(), false, false));
+    rows.push(("Review surfaces".to_string(), String::new(), false, false));
+    if surfaces.is_empty() {
+        rows.push((
+            "  !".to_string(),
+            "no reviewable surfaces yet".to_string(),
+            false,
+            true,
+        ));
+    }
+    for surface in &surfaces {
+        let kind = match surface.kind {
+            ReviewSurfaceKind::Diff => "diff",
+            ReviewSurfaceKind::File => "file",
+        };
+        rows.push((format!("  {kind:4}"), surface.path.clone(), true, false));
+    }
+    rows.push((String::new(), String::new(), false, false));
+    rows.push((
+        "toggle-space   u/s/w/l quick add   + add file   A more sources   r rename   [/] reorder   - remove source   m review mode"
+            .to_string(),
+        String::new(),
+        false,
+        false,
+    ));
+
+    rows
+}
+
+fn source_status_label(included: bool, surface_count: usize) -> String {
+    if !included {
+        return "excluded".to_string();
+    }
+    if surface_count == 0 {
+        return "no surfaces".to_string();
+    }
+    format!("{surface_count} surface(s)")
 }
 
 fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
