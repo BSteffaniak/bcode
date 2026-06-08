@@ -157,12 +157,32 @@ impl ReviewHomeApp {
         true
     }
 
+    fn open_most_recent(&mut self) -> bool {
+        let Some(index) = self
+            .visible_indices()
+            .into_iter()
+            .find(|index| {
+                self.workspace(*index)
+                    .is_some_and(|workspace| workspace.archived_at_ms.is_none())
+            })
+            .or_else(|| self.visible_indices().first().copied())
+        else {
+            self.status_message =
+                Some("no matching review workspace selected; press n to create one".to_string());
+            return true;
+        };
+        let Some(workspace) = self.workspace(index).cloned() else {
+            return true;
+        };
+        let build_mode = workspace_should_open_in_build_mode(&workspace);
+        self.open_workspace(workspace, build_mode)
+    }
+
     fn open_selected(&mut self) -> bool {
         let Some(workspace) = self.selected_workspace_or_status() else {
             return true;
         };
-        let build_mode =
-            workspace.sources.is_empty() || workspace.sources.iter().all(|source| !source.included);
+        let build_mode = workspace_should_open_in_build_mode(&workspace);
         self.open_workspace(workspace, build_mode)
     }
 
@@ -463,6 +483,7 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             true
         }
         KeyCode::Enter => app.open_selected(),
+        KeyCode::Char('c') => app.open_most_recent(),
         KeyCode::Char('o') => app.open_selected_in_review_mode(),
         KeyCode::Char('b') => app.open_selected_in_build_mode(),
         KeyCode::Char('x') => match archive_selected_workspace(client, app).await {
@@ -855,7 +876,7 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
             format!(
-                " {filter_label}  enter open   n empty   u/s/w/l/e presets   a archived   d details   D drafts   g/G top/bottom   R restore   / search   x archive "
+                " {filter_label}  enter open   c continue latest   n empty   u/s/w/l/e presets   a archived   d details   D drafts   / search   ? help "
             ),
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
@@ -885,9 +906,10 @@ const fn review_home_help_lines() -> &'static [&'static str] {
     &[
         " Review Picker Help",
         "",
-        " enter               open selected review; empty reviews open in build mode",
+        " enter               open selected review; setup opens in build mode",
+        " c                   continue latest visible active review",
         " o                   force-open selected review in review mode",
-        " b                   open selected review in build/source mode",
+        " build mode: attach sources, fix diagnostics, then m to review",
         " n                   new empty review: name it, then add sources",
         " u/s/w/l             quick-create unstaged/staged/worktree/last",
         " j/k or arrows       move selection",
@@ -928,7 +950,7 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
             &Line::from_spans(vec![Span::styled(
-                " No review workspaces yet. Press n to create an empty review, or u/s/w/l for quick presets.",
+                " No review workspaces yet. Press n for a custom review, or u/s/w/l for unstaged/staged/worktree/last-commit presets.",
                 Style::new().fg(Color::White).bg(Color::Black),
             )]),
         );
@@ -965,11 +987,7 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         } else {
             Style::new().fg(Color::White).bg(Color::Black)
         };
-        let status = if workspace.archived_at_ms.is_some() {
-            "archived"
-        } else {
-            "active"
-        };
+        let status = workspace_health_label(item);
         let text = format!("{status:8}  {}", workspace_row_text(item));
         frame.write_line(
             Rect::new(
@@ -1001,6 +1019,7 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
     let workspace = &item.workspace;
     let mut lines = vec![
         format!(" {}", workspace.title),
+        format!(" health: {}", workspace_health_label(item)),
         format!(" id: {}", workspace.id),
         format!(" repo: {}", workspace.repo_root.display()),
         format!(
@@ -1160,6 +1179,27 @@ fn source_kind_search_text(kind: &ReviewSourceKind) -> String {
     }
 }
 
+fn workspace_should_open_in_build_mode(workspace: &ReviewWorkspace) -> bool {
+    workspace.sources.is_empty() || workspace.sources.iter().all(|source| !source.included)
+}
+
+fn workspace_health_label(item: &ReviewWorkspaceListItem) -> &'static str {
+    let workspace = &item.workspace;
+    if workspace.archived_at_ms.is_some() {
+        "archived"
+    } else if workspace.sources.is_empty() {
+        "setup"
+    } else if workspace.sources.iter().all(|source| !source.included) {
+        "needs sources"
+    } else if item.draft_count > 0 && item.last_publish.is_none() {
+        "drafts"
+    } else if item.last_publish.is_some() {
+        "published"
+    } else {
+        "active"
+    }
+}
+
 fn workspace_next_action(item: &ReviewWorkspaceListItem) -> String {
     let workspace = &item.workspace;
     let included_count = workspace
@@ -1224,9 +1264,10 @@ fn workspace_row_text(item: &ReviewWorkspaceListItem) -> String {
             item.draft_count, item.thread_count
         )
     };
+    let health = workspace_health_label(item);
     let next_action = workspace_next_action(item);
     format!(
-        " {}  · {}  · {}  · next: {}  · {}{}",
+        " {}  · {}  · {health}  · {}  · next: {}  · {}{}",
         workspace.title, updated, draft_suffix, next_action, suffix, archived
     )
 }
@@ -1300,7 +1341,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter smart-open, b build, o review, n new, ? help"
+                            "review home: enter smart-open, c continue latest, b build, o review, n new, ? help"
                                 .to_string()
                         })
                     }
