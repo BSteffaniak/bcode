@@ -1301,6 +1301,7 @@ fn prompt_popup_height(kind: ReviewPromptKind, area: Rect) -> u16 {
         | ReviewPromptKind::AddSourceKind
         | ReviewPromptKind::AddCommitSource
         | ReviewPromptKind::AddCommitRangeSource
+        | ReviewPromptKind::AddBranchCompareSource
         | ReviewPromptKind::AddFileSource
         | ReviewPromptKind::AddFileRangeSource
         | ReviewPromptKind::RenameSource => area.height.min(5),
@@ -1315,6 +1316,7 @@ const fn prompt_title(kind: ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddSourceKind => " Add source ",
         ReviewPromptKind::AddCommitSource => " Add commit ",
         ReviewPromptKind::AddCommitRangeSource => " Add range ",
+        ReviewPromptKind::AddBranchCompareSource => " Add branch compare ",
         ReviewPromptKind::AddFileSource => " Add file ",
         ReviewPromptKind::AddFileRangeSource => " Add file range ",
         ReviewPromptKind::RenameSource => " Rename source ",

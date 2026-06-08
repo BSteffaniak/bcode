@@ -165,9 +165,12 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
     };
 
     match result {
-        Ok(code_review_home::ReviewHomeOutcome::OpenWorkspace { workspace }) => {
+        Ok(code_review_home::ReviewHomeOutcome::OpenWorkspace {
+            workspace,
+            build_mode,
+        }) => {
             let _writer = guard.leave()?;
-            run_code_review_workspace(workspace).await
+            run_code_review_workspace(workspace, build_mode).await
         }
         Ok(code_review_home::ReviewHomeOutcome::Exit) => {
             let _writer = guard.leave()?;
@@ -184,6 +187,7 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
 /// Returns I/O, client, or plugin service errors.
 pub async fn run_code_review_workspace(
     workspace: bcode_code_review_models::ReviewWorkspace,
+    build_mode: bool,
 ) -> Result<(), TuiError> {
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
@@ -194,7 +198,7 @@ pub async fn run_code_review_workspace(
             })?,
             helpers::terminal_area()?,
         );
-        code_review::run_workspace(&mut terminal, workspace).await
+        code_review::run_workspace(&mut terminal, workspace, build_mode).await
     };
 
     match result {

@@ -31,6 +31,8 @@ pub enum ReviewHomeOutcome {
     OpenWorkspace {
         /// Review workspace to open.
         workspace: ReviewWorkspace,
+        /// Whether to open directly in build/source-composition mode.
+        build_mode: bool,
     },
     /// Exit without opening a review.
     Exit,
@@ -132,8 +134,11 @@ impl ReviewHomeApp {
         true
     }
 
-    fn open_workspace(&mut self, workspace: ReviewWorkspace) -> bool {
-        self.outcome = Some(ReviewHomeOutcome::OpenWorkspace { workspace });
+    fn open_workspace(&mut self, workspace: ReviewWorkspace, build_mode: bool) -> bool {
+        self.outcome = Some(ReviewHomeOutcome::OpenWorkspace {
+            workspace,
+            build_mode,
+        });
         self.should_exit = true;
         true
     }
@@ -148,7 +153,7 @@ impl ReviewHomeApp {
             self.status_message = Some("selected review workspace is unavailable".to_string());
             return true;
         };
-        self.open_workspace(workspace)
+        self.open_workspace(workspace, false)
     }
     fn start_new_review(&mut self) -> bool {
         self.new_review_buffer = Some("Untitled review".to_string());
@@ -568,7 +573,7 @@ async fn create_and_open_preset_workspace(
                 last_publish: None,
             });
             sort_workspace_items_recent_first(&mut app.workspace_items);
-            app.open_workspace(workspace)
+            app.open_workspace(workspace, false)
         }
         Err(error) => {
             app.status_message = Some(format!("failed to create workspace: {error}"));
@@ -592,14 +597,9 @@ async fn submit_new_review(
     } else {
         title
     };
-    let workspace = create_workspace_with_sources(
-        client,
-        app.repo_path.clone(),
-        title,
-        vec![ReviewSourceKind::WorkingTreeAndIndex],
-    )
-    .await?;
-    app.open_workspace(workspace);
+    let workspace =
+        create_workspace_with_sources(client, app.repo_path.clone(), title, Vec::new()).await?;
+    app.open_workspace(workspace, true);
     Ok(true)
 }
 
@@ -807,7 +807,7 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         &Line::from_spans(vec![Span::styled(
             format!(
-                " {filter_label}  enter open   n named   u/s/w/l/e presets   a archived   d details   D drafts   g/G top/bottom   R restore   / search   x archive "
+                " {filter_label}  enter open   n empty   u/s/w/l/e presets   a archived   d details   D drafts   g/G top/bottom   R restore   / search   x archive "
             ),
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
@@ -838,7 +838,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " Review Picker Help",
         "",
         " enter               open selected review",
-        " n                   create named review",
+        " n                   create empty named review and start adding sources",
         " u/s/w/l/e           create unstaged/staged/worktree/last/empty preset",
         " j/k or arrows       move selection",
         " g/G                 first/last visible review",
@@ -878,7 +878,7 @@ fn render_workspace_list(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>)
         frame.write_line(
             Rect::new(area.x, area.y, area.width, 1),
             &Line::from_spans(vec![Span::styled(
-                " No review workspaces yet. Press n to create a named review, or u/s/w/l for quick presets.",
+                " No review workspaces yet. Press n to create an empty review, or u/s/w/l for quick presets.",
                 Style::new().fg(Color::White).bg(Color::Black),
             )]),
         );
@@ -1230,7 +1230,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n named, D drafts, ? help, / search, r rename"
+                            "review home: enter open, n empty, D drafts, ? help, / search, r rename"
                                 .to_string()
                         })
                     }

@@ -132,6 +132,7 @@ fn model_target_from_source_kind(
 pub async fn run_workspace<W: Write>(
     terminal: &mut Terminal<&mut W>,
     workspace: ReviewWorkspace,
+    build_mode: bool,
 ) -> Result<Option<SessionId>, TuiError> {
     let target = target_from_workspace(&workspace);
     run_with_workspace(
@@ -139,6 +140,7 @@ pub async fn run_workspace<W: Write>(
         workspace.repo_root.clone(),
         target,
         Some(workspace),
+        build_mode,
     )
     .await
 }
@@ -153,7 +155,7 @@ pub async fn run<W: Write>(
     repo_path: PathBuf,
     target: ReviewOpenTarget,
 ) -> Result<Option<SessionId>, TuiError> {
-    run_with_workspace(terminal, repo_path, target, None).await
+    run_with_workspace(terminal, repo_path, target, None, false).await
 }
 
 async fn run_with_workspace<W: Write>(
@@ -161,12 +163,18 @@ async fn run_with_workspace<W: Write>(
     repo_path: PathBuf,
     target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
+    build_mode: bool,
 ) -> Result<Option<SessionId>, TuiError> {
     let client = BcodeClient::default_endpoint();
     let review_target: ReviewTarget = target.into();
     let mut input = TuiInput::start();
     let mut app =
         load_review_app(&client, repo_path.clone(), review_target.clone(), workspace).await?;
+    if build_mode {
+        app.ux_mode = ReviewUxMode::Build;
+        app.sidebar_mode = ReviewSidebarMode::Sources;
+        app.status_message = Some("build mode: add sources with A, then m to review".to_string());
+    }
     let mut needs_redraw = true;
 
     while !app.should_exit {
@@ -2347,6 +2355,8 @@ pub enum ReviewPromptKind {
     AddCommitSource,
     /// Add a commit range source to the workspace.
     AddCommitRangeSource,
+    /// Add a branch compare source to the workspace.
+    AddBranchCompareSource,
     /// Add a file source to the workspace.
     AddFileSource,
     /// Add a file range source to the workspace.
@@ -2550,7 +2560,7 @@ impl ReviewApp {
         }
         self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddSourceKind));
         self.status_message = Some(
-            "add source kind: file, range, commit, file-range, staged, unstaged, working-tree"
+            "add source kind: file, file-range, commit, range, branch, staged, unstaged, working-tree"
                 .to_string(),
         );
         true
@@ -2612,6 +2622,9 @@ impl ReviewApp {
             ReviewPromptKind::AddSourceKind => self.submit_add_source_kind(&text),
             ReviewPromptKind::AddCommitSource => self.submit_add_commit_source(&text),
             ReviewPromptKind::AddCommitRangeSource => self.submit_add_commit_range_source(&text),
+            ReviewPromptKind::AddBranchCompareSource => {
+                self.submit_add_branch_compare_source(&text)
+            }
             ReviewPromptKind::AddFileSource => self.submit_add_file_source(&text),
             ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
             ReviewPromptKind::RenameSource => self.submit_rename_source(&text),
@@ -2642,6 +2655,13 @@ impl ReviewApp {
                 self.status_message =
                     Some("add commit range: base..head or base...head".to_string());
             }
+            "branch" | "branch-compare" | "compare" | "bc" => {
+                self.prompt_state = Some(ReviewPromptState::new(
+                    ReviewPromptKind::AddBranchCompareSource,
+                ));
+                self.status_message =
+                    Some("add branch compare: base...head or base..head".to_string());
+            }
             "staged" | "index" => {
                 return self.push_workspace_source(ReviewSourceKind::IndexStaged);
             }
@@ -2659,7 +2679,7 @@ impl ReviewApp {
             }
             _ => {
                 self.status_message = Some(
-                    "unknown source kind; use file, file-range, commit, range, staged, unstaged, working-tree".to_string(),
+                    "unknown source kind; use file, file-range, commit, range, branch, staged, unstaged, working-tree".to_string(),
                 );
             }
         }
@@ -2685,6 +2705,22 @@ impl ReviewApp {
         self.push_workspace_source(ReviewSourceKind::CommitRange {
             base: base.trim().to_string(),
             head: head.trim().to_string(),
+            merge_base,
+        })
+    }
+
+    fn submit_add_branch_compare_source(&mut self, text: &str) -> bool {
+        let Some((base_branch, head_branch)) =
+            text.split_once("...").or_else(|| text.split_once(".."))
+        else {
+            self.status_message =
+                Some("enter branch compare as base..head or base...head".to_string());
+            return true;
+        };
+        let merge_base = text.contains("...");
+        self.push_workspace_source(ReviewSourceKind::BranchCompare {
+            base_branch: base_branch.trim().to_string(),
+            head_branch: head_branch.trim().to_string(),
             merge_base,
         })
     }
