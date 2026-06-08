@@ -720,7 +720,8 @@ fn review_bundle_for_request(
     request: PublishReviewRequest,
     config: &CodeReviewPluginConfig,
 ) -> Result<ReviewBundle, ReviewError> {
-    let (summary, surfaces) = if let Some(workspace) = request.workspace.clone() {
+    let workspace = request.workspace.clone();
+    let (summary, surfaces) = if let Some(workspace) = workspace.clone() {
         let materialization =
             materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
                 repo_path: request.repo_path.clone(),
@@ -740,13 +741,20 @@ fn review_bundle_for_request(
             Vec::new(),
         )
     };
-    let review_key = review_key(&summary.repo_root, &request.target)?;
+    let review_key = workspace.as_ref().map_or_else(
+        || review_key(&summary.repo_root, &request.target),
+        |workspace| Ok(workspace_review_key(workspace)),
+    )?;
+    let scope = workspace.as_ref().map(|workspace| ReviewScope::Workspace {
+        workspace_id: workspace.id.clone(),
+        target: request.target.clone(),
+    });
     let threads = threads_from_drafts(
         list_drafts_for_request(
             &ListDraftsRequest {
                 repo_path: request.repo_path.clone(),
                 target: request.target.clone(),
-                scope: None,
+                scope,
             },
             config,
         )?
@@ -1145,13 +1153,30 @@ fn list_review_workspaces_for_request(
             for workspace in workspaces {
                 let review_key = workspace_review_key(&workspace);
                 let (thread_count, draft_count) = db.draft_counts(&review_key).await?;
-                let last_publish = db.last_publish_record(Some(&workspace.id)).await?;
-                items.push(ReviewWorkspaceListItem {
-                    workspace,
-                    thread_count,
-                    draft_count,
-                    last_publish,
-                });
+                if let Some(legacy_review_key) = workspace_legacy_review_key(&workspace)? {
+                    let (_, legacy_draft_count) = db.draft_counts(&legacy_review_key).await?;
+                    let (thread_count, draft_count) = if draft_count == 0 && legacy_draft_count > 0
+                    {
+                        db.draft_counts(&legacy_review_key).await?
+                    } else {
+                        (thread_count, draft_count)
+                    };
+                    let last_publish = db.last_publish_record(Some(&workspace.id)).await?;
+                    items.push(ReviewWorkspaceListItem {
+                        workspace,
+                        thread_count,
+                        draft_count,
+                        last_publish,
+                    });
+                } else {
+                    let last_publish = db.last_publish_record(Some(&workspace.id)).await?;
+                    items.push(ReviewWorkspaceListItem {
+                        workspace,
+                        thread_count,
+                        draft_count,
+                        last_publish,
+                    });
+                }
             }
             Ok(items)
         })
@@ -1447,6 +1472,18 @@ fn review_target_from_source_kind(kind: &ReviewSourceKind) -> Option<ReviewTarge
         | ReviewSourceKind::FileRange { .. }
         | ReviewSourceKind::Repository => None,
     }
+}
+
+fn workspace_legacy_review_key(workspace: &ReviewWorkspace) -> Result<Option<String>, ReviewError> {
+    let Some(target) = workspace
+        .sources
+        .iter()
+        .find(|source| source.included)
+        .and_then(|source| review_target_from_source_kind(&source.kind))
+    else {
+        return Ok(None);
+    };
+    review_key(&workspace.repo_root, &target).map(Some)
 }
 
 fn list_drafts_for_request(
