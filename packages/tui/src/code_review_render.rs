@@ -756,7 +756,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "enter open/toggle   C edit source   I/E/V include/exclude/invert   M merge-base   X purge excluded   m review"
+        "enter open/toggle   O open source   Y source for surface   C edit source   I/E/V include/exclude/invert   m review"
             .to_string(),
         String::new(),
         false,
@@ -1129,6 +1129,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " R                  refresh/rematerialize sources",
         " I/E/V              include all / exclude all / invert sources",
         " M/X                merge-base toggle / remove excluded",
+        " O/Y                open source surface / select source for surface",
         " C                  change selected source spec",
         " r/-                rename / remove selected source",
         " f or ctrl-p         fuzzy file picker",

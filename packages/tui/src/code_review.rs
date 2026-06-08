@@ -1289,6 +1289,8 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
         KeyCode::Char('[') => app.move_selected_source_up(),
         KeyCode::Char(']') => app.move_selected_source_down(),
         KeyCode::Char('-') => app.remove_selected_build_source(),
+        KeyCode::Char('O') => app.open_selected_source_surface(),
+        KeyCode::Char('Y') => app.select_source_for_current_surface(),
         KeyCode::Enter => app.activate_selected_build_row(),
         _ => return None,
     })
@@ -3988,6 +3990,63 @@ impl ReviewApp {
         self.selected_build_row
             .checked_sub(self.workspace.sources.len())
             .filter(|index| *index < self.review.surfaces().len())
+    }
+
+    fn first_surface_index_for_source(&self, source_id: &str) -> Option<usize> {
+        self.review
+            .surfaces()
+            .iter()
+            .position(|surface| surface.source_id == source_id)
+    }
+
+    /// Activate review mode at the first surface for the selected source.
+    pub fn open_selected_source_surface(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let Some(source_index) = self.selected_build_source_index() else {
+            self.status_message = Some("select a source to open its first surface".to_string());
+            return true;
+        };
+        let Some(source_id) = self
+            .workspace
+            .sources
+            .get(source_index)
+            .map(|source| source.id.clone())
+        else {
+            self.status_message = Some("select a source to open its first surface".to_string());
+            return true;
+        };
+        let Some(surface_index) = self.first_surface_index_for_source(&source_id) else {
+            self.status_message = Some("selected source has no materialized surfaces".to_string());
+            return true;
+        };
+        self.ux_mode = ReviewUxMode::Review;
+        let _ = self.select_file(surface_index);
+        self.status_message = Some("opened source surface".to_string());
+        true
+    }
+
+    /// Select the build source for the current review surface.
+    pub fn select_source_for_current_surface(&mut self) -> bool {
+        let Some(source_id) = self.selected_surface().map(|surface| surface.source_id) else {
+            self.status_message = Some("current surface has no source".to_string());
+            return true;
+        };
+        let Some(source_index) = self
+            .workspace
+            .sources
+            .iter()
+            .position(|source| source.id == source_id)
+        else {
+            self.status_message =
+                Some("current surface source is no longer in workspace".to_string());
+            return true;
+        };
+        self.ux_mode = ReviewUxMode::Build;
+        self.selected_build_row = source_index;
+        self.status_message = Some("selected source for current surface".to_string());
+        true
     }
 
     /// Activate selected build-mode row.
