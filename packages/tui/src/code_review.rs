@@ -3345,10 +3345,33 @@ impl ReviewApp {
         }
     }
 
+    #[must_use]
+    pub fn source_diagnostics(&self, source_id: &str) -> Vec<&ReviewSourceDiagnostic> {
+        self.review
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.source_id == source_id)
+            .collect()
+    }
+
+    fn source_diagnostic_count(&self, source_id: &str) -> usize {
+        self.review
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.source_id == source_id)
+            .count()
+    }
+
     /// Return number of rows in build mode.
     #[must_use]
-    pub const fn build_row_count(&self) -> usize {
-        self.workspace.sources.len()
+    pub fn build_row_count(&self) -> usize {
+        let diagnostic_rows = self
+            .workspace
+            .sources
+            .iter()
+            .map(|source| self.source_diagnostic_count(&source.id))
+            .sum::<usize>();
+        self.workspace.sources.len().saturating_add(diagnostic_rows)
     }
 
     /// Select next build row.

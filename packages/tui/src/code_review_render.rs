@@ -1,6 +1,8 @@
 //! Rendering for full-screen code review mode.
 
-use bcode_code_review_models::{ReviewSourceKind, ReviewSurfaceKind};
+use bcode_code_review_models::{
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurfaceKind,
+};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
@@ -340,6 +342,14 @@ const fn source_kind_short_label(kind: &ReviewSourceKind) -> &'static str {
     }
 }
 
+const fn diagnostic_severity_label(severity: ReviewSourceDiagnosticSeverity) -> &'static str {
+    match severity {
+        ReviewSourceDiagnosticSeverity::Info => "info",
+        ReviewSourceDiagnosticSeverity::Warning => "warn",
+        ReviewSourceDiagnosticSeverity::Error => "error",
+    }
+}
+
 fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -633,6 +643,38 @@ fn render_build_workspace(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
+fn push_source_rows(app: &ReviewApp, rows: &mut Vec<(String, String, bool, bool)>) {
+    let surfaces = app.review.surfaces();
+    for source in &app.workspace.sources {
+        let marker = if source.included { "✓" } else { " " };
+        let surface_count = surfaces
+            .iter()
+            .filter(|surface| surface.source_id == source.id)
+            .count();
+        let status = source_status_label(source.included, surface_count);
+        let diagnostics = app.source_diagnostics(&source.id);
+        let status = if diagnostics.is_empty() {
+            status
+        } else {
+            format!("{status}: {} diagnostic(s)", diagnostics.len())
+        };
+        rows.push((
+            format!("  [{marker}] {:<10}", source_kind_short_label(&source.kind)),
+            format!("{}  · {status}", source.label),
+            true,
+            source.included && surface_count == 0,
+        ));
+        for diagnostic in diagnostics {
+            rows.push((
+                format!("    {}", diagnostic_severity_label(diagnostic.severity)),
+                format!("{}: {}", diagnostic.code, diagnostic.message),
+                false,
+                true,
+            ));
+        }
+    }
+}
+
 fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     let workspace = &app.workspace;
     let surfaces = app.review.surfaces();
@@ -682,31 +724,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
             true,
         ));
     }
-    for source in &workspace.sources {
-        let marker = if source.included { "✓" } else { " " };
-        let surface_count = surfaces
-            .iter()
-            .filter(|surface| surface.source_id == source.id)
-            .count();
-        let status = source_status_label(source.included, surface_count);
-        let diagnostic = app
-            .review
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.source_id == source.id)
-            .map(|diagnostic| diagnostic.message.as_str());
-        let status = if let Some(message) = diagnostic {
-            format!("{status}: {message}")
-        } else {
-            status
-        };
-        rows.push((
-            format!("  [{marker}] {:<10}", source_kind_short_label(&source.kind)),
-            format!("{}  · {status}", source.label),
-            true,
-            source.included && surface_count == 0,
-        ));
-    }
+    push_source_rows(app, &mut rows);
     rows.push((String::new(), String::new(), false, false));
     rows.push(("Review surfaces".to_string(), String::new(), false, false));
     if surfaces.is_empty() {

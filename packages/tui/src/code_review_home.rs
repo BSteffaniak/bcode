@@ -113,6 +113,20 @@ impl ReviewHomeApp {
             .min(self.visible_indices().len().saturating_sub(1));
     }
 
+    fn selected_workspace(&self) -> Option<ReviewWorkspace> {
+        self.selected_workspace_index()
+            .and_then(|index| self.workspace(index).cloned())
+    }
+
+    fn selected_workspace_or_status(&mut self) -> Option<ReviewWorkspace> {
+        let Some(workspace) = self.selected_workspace() else {
+            self.status_message =
+                Some("no matching review workspace selected; press n to create one".to_string());
+            return None;
+        };
+        Some(workspace)
+    }
+
     fn move_down(&mut self) -> bool {
         let next = self
             .selected
@@ -144,30 +158,26 @@ impl ReviewHomeApp {
     }
 
     fn open_selected(&mut self) -> bool {
-        let Some(workspace_index) = self.selected_workspace_index() else {
-            self.status_message =
-                Some("no matching review workspace selected; press n to create one".to_string());
-            return true;
-        };
-        let Some(workspace) = self.workspace(workspace_index).cloned() else {
-            self.status_message = Some("selected review workspace is unavailable".to_string());
+        let Some(workspace) = self.selected_workspace_or_status() else {
             return true;
         };
         let build_mode =
             workspace.sources.is_empty() || workspace.sources.iter().all(|source| !source.included);
         self.open_workspace(workspace, build_mode)
     }
+
     fn open_selected_in_build_mode(&mut self) -> bool {
-        let Some(workspace_index) = self.selected_workspace_index() else {
-            self.status_message =
-                Some("no matching review workspace selected; press n to create one".to_string());
-            return true;
-        };
-        let Some(workspace) = self.workspace(workspace_index).cloned() else {
-            self.status_message = Some("selected review workspace is unavailable".to_string());
+        let Some(workspace) = self.selected_workspace_or_status() else {
             return true;
         };
         self.open_workspace(workspace, true)
+    }
+
+    fn open_selected_in_review_mode(&mut self) -> bool {
+        let Some(workspace) = self.selected_workspace_or_status() else {
+            return true;
+        };
+        self.open_workspace(workspace, false)
     }
 
     fn start_new_review(&mut self) -> bool {
@@ -453,6 +463,7 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             true
         }
         KeyCode::Enter => app.open_selected(),
+        KeyCode::Char('o') => app.open_selected_in_review_mode(),
         KeyCode::Char('b') => app.open_selected_in_build_mode(),
         KeyCode::Char('x') => match archive_selected_workspace(client, app).await {
             Ok(archived) => archived,
@@ -875,6 +886,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " Review Picker Help",
         "",
         " enter               open selected review; empty reviews open in build mode",
+        " o                   force-open selected review in review mode",
         " b                   open selected review in build/source mode",
         " n                   new empty review: name it, then add sources",
         " u/s/w/l             quick-create unstaged/staged/worktree/last",
@@ -1288,7 +1300,7 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("search: {}", app.search_query)
                     } else {
                         app.status_message.clone().unwrap_or_else(|| {
-                            "review home: enter open, n new, u/s/w/l quick create, D drafts, ? help"
+                            "review home: enter smart-open, b build, o review, n new, ? help"
                                 .to_string()
                         })
                     }
