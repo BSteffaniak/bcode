@@ -1277,9 +1277,13 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
         KeyCode::Char('s') => app.add_quick_source(ReviewSourceKind::IndexStaged),
         KeyCode::Char('w') => app.add_quick_source(ReviewSourceKind::WorkingTreeAndIndex),
         KeyCode::Char('l') => app.add_quick_source(ReviewSourceKind::LastCommit),
+        KeyCode::Char('g') => app.select_first_build_row(),
+        KeyCode::Char('G') => app.select_last_build_row(),
         KeyCode::Char('I') => app.include_all_sources(),
         KeyCode::Char('E') => app.exclude_all_sources(),
         KeyCode::Char('V') => app.invert_source_inclusion(),
+        KeyCode::Char('n') => app.select_next_empty_source(),
+        KeyCode::Char('N') => app.select_previous_empty_source(),
         KeyCode::Char('d') => app.select_next_diagnostic_source(),
         KeyCode::Char('Z') => app.exclude_sources_with_errors(),
         KeyCode::Char('C') => app.open_edit_source_spec_prompt(),
@@ -3949,6 +3953,42 @@ impl ReviewApp {
             .any(|diagnostic| diagnostic.severity == ReviewSourceDiagnosticSeverity::Error)
     }
 
+    /// Count included workspace sources.
+    #[must_use]
+    pub fn included_source_count(&self) -> usize {
+        self.workspace
+            .sources
+            .iter()
+            .filter(|source| source.included)
+            .count()
+    }
+
+    /// Count workspace sources by diagnostic severity.
+    #[must_use]
+    pub fn diagnostic_source_counts(&self) -> (usize, usize, usize) {
+        let mut info_sources = BTreeSet::new();
+        let mut warning_sources = BTreeSet::new();
+        let mut error_sources = BTreeSet::new();
+        for diagnostic in &self.review.diagnostics {
+            match diagnostic.severity {
+                ReviewSourceDiagnosticSeverity::Info => {
+                    info_sources.insert(diagnostic.source_id.clone());
+                }
+                ReviewSourceDiagnosticSeverity::Warning => {
+                    warning_sources.insert(diagnostic.source_id.clone());
+                }
+                ReviewSourceDiagnosticSeverity::Error => {
+                    error_sources.insert(diagnostic.source_id.clone());
+                }
+            }
+        }
+        (
+            info_sources.len(),
+            warning_sources.len(),
+            error_sources.len(),
+        )
+    }
+
     /// Return number of rows in build mode.
     #[must_use]
     pub fn build_row_count(&self) -> usize {
@@ -3957,6 +3997,24 @@ impl ReviewApp {
             .len()
             .saturating_add(self.review.surfaces().len())
             .max(1)
+    }
+
+    /// Select first build row.
+    pub fn select_first_build_row(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        self.set_selected_build_row(0);
+        true
+    }
+
+    /// Select last build row.
+    pub fn select_last_build_row(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        self.set_selected_build_row(self.build_row_count().saturating_sub(1));
+        true
     }
 
     /// Select next build row.
@@ -3990,7 +4048,11 @@ impl ReviewApp {
 
     fn set_selected_build_row(&mut self, row: usize) {
         self.selected_build_row = row.min(self.build_row_count().saturating_sub(1));
-        self.build_scroll = self.build_scroll.min(self.selected_build_row);
+        if row == 0 {
+            self.build_scroll = 0;
+        } else {
+            self.build_scroll = self.build_scroll.min(self.selected_build_row);
+        }
     }
 
     fn selected_build_source_index(&self) -> Option<usize> {
@@ -4185,6 +4247,51 @@ impl ReviewApp {
         self.pending_workspace_reload = true;
         self.status_message = Some("inverted source inclusion".to_string());
         true
+    }
+
+    fn source_has_surfaces(&self, source_id: &str) -> bool {
+        self.review
+            .surfaces()
+            .iter()
+            .any(|surface| surface.source_id == source_id)
+    }
+
+    fn select_empty_source(&mut self, forward: bool) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let source_count = self.workspace.sources.len();
+        if source_count == 0 {
+            self.status_message = Some("no sources yet; press A or u/s/w/l to add one".to_string());
+            return true;
+        }
+        let step = if forward {
+            1
+        } else {
+            source_count.saturating_sub(1)
+        };
+        let mut index = self.selected_build_row % source_count;
+        for _ in 0..source_count {
+            index = index.saturating_add(step) % source_count;
+            let source = &self.workspace.sources[index];
+            if source.included && !self.source_has_surfaces(&source.id) {
+                self.set_selected_build_row(index);
+                self.status_message = Some("selected included source with no surfaces".to_string());
+                return true;
+            }
+        }
+        self.status_message = Some("no included sources without surfaces".to_string());
+        true
+    }
+
+    /// Select next included source that materialized no surfaces.
+    pub fn select_next_empty_source(&mut self) -> bool {
+        self.select_empty_source(true)
+    }
+
+    /// Select previous included source that materialized no surfaces.
+    pub fn select_previous_empty_source(&mut self) -> bool {
+        self.select_empty_source(false)
     }
 
     /// Select the next source with diagnostics.

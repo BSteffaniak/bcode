@@ -113,11 +113,8 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         });
     let text = if app.ux_mode == super::code_review::ReviewUxMode::Build {
         let workspace = &app.workspace;
-        let included_sources = workspace
-            .sources
-            .iter()
-            .filter(|source| source.included)
-            .count();
+        let included_sources = app.included_source_count();
+        let (info_sources, warning_sources, error_sources) = app.diagnostic_source_counts();
         let pending = match (app.pending_workspace_save, app.pending_workspace_reload) {
             (true, true) => "  pending save+reload",
             (true, false) => "  pending save",
@@ -125,12 +122,14 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             (false, false) => "",
         };
         format!(
-            " bcode review build  {}  {}/{} source(s) included  {} surface(s)  {} diagnostic(s){} ",
+            " bcode review build  {}  {}/{} source(s) included  {} surface(s)  diag i/w/e {}/{}/{}{} ",
             workspace.title,
             included_sources,
             workspace.sources.len(),
             app.review.surfaces().len(),
-            app.review.diagnostics.len(),
+            info_sources,
+            warning_sources,
+            error_sources,
             pending
         )
     } else if app.review.is_repository_review() {
@@ -235,14 +234,9 @@ fn build_footer_hint(app: &ReviewApp) -> String {
             .to_string();
     }
     let source_count = app.workspace.sources.len();
-    let included_count = app
-        .workspace
-        .sources
-        .iter()
-        .filter(|source| source.included)
-        .count();
+    let included_count = app.included_source_count();
     let surface_count = app.review.surfaces().len();
-    let diagnostics = app.review.diagnostics.len();
+    let (info_sources, warning_sources, error_sources) = app.diagnostic_source_counts();
     let pending = match (app.pending_workspace_save, app.pending_workspace_reload) {
         (true, true) => "  pending save+reload",
         (true, false) => "  pending save",
@@ -250,7 +244,7 @@ fn build_footer_hint(app: &ReviewApp) -> String {
         (false, false) => "",
     };
     format!(
-        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  {diagnostics} diagnostic(s){pending}  d diagnostic  Z exclude errors  C edit  m review "
+        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  diag i/w/e {info_sources}/{warning_sources}/{error_sources}{pending}  n empty  d diagnostic  Z exclude errors  C edit  m review "
     )
 }
 
@@ -767,6 +761,30 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
         ));
         rows.push((String::new(), String::new(), false, false));
     }
+    let mut empty_sources = 0usize;
+    for source in &app.workspace.sources {
+        if source.included
+            && !surfaces
+                .iter()
+                .any(|surface| surface.source_id == source.id)
+        {
+            empty_sources = empty_sources.saturating_add(1);
+        }
+    }
+    rows.push((
+        "Summary".to_string(),
+        format!(
+            "{} source(s), {} included, {} surface(s), {} empty included source(s), {} diagnostic(s)",
+            workspace.sources.len(),
+            app.included_source_count(),
+            surfaces.len(),
+            empty_sources,
+            app.review.diagnostics.len()
+        ),
+        false,
+        empty_sources != 0 || !app.review.diagnostics.is_empty(),
+    ));
+    rows.push((String::new(), String::new(), false, false));
     rows.push(("Included sources".to_string(), String::new(), false, false));
     if workspace.sources.is_empty() {
         rows.push((
@@ -1168,14 +1186,14 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " Build Review Help",
         "",
         " m                   switch to review mode",
+        " g/G                first / last build row",
         " j/k or arrows       move selection",
-        " space              include/exclude selected source",
         " A/+                add source menu / add file source",
         " T                  rename workspace",
         " R                  refresh/rematerialize sources",
         " I/E/V              include all / exclude all / invert sources",
+        " n/N                next / previous empty included source",
         " d/Z                next diagnostic source / exclude error sources",
-        " M/X                merge-base toggle / remove excluded",
         " O/Y                open source surface / source for surface",
         " C                  change selected source spec",
         " f or ctrl-p         fuzzy file picker",
