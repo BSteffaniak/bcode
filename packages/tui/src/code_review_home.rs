@@ -536,6 +536,7 @@ async fn load_workspaces_with_archived(
                 workspace,
                 thread_count: 0,
                 draft_count: 0,
+                last_publish: None,
             })
             .collect()
     } else {
@@ -564,6 +565,7 @@ async fn create_and_open_preset_workspace(
                 workspace: workspace.clone(),
                 thread_count: 0,
                 draft_count: 0,
+                last_publish: None,
             });
             sort_workspace_items_recent_first(&mut app.workspace_items);
             app.open_workspace(workspace)
@@ -969,6 +971,20 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
         " drafts: {} comment(s) across {} thread(s)",
         item.draft_count, item.thread_count
     ));
+    if let Some(record) = &item.last_publish {
+        lines.push(format!(
+            " published: {} via {}",
+            relative_time_label(record.created_at_ms),
+            record.publisher_id
+        ));
+        lines.push(format!(
+            " output: {}",
+            record.output.as_deref().unwrap_or("none")
+        ));
+        lines.push(format!(" result: {}", record.message));
+    } else {
+        lines.push(" published: never".to_string());
+    }
     lines.push(format!(
         " sources: {}/{} included",
         workspace
@@ -1132,9 +1148,16 @@ fn workspace_row_text(item: &ReviewWorkspaceListItem) -> String {
             item.draft_count, item.thread_count
         )
     };
+    let publish_suffix = item.last_publish.as_ref().map_or_else(
+        || "not published".to_string(),
+        |record| {
+            let destination = record.output.as_deref().unwrap_or("no output");
+            format!("published via {} to {destination}", record.publisher_id)
+        },
+    );
     format!(
-        " {}  · {}  · {}  · {}{}",
-        workspace.title, updated, draft_suffix, suffix, archived
+        " {}  · {}  · {}  · {}  · {}{}",
+        workspace.title, updated, draft_suffix, publish_suffix, suffix, archived
     )
 }
 

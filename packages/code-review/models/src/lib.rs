@@ -318,6 +318,29 @@ pub struct ListReviewWorkspacesRequest {
     pub include_archived: bool,
 }
 
+/// Publish history metadata for a review workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPublishRecord {
+    /// Publish record id.
+    pub id: String,
+    /// Workspace id, when the publish was tied to a durable workspace.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// Review bundle id/key that was published.
+    pub review_id: String,
+    /// Publisher id.
+    pub publisher_id: String,
+    /// Whether submission happened.
+    pub submitted: bool,
+    /// Output location, when available.
+    #[serde(default)]
+    pub output: Option<String>,
+    /// Human-readable result message.
+    pub message: String,
+    /// Record creation timestamp.
+    pub created_at_ms: u64,
+}
+
 /// Summary metadata for a review workspace picker row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewWorkspaceListItem {
@@ -329,6 +352,9 @@ pub struct ReviewWorkspaceListItem {
     /// Number of draft comments associated with this workspace.
     #[serde(default)]
     pub draft_count: usize,
+    /// Most recent publish record associated with this workspace.
+    #[serde(default)]
+    pub last_publish: Option<ReviewPublishRecord>,
 }
 
 /// Response payload for `review.workspace.list`.

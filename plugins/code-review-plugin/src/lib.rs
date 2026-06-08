@@ -17,10 +17,10 @@ use bcode_code_review_models::{
     PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
     ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
     ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope, ReviewSource,
-    ReviewSourceKind, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewWorkspace,
-    ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse,
-    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
+    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope,
+    ReviewSource, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind, ReviewTarget,
+    ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest,
+    SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
     UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
@@ -951,10 +951,38 @@ fn publish_submit_for_request(
 ) -> Result<PublishReviewResponse, ReviewError> {
     let publisher_id = request.publisher_id.clone();
     let options = request.options.clone();
-    let bundle = review_bundle_for_request(request, config)?;
-    with_publisher(&publisher_id, |publisher| {
+    let bundle = review_bundle_for_request(request.clone(), config)?;
+    let response = with_publisher(&publisher_id, |publisher| {
         publisher.submit(&bundle, &options)
-    })
+    })?;
+    if let Some(workspace) = request.workspace {
+        let record = ReviewPublishRecord {
+            id: publish_record_id(&workspace.id, &publisher_id, response.submitted),
+            workspace_id: Some(workspace.id.clone()),
+            review_id: bundle.review_id,
+            publisher_id: response.publisher_id.clone(),
+            submitted: response.submitted,
+            output: response.output.clone(),
+            message: response.message.clone(),
+            created_at_ms: now_ms(),
+        };
+        with_database(&workspace.repo_root, config, move |database| {
+            Box::pin(async move {
+                CodeReviewDb::new(database)
+                    .save_publish_record(&record)
+                    .await
+            })
+        })?;
+    }
+    Ok(response)
+}
+
+fn publish_record_id(workspace_id: &str, publisher_id: &str, submitted: bool) -> String {
+    let status = if submitted { "submitted" } else { "skipped" };
+    format!(
+        "publish-{workspace_id}-{publisher_id}-{status}-{}",
+        now_ms()
+    )
 }
 
 fn with_publisher<T>(
@@ -1117,10 +1145,12 @@ fn list_review_workspaces_for_request(
             for workspace in workspaces {
                 let review_key = workspace_review_key(&workspace);
                 let (thread_count, draft_count) = db.draft_counts(&review_key).await?;
+                let last_publish = db.last_publish_record(Some(&workspace.id)).await?;
                 items.push(ReviewWorkspaceListItem {
                     workspace,
                     thread_count,
                     draft_count,
+                    last_publish,
                 });
             }
             Ok(items)
@@ -1948,6 +1978,51 @@ impl<'a> CodeReviewDb<'a> {
         Ok(())
     }
 
+    async fn save_publish_record(&self, record: &ReviewPublishRecord) -> Result<(), ReviewError> {
+        self.db
+            .insert("review_publish_records")
+            .value("record_id", record.id.clone())
+            .value("workspace_id", record.workspace_id.clone())
+            .value("review_id", record.review_id.clone())
+            .value("publisher_id", record.publisher_id.clone())
+            .value("submitted", i64::from(record.submitted))
+            .value("output", record.output.clone())
+            .value("message", record.message.clone())
+            .value("created_at_ms", u64_to_i64(record.created_at_ms))
+            .execute(self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn last_publish_record(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<ReviewPublishRecord>, ReviewError> {
+        let Some(workspace_id) = workspace_id else {
+            return Ok(None);
+        };
+        let rows = self
+            .db
+            .select("review_publish_records")
+            .columns(&[
+                "record_id",
+                "workspace_id",
+                "review_id",
+                "publisher_id",
+                "submitted",
+                "output",
+                "message",
+                "created_at_ms",
+            ])
+            .filter(Box::new(where_eq("workspace_id", workspace_id.to_string())))
+            .execute(self.db)
+            .await?;
+        rows.iter()
+            .max_by_key(|row| required_i64(row, "created_at_ms").unwrap_or(0))
+            .map(publish_record_from_row)
+            .transpose()
+    }
+
     async fn archive_workspace(&self, workspace_id: &str, now: u64) -> Result<bool, ReviewError> {
         if self.get_workspace(workspace_id).await?.is_none() {
             return Ok(false);
@@ -2434,6 +2509,26 @@ fn workspace_table_migration() -> CodeMigration<'static> {
     )
 }
 
+fn publish_records_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "007_review_publish_records_table".to_string(),
+        Box::new(
+            create_table("review_publish_records")
+                .if_not_exists(true)
+                .column(text_column("record_id"))
+                .column(nullable_text_column("workspace_id"))
+                .column(text_column("review_id"))
+                .column(text_column("publisher_id"))
+                .column(int_column("submitted"))
+                .column(nullable_text_column("output"))
+                .column(text_column("message"))
+                .column(int_column("created_at_ms"))
+                .primary_key("record_id"),
+        ),
+        None,
+    )
+}
+
 fn code_review_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
     source.add_migration(CodeMigration::new(
@@ -2518,6 +2613,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     ));
     source.add_migration(thread_surface_anchor_columns_migration());
     source.add_migration(workspace_table_migration());
+    source.add_migration(publish_records_table_migration());
     source
 }
 
@@ -2543,6 +2639,16 @@ fn text_column(name: &str) -> Column {
     }
 }
 
+fn nullable_text_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        nullable: true,
+        auto_increment: false,
+        data_type: DataType::Text,
+        default: None,
+    }
+}
+
 fn int_column(name: &str) -> Column {
     Column {
         name: name.to_string(),
@@ -2561,6 +2667,19 @@ fn nullable_int_column(name: &str) -> Column {
         data_type: DataType::BigInt,
         default: None,
     }
+}
+
+fn publish_record_from_row(row: &Row) -> Result<ReviewPublishRecord, ReviewError> {
+    Ok(ReviewPublishRecord {
+        id: required_text(row, "record_id")?,
+        workspace_id: optional_text(row, "workspace_id"),
+        review_id: required_text(row, "review_id")?,
+        publisher_id: required_text(row, "publisher_id")?,
+        submitted: required_i64(row, "submitted")? != 0,
+        output: optional_text(row, "output"),
+        message: required_text(row, "message")?,
+        created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
+    })
 }
 
 fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
