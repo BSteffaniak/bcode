@@ -1289,6 +1289,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char(':') => app.open_jump_to_line_prompt(),
         KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Char('N') => app.search_previous_match(),
+        KeyCode::Enter if app.ux_mode == ReviewUxMode::Build => app.activate_selected_build_row(),
         KeyCode::Enter => {
             if app.sidebar_mode == ReviewSidebarMode::Repository
                 && app.review.is_repository_review()
@@ -2738,7 +2739,11 @@ impl ReviewApp {
         if self.ux_mode != ReviewUxMode::Build {
             return false;
         }
-        let Some(source) = self.workspace.sources.get(self.selected_build_row) else {
+        let Some(index) = self.selected_build_source_index() else {
+            self.status_message = Some("select an included source to rename".to_string());
+            return true;
+        };
+        let Some(source) = self.workspace.sources.get(index) else {
             self.status_message = Some("select an included source to rename".to_string());
             return true;
         };
@@ -3012,7 +3017,11 @@ impl ReviewApp {
             self.status_message = Some("source label cannot be empty".to_string());
             return true;
         }
-        let Some(source) = self.workspace.sources.get_mut(self.selected_build_row) else {
+        let Some(index) = self.selected_build_source_index() else {
+            self.status_message = Some("select an included source to rename".to_string());
+            return true;
+        };
+        let Some(source) = self.workspace.sources.get_mut(index) else {
             self.status_message = Some("select an included source to rename".to_string());
             return true;
         };
@@ -3354,24 +3363,13 @@ impl ReviewApp {
             .collect()
     }
 
-    fn source_diagnostic_count(&self, source_id: &str) -> usize {
-        self.review
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.source_id == source_id)
-            .count()
-    }
-
     /// Return number of rows in build mode.
     #[must_use]
     pub fn build_row_count(&self) -> usize {
-        let diagnostic_rows = self
-            .workspace
+        self.workspace
             .sources
-            .iter()
-            .map(|source| self.source_diagnostic_count(&source.id))
-            .sum::<usize>();
-        self.workspace.sources.len().saturating_add(diagnostic_rows)
+            .len()
+            .saturating_add(self.review.surfaces().len())
     }
 
     /// Select next build row.
@@ -3400,6 +3398,30 @@ impl ReviewApp {
             return false;
         }
         self.selected_build_row = next;
+        true
+    }
+
+    fn selected_build_source_index(&self) -> Option<usize> {
+        (self.selected_build_row < self.workspace.sources.len()).then_some(self.selected_build_row)
+    }
+
+    fn selected_build_surface_index(&self) -> Option<usize> {
+        self.selected_build_row
+            .checked_sub(self.workspace.sources.len())
+            .filter(|index| *index < self.review.surfaces().len())
+    }
+
+    /// Activate selected build-mode row.
+    pub fn activate_selected_build_row(&mut self) -> bool {
+        if self.selected_build_source_index().is_some() {
+            return self.toggle_selected_build_source();
+        }
+        let Some(surface_index) = self.selected_build_surface_index() else {
+            return false;
+        };
+        self.ux_mode = ReviewUxMode::Review;
+        let _ = self.select_file(surface_index);
+        self.status_message = Some("opened review surface".to_string());
         true
     }
 
@@ -3450,7 +3472,11 @@ impl ReviewApp {
         if self.ux_mode != ReviewUxMode::Build {
             return false;
         }
-        let Some(source) = self.workspace.sources.get_mut(self.selected_build_row) else {
+        let Some(index) = self.selected_build_source_index() else {
+            self.status_message = Some("select an included source to toggle".to_string());
+            return true;
+        };
+        let Some(source) = self.workspace.sources.get_mut(index) else {
             self.status_message = Some("select an included source to toggle".to_string());
             return true;
         };
@@ -3474,13 +3500,14 @@ impl ReviewApp {
         if self.ux_mode != ReviewUxMode::Build {
             return false;
         }
-        if self.selected_build_row == 0 || self.selected_build_row >= self.workspace.sources.len() {
+        let Some(index) = self.selected_build_source_index() else {
+            return false;
+        };
+        if index == 0 {
             return false;
         }
-        self.workspace
-            .sources
-            .swap(self.selected_build_row, self.selected_build_row - 1);
-        self.selected_build_row -= 1;
+        self.workspace.sources.swap(index, index - 1);
+        self.selected_build_row = index - 1;
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         true
@@ -3488,15 +3515,14 @@ impl ReviewApp {
 
     /// Move the selected workspace source later.
     pub fn move_selected_source_down(&mut self) -> bool {
-        if self.ux_mode != ReviewUxMode::Build
-            || self.selected_build_row.saturating_add(1) >= self.workspace.sources.len()
-        {
+        let Some(index) = self.selected_build_source_index() else {
+            return false;
+        };
+        if index.saturating_add(1) >= self.workspace.sources.len() {
             return false;
         }
-        self.workspace
-            .sources
-            .swap(self.selected_build_row, self.selected_build_row + 1);
-        self.selected_build_row += 1;
+        self.workspace.sources.swap(index, index + 1);
+        self.selected_build_row = index + 1;
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         true
@@ -3507,11 +3533,11 @@ impl ReviewApp {
         if self.ux_mode != ReviewUxMode::Build {
             return false;
         }
-        if self.selected_build_row >= self.workspace.sources.len() {
+        let Some(index) = self.selected_build_source_index() else {
             self.status_message = Some("select an included source to remove".to_string());
             return true;
-        }
-        let source = self.workspace.sources.remove(self.selected_build_row);
+        };
+        let source = self.workspace.sources.remove(index);
         self.selected_build_row = self
             .selected_build_row
             .min(self.build_row_count().saturating_sub(1));

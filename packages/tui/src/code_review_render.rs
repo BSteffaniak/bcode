@@ -744,7 +744,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "toggle-space   u/s/w/l quick add   + add file   A more sources   r rename   [/] reorder   - remove source   m review mode"
+        "enter open/toggle   space toggle source   u/s/w/l quick add   + add file   A source menu   r rename   [/] reorder   - remove   m review"
             .to_string(),
         String::new(),
         false,
