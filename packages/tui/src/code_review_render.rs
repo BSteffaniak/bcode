@@ -876,12 +876,12 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    if selected_surface_kind(app) == Some(ReviewSurfaceKind::File) {
-        render_materialized_file_surface(app, area, frame);
-        return;
-    }
     if app.review.is_repository_review() {
         render_repository_file(app, area, frame);
+        return;
+    }
+    if selected_surface_kind(app) == Some(ReviewSurfaceKind::File) {
+        render_materialized_file_surface(app, area, frame);
         return;
     }
     let Some(file) = app.selected_file_data() else {
@@ -1019,12 +1019,11 @@ pub fn materialized_file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, St
 }
 
 fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
-    let Some(file) = app.selected_file_data() else {
+    let Some(path) = app.selected_file_path() else {
         render_empty(area, "No files", frame);
         return;
     };
-    let path = file.display_path();
-    let Some(cached) = app.file_cache.get(path) else {
+    let Some(cached) = app.file_cache.get(&path) else {
         render_empty(area, "Loading file…", frame);
         return;
     };

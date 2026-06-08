@@ -1864,6 +1864,11 @@ impl ReviewSummary {
     #[must_use]
     pub fn is_repository_review(&self) -> bool {
         self.title == "Repository Review"
+            || self.workspace.as_ref().is_some_and(|workspace| {
+                workspace.sources.iter().any(|source| {
+                    source.included && matches!(source.kind, ReviewSourceKind::Repository)
+                })
+            })
     }
 
     /// Return workspace, creating a transient workspace for legacy single-target reviews.
@@ -3875,6 +3880,14 @@ impl ReviewApp {
         self.review.files.get(self.selected_file)
     }
 
+    /// Return currently selected file path.
+    #[must_use]
+    pub fn selected_file_path(&self) -> Option<String> {
+        self.selected_file_data()
+            .map(|file| file.display_path().to_string())
+            .or_else(|| self.selected_surface().map(|surface| surface.path))
+    }
+
     /// Replace review content after rematerialization.
     pub fn replace_review(&mut self, review: ReviewSummary) {
         let workspace = review.workspace();
@@ -4741,10 +4754,7 @@ impl ReviewApp {
         if !self.review.is_repository_review() {
             return;
         }
-        let Some(path) = self
-            .selected_file_data()
-            .map(|file| file.display_path().to_string())
-        else {
+        let Some(path) = self.selected_file_path() else {
             return;
         };
         if self.file_cache.get(&path).is_none() {
@@ -6173,6 +6183,30 @@ mod tests {
     }
 
     #[test]
+    fn repository_workspace_is_repository_review() {
+        let app = build_workspace_app(
+            vec![build_source("source-1", ReviewSourceKind::Repository, true)],
+            vec![build_file_surface("surface-1", "source-1")],
+            Vec::new(),
+        );
+
+        assert!(app.review.is_repository_review());
+    }
+
+    #[test]
+    fn repository_workspace_queues_selected_file_load() {
+        let mut app = build_workspace_app(
+            vec![build_source("source-1", ReviewSourceKind::Repository, true)],
+            vec![build_file_surface("surface-1", "source-1")],
+            Vec::new(),
+        );
+
+        app.queue_selected_file_load();
+
+        assert_eq!(app.pending_file_load.as_deref(), Some("a.rs"));
+    }
+
+    #[test]
     fn thread_sidebar_toggle_and_jump() {
         let mut app = sample_app();
         app.selected_diff_line = 2;
@@ -6237,6 +6271,16 @@ mod tests {
             source_id: source_id.to_string(),
             path: "a.rs".to_string(),
             kind: ReviewSurfaceKind::Diff,
+            file: None,
+        }
+    }
+
+    fn build_file_surface(id: &str, source_id: &str) -> ReviewSurface {
+        ReviewSurface {
+            id: id.to_string(),
+            source_id: source_id.to_string(),
+            path: "a.rs".to_string(),
+            kind: ReviewSurfaceKind::File,
             file: None,
         }
     }
