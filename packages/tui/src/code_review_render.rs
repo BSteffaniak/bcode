@@ -113,15 +113,25 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         });
     let text = if app.ux_mode == super::code_review::ReviewUxMode::Build {
         let workspace = &app.workspace;
+        let included_sources = workspace
+            .sources
+            .iter()
+            .filter(|source| source.included)
+            .count();
+        let pending = match (app.pending_workspace_save, app.pending_workspace_reload) {
+            (true, true) => "  pending save+reload",
+            (true, false) => "  pending save",
+            (false, true) => "  pending reload",
+            (false, false) => "",
+        };
         format!(
-            " bcode review build  {}  {} included source(s)  {} file(s) ",
+            " bcode review build  {}  {}/{} source(s) included  {} surface(s)  {} diagnostic(s){} ",
             workspace.title,
-            workspace
-                .sources
-                .iter()
-                .filter(|source| source.included)
-                .count(),
-            app.review.files.len()
+            included_sources,
+            workspace.sources.len(),
+            app.review.surfaces().len(),
+            app.review.diagnostics.len(),
+            pending
         )
     } else if app.review.is_repository_review() {
         format!(
@@ -196,14 +206,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 });
             }
             if app.ux_mode == super::code_review::ReviewUxMode::Build {
-                let source_hint = if app.workspace.sources.is_empty() {
-                    "no sources yet — press A to add one"
-                } else {
-                    "j/k move  u/s/w/l quick add  space include/exclude  A more sources  r rename  [/] reorder  - remove"
-                };
-                return format!(
-                    " build mode  {source_hint}  m review mode  f picker  ? help  q exit "
-                );
+                return build_footer_hint(app);
             }
             if app.review.is_repository_review() {
                 return format!(
@@ -224,6 +227,31 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         )]),
         Style::new().fg(Color::White).bg(Color::BrightBlack),
     );
+}
+
+fn build_footer_hint(app: &ReviewApp) -> String {
+    if app.workspace.sources.is_empty() {
+        return " build mode  no sources yet — A source menu  + file  u/s/w/l quick add  ? help  q exit "
+            .to_string();
+    }
+    let source_count = app.workspace.sources.len();
+    let included_count = app
+        .workspace
+        .sources
+        .iter()
+        .filter(|source| source.included)
+        .count();
+    let surface_count = app.review.surfaces().len();
+    let diagnostics = app.review.diagnostics.len();
+    let pending = match (app.pending_workspace_save, app.pending_workspace_reload) {
+        (true, true) => "  pending save+reload",
+        (true, false) => "  pending save",
+        (false, true) => "  pending reload",
+        (false, false) => "",
+    };
+    format!(
+        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  {diagnostics} diagnostic(s){pending}  C edit  O open  I/E/V bulk  m review "
+    )
 }
 
 fn render_separator(area: Rect, frame: &mut Frame<'_>) {
@@ -680,13 +708,8 @@ fn push_source_rows(app: &ReviewApp, rows: &mut Vec<(String, String, bool, bool)
             .iter()
             .filter(|surface| surface.source_id == source.id)
             .count();
-        let status = source_status_label(source.included, surface_count);
         let diagnostics = app.source_diagnostics(&source.id);
-        let status = if diagnostics.is_empty() {
-            status
-        } else {
-            format!("{status}: {} diagnostic(s)", diagnostics.len())
-        };
+        let status = source_status_label(source.included, surface_count, diagnostics.len());
         rows.push((
             format!("  [{marker}] {:<10}", source_kind_short_label(&source.kind)),
             format!("{}  · {status}", source.label),
@@ -783,9 +806,15 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     rows
 }
 
-fn source_status_label(included: bool, surface_count: usize) -> String {
+fn source_status_label(included: bool, surface_count: usize, diagnostic_count: usize) -> String {
     if !included {
         return "excluded".to_string();
+    }
+    if diagnostic_count != 0 && surface_count == 0 {
+        return format!("no surfaces, {diagnostic_count} diagnostic(s)");
+    }
+    if diagnostic_count != 0 {
+        return format!("{surface_count} surface(s), {diagnostic_count} diagnostic(s)");
     }
     if surface_count == 0 {
         return "no surfaces".to_string();
