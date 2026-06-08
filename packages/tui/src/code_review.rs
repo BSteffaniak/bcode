@@ -2419,6 +2419,8 @@ pub enum ReviewPromptKind {
     AddBranchCompareSource,
     /// Add a file source using the fuzzy file picker.
     AddFileSourcePicker,
+    /// Pick a file before entering a file range source.
+    AddFileRangePathPicker,
     /// Add a file range source to the workspace.
     AddFileRangeSource,
     /// Rename the selected source.
@@ -2788,6 +2790,23 @@ impl ReviewApp {
         true
     }
 
+    /// Open add-file-range path picker.
+    pub fn open_add_file_range_path_picker(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.review.repository_files.is_empty() {
+            self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddFileRangeSource));
+            self.status_message = Some("add file range: path:start-end".to_string());
+            return true;
+        }
+        self.prompt_state = Some(ReviewPromptState::new(
+            ReviewPromptKind::AddFileRangePathPicker,
+        ));
+        self.status_message = Some("add file range: pick file, then enter start-end".to_string());
+        true
+    }
+
     /// Open jump-to-line prompt.
     pub fn open_jump_to_line_prompt(&mut self) -> bool {
         self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::JumpToLine));
@@ -2827,6 +2846,9 @@ impl ReviewApp {
             ReviewPromptKind::AddFileSourcePicker => {
                 self.submit_add_file_source_picker(&text, prompt.selected)
             }
+            ReviewPromptKind::AddFileRangePathPicker => {
+                self.submit_add_file_range_path_picker(&text, prompt.selected)
+            }
             ReviewPromptKind::AddFileRangeSource => self.submit_add_file_range_source(&text),
             ReviewPromptKind::RenameSource => self.submit_rename_source(&text),
         }
@@ -2835,11 +2857,7 @@ impl ReviewApp {
     fn start_add_source_kind(&mut self, kind: AddSourceMenuKind) -> bool {
         match kind {
             AddSourceMenuKind::File => return self.open_add_file_source_picker(),
-            AddSourceMenuKind::FileRange => {
-                self.prompt_state =
-                    Some(ReviewPromptState::new(ReviewPromptKind::AddFileRangeSource));
-                self.status_message = Some("add file range: path:start-end".to_string());
-            }
+            AddSourceMenuKind::FileRange => return self.open_add_file_range_path_picker(),
             AddSourceMenuKind::Commit => {
                 self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddCommitSource));
                 self.status_message = Some("add commit: enter revision".to_string());
@@ -2980,6 +2998,23 @@ impl ReviewApp {
             return true;
         };
         self.push_workspace_source(ReviewSourceKind::File { path })
+    }
+
+    fn submit_add_file_range_path_picker(&mut self, query: &str, selected: usize) -> bool {
+        let matches = self.repository_file_picker_matches(query);
+        let Some(path) = matches
+            .get(selected)
+            .cloned()
+            .or_else(|| matches.first().cloned())
+        else {
+            self.status_message = Some(format!("no file matches `{query}`"));
+            return true;
+        };
+        let mut prompt = ReviewPromptState::new(ReviewPromptKind::AddFileRangeSource);
+        prompt.buffer.insert_str(&format!("{path}:"));
+        self.prompt_state = Some(prompt);
+        self.status_message = Some("add file range: enter start-end".to_string());
+        true
     }
 
     fn submit_add_file_range_source(&mut self, text: &str) -> bool {
@@ -3162,10 +3197,11 @@ impl ReviewApp {
         }
         let max = match prompt.kind {
             ReviewPromptKind::AddSourceKind => add_source_menu_items().len().saturating_sub(1),
-            ReviewPromptKind::AddFileSourcePicker => self
-                .repository_file_picker_matches(prompt.buffer.text())
-                .len()
-                .saturating_sub(1),
+            ReviewPromptKind::AddFileSourcePicker | ReviewPromptKind::AddFileRangePathPicker => {
+                self.repository_file_picker_matches(prompt.buffer.text())
+                    .len()
+                    .saturating_sub(1)
+            }
             _ => self
                 .file_picker_matches(prompt.buffer.text())
                 .len()

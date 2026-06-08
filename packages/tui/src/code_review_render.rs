@@ -1469,7 +1469,8 @@ fn prompt_popup_height(kind: ReviewPromptKind, area: Rect) -> u16 {
     match kind {
         ReviewPromptKind::FilePicker
         | ReviewPromptKind::AddSourceKind
-        | ReviewPromptKind::AddFileSourcePicker => area.height.min(16),
+        | ReviewPromptKind::AddFileSourcePicker
+        | ReviewPromptKind::AddFileRangePathPicker => area.height.min(16),
         ReviewPromptKind::JumpToLine
         | ReviewPromptKind::FileSearch
         | ReviewPromptKind::AddCommitSource
@@ -1490,7 +1491,9 @@ const fn prompt_title(kind: ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddCommitRangeSource => " Add range ",
         ReviewPromptKind::AddBranchCompareSource => " Add branch compare ",
         ReviewPromptKind::AddFileSourcePicker => " Add file source ",
-        ReviewPromptKind::AddFileRangeSource => " Add file range ",
+        ReviewPromptKind::AddFileRangePathPicker | ReviewPromptKind::AddFileRangeSource => {
+            " Add file range "
+        }
         ReviewPromptKind::RenameSource => " Rename source ",
     }
 }
@@ -1571,8 +1574,8 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     );
     match prompt.kind {
         ReviewPromptKind::AddSourceKind => render_add_source_menu(prompt, popup, height, frame),
-        ReviewPromptKind::AddFileSourcePicker => {
-            render_add_file_source_picker(app, prompt, popup, height, query, frame);
+        ReviewPromptKind::AddFileSourcePicker | ReviewPromptKind::AddFileRangePathPicker => {
+            render_add_repository_file_picker(app, prompt, popup, height, query, frame);
         }
         ReviewPromptKind::FilePicker => {
             render_file_picker(app, prompt, popup, height, query, frame);
@@ -1593,7 +1596,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
-fn render_add_file_source_picker(
+fn render_add_repository_file_picker(
     app: &ReviewApp,
     prompt: &super::code_review::ReviewPromptState,
     popup: Rect,
@@ -1674,6 +1677,9 @@ const fn prompt_footer_text(kind: ReviewPromptKind) -> &'static str {
         ReviewPromptKind::AddFileRangeSource => " enter path:start-end  esc cancel ",
         ReviewPromptKind::FilePicker => " ↑/↓ choose  enter open  esc cancel ",
         ReviewPromptKind::AddFileSourcePicker => " ↑/↓ choose  enter add file source  esc cancel ",
+        ReviewPromptKind::AddFileRangePathPicker => {
+            " ↑/↓ choose file  enter pick file  esc cancel "
+        }
         _ => " enter submit  esc cancel ",
     }
 }
