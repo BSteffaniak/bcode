@@ -153,8 +153,23 @@ impl ReviewHomeApp {
             self.status_message = Some("selected review workspace is unavailable".to_string());
             return true;
         };
-        self.open_workspace(workspace, false)
+        let build_mode =
+            workspace.sources.is_empty() || workspace.sources.iter().all(|source| !source.included);
+        self.open_workspace(workspace, build_mode)
     }
+    fn open_selected_in_build_mode(&mut self) -> bool {
+        let Some(workspace_index) = self.selected_workspace_index() else {
+            self.status_message =
+                Some("no matching review workspace selected; press n to create one".to_string());
+            return true;
+        };
+        let Some(workspace) = self.workspace(workspace_index).cloned() else {
+            self.status_message = Some("selected review workspace is unavailable".to_string());
+            return true;
+        };
+        self.open_workspace(workspace, true)
+    }
+
     fn start_new_review(&mut self) -> bool {
         self.new_review_buffer = Some(String::new());
         self.status_message = Some("new review title; enter uses Untitled review".to_string());
@@ -438,6 +453,7 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             true
         }
         KeyCode::Enter => app.open_selected(),
+        KeyCode::Char('b') => app.open_selected_in_build_mode(),
         KeyCode::Char('x') => match archive_selected_workspace(client, app).await {
             Ok(archived) => archived,
             Err(error) => {
@@ -858,7 +874,8 @@ const fn review_home_help_lines() -> &'static [&'static str] {
     &[
         " Review Picker Help",
         "",
-        " enter               open selected review",
+        " enter               open selected review; empty reviews open in build mode",
+        " b                   open selected review in build/source mode",
         " n                   new empty review: name it, then add sources",
         " u/s/w/l             quick-create unstaged/staged/worktree/last",
         " j/k or arrows       move selection",

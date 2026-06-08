@@ -1132,7 +1132,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " j/k or arrows       scroll diff",
         " n/p                 next/previous file",
         " J/K                 next/previous hunk",
-        " g/G                 top/bottom of file diff",
+        " B                   switch to build/source mode",
         " b                   toggle sidebar",
         " t                   cycle included/repo/threads/sources",
         " mouse wheel         scroll diff",

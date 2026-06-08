@@ -171,8 +171,7 @@ async fn run_with_workspace<W: Write>(
     let mut app =
         load_review_app(&client, repo_path.clone(), review_target.clone(), workspace).await?;
     if build_mode {
-        app.ux_mode = ReviewUxMode::Build;
-        app.sidebar_mode = ReviewSidebarMode::Sources;
+        app.set_build_mode();
         app.status_message = Some("build mode: add sources with A, then m to review".to_string());
     }
     let mut needs_redraw = true;
@@ -1263,6 +1262,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             app.sidebar_visible = !app.sidebar_visible;
             true
         }
+        KeyCode::Char('B') => app.set_build_mode(),
         KeyCode::Char('m') => app.toggle_ux_mode(),
         KeyCode::Char('+') => app.add_selected_file_to_workspace(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
@@ -2683,6 +2683,15 @@ impl ReviewApp {
             last_file_area: None,
             last_diff_area: None,
         }
+    }
+
+    /// Switch directly to build mode.
+    pub fn set_build_mode(&mut self) -> bool {
+        self.ux_mode = ReviewUxMode::Build;
+        self.sidebar_mode = ReviewSidebarMode::Sources;
+        self.sidebar_visible = true;
+        self.status_message = Some("build mode: assemble review sources".to_string());
+        true
     }
 
     /// Toggle between build and review UX modes.
