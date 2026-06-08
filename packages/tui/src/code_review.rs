@@ -806,6 +806,7 @@ async fn load_workspace_review(
         }
     }
     let diagnostics = materialization.diagnostics;
+    let repository_files = materialization.repository_files;
     if files.is_empty() {
         return Ok(ReviewSummary {
             title: materialization.workspace.title.clone(),
@@ -816,6 +817,7 @@ async fn load_workspace_review(
             workspace: Some(materialization.workspace),
             surfaces,
             diagnostics,
+            repository_files,
         });
     }
     Ok(ReviewSummary {
@@ -827,6 +829,7 @@ async fn load_workspace_review(
         workspace: Some(materialization.workspace),
         surfaces,
         diagnostics,
+        repository_files,
     })
 }
 
@@ -1787,6 +1790,9 @@ pub struct ReviewSummary {
     /// Materialization diagnostics from workspace sources.
     #[serde(default)]
     pub diagnostics: Vec<ReviewSourceDiagnostic>,
+    /// Repository file paths available for source/file pickers.
+    #[serde(default)]
+    pub repository_files: Vec<String>,
 }
 
 impl ReviewSummary {
@@ -2929,16 +2935,15 @@ impl ReviewApp {
     }
 
     fn submit_add_file_source_picker(&mut self, query: &str, selected: usize) -> bool {
-        let matches = self.file_picker_matches(query);
-        let Some(index) = matches
+        let matches = self.repository_file_picker_matches(query);
+        let Some(path) = matches
             .get(selected)
-            .copied()
-            .or_else(|| matches.first().copied())
+            .cloned()
+            .or_else(|| matches.first().cloned())
         else {
             self.status_message = Some(format!("no file matches `{query}`"));
             return true;
         };
-        let path = self.review.files[index].display_path().to_string();
         self.push_workspace_source(ReviewSourceKind::File { path })
     }
 
@@ -3118,6 +3123,10 @@ impl ReviewApp {
         }
         let max = match prompt.kind {
             ReviewPromptKind::AddSourceKind => add_source_menu_items().len().saturating_sub(1),
+            ReviewPromptKind::AddFileSourcePicker => self
+                .repository_file_picker_matches(prompt.buffer.text())
+                .len()
+                .saturating_sub(1),
             _ => self
                 .file_picker_matches(prompt.buffer.text())
                 .len()
@@ -3160,6 +3169,19 @@ impl ReviewApp {
                 (query.is_empty() || path.contains(&query)).then_some(index)
             })
             .take(12)
+            .collect()
+    }
+
+    /// Return repository file matches for source pickers.
+    #[must_use]
+    pub fn repository_file_picker_matches(&self, query: &str) -> Vec<String> {
+        let query = query.to_lowercase();
+        self.review
+            .repository_files
+            .iter()
+            .filter(|path| query.is_empty() || path.to_lowercase().contains(&query))
+            .take(12)
+            .cloned()
             .collect()
     }
 
@@ -4871,6 +4893,7 @@ mod tests {
             workspace: None,
             surfaces: Vec::new(),
             diagnostics: Vec::new(),
+            repository_files: Vec::new(),
             files: vec![
                 ReviewFile {
                     old_path: Some("a.rs".to_string()),

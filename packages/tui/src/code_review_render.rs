@@ -1551,42 +1551,15 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::White).bg(Color::Black),
         )]),
     );
-    if prompt.kind == ReviewPromptKind::AddSourceKind {
-        render_add_source_menu(prompt, popup, height, frame);
-    }
-    if matches!(
-        prompt.kind,
-        ReviewPromptKind::FilePicker | ReviewPromptKind::AddFileSourcePicker
-    ) {
-        let matches = app.file_picker_matches(query);
-        for (row, index) in matches
-            .into_iter()
-            .take(usize::from(height.saturating_sub(3)))
-            .enumerate()
-        {
-            let style = if row == prompt.selected {
-                Style::new().fg(Color::Black).bg(Color::Yellow)
-            } else {
-                Style::new().fg(Color::White).bg(Color::Black)
-            };
-            frame.write_line(
-                Rect::new(
-                    popup.x.saturating_add(1),
-                    popup
-                        .y
-                        .saturating_add(2 + u16::try_from(row).unwrap_or(u16::MAX)),
-                    popup.width.saturating_sub(2),
-                    1,
-                ),
-                &Line::from_spans(vec![Span::styled(
-                    truncate_to_display_width(
-                        app.review.files[index].display_path(),
-                        usize::from(popup.width.saturating_sub(2)),
-                    ),
-                    style,
-                )]),
-            );
+    match prompt.kind {
+        ReviewPromptKind::AddSourceKind => render_add_source_menu(prompt, popup, height, frame),
+        ReviewPromptKind::AddFileSourcePicker => {
+            render_add_file_source_picker(app, prompt, popup, height, query, frame);
         }
+        ReviewPromptKind::FilePicker => {
+            render_file_picker(app, prompt, popup, height, query, frame);
+        }
+        _ => {}
     }
     frame.write_line(
         Rect::new(
@@ -1598,6 +1571,76 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         &Line::from_spans(vec![Span::styled(
             prompt_footer_text(prompt.kind),
             Style::new().fg(Color::Black).bg(Color::Yellow),
+        )]),
+    );
+}
+
+fn render_add_file_source_picker(
+    app: &ReviewApp,
+    prompt: &super::code_review::ReviewPromptState,
+    popup: Rect,
+    height: u16,
+    query: &str,
+    frame: &mut Frame<'_>,
+) {
+    for (row, path) in app
+        .repository_file_picker_matches(query)
+        .into_iter()
+        .take(usize::from(height.saturating_sub(3)))
+        .enumerate()
+    {
+        render_prompt_choice(row, prompt.selected, popup, &path, frame);
+    }
+}
+
+fn render_file_picker(
+    app: &ReviewApp,
+    prompt: &super::code_review::ReviewPromptState,
+    popup: Rect,
+    height: u16,
+    query: &str,
+    frame: &mut Frame<'_>,
+) {
+    for (row, index) in app
+        .file_picker_matches(query)
+        .into_iter()
+        .take(usize::from(height.saturating_sub(3)))
+        .enumerate()
+    {
+        render_prompt_choice(
+            row,
+            prompt.selected,
+            popup,
+            app.review.files[index].display_path(),
+            frame,
+        );
+    }
+}
+
+fn render_prompt_choice(
+    row: usize,
+    selected: usize,
+    popup: Rect,
+    text: &str,
+    frame: &mut Frame<'_>,
+) {
+    let style = if row == selected {
+        Style::new().fg(Color::Black).bg(Color::Yellow)
+    } else {
+        Style::new().fg(Color::White).bg(Color::Black)
+    };
+    frame.write_line(
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup
+                .y
+                .saturating_add(2 + u16::try_from(row).unwrap_or(u16::MAX)),
+            popup.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            truncate_to_display_width(text, usize::from(popup.width.saturating_sub(2))),
+            style,
         )]),
     );
 }

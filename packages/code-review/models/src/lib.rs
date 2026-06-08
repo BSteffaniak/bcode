@@ -314,6 +314,9 @@ pub struct ReviewWorkspaceMaterialization {
     /// Diagnostics produced while materializing sources.
     #[serde(default)]
     pub diagnostics: Vec<ReviewSourceDiagnostic>,
+    /// Repository file paths available for source/file pickers.
+    #[serde(default)]
+    pub repository_files: Vec<String>,
     /// Total added lines across diff surfaces.
     pub additions: u32,
     /// Total removed lines across diff surfaces.

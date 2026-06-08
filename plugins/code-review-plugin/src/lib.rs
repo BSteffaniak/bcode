@@ -1297,11 +1297,16 @@ fn materialize_review_workspace_for_request(
             ));
         }
     }
+    let repository_files = repository_review_files(&repo_root)?
+        .into_iter()
+        .filter_map(|file| file.new_path.or(file.old_path))
+        .collect::<Vec<_>>();
     Ok(MaterializeReviewWorkspaceResponse {
         materialization: ReviewWorkspaceMaterialization {
             workspace: request.workspace,
             surfaces,
             diagnostics,
+            repository_files,
             additions,
             deletions,
         },
