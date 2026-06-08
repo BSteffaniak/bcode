@@ -1465,12 +1465,15 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
-fn prompt_popup_height(kind: ReviewPromptKind, area: Rect) -> u16 {
+fn prompt_popup_height(kind: &ReviewPromptKind, area: Rect) -> u16 {
     match kind {
         ReviewPromptKind::FilePicker
         | ReviewPromptKind::AddSourceKind
         | ReviewPromptKind::AddFileSourcePicker
-        | ReviewPromptKind::AddFileRangePathPicker => area.height.min(16),
+        | ReviewPromptKind::AddFileRangePathPicker
+        | ReviewPromptKind::AddCommitPicker
+        | ReviewPromptKind::AddBranchCompareBasePicker
+        | ReviewPromptKind::AddBranchCompareHeadPicker { .. } => area.height.min(16),
         ReviewPromptKind::JumpToLine
         | ReviewPromptKind::FileSearch
         | ReviewPromptKind::AddCommitSource
@@ -1481,14 +1484,17 @@ fn prompt_popup_height(kind: ReviewPromptKind, area: Rect) -> u16 {
     }
 }
 
-const fn prompt_title(kind: ReviewPromptKind) -> &'static str {
+const fn prompt_title(kind: &ReviewPromptKind) -> &'static str {
     match kind {
         ReviewPromptKind::FilePicker => " Open file ",
         ReviewPromptKind::JumpToLine => " Jump to line ",
         ReviewPromptKind::FileSearch => " Search file ",
         ReviewPromptKind::AddSourceKind => " Add source ",
+        ReviewPromptKind::AddCommitPicker => " Pick commit ",
         ReviewPromptKind::AddCommitSource => " Add commit ",
         ReviewPromptKind::AddCommitRangeSource => " Add range ",
+        ReviewPromptKind::AddBranchCompareBasePicker => " Pick base branch ",
+        ReviewPromptKind::AddBranchCompareHeadPicker { .. } => " Pick head branch ",
         ReviewPromptKind::AddBranchCompareSource => " Add branch compare ",
         ReviewPromptKind::AddFileSourcePicker => " Add file source ",
         ReviewPromptKind::AddFileRangePathPicker | ReviewPromptKind::AddFileRangeSource => {
@@ -1538,7 +1544,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     };
     let width = area.width.min(80);
-    let height = prompt_popup_height(prompt.kind, area);
+    let height = prompt_popup_height(&prompt.kind, area);
     if width < 20 || height < 3 {
         return;
     }
@@ -1548,7 +1554,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
     frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
-    let title = prompt_title(prompt.kind);
+    let title = prompt_title(&prompt.kind);
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),
         &Line::from_spans(vec![Span::styled(
@@ -1572,10 +1578,17 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::White).bg(Color::Black),
         )]),
     );
-    match prompt.kind {
+    match &prompt.kind {
         ReviewPromptKind::AddSourceKind => render_add_source_menu(prompt, popup, height, frame),
         ReviewPromptKind::AddFileSourcePicker | ReviewPromptKind::AddFileRangePathPicker => {
             render_add_repository_file_picker(app, prompt, popup, height, query, frame);
+        }
+        ReviewPromptKind::AddCommitPicker => {
+            render_add_repository_commit_picker(app, prompt, popup, height, query, frame);
+        }
+        ReviewPromptKind::AddBranchCompareBasePicker
+        | ReviewPromptKind::AddBranchCompareHeadPicker { .. } => {
+            render_add_repository_branch_picker(app, prompt, popup, height, query, frame);
         }
         ReviewPromptKind::FilePicker => {
             render_file_picker(app, prompt, popup, height, query, frame);
@@ -1590,7 +1603,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            prompt_footer_text(prompt.kind),
+            prompt_footer_text(&prompt.kind),
             Style::new().fg(Color::Black).bg(Color::Yellow),
         )]),
     );
@@ -1611,6 +1624,48 @@ fn render_add_repository_file_picker(
         .enumerate()
     {
         render_prompt_choice(row, prompt.selected, popup, &path, frame);
+    }
+}
+
+fn render_add_repository_commit_picker(
+    app: &ReviewApp,
+    prompt: &super::code_review::ReviewPromptState,
+    popup: Rect,
+    height: u16,
+    query: &str,
+    frame: &mut Frame<'_>,
+) {
+    for (row, commit) in app
+        .repository_commit_picker_matches(query)
+        .into_iter()
+        .take(usize::from(height.saturating_sub(3)))
+        .enumerate()
+    {
+        render_prompt_choice(
+            row,
+            prompt.selected,
+            popup,
+            &format!("{} {}", commit.short_rev, commit.subject),
+            frame,
+        );
+    }
+}
+
+fn render_add_repository_branch_picker(
+    app: &ReviewApp,
+    prompt: &super::code_review::ReviewPromptState,
+    popup: Rect,
+    height: u16,
+    query: &str,
+    frame: &mut Frame<'_>,
+) {
+    for (row, branch) in app
+        .repository_branch_picker_matches(query)
+        .into_iter()
+        .take(usize::from(height.saturating_sub(3)))
+        .enumerate()
+    {
+        render_prompt_choice(row, prompt.selected, popup, &branch, frame);
     }
 }
 
@@ -1666,13 +1721,22 @@ fn render_prompt_choice(
     );
 }
 
-const fn prompt_footer_text(kind: ReviewPromptKind) -> &'static str {
+const fn prompt_footer_text(kind: &ReviewPromptKind) -> &'static str {
     match kind {
         ReviewPromptKind::AddSourceKind => {
             " add source  ↑/↓ choose  enter select  type shortcut: worktree, staged, file, range, branch  esc cancel "
         }
+        ReviewPromptKind::AddCommitPicker => {
+            " ↑/↓ choose commit  enter add commit source  esc cancel "
+        }
         ReviewPromptKind::AddCommitRangeSource | ReviewPromptKind::AddBranchCompareSource => {
             " enter base..head or base...head  esc cancel "
+        }
+        ReviewPromptKind::AddBranchCompareBasePicker => {
+            " ↑/↓ choose base branch  enter select  esc cancel "
+        }
+        ReviewPromptKind::AddBranchCompareHeadPicker { .. } => {
+            " ↑/↓ choose head branch  enter add compare  esc cancel "
         }
         ReviewPromptKind::AddFileRangeSource => " enter path:start-end  esc cancel ",
         ReviewPromptKind::FilePicker => " ↑/↓ choose  enter open  esc cancel ",

@@ -12,7 +12,7 @@ use bcode_code_review_models::{
     OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
     OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
     OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    ReviewRepositoryCommit, ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
     ReviewTarget as ModelReviewTarget, ReviewWorkspace, UpdateReviewWorkspaceRequest,
 };
@@ -811,6 +811,8 @@ async fn load_workspace_review(
     }
     let diagnostics = materialization.diagnostics;
     let repository_files = materialization.repository_files;
+    let repository_branches = materialization.repository_branches;
+    let repository_commits = materialization.repository_commits;
     if files.is_empty() {
         return Ok(ReviewSummary {
             title: materialization.workspace.title.clone(),
@@ -822,6 +824,8 @@ async fn load_workspace_review(
             surfaces,
             diagnostics,
             repository_files,
+            repository_branches,
+            repository_commits,
         });
     }
     Ok(ReviewSummary {
@@ -834,6 +838,8 @@ async fn load_workspace_review(
         surfaces,
         diagnostics,
         repository_files,
+        repository_branches,
+        repository_commits,
     })
 }
 
@@ -1800,6 +1806,12 @@ pub struct ReviewSummary {
     /// Repository file paths available for source/file pickers.
     #[serde(default)]
     pub repository_files: Vec<String>,
+    /// Repository branch names available for source pickers.
+    #[serde(default)]
+    pub repository_branches: Vec<String>,
+    /// Recent repository commits available for source pickers.
+    #[serde(default)]
+    pub repository_commits: Vec<ReviewRepositoryCommit>,
 }
 
 impl ReviewSummary {
@@ -2401,7 +2413,7 @@ pub struct ReviewPublishOption {
 }
 
 /// Active review prompt kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewPromptKind {
     /// Fuzzy file picker.
     FilePicker,
@@ -2411,10 +2423,16 @@ pub enum ReviewPromptKind {
     FileSearch,
     /// Add a source to the workspace.
     AddSourceKind,
+    /// Pick a commit source from recent repository commits.
+    AddCommitPicker,
     /// Add a commit source to the workspace.
     AddCommitSource,
     /// Add a commit range source to the workspace.
     AddCommitRangeSource,
+    /// Pick a base branch for a branch compare source.
+    AddBranchCompareBasePicker,
+    /// Pick a head branch for a branch compare source.
+    AddBranchCompareHeadPicker { base_branch: String },
     /// Add a branch compare source to the workspace.
     AddBranchCompareSource,
     /// Add a file source using the fuzzy file picker.
@@ -2775,6 +2793,40 @@ impl ReviewApp {
         true
     }
 
+    /// Open add-commit picker.
+    pub fn open_add_commit_picker(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.review.repository_commits.is_empty() {
+            self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddCommitSource));
+            self.status_message = Some("add commit: enter revision".to_string());
+            return true;
+        }
+        self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddCommitPicker));
+        self.status_message = Some("add commit: pick recent commit".to_string());
+        true
+    }
+
+    /// Open add-branch-compare base picker.
+    pub fn open_add_branch_compare_base_picker(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.review.repository_branches.is_empty() {
+            self.prompt_state = Some(ReviewPromptState::new(
+                ReviewPromptKind::AddBranchCompareSource,
+            ));
+            self.status_message = Some("add branch compare: base...head or base..head".to_string());
+            return true;
+        }
+        self.prompt_state = Some(ReviewPromptState::new(
+            ReviewPromptKind::AddBranchCompareBasePicker,
+        ));
+        self.status_message = Some("add branch compare: pick base branch".to_string());
+        true
+    }
+
     /// Open add-file-source picker.
     pub fn open_add_file_source_picker(&mut self) -> bool {
         if self.ux_mode != ReviewUxMode::Build {
@@ -2833,13 +2885,22 @@ impl ReviewApp {
             return false;
         };
         let text = prompt.buffer.text().trim().to_string();
-        match prompt.kind {
+        match prompt.kind.clone() {
             ReviewPromptKind::FilePicker => self.submit_file_picker(&text, prompt.selected),
             ReviewPromptKind::JumpToLine => self.submit_jump_to_line(&text),
             ReviewPromptKind::FileSearch => self.submit_file_search(&text),
             ReviewPromptKind::AddSourceKind => self.submit_add_source_kind(&text, prompt.selected),
+            ReviewPromptKind::AddCommitPicker => {
+                self.submit_add_commit_picker(&text, prompt.selected)
+            }
             ReviewPromptKind::AddCommitSource => self.submit_add_commit_source(&text),
             ReviewPromptKind::AddCommitRangeSource => self.submit_add_commit_range_source(&text),
+            ReviewPromptKind::AddBranchCompareBasePicker => {
+                self.submit_add_branch_compare_base_picker(&text, prompt.selected)
+            }
+            ReviewPromptKind::AddBranchCompareHeadPicker { base_branch } => {
+                self.submit_add_branch_compare_head_picker(&base_branch, &text, prompt.selected)
+            }
             ReviewPromptKind::AddBranchCompareSource => {
                 self.submit_add_branch_compare_source(&text)
             }
@@ -2858,10 +2919,7 @@ impl ReviewApp {
         match kind {
             AddSourceMenuKind::File => return self.open_add_file_source_picker(),
             AddSourceMenuKind::FileRange => return self.open_add_file_range_path_picker(),
-            AddSourceMenuKind::Commit => {
-                self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddCommitSource));
-                self.status_message = Some("add commit: enter revision".to_string());
-            }
+            AddSourceMenuKind::Commit => return self.open_add_commit_picker(),
             AddSourceMenuKind::CommitRange => {
                 self.prompt_state = Some(ReviewPromptState::new(
                     ReviewPromptKind::AddCommitRangeSource,
@@ -2869,13 +2927,7 @@ impl ReviewApp {
                 self.status_message =
                     Some("add commit range: base..head or base...head".to_string());
             }
-            AddSourceMenuKind::BranchCompare => {
-                self.prompt_state = Some(ReviewPromptState::new(
-                    ReviewPromptKind::AddBranchCompareSource,
-                ));
-                self.status_message =
-                    Some("add branch compare: base...head or base..head".to_string());
-            }
+            AddSourceMenuKind::BranchCompare => return self.open_add_branch_compare_base_picker(),
             AddSourceMenuKind::Staged => {
                 return self.push_workspace_source(ReviewSourceKind::IndexStaged);
             }
@@ -2941,6 +2993,19 @@ impl ReviewApp {
         true
     }
 
+    fn submit_add_commit_picker(&mut self, query: &str, selected: usize) -> bool {
+        let matches = self.repository_commit_picker_matches(query);
+        let Some(commit) = matches
+            .get(selected)
+            .cloned()
+            .or_else(|| matches.first().cloned())
+        else {
+            self.status_message = Some(format!("no commit matches `{query}`"));
+            return true;
+        };
+        self.push_workspace_source(ReviewSourceKind::Commit { rev: commit.rev })
+    }
+
     fn submit_add_commit_source(&mut self, text: &str) -> bool {
         let rev = text.trim();
         if rev.is_empty() {
@@ -2984,6 +3049,49 @@ impl ReviewApp {
             base_branch: base_branch.trim().to_string(),
             head_branch: head_branch.trim().to_string(),
             merge_base,
+        })
+    }
+
+    fn submit_add_branch_compare_base_picker(&mut self, query: &str, selected: usize) -> bool {
+        let matches = self.repository_branch_picker_matches(query);
+        let Some(base_branch) = matches
+            .get(selected)
+            .cloned()
+            .or_else(|| matches.first().cloned())
+        else {
+            self.status_message = Some(format!("no branch matches `{query}`"));
+            return true;
+        };
+        self.prompt_state = Some(ReviewPromptState::new(
+            ReviewPromptKind::AddBranchCompareHeadPicker { base_branch },
+        ));
+        self.status_message = Some("add branch compare: pick head branch".to_string());
+        true
+    }
+
+    fn submit_add_branch_compare_head_picker(
+        &mut self,
+        base_branch: &str,
+        query: &str,
+        selected: usize,
+    ) -> bool {
+        let matches = self.repository_branch_picker_matches(query);
+        let Some(head_branch) = matches
+            .get(selected)
+            .cloned()
+            .or_else(|| matches.first().cloned())
+        else {
+            self.status_message = Some(format!("no branch matches `{query}`"));
+            return true;
+        };
+        if base_branch == head_branch {
+            self.status_message = Some("base and head branch must differ".to_string());
+            return true;
+        }
+        self.push_workspace_source(ReviewSourceKind::BranchCompare {
+            base_branch: base_branch.to_string(),
+            head_branch,
+            merge_base: true,
         })
     }
 
@@ -3217,17 +3325,30 @@ impl ReviewApp {
             prompt.kind,
             ReviewPromptKind::FilePicker
                 | ReviewPromptKind::AddSourceKind
+                | ReviewPromptKind::AddCommitPicker
                 | ReviewPromptKind::AddFileSourcePicker
+                | ReviewPromptKind::AddFileRangePathPicker
+                | ReviewPromptKind::AddBranchCompareBasePicker
+                | ReviewPromptKind::AddBranchCompareHeadPicker { .. }
         ) {
             return false;
         }
-        let max = match prompt.kind {
+        let max = match &prompt.kind {
             ReviewPromptKind::AddSourceKind => add_source_menu_items().len().saturating_sub(1),
+            ReviewPromptKind::AddCommitPicker => self
+                .repository_commit_picker_matches(prompt.buffer.text())
+                .len()
+                .saturating_sub(1),
             ReviewPromptKind::AddFileSourcePicker | ReviewPromptKind::AddFileRangePathPicker => {
                 self.repository_file_picker_matches(prompt.buffer.text())
                     .len()
                     .saturating_sub(1)
             }
+            ReviewPromptKind::AddBranchCompareBasePicker
+            | ReviewPromptKind::AddBranchCompareHeadPicker { .. } => self
+                .repository_branch_picker_matches(prompt.buffer.text())
+                .len()
+                .saturating_sub(1),
             _ => self
                 .file_picker_matches(prompt.buffer.text())
                 .len()
@@ -3249,7 +3370,11 @@ impl ReviewApp {
             prompt.kind,
             ReviewPromptKind::FilePicker
                 | ReviewPromptKind::AddSourceKind
+                | ReviewPromptKind::AddCommitPicker
                 | ReviewPromptKind::AddFileSourcePicker
+                | ReviewPromptKind::AddFileRangePathPicker
+                | ReviewPromptKind::AddBranchCompareBasePicker
+                | ReviewPromptKind::AddBranchCompareHeadPicker { .. }
         ) {
             return false;
         }
@@ -3281,6 +3406,37 @@ impl ReviewApp {
             .repository_files
             .iter()
             .filter(|path| query.is_empty() || path.to_lowercase().contains(&query))
+            .take(12)
+            .cloned()
+            .collect()
+    }
+
+    /// Return repository commit matches for source pickers.
+    #[must_use]
+    pub fn repository_commit_picker_matches(&self, query: &str) -> Vec<ReviewRepositoryCommit> {
+        let query = query.to_lowercase();
+        self.review
+            .repository_commits
+            .iter()
+            .filter(|commit| {
+                query.is_empty()
+                    || commit.rev.to_lowercase().contains(&query)
+                    || commit.short_rev.to_lowercase().contains(&query)
+                    || commit.subject.to_lowercase().contains(&query)
+            })
+            .take(12)
+            .cloned()
+            .collect()
+    }
+
+    /// Return repository branch matches for source pickers.
+    #[must_use]
+    pub fn repository_branch_picker_matches(&self, query: &str) -> Vec<String> {
+        let query = query.to_lowercase();
+        self.review
+            .repository_branches
+            .iter()
+            .filter(|branch| query.is_empty() || branch.to_lowercase().contains(&query))
             .take(12)
             .cloned()
             .collect()
@@ -5050,6 +5206,8 @@ mod tests {
             surfaces: Vec::new(),
             diagnostics: Vec::new(),
             repository_files: Vec::new(),
+            repository_branches: Vec::new(),
+            repository_commits: Vec::new(),
             files: vec![
                 ReviewFile {
                     old_path: Some("a.rs".to_string()),

@@ -17,11 +17,12 @@ use bcode_code_review_models::{
     PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
     ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
     ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope,
-    ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind,
-    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem,
-    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest,
-    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
+    ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
+    ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization,
+    SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse,
+    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1301,12 +1302,16 @@ fn materialize_review_workspace_for_request(
         .into_iter()
         .filter_map(|file| file.new_path.or(file.old_path))
         .collect::<Vec<_>>();
+    let repository_branches = repository_review_branches(&repo_root)?;
+    let repository_commits = repository_review_commits(&repo_root)?;
     Ok(MaterializeReviewWorkspaceResponse {
         materialization: ReviewWorkspaceMaterialization {
             workspace: request.workspace,
             surfaces,
             diagnostics,
             repository_files,
+            repository_branches,
+            repository_commits,
             additions,
             deletions,
         },
@@ -2951,6 +2956,45 @@ fn repository_review_files(repo_root: &Path) -> Result<Vec<ReviewFile>, ReviewEr
             deletions: 0,
             hunks: Vec::new(),
             is_binary: false,
+        })
+        .collect())
+}
+
+fn repository_review_branches(repo_root: &Path) -> Result<Vec<String>, ReviewError> {
+    let output = git_output(
+        repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty() && !branch.ends_with("/HEAD"))
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn repository_review_commits(repo_root: &Path) -> Result<Vec<ReviewRepositoryCommit>, ReviewError> {
+    let output = git_output(
+        repo_root,
+        &["log", "--max-count=50", "--format=%H%x1f%h%x1f%s", "--all"],
+    )?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let rev = parts.next()?.to_string();
+            let short_rev = parts.next()?.to_string();
+            let subject = parts.next().unwrap_or_default().to_string();
+            Some(ReviewRepositoryCommit {
+                rev,
+                short_rev,
+                subject,
+            })
         })
         .collect())
 }

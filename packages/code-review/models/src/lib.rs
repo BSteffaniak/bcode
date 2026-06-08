@@ -304,6 +304,17 @@ pub struct ReviewSourceDiagnostic {
     pub message: String,
 }
 
+/// Repository commit available for source pickers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRepositoryCommit {
+    /// Full commit revision.
+    pub rev: String,
+    /// Short commit revision.
+    pub short_rev: String,
+    /// Commit subject.
+    pub subject: String,
+}
+
 /// Materialized workspace review data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewWorkspaceMaterialization {
@@ -317,6 +328,12 @@ pub struct ReviewWorkspaceMaterialization {
     /// Repository file paths available for source/file pickers.
     #[serde(default)]
     pub repository_files: Vec<String>,
+    /// Repository branch names available for source pickers.
+    #[serde(default)]
+    pub repository_branches: Vec<String>,
+    /// Recent repository commits available for source pickers.
+    #[serde(default)]
+    pub repository_commits: Vec<ReviewRepositoryCommit>,
     /// Total added lines across diff surfaces.
     pub additions: u32,
     /// Total removed lines across diff surfaces.
