@@ -1280,6 +1280,8 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
         KeyCode::Char('I') => app.include_all_sources(),
         KeyCode::Char('E') => app.exclude_all_sources(),
         KeyCode::Char('V') => app.invert_source_inclusion(),
+        KeyCode::Char('d') => app.select_next_diagnostic_source(),
+        KeyCode::Char('Z') => app.exclude_sources_with_errors(),
         KeyCode::Char('C') => app.open_edit_source_spec_prompt(),
         KeyCode::Char('M') => app.toggle_selected_source_merge_base(),
         KeyCode::Char('X') => app.remove_excluded_sources(),
@@ -4182,6 +4184,74 @@ impl ReviewApp {
         self.pending_workspace_save = true;
         self.pending_workspace_reload = true;
         self.status_message = Some("inverted source inclusion".to_string());
+        true
+    }
+
+    /// Select the next source with diagnostics.
+    pub fn select_next_diagnostic_source(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        if self.review.diagnostics.is_empty() {
+            self.status_message = Some("no source diagnostics".to_string());
+            return true;
+        }
+        let source_count = self.workspace.sources.len();
+        if source_count == 0 {
+            self.status_message =
+                Some("diagnostics have no matching workspace sources".to_string());
+            return true;
+        }
+        let start = self.selected_build_row.saturating_add(1);
+        for offset in 0..source_count {
+            let index = start.saturating_add(offset) % source_count;
+            let source_id = self.workspace.sources[index].id.clone();
+            if self
+                .review
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.source_id == source_id)
+            {
+                self.set_selected_build_row(index);
+                self.status_message = Some("selected source with diagnostics".to_string());
+                return true;
+            }
+        }
+        self.status_message = Some("diagnostics have no matching workspace sources".to_string());
+        true
+    }
+
+    /// Exclude all sources that have error diagnostics.
+    pub fn exclude_sources_with_errors(&mut self) -> bool {
+        if self.ux_mode != ReviewUxMode::Build {
+            return false;
+        }
+        let error_source_ids: BTreeSet<String> = self
+            .review
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == ReviewSourceDiagnosticSeverity::Error)
+            .map(|diagnostic| diagnostic.source_id.clone())
+            .collect();
+        if error_source_ids.is_empty() {
+            self.status_message = Some("no source errors to exclude".to_string());
+            return true;
+        }
+        let mut excluded = 0usize;
+        for source in &mut self.workspace.sources {
+            if source.included && error_source_ids.contains(&source.id) {
+                source.included = false;
+                excluded = excluded.saturating_add(1);
+            }
+        }
+        if excluded == 0 {
+            self.status_message = Some("error sources are already excluded".to_string());
+            return true;
+        }
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        self.pending_workspace_reload = true;
+        self.status_message = Some(format!("excluded {excluded} source(s) with errors"));
         true
     }
 

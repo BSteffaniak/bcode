@@ -250,7 +250,7 @@ fn build_footer_hint(app: &ReviewApp) -> String {
         (false, false) => "",
     };
     format!(
-        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  {diagnostics} diagnostic(s){pending}  C edit  O open  I/E/V bulk  m review "
+        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  {diagnostics} diagnostic(s){pending}  d diagnostic  Z exclude errors  C edit  m review "
     )
 }
 
@@ -1174,10 +1174,10 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " T                  rename workspace",
         " R                  refresh/rematerialize sources",
         " I/E/V              include all / exclude all / invert sources",
+        " d/Z                next diagnostic source / exclude error sources",
         " M/X                merge-base toggle / remove excluded",
-        " O/Y                open source surface / select source for surface",
+        " O/Y                open source surface / source for surface",
         " C                  change selected source spec",
-        " r/-                rename / remove selected source",
         " f or ctrl-p         fuzzy file picker",
         " enter               inspect/open selected item",
         " t                   cycle included/repo/threads/sources",
