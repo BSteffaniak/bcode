@@ -342,6 +342,8 @@ fn shell_program_and_args(
                 "exec".to_owned(),
                 cwd.display().to_string(),
                 shell_program().to_owned(),
+                "-o".to_owned(),
+                "pipefail".to_owned(),
                 "-c".to_owned(),
                 command.to_owned(),
             ],
@@ -558,6 +560,7 @@ const fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
 }
 
 fn build_process_tool_response(
+    command: &str,
     result: &bcode_tool_runtime::ProcessExecutionResult,
     max_output_bytes: usize,
     inline_output_bytes: usize,
@@ -575,6 +578,7 @@ fn build_process_tool_response(
     let inline_stdout = limit_inline_stream_output(&stdout, inline_output_bytes);
     let inline_stderr = limit_inline_stream_output(&stderr, inline_output_bytes);
     let output = format_command_output(
+        command,
         result.exit_code,
         result.timed_out,
         result.cancelled,
@@ -582,6 +586,7 @@ fn build_process_tool_response(
         &inline_stderr,
     );
     let full_output = format_command_output(
+        command,
         result.exit_code,
         result.timed_out,
         result.cancelled,
@@ -684,6 +689,7 @@ fn run_shell_command(
         .map_err(|error| error.to_string())?;
 
     Ok(build_process_tool_response(
+        &arguments.command,
         &result,
         max_output_bytes,
         inline_output_bytes,
@@ -702,7 +708,12 @@ const fn shell_program() -> &'static str {
 
 #[cfg(unix)]
 fn shell_args(command: &str) -> Vec<String> {
-    vec!["-c".to_string(), command.to_string()]
+    vec![
+        "-o".to_string(),
+        "pipefail".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]
 }
 
 #[cfg(windows)]
@@ -805,14 +816,34 @@ fn limit_output_bytes_with_truncation(
 fn limit_inline_stream_output(output: &LimitedOutput, max_bytes: usize) -> LimitedOutput {
     let bytes = output.text.as_bytes();
     let limit = max_bytes.min(bytes.len());
-    let start = utf8_boundary_at_or_after(&output.text, bytes.len().saturating_sub(limit));
-    let text = output.text[start..].to_owned();
+    if !output.truncated && limit == bytes.len() {
+        return output.clone();
+    }
+
+    let tail_budget = limit.saturating_mul(3) / 5;
+    let head_budget = limit.saturating_sub(tail_budget);
+    let head_end = utf8_boundary_at_or_before(&output.text, head_budget);
+    let tail_start =
+        utf8_boundary_at_or_after(&output.text, bytes.len().saturating_sub(tail_budget));
+    let text = if head_end >= tail_start {
+        output.text.clone()
+    } else {
+        format!("{}{}", &output.text[..head_end], &output.text[tail_start..])
+    };
+
     LimitedOutput {
         text,
         original_bytes: output.original_bytes,
-        retained_bytes: bytes.len().saturating_sub(start),
-        truncated: output.truncated || start > 0,
+        retained_bytes: head_end + bytes.len().saturating_sub(tail_start),
+        truncated: true,
     }
+}
+
+const fn utf8_boundary_at_or_before(value: &str, mut index: usize) -> usize {
+    while index > 0 && !value.is_char_boundary(index) {
+        index = index.saturating_sub(1);
+    }
+    index
 }
 
 fn valid_utf8_prefix_len(bytes: &[u8], max_len: usize) -> usize {
@@ -832,6 +863,7 @@ fn join_reader(
 }
 
 fn format_command_output(
+    command: &str,
     exit_code: Option<i32>,
     timed_out: bool,
     cancelled: bool,
@@ -839,11 +871,29 @@ fn format_command_output(
     stderr: &LimitedOutput,
 ) -> String {
     let exit_code = exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string());
+    let pipeline_note = output_slicing_pipeline_note(command);
     format!(
-        "exit_code: {exit_code}\ntimed_out: {timed_out}\ncancelled: {cancelled}\nstdout:\n{}\nstderr:\n{}",
+        "exit_code: {exit_code}\ntimed_out: {timed_out}\ncancelled: {cancelled}{pipeline_note}\nstdout:\n{}\nstderr:\n{}",
         format_stream_output("stdout", stdout),
         format_stream_output("stderr", stderr),
     )
+}
+
+fn output_slicing_pipeline_note(command: &str) -> &'static str {
+    if command_contains_output_slicing_pipe(command) {
+        "\nnote: this command pipes output through sed/head/tail. Bcode already shows the beginning and end of long shell output; prefer unsliced validation commands plus artifact.read/artifact.grep for omitted retained output."
+    } else {
+        ""
+    }
+}
+
+fn command_contains_output_slicing_pipe(command: &str) -> bool {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    [
+        "| sed ", "| head", "| tail", "|& sed ", "|& head", "|& tail",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
 }
 
 fn format_stream_output(stream: &str, output: &LimitedOutput) -> String {
@@ -857,7 +907,7 @@ fn format_stream_output(stream: &str, output: &LimitedOutput) -> String {
         ""
     };
     format!(
-        "[{stream} truncated: omitted {omitted} bytes; showing last {} of {} retained bytes.{capture_note}]\n{}",
+        "[{stream} truncated: omitted {omitted} bytes; showing first and last {} of {} retained bytes.{capture_note} Bcode already shows both the beginning and end of long shell output. Do not rerun the same command with sed/head/tail just to inspect omitted output; use artifact.read/from_end or artifact.grep.]\n{}",
         output.retained_bytes, output.original_bytes, output.text
     )
 }
@@ -922,22 +972,22 @@ mod tests {
     }
 
     #[test]
-    fn inline_stream_output_keeps_tail_when_truncated() {
+    fn inline_stream_output_keeps_head_and_tail_when_truncated() {
         let output = limit_output_bytes(b"head-middle-tail", 16);
-        let inline = limit_inline_stream_output(&output, 4);
+        let inline = limit_inline_stream_output(&output, 10);
 
-        assert_eq!(inline.text, "tail");
+        assert_eq!(inline.text, "heade-tail");
         assert_eq!(inline.original_bytes, 16);
-        assert_eq!(inline.retained_bytes, 4);
+        assert_eq!(inline.retained_bytes, 10);
         assert!(inline.truncated);
     }
 
     #[test]
     fn command_output_marks_truncated_streams() {
         let stdout = LimitedOutput {
-            text: "tail".to_string(),
+            text: "headtail".to_string(),
             original_bytes: 16,
-            retained_bytes: 4,
+            retained_bytes: 8,
             truncated: true,
         };
         let stderr = LimitedOutput {
@@ -947,11 +997,62 @@ mod tests {
             truncated: false,
         };
 
-        let output = format_command_output(Some(0), false, false, &stdout, &stderr);
+        let output = format_command_output("echo test", Some(0), false, false, &stdout, &stderr);
 
         assert!(output.contains("stdout truncated"));
-        assert!(output.contains("showing last 4 of 16 retained bytes"));
-        assert!(output.contains("tail"));
+        assert!(output.contains("showing first and last 8 of 16 retained bytes"));
+        assert!(output.contains("headtail"));
+    }
+
+    #[test]
+    fn command_output_warns_about_output_slicing_pipelines() {
+        let stdout = LimitedOutput {
+            text: String::new(),
+            original_bytes: 0,
+            retained_bytes: 0,
+            truncated: false,
+        };
+        let stderr = stdout.clone();
+
+        let output = format_command_output(
+            "cargo clippy 2>&1 | sed -n '1,120p'",
+            Some(0),
+            false,
+            false,
+            &stdout,
+            &stderr,
+        );
+
+        assert!(output.contains("pipes output through sed/head/tail"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_pipeline_preserves_failing_left_side_status() {
+        let response = run_shell_command(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            "test",
+            &ShellRunArguments {
+                command: "false | sed -n '1,1p'".to_string(),
+                cwd: None,
+                timeout_ms: Some(1_000),
+                terminal: false,
+                columns: None,
+                rows: None,
+            },
+            None,
+            None,
+        )
+        .expect("shell command should run");
+
+        assert!(response.is_error);
+        assert!(response.output.contains("exit_code: 1"));
+        assert!(
+            response
+                .output
+                .contains("pipes output through sed/head/tail")
+        );
     }
 
     #[test]
