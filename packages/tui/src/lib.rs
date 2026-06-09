@@ -8,14 +8,8 @@ pub(crate) mod activity;
 pub(crate) mod app;
 pub(crate) mod chat_loop;
 pub(crate) mod clipboard_image;
-#[allow(dead_code)]
-pub(crate) mod code_review;
-#[allow(dead_code)]
-pub(crate) mod code_review_display;
 pub mod code_review_home;
 pub mod code_review_launcher;
-#[allow(dead_code)]
-pub(crate) mod code_review_render;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
 pub(crate) mod composer_flow;
