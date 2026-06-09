@@ -41,6 +41,7 @@ pub(crate) mod permission_flow;
 pub(crate) mod permission_present;
 pub(crate) mod picker_mouse;
 pub(crate) mod picker_render;
+pub(crate) mod plugin_surface_host;
 pub(crate) mod provider_picker;
 pub(crate) mod provider_picker_render;
 pub(crate) mod render;
@@ -152,6 +153,7 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
 /// # Errors
 ///
 /// Returns I/O, client, or plugin service errors.
+#[allow(clippy::future_not_send)]
 pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
@@ -186,6 +188,7 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
 /// # Errors
 ///
 /// Returns I/O, client, or plugin service errors.
+#[allow(clippy::future_not_send)]
 pub async fn run_code_review_workspace(
     workspace: bcode_code_review_models::ReviewWorkspace,
     build_mode: bool,
@@ -220,6 +223,7 @@ pub async fn run_code_review_workspace(
 /// # Errors
 ///
 /// Returns I/O, client, or plugin service errors.
+#[allow(clippy::future_not_send)]
 pub async fn run_code_review(
     repo_path: std::path::PathBuf,
     target: code_review::ReviewOpenTarget,

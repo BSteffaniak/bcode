@@ -94,11 +94,6 @@ where
         true
     }
 
-    /// Receive one completed async value update.
-    pub async fn recv(&mut self) -> Option<AsyncValueUpdate<K, V>> {
-        self.receiver.recv().await
-    }
-
     /// Apply a completed async value update.
     pub fn apply(&mut self, update: AsyncValueUpdate<K, V>) {
         self.in_flight.remove(&update.key);
@@ -107,5 +102,10 @@ where
             Err(error) => AsyncValue::Error(error),
         };
         self.values.insert(update.key, value);
+    }
+
+    /// Try to receive one completed async value update without blocking.
+    pub fn try_recv(&mut self) -> Result<AsyncValueUpdate<K, V>, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
     }
 }

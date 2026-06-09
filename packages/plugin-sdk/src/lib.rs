@@ -4,6 +4,8 @@
 
 //! Plugin author SDK for Bcode native plugins.
 
+pub mod tui;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};

@@ -18,16 +18,17 @@ use bcode_code_review_models::{
     ReviewTarget as ModelReviewTarget, ReviewWorkspace, UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
+use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
 use serde::{Deserialize, Serialize};
 
-use super::terminal_events::TuiInput;
 use super::{TuiError, helpers};
 use crate::code_review_render::materialized_file_surface_rows;
 
@@ -125,11 +126,193 @@ fn model_target_from_source_kind(
     }
 }
 
+/// Native TUI surface wrapper for the code review experience.
+pub struct CodeReviewSurface {
+    client: BcodeClient,
+    repo_path: PathBuf,
+    review_target: ReviewTarget,
+    app: ReviewApp,
+    file_store: AsyncValueStore<String, CachedReviewFile>,
+}
+
+impl CodeReviewSurface {
+    /// Load a code review surface from plugin-backed review data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when initial review data cannot be loaded.
+    pub async fn load(
+        repo_path: PathBuf,
+        target: ReviewOpenTarget,
+        workspace: Option<ReviewWorkspace>,
+        build_mode: bool,
+    ) -> Result<Self, TuiError> {
+        let client = BcodeClient::default_endpoint();
+        let review_target: ReviewTarget = target.into();
+        let mut app =
+            load_review_app(&client, repo_path.clone(), review_target.clone(), workspace).await?;
+        if build_mode {
+            app.set_build_mode();
+            app.status_message =
+                Some("build mode: add sources with A, then m to review".to_string());
+        }
+        let mut surface = Self {
+            client,
+            repo_path,
+            review_target,
+            app,
+            file_store: AsyncValueStore::new(),
+        };
+        surface.app.queue_selected_file_load();
+        surface.ensure_selected_repository_file_load();
+        Ok(surface)
+    }
+
+    /// Return whether the surface requested exit.
+    #[must_use]
+    pub const fn should_exit(&self) -> bool {
+        self.app.should_exit
+    }
+
+    /// Take a session that should be opened after the surface exits.
+    pub const fn take_session_to_open(&mut self) -> Option<SessionId> {
+        self.app.take_session_to_open()
+    }
+
+    fn ensure_selected_repository_file_load(&mut self) -> bool {
+        ensure_selected_repository_file_load(
+            &self.client,
+            &self.repo_path,
+            &mut self.app,
+            &mut self.file_store,
+        )
+    }
+
+    /// Drain pending effectful work.
+    pub async fn drain_inline_effects(&mut self) -> bool {
+        let mut needs_redraw = false;
+        match drain_pending_workspace_changes(
+            &self.client,
+            &self.repo_path,
+            &self.review_target,
+            &mut self.app,
+        )
+        .await
+        {
+            WorkspaceDrainOutcome::Idle => {}
+            WorkspaceDrainOutcome::Applied | WorkspaceDrainOutcome::Failed => needs_redraw = true,
+        }
+        if handle_pending_draft_save(
+            &self.client,
+            &self.repo_path,
+            &self.review_target,
+            &mut self.app,
+        )
+        .await
+        {
+            needs_redraw = true;
+        }
+        if let Some(delete) = self.app.take_pending_draft_delete() {
+            match delete_draft(&self.client, self.repo_path.clone(), delete.clone()).await {
+                Ok(()) => {
+                    self.app.status_message = Some("deleted draft comment".to_string());
+                }
+                Err(error) => {
+                    self.app.restore_deleted_draft(delete);
+                    self.app.status_message =
+                        Some(format!("delete failed; restored local draft: {error}"));
+                }
+            }
+            needs_redraw = true;
+        }
+        if let Some(update) = self.app.take_pending_draft_update() {
+            match update_draft(&self.client, self.repo_path.clone(), update.clone()).await {
+                Ok(()) => {
+                    self.app.status_message = Some("updated draft comment".to_string());
+                }
+                Err(error) => {
+                    self.app.restore_updated_draft(update);
+                    self.app.status_message =
+                        Some(format!("update failed; restored local draft: {error}"));
+                }
+            }
+            needs_redraw = true;
+        }
+        if let Some(ask) = self.app.take_pending_agent_session() {
+            handle_pending_agent_session(
+                &self.client,
+                self.repo_path.clone(),
+                self.review_target.clone(),
+                &mut self.app,
+                ask,
+            )
+            .await;
+            needs_redraw = true;
+        }
+        if let Some(request) = self.app.take_publish_request() {
+            handle_publish_request(
+                &self.client,
+                self.repo_path.clone(),
+                self.review_target.clone(),
+                &mut self.app,
+                request,
+            )
+            .await;
+            needs_redraw = true;
+        }
+        needs_redraw
+    }
+}
+
+impl PluginTuiSurface for CodeReviewSurface {
+    fn id(&self) -> &'static str {
+        "bcode.code-review"
+    }
+
+    fn title(&self) -> &'static str {
+        "Code Review"
+    }
+
+    fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
+        super::code_review_render::render(&mut self.app, frame);
+    }
+
+    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let mut needs_redraw = handle_event_no_resize(&mut self.app, event);
+        self.app.queue_selected_file_load();
+        if self.ensure_selected_repository_file_load() {
+            needs_redraw = true;
+        }
+        if self.app.should_exit {
+            PluginTuiAction::Close
+        } else if needs_redraw {
+            PluginTuiAction::Redraw
+        } else {
+            PluginTuiAction::None
+        }
+    }
+
+    fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let mut needs_redraw = false;
+        while let Ok(update) = self.file_store.try_recv() {
+            self.file_store.apply(update);
+            sync_repository_file_store(&mut self.app, &self.file_store);
+            needs_redraw = true;
+        }
+        if needs_redraw {
+            PluginTuiAction::Redraw
+        } else {
+            PluginTuiAction::None
+        }
+    }
+}
+
 /// Run a full-screen local Git review from a durable workspace.
 ///
 /// # Errors
 ///
 /// Returns an error when review data cannot be loaded or terminal I/O fails.
+#[allow(clippy::future_not_send)]
 pub async fn run_workspace<W: Write>(
     terminal: &mut Terminal<&mut W>,
     workspace: ReviewWorkspace,
@@ -151,6 +334,7 @@ pub async fn run_workspace<W: Write>(
 /// # Errors
 ///
 /// Returns an error when review data cannot be loaded or terminal I/O fails.
+#[allow(clippy::future_not_send)]
 pub async fn run<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
@@ -159,6 +343,7 @@ pub async fn run<W: Write>(
     run_with_workspace(terminal, repo_path, target, None, false).await
 }
 
+#[allow(clippy::future_not_send)]
 async fn run_with_workspace<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
@@ -166,108 +351,9 @@ async fn run_with_workspace<W: Write>(
     workspace: Option<ReviewWorkspace>,
     build_mode: bool,
 ) -> Result<Option<SessionId>, TuiError> {
-    let client = BcodeClient::default_endpoint();
-    let review_target: ReviewTarget = target.into();
-    let mut input = TuiInput::start();
-    let mut app =
-        load_review_app(&client, repo_path.clone(), review_target.clone(), workspace).await?;
-    let mut file_store = AsyncValueStore::<String, CachedReviewFile>::new();
-    ensure_selected_repository_file_load(&client, &repo_path, &mut app, &mut file_store);
-    if build_mode {
-        app.set_build_mode();
-        app.status_message = Some("build mode: add sources with A, then m to review".to_string());
-    }
-    let mut needs_redraw = true;
-
-    while !app.should_exit {
-        if helpers::resize_from_terminal(terminal)? {
-            needs_redraw = true;
-        }
-        if needs_redraw {
-            terminal.draw(|frame| super::code_review_render::render(&mut app, frame))?;
-            needs_redraw = false;
-        }
-
-        tokio::select! {
-            event = input.recv() => {
-                let Some(event) = event? else {
-                    continue;
-                };
-                if handle_event(&mut app, terminal, &event) {
-                    needs_redraw = true;
-                }
-                app.queue_selected_file_load();
-                if ensure_selected_repository_file_load(&client, &repo_path, &mut app, &mut file_store) {
-                    needs_redraw = true;
-                }
-            }
-            update = file_store.recv() => {
-                if let Some(update) = update {
-                    file_store.apply(update);
-                    sync_repository_file_store(&mut app, &file_store);
-                    needs_redraw = true;
-                }
-            }
-        }
-
-        match drain_pending_workspace_changes(&client, &repo_path, &review_target, &mut app).await {
-            WorkspaceDrainOutcome::Idle => {}
-            WorkspaceDrainOutcome::Applied | WorkspaceDrainOutcome::Failed => needs_redraw = true,
-        }
-        if handle_pending_draft_save(&client, &repo_path, &review_target, &mut app).await {
-            needs_redraw = true;
-        }
-        if let Some(delete) = app.take_pending_draft_delete() {
-            match delete_draft(&client, repo_path.clone(), delete.clone()).await {
-                Ok(()) => {
-                    app.status_message = Some("deleted draft comment".to_string());
-                }
-                Err(error) => {
-                    app.restore_deleted_draft(delete);
-                    app.status_message =
-                        Some(format!("delete failed; restored local draft: {error}"));
-                }
-            }
-            needs_redraw = true;
-        }
-        if let Some(update) = app.take_pending_draft_update() {
-            match update_draft(&client, repo_path.clone(), update.clone()).await {
-                Ok(()) => {
-                    app.status_message = Some("updated draft comment".to_string());
-                }
-                Err(error) => {
-                    app.restore_updated_draft(update);
-                    app.status_message =
-                        Some(format!("update failed; restored local draft: {error}"));
-                }
-            }
-            needs_redraw = true;
-        }
-        if let Some(ask) = app.take_pending_agent_session() {
-            handle_pending_agent_session(
-                &client,
-                repo_path.clone(),
-                review_target.clone(),
-                &mut app,
-                ask,
-            )
-            .await;
-            needs_redraw = true;
-        }
-        if let Some(request) = app.take_publish_request() {
-            handle_publish_request(
-                &client,
-                repo_path.clone(),
-                review_target.clone(),
-                &mut app,
-                request,
-            )
-            .await;
-            needs_redraw = true;
-        }
-    }
-
-    Ok(app.take_session_to_open())
+    let mut surface = CodeReviewSurface::load(repo_path, target, workspace, build_mode).await?;
+    super::plugin_surface_host::run_plugin_surface(terminal, &mut surface).await?;
+    Ok(surface.take_session_to_open())
 }
 
 /// Result of draining pending workspace changes.
@@ -1180,11 +1266,7 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
     }
 }
 
-fn handle_event<W: Write>(
-    app: &mut ReviewApp,
-    terminal: &mut Terminal<&mut W>,
-    event: &Event,
-) -> bool {
+fn handle_event_no_resize(app: &mut ReviewApp, event: &Event) -> bool {
     if app.prompt_state.is_some() {
         return handle_prompt_event(app, event);
     }
@@ -1195,13 +1277,11 @@ fn handle_event<W: Write>(
         return handle_comment_editor_event(app, event);
     }
     match event {
-        Event::Resize(size) => {
-            terminal.resize(Rect::new(0, 0, size.width, size.height));
+        Event::Resize(_) | Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => {
             true
         }
         Event::Key(stroke) => handle_key(app, *stroke),
         Event::Mouse(mouse) => handle_mouse(app, *mouse),
-        Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => true,
         Event::Paste(_) | Event::User(_) => false,
     }
 }
