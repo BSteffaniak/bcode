@@ -9,9 +9,13 @@ pub(crate) mod app;
 pub(crate) mod async_values;
 pub(crate) mod chat_loop;
 pub(crate) mod clipboard_image;
-pub mod code_review;
+#[allow(dead_code)]
+pub(crate) mod code_review;
+#[allow(dead_code)]
 pub(crate) mod code_review_display;
 pub mod code_review_home;
+pub mod code_review_launcher;
+#[allow(dead_code)]
 pub(crate) mod code_review_render;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
@@ -215,7 +219,7 @@ pub async fn run_code_review_workspace(
             })?,
             helpers::terminal_area()?,
         );
-        code_review::run_workspace(&mut terminal, workspace, build_mode).await
+        code_review_launcher::run_workspace(&mut terminal, workspace, build_mode).await
     };
 
     match result {
@@ -250,7 +254,7 @@ pub async fn run_code_review(
             })?,
             helpers::terminal_area()?,
         );
-        code_review::run(&mut terminal, repo_path, target).await
+        code_review_launcher::run(&mut terminal, repo_path, target).await
     };
 
     match result {
