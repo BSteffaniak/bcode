@@ -15,7 +15,7 @@ arboard                  = { workspace = true }
 bcode_agent_profile      = { workspace = true }
 bcode_client             = { workspace = true }
 bcode_code_review_models = { workspace = true }
-bcode_code_review_plugin = { workspace = true, optional = true }
+bcode_code_review_plugin = { workspace = true }
 bcode_command            = { workspace = true }
 bcode_config             = { workspace = true }
 bcode_ipc                = { workspace = true }
@@ -44,9 +44,6 @@ unicode-segmentation     = { workspace = true }
 uuid                     = { workspace = true, features = ["v4"] }
 
 [features]
-default = []
-fail-on-warnings = []
-static-bundled-code-review-plugin = [
-    "dep:bcode_code_review_plugin",
-    "bcode_code_review_plugin/static-bundled",
-]
+default                           = []
+fail-on-warnings                  = []
+static-bundled-code-review-plugin = ["bcode_code_review_plugin/static-bundled"]

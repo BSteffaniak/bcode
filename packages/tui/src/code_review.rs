@@ -5,7 +5,6 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::async_values::{AsyncValue, AsyncValueStore};
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, MaterializeReviewWorkspaceRequest,
@@ -18,6 +17,7 @@ use bcode_code_review_models::{
     ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewWorkspace,
     UpdateReviewWorkspaceRequest,
 };
+use bcode_code_review_plugin::async_values::{AsyncValue, AsyncValueStore};
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bcode_session_models::SessionId;
