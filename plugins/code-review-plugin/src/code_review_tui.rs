@@ -30,8 +30,8 @@ use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
 use serde::{Deserialize, Serialize};
 
-use super::{TuiError, helpers};
-use crate::code_review_render::materialized_file_surface_rows;
+use crate::code_review_tui_render::materialized_file_surface_rows;
+use crate::tui_host_types::{TuiError, helpers};
 
 const SERVICE_INTERFACE_ID: &str = CODE_REVIEW_SERVICE_INTERFACE_ID;
 const CREATE_REVIEW_OPERATION: &str = "create_review";
@@ -52,6 +52,19 @@ const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISHER_PREVIEW;
 const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISHER_SUBMIT;
 const DEFAULT_PUBLISHER_ID: &str = "markdown_file";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
+
+#[allow(dead_code)]
+const fn review_open_target_id(target: &ReviewOpenTarget) -> &'static str {
+    match target {
+        ReviewOpenTarget::WorkingTreeUnstaged => "working-tree-unstaged",
+        ReviewOpenTarget::IndexStaged => "index-staged",
+        ReviewOpenTarget::WorkingTreeAndIndex => "working-tree-and-index",
+        ReviewOpenTarget::LastCommit => "last-commit",
+        ReviewOpenTarget::CommitRange { .. } => "commit-range",
+        ReviewOpenTarget::BranchCompare { .. } => "branch-compare",
+        ReviewOpenTarget::Repository => "repository",
+    }
+}
 
 fn model_target_from_source_kind(
     kind: &ReviewSourceKind,
@@ -242,7 +255,7 @@ impl PluginTuiSurface for CodeReviewSurface {
     }
 
     fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
-        super::code_review_render::render(&mut self.app, frame);
+        crate::code_review_tui_render::render(&mut self.app, frame);
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -296,14 +309,16 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for CodeReviewSurfaceFactory
             let repo_path = request
                 .repo_path
                 .ok_or("code review surface requires repo_path")?;
-            let target = serde_json::from_value(
-                request
-                    .options
-                    .get("target")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            )
-            .unwrap_or(ReviewOpenTarget::Repository);
+            let target = match request.target.as_deref() {
+                Some("repository") | None => ReviewOpenTarget::Repository,
+                Some("working-tree-unstaged") => ReviewOpenTarget::WorkingTreeUnstaged,
+                Some("index-staged") => ReviewOpenTarget::IndexStaged,
+                Some("working-tree-and-index") => ReviewOpenTarget::WorkingTreeAndIndex,
+                Some("last-commit") => ReviewOpenTarget::LastCommit,
+                Some(target) => {
+                    return Err(format!("unsupported code review target: {target}").into());
+                }
+            };
             let build_mode = request
                 .options
                 .get("build_mode")
@@ -365,6 +380,12 @@ pub async fn run<W: Write>(
 }
 
 #[allow(clippy::future_not_send)]
+#[allow(
+    clippy::unused_async,
+    clippy::needless_pass_by_ref_mut,
+    unused_variables,
+    dead_code
+)]
 async fn run_with_workspace<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
@@ -372,29 +393,12 @@ async fn run_with_workspace<W: Write>(
     workspace: Option<ReviewWorkspace>,
     build_mode: bool,
 ) -> Result<Option<SessionId>, TuiError> {
-    let options =
-        serde_json::json!({ "build_mode": build_mode, "workspace": workspace, "target": target });
-    let mut surface = current_code_review_tui_registry()
-        .open(
-            "code-review",
-            bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
-                instance_id: "code-review".to_string(),
-                repo_path: Some(repo_path),
-                target: None,
-                options,
-            },
-        )
-        .await
-        .map_err(|error| TuiError::PluginService {
-            code: "tui_surface_open_failed".to_string(),
-            message: error.to_string(),
-        })?;
-    let close_outcome =
-        super::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
-    let session_to_open = close_outcome
-        .and_then(|outcome| outcome.get("open_session").cloned())
-        .and_then(|value| serde_json::from_value(value).ok());
-    Ok(session_to_open)
+    let options = serde_json::json!({ "build_mode": build_mode, "workspace": workspace });
+    let _ = (terminal, repo_path, target, workspace, build_mode);
+    Err(TuiError::PluginService {
+        code: "unsupported_embedded_runner".to_string(),
+        message: "code review plugin surfaces must be hosted by bcode_tui".to_string(),
+    })
 }
 
 /// Result of draining pending workspace changes.

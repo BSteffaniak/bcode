@@ -1118,9 +1118,17 @@ dependencies = [
 name = "bcode_code_review_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "arboard",
+ "bcode_client",
  "bcode_code_review_models",
  "bcode_config",
+ "bcode_ipc",
  "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_syntax_render",
+ "bmux_keyboard",
+ "bmux_text_edit",
+ "bmux_tui",
  "serde",
  "serde_json",
  "sha2 0.10.9",

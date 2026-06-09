@@ -4,7 +4,12 @@
 
 //! Bundled local Git code review plugin for Bcode.
 
+pub mod async_values;
+pub mod code_review_tui;
+pub mod code_review_tui_display;
+pub mod code_review_tui_render;
 pub mod tui;
+pub mod tui_host_types;
 
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,

@@ -14,9 +14,17 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+arboard = { workspace = true }
+bcode_client = { workspace = true }
 bcode_code_review_models = { workspace = true }
 bcode_config = { workspace = true }
+bcode_ipc = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_syntax_render = { workspace = true }
+bmux_keyboard = { workspace = true }
+bmux_text_edit = { workspace = true }
+bmux_tui = { workspace = true, features = ["diff"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -28,7 +36,7 @@ switchy = { workspace = true, features = [
     "schema",
 ] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
 [features]
 default          = []
