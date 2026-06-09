@@ -4,6 +4,8 @@
 
 //! Bundled local Git code review plugin for Bcode.
 
+pub mod tui;
+
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,
     CreateReviewWorkspaceResponse, DeleteDraftRequest, DeleteDraftResponse, DraftAnchor,
@@ -3273,7 +3275,12 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(CodeReviewPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
+        CodeReviewPlugin,
+        include_str!("../bcode-plugin.toml")
+    );
+    vtable.tui_registry = Some(tui::tui_registry);
+    vtable
 }
 
 bcode_plugin_sdk::export_plugin!(CodeReviewPlugin, include_str!("../bcode-plugin.toml"));

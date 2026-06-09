@@ -1,11 +1,14 @@
 //! Native Tokio-backed TUI surface host APIs for plugins.
 
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// Boxed asynchronous task accepted by a plugin host.
@@ -66,7 +69,66 @@ pub trait PluginTuiSurface: Send {
     }
 }
 
-/// Tokio-runtime-backed TUI plugin host handle.
+/// Parameters used to open a native plugin TUI surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginTuiSurfaceOpenRequest {
+    /// Host-assigned surface instance id.
+    pub instance_id: String,
+    /// Repository path or workspace path associated with the surface.
+    pub repo_path: Option<PathBuf>,
+    /// Plugin-defined target identifier.
+    pub target: Option<String>,
+    /// Plugin-defined JSON options.
+    #[serde(default)]
+    pub options: serde_json::Value,
+}
+
+/// Factory for plugin-owned native TUI surfaces.
+pub trait PluginTuiSurfaceFactory: Send + Sync {
+    /// Stable surface kind identifier.
+    fn surface_kind(&self) -> &'static str;
+
+    /// Open a new surface instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested surface cannot be opened.
+    fn open(
+        &self,
+        request: PluginTuiSurfaceOpenRequest,
+    ) -> Result<Box<dyn PluginTuiSurface>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Registry of native TUI surfaces contributed by one plugin.
+#[derive(Default)]
+pub struct PluginTuiRegistry {
+    factories: BTreeMap<String, Box<dyn PluginTuiSurfaceFactory>>,
+}
+
+impl PluginTuiRegistry {
+    /// Register a native TUI surface factory.
+    pub fn register_factory(&mut self, factory: Box<dyn PluginTuiSurfaceFactory>) {
+        self.factories
+            .insert(factory.surface_kind().to_string(), factory);
+    }
+
+    /// Open a registered surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no factory exists or the factory fails to open the surface.
+    pub fn open(
+        &self,
+        surface_kind: &str,
+        request: PluginTuiSurfaceOpenRequest,
+    ) -> Result<Box<dyn PluginTuiSurface>, Box<dyn std::error::Error + Send + Sync>> {
+        self.factories
+            .get(surface_kind)
+            .ok_or_else(|| format!("unsupported TUI surface kind: {surface_kind}").into())
+            .and_then(|factory| factory.open(request))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TokioPluginTuiHost {
     handle: tokio::runtime::Handle,

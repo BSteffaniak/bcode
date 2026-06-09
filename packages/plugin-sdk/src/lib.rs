@@ -671,6 +671,8 @@ pub struct StaticPluginVtable {
     pub invoke_service_streaming: StreamingServiceFn,
     /// Event handling hook.
     pub handle_event: fn(*const c_void, *const u8, usize) -> i32,
+    /// Native TUI registry provider, when statically linked.
+    pub tui_registry: Option<fn() -> crate::tui::PluginTuiRegistry>,
 }
 
 impl std::fmt::Debug for StaticPluginVtable {
@@ -866,6 +868,7 @@ macro_rules! static_plugin_vtable {
             invoke_service: $crate::static_invoke_service_export::<$plugin>,
             invoke_service_streaming: $crate::static_invoke_service_streaming_export::<$plugin>,
             handle_event: $crate::static_handle_event_export::<$plugin>,
+            tui_registry: None,
         }
     }};
 }
@@ -882,6 +885,10 @@ pub mod prelude {
         SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceEventCallback, ServiceEventEmitter,
         ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn, export_plugin,
         static_plugin_vtable,
+        tui::{
+            PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
+            PluginTuiSurfaceFactory, PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
+        },
     };
 }
 

@@ -2729,6 +2729,7 @@ library = "libexample_plugin.dylib"
                                         )
                                     },
                                 handle_event,
+                                tui_registry: None,
                             },
                         },
                     },
@@ -2763,6 +2764,7 @@ library = "libexample_plugin.dylib"
                                         )
                                     },
                                 handle_event,
+                                tui_registry: None,
                             },
                         },
                     },
@@ -2909,6 +2911,7 @@ library = "libexample_plugin.dylib"
             deactivate: test_deactivate,
             invoke_service: test_large_service,
             invoke_service_streaming: test_large_chunking_service,
+            tui_registry: None,
             handle_event: test_handle_event,
         }
     }
@@ -2923,6 +2926,7 @@ library = "libexample_plugin.dylib"
             invoke_service_streaming: |instance, input_ptr, input_len, output, cap, len, _, _| {
                 test_large_service(instance, input_ptr, input_len, output, cap, len)
             },
+            tui_registry: None,
             handle_event: test_handle_event,
         }
     }
@@ -2935,6 +2939,7 @@ library = "libexample_plugin.dylib"
             deactivate: test_deactivate,
             invoke_service: test_service,
             invoke_service_streaming: test_streaming_service,
+            tui_registry: None,
             handle_event: test_handle_event,
         }
     }

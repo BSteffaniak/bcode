@@ -307,6 +307,47 @@ impl PluginTuiSurface for CodeReviewSurface {
     }
 }
 
+/// Code review TUI surface factory backed by the current in-crate implementation.
+#[derive(Debug, Default)]
+pub struct CodeReviewSurfaceFactory;
+
+impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for CodeReviewSurfaceFactory {
+    fn surface_kind(&self) -> &'static str {
+        "code-review"
+    }
+
+    fn open(
+        &self,
+        request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
+    ) -> Result<
+        Box<dyn bcode_plugin_sdk::tui::PluginTuiSurface>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let repo_path = request
+            .repo_path
+            .ok_or("code review surface requires repo_path")?;
+        let target = match request.target.as_deref() {
+            Some("repository") | None => ReviewOpenTarget::Repository,
+            Some("working-tree-unstaged") => ReviewOpenTarget::WorkingTreeUnstaged,
+            Some("index-staged") => ReviewOpenTarget::IndexStaged,
+            Some("working-tree-and-index") => ReviewOpenTarget::WorkingTreeAndIndex,
+            Some("last-commit") => ReviewOpenTarget::LastCommit,
+            Some(target) => return Err(format!("unsupported code review target: {target}").into()),
+        };
+        let handle = tokio::runtime::Handle::current();
+        let surface = handle.block_on(CodeReviewSurface::load(repo_path, target, None, false))?;
+        Ok(Box::new(surface))
+    }
+}
+
+/// Registry for code review TUI surfaces backed by current TUI implementation.
+#[must_use]
+pub fn current_code_review_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_factory(Box::new(CodeReviewSurfaceFactory));
+    registry
+}
+
 /// Run a full-screen local Git review from a durable workspace.
 ///
 /// # Errors
