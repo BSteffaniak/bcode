@@ -1535,6 +1535,7 @@ dependencies = [
  "bcode_ipc",
  "bcode_markdown_render",
  "bcode_model",
+ "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
  "bcode_session_models",

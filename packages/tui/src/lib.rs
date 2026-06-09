@@ -42,6 +42,7 @@ pub(crate) mod permission_present;
 pub(crate) mod picker_mouse;
 pub(crate) mod picker_render;
 pub(crate) mod plugin_surface_host;
+pub mod plugin_tui;
 pub(crate) mod provider_picker;
 pub(crate) mod provider_picker_render;
 pub(crate) mod render;

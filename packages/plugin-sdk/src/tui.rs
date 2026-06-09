@@ -117,6 +117,14 @@ pub struct PluginTuiRegistry {
     factories: BTreeMap<String, Box<dyn PluginTuiSurfaceFactory>>,
 }
 
+impl std::fmt::Debug for PluginTuiRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginTuiRegistry")
+            .field("surface_kinds", &self.factories.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl PluginTuiRegistry {
     /// Register a native TUI surface factory.
     pub fn register_factory(&mut self, factory: Box<dyn PluginTuiSurfaceFactory>) {

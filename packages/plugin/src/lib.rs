@@ -2,8 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Host-side plugin loading and discovery for Bcode.
-
+use bcode_plugin_sdk::tui::PluginTuiRegistry;
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
@@ -589,6 +588,8 @@ pub enum PluginLoadError {
         hook: &'static str,
         code: i32,
     },
+    #[error("plugin '{plugin_id}' TUI surface open failed: {message}")]
+    TuiSurfaceOpen { plugin_id: String, message: String },
 }
 
 /// Errors returned by typed plugin service calls.
@@ -1321,6 +1322,7 @@ pub struct PluginRuntimeHost {
     registry: Arc<PluginRegistry>,
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
+    tui_registries: Arc<BTreeMap<String, PluginTuiRegistry>>,
 }
 
 impl PluginRuntimeHost {
@@ -1375,6 +1377,18 @@ impl PluginRuntimeHost {
     #[must_use]
     pub fn configs(&self) -> &BTreeMap<String, ResolvedPluginConfig> {
         &self.configs
+    }
+
+    /// Return native TUI registries keyed by plugin ID.
+    #[must_use]
+    pub fn tui_registries(&self) -> &BTreeMap<String, PluginTuiRegistry> {
+        &self.tui_registries
+    }
+
+    /// Return a native TUI registry for a loaded plugin.
+    #[must_use]
+    pub fn tui_registry(&self, plugin_id: &str) -> Option<&PluginTuiRegistry> {
+        self.tui_registries.get(plugin_id)
     }
 
     /// Return plugin executor status snapshots.
@@ -1593,10 +1607,16 @@ impl From<PluginHost> for PluginRuntimeHost {
         let configs = std::mem::take(&mut host.configs);
         let mut manifests = BTreeMap::new();
         let mut executors = BTreeMap::new();
+        let mut tui_registries = BTreeMap::new();
         for plugin in loaded {
             let manifest = plugin.manifest().clone();
             let plugin_id = manifest.id.clone();
             manifests.insert(plugin_id.clone(), manifest.clone());
+            if let LoadedPluginBackend::Static { vtable } = &plugin.backend
+                && let Some(tui_registry) = vtable.tui_registry
+            {
+                tui_registries.insert(plugin_id.clone(), tui_registry());
+            }
             let metrics = Arc::new(PluginExecutorMetrics::default());
             let concurrency = PluginConcurrency::from(&manifest.concurrency);
             let executor = match concurrency {
@@ -1627,6 +1647,7 @@ impl From<PluginHost> for PluginRuntimeHost {
             registry: Arc::new(PluginRegistry::from_manifests(manifests)),
             executors: Arc::new(executors),
             configs: Arc::new(configs),
+            tui_registries: Arc::new(tui_registries),
         }
     }
 }
