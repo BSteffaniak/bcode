@@ -1129,6 +1129,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",
+ "crossterm",
  "serde",
  "serde_json",
  "sha2 0.10.9",

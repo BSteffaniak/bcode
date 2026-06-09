@@ -24,7 +24,8 @@ bcode_session_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true, features = ["diff"] }
+bmux_tui = { workspace = true, features = ["crossterm", "diff"] }
+crossterm = { workspace = true, features = ["events"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

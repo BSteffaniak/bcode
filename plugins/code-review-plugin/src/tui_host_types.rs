@@ -4,7 +4,9 @@ use std::io;
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::keyboard::TextKeymap;
+use bmux_tui::geometry::Rect;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
+use bmux_tui::terminal::Terminal;
 
 /// Errors returned by the code review TUI surface.
 #[derive(Debug, thiserror::Error)]
@@ -29,9 +31,10 @@ pub enum TuiError {
 /// Shared helper functions needed by the code review TUI.
 pub mod helpers {
     use super::{
-        KeyCode, KeyStroke, TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome,
-        TextKeymap,
+        KeyCode, KeyStroke, Rect, Terminal, TextInputEnterBehavior, TextInputKeyHandler,
+        TextInputKeyOutcome, TextKeymap,
     };
+    use std::io::{self, Write};
 
     /// Apply a key stroke to a text buffer using the default text-input bindings.
     pub fn handle_default_text_key(
@@ -63,5 +66,22 @@ pub mod helpers {
             KeyCode::Char(ch) => Some(ch),
             _ => None,
         }
+    }
+
+    /// Resize a terminal from current crossterm dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal size cannot be read.
+    pub fn resize_from_terminal<W: Write>(terminal: &mut Terminal<&mut W>) -> io::Result<bool> {
+        let area = terminal_area()?;
+        let resized = terminal.area() != area;
+        terminal.resize(area);
+        Ok(resized)
+    }
+
+    fn terminal_area() -> io::Result<Rect> {
+        let (width, height) = crossterm::terminal::size()?;
+        Ok(Rect::new(0, 0, width, height))
     }
 }
