@@ -85,6 +85,18 @@ pub enum ReviewOpenTarget {
     Repository,
 }
 
+const fn review_open_target_id(target: &ReviewOpenTarget) -> &'static str {
+    match target {
+        ReviewOpenTarget::WorkingTreeUnstaged => "working-tree-unstaged",
+        ReviewOpenTarget::IndexStaged => "index-staged",
+        ReviewOpenTarget::WorkingTreeAndIndex => "working-tree-and-index",
+        ReviewOpenTarget::LastCommit => "last-commit",
+        ReviewOpenTarget::CommitRange { .. } => "commit-range",
+        ReviewOpenTarget::BranchCompare { .. } => "branch-compare",
+        ReviewOpenTarget::Repository => "repository",
+    }
+}
+
 fn model_target_from_source_kind(
     kind: &ReviewSourceKind,
 ) -> bcode_code_review_models::ReviewTarget {
@@ -273,6 +285,10 @@ impl PluginTuiSurface for CodeReviewSurface {
         "Code Review"
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
         super::code_review_render::render(&mut self.app, frame);
     }
@@ -319,24 +335,34 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for CodeReviewSurfaceFactory
     fn open(
         &self,
         request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
-    ) -> Result<
-        Box<dyn bcode_plugin_sdk::tui::PluginTuiSurface>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let repo_path = request
-            .repo_path
-            .ok_or("code review surface requires repo_path")?;
-        let target = match request.target.as_deref() {
-            Some("repository") | None => ReviewOpenTarget::Repository,
-            Some("working-tree-unstaged") => ReviewOpenTarget::WorkingTreeUnstaged,
-            Some("index-staged") => ReviewOpenTarget::IndexStaged,
-            Some("working-tree-and-index") => ReviewOpenTarget::WorkingTreeAndIndex,
-            Some("last-commit") => ReviewOpenTarget::LastCommit,
-            Some(target) => return Err(format!("unsupported code review target: {target}").into()),
-        };
-        let handle = tokio::runtime::Handle::current();
-        let surface = handle.block_on(CodeReviewSurface::load(repo_path, target, None, false))?;
-        Ok(Box::new(surface))
+    ) -> bcode_plugin_sdk::tui::PluginTuiSurfaceFuture {
+        Box::pin(async move {
+            let repo_path = request
+                .repo_path
+                .ok_or("code review surface requires repo_path")?;
+            let target = match request.target.as_deref() {
+                Some("repository") | None => ReviewOpenTarget::Repository,
+                Some("working-tree-unstaged") => ReviewOpenTarget::WorkingTreeUnstaged,
+                Some("index-staged") => ReviewOpenTarget::IndexStaged,
+                Some("working-tree-and-index") => ReviewOpenTarget::WorkingTreeAndIndex,
+                Some("last-commit") => ReviewOpenTarget::LastCommit,
+                Some(target) => {
+                    return Err(format!("unsupported code review target: {target}").into());
+                }
+            };
+            let build_mode = request
+                .options
+                .get("build_mode")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let workspace = request
+                .options
+                .get("workspace")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let surface = CodeReviewSurface::load(repo_path, target, workspace, build_mode).await?;
+            Ok(Box::new(surface) as Box<dyn bcode_plugin_sdk::tui::PluginTuiSurface>)
+        })
     }
 }
 
@@ -392,9 +418,28 @@ async fn run_with_workspace<W: Write>(
     workspace: Option<ReviewWorkspace>,
     build_mode: bool,
 ) -> Result<Option<SessionId>, TuiError> {
-    let mut surface = CodeReviewSurface::load(repo_path, target, workspace, build_mode).await?;
-    super::plugin_surface_host::run_plugin_surface(terminal, &mut surface).await?;
-    Ok(surface.take_session_to_open())
+    let options = serde_json::json!({ "build_mode": build_mode, "workspace": workspace });
+    let mut surface = current_code_review_tui_registry()
+        .open(
+            "code-review",
+            bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+                instance_id: "code-review".to_string(),
+                repo_path: Some(repo_path),
+                target: Some(review_open_target_id(&target).to_string()),
+                options,
+            },
+        )
+        .await
+        .map_err(|error| TuiError::PluginService {
+            code: "tui_surface_open_failed".to_string(),
+            message: error.to_string(),
+        })?;
+    super::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
+    let session_to_open = surface
+        .as_any_mut()
+        .downcast_mut::<CodeReviewSurface>()
+        .and_then(CodeReviewSurface::take_session_to_open);
+    Ok(session_to_open)
 }
 
 /// Result of draining pending workspace changes.

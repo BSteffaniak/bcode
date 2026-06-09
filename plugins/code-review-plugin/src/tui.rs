@@ -1,9 +1,8 @@
 //! Native code review TUI surface contribution.
 
-use std::error::Error;
-
 use bcode_plugin_sdk::tui::{
-    PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory, PluginTuiSurfaceOpenRequest,
+    PluginTuiError, PluginTuiRegistry, PluginTuiSurfaceFactory, PluginTuiSurfaceFuture,
+    PluginTuiSurfaceOpenRequest,
 };
 
 /// Code review native TUI surface kind.
@@ -25,10 +24,9 @@ impl PluginTuiSurfaceFactory for CodeReviewSurfaceFactory {
         CODE_REVIEW_SURFACE_KIND
     }
 
-    fn open(
-        &self,
-        _request: PluginTuiSurfaceOpenRequest,
-    ) -> Result<Box<dyn PluginTuiSurface>, Box<dyn Error + Send + Sync>> {
-        Err("code review TUI surface implementation is supplied by bcode_tui until UI modules move into this plugin".into())
+    fn open(&self, _request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
+        Box::pin(async move {
+            Err::<_, PluginTuiError>("code review TUI surface implementation is supplied by bcode_tui until UI modules move into this plugin".into())
+        })
     }
 }

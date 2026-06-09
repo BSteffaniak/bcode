@@ -1,6 +1,8 @@
 //! Native Tokio-backed TUI surface host APIs for plugins.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -10,6 +12,16 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+/// Boxed error returned by native TUI plugin surface factories.
+pub type PluginTuiError = Box<dyn Error + Send + Sync>;
+
+/// Boxed native TUI plugin surface.
+pub type BoxedPluginTuiSurface = Box<dyn PluginTuiSurface>;
+
+/// Boxed native TUI plugin surface future.
+pub type PluginTuiSurfaceFuture =
+    Pin<Box<dyn Future<Output = Result<BoxedPluginTuiSurface, PluginTuiError>> + Send + 'static>>;
 
 /// Boxed asynchronous task accepted by a plugin host.
 pub type PluginTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -50,12 +62,15 @@ impl PluginTuiAction {
 }
 
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
-pub trait PluginTuiSurface: Send {
+pub trait PluginTuiSurface: Any + Send {
     /// Stable surface identifier.
     fn id(&self) -> &'static str;
 
     /// Human-readable surface title.
     fn title(&self) -> &'static str;
+
+    /// Return this surface as `Any` for host-side downcasting of bundled surfaces.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     /// Render this surface inside the host-assigned area.
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>);
@@ -93,10 +108,7 @@ pub trait PluginTuiSurfaceFactory: Send + Sync {
     /// # Errors
     ///
     /// Returns an error when the requested surface cannot be opened.
-    fn open(
-        &self,
-        request: PluginTuiSurfaceOpenRequest,
-    ) -> Result<Box<dyn PluginTuiSurface>, Box<dyn std::error::Error + Send + Sync>>;
+    fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture;
 }
 
 /// Registry of native TUI surfaces contributed by one plugin.
@@ -117,15 +129,16 @@ impl PluginTuiRegistry {
     /// # Errors
     ///
     /// Returns an error when no factory exists or the factory fails to open the surface.
-    pub fn open(
+    pub async fn open(
         &self,
         surface_kind: &str,
         request: PluginTuiSurfaceOpenRequest,
-    ) -> Result<Box<dyn PluginTuiSurface>, Box<dyn std::error::Error + Send + Sync>> {
-        self.factories
+    ) -> Result<BoxedPluginTuiSurface, PluginTuiError> {
+        let factory = self
+            .factories
             .get(surface_kind)
-            .ok_or_else(|| format!("unsupported TUI surface kind: {surface_kind}").into())
-            .and_then(|factory| factory.open(request))
+            .ok_or_else(|| format!("unsupported TUI surface kind: {surface_kind}"))?;
+        factory.open(request).await
     }
 }
 
