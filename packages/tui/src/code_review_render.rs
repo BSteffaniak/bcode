@@ -423,27 +423,28 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
 
 fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visible_rows: usize) {
     let rows = app.file_tree_rows();
-    let selected_row = app.selected_tree_row.min(rows.len().saturating_sub(1));
-    app.selected_tree_row = selected_row;
-    if selected_row < app.file_scroll {
-        app.file_scroll = selected_row;
+    let focused_row = app.selected_tree_row.min(rows.len().saturating_sub(1));
+    app.selected_tree_row = focused_row;
+    if focused_row < app.tree_scroll {
+        app.tree_scroll = focused_row;
     }
-    if selected_row >= app.file_scroll.saturating_add(visible_rows) {
-        app.file_scroll = selected_row.saturating_sub(visible_rows.saturating_sub(1));
+    if focused_row >= app.tree_scroll.saturating_add(visible_rows) {
+        app.tree_scroll = focused_row.saturating_sub(visible_rows.saturating_sub(1));
     }
+    let opened_path = app.selected_file_path();
     for row in 0..visible_rows {
         let y = area
             .y
             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        let index = app.file_scroll.saturating_add(row);
+        let tree_row_index = app.tree_scroll.saturating_add(row);
         let line_area = Rect::new(area.x, y, area.width, 1);
-        let Some(tree_row) = rows.get(index) else {
+        let Some(tree_row) = rows.get(tree_row_index) else {
             continue;
         };
         match tree_row {
             super::code_review::ReviewFileTreeRow::Directory { path, depth } => {
-                let selected = index == selected_row;
-                let style = if selected {
+                let focused = tree_row_index == focused_row;
+                let style = if focused {
                     Style::new().fg(Color::Black).bg(Color::White)
                 } else {
                     Style::new().fg(Color::Cyan).bg(Color::Black)
@@ -468,10 +469,11 @@ fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visi
                 );
             }
             super::code_review::ReviewFileTreeRow::File { index, depth } => {
-                if let Some(file) = app.review.files.get(*index) {
+                if let Some(path) = app.review_path_for_index(*index) {
                     render_file_tree_file_row(
-                        file,
-                        *index == app.selected_file,
+                        &path,
+                        tree_row_index == focused_row,
+                        opened_path.as_deref() == Some(path.as_str()),
                         app.draft_comment_count_for_file(*index),
                         *depth,
                         line_area,
@@ -484,29 +486,31 @@ fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visi
 }
 
 fn render_file_tree_file_row(
-    file: &ReviewFile,
-    selected: bool,
+    path: &str,
+    focused: bool,
+    opened: bool,
     draft_comments: usize,
     depth: usize,
     area: Rect,
     frame: &mut Frame<'_>,
 ) {
-    let style = if selected {
+    let style = if focused {
         Style::new().fg(Color::Black).bg(Color::White)
     } else {
         Style::new().fg(Color::White).bg(Color::Black)
     };
-    let path = std::path::Path::new(file.display_path());
+    let path = std::path::Path::new(path);
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or_else(|| file.display_path());
+        .unwrap_or_else(|| path.to_str().unwrap_or_default());
     let comments = if draft_comments == 0 {
         String::new()
     } else {
         format!(" 💬{draft_comments}")
     };
-    let text = format!(" {}  {name}{comments}", "  ".repeat(depth));
+    let open_marker = if opened { "●" } else { " " };
+    let text = format!(" {}{open_marker} {name}{comments}", "  ".repeat(depth));
     frame.write_line_with_fallback_style(
         area,
         &Line::from_spans(vec![Span::styled(

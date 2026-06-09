@@ -190,6 +190,10 @@ async fn run_with_workspace<W: Write>(
         if handle_event(&mut app, terminal, &event) {
             needs_redraw = true;
         }
+        if needs_redraw && app.has_pending_file_load() {
+            terminal.draw(|frame| super::code_review_render::render(&mut app, frame))?;
+            needs_redraw = false;
+        }
         if handle_pending_file_load(&client, &repo_path, &mut app).await {
             needs_redraw = true;
         }
@@ -2741,6 +2745,8 @@ pub struct ReviewApp {
     pub selected_file: usize,
     /// Top visible file row.
     pub file_scroll: usize,
+    /// Top visible repository tree row.
+    pub tree_scroll: usize,
     /// Top visible rendered diff row.
     pub diff_scroll: usize,
     /// Selected rendered diff row.
@@ -2820,6 +2826,7 @@ impl ReviewApp {
             ux_mode: ReviewUxMode::Review,
             selected_file: 0,
             file_scroll: 0,
+            tree_scroll: 0,
             diff_scroll: 0,
             selected_diff_line: 0,
             sidebar_visible: true,
@@ -3896,7 +3903,9 @@ impl ReviewApp {
         self.review.files.get(self.selected_file)
     }
 
-    fn review_path_for_index(&self, index: usize) -> Option<String> {
+    /// Return review file/surface path for an index.
+    #[must_use]
+    pub fn review_path_for_index(&self, index: usize) -> Option<String> {
         self.review
             .files
             .get(index)
@@ -3934,7 +3943,12 @@ impl ReviewApp {
             .selected_build_row
             .min(self.build_row_count().saturating_sub(1));
         self.build_scroll = self.build_scroll.min(self.selected_build_row);
-        self.file_scroll = self.file_scroll.min(self.selected_file);
+        self.file_scroll = self
+            .file_scroll
+            .min(self.review.files.len().saturating_sub(1));
+        self.tree_scroll = self
+            .tree_scroll
+            .min(self.file_tree_rows().len().saturating_sub(1));
         self.restore_current_file_viewport();
         self.queue_selected_file_load();
     }
@@ -4610,27 +4624,17 @@ impl ReviewApp {
             return false;
         }
         self.selected_tree_row = next;
-        self.select_tree_row_file_if_present();
         true
     }
 
     /// Select previous repository tree row.
-    pub fn select_previous_tree_row(&mut self, rows: usize) -> bool {
+    pub const fn select_previous_tree_row(&mut self, rows: usize) -> bool {
         let next = self.selected_tree_row.saturating_sub(rows);
         if next == self.selected_tree_row {
             return false;
         }
         self.selected_tree_row = next;
-        self.select_tree_row_file_if_present();
         true
-    }
-
-    fn select_tree_row_file_if_present(&mut self) {
-        if let Some(ReviewFileTreeRow::File { index, .. }) =
-            self.file_tree_rows().get(self.selected_tree_row).cloned()
-        {
-            let _ = self.select_file(index);
-        }
     }
 
     /// Expand selected directory row.
@@ -4645,13 +4649,11 @@ impl ReviewApp {
     pub fn collapse_selected_tree_row(&mut self) -> bool {
         match self.file_tree_rows().get(self.selected_tree_row).cloned() {
             Some(ReviewFileTreeRow::Directory { path, .. }) => self.expanded_dirs.remove(&path),
-            Some(ReviewFileTreeRow::File { .. }) => {
-                let parent = self.selected_file_data().and_then(|file| {
-                    Path::new(file.display_path())
-                        .parent()
-                        .map(Path::to_path_buf)
-                });
-                let Some(parent) = parent else {
+            Some(ReviewFileTreeRow::File { index, .. }) => {
+                let Some(path) = self.review_path_for_index(index) else {
+                    return false;
+                };
+                let Some(parent) = Path::new(&path).parent().map(Path::to_path_buf) else {
                     return false;
                 };
                 self.expanded_dirs.remove(&parent)
@@ -4787,6 +4789,12 @@ impl ReviewApp {
         true
     }
 
+    /// Return true when a repository file load is pending.
+    #[must_use]
+    pub const fn has_pending_file_load(&self) -> bool {
+        self.pending_file_load.is_some()
+    }
+
     /// Take pending repository file load request.
     pub const fn take_pending_file_load(&mut self) -> Option<String> {
         self.pending_file_load.take()
@@ -4829,7 +4837,8 @@ impl ReviewApp {
         let Some(path) = self.selected_file_path() else {
             return;
         };
-        if self.file_cache.get(&path).is_none() {
+        if self.file_cache.get(&path).is_none() && self.pending_file_load.as_deref() != Some(&path)
+        {
             self.pending_file_load = Some(path);
         }
     }
@@ -4841,6 +4850,10 @@ impl ReviewApp {
 
     /// Scroll file sidebar down.
     pub fn scroll_files_down(&mut self, rows: usize) -> bool {
+        if self.sidebar_mode == ReviewSidebarMode::Repository && self.review.is_repository_review()
+        {
+            return self.scroll_tree_down(rows);
+        }
         let max = self.review.files.len().saturating_sub(
             self.last_file_area
                 .map_or(1, |area| usize::from(area.height).max(1)),
@@ -4854,12 +4867,40 @@ impl ReviewApp {
     }
 
     /// Scroll file sidebar up.
-    pub const fn scroll_files_up(&mut self, rows: usize) -> bool {
+    pub fn scroll_files_up(&mut self, rows: usize) -> bool {
+        if self.sidebar_mode == ReviewSidebarMode::Repository && self.review.is_repository_review()
+        {
+            return self.scroll_tree_up(rows);
+        }
         let next = self.file_scroll.saturating_sub(rows);
         if next == self.file_scroll {
             return false;
         }
         self.file_scroll = next;
+        true
+    }
+
+    /// Scroll repository tree sidebar down.
+    pub fn scroll_tree_down(&mut self, rows: usize) -> bool {
+        let max = self.file_tree_rows().len().saturating_sub(
+            self.last_file_area
+                .map_or(1, |area| usize::from(area.height).max(1)),
+        );
+        let next = self.tree_scroll.saturating_add(rows).min(max);
+        if next == self.tree_scroll {
+            return false;
+        }
+        self.tree_scroll = next;
+        true
+    }
+
+    /// Scroll repository tree sidebar up.
+    pub const fn scroll_tree_up(&mut self, rows: usize) -> bool {
+        let next = self.tree_scroll.saturating_sub(rows);
+        if next == self.tree_scroll {
+            return false;
+        }
+        self.tree_scroll = next;
         true
     }
 
@@ -4970,7 +5011,7 @@ impl ReviewApp {
         if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
             return None;
         }
-        let index = self.file_scroll + usize::from(y.saturating_sub(area.y));
+        let index = self.tree_scroll + usize::from(y.saturating_sub(area.y));
         self.file_tree_rows().get(index).cloned()
     }
 
@@ -6325,6 +6366,94 @@ mod tests {
             app.file_tree_rows(),
             vec![ReviewFileTreeRow::File { index: 0, depth: 0 }]
         );
+    }
+
+    #[test]
+    fn moving_repository_tree_focus_does_not_open_file() {
+        let mut app = build_workspace_app(
+            vec![build_source("source-1", ReviewSourceKind::Repository, true)],
+            vec![
+                ReviewSurface {
+                    id: "surface-1".to_string(),
+                    source_id: "source-1".to_string(),
+                    path: "a.rs".to_string(),
+                    kind: ReviewSurfaceKind::File,
+                    file: None,
+                },
+                ReviewSurface {
+                    id: "surface-2".to_string(),
+                    source_id: "source-1".to_string(),
+                    path: "b.rs".to_string(),
+                    kind: ReviewSurfaceKind::File,
+                    file: None,
+                },
+            ],
+            Vec::new(),
+        );
+
+        assert!(app.select_next_tree_row(1));
+
+        assert_eq!(app.selected_tree_row, 1);
+        assert_eq!(app.selected_file, 0);
+    }
+
+    #[test]
+    fn tree_scroll_is_independent_from_file_scroll() {
+        let mut app = build_workspace_app(
+            vec![build_source("source-1", ReviewSourceKind::Repository, true)],
+            vec![
+                ReviewSurface {
+                    id: "surface-1".to_string(),
+                    source_id: "source-1".to_string(),
+                    path: "a.rs".to_string(),
+                    kind: ReviewSurfaceKind::File,
+                    file: None,
+                },
+                ReviewSurface {
+                    id: "surface-2".to_string(),
+                    source_id: "source-1".to_string(),
+                    path: "b.rs".to_string(),
+                    kind: ReviewSurfaceKind::File,
+                    file: None,
+                },
+            ],
+            Vec::new(),
+        );
+        app.file_scroll = 7;
+
+        assert!(app.scroll_tree_down(1));
+
+        assert_eq!(app.tree_scroll, 1);
+        assert_eq!(app.file_scroll, 7);
+    }
+
+    #[test]
+    fn activating_repository_tree_file_opens_it() {
+        let mut app = build_workspace_app(
+            vec![build_source("source-1", ReviewSourceKind::Repository, true)],
+            vec![
+                ReviewSurface {
+                    id: "surface-1".to_string(),
+                    source_id: "source-1".to_string(),
+                    path: "a.rs".to_string(),
+                    kind: ReviewSurfaceKind::File,
+                    file: None,
+                },
+                ReviewSurface {
+                    id: "surface-2".to_string(),
+                    source_id: "source-1".to_string(),
+                    path: "b.rs".to_string(),
+                    kind: ReviewSurfaceKind::File,
+                    file: None,
+                },
+            ],
+            Vec::new(),
+        );
+        app.selected_tree_row = 1;
+
+        assert!(app.activate_selected_tree_row());
+
+        assert_eq!(app.selected_file, 1);
     }
 
     #[test]
