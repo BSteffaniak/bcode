@@ -18,6 +18,16 @@ pub async fn open_plugin_tui_surface(
     let registry = runtime
         .tui_registry(plugin_id)
         .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
+    if runtime
+        .registry()
+        .tui_surface(plugin_id, surface_kind)
+        .is_none()
+    {
+        return Err(PluginLoadError::TuiSurfaceOpen {
+            plugin_id: plugin_id.to_string(),
+            message: format!("plugin does not declare TUI surface kind '{surface_kind}'"),
+        });
+    }
     registry
         .open(surface_kind, request)
         .await

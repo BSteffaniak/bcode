@@ -11,6 +11,11 @@ description  = "Local Git code review services"
 interface_id = "bcode.code_review/v1"
 name         = "Code Review"
 
+[[tui_surfaces]]
+description = "Full-screen local Git code review UI"
+kind        = "code-review"
+title       = "Code Review"
+
 [concurrency]
 max  = 2
 type = "limited"

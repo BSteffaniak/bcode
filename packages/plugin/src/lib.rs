@@ -75,12 +75,24 @@ pub struct PluginManifest {
     #[serde(default)]
     pub services: Vec<PluginService>,
     #[serde(default)]
+    pub tui_surfaces: Vec<PluginTuiSurfaceDeclaration>,
+    #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
     #[serde(default)]
     pub config: Option<PluginManifestConfig>,
     #[serde(default)]
     pub concurrency: PluginConcurrencyConfig,
     pub runtime: PluginRuntime,
+}
+
+/// Native TUI surface declared by a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginTuiSurfaceDeclaration {
+    pub kind: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Service interface declared by a plugin manifest.
@@ -1295,6 +1307,28 @@ impl PluginRegistry {
     #[must_use]
     pub const fn service_registry(&self) -> &PluginServiceRegistry {
         &self.service_registry
+    }
+
+    /// Return declared TUI surfaces for one plugin.
+    #[must_use]
+    pub fn tui_surfaces(&self, plugin_id: &str) -> Option<&[PluginTuiSurfaceDeclaration]> {
+        self.manifests
+            .get(plugin_id)
+            .map(|manifest| manifest.tui_surfaces.as_slice())
+    }
+
+    /// Return declared TUI surface metadata by plugin and surface kind.
+    #[must_use]
+    pub fn tui_surface(
+        &self,
+        plugin_id: &str,
+        surface_kind: &str,
+    ) -> Option<&PluginTuiSurfaceDeclaration> {
+        self.manifests
+            .get(plugin_id)?
+            .tui_surfaces
+            .iter()
+            .find(|surface| surface.kind == surface_kind)
     }
 
     /// Return runtime policy metadata for a plugin service interface.
@@ -2696,6 +2730,7 @@ library = "libexample_plugin.dylib"
                     concurrency: None,
                     class: None,
                 }],
+                tui_surfaces: Vec::new(),
                 event_subscriptions: Vec::new(),
                 concurrency: PluginConcurrencyConfig::Exclusive,
                 runtime: PluginRuntime::Native(NativePluginRuntime {
@@ -2978,6 +3013,7 @@ library = "libexample_plugin.dylib"
                 concurrency: None,
                 class: None,
             }],
+            tui_surfaces: Vec::new(),
             event_subscriptions: Vec::new(),
             concurrency: PluginConcurrencyConfig::Exclusive,
             runtime: PluginRuntime::Native(NativePluginRuntime {
