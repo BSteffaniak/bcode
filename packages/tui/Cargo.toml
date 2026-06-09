@@ -36,7 +36,7 @@ png                      = { workspace = true }
 serde                    = { workspace = true, features = ["derive", "std"] }
 serde_json               = { workspace = true }
 thiserror                = { workspace = true }
-tokio                    = { workspace = true, features = ["sync", "time"] }
+tokio                    = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 unicode-segmentation     = { workspace = true }
 uuid                     = { workspace = true, features = ["v4"] }
 

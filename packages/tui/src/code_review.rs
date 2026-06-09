@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::async_values::{AsyncValue, AsyncValueStore};
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, MaterializeReviewWorkspaceRequest,
@@ -170,6 +171,8 @@ async fn run_with_workspace<W: Write>(
     let mut input = TuiInput::start();
     let mut app =
         load_review_app(&client, repo_path.clone(), review_target.clone(), workspace).await?;
+    let mut file_store = AsyncValueStore::<String, CachedReviewFile>::new();
+    ensure_selected_repository_file_load(&client, &repo_path, &mut app, &mut file_store);
     if build_mode {
         app.set_build_mode();
         app.status_message = Some("build mode: add sources with A, then m to review".to_string());
@@ -184,19 +187,29 @@ async fn run_with_workspace<W: Write>(
             terminal.draw(|frame| super::code_review_render::render(&mut app, frame))?;
             needs_redraw = false;
         }
-        let Some(event) = input.recv().await? else {
-            continue;
-        };
-        if handle_event(&mut app, terminal, &event) {
-            needs_redraw = true;
+
+        tokio::select! {
+            event = input.recv() => {
+                let Some(event) = event? else {
+                    continue;
+                };
+                if handle_event(&mut app, terminal, &event) {
+                    needs_redraw = true;
+                }
+                app.queue_selected_file_load();
+                if ensure_selected_repository_file_load(&client, &repo_path, &mut app, &mut file_store) {
+                    needs_redraw = true;
+                }
+            }
+            update = file_store.recv() => {
+                if let Some(update) = update {
+                    file_store.apply(update);
+                    sync_repository_file_store(&mut app, &file_store);
+                    needs_redraw = true;
+                }
+            }
         }
-        if needs_redraw && app.has_pending_file_load() {
-            terminal.draw(|frame| super::code_review_render::render(&mut app, frame))?;
-            needs_redraw = false;
-        }
-        if handle_pending_file_load(&client, &repo_path, &mut app).await {
-            needs_redraw = true;
-        }
+
         match drain_pending_workspace_changes(&client, &repo_path, &review_target, &mut app).await {
             WorkspaceDrainOutcome::Idle => {}
             WorkspaceDrainOutcome::Applied | WorkspaceDrainOutcome::Failed => needs_redraw = true,
@@ -349,19 +362,38 @@ async fn handle_pending_draft_save(
     true
 }
 
-async fn handle_pending_file_load(
+fn ensure_selected_repository_file_load(
     client: &BcodeClient,
     repo_path: &Path,
     app: &mut ReviewApp,
+    file_store: &mut AsyncValueStore<String, CachedReviewFile>,
 ) -> bool {
     let Some(path) = app.take_pending_file_load() else {
         return false;
     };
-    match load_repository_file(client, repo_path.to_path_buf(), path.clone()).await {
-        Ok(file) => app.store_loaded_file(file),
-        Err(error) => app.status_message = Some(format!("failed to load {path}: {error}")),
+    let client = client.clone();
+    let repo_path = repo_path.to_path_buf();
+    let started = file_store.ensure(path, move |path| async move {
+        load_repository_file(&client, repo_path, path)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    sync_repository_file_store(app, file_store);
+    started
+}
+
+fn sync_repository_file_store(
+    app: &mut ReviewApp,
+    file_store: &AsyncValueStore<String, CachedReviewFile>,
+) {
+    let Some(path) = app.selected_file_path() else {
+        return;
+    };
+    match file_store.get(&path) {
+        AsyncValue::Ready(file) => app.store_loaded_file(file.clone()),
+        AsyncValue::Error(error) => app.store_file_load_error(path, error),
+        AsyncValue::Missing | AsyncValue::Loading => {}
     }
-    true
 }
 
 async fn load_review_app(
@@ -388,7 +420,6 @@ async fn load_review_app(
     {
         app.workspace = workspace;
     }
-    app.queue_selected_file_load();
     match drafts {
         Ok(drafts) => app.load_persisted_drafts(drafts),
         Err(error) => {
@@ -4803,6 +4834,19 @@ impl ReviewApp {
     /// Store a lazily loaded repository file.
     pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
         self.file_cache.insert(file);
+    }
+
+    /// Store a repository file load failure.
+    pub fn store_file_load_error(&mut self, path: String, error: String) {
+        self.file_cache.insert(CachedReviewFile {
+            path,
+            content: String::new(),
+            line_spans: Vec::new(),
+            size_bytes: 0,
+            mtime_ms: None,
+            is_binary: false,
+            unavailable_reason: Some(error),
+        });
     }
 
     /// Sync selected tree row to selected file.
