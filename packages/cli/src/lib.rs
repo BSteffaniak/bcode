@@ -850,20 +850,10 @@ async fn handle_review_command(command: Option<ReviewCommand>) -> Result<(), Cli
         return Ok(());
     };
     let (repo, target) = match command {
-        ReviewCommand::Unstaged { repo } => (
-            repo,
-            bcode_tui::code_review::ReviewOpenTarget::WorkingTreeUnstaged,
-        ),
-        ReviewCommand::Staged { repo } => {
-            (repo, bcode_tui::code_review::ReviewOpenTarget::IndexStaged)
-        }
-        ReviewCommand::All { repo } => (
-            repo,
-            bcode_tui::code_review::ReviewOpenTarget::WorkingTreeAndIndex,
-        ),
-        ReviewCommand::LastCommit { repo } => {
-            (repo, bcode_tui::code_review::ReviewOpenTarget::LastCommit)
-        }
+        ReviewCommand::Unstaged { repo } => (repo, ReviewTarget::WorkingTreeUnstaged),
+        ReviewCommand::Staged { repo } => (repo, ReviewTarget::IndexStaged),
+        ReviewCommand::All { repo } => (repo, ReviewTarget::WorkingTreeAndIndex),
+        ReviewCommand::LastCommit { repo } => (repo, ReviewTarget::LastCommit),
         ReviewCommand::Range {
             repo,
             base,
@@ -871,15 +861,13 @@ async fn handle_review_command(command: Option<ReviewCommand>) -> Result<(), Cli
             two_dot,
         } => (
             repo,
-            bcode_tui::code_review::ReviewOpenTarget::CommitRange {
+            ReviewTarget::CommitRange {
                 base,
                 head,
                 merge_base: !two_dot,
             },
         ),
-        ReviewCommand::Repo { repo } => {
-            (repo, bcode_tui::code_review::ReviewOpenTarget::Repository)
-        }
+        ReviewCommand::Repo { repo } => (repo, ReviewTarget::Repository),
         ReviewCommand::PublishGithub {
             github_repo,
             pr,

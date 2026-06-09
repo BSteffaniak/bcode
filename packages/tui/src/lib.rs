@@ -227,7 +227,7 @@ pub async fn run_code_review_workspace(
 #[allow(clippy::future_not_send)]
 pub async fn run_code_review(
     repo_path: std::path::PathBuf,
-    target: code_review::ReviewOpenTarget,
+    target: bcode_code_review_models::ReviewTarget,
 ) -> Result<(), TuiError> {
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;

@@ -15,7 +15,8 @@ use bcode_code_review_models::{
     OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
     ReviewRepositoryCommit, ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
-    ReviewTarget as ModelReviewTarget, ReviewWorkspace, UpdateReviewWorkspaceRequest,
+    ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewWorkspace,
+    UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
@@ -51,39 +52,6 @@ const REVIEW_PUBLISHER_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISHER_PREVIEW;
 const REVIEW_PUBLISHER_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISHER_SUBMIT;
 const DEFAULT_PUBLISHER_ID: &str = "markdown_file";
 const FILE_SIDEBAR_WIDTH: u16 = 34;
-
-/// Local Git target to open in review mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewOpenTarget {
-    /// Review unstaged working-tree changes.
-    WorkingTreeUnstaged,
-    /// Review staged index changes.
-    IndexStaged,
-    /// Review staged and unstaged changes together.
-    WorkingTreeAndIndex,
-    /// Review the last commit.
-    LastCommit,
-    /// Review a commit range.
-    CommitRange {
-        /// Base revision.
-        base: String,
-        /// Head revision.
-        head: String,
-        /// Whether to use merge-base semantics.
-        merge_base: bool,
-    },
-    /// Review a branch comparison.
-    BranchCompare {
-        /// Base branch.
-        base_branch: String,
-        /// Head branch.
-        head_branch: String,
-        /// Whether to use merge-base semantics.
-        merge_base: bool,
-    },
-    /// Browse and review repository files.
-    Repository,
-}
 
 const fn review_open_target_id(target: &ReviewOpenTarget) -> &'static str {
     match target {
@@ -142,7 +110,7 @@ fn model_target_from_source_kind(
 pub struct CodeReviewSurface {
     client: BcodeClient,
     repo_path: PathBuf,
-    review_target: ReviewTarget,
+    review_target: ReviewOpenTarget,
     app: ReviewApp,
     file_store: AsyncValueStore<String, CachedReviewFile>,
 }
@@ -160,7 +128,7 @@ impl CodeReviewSurface {
         build_mode: bool,
     ) -> Result<Self, TuiError> {
         let client = BcodeClient::default_endpoint();
-        let review_target: ReviewTarget = target.into();
+        let review_target = target;
         let mut app =
             load_review_app(&client, repo_path.clone(), review_target.clone(), workspace).await?;
         if build_mode {
@@ -456,7 +424,7 @@ enum WorkspaceDrainOutcome {
 async fn drain_pending_workspace_changes(
     client: &BcodeClient,
     repo_path: &Path,
-    fallback_target: &ReviewTarget,
+    fallback_target: &ReviewOpenTarget,
     app: &mut ReviewApp,
 ) -> WorkspaceDrainOutcome {
     let mut changed = false;
@@ -511,7 +479,7 @@ async fn drain_pending_workspace_changes(
 async fn handle_pending_draft_save(
     client: &BcodeClient,
     repo_path: &Path,
-    review_target: &ReviewTarget,
+    review_target: &ReviewOpenTarget,
     app: &mut ReviewApp,
 ) -> bool {
     let Some(save) = app.take_pending_draft_save() else {
@@ -571,7 +539,7 @@ fn sync_repository_file_store(
 async fn load_review_app(
     client: &BcodeClient,
     repo_path: PathBuf,
-    review_target: ReviewTarget,
+    review_target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
 ) -> Result<ReviewApp, TuiError> {
     let review = if let Some(workspace) = workspace.clone() {
@@ -640,7 +608,7 @@ async fn save_workspace(client: &BcodeClient, workspace: ReviewWorkspace) -> Res
 async fn handle_pending_agent_session(
     client: &BcodeClient,
     repo_path: PathBuf,
-    review_target: ReviewTarget,
+    review_target: ReviewOpenTarget,
     app: &mut ReviewApp,
     ask: PendingAgentSession,
 ) {
@@ -679,7 +647,7 @@ async fn handle_pending_agent_session(
 async fn handle_publish_request(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     app: &mut ReviewApp,
     request: PendingPublishRequest,
 ) {
@@ -759,7 +727,7 @@ async fn list_publishers(client: &BcodeClient) -> Result<Vec<ReviewPublisherMani
 async fn preview_review(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
     route: Option<ReviewPublisherRoute>,
     publisher_id: String,
@@ -811,7 +779,7 @@ async fn preview_review(
 async fn publish_review(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
     route: Option<ReviewPublisherRoute>,
     publisher_id: String,
@@ -961,7 +929,7 @@ async fn list_external_publishers(
 async fn load_review_bundle(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
 ) -> Result<serde_json::Value, TuiError> {
     let request = ReviewBundleRequest {
@@ -1007,7 +975,7 @@ async fn invoke_external_publisher(
 async fn load_workspace_review(
     client: &BcodeClient,
     repo_path: PathBuf,
-    _fallback_target: ReviewTarget,
+    _fallback_target: ReviewOpenTarget,
     workspace: ReviewWorkspace,
 ) -> Result<ReviewSummary, TuiError> {
     let payload = serde_json::to_vec(&MaterializeReviewWorkspaceRequest {
@@ -1076,11 +1044,11 @@ async fn load_workspace_review(
 async fn load_review(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
 ) -> Result<ReviewSummary, TuiError> {
     let request = CreateReviewRequest {
         repo_path,
-        target: target.to_model(),
+        target: target.clone(),
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
@@ -1133,12 +1101,12 @@ async fn load_repository_file(
 async fn load_drafts(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     scope: Option<ModelReviewScope>,
 ) -> Result<Vec<DraftComment>, TuiError> {
     let request = ListDraftsRequest {
         repo_path,
-        target: target.to_model(),
+        target: target.clone(),
         scope,
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
@@ -1163,13 +1131,13 @@ async fn load_drafts(
 async fn save_draft(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     scope: Option<ModelReviewScope>,
     save: PendingDraftSave,
 ) -> Result<(), TuiError> {
     let request = SaveDraftRequest {
         repo_path,
-        target: target.to_model(),
+        target: target.clone(),
         scope,
         anchor: save.anchor.into(),
         body: save.body,
@@ -1259,7 +1227,7 @@ async fn update_draft(
 async fn create_agent_session(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     app: &ReviewApp,
     ask: PendingAgentSession,
 ) -> Result<SessionId, TuiError> {
@@ -1280,14 +1248,14 @@ async fn create_agent_session(
 async fn link_thread_session(
     client: &BcodeClient,
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     app: &ReviewApp,
     anchor: ReviewCommentAnchor,
     session_id: SessionId,
 ) -> Result<(), TuiError> {
     let request = LinkThreadSessionRequest {
         repo_path,
-        target: target.to_model(),
+        target: target.clone(),
         scope: Some(review_scope_for_workspace(&app.workspace)),
         anchor: anchor.into(),
         session_id: session_id.to_string(),
@@ -1728,7 +1696,7 @@ struct PublishReviewPreviewResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ReviewBundleRequest {
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     #[serde(default)]
     workspace: Option<ReviewWorkspace>,
 }
@@ -1736,7 +1704,7 @@ struct ReviewBundleRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PublishReviewRequest {
     repo_path: PathBuf,
-    target: ReviewTarget,
+    target: ReviewOpenTarget,
     #[serde(default)]
     workspace: Option<ReviewWorkspace>,
     publisher_id: String,
@@ -1756,28 +1724,6 @@ pub struct PublishReviewResponse {
 struct CreateReviewRequest {
     repo_path: PathBuf,
     target: bcode_code_review_models::ReviewTarget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ReviewTarget {
-    WorkingTreeUnstaged,
-    IndexStaged,
-    WorkingTreeAndIndex,
-    LastCommit,
-    CommitRange {
-        base: String,
-        head: String,
-        #[serde(default)]
-        merge_base: bool,
-    },
-    BranchCompare {
-        base_branch: String,
-        head_branch: String,
-        #[serde(default)]
-        merge_base: bool,
-    },
-    Repository,
 }
 
 fn target_from_workspace(workspace: &ReviewWorkspace) -> ReviewOpenTarget {
@@ -1822,70 +1768,6 @@ fn target_from_source_kind(kind: &ReviewSourceKind) -> ReviewOpenTarget {
         ReviewSourceKind::File { .. }
         | ReviewSourceKind::FileRange { .. }
         | ReviewSourceKind::Repository => ReviewOpenTarget::Repository,
-    }
-}
-
-impl From<ReviewOpenTarget> for ReviewTarget {
-    fn from(target: ReviewOpenTarget) -> Self {
-        match target {
-            ReviewOpenTarget::WorkingTreeUnstaged => Self::WorkingTreeUnstaged,
-            ReviewOpenTarget::IndexStaged => Self::IndexStaged,
-            ReviewOpenTarget::WorkingTreeAndIndex => Self::WorkingTreeAndIndex,
-            ReviewOpenTarget::LastCommit => Self::LastCommit,
-            ReviewOpenTarget::CommitRange {
-                base,
-                head,
-                merge_base,
-            } => Self::CommitRange {
-                base,
-                head,
-                merge_base,
-            },
-            ReviewOpenTarget::BranchCompare {
-                base_branch,
-                head_branch,
-                merge_base,
-            } => Self::BranchCompare {
-                base_branch,
-                head_branch,
-                merge_base,
-            },
-            ReviewOpenTarget::Repository => Self::Repository,
-        }
-    }
-}
-
-impl ReviewTarget {
-    fn to_model(&self) -> bcode_code_review_models::ReviewTarget {
-        match self {
-            Self::WorkingTreeUnstaged => {
-                bcode_code_review_models::ReviewTarget::WorkingTreeUnstaged
-            }
-            Self::IndexStaged => bcode_code_review_models::ReviewTarget::IndexStaged,
-            Self::WorkingTreeAndIndex => {
-                bcode_code_review_models::ReviewTarget::WorkingTreeAndIndex
-            }
-            Self::LastCommit => bcode_code_review_models::ReviewTarget::LastCommit,
-            Self::CommitRange {
-                base,
-                head,
-                merge_base,
-            } => bcode_code_review_models::ReviewTarget::CommitRange {
-                base: base.clone(),
-                head: head.clone(),
-                merge_base: *merge_base,
-            },
-            Self::BranchCompare {
-                base_branch,
-                head_branch,
-                merge_base,
-            } => bcode_code_review_models::ReviewTarget::BranchCompare {
-                base_branch: base_branch.clone(),
-                head_branch: head_branch.clone(),
-                merge_base: *merge_base,
-            },
-            Self::Repository => bcode_code_review_models::ReviewTarget::Repository,
-        }
     }
 }
 
@@ -2077,9 +1959,9 @@ impl ReviewSummary {
     pub fn workspace(&self) -> ReviewWorkspace {
         self.workspace.clone().unwrap_or_else(|| {
             let target = if self.is_repository_review() {
-                ReviewTarget::Repository.to_model()
+                ReviewOpenTarget::Repository
             } else {
-                ReviewTarget::WorkingTreeAndIndex.to_model()
+                ReviewOpenTarget::WorkingTreeAndIndex
             };
             ReviewWorkspace::from_target(self.repo_root.clone(), target)
         })
