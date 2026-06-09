@@ -1038,7 +1038,11 @@ async fn init_turso_local_with_retry(
             .turso()
             .with_path(path)
             .with_busy_timeout(DATABASE_BUSY_TIMEOUT)
-            .with_multiprocess_wal(true)
+            // Turso's multi-process WAL mode is still experimental and has produced stale
+            // WAL-index sidecars after daemon lifecycle churn. Bcode serializes writes with
+            // database transactions and its session access guard instead of relying on that
+            // experimental sidecar format for correctness.
+            .with_multiprocess_wal(false)
             .build()
             .await
         {

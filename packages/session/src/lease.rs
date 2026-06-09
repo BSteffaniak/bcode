@@ -1,4 +1,9 @@
-//! Cross-process session and catalog lease primitives.
+//! Cross-process session compatibility and catalog lock primitives.
+//!
+//! Session access guards intentionally do not provide exclusive session ownership. Bcode's UX
+//! allows multiple clients and same-version daemons to attach to the same session, while the
+//! database provides write serialization. These guards only prevent incompatible Bcode builds from
+//! accessing the same session concurrently.
 
 use bcode_session_models::SessionId;
 use serde::{Deserialize, Serialize};
@@ -8,16 +13,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-/// Serializable metadata describing the daemon that owns a session lease.
+/// Serializable metadata describing one process currently accessing a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLeaseOwner {
     /// Metadata schema version.
     pub schema_version: u32,
-    /// Session protected by this lease.
+    /// Session protected by this access record.
     pub session_id: SessionId,
-    /// Unique token for this lease acquisition.
+    /// Unique token for this access registration.
     pub lease_token: String,
-    /// Owning process id.
+    /// Accessing process id.
     pub pid: u32,
     /// Bcode daemon namespace, when known.
     pub daemon_namespace: Option<String>,
@@ -25,13 +30,13 @@ pub struct SessionLeaseOwner {
     pub build_fingerprint: Option<String>,
     /// Bcode IPC protocol version, when known.
     pub protocol_version: Option<u32>,
-    /// Owning daemon endpoint, when known.
+    /// Accessing daemon endpoint, when known.
     pub endpoint: Option<String>,
-    /// Executable that acquired the lease, when known.
+    /// Executable that registered access, when known.
     pub executable_path: Option<PathBuf>,
     /// Daemon instance id, when known.
     pub daemon_instance_id: Option<String>,
-    /// Lease acquisition time in Unix milliseconds.
+    /// Access registration time in Unix milliseconds.
     pub acquired_at_ms: u64,
     /// Latest owner heartbeat/update time in Unix milliseconds.
     pub last_seen_ms: u64,
@@ -60,7 +65,7 @@ impl SessionLeaseOwner {
     }
 }
 
-/// Optional daemon identity to write into session lease owner metadata.
+/// Optional daemon identity to write into session access metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionLeaseOwnerContext {
     /// Bcode daemon namespace.
@@ -77,11 +82,11 @@ pub struct SessionLeaseOwnerContext {
     pub daemon_instance_id: Option<String>,
 }
 
-/// Errors returned while acquiring or releasing cross-process leases.
+/// Errors returned while registering or releasing cross-process session access.
 #[derive(Debug, Error)]
 pub enum SessionLeaseError {
     /// Filesystem operation failed.
-    #[error("session lease I/O error at {}: {source}", path.display())]
+    #[error("session access I/O error at {}: {source}", path.display())]
     Io {
         /// Path involved in the failed operation.
         path: PathBuf,
@@ -89,34 +94,32 @@ pub enum SessionLeaseError {
         source: io::Error,
     },
     /// Owner metadata could not be serialized.
-    #[error("session lease metadata serialization failed: {0}")]
+    #[error("session access metadata serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
-    /// Another daemon currently owns the session lease.
-    #[error("session {session_id} is owned by another daemon{owner_summary}")]
+    /// Another daemon with an incompatible build currently has the session open.
+    #[error("session {session_id} is open in another Bcode build{owner_summary}")]
     OwnedByOtherDaemon {
-        /// Session whose lease could not be acquired.
+        /// Session whose access could not be registered.
         session_id: SessionId,
-        /// Best-effort owner metadata.
+        /// Best-effort incompatible owner metadata.
         owner: Option<Box<SessionLeaseOwner>>,
         /// Human-readable owner summary.
         owner_summary: String,
     },
-    /// Current platform does not support Bcode's session lease mechanism.
-    #[error("session leases are unsupported on this platform")]
+    /// Current platform does not support Bcode's session access mechanism.
+    #[error("session access guards are unsupported on this platform")]
     Unsupported,
 }
 
-/// Held exclusive ownership for one session.
+/// Held compatible access registration for one session.
 #[derive(Debug)]
 pub struct SessionLeaseGuard {
-    file: File,
-    _lock_path: PathBuf,
     owner_path: PathBuf,
     owner: SessionLeaseOwner,
 }
 
 impl SessionLeaseGuard {
-    /// Return owner metadata for this held lease.
+    /// Return owner metadata for this held access registration.
     #[must_use]
     pub const fn owner(&self) -> &SessionLeaseOwner {
         &self.owner
@@ -126,6 +129,17 @@ impl SessionLeaseGuard {
 impl Drop for SessionLeaseGuard {
     fn drop(&mut self) {
         remove_owner_metadata_if_token_matches(&self.owner_path, &self.owner.lease_token);
+    }
+}
+
+/// Held short-lived exclusive access to one session write critical section.
+#[derive(Debug)]
+pub struct SessionWriteGuard {
+    file: File,
+}
+
+impl Drop for SessionWriteGuard {
+    fn drop(&mut self) {
         let _ = unlock_file(&self.file);
     }
 }
@@ -142,49 +156,71 @@ impl Drop for CatalogLockGuard {
     }
 }
 
-/// Acquire exclusive ownership for a session using a kernel-backed file lock.
+/// Register compatible access for a session.
+///
+/// This is not an exclusive session lock. It briefly takes a coordinator lock, removes dead
+/// process registrations, rejects live incompatible builds, writes this process registration, and
+/// then lets the database handle read/write concurrency.
 ///
 /// # Errors
 ///
-/// Returns an error if the lock file cannot be opened, another daemon owns the session,
-/// owner metadata cannot be written, or the platform does not support file leases.
+/// Returns an error if the coordinator lock cannot be opened/locked, owner metadata cannot be
+/// read/written, or an incompatible live build is already registered for the session.
 pub fn acquire_session_lease(
     root: &Path,
     session_id: SessionId,
     context: &SessionLeaseOwnerContext,
 ) -> Result<SessionLeaseGuard, SessionLeaseError> {
     let lock_path = session_lock_path(root, session_id);
-    let owner_path = session_owner_path(root, session_id);
     let file = open_lock_file(&lock_path)?;
-    match try_lock_file_exclusive(&file) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            let owner = read_owner_metadata(&owner_path).map(Box::new);
-            let owner_summary = owner
-                .as_deref()
-                .map_or_else(String::new, |owner| format!(": {}", format_owner(owner)));
-            return Err(SessionLeaseError::OwnedByOtherDaemon {
-                session_id,
-                owner,
-                owner_summary,
-            });
-        }
-        Err(source) => {
-            return Err(SessionLeaseError::Io {
-                path: lock_path,
-                source,
-            });
-        }
+    lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
+        path: lock_path.clone(),
+        source,
+    })?;
+
+    let access_dir = session_owner_dir(root, session_id);
+    fs::create_dir_all(&access_dir).map_err(|source| SessionLeaseError::Io {
+        path: access_dir.clone(),
+        source,
+    })?;
+    prune_dead_owner_records(&access_dir)?;
+
+    if let Some(owner) = find_incompatible_owner(&access_dir, context)? {
+        let owner_summary = format!(": {}", format_owner(&owner));
+        let _ = unlock_file(&file);
+        return Err(SessionLeaseError::OwnedByOtherDaemon {
+            session_id,
+            owner: Some(Box::new(owner)),
+            owner_summary,
+        });
     }
 
     let owner = SessionLeaseOwner::new(session_id, context);
+    let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
     write_owner_metadata(&owner_path, &owner)?;
-    Ok(SessionLeaseGuard {
-        file,
-        _lock_path: lock_path,
-        owner_path,
-        owner,
-    })
+    let _ = unlock_file(&file);
+    Ok(SessionLeaseGuard { owner_path, owner })
+}
+
+/// Acquire exclusive short-lived access to one session write critical section.
+///
+/// This does not represent session ownership. It only serializes app-assigned event sequence
+/// allocation across same-version daemons until sequence allocation is fully database-owned.
+///
+/// # Errors
+///
+/// Returns an error if the write lock file cannot be opened or locked.
+pub fn acquire_session_write_lock(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<SessionWriteGuard, SessionLeaseError> {
+    let lock_path = session_write_lock_path(root, session_id);
+    let file = open_lock_file(&lock_path)?;
+    lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
+        path: lock_path,
+        source,
+    })?;
+    Ok(SessionWriteGuard { file })
 }
 
 /// Acquire exclusive short-lived access to the global catalog database.
@@ -206,8 +242,12 @@ fn session_lock_path(root: &Path, session_id: SessionId) -> PathBuf {
     root.join("locks").join(format!("{session_id}.lock"))
 }
 
-fn session_owner_path(root: &Path, session_id: SessionId) -> PathBuf {
-    root.join("leases").join(format!("{session_id}.json"))
+fn session_write_lock_path(root: &Path, session_id: SessionId) -> PathBuf {
+    root.join("locks").join(format!("{session_id}.write.lock"))
+}
+
+fn session_owner_dir(root: &Path, session_id: SessionId) -> PathBuf {
+    root.join("leases").join(session_id.to_string())
 }
 
 fn open_lock_file(path: &Path) -> Result<File, SessionLeaseError> {
@@ -262,6 +302,78 @@ fn remove_owner_metadata_if_token_matches(path: &Path, token: &str) {
     }
 }
 
+fn prune_dead_owner_records(access_dir: &Path) -> Result<(), SessionLeaseError> {
+    for entry in fs::read_dir(access_dir).map_err(|source| SessionLeaseError::Io {
+        path: access_dir.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| SessionLeaseError::Io {
+            path: access_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(owner) = read_owner_metadata(&path) else {
+            remove_file_best_effort(&path)?;
+            continue;
+        };
+        if !process_is_alive(owner.pid) {
+            remove_file_best_effort(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn find_incompatible_owner(
+    access_dir: &Path,
+    context: &SessionLeaseOwnerContext,
+) -> Result<Option<SessionLeaseOwner>, SessionLeaseError> {
+    for entry in fs::read_dir(access_dir).map_err(|source| SessionLeaseError::Io {
+        path: access_dir.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| SessionLeaseError::Io {
+            path: access_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(owner) = read_owner_metadata(&path) else {
+            continue;
+        };
+        if !owner_is_compatible(&owner, context) {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
+}
+
+fn owner_is_compatible(owner: &SessionLeaseOwner, context: &SessionLeaseOwnerContext) -> bool {
+    match (&owner.build_fingerprint, &context.build_fingerprint) {
+        (Some(left), Some(right)) => left == right,
+        _ => {
+            owner.protocol_version.is_none()
+                || context.protocol_version.is_none()
+                || owner.protocol_version == context.protocol_version
+        }
+    }
+}
+
+fn remove_file_best_effort(path: &Path) -> Result<(), SessionLeaseError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SessionLeaseError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn format_owner(owner: &SessionLeaseOwner) -> String {
     let mut parts = vec![format!("pid {}", owner.pid)];
     if let Some(namespace) = &owner.daemon_namespace {
@@ -285,26 +397,22 @@ fn unix_time_millis() -> u64 {
 }
 
 #[cfg(unix)]
-fn try_lock_file_exclusive(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `kill(pid, 0)` does not send a signal; it only asks the kernel whether the process
+    // exists or is inaccessible. The pid is converted to the platform `i32` representation above.
+    let result = unsafe { kill(pid, 0) };
     if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+        return true;
     }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
 }
 
 #[cfg(not(unix))]
-fn try_lock_file_exclusive(_file: &File) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        SessionLeaseError::Unsupported.to_string(),
-    ))
+const fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -313,6 +421,8 @@ fn lock_file_exclusive(file: &File) -> io::Result<()> {
 
     const LOCK_EX: i32 = 2;
 
+    // SAFETY: `file.as_raw_fd()` is a valid descriptor for the lifetime of this call, and flock
+    // does not retain the pointer or require additional invariants.
     let result = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
     if result == 0 {
         Ok(())
@@ -335,6 +445,8 @@ fn unlock_file(file: &File) -> io::Result<()> {
 
     const LOCK_UN: i32 = 8;
 
+    // SAFETY: `file.as_raw_fd()` is a valid descriptor for the lifetime of this call, and flock
+    // does not retain the pointer or require additional invariants.
     let result = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
     if result == 0 {
         Ok(())
@@ -351,4 +463,59 @@ fn unlock_file(_file: &File) -> io::Result<()> {
 #[cfg(unix)]
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(build: &str) -> SessionLeaseOwnerContext {
+        SessionLeaseOwnerContext {
+            build_fingerprint: Some(build.to_string()),
+            protocol_version: Some(2),
+            ..SessionLeaseOwnerContext::default()
+        }
+    }
+
+    #[test]
+    fn allows_multiple_same_build_session_access_guards() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let first = acquire_session_lease(temp_dir.path(), session_id, &context("same"))
+            .expect("first guard");
+        let second = acquire_session_lease(temp_dir.path(), session_id, &context("same"))
+            .expect("same build guard");
+
+        assert_eq!(first.owner().build_fingerprint.as_deref(), Some("same"));
+        assert_eq!(second.owner().build_fingerprint.as_deref(), Some("same"));
+    }
+
+    #[test]
+    fn rejects_live_different_build_session_access_guard() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let _first = acquire_session_lease(temp_dir.path(), session_id, &context("old"))
+            .expect("first guard");
+        let error = acquire_session_lease(temp_dir.path(), session_id, &context("new"))
+            .expect_err("different build should be rejected");
+
+        assert!(matches!(
+            error,
+            SessionLeaseError::OwnedByOtherDaemon { .. }
+        ));
+    }
+
+    #[test]
+    fn allows_different_build_after_guard_drop() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        {
+            let _first = acquire_session_lease(temp_dir.path(), session_id, &context("old"))
+                .expect("first guard");
+        }
+
+        acquire_session_lease(temp_dir.path(), session_id, &context("new"))
+            .expect("different build after drop");
+    }
 }

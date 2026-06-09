@@ -2445,7 +2445,8 @@ async fn open_database(path: &Path) -> Result<Box<dyn Database>, ReviewError> {
             .turso()
             .with_path(path)
             .with_busy_timeout(DATABASE_BUSY_TIMEOUT)
-            .with_multiprocess_wal(true)
+            // Avoid Turso's experimental multi-process WAL sidecars for local plugin state.
+            .with_multiprocess_wal(false)
             .build()
             .await
         {

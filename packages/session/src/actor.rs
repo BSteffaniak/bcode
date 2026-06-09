@@ -504,37 +504,101 @@ impl SessionActor {
         Ok(Some(db))
     }
 
+    async fn refresh_state_from_db_for_write(
+        &mut self,
+        db: &SessionDb,
+    ) -> Result<(), SessionError> {
+        let Some(db_state) = db.session_state().await? else {
+            return Ok(());
+        };
+        let expected_last_sequence = db
+            .last_event_sequence()
+            .await?
+            .unwrap_or(db_state.last_event_seq);
+        if db_state.last_event_seq < expected_last_sequence {
+            return Err(SessionError::ProjectionStale {
+                session_id: self.state.summary.id,
+                projection: "session_state",
+                checkpoint: Some(db_state.last_event_seq),
+                expected: expected_last_sequence,
+            });
+        }
+        if expected_last_sequence.saturating_add(1) == self.state.next_sequence {
+            return Ok(());
+        }
+        let activity_bounds = db.activity_bounds().await?;
+        let created_at_ms = activity_bounds
+            .map(|(created_at_ms, _)| created_at_ms)
+            .or(db_state.updated_at_ms)
+            .unwrap_or(self.state.summary.created_at_ms);
+        let updated_at_ms = db_state
+            .updated_at_ms
+            .or_else(|| activity_bounds.map(|(_, updated_at_ms)| updated_at_ms))
+            .unwrap_or(self.state.summary.updated_at_ms);
+        let clients = self.state.clients.clone();
+        let sender = self.state.sender.clone();
+        let live_events = self.state.live_events.clone();
+        self.state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
+        self.state.clients = clients;
+        self.state.summary.client_count = self.state.clients.len();
+        self.state.sender = sender;
+        self.state.live_events = live_events;
+        Ok(())
+    }
+
     async fn append_event(
         &mut self,
         kind: SessionEventKind,
         provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
-        let mut event = self.state.build_next_event(kind);
-        event.provenance = provenance;
-        if self.store.is_some() {
+        let event = if let Some(store) = self.store.clone() {
+            let _write_guard = crate::lease::acquire_session_write_lock(
+                &store.root_path(),
+                self.state.summary.id,
+            )?;
             let db = self.session_db_for_write().await?;
+            self.refresh_state_from_db_for_write(&db).await?;
+            let mut event = self.state.build_next_event(kind);
+            event.provenance = provenance;
             let db_append_started_at = Instant::now();
             db.append_event_with_activity_timestamp(&event, Some(activity_timestamp_ms))
                 .await?;
-            if let Some(store) = &self.store {
-                store.metrics().record_histogram(
-                    "session.actor.append_event.db_append_duration_ms",
-                    elapsed_ms(db_append_started_at),
-                );
-            }
-        }
+            store.metrics().record_histogram(
+                "session.actor.append_event.db_append_duration_ms",
+                elapsed_ms(db_append_started_at),
+            );
+            event
+        } else {
+            let mut event = self.state.build_next_event(kind);
+            event.provenance = provenance;
+            event
+        };
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         if let Some(store) = &self.store {
-            let catalog =
-                crate::db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
-            catalog
-                .upsert_session(
-                    &self.state.summary(),
-                    &crate::db::session_db_path(&store.root_path(), self.state.summary.id),
-                )
-                .await?;
+            match crate::db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await {
+                Ok(catalog) => {
+                    if let Err(error) = catalog
+                        .upsert_session(
+                            &self.state.summary(),
+                            &crate::db::session_db_path(&store.root_path(), self.state.summary.id),
+                        )
+                        .await
+                    {
+                        store
+                            .metrics()
+                            .increment_counter("session.catalog.upsert_error_total");
+                        eprintln!("failed to update session catalog: {error}");
+                    }
+                }
+                Err(error) => {
+                    store
+                        .metrics()
+                        .increment_counter("session.catalog.open_error_total");
+                    eprintln!("failed to open session catalog for update: {error}");
+                }
+            }
         }
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();

@@ -3207,6 +3207,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_same_session_appends_across_managers_have_contiguous_sequences() {
+        let root = unique_temp_dir();
+        let creator = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = creator
+            .create_session(Some("cross-manager".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        drop(creator);
+
+        let first = std::sync::Arc::new(
+            SessionManager::persistent(&root).expect("first manager should restore"),
+        );
+        let second = std::sync::Arc::new(
+            SessionManager::persistent(&root).expect("second manager should restore"),
+        );
+
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let manager = if index % 2 == 0 {
+                std::sync::Arc::clone(&first)
+            } else {
+                std::sync::Arc::clone(&second)
+            };
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .append_event(
+                        session.id,
+                        SessionEventKind::SystemMessage {
+                            text: format!("message {index}"),
+                        },
+                    )
+                    .await
+                    .expect("event should append")
+            }));
+        }
+
+        let mut sequences = Vec::new();
+        for task in tasks {
+            sequences.push(task.await.expect("task should join").sequence);
+        }
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=16).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn catalog_status_subscription_reports_loaded() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
