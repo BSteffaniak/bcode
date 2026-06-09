@@ -2721,6 +2721,12 @@ pub enum ReviewPublishState {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ReviewViewportState {
+    diff_scroll: usize,
+    selected_diff_line: usize,
+}
+
 /// Stateful review app model.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -2769,6 +2775,8 @@ pub struct ReviewApp {
     pub publishers: Vec<ReviewPublisherManifest>,
     /// Repository file cache for read-only file browsing.
     pub file_cache: ReviewFileCache,
+    /// Per-file viewport state keyed by stable file/surface path.
+    file_viewports: BTreeMap<String, ReviewViewportState>,
     /// Repository file path awaiting lazy load.
     pub pending_file_load: Option<String>,
     /// Selected publisher index.
@@ -2829,6 +2837,7 @@ impl ReviewApp {
             pending_publish_request: None,
             publishers: Vec::new(),
             file_cache: ReviewFileCache::default(),
+            file_viewports: BTreeMap::new(),
             pending_file_load: None,
             selected_publisher: 0,
             publish_state: None,
@@ -3787,6 +3796,10 @@ impl ReviewApp {
             .collect()
     }
 
+    fn review_item_count(&self) -> usize {
+        self.review.files.len().max(self.review.surfaces().len())
+    }
+
     /// Return visible file-tree rows for repository review.
     #[must_use]
     pub fn file_tree_rows(&self) -> Vec<ReviewFileTreeRow> {
@@ -3798,8 +3811,11 @@ impl ReviewApp {
     fn push_tree_rows(&self, prefix: &Path, depth: usize, rows: &mut Vec<ReviewFileTreeRow>) {
         let mut dirs = BTreeSet::new();
         let mut files = Vec::new();
-        for (index, file) in self.review.files.iter().enumerate() {
-            let path = Path::new(file.display_path());
+        for index in 0..self.review_item_count() {
+            let Some(path) = self.review_path_for_index(index) else {
+                continue;
+            };
+            let path = Path::new(&path);
             let rest = if prefix.as_os_str().is_empty() {
                 path
             } else if let Ok(rest) = path.strip_prefix(prefix) {
@@ -3880,6 +3896,19 @@ impl ReviewApp {
         self.review.files.get(self.selected_file)
     }
 
+    fn review_path_for_index(&self, index: usize) -> Option<String> {
+        self.review
+            .files
+            .get(index)
+            .map(|file| file.display_path().to_string())
+            .or_else(|| {
+                self.review
+                    .surfaces()
+                    .get(index)
+                    .map(|surface| surface.path.clone())
+            })
+    }
+
     /// Return currently selected file path.
     #[must_use]
     pub fn selected_file_path(&self) -> Option<String> {
@@ -3890,20 +3919,23 @@ impl ReviewApp {
 
     /// Replace review content after rematerialization.
     pub fn replace_review(&mut self, review: ReviewSummary) {
+        self.save_current_file_viewport();
+        let previous_path = self.selected_file_path();
         let workspace = review.workspace();
         self.review = review;
         self.workspace = workspace;
         self.sync_review_workspace();
-        self.selected_file = self
-            .selected_file
-            .min(self.review.files.len().saturating_sub(1));
+        self.selected_file = previous_path
+            .as_deref()
+            .and_then(|path| self.review_file_index_for_path(path))
+            .unwrap_or(self.selected_file)
+            .min(self.review_item_count().saturating_sub(1));
         self.selected_build_row = self
             .selected_build_row
             .min(self.build_row_count().saturating_sub(1));
         self.build_scroll = self.build_scroll.min(self.selected_build_row);
         self.file_scroll = self.file_scroll.min(self.selected_file);
-        self.diff_scroll = 0;
-        self.selected_diff_line = 0;
+        self.restore_current_file_viewport();
         self.queue_selected_file_load();
     }
 
@@ -4696,16 +4728,59 @@ impl ReviewApp {
         self.ensure_selected_diff_line_visible();
     }
 
+    fn review_file_index_for_path(&self, path: &str) -> Option<usize> {
+        self.review
+            .files
+            .iter()
+            .position(|file| file.display_path() == path)
+            .or_else(|| {
+                self.review
+                    .surfaces()
+                    .iter()
+                    .position(|surface| surface.path == path)
+            })
+    }
+
+    fn save_current_file_viewport(&mut self) {
+        let Some(path) = self.selected_file_path() else {
+            return;
+        };
+        self.file_viewports.insert(
+            path,
+            ReviewViewportState {
+                diff_scroll: self.diff_scroll,
+                selected_diff_line: self.selected_diff_line,
+            },
+        );
+    }
+
+    fn restore_current_file_viewport(&mut self) {
+        let Some(path) = self.selected_file_path() else {
+            self.diff_scroll = 0;
+            self.selected_diff_line = 0;
+            return;
+        };
+        if let Some(viewport) = self.file_viewports.get(&path).copied() {
+            self.diff_scroll = viewport.diff_scroll.min(self.max_diff_scroll());
+            self.selected_diff_line = viewport
+                .selected_diff_line
+                .min(self.rendered_diff_len().saturating_sub(1));
+            self.ensure_selected_diff_line_visible();
+        } else {
+            self.diff_scroll = 0;
+            self.selected_diff_line = 0;
+        }
+    }
+
     /// Select a file by index.
     pub fn select_file(&mut self, index: usize) -> bool {
-        if index >= self.review.files.len() || index == self.selected_file {
+        if index >= self.review_item_count() || index == self.selected_file {
             return false;
         }
+        self.save_current_file_viewport();
         self.selected_file = index;
-        self.diff_scroll = 0;
-        self.selected_diff_line = 0;
         self.range_selection_start = None;
-        self.sidebar_mode = ReviewSidebarMode::Included;
+        self.restore_current_file_viewport();
         self.queue_selected_file_load();
         self.expand_selected_file_dirs();
         self.sync_tree_row_to_selected_file();
@@ -4733,10 +4808,7 @@ impl ReviewApp {
 
     /// Expand ancestor directories for the selected file.
     pub fn expand_selected_file_dirs(&mut self) {
-        let Some(path) = self
-            .selected_file_data()
-            .map(|file| file.display_path().to_string())
-        else {
+        let Some(path) = self.selected_file_path() else {
             return;
         };
         let path = Path::new(&path);
@@ -4764,7 +4836,7 @@ impl ReviewApp {
 
     /// Select next file.
     pub fn select_next_file(&mut self) -> bool {
-        self.select_file((self.selected_file + 1).min(self.review.files.len().saturating_sub(1)))
+        self.select_file((self.selected_file + 1).min(self.review_item_count().saturating_sub(1)))
     }
 
     /// Scroll file sidebar down.
@@ -5866,15 +5938,18 @@ impl ReviewApp {
     }
 
     fn rendered_diff_len(&self) -> usize {
+        if self.review.is_repository_review() {
+            let Some(path) = self.selected_file_path() else {
+                return 1;
+            };
+            return self
+                .file_cache
+                .get(&path)
+                .map_or(1, |file| file.line_spans.len().max(1));
+        }
         let Some(file) = self.selected_file_data() else {
             return 1;
         };
-        if self.review.is_repository_review() {
-            return self
-                .file_cache
-                .get(file.display_path())
-                .map_or(1, |file| file.line_spans.len().max(1));
-        }
         if self
             .selected_surface()
             .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
@@ -6180,6 +6255,76 @@ mod tests {
 
         assert_eq!(app.draft_comment_count(), 1);
         assert!(app.has_draft_comment_at(0, 2));
+    }
+
+    #[test]
+    fn selecting_file_preserves_sidebar_mode() {
+        let mut app = sample_app();
+        app.review.files.push(ReviewFile {
+            old_path: Some("b.rs".to_string()),
+            new_path: Some("b.rs".to_string()),
+            status: ReviewFileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+            is_binary: false,
+            hunks: Vec::new(),
+        });
+        app.sidebar_mode = ReviewSidebarMode::Repository;
+
+        assert!(app.select_file(1));
+
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Repository);
+    }
+
+    #[test]
+    fn selecting_file_restores_previous_viewport() {
+        let mut app = sample_app();
+        app.review.files.push(ReviewFile {
+            old_path: Some("b.rs".to_string()),
+            new_path: Some("b.rs".to_string()),
+            status: ReviewFileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+            is_binary: false,
+            hunks: vec![ReviewHunk {
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                heading: None,
+                lines: vec![ReviewLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "b".to_string(),
+                }],
+            }],
+        });
+        app.diff_scroll = 1;
+        app.selected_diff_line = 2;
+        app.set_diff_area(Rect::new(0, 0, 80, 3));
+
+        assert!(app.select_file(1));
+        assert_eq!(app.diff_scroll, 0);
+        assert_eq!(app.selected_diff_line, 0);
+
+        assert!(app.select_file(0));
+        assert_eq!(app.diff_scroll, 1);
+        assert_eq!(app.selected_diff_line, 2);
+    }
+
+    #[test]
+    fn repository_tree_rows_use_surface_paths() {
+        let app = build_workspace_app(
+            vec![build_source("source-1", ReviewSourceKind::Repository, true)],
+            vec![build_file_surface("surface-1", "source-1")],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            app.file_tree_rows(),
+            vec![ReviewFileTreeRow::File { index: 0, depth: 0 }]
+        );
     }
 
     #[test]
