@@ -1538,6 +1538,7 @@ dependencies = [
  "bcode_agent_profile",
  "bcode_client",
  "bcode_code_review_models",
+ "bcode_code_review_plugin",
  "bcode_command",
  "bcode_config",
  "bcode_ipc",

@@ -374,21 +374,30 @@ async fn run_with_workspace<W: Write>(
 ) -> Result<Option<SessionId>, TuiError> {
     let options =
         serde_json::json!({ "build_mode": build_mode, "workspace": workspace, "target": target });
-    let mut surface = current_code_review_tui_registry()
-        .open(
-            "code-review",
-            bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
-                instance_id: "code-review".to_string(),
-                repo_path: Some(repo_path),
-                target: None,
-                options,
-            },
-        )
-        .await
-        .map_err(|error| TuiError::PluginService {
-            code: "tui_surface_open_failed".to_string(),
-            message: error.to_string(),
-        })?;
+    let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        &bcode_plugin::PluginSelection::all_enabled(),
+        &crate::static_bundled_plugins(),
+    )
+    .map_err(|error| TuiError::PluginService {
+        code: "plugin_runtime_load_failed".to_string(),
+        message: error.to_string(),
+    })?;
+    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+        &runtime,
+        "bcode.code_review",
+        "code-review",
+        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+            instance_id: "code-review".to_string(),
+            repo_path: Some(repo_path),
+            target: None,
+            options,
+        },
+    )
+    .await
+    .map_err(|error| TuiError::PluginService {
+        code: "tui_surface_open_failed".to_string(),
+        message: error.to_string(),
+    })?;
     let close_outcome =
         super::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
     let session_to_open = close_outcome

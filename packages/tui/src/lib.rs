@@ -121,6 +121,18 @@ pub enum TuiError {
     Canceled,
 }
 
+/// Return statically bundled plugin registrations compiled into `bcode_tui`.
+#[must_use]
+pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
+    vec![
+        #[cfg(feature = "static-bundled-code-review-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
+            bcode_code_review_plugin::static_plugin(),
+        ),
+    ]
+}
+
 /// Run the terminal user interface.
 ///
 /// # Errors

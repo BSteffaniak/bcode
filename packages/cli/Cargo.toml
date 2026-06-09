@@ -58,6 +58,7 @@ static-bundled-blims-plugin = [
 static-bundled-code-review-plugin = [
     "_static-bundled",
     "bcode_server/static-bundled-code-review-plugin",
+    "bcode_tui/static-bundled-code-review-plugin",
 ]
 static-bundled-default-agents-plugin = [
     "_static-bundled",
