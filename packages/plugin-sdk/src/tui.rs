@@ -1,6 +1,5 @@
 //! Native Tokio-backed TUI surface host APIs for plugins.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
@@ -46,7 +45,7 @@ pub enum PluginTuiAction {
     /// Redraw the terminal.
     Redraw,
     /// Close the current surface.
-    Close,
+    Close { outcome: Option<serde_json::Value> },
     /// Open another registered surface.
     OpenSurface { surface_id: String },
     /// Run a host command.
@@ -62,15 +61,12 @@ impl PluginTuiAction {
 }
 
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
-pub trait PluginTuiSurface: Any + Send {
+pub trait PluginTuiSurface: Send {
     /// Stable surface identifier.
     fn id(&self) -> &'static str;
 
     /// Human-readable surface title.
     fn title(&self) -> &'static str;
-
-    /// Return this surface as `Any` for host-side downcasting of bundled surfaces.
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     /// Render this surface inside the host-assigned area.
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>);

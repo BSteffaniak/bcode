@@ -285,10 +285,6 @@ impl PluginTuiSurface for CodeReviewSurface {
         "Code Review"
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
     fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
         super::code_review_render::render(&mut self.app, frame);
     }
@@ -300,7 +296,11 @@ impl PluginTuiSurface for CodeReviewSurface {
             needs_redraw = true;
         }
         if self.app.should_exit {
-            PluginTuiAction::Close
+            let outcome = self
+                .app
+                .take_session_to_open()
+                .map(|session_id| serde_json::json!({ "open_session": session_id }));
+            PluginTuiAction::Close { outcome }
         } else if needs_redraw {
             PluginTuiAction::Redraw
         } else {
@@ -434,11 +434,11 @@ async fn run_with_workspace<W: Write>(
             code: "tui_surface_open_failed".to_string(),
             message: error.to_string(),
         })?;
-    super::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
-    let session_to_open = surface
-        .as_any_mut()
-        .downcast_mut::<CodeReviewSurface>()
-        .and_then(CodeReviewSurface::take_session_to_open);
+    let close_outcome =
+        super::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
+    let session_to_open = close_outcome
+        .and_then(|outcome| outcome.get("open_session").cloned())
+        .and_then(|value| serde_json::from_value(value).ok());
     Ok(session_to_open)
 }
 

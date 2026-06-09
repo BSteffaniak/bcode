@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use super::terminal_events::TuiInput;
 use super::{TuiError, helpers};
 
-/// Run one plugin-owned native TUI surface in the Bcode TUI host.
+/// Run one plugin-owned native TUI surface in the Bcode TUI host and return its close outcome.
 ///
 /// # Errors
 ///
@@ -20,11 +20,12 @@ use super::{TuiError, helpers};
 pub async fn run_plugin_surface<W: Write>(
     terminal: &mut Terminal<&mut W>,
     surface: &mut dyn PluginTuiSurface,
-) -> Result<(), TuiError> {
+) -> Result<Option<serde_json::Value>, TuiError> {
     let mut input = TuiInput::start();
     let (redraw_sender, mut redraw_receiver) = mpsc::unbounded_channel();
     let host = TokioPluginTuiHost::current(redraw_sender);
     let mut needs_redraw = true;
+    let mut close_outcome = None;
     let mut should_exit = false;
 
     while !should_exit {
@@ -53,7 +54,10 @@ pub async fn run_plugin_surface<W: Write>(
                 match surface.handle_event(&event, &host) {
                     PluginTuiAction::None => {}
                     PluginTuiAction::Redraw => needs_redraw = true,
-                    PluginTuiAction::Close => should_exit = true,
+                    PluginTuiAction::Close { outcome } => {
+                        close_outcome = outcome;
+                        should_exit = true;
+                    }
                     PluginTuiAction::OpenSurface { .. } | PluginTuiAction::RunCommand { .. } => {
                         needs_redraw = true;
                     }
@@ -67,7 +71,7 @@ pub async fn run_plugin_surface<W: Write>(
         }
     }
 
-    Ok(())
+    Ok(close_outcome)
 }
 
 fn handle_host_event<W: Write>(terminal: &mut Terminal<&mut W>, event: &Event) -> bool {
