@@ -4,10 +4,26 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use bcode_code_review_models::{ReviewSourceKind, ReviewTarget, ReviewWorkspace};
+use bcode_code_review_plugin::code_review_home::ReviewHomeOutcome;
 use bcode_session_models::SessionId;
 use bmux_tui::terminal::Terminal;
 
 use crate::TuiError;
+
+/// Run the code review plugin home/picker surface.
+///
+/// # Errors
+///
+/// Returns an error when review workspaces cannot be loaded or terminal I/O fails.
+#[allow(clippy::future_not_send)]
+pub async fn run_home<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    repo_path: PathBuf,
+) -> Result<ReviewHomeOutcome, TuiError> {
+    bcode_code_review_plugin::code_review_home::run(terminal, repo_path)
+        .await
+        .map_err(plugin_tui_error_to_host)
+}
 
 /// Run a full-screen local Git review from a durable workspace.
 ///
@@ -88,6 +104,20 @@ async fn run_with_workspace<W: Write>(
         .and_then(|outcome| outcome.get("open_session").cloned())
         .and_then(|value| serde_json::from_value(value).ok());
     Ok(session_to_open)
+}
+
+fn plugin_tui_error_to_host(error: bcode_code_review_plugin::tui_host_types::TuiError) -> TuiError {
+    match error {
+        bcode_code_review_plugin::tui_host_types::TuiError::Client(error) => {
+            TuiError::Client(error)
+        }
+        bcode_code_review_plugin::tui_host_types::TuiError::Io(error) => TuiError::Io(error),
+        bcode_code_review_plugin::tui_host_types::TuiError::Join(error) => TuiError::Join(error),
+        bcode_code_review_plugin::tui_host_types::TuiError::Json(error) => TuiError::Json(error),
+        bcode_code_review_plugin::tui_host_types::TuiError::PluginService { code, message } => {
+            TuiError::PluginService { code, message }
+        }
+    }
 }
 
 fn target_from_workspace(workspace: &ReviewWorkspace) -> ReviewTarget {

@@ -8,7 +8,6 @@ pub(crate) mod activity;
 pub(crate) mod app;
 pub(crate) mod chat_loop;
 pub(crate) mod clipboard_image;
-pub mod code_review_home;
 pub mod code_review_launcher;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
@@ -174,18 +173,18 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
             })?,
             helpers::terminal_area()?,
         );
-        code_review_home::run(&mut terminal, repo_path).await
+        code_review_launcher::run_home(&mut terminal, repo_path).await
     };
 
     match result {
-        Ok(code_review_home::ReviewHomeOutcome::OpenWorkspace {
+        Ok(bcode_code_review_plugin::code_review_home::ReviewHomeOutcome::OpenWorkspace {
             workspace,
             build_mode,
         }) => {
             let _writer = guard.leave()?;
             run_code_review_workspace(workspace, build_mode).await
         }
-        Ok(code_review_home::ReviewHomeOutcome::Exit) => {
+        Ok(bcode_code_review_plugin::code_review_home::ReviewHomeOutcome::Exit) => {
             let _writer = guard.leave()?;
             Ok(())
         }
