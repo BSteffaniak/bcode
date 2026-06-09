@@ -34,4 +34,12 @@ impl SessionStoreExecutor {
         let store = self.store.clone();
         spawn_blocking(move || store.load_catalog()).await?
     }
+
+    pub(crate) async fn write_session_manifest(
+        &self,
+        summary: bcode_session_models::SessionSummary,
+    ) -> Result<(), SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.write_session_manifest(&summary)).await?
+    }
 }

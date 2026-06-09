@@ -108,10 +108,16 @@ impl MaterializedProjection {
     }
 }
 
-/// Return Bcode's global catalog database path under `root`.
+/// Return Bcode's legacy global catalog database path under `root`.
 #[must_use]
 pub fn global_catalog_db_path(root: &Path) -> std::path::PathBuf {
     root.join("catalog.db")
+}
+
+/// Return a build/compatibility-scoped catalog database path under `root`.
+#[must_use]
+pub fn namespaced_catalog_db_path(root: &Path, namespace: &str) -> std::path::PathBuf {
+    root.join("catalogs").join(namespace).join("catalog.db")
 }
 
 /// Return Bcode's default per-session database path for `session_id`.
@@ -224,6 +230,19 @@ impl GlobalSessionDb {
         Self::open_turso(&path).await
     }
 
+    /// Open a build/compatibility-scoped session catalog database under `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog DB cannot be opened or migrated.
+    pub async fn open_turso_in_root_namespace(
+        root: &Path,
+        namespace: &str,
+    ) -> SessionDbResult<Self> {
+        let path = namespaced_catalog_db_path(root, namespace);
+        Self::open_turso(&path).await
+    }
+
     /// Open the global session catalog database at `path` and apply cheap schema migrations.
     ///
     /// # Errors
@@ -234,6 +253,7 @@ impl GlobalSessionDb {
     /// * schema migrations fail
     pub async fn open_turso(path: &Path) -> SessionDbResult<Self> {
         let root = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(root)?;
         let catalog_lock = crate::lease::acquire_catalog_lock(root)?;
         let db = init_turso_local_with_retry(path).await?;
         run_global_migrations(&*db).await?;

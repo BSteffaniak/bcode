@@ -9091,7 +9091,30 @@ fn default_session_store_dir() -> PathBuf {
 }
 
 fn default_provider_state_path() -> PathBuf {
-    bcode_config::default_state_dir().join("provider-state.json")
+    bcode_config::default_state_dir()
+        .join("provider-state")
+        .join(format!(
+            "{}.json",
+            safe_state_namespace(bcode_ipc::BUILD_FINGERPRINT)
+        ))
+}
+
+fn safe_state_namespace(value: &str) -> String {
+    let namespace = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if namespace.is_empty() {
+        "unknown".to_string()
+    } else {
+        namespace
+    }
 }
 
 fn default_trace_store_dir() -> PathBuf {

@@ -577,7 +577,28 @@ impl SessionActor {
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         if let Some(store) = &self.store {
-            match crate::db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await {
+            if let Err(error) = store.write_session_manifest(self.state.summary()).await {
+                store
+                    .metrics()
+                    .increment_counter("session.manifest.write_error_total");
+                eprintln!("failed to write session manifest: {error}");
+            }
+            let catalog = match store
+                .lease_owner()
+                .build_fingerprint
+                .as_deref()
+                .map(crate::safe_catalog_namespace)
+            {
+                Some(namespace) => {
+                    crate::db::GlobalSessionDb::open_turso_in_root_namespace(
+                        &store.root_path(),
+                        &namespace,
+                    )
+                    .await
+                }
+                None => crate::db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await,
+            };
+            match catalog {
                 Ok(catalog) => {
                     if let Err(error) = catalog
                         .upsert_session(

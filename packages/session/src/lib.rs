@@ -25,6 +25,7 @@ use bcode_session_models::{
     SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -91,6 +92,14 @@ pub struct SessionStore {
     lease_owner: SessionLeaseOwnerContext,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionManifest {
+    schema_version: u32,
+    summary: SessionSummary,
+}
+
+const SESSION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
 impl SessionStore {
     /// Create an event store rooted at the provided directory.
     #[must_use]
@@ -118,16 +127,21 @@ impl SessionStore {
             return Ok(sessions);
         }
 
-        if db::global_catalog_db_path(&self.root).exists() {
+        for summary in self.load_session_manifests()? {
+            sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
+        }
+
+        if self.catalog_db_path().exists() {
             match self.load_global_catalog_summaries() {
                 Ok(summaries) => {
                     for summary in summaries {
-                        sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
+                        sessions
+                            .entry(summary.id)
+                            .or_insert_with(|| SessionState::from_catalog_summary(summary));
                     }
-                    return Ok(sessions);
                 }
                 Err(error) => {
-                    eprintln!("failed to load global session catalog DB: {error}");
+                    eprintln!("failed to load scoped session catalog DB: {error}");
                 }
             }
         }
@@ -140,6 +154,9 @@ impl SessionStore {
                     .and_then(|name| name.to_str())
                     .and_then(|name| name.parse::<SessionId>().ok())
             {
+                if sessions.contains_key(&session_id) {
+                    continue;
+                }
                 match self.load_db_session_state(session_id) {
                     Ok(Some(state)) => {
                         sessions.insert(session_id, state);
@@ -155,17 +172,112 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    fn load_session_manifests(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let mut summaries = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(session_id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<SessionId>().ok())
+            else {
+                continue;
+            };
+            match self.load_session_manifest(session_id) {
+                Ok(Some(summary)) => summaries.push(summary),
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("skipping unreadable session manifest {session_id}: {error}");
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn load_session_manifest(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionSummary>, SessionStoreError> {
+        let path = self.session_manifest_path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read(&path)?;
+        let manifest: SessionManifest = serde_json::from_slice(&contents)
+            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        if manifest.schema_version != SESSION_MANIFEST_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        if manifest.summary.id != session_id {
+            return Err(SessionStoreError::CatalogLoad(format!(
+                "session manifest id mismatch: expected {session_id}, found {}",
+                manifest.summary.id
+            )));
+        }
+        Ok(Some(manifest.summary))
+    }
+
+    pub(crate) fn write_session_manifest(
+        &self,
+        summary: &SessionSummary,
+    ) -> Result<(), SessionStoreError> {
+        let path = self.session_manifest_path(summary.id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut summary = summary.clone();
+        summary.client_count = 0;
+        let manifest = SessionManifest {
+            schema_version: SESSION_MANIFEST_SCHEMA_VERSION,
+            summary,
+        };
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(
+            &temp_path,
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?,
+        )?;
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    }
+
+    fn session_manifest_path(&self, session_id: SessionId) -> PathBuf {
+        self.root.join(session_id.to_string()).join("manifest.json")
+    }
+
+    fn catalog_namespace(&self) -> Option<String> {
+        self.lease_owner
+            .build_fingerprint
+            .as_deref()
+            .map(safe_catalog_namespace)
+    }
+
+    fn catalog_db_path(&self) -> PathBuf {
+        self.catalog_namespace().map_or_else(
+            || db::global_catalog_db_path(&self.root),
+            |namespace| db::namespaced_catalog_db_path(&self.root, &namespace),
+        )
+    }
+
     fn load_global_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
         let root = self.root.clone();
+        let namespace = self.catalog_namespace();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
             runtime.block_on(async move {
-                let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let catalog = match namespace.as_deref() {
+                    Some(namespace) => {
+                        db::GlobalSessionDb::open_turso_in_root_namespace(&root, namespace).await
+                    }
+                    None => db::GlobalSessionDb::open_turso_in_root(&root).await,
+                }
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
                 catalog
                     .list_sessions()
                     .await
@@ -1011,8 +1123,26 @@ impl SessionManager {
             inner.leases.remove(&session_id)
         };
         if let Some(store) = &self.store {
-            let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
-            catalog.delete_session(session_id).await?;
+            let catalog = match store
+                .lease_owner()
+                .build_fingerprint
+                .as_deref()
+                .map(safe_catalog_namespace)
+            {
+                Some(namespace) => {
+                    db::GlobalSessionDb::open_turso_in_root_namespace(
+                        &store.root_path(),
+                        &namespace,
+                    )
+                    .await
+                }
+                None => db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await,
+            };
+            if let Ok(catalog) = catalog
+                && let Err(error) = catalog.delete_session(session_id).await
+            {
+                eprintln!("failed to remove session from scoped catalog: {error}");
+            }
             let session_db_path = db::session_db_path(&store.root_path(), session_id);
             if let Some(session_dir) = session_db_path.parent() {
                 match std::fs::remove_dir_all(session_dir) {
@@ -2218,6 +2348,24 @@ fn current_unix_millis() -> u64 {
         })
 }
 
+fn safe_catalog_namespace(value: &str) -> String {
+    let namespace = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if namespace.is_empty() {
+        "unknown".to_string()
+    } else {
+        namespace
+    }
+}
+
 fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -2270,7 +2418,8 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionManager;
+    use super::{SessionLeaseOwnerContext, SessionManager, db};
+    use bcode_metrics::MetricsRegistry;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
@@ -3358,6 +3507,74 @@ mod tests {
         let sessions = restored.list_sessions(&test_working_directory()).await;
         assert_eq!(sessions[0].name.as_deref(), Some("New title"));
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn persistent_sessions_write_manifest_and_scoped_catalog() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                build_fingerprint: Some("test-build".to_string()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("manager should initialize");
+        let session = manager
+            .create_session(Some("manifested".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+
+        assert!(
+            root.join(session.id.to_string())
+                .join("manifest.json")
+                .exists()
+        );
+        assert!(
+            db::namespaced_catalog_db_path(&root, "test-build").exists(),
+            "catalog should be build-scoped"
+        );
+        assert!(
+            !db::global_catalog_db_path(&root).exists(),
+            "build-scoped managers should not create the legacy shared catalog"
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn catalog_load_uses_manifest_without_opening_session_db() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("manifest catalog".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        drop(manager);
+        let session_db = db::session_db_path(&root, session.id);
+        let hidden_db = session_db.with_extension("db.hidden");
+        std::fs::rename(&session_db, &hidden_db).expect("hide session db");
+
+        let restored = SessionManager::persistent_lazy(&root);
+        restored.start_catalog_load();
+        let mut status = restored.subscribe_catalog_status();
+        loop {
+            if matches!(*status.borrow(), super::CatalogLoadStatus::Loaded) {
+                break;
+            }
+            status.changed().await.expect("status should change");
+        }
+        let sessions = restored.cached_sessions(&test_working_directory()).await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.id);
+        assert_eq!(sessions[0].name.as_deref(), Some("manifest catalog"));
+
+        std::fs::rename(hidden_db, session_db).expect("restore session db");
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
