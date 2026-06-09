@@ -1,19 +1,42 @@
 //! Native code review TUI surface contribution.
 
+use crate::code_review_home::ReviewHomeSurface;
 use crate::code_review_tui::CodeReviewSurface;
 use bcode_plugin_sdk::tui::{
     PluginTuiRegistry, PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
 };
 
-/// Code review native TUI surface kind.
+/// Code review native detail TUI surface kind.
 pub const CODE_REVIEW_SURFACE_KIND: &str = "code-review";
+/// Code review home/picker native TUI surface kind.
+pub const CODE_REVIEW_HOME_SURFACE_KIND: &str = "code-review-home";
 
 /// Register native TUI surfaces contributed by the code review plugin.
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
+    registry.register_factory(Box::new(CodeReviewHomeSurfaceFactory));
     registry.register_factory(Box::new(CodeReviewSurfaceFactory));
     registry
+}
+
+#[derive(Debug, Default)]
+struct CodeReviewHomeSurfaceFactory;
+
+impl PluginTuiSurfaceFactory for CodeReviewHomeSurfaceFactory {
+    fn surface_kind(&self) -> &'static str {
+        CODE_REVIEW_HOME_SURFACE_KIND
+    }
+
+    fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
+        Box::pin(async move {
+            let repo_path = request
+                .repo_path
+                .ok_or("code review home surface requires repo_path")?;
+            let surface = ReviewHomeSurface::load(repo_path).await?;
+            Ok(Box::new(surface) as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
+        })
+    }
 }
 
 #[derive(Debug, Default)]

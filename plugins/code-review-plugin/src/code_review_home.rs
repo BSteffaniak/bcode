@@ -13,6 +13,7 @@ use bcode_code_review_models::{
     ReviewSourceKind, ReviewWorkspace, ReviewWorkspaceListItem, UpdateReviewWorkspaceRequest,
     UpdateReviewWorkspaceResponse,
 };
+use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
@@ -25,7 +26,7 @@ use crate::terminal_events::TuiInput;
 use crate::tui_host_types::{TuiError, helpers};
 
 /// Review home outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReviewHomeOutcome {
     /// Open an existing or newly created review target.
     OpenWorkspace {
@@ -426,6 +427,69 @@ enum ReviewHomeKeyOutcome {
     SubmitRename,
     SubmitNewReview,
     Ignored,
+}
+
+pub struct ReviewHomeSurface {
+    client: BcodeClient,
+    app: ReviewHomeApp,
+}
+
+impl ReviewHomeSurface {
+    /// Load the review home surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when initial workspace loading fails catastrophically.
+    pub async fn load(repo_path: PathBuf) -> Result<Self, TuiError> {
+        let client = BcodeClient::default_endpoint();
+        let app = match load_workspaces(&client, repo_path.clone()).await {
+            Ok(workspaces) => ReviewHomeApp::new(repo_path, workspaces),
+            Err(error) => {
+                let mut app = ReviewHomeApp::new(repo_path, Vec::new());
+                app.status_message = Some(format!("failed to load workspaces: {error}"));
+                app
+            }
+        };
+        Ok(Self { client, app })
+    }
+}
+
+impl PluginTuiSurface for ReviewHomeSurface {
+    fn id(&self) -> &'static str {
+        "code-review-home"
+    }
+
+    fn title(&self) -> &'static str {
+        "Code Review Home"
+    }
+
+    fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
+        render(&self.app, frame);
+    }
+
+    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Event::Key(key) = event {
+            let needs_redraw = tokio::runtime::Handle::current().block_on(handle_key_event(
+                &self.client,
+                &mut self.app,
+                *key,
+            ));
+            if self.app.should_exit {
+                let outcome = self.app.outcome.take().and_then(|outcome| {
+                    serde_json::to_value(outcome)
+                        .ok()
+                        .map(|value| serde_json::json!({ "review_home": value }))
+                });
+                PluginTuiAction::Close { outcome }
+            } else if needs_redraw {
+                PluginTuiAction::Redraw
+            } else {
+                PluginTuiAction::None
+            }
+        } else {
+            PluginTuiAction::None
+        }
+    }
 }
 
 /// Run the review home/picker.

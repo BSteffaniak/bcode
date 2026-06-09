@@ -4,25 +4,56 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use bcode_code_review_models::{ReviewSourceKind, ReviewTarget, ReviewWorkspace};
-use bcode_code_review_plugin::code_review_home::ReviewHomeOutcome;
 use bcode_session_models::SessionId;
 use bmux_tui::terminal::Terminal;
+use serde::Deserialize;
 
 use crate::TuiError;
+
+/// Review home outcome returned by the code review home plugin surface.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub enum ReviewHomeOutcome {
+    /// Open an existing or newly created review target.
+    OpenWorkspace {
+        /// Review workspace to open.
+        workspace: ReviewWorkspace,
+        /// Whether to open directly in build/source-composition mode.
+        build_mode: bool,
+    },
+    /// Exit without opening a review.
+    Exit,
+}
 
 /// Run the code review plugin home/picker surface.
 ///
 /// # Errors
 ///
-/// Returns an error when review workspaces cannot be loaded or terminal I/O fails.
+/// Returns an error when the code review plugin cannot be loaded/opened or terminal I/O fails.
 #[allow(clippy::future_not_send)]
 pub async fn run_home<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
 ) -> Result<ReviewHomeOutcome, TuiError> {
-    bcode_code_review_plugin::code_review_home::run(terminal, repo_path)
-        .await
-        .map_err(plugin_tui_error_to_host)
+    let runtime = load_code_review_tui_runtime()?;
+    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+        &runtime,
+        "bcode.code_review",
+        "code-review-home",
+        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+            instance_id: "code-review-home".to_string(),
+            repo_path: Some(repo_path),
+            target: None,
+            options: serde_json::Value::Null,
+        },
+    )
+    .await
+    .map_err(|error| TuiError::PluginService {
+        code: "tui_surface_open_failed".to_string(),
+        message: error.to_string(),
+    })?;
+    let close_outcome =
+        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
+    Ok(parse_review_home_outcome(close_outcome))
 }
 
 /// Run a full-screen local Git review from a durable workspace.
@@ -74,14 +105,7 @@ async fn run_with_workspace<W: Write>(
         "workspace": workspace,
         "target": target,
     });
-    let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-        &bcode_plugin::PluginSelection::all_enabled(),
-        &crate::static_bundled_plugins(),
-    )
-    .map_err(|error| TuiError::PluginService {
-        code: "plugin_runtime_load_failed".to_string(),
-        message: error.to_string(),
-    })?;
+    let runtime = load_code_review_tui_runtime()?;
     let mut surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
         "bcode.code_review",
@@ -106,18 +130,22 @@ async fn run_with_workspace<W: Write>(
     Ok(session_to_open)
 }
 
-fn plugin_tui_error_to_host(error: bcode_code_review_plugin::tui_host_types::TuiError) -> TuiError {
-    match error {
-        bcode_code_review_plugin::tui_host_types::TuiError::Client(error) => {
-            TuiError::Client(error)
-        }
-        bcode_code_review_plugin::tui_host_types::TuiError::Io(error) => TuiError::Io(error),
-        bcode_code_review_plugin::tui_host_types::TuiError::Join(error) => TuiError::Join(error),
-        bcode_code_review_plugin::tui_host_types::TuiError::Json(error) => TuiError::Json(error),
-        bcode_code_review_plugin::tui_host_types::TuiError::PluginService { code, message } => {
-            TuiError::PluginService { code, message }
-        }
-    }
+fn load_code_review_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {
+    bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        &bcode_plugin::PluginSelection::all_enabled(),
+        &crate::static_bundled_plugins(),
+    )
+    .map_err(|error| TuiError::PluginService {
+        code: "plugin_runtime_load_failed".to_string(),
+        message: error.to_string(),
+    })
+}
+
+fn parse_review_home_outcome(outcome: Option<serde_json::Value>) -> ReviewHomeOutcome {
+    outcome
+        .and_then(|value| value.get("review_home").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(ReviewHomeOutcome::Exit)
 }
 
 fn target_from_workspace(workspace: &ReviewWorkspace) -> ReviewTarget {

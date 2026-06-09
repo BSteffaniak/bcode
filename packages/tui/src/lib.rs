@@ -177,14 +177,14 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
     };
 
     match result {
-        Ok(bcode_code_review_plugin::code_review_home::ReviewHomeOutcome::OpenWorkspace {
+        Ok(code_review_launcher::ReviewHomeOutcome::OpenWorkspace {
             workspace,
             build_mode,
         }) => {
             let _writer = guard.leave()?;
             run_code_review_workspace(workspace, build_mode).await
         }
-        Ok(bcode_code_review_plugin::code_review_home::ReviewHomeOutcome::Exit) => {
+        Ok(code_review_launcher::ReviewHomeOutcome::Exit) => {
             let _writer = guard.leave()?;
             Ok(())
         }

@@ -12,6 +12,11 @@ interface_id = "bcode.code_review/v1"
 name         = "Code Review"
 
 [[tui_surfaces]]
+description = "Full-screen local Git code review home/picker UI"
+kind        = "code-review-home"
+title       = "Code Review Home"
+
+[[tui_surfaces]]
 description = "Full-screen local Git code review UI"
 kind        = "code-review"
 title       = "Code Review"
