@@ -265,10 +265,6 @@ fn should_summarize_thread(thread: &ReviewBundleThread) -> bool {
             .selected_lines
             .iter()
             .any(|line| line.surface_id.is_some() && line.kind == ReviewLineKind::Context)
-        || thread
-            .selected_lines
-            .iter()
-            .all(|line| line.new_line.is_none() && line.old_line.is_none())
 }
 
 fn summary_comment_for_thread(thread: &ReviewBundleThread) -> String {
