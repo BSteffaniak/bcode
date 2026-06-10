@@ -128,6 +128,7 @@ impl ReviewViewDocument {
             {
                 let thread_key = anchor.thread_key();
                 let collapsed = collapsed_threads.contains(&thread_key);
+                let resolved = resolved_threads.contains(&thread_key);
                 rows.push(ReviewViewRow {
                     visual_row: 0,
                     source_row: None,
@@ -139,7 +140,7 @@ impl ReviewViewDocument {
                         anchor: anchor.clone(),
                         comment_count: comments.len(),
                         collapsed,
-                        resolved: resolved_threads.contains(&thread_key),
+                        resolved,
                     },
                 });
                 if collapsed {
@@ -167,7 +168,7 @@ impl ReviewViewDocument {
                         });
                     }
                 }
-                for action in ReviewThreadAction::all() {
+                for action in ReviewThreadAction::all_for_state(resolved) {
                     rows.push(ReviewViewRow {
                         visual_row: 0,
                         source_row: None,
@@ -288,19 +289,25 @@ pub enum ReviewThreadAction {
     Publish,
     /// Resolve or reopen the thread locally.
     Resolve,
+    /// Reopen the thread locally.
+    Reopen,
 }
 
 impl ReviewThreadAction {
     /// Return all inline thread actions in visual order.
     #[must_use]
-    pub const fn all() -> [Self; 6] {
+    pub const fn all_for_state(resolved: bool) -> [Self; 6] {
         [
             Self::Reply,
             Self::Edit,
             Self::Delete,
             Self::AskBcode,
             Self::Publish,
-            Self::Resolve,
+            if resolved {
+                Self::Reopen
+            } else {
+                Self::Resolve
+            },
         ]
     }
 
@@ -314,6 +321,7 @@ impl ReviewThreadAction {
             Self::AskBcode => "ask",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
+            Self::Reopen => "reopen",
         }
     }
 
@@ -326,7 +334,7 @@ impl ReviewThreadAction {
             Self::Delete => "D",
             Self::AskBcode => "a",
             Self::Publish => "x",
-            Self::Resolve => "r",
+            Self::Resolve | Self::Reopen => "r",
         }
     }
 
@@ -339,7 +347,8 @@ impl ReviewThreadAction {
             Self::Delete => "delete",
             Self::AskBcode => "ask Bcode",
             Self::Publish => "publish",
-            Self::Resolve => "resolve/reopen",
+            Self::Resolve => "resolve",
+            Self::Reopen => "reopen",
         }
     }
 
@@ -353,6 +362,7 @@ impl ReviewThreadAction {
             b"ask" => Some(Self::AskBcode),
             b"publish" => Some(Self::Publish),
             b"resolve" => Some(Self::Resolve),
+            b"reopen" => Some(Self::Reopen),
             _ => None,
         }
     }

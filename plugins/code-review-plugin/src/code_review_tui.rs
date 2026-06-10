@@ -6188,7 +6188,8 @@ impl ReviewApp {
             Some(ReviewThreadAction::Delete) => self.delete_latest_draft_at_selection(),
             Some(ReviewThreadAction::AskBcode) => self.ask_bcode_about_selection(),
             Some(ReviewThreadAction::Publish) => self.publish_review(),
-            Some(ReviewThreadAction::Resolve) => self.toggle_selected_thread_resolved(),
+            Some(ReviewThreadAction::Resolve) => self.resolve_selected_thread(),
+            Some(ReviewThreadAction::Reopen) => self.reopen_selected_thread(),
             None => false,
         }
     }
@@ -6200,18 +6201,56 @@ impl ReviewApp {
 
     /// Toggle selected thread resolved state locally.
     pub fn toggle_selected_thread_resolved(&mut self) -> bool {
-        let Some(anchor) = self.selected_comment_anchor() else {
+        let Some(thread_key) = self.selected_thread_key() else {
             self.status_message = Some("select a review thread to resolve".to_string());
             return true;
         };
-        let thread_key = Self::thread_key_for_anchor(&anchor);
-        if self.resolved_review_threads.remove(&thread_key) {
-            self.status_message = Some("reopened review thread".to_string());
+        if self.resolved_review_threads.contains(&thread_key) {
+            self.reopen_thread_key(&thread_key)
         } else {
-            self.resolved_review_threads.insert(thread_key);
-            self.status_message = Some("resolved review thread".to_string());
+            self.resolve_thread_key(&thread_key)
         }
+    }
+
+    /// Resolve selected thread locally.
+    pub fn resolve_selected_thread(&mut self) -> bool {
+        let Some(thread_key) = self.selected_thread_key() else {
+            self.status_message = Some("select a review thread to resolve".to_string());
+            return true;
+        };
+        self.resolve_thread_key(&thread_key)
+    }
+
+    /// Reopen selected thread locally.
+    pub fn reopen_selected_thread(&mut self) -> bool {
+        let Some(thread_key) = self.selected_thread_key() else {
+            self.status_message = Some("select a review thread to reopen".to_string());
+            return true;
+        };
+        self.reopen_thread_key(&thread_key)
+    }
+
+    fn resolve_thread_key(&mut self, thread_key: &str) -> bool {
+        self.resolved_review_threads.insert(thread_key.to_string());
+        self.status_message = Some("resolved review thread".to_string());
         true
+    }
+
+    fn reopen_thread_key(&mut self, thread_key: &str) -> bool {
+        self.resolved_review_threads.remove(thread_key);
+        self.status_message = Some("reopened review thread".to_string());
+        true
+    }
+
+    fn selected_thread_key(&self) -> Option<String> {
+        match self.selected_view_target.as_ref()? {
+            ReviewViewTarget::Thread { thread_key }
+            | ReviewViewTarget::Comment { thread_key, .. }
+            | ReviewViewTarget::ThreadAction { thread_key, .. } => Some(thread_key.clone()),
+            ReviewViewTarget::HunkHeader { .. } | ReviewViewTarget::SourceLine { .. } => self
+                .selected_comment_anchor()
+                .map(|anchor| Self::thread_key_for_anchor(&anchor)),
+        }
     }
 
     /// Return a prompt for a pending Bcode agent session.
