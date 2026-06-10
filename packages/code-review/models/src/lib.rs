@@ -649,6 +649,31 @@ pub struct LinkThreadSessionResponse {
     pub thread_id: String,
 }
 
+/// Request payload for `thread.resolve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveThreadRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped threads.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+    /// Thread anchor.
+    pub anchor: DraftAnchor,
+    /// Whether the thread should be resolved.
+    pub resolved: bool,
+}
+
+/// Response payload for `thread.resolve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveThreadResponse {
+    /// Updated thread id.
+    pub thread_id: String,
+    /// Resolution timestamp in milliseconds since Unix epoch, when resolved.
+    pub resolved_at_ms: Option<u64>,
+}
+
 /// Request payload for review context operations scoped to a target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewContextRequest {
@@ -720,6 +745,9 @@ pub struct DraftComment {
     /// Linked Bcode session id, when present.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Resolution timestamp in milliseconds since Unix epoch, when resolved.
+    #[serde(default)]
+    pub resolved_at_ms: Option<u64>,
 }
 
 /// File status in a review.

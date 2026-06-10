@@ -43,6 +43,7 @@ const SAVE_DRAFT_OPERATION: &str = "draft.save";
 const DELETE_DRAFT_OPERATION: &str = "draft.delete";
 const UPDATE_DRAFT_OPERATION: &str = "draft.update";
 const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
+const THREAD_RESOLVE_OPERATION: &str = "thread.resolve";
 const PUBLISH_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISH_SUBMIT;
 const PUBLISHERS_LIST_OPERATION: &str = OP_REVIEW_PUBLISHERS_LIST;
 const PUBLISH_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISH_PREVIEW;
@@ -218,6 +219,24 @@ impl CodeReviewSurface {
                     self.app.restore_updated_draft(update);
                     self.app.status_message =
                         Some(format!("update failed; restored local draft: {error}"));
+                }
+            }
+            needs_redraw = true;
+        }
+        if let Some(resolve) = self.app.take_pending_thread_resolve() {
+            match resolve_thread(&self.client, self.repo_path.clone(), resolve.clone()).await {
+                Ok(()) => {
+                    self.app.status_message = Some(if resolve.resolved {
+                        "resolved review thread".to_string()
+                    } else {
+                        "reopened review thread".to_string()
+                    });
+                }
+                Err(error) => {
+                    self.app.restore_thread_resolution(&resolve);
+                    self.app.status_message = Some(format!(
+                        "thread resolution failed; restored local state: {error}"
+                    ));
                 }
             }
             needs_redraw = true;
@@ -1293,6 +1312,38 @@ async fn link_thread_session(
     Ok(())
 }
 
+async fn resolve_thread(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    resolve: PendingThreadResolve,
+) -> Result<(), TuiError> {
+    let request = ResolveThreadRequest {
+        repo_path,
+        target: resolve.target,
+        scope: resolve.scope,
+        anchor: resolve.anchor.into(),
+        resolved: resolve.resolved,
+    };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            THREAD_RESOLVE_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ResolveThreadResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    let _ = (response.thread_id, response.resolved_at_ms);
+    Ok(())
+}
+
 fn handle_publish_event(app: &mut ReviewApp, event: &Event) -> bool {
     match event {
         Event::Key(stroke) => handle_publish_key(app, *stroke),
@@ -1876,6 +1927,22 @@ struct LinkThreadSessionResponse {
     thread_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ResolveThreadRequest {
+    repo_path: PathBuf,
+    target: ModelReviewTarget,
+    #[serde(default)]
+    scope: Option<ModelReviewScope>,
+    anchor: DraftAnchor,
+    resolved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ResolveThreadResponse {
+    thread_id: String,
+    resolved_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DraftAnchor {
     file_path: String,
@@ -1909,6 +1976,8 @@ struct DraftComment {
     updated_at_ms: u64,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    resolved_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -2517,6 +2586,19 @@ pub struct PendingDraftUpdate {
     pub new_body: String,
 }
 
+/// Pending thread resolution persistence request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingThreadResolve {
+    /// Review target for persistence scope.
+    pub target: ModelReviewTarget,
+    /// Review scope for persistence.
+    pub scope: Option<ModelReviewScope>,
+    /// Thread anchor.
+    pub anchor: ReviewCommentAnchor,
+    /// Whether the thread should be resolved.
+    pub resolved: bool,
+}
+
 /// Pending Bcode agent session request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAgentSession {
@@ -2898,6 +2980,8 @@ pub struct ReviewApp {
     pub pending_draft_delete: Option<PendingDraftDelete>,
     /// Draft comment awaiting update.
     pub pending_draft_update: Option<PendingDraftUpdate>,
+    /// Thread resolution awaiting persistence.
+    pub pending_thread_resolve: Option<PendingThreadResolve>,
     /// Pending publish request.
     pub pending_publish_request: Option<PendingPublishRequest>,
     /// Available publishers.
@@ -2974,6 +3058,7 @@ impl ReviewApp {
             pending_draft_save: None,
             pending_draft_delete: None,
             pending_draft_update: None,
+            pending_thread_resolve: None,
             pending_publish_request: None,
             publishers: Vec::new(),
             file_cache: ReviewFileCache::default(),
@@ -5752,6 +5837,11 @@ impl ReviewApp {
         self.pending_draft_update.take()
     }
 
+    /// Take the pending thread resolution request, if present.
+    pub const fn take_pending_thread_resolve(&mut self) -> Option<PendingThreadResolve> {
+        self.pending_thread_resolve.take()
+    }
+
     /// Take the pending Bcode agent session request, if present.
     pub const fn take_pending_agent_session(&mut self) -> Option<PendingAgentSession> {
         self.pending_agent_session.take()
@@ -6260,15 +6350,42 @@ impl ReviewApp {
     }
 
     fn resolve_thread_key(&mut self, thread_key: &str) -> bool {
+        let Some(anchor) = self.anchor_for_thread_key(thread_key) else {
+            self.status_message = Some("select a review thread to resolve".to_string());
+            return true;
+        };
         self.resolved_review_threads.insert(thread_key.to_string());
+        self.pending_thread_resolve = Some(PendingThreadResolve {
+            target: review_scope_for_workspace(&self.workspace).target().clone(),
+            scope: Some(review_scope_for_workspace(&self.workspace)),
+            anchor,
+            resolved: true,
+        });
         self.status_message = Some("resolved review thread".to_string());
         true
     }
 
     fn reopen_thread_key(&mut self, thread_key: &str) -> bool {
+        let Some(anchor) = self.anchor_for_thread_key(thread_key) else {
+            self.status_message = Some("select a review thread to reopen".to_string());
+            return true;
+        };
         self.resolved_review_threads.remove(thread_key);
+        self.pending_thread_resolve = Some(PendingThreadResolve {
+            target: review_scope_for_workspace(&self.workspace).target().clone(),
+            scope: Some(review_scope_for_workspace(&self.workspace)),
+            anchor,
+            resolved: false,
+        });
         self.status_message = Some("reopened review thread".to_string());
         true
+    }
+
+    fn anchor_for_thread_key(&self, thread_key: &str) -> Option<ReviewCommentAnchor> {
+        self.draft_comments
+            .keys()
+            .find(|anchor| Self::thread_key_for_anchor(anchor) == thread_key)
+            .cloned()
     }
 
     fn selected_thread_key(&self) -> Option<String> {
@@ -6407,6 +6524,16 @@ impl ReviewApp {
         true
     }
 
+    /// Restore local thread resolution state after failed persistence.
+    pub fn restore_thread_resolution(&mut self, resolve: &PendingThreadResolve) {
+        let thread_key = Self::thread_key_for_anchor(&resolve.anchor);
+        if resolve.resolved {
+            self.resolved_review_threads.remove(&thread_key);
+        } else {
+            self.resolved_review_threads.insert(thread_key);
+        }
+    }
+
     /// Return a footer preview for the selected thread.
     #[must_use]
     pub fn selected_thread_preview(&self) -> Option<String> {
@@ -6459,7 +6586,7 @@ impl ReviewApp {
         for draft in drafts {
             if let Some(anchor) = self.anchor_from_persisted_draft(&draft) {
                 self.draft_comments
-                    .entry(anchor)
+                    .entry(anchor.clone())
                     .or_default()
                     .push(ReviewDraftComment {
                         id: Some(draft.comment_id),
@@ -6469,6 +6596,10 @@ impl ReviewApp {
                         updated_at_ms: Some(draft.updated_at_ms),
                         session_id: draft.session_id,
                     });
+                if draft.resolved_at_ms.is_some() {
+                    self.resolved_review_threads
+                        .insert(Self::thread_key_for_anchor(&anchor));
+                }
             }
         }
     }
@@ -7452,6 +7583,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             session_id: None,
+            resolved_at_ms: None,
         }]);
 
         assert!(app.open_latest_draft_editor());
@@ -7498,6 +7630,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             session_id: None,
+            resolved_at_ms: None,
         }]);
 
         assert_eq!(app.draft_comment_count(), 1);

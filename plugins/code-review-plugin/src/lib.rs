@@ -25,14 +25,14 @@ use bcode_code_review_models::{
     OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST,
     OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse,
     PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
-    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
-    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
-    ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
-    ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization,
-    SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest, UpdateDraftResponse,
-    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ResolveThreadRequest, ResolveThreadResponse, ReviewBundle, ReviewBundleLine,
+    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
+    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord, ReviewPublisherCapabilities,
+    ReviewPublisherManifest, ReviewRepositoryCommit, ReviewScope, ReviewSource,
+    ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface,
+    ReviewSurfaceKind, ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem,
+    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest,
+    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,8 @@ pub const OP_DRAFT_DELETE: &str = "draft.delete";
 pub const OP_DRAFT_UPDATE: &str = "draft.update";
 /// Operation that links a review thread to a Bcode session.
 pub const OP_THREAD_LINK_SESSION: &str = "thread.link_session";
+/// Operation that resolves or reopens a review thread.
+pub const OP_THREAD_RESOLVE: &str = "thread.resolve";
 /// Operation that returns review context metadata.
 pub const OP_REVIEW_CONTEXT_GET: &str = "review.context.get";
 /// Operation that lists review comments.
@@ -138,6 +140,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_DRAFT_DELETE => delete_draft(&context),
             OP_DRAFT_UPDATE => update_draft(&context),
             OP_THREAD_LINK_SESSION => link_thread_session(&context),
+            OP_THREAD_RESOLVE => resolve_thread(&context),
             OP_REVIEW_CONTEXT_GET => review_context_get(&context),
             OP_REVIEW_COMMENTS_LIST => review_comments_list(&context),
             OP_REVIEW_THREAD_GET => review_thread_get(&context),
@@ -484,6 +487,22 @@ fn link_thread_session(context: &NativeServiceContext) -> ServiceResponse {
     match link_thread_session_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("thread_link_session_failed", error.to_string()),
+    }
+}
+
+fn resolve_thread(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ResolveThreadRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+
+    match resolve_thread_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("thread_resolve_failed", error.to_string()),
     }
 }
 
@@ -1633,6 +1652,32 @@ fn link_thread_session_for_request(
     Ok(response)
 }
 
+fn resolve_thread_for_request(
+    request: ResolveThreadRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ResolveThreadResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let db_repo_root = repo_root.clone();
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let target_kind = target_kind(&request.target).to_string();
+    let target_json = serde_json::to_string(&request.target)?;
+    let response = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .resolve_thread(
+                    &review_key,
+                    &db_repo_root,
+                    &target_kind,
+                    &target_json,
+                    &request.anchor,
+                    request.resolved,
+                )
+                .await
+        })
+    })?;
+    Ok(response)
+}
+
 fn threads_from_drafts(drafts: Vec<DraftComment>) -> Vec<ReviewThread> {
     let mut threads: BTreeMap<String, ReviewThread> = BTreeMap::new();
     for draft in drafts {
@@ -2145,6 +2190,7 @@ impl<'a> CodeReviewDb<'a> {
                 "old_line",
                 "new_line",
                 "line_kind",
+                "resolved_at_ms",
                 "is_file_anchor",
                 "surface_id",
                 "source_id",
@@ -2156,6 +2202,7 @@ impl<'a> CodeReviewDb<'a> {
         for thread in thread_rows {
             let thread_id = required_text(&thread, "thread_id")?;
             let session_id = optional_text(&thread, "session_id");
+            let resolved_at_ms = optional_i64(&thread, "resolved_at_ms").map(i64_to_u64);
             let anchor = DraftAnchor {
                 file_path: required_text(&thread, "file_path")?,
                 diff_row: i64_to_u64(required_i64(&thread, "diff_row")?),
@@ -2182,7 +2229,15 @@ impl<'a> CodeReviewDb<'a> {
             drafts.extend(
                 comment_rows
                     .into_iter()
-                    .map(|row| comment_from_row(&row, &thread_id, &anchor, session_id.clone()))
+                    .map(|row| {
+                        comment_from_row(
+                            &row,
+                            &thread_id,
+                            &anchor,
+                            session_id.clone(),
+                            resolved_at_ms,
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -2247,6 +2302,7 @@ impl<'a> CodeReviewDb<'a> {
             created_at_ms: now,
             updated_at_ms: now,
             session_id: None,
+            resolved_at_ms: None,
         })
     }
 
@@ -2342,6 +2398,35 @@ impl<'a> CodeReviewDb<'a> {
         })
     }
 
+    async fn resolve_thread(
+        &self,
+        review_key: &str,
+        repo_root: &Path,
+        target_kind: &str,
+        target_json: &str,
+        anchor: &DraftAnchor,
+        resolved: bool,
+    ) -> Result<ResolveThreadResponse, ReviewError> {
+        let now = now_ms();
+        let thread_id = thread_id(review_key, anchor)?;
+        self.ensure_review(review_key, repo_root, target_kind, target_json, now)
+            .await?;
+        self.ensure_thread(review_key, &thread_id, anchor, now)
+            .await?;
+        let resolved_at_ms = resolved.then_some(now);
+        self.db
+            .update("draft_threads")
+            .value("resolved_at_ms", resolved_at_ms.map(u64_to_i64))
+            .value("updated_at_ms", u64_to_i64(now))
+            .filter(Box::new(where_eq("thread_id", thread_id.clone())))
+            .execute(self.db)
+            .await?;
+        Ok(ResolveThreadResponse {
+            thread_id,
+            resolved_at_ms,
+        })
+    }
+
     async fn ensure_review(
         &self,
         review_key: &str,
@@ -2422,6 +2507,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("is_file_anchor", anchor.is_file_anchor)
             .value("surface_id", anchor.surface_id.clone())
             .value("source_id", anchor.source_id.clone())
+            .value("resolved_at_ms", Option::<i64>::None)
             .value("created_at_ms", u64_to_i64(now))
             .value("updated_at_ms", u64_to_i64(now))
             .execute(self.db)
@@ -2581,6 +2667,19 @@ async fn reconcile_legacy_code_review_migrations(
     Ok(())
 }
 
+fn thread_resolved_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "008_thread_resolved_column".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "resolved_at_ms".to_string(),
+            DataType::BigInt,
+            true,
+            None,
+        )),
+        None,
+    )
+}
+
 fn workspace_table_migration() -> CodeMigration<'static> {
     CodeMigration::new(
         "006_review_workspaces_table".to_string(),
@@ -2703,6 +2802,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
         None,
     ));
     source.add_migration(thread_surface_anchor_columns_migration());
+    source.add_migration(thread_resolved_column_migration());
     source.add_migration(workspace_table_migration());
     source.add_migration(publish_records_table_migration());
     source
@@ -2791,6 +2891,7 @@ fn comment_from_row(
     thread_id: &str,
     anchor: &DraftAnchor,
     session_id: Option<String>,
+    resolved_at_ms: Option<u64>,
 ) -> Result<DraftComment, ReviewError> {
     Ok(DraftComment {
         comment_id: required_text(row, "comment_id")?,
@@ -2800,6 +2901,7 @@ fn comment_from_row(
         created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
         updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
         session_id,
+        resolved_at_ms,
     })
 }
 
