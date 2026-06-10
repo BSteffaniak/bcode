@@ -35,6 +35,9 @@ pub async fn run_plugin_surface<W: Write>(
         if surface.poll(&host).requests_redraw() {
             needs_redraw = true;
         }
+        if surface.drain_effects(&host).await.requests_redraw() {
+            needs_redraw = true;
+        }
         if needs_redraw {
             terminal.draw(|frame| {
                 let area = frame.area();

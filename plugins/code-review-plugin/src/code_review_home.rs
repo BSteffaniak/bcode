@@ -21,6 +21,7 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::terminal::Terminal;
+use tokio::sync::mpsc;
 
 use crate::terminal_events::TuiInput;
 use crate::tui_host_types::{TuiError, helpers};
@@ -432,6 +433,55 @@ enum ReviewHomeKeyOutcome {
 pub struct ReviewHomeSurface {
     client: BcodeClient,
     app: ReviewHomeApp,
+    pending_action: Option<ReviewHomeAsyncAction>,
+    action_sender: mpsc::UnboundedSender<ReviewHomeAsyncResult>,
+    action_receiver: mpsc::UnboundedReceiver<ReviewHomeAsyncResult>,
+}
+
+#[derive(Debug, Clone)]
+enum ReviewHomeAsyncAction {
+    ArchiveSelectedWorkspace {
+        workspace_index: usize,
+        workspace_id: String,
+    },
+    CreatePreset {
+        title: String,
+        source_kinds: Vec<ReviewSourceKind>,
+    },
+    ToggleArchived {
+        include_archived: bool,
+    },
+    RestoreSelectedWorkspace {
+        workspace: ReviewWorkspace,
+    },
+    SubmitNewReview {
+        title: String,
+    },
+    SubmitRename {
+        workspace: ReviewWorkspace,
+    },
+}
+
+#[derive(Debug)]
+enum ReviewHomeAsyncResult {
+    ArchiveSelectedWorkspace(Result<ArchiveSelectedWorkspaceResult, TuiError>),
+    CreatePreset(Result<ReviewWorkspace, TuiError>),
+    ToggleArchived(Result<ToggleArchivedResult, TuiError>),
+    RestoreSelectedWorkspace(Result<ReviewWorkspace, TuiError>),
+    SubmitNewReview(Result<ReviewWorkspace, TuiError>),
+    SubmitRename(Result<ReviewWorkspace, TuiError>),
+}
+
+#[derive(Debug)]
+struct ArchiveSelectedWorkspaceResult {
+    workspace_index: usize,
+    archived: bool,
+}
+
+#[derive(Debug)]
+struct ToggleArchivedResult {
+    include_archived: bool,
+    workspaces: Vec<ReviewWorkspaceListItem>,
 }
 
 impl ReviewHomeSurface {
@@ -450,8 +500,186 @@ impl ReviewHomeSurface {
                 app
             }
         };
-        Ok(Self { client, app })
+        let (action_sender, action_receiver) = mpsc::unbounded_channel();
+        Ok(Self {
+            client,
+            app,
+            pending_action: None,
+            action_sender,
+            action_receiver,
+        })
     }
+
+    fn action_after_state_update(&mut self, needs_redraw: bool) -> PluginTuiAction {
+        if self.app.should_exit {
+            let outcome = self.app.outcome.take().and_then(|outcome| {
+                serde_json::to_value(outcome)
+                    .ok()
+                    .map(|value| serde_json::json!({ "review_home": value }))
+            });
+            PluginTuiAction::Close { outcome }
+        } else if needs_redraw {
+            PluginTuiAction::Redraw
+        } else {
+            PluginTuiAction::None
+        }
+    }
+
+    fn spawn_pending_action(&mut self, host: &dyn PluginTuiHost) {
+        let Some(action) = self.pending_action.take() else {
+            return;
+        };
+        let client = self.client.clone();
+        let repo_path = self.app.repo_path.clone();
+        let sender = self.action_sender.clone();
+        host.spawn(Box::pin(async move {
+            let result = run_home_async_action(&client, repo_path, action).await;
+            let _ = sender.send(result);
+        }));
+    }
+}
+
+async fn run_home_async_action(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    action: ReviewHomeAsyncAction,
+) -> ReviewHomeAsyncResult {
+    match action {
+        ReviewHomeAsyncAction::ArchiveSelectedWorkspace {
+            workspace_index,
+            workspace_id,
+        } => ReviewHomeAsyncResult::ArchiveSelectedWorkspace(
+            archive_workspace_action(client, repo_path, workspace_index, workspace_id).await,
+        ),
+        ReviewHomeAsyncAction::CreatePreset {
+            title,
+            source_kinds,
+        } => ReviewHomeAsyncResult::CreatePreset(
+            create_workspace_with_sources(client, repo_path, title, source_kinds).await,
+        ),
+        ReviewHomeAsyncAction::ToggleArchived { include_archived } => {
+            ReviewHomeAsyncResult::ToggleArchived(
+                load_workspaces_with_archived(client, repo_path, include_archived)
+                    .await
+                    .map(|workspaces| ToggleArchivedResult {
+                        include_archived,
+                        workspaces,
+                    }),
+            )
+        }
+        ReviewHomeAsyncAction::RestoreSelectedWorkspace { workspace } => {
+            ReviewHomeAsyncResult::RestoreSelectedWorkspace(
+                update_workspace_action(client, repo_path, workspace).await,
+            )
+        }
+        ReviewHomeAsyncAction::SubmitNewReview { title } => ReviewHomeAsyncResult::SubmitNewReview(
+            create_workspace_with_sources(client, repo_path, title, Vec::new()).await,
+        ),
+        ReviewHomeAsyncAction::SubmitRename { workspace } => ReviewHomeAsyncResult::SubmitRename(
+            update_workspace_action(client, repo_path, workspace).await,
+        ),
+    }
+}
+
+fn apply_home_async_result(app: &mut ReviewHomeApp, result: ReviewHomeAsyncResult) {
+    match result {
+        ReviewHomeAsyncResult::ArchiveSelectedWorkspace(result) => match result {
+            Ok(result) => apply_archive_selected_workspace_result(app, &result),
+            Err(error) => {
+                app.status_message = Some(format!("failed to archive workspace: {error}"));
+            }
+        },
+        ReviewHomeAsyncResult::CreatePreset(result) => match result {
+            Ok(workspace) => {
+                app.workspace_items.push(ReviewWorkspaceListItem {
+                    workspace: workspace.clone(),
+                    thread_count: 0,
+                    draft_count: 0,
+                    last_publish: None,
+                });
+                sort_workspace_items_recent_first(&mut app.workspace_items);
+                app.open_workspace(workspace, false);
+            }
+            Err(error) => {
+                app.status_message = Some(format!("failed to create workspace: {error}"));
+            }
+        },
+        ReviewHomeAsyncResult::ToggleArchived(result) => match result {
+            Ok(result) => {
+                app.include_archived = result.include_archived;
+                app.workspace_items = result.workspaces;
+                app.clamp_selection();
+                app.status_message = Some(if app.include_archived {
+                    "showing archived reviews".to_string()
+                } else {
+                    "hiding archived reviews".to_string()
+                });
+            }
+            Err(error) => {
+                app.status_message = Some(format!("failed to toggle archived reviews: {error}"));
+            }
+        },
+        ReviewHomeAsyncResult::RestoreSelectedWorkspace(result) => match result {
+            Ok(workspace) => apply_restored_workspace(app, workspace),
+            Err(error) => {
+                app.status_message = Some(format!("failed to restore workspace: {error}"));
+            }
+        },
+        ReviewHomeAsyncResult::SubmitNewReview(result) => match result {
+            Ok(workspace) => {
+                app.open_workspace(workspace, true);
+            }
+            Err(error) => {
+                app.status_message = Some(format!("failed to create workspace: {error}"));
+            }
+        },
+        ReviewHomeAsyncResult::SubmitRename(result) => match result {
+            Ok(workspace) => apply_renamed_workspace(app, workspace),
+            Err(error) => {
+                app.status_message = Some(format!("failed to rename workspace: {error}"));
+            }
+        },
+    }
+}
+
+fn apply_archive_selected_workspace_result(
+    app: &mut ReviewHomeApp,
+    result: &ArchiveSelectedWorkspaceResult,
+) {
+    if !result.archived {
+        app.status_message = Some("workspace was not found".to_string());
+        return;
+    }
+    if result.workspace_index >= app.workspace_items.len() {
+        app.status_message = Some("archived workspace".to_string());
+        return;
+    }
+    let archived = app.workspace_items.remove(result.workspace_index);
+    app.clamp_selection();
+    app.status_message = Some(format!("archived {}", archived.workspace.title));
+}
+
+fn apply_restored_workspace(app: &mut ReviewHomeApp, workspace: ReviewWorkspace) {
+    if let Some(item) = app
+        .workspace_items
+        .iter_mut()
+        .find(|item| item.workspace.id == workspace.id)
+    {
+        item.workspace = workspace;
+    }
+    app.status_message = Some("restored review workspace".to_string());
+}
+
+fn apply_renamed_workspace(app: &mut ReviewHomeApp, workspace: ReviewWorkspace) {
+    let new_title = workspace.title.clone();
+    if let Some(item) = app
+        .workspace_items
+        .iter_mut()
+        .find(|item| item.workspace.id == workspace.id)
+    {
+        item.workspace = workspace;
+    }
+    app.status_message = Some(format!("renamed review to {new_title}"));
 }
 
 impl PluginTuiSurface for ReviewHomeSurface {
@@ -467,28 +695,22 @@ impl PluginTuiSurface for ReviewHomeSurface {
         render(&self.app, frame);
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
-        if let Event::Key(key) = event {
-            let needs_redraw = tokio::runtime::Handle::current().block_on(handle_key_event(
-                &self.client,
-                &mut self.app,
-                *key,
-            ));
-            if self.app.should_exit {
-                let outcome = self.app.outcome.take().and_then(|outcome| {
-                    serde_json::to_value(outcome)
-                        .ok()
-                        .map(|value| serde_json::json!({ "review_home": value }))
-                });
-                PluginTuiAction::Close { outcome }
-            } else if needs_redraw {
-                PluginTuiAction::Redraw
-            } else {
-                PluginTuiAction::None
-            }
-        } else {
-            PluginTuiAction::None
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let Event::Key(key) = event else {
+            return PluginTuiAction::None;
+        };
+        let needs_redraw = handle_plugin_key_event(&mut self.app, *key, &mut self.pending_action);
+        self.spawn_pending_action(host);
+        self.action_after_state_update(needs_redraw)
+    }
+
+    fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let mut needs_redraw = false;
+        while let Ok(result) = self.action_receiver.try_recv() {
+            apply_home_async_result(&mut self.app, result);
+            needs_redraw = true;
         }
+        self.action_after_state_update(needs_redraw)
     }
 }
 
@@ -530,6 +752,234 @@ pub async fn run<W: Write>(
     }
 
     Ok(app.outcome.unwrap_or(ReviewHomeOutcome::Exit))
+}
+
+fn handle_plugin_key_event(
+    app: &mut ReviewHomeApp,
+    stroke: KeyStroke,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    if stroke.modifiers.ctrl
+        || stroke.modifiers.alt
+        || stroke.modifiers.super_key
+        || stroke.modifiers.hyper
+        || stroke.modifiers.meta
+    {
+        return false;
+    }
+    let key = normalized_home_key(stroke);
+    if pending_action.is_some() {
+        app.status_message = Some("review action already in progress".to_string());
+        return true;
+    }
+    if app.new_review_buffer.is_some() {
+        return handle_plugin_new_review_key(app, key, pending_action);
+    }
+    if app.rename_buffer.is_some() {
+        return handle_plugin_rename_key(app, key, pending_action);
+    }
+    if app.search_active {
+        return app.handle_search_key(key);
+    }
+    handle_plugin_normal_key(app, key, pending_action)
+}
+
+fn handle_plugin_new_review_key(
+    app: &mut ReviewHomeApp,
+    key: KeyCode,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    match app.handle_new_review_key(key) {
+        ReviewHomeKeyOutcome::Redraw => true,
+        ReviewHomeKeyOutcome::SubmitNewReview => {
+            let title = app
+                .new_review_buffer
+                .take()
+                .unwrap_or_else(|| "Untitled review".to_string())
+                .trim()
+                .to_string();
+            let title = if title.is_empty() {
+                "Untitled review".to_string()
+            } else {
+                title
+            };
+            *pending_action = Some(ReviewHomeAsyncAction::SubmitNewReview { title });
+            app.status_message = Some("creating review workspace...".to_string());
+            true
+        }
+        ReviewHomeKeyOutcome::SubmitRename | ReviewHomeKeyOutcome::Ignored => false,
+    }
+}
+
+fn handle_plugin_rename_key(
+    app: &mut ReviewHomeApp,
+    key: KeyCode,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    match app.handle_rename_key(key) {
+        ReviewHomeKeyOutcome::Redraw => true,
+        ReviewHomeKeyOutcome::SubmitRename => queue_rename_selected_workspace(app, pending_action),
+        ReviewHomeKeyOutcome::SubmitNewReview | ReviewHomeKeyOutcome::Ignored => false,
+    }
+}
+
+fn handle_plugin_normal_key(
+    app: &mut ReviewHomeApp,
+    key: KeyCode,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    match key {
+        KeyCode::Char('q') | KeyCode::Escape => {
+            app.outcome = Some(ReviewHomeOutcome::Exit);
+            app.should_exit = true;
+            true
+        }
+        KeyCode::Char('/') => app.toggle_search(),
+        KeyCode::Char('r') => app.start_rename(),
+        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char('d') => {
+            app.details_visible = !app.details_visible;
+            true
+        }
+        KeyCode::Char('D') => app.toggle_draft_filter(),
+        KeyCode::Char('?') => {
+            app.help_visible = !app.help_visible;
+            true
+        }
+        KeyCode::Enter => app.open_selected(),
+        KeyCode::Char('c') => app.open_most_recent(),
+        KeyCode::Char('o') => app.open_selected_in_review_mode(),
+        KeyCode::Char('b') => app.open_selected_in_build_mode(),
+        KeyCode::Char('x') => queue_archive_selected_workspace(app, pending_action),
+        KeyCode::Char('n' | 'e') => app.start_new_review(),
+        KeyCode::Char('u' | 's' | 'w' | 'l' | 'v') => {
+            queue_create_preset_for_key(app, key, pending_action)
+        }
+        KeyCode::Char('S') => app.select_next_setup_review(),
+        KeyCode::Char('U') => app.select_previous_setup_review(),
+        KeyCode::Char('F') => app.select_next_draft_review(),
+        KeyCode::Char('B') => app.select_previous_draft_review(),
+        KeyCode::Char('p') => app.select_next_published_review(),
+        KeyCode::Char('P') => app.select_previous_published_review(),
+        KeyCode::Char('a') => queue_toggle_archived(app, pending_action),
+        KeyCode::Char('g') => {
+            app.selected = 0;
+            true
+        }
+        KeyCode::Char('G') => {
+            app.selected = app.visible_indices().len().saturating_sub(1);
+            true
+        }
+        KeyCode::Char('R') => queue_restore_selected_workspace(app, pending_action),
+        _ => false,
+    }
+}
+
+fn queue_create_preset_for_key(
+    app: &mut ReviewHomeApp,
+    key: KeyCode,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    let KeyCode::Char(ch) = key else {
+        return false;
+    };
+    let Some((title, source_kind)) = (match ch {
+        'u' => Some(("Unstaged changes", ReviewSourceKind::WorkingTreeUnstaged)),
+        's' => Some(("Staged changes", ReviewSourceKind::IndexStaged)),
+        'w' => Some(("Working tree review", ReviewSourceKind::WorkingTreeAndIndex)),
+        'l' => Some(("Last commit review", ReviewSourceKind::LastCommit)),
+        'v' => Some(("Repository browser review", ReviewSourceKind::Repository)),
+        _ => None,
+    }) else {
+        return false;
+    };
+    *pending_action = Some(ReviewHomeAsyncAction::CreatePreset {
+        title: title.to_string(),
+        source_kinds: vec![source_kind],
+    });
+    app.status_message = Some("creating review workspace...".to_string());
+    true
+}
+
+fn queue_toggle_archived(
+    app: &mut ReviewHomeApp,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    let include_archived = !app.include_archived;
+    *pending_action = Some(ReviewHomeAsyncAction::ToggleArchived { include_archived });
+    app.status_message = Some("loading review workspaces...".to_string());
+    true
+}
+
+fn queue_archive_selected_workspace(
+    app: &mut ReviewHomeApp,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    let Some(workspace_index) = app.selected_workspace_index() else {
+        app.status_message = Some("no matching review workspace selected".to_string());
+        return true;
+    };
+    let Some(workspace) = app.workspace(workspace_index) else {
+        app.status_message = Some("no review workspace selected".to_string());
+        return true;
+    };
+    *pending_action = Some(ReviewHomeAsyncAction::ArchiveSelectedWorkspace {
+        workspace_index,
+        workspace_id: workspace.id.clone(),
+    });
+    app.status_message = Some(format!("archiving {}...", workspace.title));
+    true
+}
+
+fn queue_restore_selected_workspace(
+    app: &mut ReviewHomeApp,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    let Some(workspace_index) = app.selected_workspace_index() else {
+        app.status_message = Some("no matching review workspace selected".to_string());
+        return true;
+    };
+    let Some(existing) = app.workspace(workspace_index) else {
+        app.status_message = Some("no review workspace selected".to_string());
+        return true;
+    };
+    if existing.archived_at_ms.is_none() {
+        app.status_message = Some("selected review is not archived".to_string());
+        return true;
+    }
+    let mut workspace = existing.clone();
+    workspace.archived_at_ms = None;
+    *pending_action = Some(ReviewHomeAsyncAction::RestoreSelectedWorkspace { workspace });
+    app.status_message = Some("restoring review workspace...".to_string());
+    true
+}
+
+fn queue_rename_selected_workspace(
+    app: &mut ReviewHomeApp,
+    pending_action: &mut Option<ReviewHomeAsyncAction>,
+) -> bool {
+    let Some(new_title) = app.rename_buffer.take() else {
+        return false;
+    };
+    let new_title = new_title.trim().to_string();
+    if new_title.is_empty() {
+        app.status_message = Some("review title cannot be empty".to_string());
+        return true;
+    }
+    let Some(workspace_index) = app.selected_workspace_index() else {
+        app.status_message = Some("no matching review workspace selected".to_string());
+        return true;
+    };
+    let Some(existing) = app.workspace(workspace_index) else {
+        app.status_message = Some("selected review workspace is unavailable".to_string());
+        return true;
+    };
+    let mut workspace = existing.clone();
+    workspace.title = new_title;
+    *pending_action = Some(ReviewHomeAsyncAction::SubmitRename { workspace });
+    app.status_message = Some("renaming review workspace...".to_string());
+    true
 }
 
 async fn handle_key_event(
@@ -935,6 +1385,66 @@ async fn archive_selected_workspace(
         app.status_message = Some("workspace was not found".to_string());
     }
     Ok(true)
+}
+
+async fn archive_workspace_action(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    workspace_index: usize,
+    workspace_id: String,
+) -> Result<ArchiveSelectedWorkspaceResult, TuiError> {
+    let payload = serde_json::to_vec(&ArchiveReviewWorkspaceRequest {
+        repo_path,
+        workspace_id,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_WORKSPACE_ARCHIVE.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ArchiveReviewWorkspaceResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(ArchiveSelectedWorkspaceResult {
+        workspace_index,
+        archived: response.archived,
+    })
+}
+
+async fn update_workspace_action(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    workspace: ReviewWorkspace,
+) -> Result<ReviewWorkspace, TuiError> {
+    let payload = serde_json::to_vec(&UpdateReviewWorkspaceRequest {
+        repo_path,
+        workspace,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_WORKSPACE_UPDATE.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: UpdateReviewWorkspaceResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.workspace)
 }
 
 async fn create_workspace_with_sources(

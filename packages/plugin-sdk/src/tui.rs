@@ -78,6 +78,14 @@ pub trait PluginTuiSurface: Send {
     fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
         PluginTuiAction::None
     }
+
+    /// Drain effectful asynchronous work that was queued by synchronous input handling.
+    fn drain_effects<'a>(
+        &'a mut self,
+        _host: &'a dyn PluginTuiHost,
+    ) -> Pin<Box<dyn Future<Output = PluginTuiAction> + Send + 'a>> {
+        Box::pin(async { PluginTuiAction::None })
+    }
 }
 
 /// Parameters used to open a native plugin TUI surface.

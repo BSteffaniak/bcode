@@ -290,6 +290,19 @@ impl PluginTuiSurface for CodeReviewSurface {
             PluginTuiAction::None
         }
     }
+
+    fn drain_effects<'a>(
+        &'a mut self,
+        _host: &'a dyn PluginTuiHost,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginTuiAction> + Send + 'a>> {
+        Box::pin(async move {
+            if self.drain_inline_effects().await {
+                PluginTuiAction::Redraw
+            } else {
+                PluginTuiAction::None
+            }
+        })
+    }
 }
 
 /// Code review TUI surface factory backed by the current in-crate implementation.
@@ -310,7 +323,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for CodeReviewSurfaceFactory
                 .repo_path
                 .ok_or("code review surface requires repo_path")?;
             let target = match request.target.as_deref() {
-                Some("repository") | None => ReviewOpenTarget::Repository,
+                Some("repository") => ReviewOpenTarget::Repository,
                 Some("working-tree-unstaged") => ReviewOpenTarget::WorkingTreeUnstaged,
                 Some("index-staged") => ReviewOpenTarget::IndexStaged,
                 Some("working-tree-and-index") => ReviewOpenTarget::WorkingTreeAndIndex,
@@ -318,6 +331,13 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for CodeReviewSurfaceFactory
                 Some(target) => {
                     return Err(format!("unsupported code review target: {target}").into());
                 }
+                None => request
+                    .options
+                    .get("target")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or(ReviewOpenTarget::Repository),
             };
             let build_mode = request
                 .options
