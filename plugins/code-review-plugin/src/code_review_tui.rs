@@ -1533,7 +1533,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Char('N') => app.search_previous_match(),
         KeyCode::Enter => {
-            if app.activate_selected_inline_action() || app.toggle_selected_inline_thread() {
+            if app.activate_selected_review_target() {
                 true
             } else if app.sidebar_mode == ReviewSidebarMode::Repository
                 && app.review.is_repository_review()
@@ -1647,11 +1647,7 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
             } else if let Some(visual_row) =
                 app.view_visual_row_at(mouse.position.x, mouse.position.y)
             {
-                let selected = app.select_view_visual_row(visual_row);
-                let Some(index) = app.diff_line_index_at(mouse.position.x, mouse.position.y) else {
-                    return selected;
-                };
-                app.begin_mouse_range_selection(index) || selected
+                app.handle_review_view_click(visual_row)
             } else {
                 false
             }
@@ -5327,6 +5323,44 @@ impl ReviewApp {
         true
     }
 
+    /// Return whether a visual row target is an inline action.
+    #[must_use]
+    pub fn is_view_visual_row_action(&self, visual_row: usize) -> bool {
+        self.current_review_view_document()
+            .and_then(|document| document.row_for_visual_row(visual_row).cloned())
+            .is_some_and(|row| matches!(row.target, ReviewViewTarget::ThreadAction { .. }))
+    }
+
+    /// Return whether a visual row target is an inline thread header.
+    #[must_use]
+    pub fn is_view_visual_row_thread(&self, visual_row: usize) -> bool {
+        self.current_review_view_document()
+            .and_then(|document| document.row_for_visual_row(visual_row).cloned())
+            .is_some_and(|row| matches!(row.target, ReviewViewTarget::Thread { .. }))
+    }
+
+    /// Handle primary click on a review document visual row.
+    pub fn handle_review_view_click(&mut self, visual_row: usize) -> bool {
+        let Some(document) = self.current_review_view_document() else {
+            return self.begin_mouse_range_selection(visual_row);
+        };
+        let Some(row) = document.row_for_visual_row(visual_row) else {
+            return false;
+        };
+        let selected = self.select_view_visual_row(visual_row);
+        match &row.target {
+            ReviewViewTarget::SourceLine { source_row, .. }
+            | ReviewViewTarget::HunkHeader { source_row, .. } => {
+                self.begin_mouse_range_selection(*source_row) || selected
+            }
+            ReviewViewTarget::Thread { .. } => self.toggle_selected_inline_thread() || selected,
+            ReviewViewTarget::ThreadAction { .. } => {
+                self.activate_selected_inline_action() || selected
+            }
+            ReviewViewTarget::Comment { .. } => selected,
+        }
+    }
+
     /// Select a visible diff line by rendered row index.
     pub fn select_diff_line(&mut self, index: usize) -> bool {
         let clamped = index.min(self.source_rendered_diff_len().saturating_sub(1));
@@ -6159,6 +6193,11 @@ impl ReviewApp {
         }
     }
 
+    /// Activate selected review target, if it has a primary action.
+    pub fn activate_selected_review_target(&mut self) -> bool {
+        self.activate_selected_inline_action() || self.toggle_selected_inline_thread()
+    }
+
     /// Toggle selected thread resolved state locally.
     pub fn toggle_selected_thread_resolved(&mut self) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
@@ -6907,6 +6946,98 @@ mod tests {
 
         assert!(app.selected_diff_visual_row() >= app.diff_scroll);
         assert!(app.selected_diff_visual_row() < app.diff_scroll + 2);
+    }
+
+    #[test]
+    fn clicking_inline_thread_header_toggles_collapse() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let thread_key = ReviewApp::thread_key_for_anchor(&anchor);
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment-1".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+        let document = app.current_review_view_document().expect("document");
+        let thread_row = document
+            .rows
+            .iter()
+            .find(|row| matches!(row.target, ReviewViewTarget::Thread { .. }))
+            .expect("thread row")
+            .visual_row;
+
+        assert!(app.handle_review_view_click(thread_row));
+
+        assert!(app.collapsed_review_threads.contains(&thread_key));
+    }
+
+    #[test]
+    fn clicking_inline_action_activates_action() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment-1".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+        let document = app.current_review_view_document().expect("document");
+        let resolve_row = document
+            .rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.target,
+                    ReviewViewTarget::ThreadAction { action, .. } if action == "resolve"
+                )
+            })
+            .expect("resolve action")
+            .visual_row;
+
+        assert!(app.handle_review_view_click(resolve_row));
+
+        assert_eq!(app.resolved_review_threads.len(), 1);
     }
 
     #[test]
