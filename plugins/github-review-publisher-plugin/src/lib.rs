@@ -68,8 +68,8 @@ fn github_manifest() -> ReviewPublisherManifest {
                 "token_env": { "type": "string", "description": "GitHub token env var", "default": "GITHUB_TOKEN" },
                 "submit_event": { "type": "string", "description": "GitHub review event", "default": "COMMENT", "enum": ["COMMENT", "REQUEST_CHANGES", "APPROVE"] },
                 "summary": { "type": "string", "description": "Optional review summary body" },
-                "fallback_file_comments_to_summary": { "type": "string", "description": "Set to false to fail submit when file/context comments cannot be published inline", "default": "true" },
-                "fallback_unmapped_to_summary": { "type": "string", "description": "Set to true to include unmappable inline comments in the review summary instead of failing submit", "default": "false" }
+                "fallback_file_comments_to_summary": { "type": "boolean", "description": "Summarize file/context comments instead of failing inline submit", "default": true },
+                "fallback_unmapped_to_summary": { "type": "boolean", "description": "Include unmappable inline comments in the review summary instead of failing submit", "default": false }
             }
         }),
         route: None,

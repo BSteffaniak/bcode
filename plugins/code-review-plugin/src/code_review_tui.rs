@@ -873,7 +873,7 @@ fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
                         .get("type")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
-                    (option_type == "string").then(|| {
+                    ((option_type == "string") || (option_type == "boolean")).then(|| {
                         let mut label = schema
                             .get("description")
                             .and_then(serde_json::Value::as_str)
@@ -900,9 +900,13 @@ fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
                         }
                         let value = schema
                             .get("default")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
+                            .and_then(|value| {
+                                value
+                                    .as_str()
+                                    .map(ToString::to_string)
+                                    .or_else(|| value.as_bool().map(|value| value.to_string()))
+                            })
+                            .unwrap_or_default();
                         ReviewPublishOption {
                             name: name.clone(),
                             label,
@@ -912,8 +916,20 @@ fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
                                 .and_then(serde_json::Value::as_array)
                                 .into_iter()
                                 .flatten()
-                                .filter_map(serde_json::Value::as_str)
-                                .map(ToString::to_string)
+                                .filter_map(|value| {
+                                    value
+                                        .as_str()
+                                        .map(ToString::to_string)
+                                        .or_else(|| value.as_bool().map(|value| value.to_string()))
+                                })
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .chain(
+                                    (option_type == "boolean")
+                                        .then(|| ["false".to_string(), "true".to_string()])
+                                        .into_iter()
+                                        .flatten(),
+                                )
                                 .collect(),
                         }
                     })
@@ -926,7 +942,15 @@ fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
 fn options_json(options: Vec<ReviewPublishOption>) -> serde_json::Value {
     let mut object = serde_json::Map::new();
     for option in options {
-        if !option.value.is_empty() {
+        if option.value.is_empty() {
+            continue;
+        }
+        if option.choices == ["false".to_string(), "true".to_string()] {
+            object.insert(
+                option.name,
+                serde_json::Value::Bool(option.value.eq_ignore_ascii_case("true")),
+            );
+        } else {
             object.insert(option.name, serde_json::Value::String(option.value));
         }
     }
