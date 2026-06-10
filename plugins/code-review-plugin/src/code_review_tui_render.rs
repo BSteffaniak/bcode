@@ -1637,7 +1637,7 @@ fn render_publish_options(
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            " Publisher options  Enter preview  Tab next  Esc cancel ",
+            " Publisher options  Enter preview  Tab next  ←/→ choice  Esc cancel ",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -1651,7 +1651,16 @@ fn render_publish_options(
         } else {
             Style::new().fg(Color::White).bg(Color::BrightBlack)
         };
-        let text = format!(" {}: {}", option.label, option.value);
+        let text = if option.choices.is_empty() {
+            format!(" {}: {}", option.label, option.value)
+        } else {
+            format!(
+                " {}: {}  ‹{}›",
+                option.label,
+                option.value,
+                option.choices.join("/")
+            )
+        };
         let y = popup
             .y
             .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));

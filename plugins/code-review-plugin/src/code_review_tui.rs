@@ -907,6 +907,14 @@ fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
                             name: name.clone(),
                             label,
                             value,
+                            choices: schema
+                                .get("enum")
+                                .and_then(serde_json::Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(ToString::to_string)
+                                .collect(),
                         }
                     })
                 })
@@ -1367,6 +1375,15 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         }
         if stroke.key == KeyCode::Tab && stroke.modifiers.shift {
             return app.publish_up(1);
+        }
+        if stroke.key == KeyCode::Right && stroke.modifiers.is_empty() {
+            return app.cycle_selected_publish_option(1);
+        }
+        if stroke.key == KeyCode::Left && stroke.modifiers.is_empty() {
+            return app.cycle_selected_publish_option(-1);
+        }
+        if stroke.key == KeyCode::Char(' ') && stroke.modifiers.is_empty() {
+            return app.cycle_selected_publish_option(1);
         }
         return app.edit_publish_option(stroke);
     }
@@ -2783,6 +2800,8 @@ pub struct ReviewPublishOption {
     pub label: String,
     /// Option value.
     pub value: String,
+    /// Enumerated choices, when the publisher exposes them.
+    pub choices: Vec<String>,
 }
 
 /// Source kind that should be edited.
@@ -6207,6 +6226,40 @@ impl ReviewApp {
         true
     }
 
+    /// Cycle the selected publish option when it has enumerated choices.
+    pub fn cycle_selected_publish_option(&mut self, offset: isize) -> bool {
+        let Some(ReviewPublishState::Options {
+            options, selected, ..
+        }) = &mut self.publish_state
+        else {
+            return false;
+        };
+        let Some(option) = options.get_mut(*selected) else {
+            return false;
+        };
+        if option.choices.is_empty() {
+            self.status_message = Some("selected publish option has no choices".to_string());
+            return true;
+        }
+        let current = option
+            .choices
+            .iter()
+            .position(|choice| choice == &option.value)
+            .unwrap_or(0);
+        let len = option.choices.len();
+        let next = if offset.is_negative() {
+            current
+                .saturating_add(len)
+                .saturating_sub(offset.unsigned_abs() % len)
+                % len
+        } else {
+            current.saturating_add(offset.unsigned_abs()) % len
+        };
+        option.value.clone_from(&option.choices[next]);
+        self.status_message = Some(format!("{} = {}", option.name, option.value));
+        true
+    }
+
     /// Edit selected publisher option.
     pub fn edit_publish_option(&mut self, stroke: KeyStroke) -> bool {
         let Some(ReviewPublishState::Options {
@@ -6219,11 +6272,11 @@ impl ReviewApp {
             return false;
         };
         match stroke.key {
-            KeyCode::Char(ch) if stroke.modifiers.is_empty() => {
+            KeyCode::Char(ch) if stroke.modifiers.is_empty() && option.choices.is_empty() => {
                 option.value.push(ch);
                 true
             }
-            KeyCode::Backspace if stroke.modifiers.is_empty() => {
+            KeyCode::Backspace if stroke.modifiers.is_empty() && option.choices.is_empty() => {
                 option.value.pop();
                 true
             }
@@ -8224,5 +8277,30 @@ mod tests {
                 .expect("thread preview")
                 .contains("resolved thread")
         );
+    }
+
+    #[test]
+    fn cycles_enumerated_publish_options() {
+        let mut app = sample_app();
+        app.publish_state = Some(ReviewPublishState::Options {
+            publisher_id: "github".to_string(),
+            options: vec![ReviewPublishOption {
+                name: "submit_event".to_string(),
+                label: "GitHub review event".to_string(),
+                value: "COMMENT".to_string(),
+                choices: vec![
+                    "COMMENT".to_string(),
+                    "REQUEST_CHANGES".to_string(),
+                    "APPROVE".to_string(),
+                ],
+            }],
+            selected: 0,
+        });
+
+        assert!(app.cycle_selected_publish_option(1));
+        let Some(ReviewPublishState::Options { options, .. }) = &app.publish_state else {
+            panic!("options state expected");
+        };
+        assert_eq!(options[0].value, "REQUEST_CHANGES");
     }
 }
