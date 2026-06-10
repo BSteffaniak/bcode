@@ -1738,6 +1738,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('W') => app.select_next_unviewed_file(),
         KeyCode::Char('w') => app.toggle_selected_file_viewed(),
         KeyCode::Char('u') => app.select_next_open_thread(),
+        KeyCode::Char('i') => app.select_previous_open_thread(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
@@ -1907,15 +1908,14 @@ pub struct ReviewPublisherCapabilities {
 }
 
 fn relative_index(current_index: Option<usize>, len: usize, offset: isize) -> usize {
+    let Some(max_index) = len.checked_sub(1) else {
+        return 0;
+    };
     let start = current_index.unwrap_or_else(|| if offset.is_negative() { len } else { 0 });
     if offset.is_negative() {
-        start
-            .saturating_sub(offset.unsigned_abs())
-            .min(len.saturating_sub(1))
+        start.saturating_sub(offset.unsigned_abs()).min(max_index)
     } else {
-        start
-            .saturating_add(offset.unsigned_abs())
-            .min(len.saturating_sub(1))
+        start.saturating_add(offset.unsigned_abs()).min(max_index)
     }
 }
 
@@ -7954,6 +7954,64 @@ mod tests {
                 thread_key: ReviewApp::thread_key_for_anchor(&second),
             })
         );
+    }
+
+    #[test]
+    fn open_thread_navigation_selects_previous_thread() {
+        let mut app = sample_app();
+        let first = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 1,
+            end_diff_row: None,
+            old_line: Some(1),
+            new_line: None,
+            old_start: Some(1),
+            old_end: Some(1),
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Removed,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let second = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        for anchor in [first.clone(), second.clone()] {
+            app.draft_comments.insert(
+                anchor,
+                vec![ReviewDraftComment {
+                    id: Some("comment".to_string()),
+                    body: "note".to_string(),
+                    persisted: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    session_id: None,
+                }],
+            );
+        }
+        app.select_anchor(&second);
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: ReviewApp::thread_key_for_anchor(&second),
+        });
+
+        assert!(app.select_previous_open_thread());
+
+        assert_eq!(app.selected_diff_line, first.diff_row);
     }
 
     #[test]
