@@ -218,6 +218,9 @@ pub struct ReviewThread {
     pub anchor: DraftAnchor,
     /// Linked Bcode session id, when present.
     pub session_id: Option<String>,
+    /// Resolution timestamp in milliseconds since Unix epoch, when resolved.
+    #[serde(default)]
+    pub resolved_at_ms: Option<u64>,
     /// Draft comments in the thread.
     pub comments: Vec<DraftComment>,
 }
@@ -800,6 +803,7 @@ fn review_bundle_for_request(
             anchor: thread.anchor,
             comments: thread.comments,
             session_id: thread.session_id,
+            resolved_at_ms: thread.resolved_at_ms,
             selected_lines,
             selected_diff_lines,
             hunk_context,
@@ -1687,10 +1691,14 @@ fn threads_from_drafts(drafts: Vec<DraftComment>) -> Vec<ReviewThread> {
                 thread_id: draft.thread_id.clone(),
                 anchor: draft.anchor.clone(),
                 session_id: draft.session_id.clone(),
+                resolved_at_ms: draft.resolved_at_ms,
                 comments: Vec::new(),
             });
         if entry.session_id.is_none() {
             entry.session_id.clone_from(&draft.session_id);
+        }
+        if entry.resolved_at_ms.is_none() {
+            entry.resolved_at_ms = draft.resolved_at_ms;
         }
         entry.comments.push(draft);
     }

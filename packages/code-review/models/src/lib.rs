@@ -941,6 +941,9 @@ pub struct ReviewBundleThread {
     pub comments: Vec<DraftComment>,
     /// Linked Bcode session id, when present.
     pub session_id: Option<String>,
+    /// Resolution timestamp in milliseconds since Unix epoch, when resolved.
+    #[serde(default)]
+    pub resolved_at_ms: Option<u64>,
     /// Structured selected diff lines.
     #[serde(default)]
     pub selected_lines: Vec<ReviewBundleLine>,
