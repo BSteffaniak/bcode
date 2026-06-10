@@ -2145,6 +2145,7 @@ mod tests {
             sources,
             created_at_ms: Some(1),
             updated_at_ms: Some(2),
+            viewed_files: std::collections::BTreeSet::new(),
             archived_at_ms: archived.then_some(3),
         }
     }

@@ -5,6 +5,7 @@
 //! Shared code review models for Bcode.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Code review plugin service interface.
@@ -96,6 +97,9 @@ pub struct ReviewWorkspace {
     /// Updated timestamp in milliseconds since Unix epoch, when known.
     #[serde(default)]
     pub updated_at_ms: Option<u64>,
+    /// Review file display paths marked viewed.
+    #[serde(default)]
+    pub viewed_files: BTreeSet<String>,
     /// Archived timestamp in milliseconds since Unix epoch, when archived.
     #[serde(default)]
     pub archived_at_ms: Option<u64>,
@@ -119,6 +123,7 @@ impl ReviewWorkspace {
             }],
             created_at_ms: None,
             updated_at_ms: None,
+            viewed_files: BTreeSet::new(),
             archived_at_ms: None,
         }
     }

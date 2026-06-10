@@ -3208,6 +3208,7 @@ impl ReviewApp {
     #[must_use]
     pub fn new(review: ReviewSummary) -> Self {
         let workspace = review.workspace();
+        let viewed_files = workspace.viewed_files.clone();
         Self {
             workspace,
             review,
@@ -3233,7 +3234,7 @@ impl ReviewApp {
             pending_thread_resolve: None,
             pending_publish_request: None,
             publishers: Vec::new(),
-            viewed_files: BTreeSet::new(),
+            viewed_files,
             file_cache: ReviewFileCache::default(),
             file_viewports: BTreeMap::new(),
             pending_file_load: None,
@@ -5389,9 +5390,13 @@ impl ReviewApp {
             return true;
         };
         if self.viewed_files.remove(&path) {
+            self.workspace.viewed_files.remove(&path);
+            self.pending_workspace_save = true;
             self.status_message = Some(format!("marked {path} unviewed"));
         } else {
             self.viewed_files.insert(path.clone());
+            self.workspace.viewed_files.insert(path.clone());
+            self.pending_workspace_save = true;
             self.status_message = Some(format!("marked {path} viewed"));
         }
         true
@@ -8212,6 +8217,7 @@ mod tests {
                 sources,
                 created_at_ms: None,
                 updated_at_ms: None,
+                viewed_files: BTreeSet::new(),
                 archived_at_ms: None,
             }),
             surfaces,

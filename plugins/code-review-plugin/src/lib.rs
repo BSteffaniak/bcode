@@ -1280,6 +1280,7 @@ fn create_review_workspace_for_request(
         sources: request.sources,
         created_at_ms: Some(now),
         updated_at_ms: Some(now),
+        viewed_files: BTreeSet::new(),
         archived_at_ms: None,
     };
     let saved = workspace.clone();
@@ -2083,6 +2084,7 @@ impl<'a> CodeReviewDb<'a> {
                 "created_at_ms",
                 "updated_at_ms",
                 "archived_at_ms",
+                "viewed_files_json",
             ])
             .filter(Box::new(where_eq(
                 "repo_root",
@@ -2117,6 +2119,7 @@ impl<'a> CodeReviewDb<'a> {
                 "created_at_ms",
                 "updated_at_ms",
                 "archived_at_ms",
+                "viewed_files_json",
             ])
             .filter(Box::new(where_eq("workspace_id", workspace_id)))
             .execute_first(self.db)
@@ -2129,12 +2132,14 @@ impl<'a> CodeReviewDb<'a> {
 
     async fn save_workspace(&self, workspace: &ReviewWorkspace) -> Result<(), ReviewError> {
         let sources_json = serde_json::to_string(&workspace.sources)?;
+        let viewed_files_json = serde_json::to_string(&workspace.viewed_files)?;
         if self.get_workspace(&workspace.id).await?.is_some() {
             self.db
                 .update("review_workspaces")
                 .value("repo_root", workspace.repo_root.display().to_string())
                 .value("title", workspace.title.clone())
                 .value("sources_json", sources_json)
+                .value("viewed_files_json", viewed_files_json.clone())
                 .value(
                     "updated_at_ms",
                     u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
@@ -2151,6 +2156,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("repo_root", workspace.repo_root.display().to_string())
             .value("title", workspace.title.clone())
             .value("sources_json", sources_json)
+            .value("viewed_files_json", viewed_files_json)
             .value(
                 "created_at_ms",
                 u64_to_i64(workspace.created_at_ms.unwrap_or_else(now_ms)),
@@ -2745,8 +2751,22 @@ fn workspace_table_migration() -> CodeMigration<'static> {
                 .column(int_column("created_at_ms"))
                 .column(int_column("updated_at_ms"))
                 .column(nullable_int_column("archived_at_ms"))
+                .column(text_column("viewed_files_json"))
                 .primary_key("workspace_id"),
         ),
+        None,
+    )
+}
+
+fn workspace_viewed_files_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "008_workspace_viewed_files_column".to_string(),
+        Box::new(alter_table("review_workspaces").add_column(
+            "viewed_files_json".to_string(),
+            DataType::Text,
+            false,
+            None,
+        )),
         None,
     )
 }
@@ -2856,6 +2876,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(thread_surface_anchor_columns_migration());
     source.add_migration(thread_resolved_column_migration());
     source.add_migration(workspace_table_migration());
+    source.add_migration(workspace_viewed_files_column_migration());
     source.add_migration(publish_records_table_migration());
     source
 }
@@ -2927,6 +2948,8 @@ fn publish_record_from_row(row: &Row) -> Result<ReviewPublishRecord, ReviewError
 
 fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
     let sources: Vec<ReviewSource> = serde_json::from_str(&required_text(row, "sources_json")?)?;
+    let viewed_files = optional_text(row, "viewed_files_json")
+        .map_or_else(|| Ok(BTreeSet::new()), |json| serde_json::from_str(&json))?;
     Ok(ReviewWorkspace {
         id: required_text(row, "workspace_id")?,
         title: required_text(row, "title")?,
@@ -2934,6 +2957,7 @@ fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
         sources,
         created_at_ms: Some(i64_to_u64(required_i64(row, "created_at_ms")?)),
         updated_at_ms: Some(i64_to_u64(required_i64(row, "updated_at_ms")?)),
+        viewed_files,
         archived_at_ms: optional_i64(row, "archived_at_ms").map(i64_to_u64),
     })
 }
