@@ -15,9 +15,9 @@ use crate::code_review_tui::{
     add_source_menu_items, sidebar_width,
 };
 use crate::code_review_tui_display::{
-    ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment,
-    ReviewDisplayTextRole,
+    ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
 };
+use crate::code_review_tui_view::{ReviewViewBlock, ReviewViewDocument};
 use bcode_code_review_models::ReviewSource;
 
 /// Render one full-screen code review frame.
@@ -897,7 +897,7 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_empty(area, "Binary file diff not available", frame);
         return;
     }
-    let rows = rendered_rows(file);
+    let rows = rendered_rows(app.selected_file, file);
     if rows.is_empty() {
         render_empty(area, "No textual changes", frame);
         return;
@@ -1124,13 +1124,16 @@ fn highlighted_source_spans(
         .collect()
 }
 
-fn rendered_rows(file: &ReviewFile) -> Vec<RenderedRow> {
-    ReviewDisplayBuilder::new()
-        .syntax_highlighting(true)
-        .build_file(file)
+fn rendered_rows(file_index: usize, file: &ReviewFile) -> Vec<RenderedRow> {
+    ReviewViewDocument::build_diff_file(file_index, file, true)
         .rows
         .iter()
-        .map(render_display_row)
+        .filter_map(|row| match &row.block {
+            ReviewViewBlock::DisplayRow(display_row) => Some(render_display_row(display_row)),
+            ReviewViewBlock::InlineThreadHeader { .. }
+            | ReviewViewBlock::InlineComment { .. }
+            | ReviewViewBlock::InlineThreadActions { .. } => None,
+        })
         .collect()
 }
 
