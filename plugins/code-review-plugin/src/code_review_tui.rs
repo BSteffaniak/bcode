@@ -1612,6 +1612,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('{') => app.select_previous_inline_draft(),
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
+        KeyCode::Char('T') => app.cycle_thread_filter(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
@@ -2684,6 +2685,39 @@ impl ReviewSidebarMode {
     }
 }
 
+/// Review thread sidebar filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewThreadFilter {
+    /// Show all threads.
+    All,
+    /// Show open threads only.
+    Open,
+    /// Show resolved threads only.
+    Resolved,
+}
+
+impl ReviewThreadFilter {
+    /// Return the next filter in cycle order.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Open,
+            Self::Open => Self::Resolved,
+            Self::Resolved => Self::All,
+        }
+    }
+
+    /// Return a compact filter label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
 /// Review thread row summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewThreadSummary {
@@ -2962,6 +2996,8 @@ pub struct ReviewApp {
     pub sidebar_mode: ReviewSidebarMode,
     /// Selected review thread index.
     pub selected_thread: usize,
+    /// Active thread sidebar filter.
+    pub thread_filter: ReviewThreadFilter,
     /// Top visible review thread row.
     pub thread_scroll: usize,
     /// Whether help is visible.
@@ -3049,6 +3085,7 @@ impl ReviewApp {
             sidebar_visible: true,
             sidebar_mode: ReviewSidebarMode::Included,
             selected_thread: 0,
+            thread_filter: ReviewThreadFilter::All,
             thread_scroll: 0,
             help_visible: false,
             should_exit: false,
@@ -4915,9 +4952,34 @@ impl ReviewApp {
             .collect()
     }
 
+    /// Return review thread summaries visible in the sidebar.
+    #[must_use]
+    pub fn visible_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        self.thread_summaries()
+            .into_iter()
+            .filter(|thread| match self.thread_filter {
+                ReviewThreadFilter::All => true,
+                ReviewThreadFilter::Open => !thread.resolved,
+                ReviewThreadFilter::Resolved => thread.resolved,
+            })
+            .collect()
+    }
+
+    /// Cycle thread sidebar filter.
+    pub fn cycle_thread_filter(&mut self) -> bool {
+        self.thread_filter = self.thread_filter.next();
+        self.selected_thread = 0;
+        self.thread_scroll = 0;
+        self.status_message = Some(format!(
+            "showing {} review threads",
+            self.thread_filter.label()
+        ));
+        true
+    }
+
     /// Select next thread.
     pub fn select_next_thread(&mut self, rows: usize) -> bool {
-        let max = self.thread_summaries().len().saturating_sub(1);
+        let max = self.visible_thread_summaries().len().saturating_sub(1);
         let next = self.selected_thread.saturating_add(rows).min(max);
         if next == self.selected_thread {
             return false;
@@ -4928,7 +4990,7 @@ impl ReviewApp {
 
     /// Select a thread by absolute index.
     pub fn select_thread(&mut self, index: usize) -> bool {
-        if index >= self.thread_summaries().len() || index == self.selected_thread {
+        if index >= self.visible_thread_summaries().len() || index == self.selected_thread {
             return false;
         }
         self.selected_thread = index;
@@ -5044,7 +5106,7 @@ impl ReviewApp {
     }
 
     fn jump_to_thread_index(&mut self, index: usize) -> bool {
-        let Some(thread) = self.thread_summaries().get(index).cloned() else {
+        let Some(thread) = self.visible_thread_summaries().get(index).cloned() else {
             self.status_message = Some("no review threads".to_string());
             return true;
         };
@@ -5094,7 +5156,11 @@ impl ReviewApp {
         if self.sidebar_mode != ReviewSidebarMode::Threads {
             return false;
         }
-        let Some(thread) = self.thread_summaries().get(self.selected_thread).cloned() else {
+        let Some(thread) = self
+            .visible_thread_summaries()
+            .get(self.selected_thread)
+            .cloned()
+        else {
             self.status_message = Some("no review thread selected".to_string());
             return true;
         };
@@ -5593,7 +5659,7 @@ impl ReviewApp {
             return None;
         }
         let index = self.thread_scroll + usize::from(y.saturating_sub(area.y));
-        (index < self.thread_summaries().len()).then_some(index)
+        (index < self.visible_thread_summaries().len()).then_some(index)
     }
 
     /// Return visible diff row index under terminal coordinates.
@@ -6546,7 +6612,10 @@ impl ReviewApp {
     /// Return a footer preview for the selected thread.
     #[must_use]
     pub fn selected_thread_preview(&self) -> Option<String> {
-        let thread = self.thread_summaries().get(self.selected_thread)?.clone();
+        let thread = self
+            .visible_thread_summaries()
+            .get(self.selected_thread)?
+            .clone();
         let range = if thread.anchor.start_diff_row() == thread.anchor.end_diff_row() {
             format!("@{}", thread.anchor.start_diff_row())
         } else {
@@ -7328,6 +7397,11 @@ mod tests {
             }],
         );
         app.resolved_review_threads.insert(thread_key.clone());
+
+        app.thread_filter = ReviewThreadFilter::Open;
+        assert!(app.visible_thread_summaries().is_empty());
+        app.thread_filter = ReviewThreadFilter::Resolved;
+        assert_eq!(app.visible_thread_summaries().len(), 1);
 
         assert!(app.toggle_show_resolved_threads());
 

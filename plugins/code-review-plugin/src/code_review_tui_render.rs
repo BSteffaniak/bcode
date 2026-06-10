@@ -108,14 +108,7 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         format!("  💬 {drafts} draft")
     };
-    let (open_threads, resolved_threads) = app.thread_status_counts();
-    let thread_label = if open_threads == 0 && resolved_threads == 0 {
-        String::new()
-    } else if app.show_resolved_threads {
-        format!("  threads {open_threads} open/{resolved_threads} resolved")
-    } else {
-        format!("  threads {open_threads} open/{resolved_threads} hidden")
-    };
+    let thread_label = header_thread_label(app);
     let surface_kind = app
         .review
         .surfaces()
@@ -185,6 +178,23 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
+fn header_thread_label(app: &ReviewApp) -> String {
+    let (open_threads, resolved_threads) = app.thread_status_counts();
+    if open_threads == 0 && resolved_threads == 0 {
+        String::new()
+    } else if app.show_resolved_threads {
+        format!(
+            "  threads {open_threads} open/{resolved_threads} resolved  filter:{}",
+            app.thread_filter.label()
+        )
+    } else {
+        format!(
+            "  threads {open_threads} open/{resolved_threads} hidden  filter:{}",
+            app.thread_filter.label()
+        )
+    }
+}
+
 fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -212,7 +222,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 let linked = app
                     .selected_draft_session_id()
                     .map_or(String::new(), |_| "  🤖 session linked".to_string());
-                return format!(" {preview}{linked}  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  U expand  Z collapse  c reply  a ask/follow up  o open  e edit  D delete ");
+                return format!(" {preview}{linked}  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  U expand  Z collapse  c reply  a ask/follow up  o open  e edit  D delete ");
             }
             if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
                 return app.selected_thread_preview().unwrap_or_else(|| {
@@ -228,7 +238,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 );
             }
             format!(
-                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -539,13 +549,13 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let threads = app.thread_summaries();
+    let threads = app.visible_thread_summaries();
     let visible_rows = usize::from(area.height);
     if threads.is_empty() {
         frame.write_line(
             area,
             &Line::from_spans(vec![Span::styled(
-                " no review threads",
+                format!(" no {} review threads", app.thread_filter.label()),
                 Style::new().fg(Color::BrightBlack),
             )]),
         );
@@ -1505,6 +1515,7 @@ const DIFF_HELP_LINES: &[&str] = &[
     " Enter               fold thread or activate selected action",
     " r                   resolve/reopen selected thread",
     " R                   show/hide resolved threads",
+    " T                   cycle thread sidebar filter",
     " U/Z                 expand/collapse all inline threads",
     " B                   switch to build/source mode",
     " b                   toggle sidebar",
