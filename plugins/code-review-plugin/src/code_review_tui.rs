@@ -1723,12 +1723,19 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Right => app.expand_selected_tree_row(),
         KeyCode::Char('p') => app.select_previous_file(),
         KeyCode::Left => app.collapse_selected_tree_row(),
+        key => handle_review_navigation_key(app, key),
+    }
+}
+
+fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
+    match key {
         KeyCode::Char('}') => app.select_next_inline_draft(),
         KeyCode::Char('{') => app.select_previous_inline_draft(),
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
         KeyCode::Char('T') => app.cycle_thread_filter(),
         KeyCode::Char('w') => app.toggle_selected_file_viewed(),
+        KeyCode::Char('u') => app.select_next_open_thread(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
@@ -1895,6 +1902,19 @@ pub struct ReviewPublisherCapabilities {
     supports_ranges: bool,
     supports_inline_comments: bool,
     supports_summary_comment: bool,
+}
+
+fn relative_index(current_index: Option<usize>, len: usize, offset: isize) -> usize {
+    let start = current_index.unwrap_or_else(|| if offset.is_negative() { len } else { 0 });
+    if offset.is_negative() {
+        start
+            .saturating_sub(offset.unsigned_abs())
+            .min(len.saturating_sub(1))
+    } else {
+        start
+            .saturating_add(offset.unsigned_abs())
+            .min(len.saturating_sub(1))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -5208,6 +5228,30 @@ impl ReviewApp {
         self.select_view_visual_row(row.visual_row)
     }
 
+    /// Select next unresolved review thread in the main pane.
+    pub fn select_next_open_thread(&mut self) -> bool {
+        self.select_relative_open_thread(1)
+    }
+
+    /// Select previous unresolved review thread in the main pane.
+    pub fn select_previous_open_thread(&mut self) -> bool {
+        self.select_relative_open_thread(-1)
+    }
+
+    fn select_relative_open_thread(&mut self, offset: isize) -> bool {
+        let summaries = self.open_inline_thread_summaries();
+        if summaries.is_empty() {
+            self.status_message = Some("no unresolved review threads".to_string());
+            return true;
+        }
+        let current_anchor = self.selected_comment_anchor();
+        let current_index = current_anchor
+            .as_ref()
+            .and_then(|anchor| summaries.iter().position(|thread| &thread.anchor == anchor));
+        let next_index = relative_index(current_index, summaries.len(), offset);
+        self.jump_to_thread_summary(&summaries[next_index])
+    }
+
     /// Select next review thread in the main pane.
     pub fn select_next_inline_thread(&mut self) -> bool {
         let Some(current_anchor) = self.selected_comment_anchor() else {
@@ -5257,9 +5301,20 @@ impl ReviewApp {
             self.status_message = Some("no review threads".to_string());
             return true;
         };
+        self.jump_to_thread_summary(&thread)
+    }
+
+    fn jump_to_thread_summary(&mut self, thread: &ReviewThreadSummary) -> bool {
         self.sync_selected_thread_to_specific_anchor(&thread.anchor);
-        self.focus_thread_summary(&thread);
+        self.focus_thread_summary(thread);
         true
+    }
+
+    fn open_inline_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        self.inline_thread_summaries()
+            .into_iter()
+            .filter(|thread| !thread.resolved)
+            .collect()
     }
 
     fn inline_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
@@ -7776,6 +7831,69 @@ mod tests {
         });
 
         assert!(app.select_next_inline_thread());
+
+        assert_eq!(app.selected_diff_line, second.diff_row);
+        assert_eq!(
+            app.selected_view_target,
+            Some(ReviewViewTarget::Thread {
+                thread_key: ReviewApp::thread_key_for_anchor(&second),
+            })
+        );
+    }
+
+    #[test]
+    fn open_thread_navigation_skips_resolved_threads() {
+        let mut app = sample_app();
+        let first = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 1,
+            end_diff_row: None,
+            old_line: Some(1),
+            new_line: None,
+            old_start: Some(1),
+            old_end: Some(1),
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Removed,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let second = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        for anchor in [first.clone(), second.clone()] {
+            app.draft_comments.insert(
+                anchor,
+                vec![ReviewDraftComment {
+                    id: Some("comment".to_string()),
+                    body: "note".to_string(),
+                    persisted: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    session_id: None,
+                }],
+            );
+        }
+        app.resolved_review_threads
+            .insert(ReviewApp::thread_key_for_anchor(&first));
+        app.select_anchor(&first);
+
+        assert!(app.select_next_open_thread());
 
         assert_eq!(app.selected_diff_line, second.diff_row);
         assert_eq!(

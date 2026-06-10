@@ -239,7 +239,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  c comment  w viewed  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  u unresolved  c comment  w viewed  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
@@ -1529,6 +1529,7 @@ const DIFF_HELP_LINES: &[&str] = &[
     " n/p                 next/previous file",
     " J/K                 next/previous hunk",
     " [/]/                previous/next review thread",
+    " u                   next unresolved review thread",
     " {/}                 previous/next draft comment",
     " Enter               fold thread or activate selected action",
     " r                   resolve/reopen selected thread",
