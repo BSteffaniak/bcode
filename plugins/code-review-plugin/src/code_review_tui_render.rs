@@ -1364,74 +1364,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         " ",
         Style::new().fg(Color::White).bg(Color::BrightBlack),
     );
-    let build_lines = [
-        " Build Review Help",
-        "",
-        " m                   switch to review mode",
-        " g/G                first / last build row",
-        " j/k or arrows       move selection",
-        " A/+                add source menu / add file source",
-        " T                  rename workspace",
-        " R                  refresh/rematerialize sources",
-        " I/E/V              include all / exclude all / invert sources",
-        " n/N/z              next / previous / exclude empty sources",
-        " d/Z                next diagnostic source / exclude error sources",
-        " M/X/P              merge-base / remove excluded / remove duplicates",
-        " O/Y                open source surface / source for surface",
-        " f or ctrl-p         fuzzy file picker",
-        " enter               inspect/open selected item",
-        " t                   cycle included/repo/threads/sources",
-        " b                   toggle sidebar",
-        " ?                   toggle this help",
-        " q or esc            exit review",
-    ];
-    let repo_lines = [
-        " Repository Review Help",
-        "",
-        " j/k or arrows       move tree selection",
-        " enter/right         open file or expand directory",
-        " left                collapse directory/parent",
-        " f or ctrl-p         fuzzy file picker",
-        " :                   jump to line",
-        " /                   search current file",
-        " n/N                 next/previous search match",
-        " v                   select/clear line range",
-        " c                   create draft comment",
-        " a                   ask Bcode about selected line",
-        " x                   publish/export review",
-        " t                   cycle included/repo/threads/sources",
-        " b                   toggle sidebar",
-        " ?                   toggle this help",
-        " q or esc            exit review",
-    ];
-    let diff_lines = [
-        " Code Review Help",
-        "",
-        " j/k or arrows       scroll diff",
-        " n/p                 next/previous file",
-        " J/K                 next/previous hunk",
-        " B                   switch to build/source mode",
-        " b                   toggle sidebar",
-        " t                   cycle included/repo/threads/sources",
-        " mouse wheel         scroll diff",
-        " click file          open file",
-        " c                   create draft comment",
-        " x                   publish/export review",
-        " v                   select/clear line range",
-        " a                   ask Bcode about selected line",
-        " o                   open linked Bcode session",
-        " e                   edit latest draft on line",
-        " D                   delete latest draft on line",
-        " ?                   toggle this help",
-        " q or esc            exit review",
-    ];
-    let lines: &[&str] = if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
-        &build_lines
-    } else if app.review.is_repository_review() {
-        &repo_lines
-    } else {
-        &diff_lines
-    };
+    let lines = help_lines(app);
     for (index, text) in lines.iter().enumerate() {
         let y = popup
             .y
@@ -1453,6 +1386,84 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         );
     }
 }
+
+fn help_lines(app: &ReviewApp) -> &'static [&'static str] {
+    if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
+        BUILD_HELP_LINES
+    } else if app.review.is_repository_review() {
+        REPOSITORY_HELP_LINES
+    } else {
+        DIFF_HELP_LINES
+    }
+}
+
+const BUILD_HELP_LINES: &[&str] = &[
+    " Build Review Help",
+    "",
+    " m                   switch to review mode",
+    " g/G                first / last build row",
+    " j/k or arrows       move selection",
+    " A/+                add source menu / add file source",
+    " T                  rename workspace",
+    " R                  refresh/rematerialize sources",
+    " I/E/V              include all / exclude all / invert sources",
+    " n/N/z              next / previous / exclude empty sources",
+    " d/Z                next diagnostic source / exclude error sources",
+    " M/X/P              merge-base / remove excluded / remove duplicates",
+    " O/Y                open source surface / source for surface",
+    " f or ctrl-p         fuzzy file picker",
+    " enter               inspect/open selected item",
+    " t                   cycle included/repo/threads/sources",
+    " b                   toggle sidebar",
+    " ?                   toggle this help",
+    " q or esc            exit review",
+];
+
+const REPOSITORY_HELP_LINES: &[&str] = &[
+    " Repository Review Help",
+    "",
+    " j/k or arrows       move tree selection",
+    " enter/right         open file or expand directory",
+    " left                collapse directory/parent",
+    " f or ctrl-p         fuzzy file picker",
+    " :                   jump to line",
+    " /                   search current file",
+    " n/N                 next/previous search match",
+    " v                   select/clear line range",
+    " c                   create draft comment",
+    " a                   ask Bcode about selected line",
+    " x                   publish/export review",
+    " t                   cycle included/repo/threads/sources",
+    " b                   toggle sidebar",
+    " ?                   toggle this help",
+    " q or esc            exit review",
+];
+
+const DIFF_HELP_LINES: &[&str] = &[
+    " Code Review Help",
+    "",
+    " j/k or arrows       move through diff, comments, and actions",
+    " n/p                 next/previous file",
+    " J/K                 next/previous hunk",
+    " [/]/                previous/next review thread",
+    " {/}                 previous/next draft comment",
+    " Enter               fold thread or activate selected action",
+    " U/Z                 expand/collapse all inline threads",
+    " B                   switch to build/source mode",
+    " b                   toggle sidebar",
+    " t                   cycle included/repo/threads/sources",
+    " mouse wheel         scroll diff",
+    " click file          open file",
+    " c                   create draft comment or reply",
+    " x                   publish/export review",
+    " v                   select/clear line range",
+    " a                   ask Bcode about selected line/thread",
+    " o                   open linked Bcode session",
+    " e                   edit selected/latest draft",
+    " D                   delete selected/latest draft",
+    " ?                   toggle this help",
+    " q or esc            exit review",
+];
 
 fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let Some(state) = &app.publish_state else {

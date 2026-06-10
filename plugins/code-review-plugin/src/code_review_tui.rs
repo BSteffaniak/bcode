@@ -1511,7 +1511,9 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
             true
         }
         KeyCode::Escape => {
-            let cleared = app.clear_range_selection();
+            let cleared = app.clear_range_selection()
+                || app.clear_selected_view_target()
+                || app.expand_all_inline_threads();
             if !cleared {
                 app.should_exit = true;
             }
@@ -4840,6 +4842,16 @@ impl ReviewApp {
         true
     }
 
+    /// Clear selected inline review target.
+    pub fn clear_selected_view_target(&mut self) -> bool {
+        if self.selected_view_target.is_none() {
+            return false;
+        }
+        self.selected_view_target = None;
+        self.status_message = Some("cleared inline selection".to_string());
+        true
+    }
+
     /// Select next draft comment in the main pane.
     pub fn select_next_inline_draft(&mut self) -> bool {
         self.select_relative_inline_comment(1)
@@ -6536,6 +6548,18 @@ impl ReviewApp {
         }
         self.current_review_view_document()
             .and_then(|document| document.visual_row_for_source_row(self.selected_diff_line))
+            .or_else(|| {
+                self.current_review_view_document().and_then(|document| {
+                    document.rows.iter().find_map(|row| match &row.target {
+                        ReviewViewTarget::Thread { thread_key }
+                            if self.collapsed_review_threads.contains(thread_key) =>
+                        {
+                            Some(row.visual_row)
+                        }
+                        _ => None,
+                    })
+                })
+            })
             .unwrap_or(self.selected_diff_line)
     }
 
