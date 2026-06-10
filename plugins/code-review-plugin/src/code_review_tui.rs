@@ -1604,22 +1604,26 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.sidebar_mode == ReviewSidebarMode::Threads {
-                app.thread_index_at(mouse.position.x, mouse.position.y)
-                    .is_some_and(|index| {
-                        app.select_thread(index);
-                        app.jump_to_selected_thread()
-                    })
-            } else if app.review.is_repository_review() {
-                match app.file_tree_row_at(mouse.position.x, mouse.position.y) {
-                    Some(ReviewFileTreeRow::Directory { path, .. }) => {
-                        app.toggle_file_tree_directory(&path)
+            if app.file_area_contains(mouse.position.x, mouse.position.y) {
+                if app.sidebar_mode == ReviewSidebarMode::Threads {
+                    app.thread_index_at(mouse.position.x, mouse.position.y)
+                        .is_some_and(|index| {
+                            app.select_thread(index);
+                            app.jump_to_selected_thread()
+                        })
+                } else if app.review.is_repository_review() {
+                    match app.file_tree_row_at(mouse.position.x, mouse.position.y) {
+                        Some(ReviewFileTreeRow::Directory { path, .. }) => {
+                            app.toggle_file_tree_directory(&path)
+                        }
+                        Some(ReviewFileTreeRow::File { index, .. }) => app.select_file(index),
+                        None => false,
                     }
-                    Some(ReviewFileTreeRow::File { index, .. }) => app.select_file(index),
-                    None => false,
+                } else if let Some(index) = app.file_index_at(mouse.position.x, mouse.position.y) {
+                    app.select_file(index)
+                } else {
+                    false
                 }
-            } else if let Some(index) = app.file_index_at(mouse.position.x, mouse.position.y) {
-                app.select_file(index)
             } else if let Some(index) = app.diff_line_index_at(mouse.position.x, mouse.position.y) {
                 app.select_diff_line(index)
             } else {
