@@ -4838,14 +4838,14 @@ impl ReviewApp {
         let Some(current_anchor) = self.selected_comment_anchor() else {
             return self.jump_to_thread_index(0);
         };
-        let summaries = self.thread_summaries();
+        let summaries = self.inline_thread_summaries();
         let Some(current_index) = summaries
             .iter()
             .position(|thread| thread.anchor == current_anchor)
         else {
             return self.jump_to_thread_index(0);
         };
-        self.jump_to_thread_index(
+        self.jump_to_thread_summary_index(
             current_index
                 .saturating_add(1)
                 .min(summaries.len().saturating_sub(1)),
@@ -4857,14 +4857,14 @@ impl ReviewApp {
         let Some(current_anchor) = self.selected_comment_anchor() else {
             return self.jump_to_thread_index(0);
         };
-        let summaries = self.thread_summaries();
+        let summaries = self.inline_thread_summaries();
         let Some(current_index) = summaries
             .iter()
             .position(|thread| thread.anchor == current_anchor)
         else {
             return self.jump_to_thread_index(0);
         };
-        self.jump_to_thread_index(current_index.saturating_sub(1))
+        self.jump_to_thread_summary_index(current_index.saturating_sub(1))
     }
 
     fn jump_to_thread_index(&mut self, index: usize) -> bool {
@@ -4873,13 +4873,44 @@ impl ReviewApp {
             return true;
         };
         self.selected_thread = index;
+        self.focus_thread_summary(&thread);
+        true
+    }
+
+    fn jump_to_thread_summary_index(&mut self, index: usize) -> bool {
+        let Some(thread) = self.inline_thread_summaries().get(index).cloned() else {
+            self.status_message = Some("no review threads".to_string());
+            return true;
+        };
+        self.sync_selected_thread_to_specific_anchor(&thread.anchor);
+        self.focus_thread_summary(&thread);
+        true
+    }
+
+    fn inline_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        let mut summaries = self
+            .thread_summaries()
+            .into_iter()
+            .filter(|thread| thread.anchor.file_index == self.selected_file)
+            .collect::<Vec<_>>();
+        summaries.sort_by_key(|thread| {
+            (
+                thread.anchor.file_index,
+                thread.anchor.start_diff_row(),
+                thread.anchor.end_diff_row(),
+                thread.anchor.path.clone(),
+            )
+        });
+        summaries
+    }
+
+    fn focus_thread_summary(&mut self, thread: &ReviewThreadSummary) {
         self.select_anchor(&thread.anchor);
         self.selected_view_target = Some(ReviewViewTarget::Thread {
             thread_key: Self::thread_key_for_anchor(&thread.anchor),
         });
         self.ensure_selected_diff_line_visible();
         self.status_message = Some("selected review thread".to_string());
-        true
     }
 
     /// Jump to the selected thread in the diff.
@@ -6627,6 +6658,119 @@ mod tests {
                 },
             ],
         })
+    }
+
+    #[test]
+    fn inline_thread_navigation_selects_next_thread_target() {
+        let mut app = sample_app();
+        let first = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 1,
+            end_diff_row: None,
+            old_line: Some(1),
+            new_line: None,
+            old_start: Some(1),
+            old_end: Some(1),
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Removed,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let second = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        for anchor in [first.clone(), second.clone()] {
+            app.draft_comments.insert(
+                anchor,
+                vec![ReviewDraftComment {
+                    id: Some("comment".to_string()),
+                    body: "note".to_string(),
+                    persisted: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    session_id: None,
+                }],
+            );
+        }
+        app.select_anchor(&first);
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: ReviewApp::thread_key_for_anchor(&first),
+        });
+
+        assert!(app.select_next_inline_thread());
+
+        assert_eq!(app.selected_diff_line, second.diff_row);
+        assert_eq!(
+            app.selected_view_target,
+            Some(ReviewViewTarget::Thread {
+                thread_key: ReviewApp::thread_key_for_anchor(&second),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_view_document_includes_inline_thread_actions() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor.clone(),
+            vec![ReviewDraftComment {
+                id: Some("comment-1".to_string()),
+                body: "Looks risky".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+
+        let document = app.current_review_view_document().expect("document");
+        let thread_key = ReviewApp::thread_key_for_anchor(&anchor);
+
+        assert!(document.rows.iter().any(|row| {
+            row.target
+                == ReviewViewTarget::Thread {
+                    thread_key: thread_key.clone(),
+                }
+        }));
+        assert!(document.rows.iter().any(|row| {
+            row.target
+                == ReviewViewTarget::ThreadAction {
+                    thread_key: thread_key.clone(),
+                    action: "reply".to_string(),
+                }
+        }));
     }
 
     #[test]
