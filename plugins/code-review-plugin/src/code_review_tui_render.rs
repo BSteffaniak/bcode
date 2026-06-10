@@ -935,13 +935,17 @@ fn render_view_document(
         let Some(view_row) = document.row_for_visual_row(visual_row) else {
             break;
         };
-        let rendered = render_view_row(
+        let mut rendered = render_view_row(
             app,
             view_row,
             syntax_highlighter,
             can_highlight,
             &syntax_hint,
         );
+        if app.is_view_target_selected(&view_row.target) {
+            rendered.line = selected_line(&rendered.line);
+            rendered.style = rendered.style.bg(Color::BrightBlack);
+        }
         frame.write_line_with_fallback_style(
             Rect::new(area.x, y, area.width, 1),
             &rendered.line,

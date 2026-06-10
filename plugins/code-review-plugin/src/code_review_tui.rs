@@ -31,7 +31,7 @@ use bmux_tui::terminal::Terminal;
 use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
-use crate::code_review_tui_view::{ReviewThreadAnchor, ReviewViewDocument};
+use crate::code_review_tui_view::{ReviewThreadAnchor, ReviewViewDocument, ReviewViewTarget};
 use crate::tui_host_types::{TuiError, helpers};
 
 const SERVICE_INTERFACE_ID: &str = CODE_REVIEW_SERVICE_INTERFACE_ID;
@@ -1625,8 +1625,14 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
                 } else {
                     false
                 }
-            } else if let Some(index) = app.diff_line_index_at(mouse.position.x, mouse.position.y) {
-                app.begin_mouse_range_selection(index)
+            } else if let Some(visual_row) =
+                app.view_visual_row_at(mouse.position.x, mouse.position.y)
+            {
+                let selected = app.select_view_visual_row(visual_row);
+                let Some(index) = app.diff_line_index_at(mouse.position.x, mouse.position.y) else {
+                    return selected;
+                };
+                app.begin_mouse_range_selection(index) || selected
             } else {
                 false
             }
@@ -2910,6 +2916,8 @@ pub struct ReviewApp {
     pub range_selection_start: Option<usize>,
     mouse_range_selection_start: Option<usize>,
     mouse_range_selection_dragged: bool,
+    /// Selected inline review target, if selection is on a non-source row.
+    pub selected_view_target: Option<ReviewViewTarget>,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -2961,6 +2969,7 @@ impl ReviewApp {
             range_selection_start: None,
             mouse_range_selection_start: None,
             mouse_range_selection_dragged: false,
+            selected_view_target: None,
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -4887,6 +4896,7 @@ impl ReviewApp {
         self.range_selection_start = None;
         self.mouse_range_selection_start = None;
         self.mouse_range_selection_dragged = false;
+        self.selected_view_target = None;
         self.restore_current_file_viewport();
         self.queue_selected_file_load();
         self.expand_selected_file_dirs();
@@ -5107,12 +5117,53 @@ impl ReviewApp {
     /// Select a visible diff line by rendered row index.
     pub fn select_diff_line(&mut self, index: usize) -> bool {
         let clamped = index.min(self.source_rendered_diff_len().saturating_sub(1));
+        self.selected_view_target = None;
         if clamped == self.selected_diff_line {
             return false;
         }
         self.selected_diff_line = clamped;
         self.ensure_selected_diff_line_visible();
         true
+    }
+
+    /// Select a semantic row in the current review view document.
+    pub fn select_view_visual_row(&mut self, visual_row: usize) -> bool {
+        let Some(document) = self.current_review_view_document() else {
+            return self.select_diff_line(visual_row);
+        };
+        let Some(row) = document.row_for_visual_row(visual_row) else {
+            return false;
+        };
+        match &row.target {
+            ReviewViewTarget::SourceLine { source_row, .. }
+            | ReviewViewTarget::HunkHeader { source_row, .. } => self.select_diff_line(*source_row),
+            target => {
+                if self.selected_view_target.as_ref() == Some(target) {
+                    return false;
+                }
+                self.selected_view_target = Some(target.clone());
+                self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
+                true
+            }
+        }
+    }
+
+    /// Return the selected semantic target in the current review view.
+    #[must_use]
+    pub fn selected_review_view_target(&self) -> Option<ReviewViewTarget> {
+        self.selected_view_target.clone().or_else(|| {
+            self.current_review_view_document().and_then(|document| {
+                document
+                    .visual_row_for_source_row(self.selected_diff_line)
+                    .and_then(|visual_row| document.target_for_visual_row(visual_row).cloned())
+            })
+        })
+    }
+
+    /// Return whether the provided view target is selected.
+    #[must_use]
+    pub fn is_view_target_selected(&self, target: &ReviewViewTarget) -> bool {
+        self.selected_review_view_target().as_ref() == Some(target)
     }
 
     /// Start a mouse-driven range selection from a rendered diff row.
@@ -5202,13 +5253,22 @@ impl ReviewApp {
             return None;
         }
         let visual_row = self.diff_scroll + usize::from(y.saturating_sub(area.y));
-        self.current_review_view_document()
-            .and_then(|document| {
-                document
-                    .row_for_visual_row(visual_row)
-                    .and_then(|row| row.source_row)
-            })
-            .or(Some(visual_row))
+        if let Some(document) = self.current_review_view_document() {
+            return document
+                .row_for_visual_row(visual_row)
+                .and_then(|row| row.source_row);
+        }
+        Some(visual_row)
+    }
+
+    /// Return visible semantic row index under terminal coordinates.
+    #[must_use]
+    pub fn view_visual_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let area = self.last_diff_area?;
+        if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+            return None;
+        }
+        Some(self.diff_scroll + usize::from(y.saturating_sub(area.y)))
     }
 
     /// Return total draft comment count.
@@ -6135,6 +6195,17 @@ impl ReviewApp {
     }
 
     fn selected_diff_visual_row(&self) -> usize {
+        if let Some(target) = &self.selected_view_target
+            && let Some(visual_row) = self.current_review_view_document().and_then(|document| {
+                document
+                    .rows
+                    .iter()
+                    .find(|row| &row.target == target)
+                    .map(|row| row.visual_row)
+            })
+        {
+            return visual_row;
+        }
         self.current_review_view_document()
             .and_then(|document| document.visual_row_for_source_row(self.selected_diff_line))
             .unwrap_or(self.selected_diff_line)
