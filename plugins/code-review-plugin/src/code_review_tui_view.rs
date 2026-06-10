@@ -109,6 +109,7 @@ impl ReviewViewDocument {
         drafts: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewDraftComment>)>,
         collapsed_threads: &BTreeSet<String>,
         resolved_threads: &BTreeSet<String>,
+        show_resolved_threads: bool,
     ) -> Self {
         let mut threads = drafts
             .filter(|(anchor, comments)| anchor.file_index == file_index && !comments.is_empty())
@@ -129,6 +130,9 @@ impl ReviewViewDocument {
                 let thread_key = anchor.thread_key();
                 let collapsed = collapsed_threads.contains(&thread_key);
                 let resolved = resolved_threads.contains(&thread_key);
+                if resolved && !show_resolved_threads {
+                    continue;
+                }
                 rows.push(ReviewViewRow {
                     visual_row: 0,
                     source_row: None,
@@ -539,6 +543,7 @@ mod tests {
                 std::iter::once((anchor.clone(), vec![comment])),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
+                true,
             );
 
         assert_eq!(document.rows.len(), 10);
@@ -587,6 +592,7 @@ mod tests {
                 std::iter::once((anchor, vec![comment])),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
+                true,
             );
 
         assert!(matches!(

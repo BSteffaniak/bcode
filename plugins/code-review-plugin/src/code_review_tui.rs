@@ -1561,6 +1561,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('{') => app.select_previous_inline_draft(),
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
+        KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
         KeyCode::Char('Z') => app.collapse_all_inline_threads(),
@@ -2937,6 +2938,8 @@ pub struct ReviewApp {
     pub collapsed_review_threads: BTreeSet<String>,
     /// Locally resolved inline review thread keys.
     pub resolved_review_threads: BTreeSet<String>,
+    /// Whether resolved inline review threads are visible.
+    pub show_resolved_threads: bool,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -2991,6 +2994,7 @@ impl ReviewApp {
             selected_view_target: None,
             collapsed_review_threads: BTreeSet::new(),
             resolved_review_threads: BTreeSet::new(),
+            show_resolved_threads: true,
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -6199,6 +6203,26 @@ impl ReviewApp {
         self.activate_selected_inline_action() || self.toggle_selected_inline_thread()
     }
 
+    /// Toggle resolved inline review thread visibility.
+    pub fn toggle_show_resolved_threads(&mut self) -> bool {
+        self.show_resolved_threads = !self.show_resolved_threads;
+        if self.show_resolved_threads {
+            self.status_message = Some("showing resolved review threads".to_string());
+        } else {
+            self.status_message = Some("hiding resolved review threads".to_string());
+            if self.selected_view_target.as_ref().is_some_and(|target| {
+                self.anchor_for_view_target(target).is_some_and(|anchor| {
+                    self.resolved_review_threads
+                        .contains(&Self::thread_key_for_anchor(&anchor))
+                })
+            }) {
+                self.selected_view_target = None;
+            }
+        }
+        self.ensure_selected_diff_line_visible();
+        true
+    }
+
     /// Toggle selected thread resolved state locally.
     pub fn toggle_selected_thread_resolved(&mut self) -> bool {
         let Some(thread_key) = self.selected_thread_key() else {
@@ -6755,6 +6779,7 @@ impl ReviewApp {
             }),
             &self.collapsed_review_threads,
             &self.resolved_review_threads,
+            self.show_resolved_threads,
         );
         Some(document)
     }
@@ -7123,6 +7148,50 @@ mod tests {
         )));
         assert!(app.toggle_selected_thread_resolved());
         assert!(!app.resolved_review_threads.contains(&thread_key));
+    }
+
+    #[test]
+    fn hiding_resolved_threads_removes_them_from_document() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let thread_key = ReviewApp::thread_key_for_anchor(&anchor);
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment-1".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+        app.resolved_review_threads.insert(thread_key.clone());
+
+        assert!(app.toggle_show_resolved_threads());
+
+        let document = app.current_review_view_document().expect("document");
+        assert!(!document.rows.iter().any(|row| {
+            row.target
+                == ReviewViewTarget::Thread {
+                    thread_key: thread_key.clone(),
+                }
+        }));
     }
 
     #[test]
