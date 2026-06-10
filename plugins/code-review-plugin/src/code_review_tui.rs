@@ -2613,6 +2613,8 @@ pub struct ReviewThreadSummary {
     pub latest_body: String,
     /// Linked Bcode session id, when present.
     pub session_id: Option<String>,
+    /// Whether the thread is locally resolved.
+    pub resolved: bool,
 }
 
 /// Pending publish request.
@@ -4811,6 +4813,9 @@ impl ReviewApp {
                     draft_count: comments.len(),
                     latest_body: latest.body.clone(),
                     session_id: latest.session_id.clone(),
+                    resolved: self
+                        .resolved_review_threads
+                        .contains(&Self::thread_key_for_anchor(anchor)),
                 })
             })
             .collect()
@@ -6419,8 +6424,9 @@ impl ReviewApp {
             .session_id
             .as_deref()
             .map_or(String::new(), |session_id| format!("  🤖 {session_id}"));
+        let status = if thread.resolved { "resolved" } else { "open" };
         Some(format!(
-            " thread {} {range} x{}:{linked} {}  Enter jump  a ask/follow up  o open ",
+            " {status} thread {} {range} x{}:{linked} {}  Enter jump  r resolve/reopen  a ask/follow up  o open ",
             thread.anchor.path, thread.draft_count, thread.latest_body
         ))
     }
@@ -7896,5 +7902,30 @@ mod tests {
         let preview = app.selected_thread_preview().expect("thread preview");
         assert!(preview.contains("🤖"));
         assert!(preview.contains("Needs a test"));
+    }
+
+    #[test]
+    fn thread_summary_tracks_resolved_state() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor should open")
+            .buffer
+            .insert_str("Needs a test");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        app.resolved_review_threads
+            .insert(ReviewApp::thread_key_for_anchor(&anchor));
+
+        let summary = app.thread_summaries().pop().expect("thread summary");
+
+        assert!(summary.resolved);
+        assert!(
+            app.selected_thread_preview()
+                .expect("thread preview")
+                .contains("resolved thread")
+        );
     }
 }

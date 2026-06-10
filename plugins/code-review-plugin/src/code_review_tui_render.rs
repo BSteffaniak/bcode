@@ -563,10 +563,11 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             } else {
                 Style::new().fg(Color::White).bg(Color::Black)
             };
-            let marker = if thread.session_id.is_some() {
-                "🤖💬"
-            } else {
-                "💬"
+            let marker = match (thread.resolved, thread.session_id.is_some()) {
+                (true, true) => "✓🤖",
+                (true, false) => "✓",
+                (false, true) => "🤖💬",
+                (false, false) => "💬",
             };
             let line_label = thread
                 .anchor
@@ -577,8 +578,9 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                     |line| format!("+{line}"),
                 );
             let body = thread.latest_body.lines().next().unwrap_or_default();
+            let status = if thread.resolved { "resolved" } else { "open" };
             let text = format!(
-                " {marker} {} {line_label} x{}  {body}",
+                " {marker} {status} {} {line_label} x{}  {body}",
                 thread.anchor.path, thread.draft_count
             );
             frame.write_line_with_fallback_style(
