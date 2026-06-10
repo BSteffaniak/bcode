@@ -31,7 +31,9 @@ use bmux_tui::terminal::Terminal;
 use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
-use crate::code_review_tui_view::{ReviewThreadAnchor, ReviewViewDocument, ReviewViewTarget};
+use crate::code_review_tui_view::{
+    ReviewThreadAction, ReviewThreadAnchor, ReviewViewDocument, ReviewViewTarget,
+};
 use crate::tui_host_types::{TuiError, helpers};
 
 const SERVICE_INTERFACE_ID: &str = CODE_REVIEW_SERVICE_INTERFACE_ID;
@@ -1553,6 +1555,8 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Right => app.expand_selected_tree_row(),
         KeyCode::Char('p') => app.select_previous_file(),
         KeyCode::Left => app.collapse_selected_tree_row(),
+        KeyCode::Char(']') => app.select_next_inline_thread(),
+        KeyCode::Char('[') => app.select_previous_inline_thread(),
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
         KeyCode::Char('v') => app.toggle_range_selection(),
@@ -4829,6 +4833,55 @@ impl ReviewApp {
         true
     }
 
+    /// Select next review thread in the main pane.
+    pub fn select_next_inline_thread(&mut self) -> bool {
+        let Some(current_anchor) = self.selected_comment_anchor() else {
+            return self.jump_to_thread_index(0);
+        };
+        let summaries = self.thread_summaries();
+        let Some(current_index) = summaries
+            .iter()
+            .position(|thread| thread.anchor == current_anchor)
+        else {
+            return self.jump_to_thread_index(0);
+        };
+        self.jump_to_thread_index(
+            current_index
+                .saturating_add(1)
+                .min(summaries.len().saturating_sub(1)),
+        )
+    }
+
+    /// Select previous review thread in the main pane.
+    pub fn select_previous_inline_thread(&mut self) -> bool {
+        let Some(current_anchor) = self.selected_comment_anchor() else {
+            return self.jump_to_thread_index(0);
+        };
+        let summaries = self.thread_summaries();
+        let Some(current_index) = summaries
+            .iter()
+            .position(|thread| thread.anchor == current_anchor)
+        else {
+            return self.jump_to_thread_index(0);
+        };
+        self.jump_to_thread_index(current_index.saturating_sub(1))
+    }
+
+    fn jump_to_thread_index(&mut self, index: usize) -> bool {
+        let Some(thread) = self.thread_summaries().get(index).cloned() else {
+            self.status_message = Some("no review threads".to_string());
+            return true;
+        };
+        self.selected_thread = index;
+        self.select_anchor(&thread.anchor);
+        self.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: Self::thread_key_for_anchor(&thread.anchor),
+        });
+        self.ensure_selected_diff_line_visible();
+        self.status_message = Some("selected review thread".to_string());
+        true
+    }
+
     /// Jump to the selected thread in the diff.
     pub fn jump_to_selected_thread(&mut self) -> bool {
         if self.sidebar_mode != ReviewSidebarMode::Threads {
@@ -4839,6 +4892,10 @@ impl ReviewApp {
             return true;
         };
         self.select_anchor(&thread.anchor);
+        self.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: Self::thread_key_for_anchor(&thread.anchor),
+        });
+        self.ensure_selected_diff_line_visible();
         self.status_message = Some("jumped to review thread".to_string());
         true
     }
@@ -5183,7 +5240,8 @@ impl ReviewApp {
                     return false;
                 }
                 self.selected_view_target = Some(target.clone());
-                self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
+                self.sync_selected_thread_to_view_target(target);
+                self.ensure_selected_diff_line_visible();
                 true
             }
         }
@@ -5611,12 +5669,34 @@ impl ReviewApp {
         let Some(anchor) = self.selected_comment_anchor() else {
             return;
         };
+        self.sync_selected_thread_to_specific_anchor(&anchor);
+    }
+
+    fn sync_selected_thread_to_view_target(&mut self, target: &ReviewViewTarget) {
+        let Some(anchor) = self.anchor_for_view_target(target) else {
+            return;
+        };
+        self.sync_selected_thread_to_specific_anchor(&anchor);
+    }
+
+    fn sync_selected_thread_to_specific_anchor(&mut self, anchor: &ReviewCommentAnchor) {
         if let Some(index) = self
             .thread_summaries()
             .iter()
-            .position(|thread| thread.anchor == anchor)
+            .position(|thread| thread.anchor == *anchor)
         {
             self.selected_thread = index;
+        }
+    }
+
+    fn anchor_for_view_target(&self, target: &ReviewViewTarget) -> Option<ReviewCommentAnchor> {
+        match target {
+            ReviewViewTarget::Thread { thread_key }
+            | ReviewViewTarget::Comment { thread_key, .. }
+            | ReviewViewTarget::ThreadAction { thread_key, .. } => {
+                self.draft_anchor_for_thread_key(thread_key)
+            }
+            ReviewViewTarget::HunkHeader { .. } | ReviewViewTarget::SourceLine { .. } => None,
         }
     }
 
@@ -5908,13 +5988,13 @@ impl ReviewApp {
         else {
             return false;
         };
-        match action.as_str() {
-            "reply" => self.open_comment_editor(),
-            "edit" => self.open_latest_draft_editor(),
-            "delete" => self.delete_latest_draft_at_selection(),
-            "ask" => self.ask_bcode_about_selection(),
-            "publish" => self.publish_review(),
-            _ => false,
+        match ReviewThreadAction::from_id(&action) {
+            Some(ReviewThreadAction::Reply) => self.open_comment_editor(),
+            Some(ReviewThreadAction::Edit) => self.open_latest_draft_editor(),
+            Some(ReviewThreadAction::Delete) => self.delete_latest_draft_at_selection(),
+            Some(ReviewThreadAction::AskBcode) => self.ask_bcode_about_selection(),
+            Some(ReviewThreadAction::Publish) => self.publish_review(),
+            None => false,
         }
     }
 

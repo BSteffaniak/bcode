@@ -322,6 +322,19 @@ impl ReviewThreadAction {
             Self::Publish => "publish",
         }
     }
+
+    /// Parse a stable action id.
+    #[must_use]
+    pub const fn from_id(id: &str) -> Option<Self> {
+        match id.as_bytes() {
+            b"reply" => Some(Self::Reply),
+            b"edit" => Some(Self::Edit),
+            b"delete" => Some(Self::Delete),
+            b"ask" => Some(Self::AskBcode),
+            b"publish" => Some(Self::Publish),
+            _ => None,
+        }
+    }
 }
 
 /// Stable semantic target for selection, mouse, and actions.

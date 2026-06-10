@@ -201,7 +201,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 let linked = app
                     .selected_draft_session_id()
                     .map_or(String::new(), |_| "  🤖 session linked".to_string());
-                return format!(" {preview}{linked}  a ask/follow up  o open  e edit  D delete latest draft ");
+                return format!(" {preview}{linked}  [/]/ thread  c reply  a ask/follow up  o open  e edit  D delete ");
             }
             if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
                 return app.selected_thread_preview().unwrap_or_else(|| {
@@ -217,7 +217,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 );
             }
             format!(
-                " j/k scroll  n/p file  J/K hunk  c comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k move  [/]/ thread  n/p file  J/K hunk  c comment/reply  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
