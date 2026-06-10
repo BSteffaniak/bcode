@@ -4090,7 +4090,7 @@ impl ReviewApp {
         {
             self.select_next_tree_row(rows)
         } else {
-            self.scroll_down(rows)
+            self.select_next_view_row(rows)
         }
     }
 
@@ -4106,7 +4106,7 @@ impl ReviewApp {
         {
             self.select_previous_tree_row(rows)
         } else {
-            self.scroll_up(rows)
+            self.select_previous_view_row(rows)
         }
     }
 
@@ -5037,6 +5037,34 @@ impl ReviewApp {
         self.select_file(self.selected_file.saturating_sub(1))
     }
 
+    /// Move visual review selection down.
+    pub fn select_next_view_row(&mut self, rows: usize) -> bool {
+        let Some(document) = self.current_review_view_document() else {
+            return self.scroll_down(rows);
+        };
+        let current = self.selected_diff_visual_row();
+        let next = current
+            .saturating_add(rows)
+            .min(document.rows.len().saturating_sub(1));
+        if next == current {
+            return false;
+        }
+        self.select_view_visual_row(next)
+    }
+
+    /// Move visual review selection up.
+    pub fn select_previous_view_row(&mut self, rows: usize) -> bool {
+        let Some(_) = self.current_review_view_document() else {
+            return self.scroll_up(rows);
+        };
+        let current = self.selected_diff_visual_row();
+        let previous = current.saturating_sub(rows);
+        if previous == current {
+            return false;
+        }
+        self.select_view_visual_row(previous)
+    }
+
     /// Scroll diff down.
     pub fn scroll_down(&mut self, rows: usize) -> bool {
         let max = self.max_diff_scroll();
@@ -5067,11 +5095,13 @@ impl ReviewApp {
     }
 
     /// Scroll to top.
-    pub const fn scroll_to_top(&mut self) -> bool {
+    pub fn scroll_to_top(&mut self) -> bool {
         if self.diff_scroll == 0 {
             return false;
         }
+        self.selected_view_target = None;
         self.diff_scroll = 0;
+        self.ensure_selected_diff_line_visible();
         true
     }
 
@@ -5081,7 +5111,10 @@ impl ReviewApp {
         if self.diff_scroll == max {
             return false;
         }
+        self.selected_view_target = None;
         self.diff_scroll = max;
+        self.selected_diff_line = self.source_rendered_diff_len().saturating_sub(1);
+        self.ensure_selected_diff_line_visible();
         true
     }
 
