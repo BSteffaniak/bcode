@@ -1380,6 +1380,7 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         }
         KeyCode::Char('j') | KeyCode::Down => app.publish_down(1),
         KeyCode::Char('k') | KeyCode::Up => app.publish_up(1),
+        KeyCode::Char('p') => app.back_to_publish_preview(),
         KeyCode::Enter => app.confirm_publish_selection(),
         _ => false,
     }
@@ -2972,6 +2973,17 @@ pub enum ReviewPublishState {
     },
     /// Preview content.
     Preview {
+        /// Publisher id.
+        publisher_id: String,
+        /// Publisher options.
+        options: Vec<ReviewPublishOption>,
+        /// Preview text.
+        preview: String,
+        /// Top visible preview line.
+        scroll: usize,
+    },
+    /// Submit confirmation.
+    ConfirmSubmit {
         /// Publisher id.
         publisher_id: String,
         /// Publisher options.
@@ -6111,9 +6123,14 @@ impl ReviewApp {
                 *selected = next;
                 true
             }
-            Some(ReviewPublishState::Preview {
-                scroll, preview, ..
-            }) => {
+            Some(
+                ReviewPublishState::Preview {
+                    scroll, preview, ..
+                }
+                | ReviewPublishState::ConfirmSubmit {
+                    scroll, preview, ..
+                },
+            ) => {
                 let max = preview.lines().count().saturating_sub(1);
                 let next = scroll.saturating_add(rows).min(max);
                 if next == *scroll {
@@ -6145,7 +6162,10 @@ impl ReviewApp {
                 *selected = next;
                 true
             }
-            Some(ReviewPublishState::Preview { scroll, .. }) => {
+            Some(
+                ReviewPublishState::Preview { scroll, .. }
+                | ReviewPublishState::ConfirmSubmit { scroll, .. },
+            ) => {
                 let next = scroll.saturating_sub(rows);
                 if next == *scroll {
                     return false;
@@ -6215,10 +6235,32 @@ impl ReviewApp {
         match &self.publish_state {
             Some(
                 ReviewPublishState::Options { options, .. }
-                | ReviewPublishState::Preview { options, .. },
+                | ReviewPublishState::Preview { options, .. }
+                | ReviewPublishState::ConfirmSubmit { options, .. },
             ) => options.clone(),
             _ => Vec::new(),
         }
+    }
+
+    /// Return from submit confirmation to preview.
+    pub fn back_to_publish_preview(&mut self) -> bool {
+        let Some(ReviewPublishState::ConfirmSubmit {
+            publisher_id,
+            options,
+            preview,
+            scroll,
+        }) = self.publish_state.take()
+        else {
+            return false;
+        };
+        self.publish_state = Some(ReviewPublishState::Preview {
+            publisher_id,
+            options,
+            preview,
+            scroll,
+        });
+        self.status_message = Some("returned to review publish preview".to_string());
+        true
     }
 
     /// Confirm current publish UI selection.
@@ -6258,7 +6300,26 @@ impl ReviewApp {
                 self.status_message = Some(format!("previewing publisher {publisher_id}"));
                 true
             }
-            Some(ReviewPublishState::Preview {
+            Some(ReviewPublishState::Preview { .. }) => {
+                let Some(ReviewPublishState::Preview {
+                    publisher_id,
+                    options,
+                    preview,
+                    scroll,
+                }) = self.publish_state.take()
+                else {
+                    return false;
+                };
+                self.status_message = Some(format!("confirm submit via {publisher_id}"));
+                self.publish_state = Some(ReviewPublishState::ConfirmSubmit {
+                    publisher_id,
+                    options,
+                    preview,
+                    scroll,
+                });
+                true
+            }
+            Some(ReviewPublishState::ConfirmSubmit {
                 publisher_id,
                 options,
                 ..

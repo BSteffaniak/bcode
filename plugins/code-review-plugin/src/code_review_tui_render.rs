@@ -1562,7 +1562,13 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             preview,
             scroll,
             ..
-        } => render_publish_preview(publisher_id, preview, *scroll, popup, frame),
+        } => render_publish_preview(publisher_id, preview, *scroll, false, popup, frame),
+        ReviewPublishState::ConfirmSubmit {
+            publisher_id,
+            preview,
+            scroll,
+            ..
+        } => render_publish_preview(publisher_id, preview, *scroll, true, popup, frame),
     }
 }
 
@@ -1669,6 +1675,7 @@ fn render_publish_preview(
     publisher_id: &str,
     preview: &str,
     scroll: usize,
+    confirming: bool,
     popup: Rect,
     frame: &mut Frame<'_>,
 ) {
@@ -1680,7 +1687,11 @@ fn render_publish_preview(
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            format!(" Preview {publisher_id}  Enter submit  Esc cancel "),
+            if confirming {
+                format!(" Confirm submit {publisher_id}  Enter publish  Esc cancel ")
+            } else {
+                format!(" Preview {publisher_id}  Enter confirm  Esc cancel ")
+            },
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -1702,6 +1713,21 @@ fn render_publish_preview(
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(line, usize::from(popup.width.saturating_sub(2))),
                 Style::new().fg(Color::White).bg(Color::BrightBlack),
+            )]),
+        );
+    }
+    if confirming {
+        let warning = " This will publish the review. Press Enter again to submit. ";
+        frame.write_line(
+            Rect::new(
+                popup.x.saturating_add(1),
+                popup.bottom().saturating_sub(1),
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(warning, usize::from(popup.width.saturating_sub(2))),
+                Style::new().fg(Color::Black).bg(Color::Yellow),
             )]),
         );
     }
