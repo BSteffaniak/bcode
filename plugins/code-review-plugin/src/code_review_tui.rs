@@ -862,81 +862,97 @@ async fn publish_review(
 }
 
 fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
+    let required = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
     schema
         .get("properties")
         .and_then(serde_json::Value::as_object)
         .map(|properties| {
             properties
                 .iter()
-                .filter_map(|(name, schema)| {
-                    let option_type = schema
-                        .get("type")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    ((option_type == "string") || (option_type == "boolean")).then(|| {
-                        let mut label = schema
-                            .get("description")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or(name)
-                            .to_string();
-                        if schema
-                            .get("required")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false)
-                        {
-                            label.push_str(" [required]");
-                        }
-                        if let Some(values) =
-                            schema.get("enum").and_then(serde_json::Value::as_array)
-                        {
-                            let choices = values
-                                .iter()
-                                .filter_map(serde_json::Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join("|");
-                            if !choices.is_empty() {
-                                let _ = write!(label, " [{choices}]");
-                            }
-                        }
-                        let value = schema
-                            .get("default")
-                            .and_then(|value| {
-                                value
-                                    .as_str()
-                                    .map(ToString::to_string)
-                                    .or_else(|| value.as_bool().map(|value| value.to_string()))
-                            })
-                            .unwrap_or_default();
-                        ReviewPublishOption {
-                            name: name.clone(),
-                            label,
-                            value,
-                            choices: schema
-                                .get("enum")
-                                .and_then(serde_json::Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|value| {
-                                    value
-                                        .as_str()
-                                        .map(ToString::to_string)
-                                        .or_else(|| value.as_bool().map(|value| value.to_string()))
-                                })
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .chain(
-                                    (option_type == "boolean")
-                                        .then(|| ["false".to_string(), "true".to_string()])
-                                        .into_iter()
-                                        .flatten(),
-                                )
-                                .collect(),
-                        }
-                    })
-                })
+                .filter_map(|(name, schema)| publish_option_from_schema(name, schema, &required))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn publish_option_from_schema(
+    name: &str,
+    schema: &serde_json::Value,
+    required: &BTreeSet<&str>,
+) -> Option<ReviewPublishOption> {
+    let option_type = schema
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if option_type != "string" && option_type != "boolean" {
+        return None;
+    }
+    Some(ReviewPublishOption {
+        name: name.to_string(),
+        label: publish_option_label(name, schema, required.contains(name)),
+        value: publish_option_default(schema),
+        choices: publish_option_choices(option_type, schema),
+    })
+}
+
+fn publish_option_label(name: &str, schema: &serde_json::Value, required: bool) -> String {
+    let mut label = schema
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(name)
+        .to_string();
+    if required {
+        label.push_str(" [required]");
+    }
+    let choices = publish_option_choices(
+        schema
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        schema,
+    )
+    .join("|");
+    if !choices.is_empty() {
+        let _ = write!(label, " [{choices}]");
+    }
+    label
+}
+
+fn publish_option_default(schema: &serde_json::Value) -> String {
+    schema
+        .get("default")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_bool().map(|value| value.to_string()))
+        })
+        .unwrap_or_default()
+}
+
+fn publish_option_choices(option_type: &str, schema: &serde_json::Value) -> Vec<String> {
+    let mut choices = schema
+        .get("enum")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_bool().map(|value| value.to_string()))
+        })
+        .collect::<Vec<_>>();
+    if option_type == "boolean" && choices.is_empty() {
+        choices.extend(["false".to_string(), "true".to_string()]);
+    }
+    choices
 }
 
 fn options_json(options: Vec<ReviewPublishOption>) -> serde_json::Value {
