@@ -1728,6 +1728,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
         KeyCode::Char('T') => app.cycle_thread_filter(),
+        KeyCode::Char('w') => app.toggle_selected_file_viewed(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
@@ -3154,6 +3155,8 @@ pub struct ReviewApp {
     pub pending_publish_request: Option<PendingPublishRequest>,
     /// Available publishers.
     pub publishers: Vec<ReviewPublisherManifest>,
+    /// Files marked viewed by display path.
+    pub viewed_files: BTreeSet<String>,
     /// Repository file cache for read-only file browsing.
     pub file_cache: ReviewFileCache,
     /// Per-file viewport state keyed by stable file/surface path.
@@ -3230,6 +3233,7 @@ impl ReviewApp {
             pending_thread_resolve: None,
             pending_publish_request: None,
             publishers: Vec::new(),
+            viewed_files: BTreeSet::new(),
             file_cache: ReviewFileCache::default(),
             file_viewports: BTreeMap::new(),
             pending_file_load: None,
@@ -5354,6 +5358,49 @@ impl ReviewApp {
             self.diff_scroll = 0;
             self.selected_diff_line = 0;
         }
+    }
+
+    /// Return whether the file at index is marked viewed.
+    #[must_use]
+    pub fn file_viewed(&self, index: usize) -> bool {
+        self.review
+            .files
+            .get(index)
+            .is_some_and(|file| self.viewed_files.contains(file.display_path()))
+    }
+
+    /// Return reviewed file progress.
+    #[must_use]
+    pub fn viewed_file_counts(&self) -> (usize, usize) {
+        let total = self.review.files.len();
+        let viewed = self
+            .review
+            .files
+            .iter()
+            .filter(|file| self.viewed_files.contains(file.display_path()))
+            .count();
+        (viewed, total)
+    }
+
+    /// Toggle viewed state for the selected review file.
+    pub fn toggle_selected_file_viewed(&mut self) -> bool {
+        let Some(path) = self.selected_file_path() else {
+            self.status_message = Some("no review file selected".to_string());
+            return true;
+        };
+        if self.viewed_files.remove(&path) {
+            self.status_message = Some(format!("marked {path} unviewed"));
+        } else {
+            self.viewed_files.insert(path.clone());
+            self.status_message = Some(format!("marked {path} viewed"));
+        }
+        true
+    }
+
+    /// Return whether the file at index has draft comments.
+    #[must_use]
+    pub fn file_has_drafts(&self, index: usize) -> bool {
+        self.draft_comment_count_for_file(index) > 0
     }
 
     /// Select a file by index.
@@ -8384,5 +8431,18 @@ mod tests {
             panic!("options state expected");
         };
         assert_eq!(options[0].value, "REQUEST_CHANGES");
+    }
+
+    #[test]
+    fn toggles_selected_file_viewed() {
+        let mut app = sample_app();
+        assert_eq!(app.viewed_file_counts(), (0, app.review.files.len()));
+
+        assert!(app.toggle_selected_file_viewed());
+        assert!(app.file_viewed(0));
+        assert_eq!(app.viewed_file_counts(), (1, app.review.files.len()));
+
+        assert!(app.toggle_selected_file_viewed());
+        assert!(!app.file_viewed(0));
     }
 }

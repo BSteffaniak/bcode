@@ -108,6 +108,7 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         format!("  💬 {drafts} draft")
     };
+    let (viewed_files, total_files) = app.viewed_file_counts();
     let thread_label = header_thread_label(app);
     let surface_kind = app
         .review
@@ -140,19 +141,21 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         )
     } else if app.review.is_repository_review() {
         format!(
-            " bcode review  {}  {}  File {}  Surface {}  Line {}{}{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Line {}{}{}  viewed {}/{} ",
             app.review.title,
             file_label,
             file_position,
             surface_kind,
             app.selected_diff_line.saturating_add(1),
             draft_label,
-            thread_label
+            thread_label,
+            viewed_files,
+            total_files
         )
     } else {
         let (hunk, hunk_total) = app.hunk_position();
         format!(
-            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}{}  +{} -{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}{}  viewed {}/{}  +{} -{} ",
             app.review.title,
             file_label,
             file_position,
@@ -161,6 +164,8 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             hunk_total,
             draft_label,
             thread_label,
+            viewed_files,
+            total_files,
             app.review.additions,
             app.review.deletions
         )
@@ -234,7 +239,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  c comment  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  c comment  w viewed  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
@@ -437,6 +442,7 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             render_file_row(
                 file,
                 index == app.selected_file,
+                app.file_viewed(index),
                 app.draft_comment_count_for_file(index),
                 line_area,
                 frame,
@@ -495,11 +501,14 @@ fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visi
             crate::code_review_tui::ReviewFileTreeRow::File { index, depth } => {
                 if let Some(path) = app.review_path_for_index(*index) {
                     render_file_tree_file_row(
-                        &path,
-                        tree_row_index == focused_row,
-                        opened_path.as_deref() == Some(path.as_str()),
-                        app.draft_comment_count_for_file(*index),
-                        *depth,
+                        &FileTreeFileRow {
+                            path: &path,
+                            focused: tree_row_index == focused_row,
+                            opened: opened_path.as_deref() == Some(path.as_str()),
+                            viewed: app.viewed_files.contains(&path),
+                            draft_comments: app.draft_comment_count_for_file(*index),
+                            depth: *depth,
+                        },
                         line_area,
                         frame,
                     );
@@ -509,32 +518,37 @@ fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visi
     }
 }
 
-fn render_file_tree_file_row(
-    path: &str,
+struct FileTreeFileRow<'a> {
+    path: &'a str,
     focused: bool,
     opened: bool,
+    viewed: bool,
     draft_comments: usize,
     depth: usize,
-    area: Rect,
-    frame: &mut Frame<'_>,
-) {
-    let style = if focused {
+}
+
+fn render_file_tree_file_row(row: &FileTreeFileRow<'_>, area: Rect, frame: &mut Frame<'_>) {
+    let style = if row.focused {
         Style::new().fg(Color::Black).bg(Color::White)
     } else {
         Style::new().fg(Color::White).bg(Color::Black)
     };
-    let path = std::path::Path::new(path);
+    let path = std::path::Path::new(row.path);
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| path.to_str().unwrap_or_default());
-    let comments = if draft_comments == 0 {
+    let comments = if row.draft_comments == 0 {
         String::new()
     } else {
-        format!(" 💬{draft_comments}")
+        format!(" 💬{}", row.draft_comments)
     };
-    let open_marker = if opened { "●" } else { " " };
-    let text = format!(" {}{open_marker} {name}{comments}", "  ".repeat(depth));
+    let open_marker = if row.opened { "●" } else { " " };
+    let viewed_marker = if row.viewed { "✓" } else { "○" };
+    let text = format!(
+        " {}{open_marker}{viewed_marker} {name}{comments}",
+        "  ".repeat(row.depth)
+    );
     frame.write_line_with_fallback_style(
         area,
         &Line::from_spans(vec![Span::styled(
@@ -619,6 +633,7 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
 fn render_file_row(
     file: &ReviewFile,
     selected: bool,
+    viewed: bool,
     draft_comments: usize,
     area: Rect,
     frame: &mut Frame<'_>,
@@ -650,12 +665,14 @@ fn render_file_row(
             file.additions, file.deletions
         )
     };
+    let viewed_marker = if viewed { "✓ " } else { "  " };
     let path_width = usize::from(area.width)
         .saturating_sub(counts.len())
-        .saturating_sub(3);
+        .saturating_sub(5);
     let path = truncate_to_display_width(file.display_path(), path_width);
     let line = Line::from_spans(vec![
         Span::raw(" "),
+        Span::styled(viewed_marker, style),
         Span::styled(file.status.label(), status_style),
         Span::raw(" "),
         Span::styled(path, style),
@@ -1498,6 +1515,7 @@ const REPOSITORY_HELP_LINES: &[&str] = &[
     " c                   create draft comment",
     " a                   ask Bcode about selected line",
     " x                   publish/export review",
+    " w                   mark selected file viewed/unviewed",
     " t                   cycle included/repo/threads/sources",
     " b                   toggle sidebar",
     " ?                   toggle this help",
@@ -1524,6 +1542,7 @@ const DIFF_HELP_LINES: &[&str] = &[
     " click file          open file",
     " c                   create draft comment or reply",
     " x                   publish/export review",
+    " w                   mark selected file viewed/unviewed",
     " v                   select/clear line range",
     " a                   ask Bcode about selected line/thread",
     " o                   open linked Bcode session",
