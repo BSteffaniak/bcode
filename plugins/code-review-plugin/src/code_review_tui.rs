@@ -5400,15 +5400,19 @@ impl ReviewApp {
 
     /// Open the latest persisted draft for editing.
     pub fn open_latest_draft_editor(&mut self) -> bool {
-        let Some(anchor) = self.selected_comment_anchor() else {
+        let Some((anchor, selected_index)) = self
+            .selected_draft_anchor_and_comment_index()
+            .or_else(|| self.selected_comment_anchor().map(|anchor| (anchor, None)))
+        else {
             self.status_message = Some("select a commented line to edit a draft".to_string());
             return true;
         };
-        let Some(comment) = self
-            .draft_comments
-            .get(&anchor)
-            .and_then(|comments| comments.last())
-        else {
+        let Some(comments) = self.draft_comments.get(&anchor) else {
+            self.status_message = Some("no draft comment at selected line".to_string());
+            return true;
+        };
+        let index = selected_index.unwrap_or_else(|| comments.len().saturating_sub(1));
+        let Some(comment) = comments.get(index) else {
             self.status_message = Some("no draft comment at selected line".to_string());
             return true;
         };
@@ -5947,7 +5951,10 @@ impl ReviewApp {
 
     /// Delete the latest draft comment at the selected line.
     pub fn delete_latest_draft_at_selection(&mut self) -> bool {
-        let Some(anchor) = self.selected_comment_anchor() else {
+        let Some((anchor, selected_index)) = self
+            .selected_draft_anchor_and_comment_index()
+            .or_else(|| self.selected_comment_anchor().map(|anchor| (anchor, None)))
+        else {
             self.status_message = Some("select a commented line to delete a draft".to_string());
             return true;
         };
@@ -5955,12 +5962,19 @@ impl ReviewApp {
             self.status_message = Some("no draft comment at selected line".to_string());
             return true;
         };
-        let Some(comment) = comments.pop() else {
+        if comments.is_empty() {
             self.status_message = Some("no draft comment at selected line".to_string());
             return true;
-        };
+        }
+        let index = selected_index.unwrap_or_else(|| comments.len().saturating_sub(1));
+        if index >= comments.len() {
+            self.status_message = Some("no draft comment at selected line".to_string());
+            return true;
+        }
+        let comment = comments.remove(index);
         if comments.is_empty() {
             self.draft_comments.remove(&anchor);
+            self.selected_view_target = None;
         }
         self.pending_draft_delete = Some(PendingDraftDelete {
             target: review_scope_for_workspace(&self.workspace).target().clone(),
@@ -5998,21 +6012,24 @@ impl ReviewApp {
     /// Return a short preview for the selected line's latest draft comment.
     #[must_use]
     pub fn selected_draft_preview(&self) -> Option<String> {
-        let anchor = self.selected_comment_anchor()?;
+        let (anchor, selected_index) = self
+            .selected_draft_anchor_and_comment_index()
+            .or_else(|| self.selected_comment_anchor().map(|anchor| (anchor, None)))?;
         let comments = self.draft_comments.get(&anchor)?;
-        let latest = comments.last()?;
-        Some(format!("{} draft: {}", comments.len(), latest.body))
+        let index = selected_index.unwrap_or_else(|| comments.len().saturating_sub(1));
+        let comment = comments.get(index)?;
+        Some(format!("{} draft: {}", comments.len(), comment.body))
     }
 
     /// Return linked session id for the selected line's latest draft comment.
     #[must_use]
     pub fn selected_draft_session_id(&self) -> Option<&str> {
-        let anchor = self.selected_comment_anchor()?;
-        self.draft_comments
-            .get(&anchor)?
-            .last()?
-            .session_id
-            .as_deref()
+        let (anchor, selected_index) = self
+            .selected_draft_anchor_and_comment_index()
+            .or_else(|| self.selected_comment_anchor().map(|anchor| (anchor, None)))?;
+        let comments = self.draft_comments.get(&anchor)?;
+        let index = selected_index.unwrap_or_else(|| comments.len().saturating_sub(1));
+        comments.get(index)?.session_id.as_deref()
     }
 
     /// Load persisted draft comments into local state.
@@ -6067,7 +6084,44 @@ impl ReviewApp {
     /// Return the selected diff line comment anchor, if the selected row is commentable.
     #[must_use]
     pub fn selected_comment_anchor(&self) -> Option<ReviewCommentAnchor> {
-        self.comment_anchor_for_row(self.selected_diff_line)
+        self.selected_draft_anchor_and_comment_index()
+            .map(|(anchor, _)| anchor)
+            .or_else(|| self.comment_anchor_for_row(self.selected_diff_line))
+    }
+
+    fn selected_draft_anchor_and_comment_index(
+        &self,
+    ) -> Option<(ReviewCommentAnchor, Option<usize>)> {
+        match self.selected_view_target.as_ref()? {
+            ReviewViewTarget::Thread { thread_key }
+            | ReviewViewTarget::ThreadAction { thread_key, .. } => self
+                .draft_anchor_for_thread_key(thread_key)
+                .map(|anchor| (anchor, None)),
+            ReviewViewTarget::Comment {
+                thread_key,
+                comment_index,
+            } => self
+                .draft_anchor_for_thread_key(thread_key)
+                .map(|anchor| (anchor, Some(*comment_index))),
+            ReviewViewTarget::HunkHeader { .. } | ReviewViewTarget::SourceLine { .. } => None,
+        }
+    }
+
+    fn draft_anchor_for_thread_key(&self, thread_key: &str) -> Option<ReviewCommentAnchor> {
+        self.draft_comments
+            .keys()
+            .find(|anchor| Self::thread_key_for_anchor(anchor) == thread_key)
+            .cloned()
+    }
+
+    fn thread_key_for_anchor(anchor: &ReviewCommentAnchor) -> String {
+        ReviewThreadAnchor {
+            file_index: anchor.file_index,
+            path: anchor.path.clone(),
+            source_row: anchor.diff_row,
+            end_source_row: anchor.end_diff_row,
+        }
+        .thread_key()
     }
 
     /// Return a comment anchor for a rendered diff row.
