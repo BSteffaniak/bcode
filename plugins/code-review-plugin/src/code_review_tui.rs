@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
 use crate::code_review_tui_view::{
-    ReviewThreadAction, ReviewThreadAnchor, ReviewViewDocument, ReviewViewTarget,
+    ReviewThreadAction, ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument, ReviewViewTarget,
 };
 use crate::tui_host_types::{TuiError, helpers};
 
@@ -1555,6 +1555,8 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Right => app.expand_selected_tree_row(),
         KeyCode::Char('p') => app.select_previous_file(),
         KeyCode::Left => app.collapse_selected_tree_row(),
+        KeyCode::Char('}') => app.select_next_inline_draft(),
+        KeyCode::Char('{') => app.select_previous_inline_draft(),
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
         KeyCode::Char('J') => app.select_next_hunk(),
@@ -4833,6 +4835,60 @@ impl ReviewApp {
         true
     }
 
+    /// Select next draft comment in the main pane.
+    pub fn select_next_inline_draft(&mut self) -> bool {
+        self.select_relative_inline_comment(1)
+    }
+
+    /// Select previous draft comment in the main pane.
+    pub fn select_previous_inline_draft(&mut self) -> bool {
+        self.select_relative_inline_comment(-1)
+    }
+
+    fn select_relative_inline_comment(&mut self, offset: isize) -> bool {
+        let Some(document) = self.current_review_view_document() else {
+            self.status_message = Some("no review comments".to_string());
+            return true;
+        };
+        let comment_rows = document
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.block,
+                    ReviewViewBlock::InlineComment {
+                        body_line_index: 0,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        if comment_rows.is_empty() {
+            self.status_message = Some("no review comments".to_string());
+            return true;
+        }
+        let current_visual = self.selected_diff_visual_row();
+        let current_index = comment_rows
+            .iter()
+            .position(|row| row.visual_row >= current_visual)
+            .unwrap_or_else(|| comment_rows.len().saturating_sub(1));
+        let next_index = if offset.is_negative() {
+            current_index.saturating_sub(offset.unsigned_abs())
+        } else {
+            let step = offset.unsigned_abs();
+            let start_index = if comment_rows[current_index].visual_row == current_visual {
+                current_index.saturating_add(step)
+            } else {
+                current_index
+            };
+            start_index.min(comment_rows.len().saturating_sub(1))
+        };
+        let Some(row) = comment_rows.get(next_index) else {
+            return false;
+        };
+        self.select_view_visual_row(row.visual_row)
+    }
+
     /// Select next review thread in the main pane.
     pub fn select_next_inline_thread(&mut self) -> bool {
         let Some(current_anchor) = self.selected_comment_anchor() else {
@@ -5707,6 +5763,8 @@ impl ReviewApp {
         let Some(anchor) = self.anchor_for_view_target(target) else {
             return;
         };
+        self.selected_file = anchor.file_index;
+        self.selected_diff_line = anchor.diff_row;
         self.sync_selected_thread_to_specific_anchor(&anchor);
     }
 
@@ -6658,6 +6716,55 @@ mod tests {
                 },
             ],
         })
+    }
+
+    #[test]
+    fn inline_draft_navigation_selects_comment_targets() {
+        let mut app = sample_app();
+        for (index, diff_row) in [1_usize, 2_usize].into_iter().enumerate() {
+            let anchor = ReviewCommentAnchor {
+                file_index: 0,
+                path: "a.rs".to_string(),
+                diff_row,
+                end_diff_row: None,
+                old_line: (diff_row == 1).then_some(1),
+                new_line: (diff_row == 2).then_some(1),
+                old_start: (diff_row == 1).then_some(1),
+                old_end: (diff_row == 1).then_some(1),
+                new_start: (diff_row == 2).then_some(1),
+                new_end: (diff_row == 2).then_some(1),
+                line_kind: if diff_row == 1 {
+                    ReviewLineKind::Removed
+                } else {
+                    ReviewLineKind::Added
+                },
+                is_file_anchor: false,
+                surface_id: None,
+                source_id: None,
+            };
+            app.draft_comments.insert(
+                anchor,
+                vec![ReviewDraftComment {
+                    id: Some(format!("comment-{index}")),
+                    body: "note".to_string(),
+                    persisted: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    session_id: None,
+                }],
+            );
+        }
+
+        assert!(app.select_next_inline_draft());
+        assert!(matches!(
+            app.selected_view_target,
+            Some(ReviewViewTarget::Comment {
+                comment_index: 0,
+                ..
+            })
+        ));
+        assert!(app.select_next_inline_draft());
+        assert_eq!(app.selected_diff_line, 2);
     }
 
     #[test]
