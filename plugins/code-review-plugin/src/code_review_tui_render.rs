@@ -982,6 +982,7 @@ fn render_view_row(
         ReviewViewBlock::InlineThreadHeader {
             anchor,
             comment_count,
+            collapsed,
             ..
         } => {
             let style = Style::new()
@@ -991,7 +992,8 @@ fn render_view_row(
             RenderedRow {
                 line: Line::from_spans(vec![Span::styled(
                     format!(
-                        "   ╭─ draft thread on rows {}-{} ({comment_count} comment{})",
+                        "   {}─ draft thread on rows {}-{} ({comment_count} comment{})",
+                        if *collapsed { "▸" } else { "▾" },
                         anchor.source_row,
                         anchor.end_source_row(),
                         if *comment_count == 1 { "" } else { "s" }

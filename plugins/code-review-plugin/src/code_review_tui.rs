@@ -1531,7 +1531,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Char('N') => app.search_previous_match(),
         KeyCode::Enter => {
-            if app.activate_selected_inline_action() {
+            if app.activate_selected_inline_action() || app.toggle_selected_inline_thread() {
                 true
             } else if app.sidebar_mode == ReviewSidebarMode::Repository
                 && app.review.is_repository_review()
@@ -2932,6 +2932,8 @@ pub struct ReviewApp {
     mouse_range_selection_dragged: bool,
     /// Selected inline review target, if selection is on a non-source row.
     pub selected_view_target: Option<ReviewViewTarget>,
+    /// Collapsed inline review thread keys.
+    pub collapsed_review_threads: BTreeSet<String>,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -2984,6 +2986,7 @@ impl ReviewApp {
             mouse_range_selection_start: None,
             mouse_range_selection_dragged: false,
             selected_view_target: None,
+            collapsed_review_threads: BTreeSet::new(),
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -6071,6 +6074,22 @@ impl ReviewApp {
         true
     }
 
+    /// Toggle selected inline thread collapsed state.
+    pub fn toggle_selected_inline_thread(&mut self) -> bool {
+        let Some(ReviewViewTarget::Thread { thread_key }) = self.selected_view_target.clone()
+        else {
+            return false;
+        };
+        if self.collapsed_review_threads.remove(&thread_key) {
+            self.status_message = Some("expanded review thread".to_string());
+        } else {
+            self.collapsed_review_threads.insert(thread_key);
+            self.status_message = Some("collapsed review thread".to_string());
+        }
+        self.ensure_selected_diff_line_visible();
+        true
+    }
+
     /// Activate the currently selected inline action, if any.
     pub fn activate_selected_inline_action(&mut self) -> bool {
         let Some(ReviewViewTarget::ThreadAction { action, .. }) = self.selected_view_target.clone()
@@ -6573,6 +6592,7 @@ impl ReviewApp {
                     comments.clone(),
                 )
             }),
+            &self.collapsed_review_threads,
         );
         Some(document)
     }

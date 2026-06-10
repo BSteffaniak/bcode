@@ -1,5 +1,7 @@
 //! Transcript-like semantic view document construction for code review panes.
 
+use std::collections::BTreeSet;
+
 use crate::code_review_tui::{CachedReviewFile, ReviewDraftComment, ReviewFile};
 use crate::code_review_tui_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
@@ -105,6 +107,7 @@ impl ReviewViewDocument {
         mut self,
         file_index: usize,
         drafts: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewDraftComment>)>,
+        collapsed_threads: &BTreeSet<String>,
     ) -> Self {
         let mut threads = drafts
             .filter(|(anchor, comments)| anchor.file_index == file_index && !comments.is_empty())
@@ -123,6 +126,7 @@ impl ReviewViewDocument {
                 .filter(|(anchor, _)| anchor.end_source_row() == source_row)
             {
                 let thread_key = anchor.thread_key();
+                let collapsed = collapsed_threads.contains(&thread_key);
                 rows.push(ReviewViewRow {
                     visual_row: 0,
                     source_row: None,
@@ -133,8 +137,12 @@ impl ReviewViewDocument {
                         thread_key: thread_key.clone(),
                         anchor: anchor.clone(),
                         comment_count: comments.len(),
+                        collapsed,
                     },
                 });
+                if collapsed {
+                    continue;
+                }
                 for (comment_index, comment) in comments.iter().cloned().enumerate() {
                     let body_lines = comment_body_lines(&comment.body);
                     let body_line_count = body_lines.len();
@@ -234,6 +242,8 @@ pub enum ReviewViewBlock {
         anchor: ReviewThreadAnchor,
         /// Number of comments in the thread.
         comment_count: usize,
+        /// Whether this thread is collapsed.
+        collapsed: bool,
     },
     /// Inline comment body row.
     InlineComment {
@@ -448,6 +458,8 @@ fn comment_body_lines(body: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument, ReviewViewTarget};
     use crate::code_review_tui::{
         ReviewDraftComment, ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine, ReviewLineKind,
@@ -501,7 +513,11 @@ mod tests {
         };
 
         let document = ReviewViewDocument::build_diff_file(7, &file, false)
-            .with_inline_draft_threads(7, std::iter::once((anchor.clone(), vec![comment])));
+            .with_inline_draft_threads(
+                7,
+                std::iter::once((anchor.clone(), vec![comment])),
+                &BTreeSet::new(),
+            );
 
         assert_eq!(document.rows.len(), 9);
         assert_eq!(document.rows[1].source_row, Some(1));
@@ -544,7 +560,11 @@ mod tests {
         };
 
         let document = ReviewViewDocument::build_diff_file(7, &file, false)
-            .with_inline_draft_threads(7, std::iter::once((anchor, vec![comment])));
+            .with_inline_draft_threads(
+                7,
+                std::iter::once((anchor, vec![comment])),
+                &BTreeSet::new(),
+            );
 
         assert!(matches!(
             document.rows[3].block,
