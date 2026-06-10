@@ -108,6 +108,7 @@ impl ReviewViewDocument {
         file_index: usize,
         drafts: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewDraftComment>)>,
         collapsed_threads: &BTreeSet<String>,
+        resolved_threads: &BTreeSet<String>,
     ) -> Self {
         let mut threads = drafts
             .filter(|(anchor, comments)| anchor.file_index == file_index && !comments.is_empty())
@@ -138,6 +139,7 @@ impl ReviewViewDocument {
                         anchor: anchor.clone(),
                         comment_count: comments.len(),
                         collapsed,
+                        resolved: resolved_threads.contains(&thread_key),
                     },
                 });
                 if collapsed {
@@ -244,6 +246,8 @@ pub enum ReviewViewBlock {
         comment_count: usize,
         /// Whether this thread is collapsed.
         collapsed: bool,
+        /// Whether this thread is locally resolved.
+        resolved: bool,
     },
     /// Inline comment body row.
     InlineComment {
@@ -282,18 +286,21 @@ pub enum ReviewThreadAction {
     AskBcode,
     /// Publish review drafts.
     Publish,
+    /// Resolve or reopen the thread locally.
+    Resolve,
 }
 
 impl ReviewThreadAction {
     /// Return all inline thread actions in visual order.
     #[must_use]
-    pub const fn all() -> [Self; 5] {
+    pub const fn all() -> [Self; 6] {
         [
             Self::Reply,
             Self::Edit,
             Self::Delete,
             Self::AskBcode,
             Self::Publish,
+            Self::Resolve,
         ]
     }
 
@@ -306,6 +313,7 @@ impl ReviewThreadAction {
             Self::Delete => "delete",
             Self::AskBcode => "ask",
             Self::Publish => "publish",
+            Self::Resolve => "resolve",
         }
     }
 
@@ -318,6 +326,7 @@ impl ReviewThreadAction {
             Self::Delete => "D",
             Self::AskBcode => "a",
             Self::Publish => "x",
+            Self::Resolve => "r",
         }
     }
 
@@ -330,6 +339,7 @@ impl ReviewThreadAction {
             Self::Delete => "delete",
             Self::AskBcode => "ask Bcode",
             Self::Publish => "publish",
+            Self::Resolve => "resolve/reopen",
         }
     }
 
@@ -342,6 +352,7 @@ impl ReviewThreadAction {
             b"delete" => Some(Self::Delete),
             b"ask" => Some(Self::AskBcode),
             b"publish" => Some(Self::Publish),
+            b"resolve" => Some(Self::Resolve),
             _ => None,
         }
     }
@@ -517,9 +528,10 @@ mod tests {
                 7,
                 std::iter::once((anchor.clone(), vec![comment])),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
             );
 
-        assert_eq!(document.rows.len(), 9);
+        assert_eq!(document.rows.len(), 10);
         assert_eq!(document.rows[1].source_row, Some(1));
         assert!(matches!(
             document.rows[2].block,
@@ -563,6 +575,7 @@ mod tests {
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor, vec![comment])),
+                &BTreeSet::new(),
                 &BTreeSet::new(),
             );
 

@@ -1561,6 +1561,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('{') => app.select_previous_inline_draft(),
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
+        KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
         KeyCode::Char('Z') => app.collapse_all_inline_threads(),
         KeyCode::Char('J') => app.select_next_hunk(),
@@ -2938,6 +2939,8 @@ pub struct ReviewApp {
     pub selected_view_target: Option<ReviewViewTarget>,
     /// Collapsed inline review thread keys.
     pub collapsed_review_threads: BTreeSet<String>,
+    /// Locally resolved inline review thread keys.
+    pub resolved_review_threads: BTreeSet<String>,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -2991,6 +2994,7 @@ impl ReviewApp {
             mouse_range_selection_dragged: false,
             selected_view_target: None,
             collapsed_review_threads: BTreeSet::new(),
+            resolved_review_threads: BTreeSet::new(),
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -6150,8 +6154,25 @@ impl ReviewApp {
             Some(ReviewThreadAction::Delete) => self.delete_latest_draft_at_selection(),
             Some(ReviewThreadAction::AskBcode) => self.ask_bcode_about_selection(),
             Some(ReviewThreadAction::Publish) => self.publish_review(),
+            Some(ReviewThreadAction::Resolve) => self.toggle_selected_thread_resolved(),
             None => false,
         }
+    }
+
+    /// Toggle selected thread resolved state locally.
+    pub fn toggle_selected_thread_resolved(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a review thread to resolve".to_string());
+            return true;
+        };
+        let thread_key = Self::thread_key_for_anchor(&anchor);
+        if self.resolved_review_threads.remove(&thread_key) {
+            self.status_message = Some("reopened review thread".to_string());
+        } else {
+            self.resolved_review_threads.insert(thread_key);
+            self.status_message = Some("resolved review thread".to_string());
+        }
+        true
     }
 
     /// Return a prompt for a pending Bcode agent session.
@@ -6655,6 +6676,7 @@ impl ReviewApp {
                 )
             }),
             &self.collapsed_review_threads,
+            &self.resolved_review_threads,
         );
         Some(document)
     }
@@ -6885,6 +6907,52 @@ mod tests {
 
         assert!(app.selected_diff_visual_row() >= app.diff_scroll);
         assert!(app.selected_diff_visual_row() < app.diff_scroll + 2);
+    }
+
+    #[test]
+    fn selected_inline_thread_can_toggle_resolved_state() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let thread_key = ReviewApp::thread_key_for_anchor(&anchor);
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment-1".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: thread_key.clone(),
+        });
+
+        assert!(app.toggle_selected_thread_resolved());
+        assert!(app.resolved_review_threads.contains(&thread_key));
+        let document = app.current_review_view_document().expect("document");
+        assert!(document.rows.iter().any(|row| matches!(
+            row.block,
+            ReviewViewBlock::InlineThreadHeader { resolved: true, .. }
+        )));
+        assert!(app.toggle_selected_thread_resolved());
+        assert!(!app.resolved_review_threads.contains(&thread_key));
     }
 
     #[test]
