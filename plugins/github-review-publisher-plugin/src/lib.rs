@@ -235,7 +235,12 @@ fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) ->
     let mut comments = Vec::new();
     let mut warnings = Vec::new();
     let mut summary_comments = Vec::new();
+    let mut skipped_resolved_count = 0usize;
     for thread in &bundle.threads {
+        if thread.resolved_at_ms.is_some() {
+            skipped_resolved_count = skipped_resolved_count.saturating_add(1);
+            continue;
+        }
         if should_summarize_thread(thread) {
             summary_comments.push(summary_comment_for_thread(thread));
             continue;
@@ -250,6 +255,12 @@ fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) ->
                 thread.thread_id, thread.anchor.file_path
             )),
         }
+    }
+    if skipped_resolved_count > 0 {
+        warnings.push(format!(
+            "skipped {skipped_resolved_count} resolved Bcode review thread{}",
+            if skipped_resolved_count == 1 { "" } else { "s" }
+        ));
     }
     GitHubReviewDraft {
         body: options.summary.clone(),
@@ -809,6 +820,47 @@ mod tests {
         let response = preview_for_request(&request).expect("preview");
 
         assert!(response.preview.contains("Warnings"));
+    }
+
+    #[test]
+    fn resolved_threads_are_not_published() {
+        let mut thread = review_thread(bundle_line(
+            "src/lib.rs",
+            ReviewLineKind::Added,
+            None,
+            Some(42),
+            1,
+            "added",
+        ));
+        thread.resolved_at_ms = Some(123);
+        let bundle = ReviewBundle {
+            review_id: "review".to_string(),
+            title: "Review".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
+            files: Vec::new(),
+            threads: vec![thread],
+            generated_at_ms: 1,
+        };
+        let options = GitHubPublishOptions::from_json(
+            &serde_json::json!({
+                "repository": "owner/repo",
+                "pull_request": "123"
+            }),
+            &bundle,
+        )
+        .expect("options");
+
+        let draft = github_review_draft(&bundle, &options);
+
+        assert!(draft.comments.is_empty());
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skipped 1 resolved"))
+        );
     }
 
     #[test]
