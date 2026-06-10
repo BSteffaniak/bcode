@@ -1734,6 +1734,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
         KeyCode::Char('T') => app.cycle_thread_filter(),
+        KeyCode::Char('V') => app.mark_all_files_viewed(),
         KeyCode::Char('W') => app.select_next_unviewed_file(),
         KeyCode::Char('w') => app.toggle_selected_file_viewed(),
         KeyCode::Char('u') => app.select_next_open_thread(),
@@ -5610,6 +5611,22 @@ impl ReviewApp {
         true
     }
 
+    /// Mark every review file viewed.
+    pub fn mark_all_files_viewed(&mut self) -> bool {
+        self.viewed_files = self
+            .review
+            .files
+            .iter()
+            .map(|file| file.display_path().to_string())
+            .collect();
+        self.workspace.viewed_files.clone_from(&self.viewed_files);
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        let (viewed, total) = self.viewed_file_counts();
+        self.status_message = Some(format!("marked {viewed}/{total} files viewed"));
+        true
+    }
+
     /// Select next file not yet marked viewed.
     pub fn select_next_unviewed_file(&mut self) -> bool {
         self.select_relative_unviewed_file(1)
@@ -8617,5 +8634,19 @@ mod tests {
             app.status_message.as_deref(),
             Some("selected unviewed file")
         );
+    }
+
+    #[test]
+    fn marks_all_files_viewed() {
+        let mut app = sample_app();
+
+        assert!(app.mark_all_files_viewed());
+
+        assert_eq!(
+            app.viewed_file_counts(),
+            (app.review.files.len(), app.review.files.len())
+        );
+        assert_eq!(app.workspace.viewed_files, app.viewed_files);
+        assert!(app.pending_workspace_save);
     }
 }
