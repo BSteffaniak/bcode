@@ -1559,6 +1559,8 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('{') => app.select_previous_inline_draft(),
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
+        KeyCode::Char('U') => app.expand_all_inline_threads(),
+        KeyCode::Char('Z') => app.collapse_all_inline_threads(),
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
         KeyCode::Char('v') => app.toggle_range_selection(),
@@ -6074,6 +6076,33 @@ impl ReviewApp {
         true
     }
 
+    /// Expand all inline review threads.
+    pub fn expand_all_inline_threads(&mut self) -> bool {
+        if self.collapsed_review_threads.is_empty() {
+            return false;
+        }
+        self.collapsed_review_threads.clear();
+        self.status_message = Some("expanded all review threads".to_string());
+        self.ensure_selected_diff_line_visible();
+        true
+    }
+
+    /// Collapse all inline review threads in the current view.
+    pub fn collapse_all_inline_threads(&mut self) -> bool {
+        let keys = self
+            .inline_thread_summaries()
+            .into_iter()
+            .map(|thread| Self::thread_key_for_anchor(&thread.anchor))
+            .collect::<BTreeSet<_>>();
+        if keys.is_empty() || keys == self.collapsed_review_threads {
+            return false;
+        }
+        self.collapsed_review_threads = keys;
+        self.status_message = Some("collapsed all review threads".to_string());
+        self.ensure_selected_diff_line_visible();
+        true
+    }
+
     /// Toggle selected inline thread collapsed state.
     pub fn toggle_selected_inline_thread(&mut self) -> bool {
         let Some(ReviewViewTarget::Thread { thread_key }) = self.selected_view_target.clone()
@@ -6785,6 +6814,47 @@ mod tests {
         ));
         assert!(app.select_next_inline_draft());
         assert_eq!(app.selected_diff_line, 2);
+    }
+
+    #[test]
+    fn selected_inline_thread_can_toggle_collapsed_state() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let thread_key = ReviewApp::thread_key_for_anchor(&anchor);
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment-1".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: thread_key.clone(),
+        });
+
+        assert!(app.toggle_selected_inline_thread());
+        assert!(app.collapsed_review_threads.contains(&thread_key));
+        assert!(app.toggle_selected_inline_thread());
+        assert!(!app.collapsed_review_threads.contains(&thread_key));
     }
 
     #[test]
