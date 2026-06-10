@@ -1625,14 +1625,18 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
                     false
                 }
             } else if let Some(index) = app.diff_line_index_at(mouse.position.x, mouse.position.y) {
-                app.select_diff_line(index)
+                app.begin_mouse_range_selection(index)
             } else {
                 false
             }
         }
+        MouseEventKind::Drag(MouseButton::Left) => app
+            .diff_line_index_at(mouse.position.x, mouse.position.y)
+            .is_some_and(|index| app.update_mouse_range_selection(index)),
+        MouseEventKind::Up(MouseButton::Left) => app.finish_mouse_range_selection(),
         MouseEventKind::Down(MouseButton::Right | MouseButton::Middle | MouseButton::Other(_))
-        | MouseEventKind::Up(_)
-        | MouseEventKind::Drag(_)
+        | MouseEventKind::Up(MouseButton::Right | MouseButton::Middle | MouseButton::Other(_))
+        | MouseEventKind::Drag(MouseButton::Right | MouseButton::Middle | MouseButton::Other(_))
         | MouseEventKind::Move
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => false,
@@ -2903,6 +2907,8 @@ pub struct ReviewApp {
     pub pending_agent_session: Option<PendingAgentSession>,
     /// Active range selection start row, if any.
     pub range_selection_start: Option<usize>,
+    mouse_range_selection_start: Option<usize>,
+    mouse_range_selection_dragged: bool,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -2952,6 +2958,8 @@ impl ReviewApp {
             pending_workspace_reload: false,
             pending_agent_session: None,
             range_selection_start: None,
+            mouse_range_selection_start: None,
+            mouse_range_selection_dragged: false,
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -4876,6 +4884,8 @@ impl ReviewApp {
         self.save_current_file_viewport();
         self.selected_file = index;
         self.range_selection_start = None;
+        self.mouse_range_selection_start = None;
+        self.mouse_range_selection_dragged = false;
         self.restore_current_file_viewport();
         self.queue_selected_file_load();
         self.expand_selected_file_dirs();
@@ -5102,6 +5112,45 @@ impl ReviewApp {
         self.selected_diff_line = clamped;
         self.ensure_selected_diff_line_visible();
         true
+    }
+
+    /// Start a mouse-driven range selection from a rendered diff row.
+    pub fn begin_mouse_range_selection(&mut self, index: usize) -> bool {
+        self.mouse_range_selection_start =
+            Some(index.min(self.rendered_diff_len().saturating_sub(1)));
+        self.mouse_range_selection_dragged = false;
+        self.range_selection_start = None;
+        self.select_diff_line(index)
+    }
+
+    /// Extend a mouse-driven range selection to a rendered diff row.
+    pub fn update_mouse_range_selection(&mut self, index: usize) -> bool {
+        let Some(start) = self.mouse_range_selection_start else {
+            return false;
+        };
+        self.mouse_range_selection_dragged = true;
+        self.range_selection_start = Some(start);
+        let changed = self.select_diff_line(index);
+        if changed {
+            self.status_message = self.range_selection_label();
+        }
+        true
+    }
+
+    /// Complete a mouse-driven range selection.
+    pub fn finish_mouse_range_selection(&mut self) -> bool {
+        let Some(_) = self.mouse_range_selection_start.take() else {
+            return false;
+        };
+        if self.mouse_range_selection_dragged {
+            self.mouse_range_selection_dragged = false;
+            self.status_message = self.range_selection_label();
+            true
+        } else {
+            self.mouse_range_selection_dragged = false;
+            self.range_selection_start = None;
+            false
+        }
     }
 
     /// Return whether file sidebar contains terminal coordinates.
