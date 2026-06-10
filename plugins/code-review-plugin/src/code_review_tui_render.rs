@@ -17,7 +17,9 @@ use crate::code_review_tui::{
 use crate::code_review_tui_display::{
     ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
 };
-use crate::code_review_tui_view::{ReviewViewBlock, ReviewViewDocument, ReviewViewRow};
+use crate::code_review_tui_view::{
+    ReviewThreadAction, ReviewViewBlock, ReviewViewDocument, ReviewViewRow,
+};
 use bcode_code_review_models::ReviewSource;
 
 /// Render one full-screen code review frame.
@@ -1028,18 +1030,25 @@ fn render_view_row(
                 style,
             }
         }
-        ReviewViewBlock::InlineThreadActions { .. } => {
-            let style = Style::new()
-                .fg(Color::BrightBlack)
-                .bg(Color::Rgb(20, 20, 20));
-            RenderedRow {
-                line: Line::from_spans(vec![Span::styled(
-                    "   ├─ actions: c reply  e edit  D delete  a ask Bcode  x publish",
-                    style,
-                )]),
-                style,
-            }
-        }
+        ReviewViewBlock::InlineThreadAction { action, .. } => render_inline_thread_action(*action),
+    }
+}
+
+fn render_inline_thread_action(action: ReviewThreadAction) -> RenderedRow {
+    let style = Style::new()
+        .fg(Color::BrightBlack)
+        .bg(Color::Rgb(18, 18, 18));
+    let shortcut_style = Style::new().fg(Color::Yellow).bg(Color::Rgb(18, 18, 18));
+    RenderedRow {
+        line: Line::from_spans(vec![
+            Span::styled("   ├─ [", style),
+            Span::styled(
+                action.shortcut(),
+                shortcut_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("] {}", action.label()), style),
+        ]),
+        style,
     }
 }
 

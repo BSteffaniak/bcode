@@ -157,15 +157,20 @@ impl ReviewViewDocument {
                         });
                     }
                 }
-                rows.push(ReviewViewRow {
-                    visual_row: 0,
-                    source_row: None,
-                    target: ReviewViewTarget::ThreadAction {
-                        thread_key: thread_key.clone(),
-                        action: "reply".to_string(),
-                    },
-                    block: ReviewViewBlock::InlineThreadActions { thread_key },
-                });
+                for action in ReviewThreadAction::all() {
+                    rows.push(ReviewViewRow {
+                        visual_row: 0,
+                        source_row: None,
+                        target: ReviewViewTarget::ThreadAction {
+                            thread_key: thread_key.clone(),
+                            action: action.id().to_string(),
+                        },
+                        block: ReviewViewBlock::InlineThreadAction {
+                            thread_key: thread_key.clone(),
+                            action,
+                        },
+                    });
+                }
             }
         }
         for (visual_row, row) in rows.iter_mut().enumerate() {
@@ -246,7 +251,77 @@ pub enum ReviewViewBlock {
         comment: ReviewDraftComment,
     },
     /// Inline thread action row.
-    InlineThreadActions { thread_key: String },
+    InlineThreadAction {
+        /// Stable thread key.
+        thread_key: String,
+        /// Action represented by this row.
+        action: ReviewThreadAction,
+    },
+}
+
+/// Inline action exposed for a review thread.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReviewThreadAction {
+    /// Add a reply/draft to the thread.
+    Reply,
+    /// Edit a draft comment in the thread.
+    Edit,
+    /// Delete a draft comment in the thread.
+    Delete,
+    /// Ask Bcode about this thread.
+    AskBcode,
+    /// Publish review drafts.
+    Publish,
+}
+
+impl ReviewThreadAction {
+    /// Return all inline thread actions in visual order.
+    #[must_use]
+    pub const fn all() -> [Self; 5] {
+        [
+            Self::Reply,
+            Self::Edit,
+            Self::Delete,
+            Self::AskBcode,
+            Self::Publish,
+        ]
+    }
+
+    /// Return stable action id.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Reply => "reply",
+            Self::Edit => "edit",
+            Self::Delete => "delete",
+            Self::AskBcode => "ask",
+            Self::Publish => "publish",
+        }
+    }
+
+    /// Return keyboard shortcut label.
+    #[must_use]
+    pub const fn shortcut(self) -> &'static str {
+        match self {
+            Self::Reply => "c",
+            Self::Edit => "e",
+            Self::Delete => "D",
+            Self::AskBcode => "a",
+            Self::Publish => "x",
+        }
+    }
+
+    /// Return display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reply => "reply",
+            Self::Edit => "edit",
+            Self::Delete => "delete",
+            Self::AskBcode => "ask Bcode",
+            Self::Publish => "publish",
+        }
+    }
 }
 
 /// Stable semantic target for selection, mouse, and actions.
@@ -415,7 +490,7 @@ mod tests {
         let document = ReviewViewDocument::build_diff_file(7, &file, false)
             .with_inline_draft_threads(7, std::iter::once((anchor.clone(), vec![comment])));
 
-        assert_eq!(document.rows.len(), 5);
+        assert_eq!(document.rows.len(), 9);
         assert_eq!(document.rows[1].source_row, Some(1));
         assert!(matches!(
             document.rows[2].block,
@@ -427,6 +502,53 @@ mod tests {
                 thread_key: anchor.thread_key(),
             })
         );
+        assert!(matches!(
+            document.rows[3].block,
+            ReviewViewBlock::InlineComment { .. }
+        ));
+        assert!(matches!(
+            document.rows[4].block,
+            ReviewViewBlock::InlineThreadAction { .. }
+        ));
+    }
+
+    #[test]
+    fn multiline_draft_comments_render_multiple_semantic_rows() {
+        let file = test_file();
+        let anchor = ReviewThreadAnchor {
+            file_index: 7,
+            path: "src/lib.rs".to_string(),
+            source_row: 1,
+            end_source_row: None,
+        };
+        let comment = ReviewDraftComment {
+            id: Some("draft-1".to_string()),
+            body: "first\nsecond".to_string(),
+            persisted: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            session_id: None,
+        };
+
+        let document = ReviewViewDocument::build_diff_file(7, &file, false)
+            .with_inline_draft_threads(7, std::iter::once((anchor, vec![comment])));
+
+        assert!(matches!(
+            document.rows[3].block,
+            ReviewViewBlock::InlineComment {
+                body_line_index: 0,
+                body_line_count: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            document.rows[4].block,
+            ReviewViewBlock::InlineComment {
+                body_line_index: 1,
+                body_line_count: 2,
+                ..
+            }
+        ));
     }
 
     fn test_file() -> ReviewFile {
