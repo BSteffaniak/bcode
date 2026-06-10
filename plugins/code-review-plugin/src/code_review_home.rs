@@ -1772,6 +1772,7 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
     } else {
         lines.push(" published: never".to_string());
     }
+    append_workspace_detail_progress(&mut lines, workspace, area.height);
     lines.push(format!(
         " sources: {}/{} included",
         workspace
@@ -1813,6 +1814,21 @@ fn render_workspace_details(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'
                 },
             )]),
         );
+    }
+}
+
+fn append_workspace_detail_progress(
+    lines: &mut Vec<String>,
+    workspace: &ReviewWorkspace,
+    area_height: u16,
+) {
+    lines.push(format!(" viewed: {} file(s)", workspace.viewed_files.len()));
+    for path in workspace.viewed_files.iter().take(
+        usize::from(area_height)
+            .saturating_sub(lines.len())
+            .saturating_sub(2),
+    ) {
+        lines.push(format!("   ✓ {path}"));
     }
 }
 
@@ -1879,6 +1895,10 @@ fn workspace_matches_query(workspace: &ReviewWorkspace, query: &str) -> bool {
         || workspace
             .archived_at_ms
             .is_some_and(|archived_at_ms| archived_at_ms.to_string().contains(query))
+        || workspace
+            .viewed_files
+            .iter()
+            .any(|path| path.to_ascii_lowercase().contains(query))
         || workspace.sources.iter().any(|source| {
             source.label.to_ascii_lowercase().contains(query)
                 || source.id.to_ascii_lowercase().contains(query)
@@ -2023,8 +2043,13 @@ fn workspace_row_text(item: &ReviewWorkspaceListItem) -> String {
             )
         },
     );
+    let viewed_suffix = if workspace.viewed_files.is_empty() {
+        "viewed 0".to_string()
+    } else {
+        format!("viewed {}", workspace.viewed_files.len())
+    };
     format!(
-        " {}  · {}  · {health}  · {}  · {publish_suffix}  · next: {}  · {}{}",
+        " {}  · {}  · {health}  · {}  · {publish_suffix}  · {viewed_suffix}  · next: {}  · {}{}",
         workspace.title, updated, draft_suffix, next_action, suffix, archived
     )
 }
@@ -2224,6 +2249,11 @@ mod tests {
         assert!(workspace_item_matches_query(&published, "published"));
         assert!(workspace_item_matches_query(&published, "github"));
         assert!(workspace_item_matches_query(&published, "example.test"));
+        published
+            .workspace
+            .viewed_files
+            .insert("src/lib.rs".to_string());
+        assert!(workspace_item_matches_query(&published, "src/lib"));
         assert!(workspace_item_matches_query(&published, "submitted"));
     }
 
