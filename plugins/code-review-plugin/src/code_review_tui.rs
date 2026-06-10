@@ -1529,7 +1529,9 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Char('N') => app.search_previous_match(),
         KeyCode::Enter => {
-            if app.sidebar_mode == ReviewSidebarMode::Repository
+            if app.activate_selected_inline_action() {
+                true
+            } else if app.sidebar_mode == ReviewSidebarMode::Repository
                 && app.review.is_repository_review()
             {
                 app.activate_selected_tree_row()
@@ -1557,7 +1559,13 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
-        KeyCode::Char('x') => app.publish_review(),
+        KeyCode::Char('x') => {
+            if app.activate_selected_inline_action() {
+                true
+            } else {
+                app.publish_review()
+            }
+        }
         KeyCode::Char('a') => app.ask_bcode_about_selection(),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
         KeyCode::Char('?') => {
@@ -5892,6 +5900,22 @@ impl ReviewApp {
             |session_id| format!("sending review follow-up to linked session {session_id}"),
         ));
         true
+    }
+
+    /// Activate the currently selected inline action, if any.
+    pub fn activate_selected_inline_action(&mut self) -> bool {
+        let Some(ReviewViewTarget::ThreadAction { action, .. }) = self.selected_view_target.clone()
+        else {
+            return false;
+        };
+        match action.as_str() {
+            "reply" => self.open_comment_editor(),
+            "edit" => self.open_latest_draft_editor(),
+            "delete" => self.delete_latest_draft_at_selection(),
+            "ask" => self.ask_bcode_about_selection(),
+            "publish" => self.publish_review(),
+            _ => false,
+        }
     }
 
     /// Return a prompt for a pending Bcode agent session.

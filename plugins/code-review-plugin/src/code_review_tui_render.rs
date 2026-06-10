@@ -999,15 +999,31 @@ fn render_view_row(
                 style,
             }
         }
-        ReviewViewBlock::InlineComment { comment, .. } => {
+        ReviewViewBlock::InlineComment {
+            comment,
+            body_line_index,
+            body_line_count,
+            body_line,
+            ..
+        } => {
             let style = Style::new().fg(Color::White).bg(Color::Rgb(20, 20, 20));
+            let label = if *body_line_index == 0 {
+                if comment.persisted { "draft" } else { "saving" }
+            } else {
+                ""
+            };
+            let branch = if body_line_index.saturating_add(1) == *body_line_count {
+                "╰"
+            } else {
+                "│"
+            };
             RenderedRow {
                 line: Line::from_spans(vec![
                     Span::styled(
-                        "   │ draft ",
+                        format!("   {branch} {label:<6} "),
                         Style::new().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20)),
                     ),
-                    Span::styled(comment.body.clone(), style),
+                    Span::styled(body_line.clone(), style),
                 ]),
                 style,
             }
@@ -1018,7 +1034,7 @@ fn render_view_row(
                 .bg(Color::Rgb(20, 20, 20));
             RenderedRow {
                 line: Line::from_spans(vec![Span::styled(
-                    "   ╰─ actions: c reply  e edit  d delete  a ask Bcode  p publish",
+                    "   ├─ actions: c reply  e edit  D delete  a ask Bcode  x publish",
                     style,
                 )]),
                 style,
