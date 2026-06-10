@@ -3,6 +3,7 @@
 use bcode_code_review_models::{
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurfaceKind,
 };
+use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
@@ -965,6 +966,9 @@ fn render_materialized_file_surface(app: &ReviewApp, area: Rect, frame: &mut Fra
         render_empty(area, "No file content", frame);
         return;
     }
+    let syntax_highlighter = SyntaxHighlighter::new();
+    let syntax_hint = file.display_path();
+    let can_highlight = syntax_highlighter.can_highlight(syntax_hint);
     let visible = usize::from(area.height);
     for row in 0..visible {
         let index = app.diff_scroll.saturating_add(row);
@@ -977,21 +981,25 @@ fn render_materialized_file_surface(app: &ReviewApp, area: Rect, frame: &mut Fra
         let Some((line_number, content)) = rows.get(index) else {
             break;
         };
-        let mut style = if index == app.selected_diff_line {
-            Style::new().fg(Color::Black).bg(Color::Yellow)
-        } else if app.is_row_in_range_selection(app.selected_file, index) {
-            Style::new().fg(Color::White).bg(Color::Blue)
-        } else if app.has_draft_comment_at(app.selected_file, index) {
-            Style::new().fg(Color::White).bg(Color::BrightBlack)
-        } else {
-            Style::new()
-        };
+        let mut style = file_viewer_row_style(app, index);
         let line_number =
             line_number.map_or_else(|| "      ".to_string(), |number| format!("{number:>5} "));
-        let mut line = Line::from_spans(vec![
-            Span::styled(line_number, Style::new().fg(Color::BrightBlack)),
-            Span::styled(content.clone(), style),
-        ]);
+        let mut spans = vec![Span::styled(
+            line_number.clone(),
+            Style::new().fg(Color::BrightBlack),
+        )];
+        if line_number.trim().is_empty() {
+            spans.push(Span::styled(content.clone(), style));
+        } else {
+            spans.extend(highlighted_source_spans(
+                syntax_highlighter,
+                can_highlight,
+                syntax_hint,
+                content,
+                style,
+            ));
+        }
+        let mut line = Line::from_spans(spans);
         if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
             line.spans
                 .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
@@ -1036,6 +1044,8 @@ fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_empty(area, reason, frame);
         return;
     }
+    let syntax_highlighter = SyntaxHighlighter::new();
+    let can_highlight = syntax_highlighter.can_highlight(&path);
     let visible = usize::from(area.height);
     for row in 0..visible {
         let index = app.diff_scroll.saturating_add(row);
@@ -1048,20 +1058,20 @@ fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         let Some(content) = cached.line(index) else {
             break;
         };
-        let mut style = if index == app.selected_diff_line {
-            Style::new().fg(Color::Black).bg(Color::Yellow)
-        } else if app.is_row_in_range_selection(app.selected_file, index) {
-            Style::new().fg(Color::White).bg(Color::Blue)
-        } else if app.has_draft_comment_at(app.selected_file, index) {
-            Style::new().fg(Color::White).bg(Color::BrightBlack)
-        } else {
-            Style::new()
-        };
+        let mut style = file_viewer_row_style(app, index);
         let line_number = format!("{:>5} ", index.saturating_add(1));
-        let mut line = Line::from_spans(vec![
-            Span::styled(line_number, Style::new().fg(Color::BrightBlack)),
-            Span::styled(content.to_string(), style),
-        ]);
+        let mut spans = vec![Span::styled(
+            line_number,
+            Style::new().fg(Color::BrightBlack),
+        )];
+        spans.extend(highlighted_source_spans(
+            syntax_highlighter,
+            can_highlight,
+            &path,
+            content,
+            style,
+        ));
+        let mut line = Line::from_spans(spans);
         if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
             line.spans
                 .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
@@ -1078,6 +1088,40 @@ fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             style,
         );
     }
+}
+
+fn file_viewer_row_style(app: &ReviewApp, index: usize) -> Style {
+    if index == app.selected_diff_line {
+        Style::new().fg(Color::Black).bg(Color::Yellow)
+    } else if app.is_row_in_range_selection(app.selected_file, index) {
+        Style::new().fg(Color::White).bg(Color::Blue)
+    } else if app.has_draft_comment_at(app.selected_file, index) {
+        Style::new().fg(Color::White).bg(Color::BrightBlack)
+    } else {
+        Style::new()
+    }
+}
+
+fn highlighted_source_spans(
+    syntax_highlighter: SyntaxHighlighter,
+    can_highlight: bool,
+    syntax_hint: &str,
+    content: &str,
+    base_style: Style,
+) -> Vec<Span> {
+    if !can_highlight {
+        return vec![Span::styled(content.to_string(), base_style)];
+    }
+    syntax_highlighter
+        .highlight_line_tokens(syntax_hint, content)
+        .into_iter()
+        .map(|span| {
+            Span::styled(
+                span.content,
+                base_style.patch(syntax_style_to_tui(span.style)),
+            )
+        })
+        .collect()
 }
 
 fn rendered_rows(file: &ReviewFile) -> Vec<RenderedRow> {
