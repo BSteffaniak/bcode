@@ -17,7 +17,7 @@ use crate::code_review_tui::{
 use crate::code_review_tui_display::{
     ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
 };
-use crate::code_review_tui_view::{ReviewViewBlock, ReviewViewDocument};
+use crate::code_review_tui_view::{ReviewViewBlock, ReviewViewDocument, ReviewViewRow};
 use bcode_code_review_models::ReviewSource;
 
 /// Render one full-screen code review frame.
@@ -897,34 +897,191 @@ fn render_diff(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_empty(area, "Binary file diff not available", frame);
         return;
     }
-    let rows = rendered_rows(app.selected_file, file);
-    if rows.is_empty() {
+    let Some(document) = app.current_review_view_document() else {
+        render_empty(area, "No textual changes", frame);
+        return;
+    };
+    if document.rows.is_empty() {
         render_empty(area, "No textual changes", frame);
         return;
     }
+    render_view_document(app, &document, area, frame);
+}
+
+fn render_view_document(
+    app: &ReviewApp,
+    document: &ReviewViewDocument,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let syntax_highlighter = SyntaxHighlighter::new();
+    let syntax_hint = app
+        .selected_file_path()
+        .or_else(|| {
+            app.selected_file_data()
+                .map(|file| file.display_path().to_string())
+        })
+        .unwrap_or_default();
+    let can_highlight = syntax_highlighter.can_highlight(&syntax_hint);
     let visible = usize::from(area.height);
     for row in 0..visible {
-        let index = app.diff_scroll.saturating_add(row);
+        let visual_row = app.diff_scroll.saturating_add(row);
         let y = area
             .y
             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        let row_area = Rect::new(area.x, y, area.width, 1);
-        if let Some(rendered) = rows.get(index) {
-            let mut line = rendered.line.clone();
-            if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
-                line.spans
-                    .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
+        if y >= area.bottom() {
+            break;
+        }
+        let Some(view_row) = document.row_for_visual_row(visual_row) else {
+            break;
+        };
+        let rendered = render_view_row(
+            app,
+            view_row,
+            syntax_highlighter,
+            can_highlight,
+            &syntax_hint,
+        );
+        frame.write_line_with_fallback_style(
+            Rect::new(area.x, y, area.width, 1),
+            &rendered.line,
+            rendered.style,
+        );
+    }
+}
+
+fn render_view_row(
+    app: &ReviewApp,
+    view_row: &ReviewViewRow,
+    syntax_highlighter: SyntaxHighlighter,
+    can_highlight: bool,
+    syntax_hint: &str,
+) -> RenderedRow {
+    match &view_row.block {
+        ReviewViewBlock::DisplayRow(display_row) => {
+            render_source_view_row(app, view_row, display_row)
+        }
+        ReviewViewBlock::FileLine {
+            line_number,
+            content,
+        } => render_file_view_row(
+            app,
+            view_row,
+            *line_number,
+            content,
+            syntax_highlighter,
+            can_highlight,
+            syntax_hint,
+        ),
+        ReviewViewBlock::InlineThreadHeader {
+            anchor,
+            comment_count,
+            ..
+        } => {
+            let style = Style::new()
+                .fg(Color::Yellow)
+                .bg(Color::Rgb(30, 28, 12))
+                .add_modifier(Modifier::BOLD);
+            RenderedRow {
+                line: Line::from_spans(vec![Span::styled(
+                    format!(
+                        "   ╭─ draft thread on rows {}-{} ({comment_count} comment{})",
+                        anchor.source_row,
+                        anchor.end_source_row(),
+                        if *comment_count == 1 { "" } else { "s" }
+                    ),
+                    style,
+                )]),
+                style,
             }
-            let (line, style) = if index == app.selected_diff_line {
-                (selected_line(&line), rendered.style.bg(Color::BrightBlack))
-            } else if app.is_row_in_range_selection(app.selected_file, index) {
-                (selected_line(&line), rendered.style.bg(Color::Blue))
-            } else {
-                (line, rendered.style)
-            };
-            frame.write_line_with_fallback_style(row_area, &line, style);
+        }
+        ReviewViewBlock::InlineComment { comment, .. } => {
+            let style = Style::new().fg(Color::White).bg(Color::Rgb(20, 20, 20));
+            RenderedRow {
+                line: Line::from_spans(vec![
+                    Span::styled(
+                        "   │ draft ",
+                        Style::new().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20)),
+                    ),
+                    Span::styled(comment.body.clone(), style),
+                ]),
+                style,
+            }
+        }
+        ReviewViewBlock::InlineThreadActions { .. } => {
+            let style = Style::new()
+                .fg(Color::BrightBlack)
+                .bg(Color::Rgb(20, 20, 20));
+            RenderedRow {
+                line: Line::from_spans(vec![Span::styled(
+                    "   ╰─ actions: c reply  e edit  d delete  a ask Bcode  p publish",
+                    style,
+                )]),
+                style,
+            }
         }
     }
+}
+
+fn render_source_view_row(
+    app: &ReviewApp,
+    view_row: &ReviewViewRow,
+    display_row: &ReviewDisplayRow,
+) -> RenderedRow {
+    let Some(source_row) = view_row.source_row else {
+        return render_display_row(display_row);
+    };
+    let rendered = render_display_row(display_row);
+    let mut line = rendered.line;
+    if let Some(marker) = app.draft_marker_at(app.selected_file, source_row) {
+        line.spans
+            .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
+    }
+    let (line, style) = if source_row == app.selected_diff_line {
+        (selected_line(&line), rendered.style.bg(Color::BrightBlack))
+    } else if app.is_row_in_range_selection(app.selected_file, source_row) {
+        (selected_line(&line), rendered.style.bg(Color::Blue))
+    } else {
+        (line, rendered.style)
+    };
+    RenderedRow { line, style }
+}
+
+fn render_file_view_row(
+    app: &ReviewApp,
+    view_row: &ReviewViewRow,
+    line_number: Option<u32>,
+    content: &str,
+    syntax_highlighter: SyntaxHighlighter,
+    can_highlight: bool,
+    syntax_hint: &str,
+) -> RenderedRow {
+    let source_row = view_row.source_row.unwrap_or(view_row.visual_row);
+    let mut style = file_viewer_row_style(app, source_row);
+    let line_number =
+        line_number.map_or_else(|| "      ".to_string(), |number| format!("{number:>5} "));
+    let mut spans = vec![Span::styled(
+        line_number.clone(),
+        Style::new().fg(Color::BrightBlack),
+    )];
+    if line_number.trim().is_empty() {
+        spans.push(Span::styled(content.to_string(), style));
+    } else {
+        spans.extend(highlighted_source_spans(
+            syntax_highlighter,
+            can_highlight,
+            syntax_hint,
+            content,
+            style,
+        ));
+    }
+    let mut line = Line::from_spans(spans);
+    if let Some(marker) = app.draft_marker_at(app.selected_file, source_row) {
+        line.spans
+            .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
+        style = style.bg(style.bg.unwrap_or(Color::BrightBlack));
+    }
+    RenderedRow { line, style }
 }
 
 fn selected_line(line: &Line) -> Line {
@@ -961,56 +1118,15 @@ fn render_materialized_file_surface(app: &ReviewApp, area: Rect, frame: &mut Fra
         render_empty(area, "Binary file content not available", frame);
         return;
     }
-    let rows = file_surface_rows(file);
-    if rows.is_empty() {
+    let Some(document) = app.current_review_view_document() else {
+        render_empty(area, "No file content", frame);
+        return;
+    };
+    if document.rows.is_empty() {
         render_empty(area, "No file content", frame);
         return;
     }
-    let syntax_highlighter = SyntaxHighlighter::new();
-    let syntax_hint = file.display_path();
-    let can_highlight = syntax_highlighter.can_highlight(syntax_hint);
-    let visible = usize::from(area.height);
-    for row in 0..visible {
-        let index = app.diff_scroll.saturating_add(row);
-        let y = area
-            .y
-            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        if y >= area.bottom() {
-            break;
-        }
-        let Some((line_number, content)) = rows.get(index) else {
-            break;
-        };
-        let mut style = file_viewer_row_style(app, index);
-        let line_number =
-            line_number.map_or_else(|| "      ".to_string(), |number| format!("{number:>5} "));
-        let mut spans = vec![Span::styled(
-            line_number.clone(),
-            Style::new().fg(Color::BrightBlack),
-        )];
-        if line_number.trim().is_empty() {
-            spans.push(Span::styled(content.clone(), style));
-        } else {
-            spans.extend(highlighted_source_spans(
-                syntax_highlighter,
-                can_highlight,
-                syntax_hint,
-                content,
-                style,
-            ));
-        }
-        let mut line = Line::from_spans(spans);
-        if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
-            line.spans
-                .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
-            style = style.bg(style.bg.unwrap_or(Color::BrightBlack));
-        }
-        frame.write_line_with_fallback_style(Rect::new(area.x, y, area.width, 1), &line, style);
-    }
-}
-
-fn file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, String)> {
-    materialized_file_surface_rows(file)
+    render_view_document(app, &document, area, frame);
 }
 
 #[must_use]
@@ -1044,50 +1160,15 @@ fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_empty(area, reason, frame);
         return;
     }
-    let syntax_highlighter = SyntaxHighlighter::new();
-    let can_highlight = syntax_highlighter.can_highlight(&path);
-    let visible = usize::from(area.height);
-    for row in 0..visible {
-        let index = app.diff_scroll.saturating_add(row);
-        let y = area
-            .y
-            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        if y >= area.bottom() {
-            break;
-        }
-        let Some(content) = cached.line(index) else {
-            break;
-        };
-        let mut style = file_viewer_row_style(app, index);
-        let line_number = format!("{:>5} ", index.saturating_add(1));
-        let mut spans = vec![Span::styled(
-            line_number,
-            Style::new().fg(Color::BrightBlack),
-        )];
-        spans.extend(highlighted_source_spans(
-            syntax_highlighter,
-            can_highlight,
-            &path,
-            content,
-            style,
-        ));
-        let mut line = Line::from_spans(spans);
-        if let Some(marker) = app.draft_marker_at(app.selected_file, index) {
-            line.spans
-                .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
-            style = style.bg(style.bg.unwrap_or(Color::BrightBlack));
-        }
-        frame.write_line_with_fallback_style(
-            Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            },
-            &line,
-            style,
-        );
+    let Some(document) = app.current_review_view_document() else {
+        render_empty(area, "No file content", frame);
+        return;
+    };
+    if document.rows.is_empty() {
+        render_empty(area, "No file content", frame);
+        return;
     }
+    render_view_document(app, &document, area, frame);
 }
 
 fn file_viewer_row_style(app: &ReviewApp, index: usize) -> Style {
@@ -1120,20 +1201,6 @@ fn highlighted_source_spans(
                 span.content,
                 base_style.patch(syntax_style_to_tui(span.style)),
             )
-        })
-        .collect()
-}
-
-fn rendered_rows(file_index: usize, file: &ReviewFile) -> Vec<RenderedRow> {
-    ReviewViewDocument::build_diff_file(file_index, file, true)
-        .rows
-        .iter()
-        .filter_map(|row| match &row.block {
-            ReviewViewBlock::DisplayRow(display_row) => Some(render_display_row(display_row)),
-            ReviewViewBlock::FileLine { .. }
-            | ReviewViewBlock::InlineThreadHeader { .. }
-            | ReviewViewBlock::InlineComment { .. }
-            | ReviewViewBlock::InlineThreadActions { .. } => None,
         })
         .collect()
 }

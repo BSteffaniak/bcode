@@ -31,6 +31,7 @@ use bmux_tui::terminal::Terminal;
 use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
+use crate::code_review_tui_view::{ReviewThreadAnchor, ReviewViewDocument};
 use crate::tui_host_types::{TuiError, helpers};
 
 const SERVICE_INTERFACE_ID: &str = CODE_REVIEW_SERVICE_INTERFACE_ID;
@@ -4868,7 +4869,7 @@ impl ReviewApp {
             self.diff_scroll = viewport.diff_scroll.min(self.max_diff_scroll());
             self.selected_diff_line = viewport
                 .selected_diff_line
-                .min(self.rendered_diff_len().saturating_sub(1));
+                .min(self.source_rendered_diff_len().saturating_sub(1));
             self.ensure_selected_diff_line_visible();
         } else {
             self.diff_scroll = 0;
@@ -5105,7 +5106,7 @@ impl ReviewApp {
 
     /// Select a visible diff line by rendered row index.
     pub fn select_diff_line(&mut self, index: usize) -> bool {
-        let clamped = index.min(self.rendered_diff_len().saturating_sub(1));
+        let clamped = index.min(self.source_rendered_diff_len().saturating_sub(1));
         if clamped == self.selected_diff_line {
             return false;
         }
@@ -5117,7 +5118,7 @@ impl ReviewApp {
     /// Start a mouse-driven range selection from a rendered diff row.
     pub fn begin_mouse_range_selection(&mut self, index: usize) -> bool {
         self.mouse_range_selection_start =
-            Some(index.min(self.rendered_diff_len().saturating_sub(1)));
+            Some(index.min(self.source_rendered_diff_len().saturating_sub(1)));
         self.mouse_range_selection_dragged = false;
         self.range_selection_start = None;
         self.select_diff_line(index)
@@ -5200,7 +5201,14 @@ impl ReviewApp {
         if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
             return None;
         }
-        Some(self.diff_scroll + usize::from(y.saturating_sub(area.y)))
+        let visual_row = self.diff_scroll + usize::from(y.saturating_sub(area.y));
+        self.current_review_view_document()
+            .and_then(|document| {
+                document
+                    .row_for_visual_row(visual_row)
+                    .and_then(|row| row.source_row)
+            })
+            .or(Some(visual_row))
     }
 
     /// Return total draft comment count.
@@ -6117,14 +6125,19 @@ impl ReviewApp {
         let height = self
             .last_diff_area
             .map_or(1, |area| usize::from(area.height).max(1));
-        if self.selected_diff_line < self.diff_scroll {
-            self.diff_scroll = self.selected_diff_line;
-        } else if self.selected_diff_line >= self.diff_scroll.saturating_add(height) {
-            self.diff_scroll = self
-                .selected_diff_line
-                .saturating_sub(height.saturating_sub(1));
+        let selected_visual_row = self.selected_diff_visual_row();
+        if selected_visual_row < self.diff_scroll {
+            self.diff_scroll = selected_visual_row;
+        } else if selected_visual_row >= self.diff_scroll.saturating_add(height) {
+            self.diff_scroll = selected_visual_row.saturating_sub(height.saturating_sub(1));
         }
         self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
+    }
+
+    fn selected_diff_visual_row(&self) -> usize {
+        self.current_review_view_document()
+            .and_then(|document| document.visual_row_for_source_row(self.selected_diff_line))
+            .unwrap_or(self.selected_diff_line)
     }
 
     fn max_diff_scroll(&self) -> usize {
@@ -6135,6 +6148,15 @@ impl ReviewApp {
     }
 
     fn rendered_diff_len(&self) -> usize {
+        self.current_review_view_document()
+            .map_or_else(
+                || self.source_rendered_diff_len(),
+                |document| document.rows.len(),
+            )
+            .max(1)
+    }
+
+    fn source_rendered_diff_len(&self) -> usize {
         if self.review.is_repository_review() {
             let Some(path) = self.selected_file_path() else {
                 return 1;
@@ -6161,6 +6183,47 @@ impl ReviewApp {
             .map(|hunk| hunk.lines.len().saturating_add(1))
             .sum::<usize>()
             .max(1)
+    }
+
+    /// Build the semantic view document for the current main review pane.
+    #[must_use]
+    pub fn current_review_view_document(&self) -> Option<ReviewViewDocument> {
+        let mut document = if self.review.is_repository_review() {
+            let path = self.selected_file_path()?;
+            let cached = self.file_cache.get(&path)?;
+            if cached.unavailable_reason.is_some() {
+                return None;
+            }
+            ReviewViewDocument::build_repository_file(self.selected_file, cached)
+        } else {
+            let file = self.selected_file_data()?;
+            if file.is_binary {
+                return None;
+            }
+            if self
+                .selected_surface()
+                .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
+            {
+                ReviewViewDocument::build_materialized_file_surface(self.selected_file, file)
+            } else {
+                ReviewViewDocument::build_diff_file(self.selected_file, file, true)
+            }
+        };
+        document = document.with_inline_draft_threads(
+            self.selected_file,
+            self.draft_comments.iter().map(|(anchor, comments)| {
+                (
+                    ReviewThreadAnchor {
+                        file_index: anchor.file_index,
+                        path: anchor.path.clone(),
+                        source_row: anchor.diff_row,
+                        end_source_row: anchor.end_diff_row,
+                    },
+                    comments.clone(),
+                )
+            }),
+        );
+        Some(document)
     }
 
     fn hunk_render_rows(&self) -> Vec<usize> {
