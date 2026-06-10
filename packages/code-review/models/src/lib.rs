@@ -20,6 +20,8 @@ pub const OP_REVIEW_PUBLISHERS_LIST: &str = "review.publishers.list";
 pub const OP_REVIEW_PUBLISH_PREVIEW: &str = "review.publish.preview";
 /// Operation that submits a review publish operation.
 pub const OP_REVIEW_PUBLISH_SUBMIT: &str = "review.publish.submit";
+/// Operation that saves publish history for an externally handled publisher.
+pub const OP_REVIEW_PUBLISH_RECORD_SAVE: &str = "review.publish.record.save";
 /// Operation that lists durable review workspaces.
 pub const OP_REVIEW_WORKSPACE_LIST: &str = "review.workspace.list";
 /// Operation that creates a durable review workspace.
@@ -1022,6 +1024,31 @@ pub struct PublishReviewRequest {
     /// Publisher options.
     #[serde(default)]
     pub options: serde_json::Value,
+}
+
+/// Request payload for recording an external publish result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavePublishRecordRequest {
+    /// Review workspace that was published.
+    pub workspace: ReviewWorkspace,
+    /// Review bundle id/key that was published.
+    pub review_id: String,
+    /// Publisher id.
+    pub publisher_id: String,
+    /// Whether submission happened.
+    pub submitted: bool,
+    /// Output location, when available.
+    #[serde(default)]
+    pub output: Option<String>,
+    /// Human-readable result message.
+    pub message: String,
+}
+
+/// Response payload for recording an external publish result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavePublishRecordResponse {
+    /// Saved publish record.
+    pub record: ReviewPublishRecord,
 }
 
 /// Request payload for external publisher operations.

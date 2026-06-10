@@ -1924,6 +1924,8 @@ fn workspace_health_label(item: &ReviewWorkspaceListItem) -> &'static str {
         "setup"
     } else if workspace.sources.iter().all(|source| !source.included) {
         "needs sources"
+    } else if has_unpublished_drafts(item) {
+        "changed since publish"
     } else if item.draft_count > 0 && item.last_publish.is_none() {
         "drafts"
     } else if item.last_publish.is_some() {
@@ -1931,6 +1933,15 @@ fn workspace_health_label(item: &ReviewWorkspaceListItem) -> &'static str {
     } else {
         "active"
     }
+}
+
+fn has_unpublished_drafts(item: &ReviewWorkspaceListItem) -> bool {
+    item.draft_count > 0
+        && item.last_publish.as_ref().is_some_and(|publish| {
+            item.workspace
+                .updated_at_ms
+                .is_some_and(|updated_at_ms| updated_at_ms > publish.created_at_ms)
+        })
 }
 
 fn workspace_next_action(item: &ReviewWorkspaceListItem) -> String {
@@ -1948,6 +1959,9 @@ fn workspace_next_action(item: &ReviewWorkspaceListItem) -> String {
     }
     if included_count == 0 {
         return "open and include at least one source".to_string();
+    }
+    if has_unpublished_drafts(item) {
+        return "open and publish draft updates".to_string();
     }
     if item.draft_count > 0 && item.last_publish.is_none() {
         return "open and publish drafts".to_string();
@@ -1999,8 +2013,18 @@ fn workspace_row_text(item: &ReviewWorkspaceListItem) -> String {
     };
     let health = workspace_health_label(item);
     let next_action = workspace_next_action(item);
+    let publish_suffix = item.last_publish.as_ref().map_or_else(
+        || "never published".to_string(),
+        |record| {
+            format!(
+                "published {} via {}",
+                relative_time_label(record.created_at_ms),
+                record.publisher_id
+            )
+        },
+    );
     format!(
-        " {}  · {}  · {health}  · {}  · next: {}  · {}{}",
+        " {}  · {}  · {health}  · {}  · {publish_suffix}  · next: {}  · {}{}",
         workspace.title, updated, draft_suffix, next_action, suffix, archived
     )
 }
@@ -2226,6 +2250,13 @@ mod tests {
         assert_eq!(workspace_health_label(&needs_sources), "needs sources");
         assert_eq!(workspace_health_label(&drafts), "drafts");
         assert_eq!(workspace_health_label(&published), "published");
+        published.workspace.updated_at_ms = Some(5);
+        published.draft_count = 1;
+        assert_eq!(workspace_health_label(&published), "changed since publish");
+        assert_eq!(
+            workspace_next_action(&published),
+            "open and publish draft updates"
+        );
         assert_eq!(workspace_health_label(&active), "active");
         assert_eq!(workspace_health_label(&archived), "archived");
     }

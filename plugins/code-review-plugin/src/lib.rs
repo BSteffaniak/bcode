@@ -21,18 +21,20 @@ use bcode_code_review_models::{
     GetReviewWorkspaceResponse, LinkThreadSessionRequest, LinkThreadSessionResponse,
     ListDraftsRequest, ListDraftsResponse, ListReviewPublishersResponse,
     ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, MaterializeReviewWorkspaceRequest,
-    MaterializeReviewWorkspaceResponse, OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_ARCHIVE,
-    OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST,
-    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse,
-    PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
-    ResolveThreadRequest, ResolveThreadResponse, ReviewBundle, ReviewBundleLine,
-    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
-    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord, ReviewPublisherCapabilities,
-    ReviewPublisherManifest, ReviewRepositoryCommit, ReviewScope, ReviewSource,
-    ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface,
-    ReviewSurfaceKind, ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem,
-    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, UpdateDraftRequest,
-    UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    MaterializeReviewWorkspaceResponse, OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_REPO_FILE_GET,
+    OP_REVIEW_WORKSPACE_ARCHIVE, OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET,
+    OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
+    PublishReviewPreviewResponse, PublishReviewRequest, PublishReviewResponse,
+    RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest, ResolveThreadResponse,
+    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
+    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
+    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
+    ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
+    ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization,
+    SaveDraftRequest, SaveDraftResponse, SavePublishRecordRequest, SavePublishRecordResponse,
+    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
+    UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -156,6 +158,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
             OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
             OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
+            OP_REVIEW_PUBLISH_RECORD_SAVE => review_publish_record_save(&context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -987,6 +990,17 @@ fn publish_preview_for_request(
     })
 }
 
+fn review_publish_record_save(context: &NativeServiceContext) -> ServiceResponse {
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match save_publish_record_for_request(&context.request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("publish_record_save_failed", error.to_string()),
+    }
+}
+
 fn publish_submit_for_request(
     request: PublishReviewRequest,
     config: &CodeReviewPluginConfig,
@@ -1017,6 +1031,36 @@ fn publish_submit_for_request(
         })?;
     }
     Ok(response)
+}
+
+fn save_publish_record_for_request(
+    request: &ServiceRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<SavePublishRecordResponse, ReviewError> {
+    let request = request.payload_json::<SavePublishRecordRequest>()?;
+    let record = ReviewPublishRecord {
+        id: publish_record_id(
+            &request.workspace.id,
+            &request.publisher_id,
+            request.submitted,
+        ),
+        workspace_id: Some(request.workspace.id.clone()),
+        review_id: request.review_id,
+        publisher_id: request.publisher_id,
+        submitted: request.submitted,
+        output: request.output,
+        message: request.message,
+        created_at_ms: now_ms(),
+    };
+    let record_to_save = record.clone();
+    with_database(&request.workspace.repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .save_publish_record(&record_to_save)
+                .await
+        })
+    })?;
+    Ok(SavePublishRecordResponse { record })
 }
 
 fn publish_record_id(workspace_id: &str, publisher_id: &str, submitted: bool) -> String {

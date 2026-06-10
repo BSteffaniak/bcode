@@ -10,13 +10,14 @@ use bcode_client::BcodeClient;
 use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, MaterializeReviewWorkspaceRequest,
     MaterializeReviewWorkspaceResponse, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
-    OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
-    OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
-    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewRepositoryCommit, ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST,
+    OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST,
+    OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
+    REVIEW_PUBLISHER_INTERFACE_ID, ReviewBundle, ReviewRepositoryCommit,
+    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
     ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewWorkspace,
-    UpdateReviewWorkspaceRequest,
+    SavePublishRecordRequest, SavePublishRecordResponse, UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
@@ -45,6 +46,7 @@ const UPDATE_DRAFT_OPERATION: &str = "draft.update";
 const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
 const THREAD_RESOLVE_OPERATION: &str = "thread.resolve";
 const PUBLISH_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISH_SUBMIT;
+const PUBLISH_RECORD_SAVE_OPERATION: &str = OP_REVIEW_PUBLISH_RECORD_SAVE;
 const PUBLISHERS_LIST_OPERATION: &str = OP_REVIEW_PUBLISHERS_LIST;
 const PUBLISH_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISH_PREVIEW;
 const REVIEW_BUNDLE_GET_OPERATION: &str = OP_REVIEW_BUNDLE_GET;
@@ -773,7 +775,7 @@ async fn preview_review(
             client,
             route,
             REVIEW_PUBLISHER_PREVIEW_OPERATION.to_string(),
-            bundle,
+            &bundle,
             options,
         )
         .await?;
@@ -820,12 +822,13 @@ async fn publish_review(
 ) -> Result<PublishReviewResponse, TuiError> {
     let options = options_json(options);
     if let Some(route) = route {
-        let bundle = load_review_bundle(client, repo_path, target, workspace.clone()).await?;
+        let bundle =
+            load_review_bundle(client, repo_path.clone(), target, workspace.clone()).await?;
         let response = invoke_external_publisher(
             client,
             route,
             REVIEW_PUBLISHER_SUBMIT_OPERATION.to_string(),
-            bundle,
+            &bundle,
             options,
         )
         .await?;
@@ -835,7 +838,13 @@ async fn publish_review(
                 message: error.message,
             });
         }
-        return serde_json::from_slice(&response.payload).map_err(TuiError::Json);
+        let publish_response: PublishReviewResponse =
+            serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+        if let Some(workspace) = workspace {
+            save_external_publish_record(client, workspace, bundle.review_id, &publish_response)
+                .await?;
+        }
+        return Ok(publish_response);
     }
     let request = PublishReviewRequest {
         repo_path,
@@ -859,6 +868,39 @@ async fn publish_review(
         });
     }
     serde_json::from_slice(&response.payload).map_err(TuiError::Json)
+}
+
+async fn save_external_publish_record(
+    client: &BcodeClient,
+    workspace: ReviewWorkspace,
+    review_id: String,
+    response: &PublishReviewResponse,
+) -> Result<(), TuiError> {
+    let request = SavePublishRecordRequest {
+        workspace,
+        review_id,
+        publisher_id: response.publisher_id.clone(),
+        submitted: response.submitted,
+        output: response.output.clone(),
+        message: response.message.clone(),
+    };
+    let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            PUBLISH_RECORD_SAVE_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let _: SavePublishRecordResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(())
 }
 
 fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
@@ -1012,7 +1054,7 @@ async fn load_review_bundle(
     repo_path: PathBuf,
     target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
-) -> Result<serde_json::Value, TuiError> {
+) -> Result<ReviewBundle, TuiError> {
     let request = ReviewBundleRequest {
         repo_path,
         target,
@@ -1039,7 +1081,7 @@ async fn invoke_external_publisher(
     client: &BcodeClient,
     route: ReviewPublisherRoute,
     operation: String,
-    bundle: serde_json::Value,
+    bundle: &ReviewBundle,
     options: serde_json::Value,
 ) -> Result<PluginServiceResponse, TuiError> {
     let payload = serde_json::to_vec(&serde_json::json!({
