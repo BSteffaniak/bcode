@@ -5242,7 +5242,7 @@ impl ReviewApp {
             return false;
         }
         self.diff_scroll = next;
-        self.selected_diff_line = self.selected_diff_line.max(self.diff_scroll);
+        self.keep_selection_inside_visible_diff();
         true
     }
 
@@ -5253,14 +5253,21 @@ impl ReviewApp {
             return false;
         }
         self.diff_scroll = next;
-        self.selected_diff_line = self.selected_diff_line.min(
-            self.diff_scroll.saturating_add(
-                self.last_diff_area
-                    .map_or(1, |area| usize::from(area.height).max(1))
-                    .saturating_sub(1),
-            ),
-        );
+        self.keep_selection_inside_visible_diff();
         true
+    }
+
+    fn keep_selection_inside_visible_diff(&mut self) {
+        let height = self
+            .last_diff_area
+            .map_or(1, |area| usize::from(area.height).max(1));
+        let selected_visual_row = self.selected_diff_visual_row();
+        if selected_visual_row < self.diff_scroll {
+            let _ = self.select_view_visual_row(self.diff_scroll);
+        } else if selected_visual_row >= self.diff_scroll.saturating_add(height) {
+            let bottom = self.diff_scroll.saturating_add(height.saturating_sub(1));
+            let _ = self.select_view_visual_row(bottom);
+        }
     }
 
     /// Scroll to top.
@@ -6535,8 +6542,9 @@ impl ReviewApp {
     }
 
     fn selected_diff_visual_row(&self) -> usize {
+        let document = self.current_review_view_document();
         if let Some(target) = &self.selected_view_target
-            && let Some(visual_row) = self.current_review_view_document().and_then(|document| {
+            && let Some(visual_row) = document.as_ref().and_then(|document| {
                 document
                     .rows
                     .iter()
@@ -6546,10 +6554,11 @@ impl ReviewApp {
         {
             return visual_row;
         }
-        self.current_review_view_document()
+        document
+            .as_ref()
             .and_then(|document| document.visual_row_for_source_row(self.selected_diff_line))
             .or_else(|| {
-                self.current_review_view_document().and_then(|document| {
+                document.as_ref().and_then(|document| {
                     document.rows.iter().find_map(|row| match &row.target {
                         ReviewViewTarget::Thread { thread_key }
                             if self.collapsed_review_threads.contains(thread_key) =>
@@ -6838,6 +6847,44 @@ mod tests {
         ));
         assert!(app.select_next_inline_draft());
         assert_eq!(app.selected_diff_line, 2);
+    }
+
+    #[test]
+    fn scrolling_keeps_selection_on_visible_semantic_rows() {
+        let mut app = sample_app();
+        app.last_diff_area = Some(Rect::new(0, 0, 80, 2));
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment-1".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+
+        assert!(app.scroll_down(3));
+
+        assert!(app.selected_diff_visual_row() >= app.diff_scroll);
+        assert!(app.selected_diff_visual_row() < app.diff_scroll + 2);
     }
 
     #[test]
