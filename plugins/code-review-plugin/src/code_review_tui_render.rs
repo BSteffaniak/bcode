@@ -1725,7 +1725,11 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),
         &Line::from_spans(vec![Span::styled(
-            " Draft comment ",
+            if editor.preview {
+                " Draft comment preview "
+            } else {
+                " Draft comment "
+            },
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
@@ -1759,23 +1763,7 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         )]),
     );
     let text_height = usize::from(height.saturating_sub(4));
-    for (index, line) in editor.buffer.text().lines().take(text_height).enumerate() {
-        frame.write_line(
-            Rect::new(
-                popup.x.saturating_add(1),
-                popup
-                    .y
-                    .saturating_add(2)
-                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
-                popup.width.saturating_sub(2),
-                1,
-            ),
-            &Line::from_spans(vec![Span::styled(
-                truncate_to_display_width(line, usize::from(popup.width.saturating_sub(2))),
-                Style::new().fg(Color::White).bg(Color::Black),
-            )]),
-        );
-    }
+    render_comment_editor_body(editor, popup, text_height, frame);
     if editor.buffer.text().is_empty() {
         frame.write_line(
             Rect::new(
@@ -1798,10 +1786,87 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            " enter/ctrl+s save  esc cancel ",
+            if editor.preview {
+                " tab edit  enter/ctrl+s save  esc cancel "
+            } else {
+                " tab preview  enter/ctrl+s save  esc cancel "
+            },
             Style::new().fg(Color::Black).bg(Color::Yellow),
         )]),
     );
+}
+
+fn render_comment_editor_body(
+    editor: &crate::code_review_tui::ReviewCommentEditor,
+    popup: Rect,
+    text_height: usize,
+    frame: &mut Frame<'_>,
+) {
+    if editor.preview {
+        render_comment_editor_preview(editor, popup, text_height, frame);
+    } else {
+        render_comment_editor_text(editor, popup, text_height, frame);
+    }
+}
+
+fn render_comment_editor_preview(
+    editor: &crate::code_review_tui::ReviewCommentEditor,
+    popup: Rect,
+    text_height: usize,
+    frame: &mut Frame<'_>,
+) {
+    let preview_width = popup.width.saturating_sub(2).max(1);
+    for (index, line) in render_markdown_lines(
+        editor.buffer.text(),
+        MarkdownRenderOptions::new(preview_width),
+    )
+    .into_iter()
+    .take(text_height)
+    .enumerate()
+    {
+        let mut spans = line.spans;
+        if spans.is_empty() {
+            spans.push(Span::styled(String::new(), Style::new().bg(Color::Black)));
+        }
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                popup.x.saturating_add(1),
+                popup
+                    .y
+                    .saturating_add(2)
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                preview_width,
+                1,
+            ),
+            &Line::from_spans(spans),
+            Style::new().fg(Color::White).bg(Color::Black),
+        );
+    }
+}
+
+fn render_comment_editor_text(
+    editor: &crate::code_review_tui::ReviewCommentEditor,
+    popup: Rect,
+    text_height: usize,
+    frame: &mut Frame<'_>,
+) {
+    for (index, line) in editor.buffer.text().lines().take(text_height).enumerate() {
+        frame.write_line(
+            Rect::new(
+                popup.x.saturating_add(1),
+                popup
+                    .y
+                    .saturating_add(2)
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(line, usize::from(popup.width.saturating_sub(2))),
+                Style::new().fg(Color::White).bg(Color::Black),
+            )]),
+        );
+    }
 }
 
 fn prompt_popup_height(kind: &ReviewPromptKind, area: Rect) -> u16 {

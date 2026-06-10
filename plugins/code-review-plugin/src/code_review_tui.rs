@@ -1486,7 +1486,22 @@ fn handle_comment_editor_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         app.save_comment_editor();
         return true;
     }
+    if stroke.key == KeyCode::Tab
+        && stroke.modifiers.is_empty()
+        && let Some(editor) = &mut app.comment_editor
+    {
+        editor.preview = !editor.preview;
+        app.status_message = Some(if editor.preview {
+            "showing Markdown preview".to_string()
+        } else {
+            "editing Markdown comment".to_string()
+        });
+        return true;
+    }
     if let Some(editor) = &mut app.comment_editor {
+        if editor.preview {
+            return true;
+        }
         return matches!(
             helpers::handle_default_text_key(
                 &mut editor.buffer,
@@ -2630,6 +2645,8 @@ pub struct ReviewCommentEditor {
     pub anchor: ReviewCommentAnchor,
     /// Editable comment buffer.
     pub buffer: TextEditBuffer,
+    /// Whether the editor is showing Markdown preview.
+    pub preview: bool,
     /// Editor mode.
     pub mode: ReviewCommentEditorMode,
 }
@@ -2641,6 +2658,7 @@ impl ReviewCommentEditor {
         Self {
             anchor,
             buffer: TextEditBuffer::new(),
+            preview: false,
             mode: ReviewCommentEditorMode::Create,
         }
     }
@@ -2651,6 +2669,7 @@ impl ReviewCommentEditor {
         Self {
             anchor,
             buffer: TextEditBuffer::from_text(&body),
+            preview: false,
             mode: ReviewCommentEditorMode::Edit {
                 comment_id,
                 previous_body: body,
