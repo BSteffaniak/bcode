@@ -1130,7 +1130,8 @@ fn rendered_rows(file_index: usize, file: &ReviewFile) -> Vec<RenderedRow> {
         .iter()
         .filter_map(|row| match &row.block {
             ReviewViewBlock::DisplayRow(display_row) => Some(render_display_row(display_row)),
-            ReviewViewBlock::InlineThreadHeader { .. }
+            ReviewViewBlock::FileLine { .. }
+            | ReviewViewBlock::InlineThreadHeader { .. }
             | ReviewViewBlock::InlineComment { .. }
             | ReviewViewBlock::InlineThreadActions { .. } => None,
         })

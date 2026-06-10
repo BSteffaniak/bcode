@@ -1,6 +1,6 @@
 //! Transcript-like semantic view document construction for code review panes.
 
-use crate::code_review_tui::ReviewFile;
+use crate::code_review_tui::{CachedReviewFile, ReviewDraftComment, ReviewFile};
 use crate::code_review_tui_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
 };
@@ -27,23 +27,11 @@ impl ReviewViewDocument {
             .rows
             .into_iter()
             .enumerate()
-            .map(|(render_row, display_row)| {
-                let target = match display_row.source {
-                    ReviewDisplayRowSource::HunkHeader => ReviewViewTarget::HunkHeader {
-                        file_index,
-                        diff_row: render_row,
-                    },
-                    ReviewDisplayRowSource::Context
-                    | ReviewDisplayRowSource::Added
-                    | ReviewDisplayRowSource::Removed => ReviewViewTarget::SourceLine {
-                        file_index,
-                        diff_row: render_row,
-                        old_line: display_row.old_line,
-                        new_line: display_row.new_line,
-                    },
-                };
+            .map(|(source_row, display_row)| {
+                let target = display_row_target(file_index, source_row, &display_row);
                 ReviewViewRow {
-                    render_row,
+                    visual_row: source_row,
+                    source_row: Some(source_row),
                     target,
                     block: ReviewViewBlock::DisplayRow(display_row),
                 }
@@ -52,21 +40,162 @@ impl ReviewViewDocument {
         Self { rows }
     }
 
-    /// Return the semantic target for a rendered row.
+    /// Build a view document for a materialized full-file surface.
     #[must_use]
-    pub fn target_for_render_row(&self, render_row: usize) -> Option<&ReviewViewTarget> {
+    pub fn build_materialized_file_surface(file_index: usize, file: &ReviewFile) -> Self {
+        let rows = materialized_file_surface_rows(file)
+            .into_iter()
+            .enumerate()
+            .map(|(source_row, (line_number, content))| ReviewViewRow {
+                visual_row: source_row,
+                source_row: Some(source_row),
+                target: line_number.map_or(
+                    ReviewViewTarget::HunkHeader {
+                        file_index,
+                        source_row,
+                    },
+                    |line_number| ReviewViewTarget::SourceLine {
+                        file_index,
+                        source_row,
+                        old_line: None,
+                        new_line: Some(line_number),
+                    },
+                ),
+                block: ReviewViewBlock::FileLine {
+                    line_number,
+                    content,
+                },
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// Build a view document for a lazily loaded repository file.
+    #[must_use]
+    pub fn build_repository_file(file_index: usize, file: &CachedReviewFile) -> Self {
+        let rows = file
+            .line_spans
+            .iter()
+            .enumerate()
+            .filter_map(|(source_row, _)| {
+                let content = file.line(source_row)?.to_string();
+                let line_number = u32::try_from(source_row.saturating_add(1)).ok();
+                Some(ReviewViewRow {
+                    visual_row: source_row,
+                    source_row: Some(source_row),
+                    target: ReviewViewTarget::SourceLine {
+                        file_index,
+                        source_row,
+                        old_line: None,
+                        new_line: line_number,
+                    },
+                    block: ReviewViewBlock::FileLine {
+                        line_number,
+                        content,
+                    },
+                })
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// Return a copy with inline draft thread rows inserted after anchor end rows.
+    #[must_use]
+    pub fn with_inline_draft_threads(
+        mut self,
+        file_index: usize,
+        drafts: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewDraftComment>)>,
+    ) -> Self {
+        let mut threads = drafts
+            .filter(|(anchor, comments)| anchor.file_index == file_index && !comments.is_empty())
+            .collect::<Vec<_>>();
+        threads.sort_by_key(|(anchor, _)| anchor.end_source_row());
+
+        let mut rows = Vec::with_capacity(self.rows.len().saturating_add(threads.len()));
+        for row in self.rows.drain(..) {
+            let source_row = row.source_row;
+            rows.push(row);
+            let Some(source_row) = source_row else {
+                continue;
+            };
+            for (anchor, comments) in threads
+                .iter()
+                .filter(|(anchor, _)| anchor.end_source_row() == source_row)
+            {
+                let thread_key = anchor.thread_key();
+                rows.push(ReviewViewRow {
+                    visual_row: 0,
+                    source_row: None,
+                    target: ReviewViewTarget::Thread {
+                        thread_key: thread_key.clone(),
+                    },
+                    block: ReviewViewBlock::InlineThreadHeader {
+                        thread_key: thread_key.clone(),
+                        anchor: anchor.clone(),
+                        comment_count: comments.len(),
+                    },
+                });
+                for (comment_index, comment) in comments.iter().cloned().enumerate() {
+                    rows.push(ReviewViewRow {
+                        visual_row: 0,
+                        source_row: None,
+                        target: ReviewViewTarget::Comment {
+                            thread_key: thread_key.clone(),
+                            comment_index,
+                        },
+                        block: ReviewViewBlock::InlineComment {
+                            thread_key: thread_key.clone(),
+                            comment_index,
+                            comment,
+                        },
+                    });
+                }
+                rows.push(ReviewViewRow {
+                    visual_row: 0,
+                    source_row: None,
+                    target: ReviewViewTarget::ThreadAction {
+                        thread_key: thread_key.clone(),
+                        action: "reply".to_string(),
+                    },
+                    block: ReviewViewBlock::InlineThreadActions { thread_key },
+                });
+            }
+        }
+        for (visual_row, row) in rows.iter_mut().enumerate() {
+            row.visual_row = visual_row;
+        }
+        Self { rows }
+    }
+
+    /// Return the semantic row for a visual row.
+    #[must_use]
+    pub fn row_for_visual_row(&self, visual_row: usize) -> Option<&ReviewViewRow> {
+        self.rows.get(visual_row)
+    }
+
+    /// Return the semantic target for a visual row.
+    #[must_use]
+    pub fn target_for_visual_row(&self, visual_row: usize) -> Option<&ReviewViewTarget> {
+        self.row_for_visual_row(visual_row).map(|row| &row.target)
+    }
+
+    /// Return the visual row for a source row.
+    #[must_use]
+    pub fn visual_row_for_source_row(&self, source_row: usize) -> Option<usize> {
         self.rows
-            .get(render_row)
-            .filter(|row| row.render_row == render_row)
-            .map(|row| &row.target)
+            .iter()
+            .find(|row| row.source_row == Some(source_row))
+            .map(|row| row.visual_row)
     }
 }
 
 /// One semantic row in a review view document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewViewRow {
-    /// Zero-based rendered row index in this document.
-    pub render_row: usize,
+    /// Zero-based visual row index in this document.
+    pub visual_row: usize,
+    /// Source/diff row represented by this row, if any.
+    pub source_row: Option<usize>,
     /// Semantic selection/action target represented by this row.
     pub target: ReviewViewTarget,
     /// Renderable semantic block for this row.
@@ -78,26 +207,47 @@ pub struct ReviewViewRow {
 pub enum ReviewViewBlock {
     /// Existing source/hunk display row.
     DisplayRow(ReviewDisplayRow),
-    /// Placeholder for future inline thread header rows.
-    InlineThreadHeader { thread_key: String },
-    /// Placeholder for future inline comment body rows.
-    InlineComment {
-        thread_key: String,
-        comment_index: usize,
+    /// Full-file source line row.
+    FileLine {
+        /// One-based source line number, when this is source code.
+        line_number: Option<u32>,
+        /// Line content.
+        content: String,
     },
-    /// Placeholder for future inline thread action rows.
+    /// Inline thread header row.
+    InlineThreadHeader {
+        /// Stable thread key.
+        thread_key: String,
+        /// Thread anchor.
+        anchor: ReviewThreadAnchor,
+        /// Number of comments in the thread.
+        comment_count: usize,
+    },
+    /// Inline comment body row.
+    InlineComment {
+        /// Stable thread key.
+        thread_key: String,
+        /// Comment index inside the thread.
+        comment_index: usize,
+        /// Draft comment body and metadata.
+        comment: ReviewDraftComment,
+    },
+    /// Inline thread action row.
     InlineThreadActions { thread_key: String },
 }
 
 /// Stable semantic target for selection, mouse, and actions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReviewViewTarget {
-    /// Hunk header row in a diff.
-    HunkHeader { file_index: usize, diff_row: usize },
+    /// Hunk header row in a diff or materialized file.
+    HunkHeader {
+        file_index: usize,
+        source_row: usize,
+    },
     /// Source line row in a diff or file surface.
     SourceLine {
         file_index: usize,
-        diff_row: usize,
+        source_row: usize,
         old_line: Option<u32>,
         new_line: Option<u32>,
     },
@@ -112,16 +262,153 @@ pub enum ReviewViewTarget {
     ThreadAction { thread_key: String, action: String },
 }
 
+/// Minimal, renderer-neutral thread anchor used by view construction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReviewThreadAnchor {
+    /// File index in the current review.
+    pub file_index: usize,
+    /// Display path for the commented file.
+    pub path: String,
+    /// Source row where the anchor starts.
+    pub source_row: usize,
+    /// Source row where the anchor ends.
+    pub end_source_row: Option<usize>,
+}
+
+impl ReviewThreadAnchor {
+    /// Return the final source row for this anchor.
+    #[must_use]
+    pub const fn end_source_row(&self) -> usize {
+        match self.end_source_row {
+            Some(row) => row,
+            None => self.source_row,
+        }
+    }
+
+    /// Return a stable per-document thread key.
+    #[must_use]
+    pub fn thread_key(&self) -> String {
+        format!(
+            "{}:{}:{}-{}",
+            self.file_index,
+            self.path,
+            self.source_row,
+            self.end_source_row()
+        )
+    }
+}
+
+const fn display_row_target(
+    file_index: usize,
+    source_row: usize,
+    display_row: &ReviewDisplayRow,
+) -> ReviewViewTarget {
+    match display_row.source {
+        ReviewDisplayRowSource::HunkHeader => ReviewViewTarget::HunkHeader {
+            file_index,
+            source_row,
+        },
+        ReviewDisplayRowSource::Context
+        | ReviewDisplayRowSource::Added
+        | ReviewDisplayRowSource::Removed => ReviewViewTarget::SourceLine {
+            file_index,
+            source_row,
+            old_line: display_row.old_line,
+            new_line: display_row.new_line,
+        },
+    }
+}
+
+fn materialized_file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, String)> {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| {
+            let heading = hunk
+                .heading
+                .iter()
+                .map(|heading| (None, format!("# {heading}")));
+            heading.chain(
+                hunk.lines
+                    .iter()
+                    .map(|line| (line.new_line.or(line.old_line), line.content.clone())),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ReviewViewBlock, ReviewViewDocument, ReviewViewTarget};
+    use super::{ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument, ReviewViewTarget};
     use crate::code_review_tui::{
-        ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine, ReviewLineKind,
+        ReviewDraftComment, ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine, ReviewLineKind,
     };
 
     #[test]
-    fn diff_file_document_maps_render_rows_to_semantic_targets() {
-        let file = ReviewFile {
+    fn diff_file_document_maps_visual_rows_to_semantic_targets() {
+        let file = test_file();
+
+        let document = ReviewViewDocument::build_diff_file(7, &file, true);
+
+        assert_eq!(document.rows.len(), 2);
+        assert_eq!(
+            document.target_for_visual_row(0),
+            Some(&ReviewViewTarget::HunkHeader {
+                file_index: 7,
+                source_row: 0,
+            })
+        );
+        assert_eq!(
+            document.target_for_visual_row(1),
+            Some(&ReviewViewTarget::SourceLine {
+                file_index: 7,
+                source_row: 1,
+                old_line: None,
+                new_line: Some(1),
+            })
+        );
+        assert!(matches!(
+            document.rows[1].block,
+            ReviewViewBlock::DisplayRow(_)
+        ));
+    }
+
+    #[test]
+    fn inline_draft_threads_are_inserted_after_anchor_rows() {
+        let file = test_file();
+        let anchor = ReviewThreadAnchor {
+            file_index: 7,
+            path: "src/lib.rs".to_string(),
+            source_row: 1,
+            end_source_row: None,
+        };
+        let comment = ReviewDraftComment {
+            id: Some("draft-1".to_string()),
+            body: "Please double-check this.".to_string(),
+            persisted: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            session_id: None,
+        };
+
+        let document = ReviewViewDocument::build_diff_file(7, &file, false)
+            .with_inline_draft_threads(7, std::iter::once((anchor.clone(), vec![comment])));
+
+        assert_eq!(document.rows.len(), 5);
+        assert_eq!(document.rows[1].source_row, Some(1));
+        assert!(matches!(
+            document.rows[2].block,
+            ReviewViewBlock::InlineThreadHeader { .. }
+        ));
+        assert_eq!(
+            document.target_for_visual_row(2),
+            Some(&ReviewViewTarget::Thread {
+                thread_key: anchor.thread_key(),
+            })
+        );
+    }
+
+    fn test_file() -> ReviewFile {
+        ReviewFile {
             old_path: Some("src/lib.rs".to_string()),
             new_path: Some("src/lib.rs".to_string()),
             status: ReviewFileStatus::Modified,
@@ -141,30 +428,6 @@ mod tests {
                 }],
             }],
             is_binary: false,
-        };
-
-        let document = ReviewViewDocument::build_diff_file(7, &file, true);
-
-        assert_eq!(document.rows.len(), 2);
-        assert_eq!(
-            document.target_for_render_row(0),
-            Some(&ReviewViewTarget::HunkHeader {
-                file_index: 7,
-                diff_row: 0,
-            })
-        );
-        assert_eq!(
-            document.target_for_render_row(1),
-            Some(&ReviewViewTarget::SourceLine {
-                file_index: 7,
-                diff_row: 1,
-                old_line: None,
-                new_line: Some(1),
-            })
-        );
-        assert!(matches!(
-            document.rows[1].block,
-            ReviewViewBlock::DisplayRow(_)
-        ));
+        }
     }
 }
