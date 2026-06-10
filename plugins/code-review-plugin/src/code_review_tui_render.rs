@@ -3,6 +3,7 @@
 use bcode_code_review_models::{
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurfaceKind,
 };
+use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -945,6 +946,7 @@ fn render_view_document(
             syntax_highlighter,
             can_highlight,
             &syntax_hint,
+            area.width,
         );
         if app.is_view_target_selected(&view_row.target) {
             rendered.line = selected_line(&rendered.line);
@@ -964,6 +966,7 @@ fn render_view_row(
     syntax_highlighter: SyntaxHighlighter,
     can_highlight: bool,
     syntax_hint: &str,
+    width: u16,
 ) -> RenderedRow {
     match &view_row.block {
         ReviewViewBlock::DisplayRow(display_row) => {
@@ -1022,7 +1025,6 @@ fn render_view_row(
             comment,
             body_line_index,
             body_line_count,
-            body_line,
             ..
         } => {
             let style = Style::new().fg(Color::White).bg(Color::Rgb(20, 20, 20));
@@ -1037,9 +1039,14 @@ fn render_view_row(
                 "│"
             };
             RenderedRow {
-                line: Line::from_spans(render_inline_comment_spans(
-                    branch, label, body_line, style,
-                )),
+                line: render_inline_comment_line(
+                    branch,
+                    label,
+                    comment,
+                    *body_line_index,
+                    width,
+                    style,
+                ),
                 style,
             }
         }
@@ -1047,91 +1054,31 @@ fn render_view_row(
     }
 }
 
-fn render_inline_comment_spans(
+fn render_inline_comment_line(
     branch: &str,
     label: &str,
-    body_line: &str,
+    comment: &crate::code_review_tui::ReviewDraftComment,
+    body_line_index: usize,
+    width: u16,
     style: Style,
-) -> Vec<Span> {
+) -> Line {
     let prefix_style = Style::new().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20));
-    let mut spans = vec![Span::styled(
-        format!("   {branch} {label:<6} "),
-        prefix_style,
-    )];
-    spans.extend(markdown_comment_spans(body_line, style));
-    spans
-}
-
-fn markdown_comment_spans(body_line: &str, style: Style) -> Vec<Span> {
-    if let Some(heading) = body_line.strip_prefix("### ") {
-        return vec![Span::styled(
-            heading.to_string(),
-            style.add_modifier(Modifier::BOLD).fg(Color::Cyan),
-        )];
-    }
-    if let Some(heading) = body_line.strip_prefix("## ") {
-        return vec![Span::styled(
-            heading.to_string(),
-            style.add_modifier(Modifier::BOLD).fg(Color::Cyan),
-        )];
-    }
-    if let Some(heading) = body_line.strip_prefix("# ") {
-        return vec![Span::styled(
-            heading.to_string(),
-            style.add_modifier(Modifier::BOLD).fg(Color::Cyan),
-        )];
-    }
-    if body_line.starts_with("> ") {
-        return vec![Span::styled(
-            body_line.to_string(),
-            style.fg(Color::BrightBlack).add_modifier(Modifier::ITALIC),
-        )];
-    }
-    if body_line.starts_with("```") {
-        return vec![Span::styled(
-            body_line.to_string(),
-            style.fg(Color::Green).add_modifier(Modifier::BOLD),
-        )];
-    }
-    if body_line.starts_with("- [ ] ") || body_line.starts_with("- [x] ") {
-        return vec![Span::styled(
-            body_line.to_string(),
-            style.fg(Color::Magenta),
-        )];
-    }
-    inline_code_spans(body_line, style)
-}
-
-fn inline_code_spans(body_line: &str, style: Style) -> Vec<Span> {
-    let mut spans = Vec::new();
-    let mut remaining = body_line;
-    let mut code = false;
-    while let Some((before, after_tick)) = remaining.split_once('`') {
-        if !before.is_empty() {
-            spans.push(Span::styled(before.to_string(), style));
-        }
-        if let Some((code_text, after_code)) = after_tick.split_once('`') {
-            spans.push(Span::styled(
-                code_text.to_string(),
-                style.fg(Color::Green).bg(Color::Rgb(28, 28, 28)),
-            ));
-            remaining = after_code;
-            code = false;
-        } else {
-            spans.push(Span::styled("`".to_string(), style));
-            remaining = after_tick;
-            code = true;
-            break;
-        }
-    }
-    if !remaining.is_empty() {
-        spans.push(Span::styled(remaining.to_string(), style));
-    }
-    if spans.is_empty() || code {
-        vec![Span::styled(body_line.to_string(), style)]
+    let prefix = format!("   {branch} {label:<6} ");
+    let markdown_width = width
+        .saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX))
+        .max(1);
+    let markdown_line =
+        render_markdown_lines(&comment.body, MarkdownRenderOptions::new(markdown_width))
+            .get(body_line_index)
+            .cloned()
+            .unwrap_or_else(Line::default);
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    if markdown_line.spans.is_empty() {
+        spans.push(Span::styled(String::new(), style));
     } else {
-        spans
+        spans.extend(markdown_line.spans);
     }
+    Line::from_spans(spans)
 }
 
 fn render_inline_thread_action(action: ReviewThreadAction) -> RenderedRow {

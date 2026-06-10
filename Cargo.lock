@@ -1123,6 +1123,7 @@ dependencies = [
  "bcode_code_review_models",
  "bcode_config",
  "bcode_ipc",
+ "bcode_markdown_render",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_syntax_render",

@@ -151,9 +151,8 @@ impl ReviewViewDocument {
                     continue;
                 }
                 for (comment_index, comment) in comments.iter().cloned().enumerate() {
-                    let body_lines = comment_body_lines(&comment.body);
-                    let body_line_count = body_lines.len();
-                    for (body_line_index, body_line) in body_lines.into_iter().enumerate() {
+                    let body_line_count = comment.body.lines().count().max(1);
+                    for body_line_index in 0..body_line_count {
                         rows.push(ReviewViewRow {
                             visual_row: 0,
                             source_row: None,
@@ -166,7 +165,6 @@ impl ReviewViewDocument {
                                 comment_index,
                                 body_line_index,
                                 body_line_count,
-                                body_line,
                                 comment: comment.clone(),
                             },
                         });
@@ -262,10 +260,8 @@ pub enum ReviewViewBlock {
         comment_index: usize,
         /// Body line index inside this comment.
         body_line_index: usize,
-        /// Total rendered body lines for this comment.
+        /// Total source body lines for this comment.
         body_line_count: usize,
-        /// Rendered body line.
-        body_line: String,
         /// Draft comment body and metadata.
         comment: ReviewDraftComment,
     },
@@ -470,15 +466,6 @@ fn materialized_file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, String
             )
         })
         .collect()
-}
-
-fn comment_body_lines(body: &str) -> Vec<String> {
-    let lines = body.lines().map(str::to_string).collect::<Vec<_>>();
-    if lines.is_empty() {
-        vec![String::new()]
-    } else {
-        lines
-    }
 }
 
 #[cfg(test)]
