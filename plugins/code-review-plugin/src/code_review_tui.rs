@@ -4886,6 +4886,15 @@ impl ReviewApp {
         }
     }
 
+    /// Return open and resolved thread counts.
+    #[must_use]
+    pub fn thread_status_counts(&self) -> (usize, usize) {
+        let summaries = self.thread_summaries();
+        let total = summaries.len();
+        let resolved = summaries.iter().filter(|thread| thread.resolved).count();
+        (total.saturating_sub(resolved), resolved)
+    }
+
     /// Return review thread summaries in deterministic order.
     #[must_use]
     pub fn thread_summaries(&self) -> Vec<ReviewThreadSummary> {
@@ -8055,6 +8064,7 @@ mod tests {
         let summary = app.thread_summaries().pop().expect("thread summary");
 
         assert!(summary.resolved);
+        assert_eq!(app.thread_status_counts(), (0, 1));
         assert!(
             app.selected_thread_preview()
                 .expect("thread preview")

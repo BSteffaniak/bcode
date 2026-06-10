@@ -108,6 +108,14 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         format!("  💬 {drafts} draft")
     };
+    let (open_threads, resolved_threads) = app.thread_status_counts();
+    let thread_label = if open_threads == 0 && resolved_threads == 0 {
+        String::new()
+    } else if app.show_resolved_threads {
+        format!("  threads {open_threads} open/{resolved_threads} resolved")
+    } else {
+        format!("  threads {open_threads} open/{resolved_threads} hidden")
+    };
     let surface_kind = app
         .review
         .surfaces()
@@ -139,18 +147,19 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         )
     } else if app.review.is_repository_review() {
         format!(
-            " bcode review  {}  {}  File {}  Surface {}  Line {}{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Line {}{}{} ",
             app.review.title,
             file_label,
             file_position,
             surface_kind,
             app.selected_diff_line.saturating_add(1),
-            draft_label
+            draft_label,
+            thread_label
         )
     } else {
         let (hunk, hunk_total) = app.hunk_position();
         format!(
-            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}  +{} -{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}{}  +{} -{} ",
             app.review.title,
             file_label,
             file_position,
@@ -158,6 +167,7 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             hunk,
             hunk_total,
             draft_label,
+            thread_label,
             app.review.additions,
             app.review.deletions
         )
