@@ -1734,6 +1734,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
         KeyCode::Char('T') => app.cycle_thread_filter(),
+        KeyCode::Char('W') => app.select_next_unviewed_file(),
         KeyCode::Char('w') => app.toggle_selected_file_viewed(),
         KeyCode::Char('u') => app.select_next_open_thread(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
@@ -5609,6 +5610,40 @@ impl ReviewApp {
         true
     }
 
+    /// Select next file not yet marked viewed.
+    pub fn select_next_unviewed_file(&mut self) -> bool {
+        self.select_relative_unviewed_file(1)
+    }
+
+    /// Select previous file not yet marked viewed.
+    pub fn select_previous_unviewed_file(&mut self) -> bool {
+        self.select_relative_unviewed_file(-1)
+    }
+
+    fn select_relative_unviewed_file(&mut self, offset: isize) -> bool {
+        let files = self.unviewed_file_indices();
+        if files.is_empty() {
+            self.status_message = Some("all files viewed".to_string());
+            return true;
+        }
+        let current_index = files.iter().position(|index| *index == self.selected_file);
+        let next_index = files[relative_index(current_index, files.len(), offset)];
+        let _ = self.select_file(next_index);
+        self.status_message = Some("selected unviewed file".to_string());
+        true
+    }
+
+    fn unviewed_file_indices(&self) -> Vec<usize> {
+        self.review
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                (!self.viewed_files.contains(file.display_path())).then_some(index)
+            })
+            .collect()
+    }
+
     /// Select previous file.
     pub fn select_previous_file(&mut self) -> bool {
         self.select_file(self.selected_file.saturating_sub(1))
@@ -8568,5 +8603,19 @@ mod tests {
 
         assert!(app.toggle_selected_file_viewed());
         assert!(!app.file_viewed(0));
+    }
+
+    #[test]
+    fn selects_next_unviewed_file() {
+        let mut app = sample_app();
+        assert!(app.toggle_selected_file_viewed());
+
+        assert!(app.select_next_unviewed_file());
+
+        assert_eq!(app.selected_file, 1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("selected unviewed file")
+        );
     }
 }
