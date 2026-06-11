@@ -2679,46 +2679,63 @@ async fn run_migrations(database: &dyn Database) -> Result<(), ReviewError> {
 async fn reconcile_legacy_code_review_migrations(
     database: &dyn Database,
 ) -> Result<(), ReviewError> {
-    if !database.table_exists("draft_threads").await? {
+    let has_draft_threads = database.table_exists("draft_threads").await?;
+    let has_review_workspaces = database.table_exists("review_workspaces").await?;
+    if !has_draft_threads && !has_review_workspaces {
         return Ok(());
     }
 
     let tracker = VersionTracker::with_table_name(MIGRATIONS_TABLE.to_string());
     tracker.ensure_table_exists(database).await?;
 
-    if database
-        .column_exists("draft_threads", "start_diff_row")
-        .await?
-        && !tracker
-            .is_migration_applied(database, "005_thread_range_columns")
+    if has_draft_threads {
+        if database
+            .column_exists("draft_threads", "start_diff_row")
             .await?
-    {
-        tracker
-            .record_migration(database, "005_thread_range_columns")
-            .await?;
+            && !tracker
+                .is_migration_applied(database, "005_thread_range_columns")
+                .await?
+        {
+            tracker
+                .record_migration(database, "005_thread_range_columns")
+                .await?;
+        }
+
+        if database
+            .column_exists("draft_threads", "is_file_anchor")
+            .await?
+            && !tracker
+                .is_migration_applied(database, "006_thread_file_anchor_column")
+                .await?
+        {
+            tracker
+                .record_migration(database, "006_thread_file_anchor_column")
+                .await?;
+        }
+
+        if database
+            .column_exists("draft_threads", "surface_id")
+            .await?
+            && !tracker
+                .is_migration_applied(database, "007_thread_surface_anchor_columns")
+                .await?
+        {
+            tracker
+                .record_migration(database, "007_thread_surface_anchor_columns")
+                .await?;
+        }
     }
 
-    if database
-        .column_exists("draft_threads", "is_file_anchor")
-        .await?
+    if has_review_workspaces
+        && database
+            .column_exists("review_workspaces", "viewed_files_json")
+            .await?
         && !tracker
-            .is_migration_applied(database, "006_thread_file_anchor_column")
+            .is_migration_applied(database, "008_workspace_viewed_files_column")
             .await?
     {
         tracker
-            .record_migration(database, "006_thread_file_anchor_column")
-            .await?;
-    }
-
-    if database
-        .column_exists("draft_threads", "surface_id")
-        .await?
-        && !tracker
-            .is_migration_applied(database, "007_thread_surface_anchor_columns")
-            .await?
-    {
-        tracker
-            .record_migration(database, "007_thread_surface_anchor_columns")
+            .record_migration(database, "008_workspace_viewed_files_column")
             .await?;
     }
 
@@ -2765,7 +2782,7 @@ fn workspace_viewed_files_column_migration() -> CodeMigration<'static> {
             "viewed_files_json".to_string(),
             DataType::Text,
             false,
-            None,
+            Some(DatabaseValue::String("[]".to_string())),
         )),
         None,
     )
