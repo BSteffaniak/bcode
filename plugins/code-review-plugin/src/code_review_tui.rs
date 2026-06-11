@@ -1786,7 +1786,10 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             if app.file_area_contains(mouse.position.x, mouse.position.y) {
-                if app.sidebar_mode == ReviewSidebarMode::Threads {
+                if matches!(
+                    app.sidebar_mode,
+                    ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+                ) {
                     app.select_previous_thread(3)
                 } else {
                     app.scroll_files_up(3)
@@ -1797,7 +1800,10 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
         }
         MouseEventKind::ScrollDown => {
             if app.file_area_contains(mouse.position.x, mouse.position.y) {
-                if app.sidebar_mode == ReviewSidebarMode::Threads {
+                if matches!(
+                    app.sidebar_mode,
+                    ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+                ) {
                     app.select_next_thread(3)
                 } else {
                     app.scroll_files_down(3)
@@ -1808,7 +1814,10 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if app.file_area_contains(mouse.position.x, mouse.position.y) {
-                if app.sidebar_mode == ReviewSidebarMode::Threads {
+                if matches!(
+                    app.sidebar_mode,
+                    ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+                ) {
                     app.thread_index_at(mouse.position.x, mouse.position.y)
                         .is_some_and(|index| {
                             app.select_thread(index);
@@ -2816,6 +2825,8 @@ pub enum ReviewSidebarMode {
     Threads,
     /// Review source list sidebar.
     Sources,
+    /// Files with local review work remaining.
+    NeedsAttention,
 }
 
 impl ReviewSidebarMode {
@@ -2827,6 +2838,7 @@ impl ReviewSidebarMode {
             Self::Repository => "repo",
             Self::Threads => "threads",
             Self::Sources => "sources",
+            Self::NeedsAttention => "attention",
         }
     }
 }
@@ -4386,7 +4398,8 @@ impl ReviewApp {
             ReviewSidebarMode::Included => ReviewSidebarMode::Repository,
             ReviewSidebarMode::Repository => ReviewSidebarMode::Threads,
             ReviewSidebarMode::Threads => ReviewSidebarMode::Sources,
-            ReviewSidebarMode::Sources => ReviewSidebarMode::Included,
+            ReviewSidebarMode::Sources => ReviewSidebarMode::NeedsAttention,
+            ReviewSidebarMode::NeedsAttention => ReviewSidebarMode::Included,
         };
         self.sidebar_visible = true;
         self.status_message = Some(format!("sidebar: {}", self.sidebar_mode.label()));
@@ -4397,7 +4410,11 @@ impl ReviewApp {
     pub fn move_down(&mut self, rows: usize) -> bool {
         if self.ux_mode == ReviewUxMode::Build {
             self.select_next_build_row(rows)
-        } else if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
+        } else if matches!(
+            self.sidebar_mode,
+            ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+        ) && self.sidebar_visible
+        {
             self.select_next_thread(rows)
         } else if self.review.is_repository_review()
             && self.sidebar_mode == ReviewSidebarMode::Repository
@@ -4413,7 +4430,11 @@ impl ReviewApp {
     pub fn move_up(&mut self, rows: usize) -> bool {
         if self.ux_mode == ReviewUxMode::Build {
             self.select_previous_build_row(rows)
-        } else if self.sidebar_mode == ReviewSidebarMode::Threads && self.sidebar_visible {
+        } else if matches!(
+            self.sidebar_mode,
+            ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+        ) && self.sidebar_visible
+        {
             self.select_previous_thread(rows)
         } else if self.review.is_repository_review()
             && self.sidebar_mode == ReviewSidebarMode::Repository
@@ -5121,6 +5142,13 @@ impl ReviewApp {
     /// Return review thread summaries visible in the sidebar.
     #[must_use]
     pub fn visible_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        if self.sidebar_mode == ReviewSidebarMode::NeedsAttention {
+            return self
+                .thread_summaries()
+                .into_iter()
+                .filter(|thread| !thread.resolved)
+                .collect();
+        }
         self.thread_summaries()
             .into_iter()
             .filter(|thread| match self.thread_filter {
@@ -5385,7 +5413,10 @@ impl ReviewApp {
 
     /// Jump to the selected thread in the diff.
     pub fn jump_to_selected_thread(&mut self) -> bool {
-        if self.sidebar_mode != ReviewSidebarMode::Threads {
+        if !matches!(
+            self.sidebar_mode,
+            ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+        ) {
             return false;
         }
         let Some(thread) = self
@@ -8128,6 +8159,64 @@ mod tests {
         assert!(app.select_previous_open_thread());
 
         assert_eq!(app.selected_diff_line, first.diff_row);
+    }
+
+    #[test]
+    fn attention_sidebar_shows_only_open_threads() {
+        let mut app = sample_app();
+        let open = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 1,
+            end_diff_row: None,
+            old_line: Some(1),
+            new_line: None,
+            old_start: Some(1),
+            old_end: Some(1),
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Removed,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let resolved = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        for anchor in [open.clone(), resolved.clone()] {
+            app.draft_comments.insert(
+                anchor,
+                vec![ReviewDraftComment {
+                    id: Some("comment".to_string()),
+                    body: "note".to_string(),
+                    persisted: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    session_id: None,
+                }],
+            );
+        }
+        app.resolved_review_threads
+            .insert(ReviewApp::thread_key_for_anchor(&resolved));
+        app.sidebar_mode = ReviewSidebarMode::NeedsAttention;
+
+        let threads = app.visible_thread_summaries();
+
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].anchor, open);
     }
 
     #[test]

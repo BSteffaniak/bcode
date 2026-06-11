@@ -52,7 +52,9 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
         match app.sidebar_mode {
             ReviewSidebarMode::Included => render_included(app, file_area, frame),
             ReviewSidebarMode::Repository => render_files(app, file_area, frame),
-            ReviewSidebarMode::Threads => render_threads(app, file_area, frame),
+            ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention => {
+                render_threads(app, file_area, frame);
+            }
             ReviewSidebarMode::Sources => render_sources(app, file_area, frame),
         }
         let separator = Rect::new(file_area.right(), body.y, 1, body.height);
@@ -242,7 +244,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  u/i file-open  P/O global-open  c comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  u/i file-open  P/O global-open  c comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
@@ -570,10 +572,15 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let threads = app.visible_thread_summaries();
     let visible_rows = usize::from(area.height);
     if threads.is_empty() {
+        let label = if app.sidebar_mode == ReviewSidebarMode::NeedsAttention {
+            "open"
+        } else {
+            app.thread_filter.label()
+        };
         frame.write_line(
             area,
             &Line::from_spans(vec![Span::styled(
-                format!(" no {} review threads", app.thread_filter.label()),
+                format!(" no {label} review threads"),
                 Style::new().fg(Color::BrightBlack),
             )]),
         );
@@ -1505,7 +1512,7 @@ const BUILD_HELP_LINES: &[&str] = &[
     " O/Y                open source surface / source for surface",
     " f or ctrl-p         fuzzy file picker",
     " enter               inspect/open selected item",
-    " t                   cycle included/repo/threads/sources",
+    " t                   cycle included/repo/threads/sources/attention",
     " b                   toggle sidebar",
     " ?                   toggle this help",
     " q or esc            exit review",
@@ -1529,7 +1536,7 @@ const REPOSITORY_HELP_LINES: &[&str] = &[
     " W/I                 next/previous unviewed file",
     " V                   mark all files viewed",
     " E                   mark all files unviewed",
-    " t                   cycle included/repo/threads/sources",
+    " t                   cycle included/repo/threads/sources/attention",
     " b                   toggle sidebar",
     " ?                   toggle this help",
     " q or esc            exit review",
@@ -1552,7 +1559,7 @@ const DIFF_HELP_LINES: &[&str] = &[
     " U/Z                 expand/collapse all inline threads",
     " B                   switch to build/source mode",
     " b                   toggle sidebar",
-    " t                   cycle included/repo/threads/sources",
+    " t                   cycle included/repo/threads/sources/attention",
     " mouse wheel         scroll diff",
     " click file          open file",
     " c                   create draft comment or reply",
