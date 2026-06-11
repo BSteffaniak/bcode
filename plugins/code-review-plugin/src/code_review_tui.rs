@@ -6048,6 +6048,20 @@ impl ReviewApp {
             .sum()
     }
 
+    /// Return unresolved thread count for a file.
+    #[must_use]
+    pub fn open_thread_count_for_file(&self, file_index: usize) -> usize {
+        self.draft_comments
+            .keys()
+            .filter(|anchor| {
+                anchor.file_index == file_index
+                    && !self
+                        .resolved_review_threads
+                        .contains(&Self::thread_key_for_anchor(anchor))
+            })
+            .count()
+    }
+
     /// Clear active range selection.
     pub fn clear_range_selection(&mut self) -> bool {
         if self.range_selection_start.is_none() {
@@ -8293,6 +8307,7 @@ mod tests {
         assert_eq!(app.draft_comment_count(), 1);
         assert!(app.has_draft_comment_at(0, 2));
         assert_eq!(app.draft_comment_count_for_file(0), 1);
+        assert_eq!(app.open_thread_count_for_file(0), 1);
         let pending = app
             .take_pending_draft_save()
             .expect("draft should be pending persistence");

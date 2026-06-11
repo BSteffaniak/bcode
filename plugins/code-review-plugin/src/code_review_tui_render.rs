@@ -1,5 +1,7 @@
 //! Rendering for full-screen code review mode.
 
+use std::fmt::Write as _;
+
 use bcode_code_review_models::{
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurfaceKind,
 };
@@ -445,6 +447,7 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 index == app.selected_file,
                 app.file_viewed(index),
                 app.draft_comment_count_for_file(index),
+                app.open_thread_count_for_file(index),
                 line_area,
                 frame,
             );
@@ -636,6 +639,7 @@ fn render_file_row(
     selected: bool,
     viewed: bool,
     draft_comments: usize,
+    open_threads: usize,
     area: Rect,
     frame: &mut Frame<'_>,
 ) {
@@ -658,14 +662,7 @@ fn render_file_row(
             .fg(Color::Cyan)
             .bg(style.bg.unwrap_or(Color::Black)),
     };
-    let counts = if draft_comments == 0 {
-        format!(" +{} -{}", file.additions, file.deletions)
-    } else {
-        format!(
-            " 💬{draft_comments} +{} -{}",
-            file.additions, file.deletions
-        )
-    };
+    let counts = file_row_counts(file, draft_comments, open_threads);
     let viewed_marker = if viewed { "✓ " } else { "  " };
     let path_width = usize::from(area.width)
         .saturating_sub(counts.len())
@@ -685,6 +682,18 @@ fn render_file_row(
         ),
     ]);
     frame.write_line_with_fallback_style(area, &line, style);
+}
+
+fn file_row_counts(file: &ReviewFile, draft_comments: usize, open_threads: usize) -> String {
+    let mut counts = String::new();
+    if draft_comments > 0 {
+        let _ = write!(counts, " 💬{draft_comments}");
+    }
+    if open_threads > 0 {
+        let _ = write!(counts, " ⚠{open_threads}");
+    }
+    let _ = write!(counts, " +{} -{}", file.additions, file.deletions);
+    counts
 }
 
 fn render_build_workspace(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2235,4 +2244,26 @@ const fn prompt_footer_text(kind: &ReviewPromptKind) -> &'static str {
 struct RenderedRow {
     line: Line,
     style: Style,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::code_review_tui::ReviewFileStatus;
+
+    use super::*;
+
+    #[test]
+    fn file_row_counts_include_open_threads() {
+        let file = ReviewFile {
+            old_path: Some("a.rs".to_string()),
+            new_path: Some("a.rs".to_string()),
+            status: ReviewFileStatus::Modified,
+            additions: 2,
+            deletions: 1,
+            is_binary: false,
+            hunks: Vec::new(),
+        };
+
+        assert_eq!(file_row_counts(&file, 2, 1), " 💬2 ⚠1 +2 -1");
+    }
 }
