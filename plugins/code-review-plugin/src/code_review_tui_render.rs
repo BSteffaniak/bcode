@@ -1629,7 +1629,7 @@ fn render_publish_checklist(app: &ReviewApp, popup: Rect, frame: &mut Frame<'_>)
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            " Publish checklist  Enter continue  Esc cancel ",
+            " Publish checklist  Enter continue  ! attention  W unviewed  P open thread  Esc cancel ",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::White)

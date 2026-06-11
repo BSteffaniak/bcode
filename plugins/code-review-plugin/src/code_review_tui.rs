@@ -1444,6 +1444,25 @@ fn handle_publish_event(app: &mut ReviewApp, event: &Event) -> bool {
 }
 
 fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
+    if matches!(app.publish_state, Some(ReviewPublishState::Checklist))
+        && stroke.modifiers.is_empty()
+    {
+        match stroke.key {
+            KeyCode::Char('!') => {
+                app.publish_state = None;
+                return app.show_attention_sidebar();
+            }
+            KeyCode::Char('W') => {
+                app.publish_state = None;
+                return app.select_next_unviewed_file();
+            }
+            KeyCode::Char('P') => {
+                app.publish_state = None;
+                return app.select_next_open_thread_global();
+            }
+            _ => {}
+        }
+    }
     if app.publish_options_active() {
         if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
             app.publish_state = None;
@@ -6701,10 +6720,11 @@ impl ReviewApp {
         vec![
             readiness,
             format!("files viewed: {viewed}/{total}"),
-            format!("unviewed files: {unviewed}"),
-            format!("open threads: {open_threads}"),
+            format!("unviewed files: {unviewed}  (W jump)"),
+            format!("open threads: {open_threads}  (P jump)"),
             format!("resolved threads: {resolved_threads}"),
             format!("draft comments: {drafts}"),
+            "press ! for attention sidebar".to_string(),
         ]
     }
 
@@ -9133,10 +9153,11 @@ mod tests {
             vec![
                 "! review has remaining attention items".to_string(),
                 "files viewed: 0/2".to_string(),
-                "unviewed files: 2".to_string(),
-                "open threads: 0".to_string(),
+                "unviewed files: 2  (W jump)".to_string(),
+                "open threads: 0  (P jump)".to_string(),
                 "resolved threads: 0".to_string(),
                 "draft comments: 0".to_string(),
+                "press ! for attention sidebar".to_string(),
             ]
         );
 
@@ -9145,6 +9166,38 @@ mod tests {
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
         );
+    }
+
+    #[test]
+    fn publish_checklist_shortcuts_jump_to_attention_items() {
+        let mut app = sample_app();
+        app.publish_state = Some(ReviewPublishState::Checklist);
+
+        assert!(handle_publish_key(
+            &mut app,
+            KeyStroke {
+                key: KeyCode::Char('W'),
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            },
+        ));
+
+        assert!(app.publish_state.is_none());
+        assert_eq!(app.selected_file, 1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("selected unviewed file")
+        );
+
+        app.publish_state = Some(ReviewPublishState::Checklist);
+        assert!(handle_publish_key(
+            &mut app,
+            KeyStroke {
+                key: KeyCode::Char('!'),
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            },
+        ));
+        assert!(app.publish_state.is_none());
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::NeedsAttention);
     }
 
     #[test]
