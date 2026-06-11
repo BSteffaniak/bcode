@@ -54,6 +54,7 @@ struct ReviewHomeApp {
     include_archived: bool,
     details_visible: bool,
     draft_filter_active: bool,
+    attention_filter_active: bool,
     help_visible: bool,
     should_exit: bool,
     outcome: Option<ReviewHomeOutcome>,
@@ -73,6 +74,7 @@ impl ReviewHomeApp {
             include_archived: false,
             details_visible: true,
             draft_filter_active: false,
+            attention_filter_active: false,
             help_visible: false,
             should_exit: false,
             outcome: None,
@@ -94,6 +96,9 @@ impl ReviewHomeApp {
             .enumerate()
             .filter_map(|(index, item)| {
                 if self.draft_filter_active && item.draft_count == 0 {
+                    return None;
+                }
+                if self.attention_filter_active && !workspace_needs_attention(item) {
                     return None;
                 }
                 if query.is_empty() || workspace_item_matches_query(item, &query) {
@@ -374,6 +379,17 @@ impl ReviewHomeApp {
         self.clamp_selection();
         self.status_message = Some(if self.draft_filter_active {
             "showing reviews with drafts".to_string()
+        } else {
+            "showing all matching reviews".to_string()
+        });
+        true
+    }
+
+    fn toggle_attention_filter(&mut self) -> bool {
+        self.attention_filter_active = !self.attention_filter_active;
+        self.clamp_selection();
+        self.status_message = Some(if self.attention_filter_active {
+            "showing reviews needing attention".to_string()
         } else {
             "showing all matching reviews".to_string()
         });
@@ -843,6 +859,7 @@ fn handle_plugin_normal_key(
             true
         }
         KeyCode::Char('D') => app.toggle_draft_filter(),
+        KeyCode::Char('A') => app.toggle_attention_filter(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
             true
@@ -1067,6 +1084,7 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
             true
         }
         KeyCode::Char('D') => app.toggle_draft_filter(),
+        KeyCode::Char('A') => app.toggle_attention_filter(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
             true
@@ -1564,12 +1582,17 @@ fn active_filter_label(app: &ReviewHomeApp) -> String {
     } else {
         "drafts:all"
     };
+    let attention = if app.attention_filter_active {
+        "attention:on"
+    } else {
+        "attention:all"
+    };
     let search = if app.search_query.trim().is_empty() {
         "search:off".to_string()
     } else {
         format!("search:{}", app.search_query.trim())
     };
-    format!("[{archived} {drafts} {search}]")
+    format!("[{archived} {drafts} {attention} {search}]")
 }
 
 const fn review_home_help_lines() -> &'static [&'static str] {
@@ -1589,6 +1612,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " /                   search title, health, source, branch, commit, publish, id",
         " a                   show/hide archived reviews",
         " D                   show only reviews with drafts",
+        " A                   show only reviews needing attention",
         " d                   show/hide details pane",
         " r                   rename selected review",
         " x                   archive selected review",
@@ -1962,6 +1986,13 @@ fn has_unpublished_drafts(item: &ReviewWorkspaceListItem) -> bool {
                 .updated_at_ms
                 .is_some_and(|updated_at_ms| updated_at_ms > publish.created_at_ms)
         })
+}
+
+fn workspace_needs_attention(item: &ReviewWorkspaceListItem) -> bool {
+    matches!(
+        workspace_health_label(item),
+        "setup" | "needs sources" | "changed since publish" | "drafts"
+    ) || item.thread_count > 0
 }
 
 fn workspace_next_action(item: &ReviewWorkspaceListItem) -> String {
@@ -2365,5 +2396,22 @@ mod tests {
 
         assert_eq!(app.visible_selection_bounds(5), (4, 9));
         assert_eq!(app.visible_selection_bounds(20), (0, 10));
+    }
+
+    #[test]
+    fn attention_filter_shows_reviews_needing_work() {
+        let mut draft = item(workspace("draft", vec![source("source", true)], false));
+        draft.draft_count = 1;
+        let app = ReviewHomeApp {
+            attention_filter_active: true,
+            workspace_items: vec![
+                item(workspace("setup", Vec::new(), false)),
+                item(workspace("active", vec![source("source", true)], false)),
+                draft,
+            ],
+            ..ReviewHomeApp::new(PathBuf::from("/repo"), Vec::new())
+        };
+
+        assert_eq!(app.visible_indices(), vec![0, 2]);
     }
 }
