@@ -1710,6 +1710,7 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         }
         KeyCode::Char('B') => app.set_build_mode(),
         KeyCode::Char('m') => app.toggle_ux_mode(),
+        KeyCode::Char('M') => app.select_next_attention_item(),
         KeyCode::Char('+') => app.open_add_file_source_picker(),
         KeyCode::Char('A') => app.open_add_source_prompt(),
         KeyCode::Char('t') => app.toggle_sidebar_mode(),
@@ -5767,6 +5768,14 @@ impl ReviewApp {
         true
     }
 
+    /// Select next item needing review attention.
+    pub fn select_next_attention_item(&mut self) -> bool {
+        if !self.unviewed_file_indices().is_empty() {
+            return self.select_next_unviewed_file();
+        }
+        self.select_next_open_thread_global()
+    }
+
     /// Select next file not yet marked viewed.
     pub fn select_next_unviewed_file(&mut self) -> bool {
         self.select_relative_unviewed_file(1)
@@ -9205,6 +9214,51 @@ mod tests {
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
         );
+    }
+
+    #[test]
+    fn attention_navigation_prioritizes_unviewed_then_open_threads() {
+        let mut app = sample_app();
+
+        assert!(app.select_next_attention_item());
+        assert_eq!(app.selected_file, 1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("selected unviewed file")
+        );
+
+        assert!(app.mark_all_files_viewed());
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor.clone(),
+            vec![ReviewDraftComment {
+                id: Some("comment".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+
+        assert!(app.select_next_attention_item());
+        assert_eq!(app.selected_file, anchor.file_index);
+        assert_eq!(app.selected_diff_line, anchor.diff_row);
     }
 
     #[test]
