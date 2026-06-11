@@ -1741,6 +1741,8 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('w') => app.toggle_selected_file_viewed(),
         KeyCode::Char('u') => app.select_next_open_thread(),
         KeyCode::Char('i') => app.select_previous_open_thread(),
+        KeyCode::Char('O') => app.select_previous_open_thread_global(),
+        KeyCode::Char('P') => app.select_next_open_thread_global(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
@@ -5259,6 +5261,30 @@ impl ReviewApp {
         self.jump_to_thread_summary(&summaries[next_index])
     }
 
+    /// Select next unresolved review thread across all files.
+    pub fn select_next_open_thread_global(&mut self) -> bool {
+        self.select_relative_open_thread_global(1)
+    }
+
+    /// Select previous unresolved review thread across all files.
+    pub fn select_previous_open_thread_global(&mut self) -> bool {
+        self.select_relative_open_thread_global(-1)
+    }
+
+    fn select_relative_open_thread_global(&mut self, offset: isize) -> bool {
+        let summaries = self.open_thread_summaries();
+        if summaries.is_empty() {
+            self.status_message = Some("no unresolved review threads".to_string());
+            return true;
+        }
+        let current_anchor = self.selected_comment_anchor();
+        let current_index = current_anchor
+            .as_ref()
+            .and_then(|anchor| summaries.iter().position(|thread| &thread.anchor == anchor));
+        let next_index = relative_index(current_index, summaries.len(), offset);
+        self.jump_to_thread_summary(&summaries[next_index])
+    }
+
     /// Select next review thread in the main pane.
     pub fn select_next_inline_thread(&mut self) -> bool {
         let Some(current_anchor) = self.selected_comment_anchor() else {
@@ -5319,6 +5345,13 @@ impl ReviewApp {
 
     fn open_inline_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
         self.inline_thread_summaries()
+            .into_iter()
+            .filter(|thread| !thread.resolved)
+            .collect()
+    }
+
+    fn open_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        self.thread_summaries()
             .into_iter()
             .filter(|thread| !thread.resolved)
             .collect()
@@ -8081,6 +8114,70 @@ mod tests {
         assert!(app.select_previous_open_thread());
 
         assert_eq!(app.selected_diff_line, first.diff_row);
+    }
+
+    #[test]
+    fn global_open_thread_navigation_crosses_files() {
+        let mut app = sample_app();
+        let first = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 1,
+            end_diff_row: None,
+            old_line: Some(1),
+            new_line: None,
+            old_start: Some(1),
+            old_end: Some(1),
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Removed,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let second = ReviewCommentAnchor {
+            file_index: 1,
+            path: "b.rs".to_string(),
+            diff_row: 0,
+            end_diff_row: None,
+            old_line: None,
+            new_line: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: true,
+            surface_id: None,
+            source_id: None,
+        };
+        for anchor in [first.clone(), second.clone()] {
+            app.draft_comments.insert(
+                anchor,
+                vec![ReviewDraftComment {
+                    id: Some("comment".to_string()),
+                    body: "note".to_string(),
+                    persisted: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    session_id: None,
+                }],
+            );
+        }
+        app.select_anchor(&first);
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: ReviewApp::thread_key_for_anchor(&first),
+        });
+
+        assert!(app.select_next_open_thread_global());
+
+        assert_eq!(app.selected_file, 1);
+        assert_eq!(
+            app.selected_view_target,
+            Some(ReviewViewTarget::Thread {
+                thread_key: ReviewApp::thread_key_for_anchor(&second),
+            })
+        );
     }
 
     #[test]
