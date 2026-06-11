@@ -1590,8 +1590,13 @@ fn review_home_summary_label(app: &ReviewHomeApp) -> String {
         .iter()
         .filter(|item| workspace_health_label(item) == "published")
         .count();
+    let attention_count = app
+        .workspace_items
+        .iter()
+        .filter(|item| workspace_needs_attention(item))
+        .count();
     format!(
-        "{visible_count} visible · {active_count} active · {draft_count} drafts · {published_count} published · {setup_count} setup"
+        "{visible_count} visible · {active_count} active · {attention_count} need attention · {draft_count} drafts · {published_count} published · {setup_count} setup"
     )
 }
 
@@ -2440,5 +2445,21 @@ mod tests {
         };
 
         assert_eq!(app.visible_indices(), vec![0, 2]);
+    }
+
+    #[test]
+    fn summary_counts_reviews_needing_attention() {
+        let mut draft = item(workspace("draft", vec![source("source", true)], false));
+        draft.draft_count = 1;
+        let app = ReviewHomeApp::new(
+            PathBuf::from("/repo"),
+            vec![
+                item(workspace("setup", Vec::new(), false)),
+                item(workspace("active", vec![source("source", true)], false)),
+                draft,
+            ],
+        );
+
+        assert!(review_home_summary_label(&app).contains("2 need attention"));
     }
 }
