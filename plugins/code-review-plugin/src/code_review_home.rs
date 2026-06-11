@@ -1921,6 +1921,7 @@ fn workspace_item_matches_query(item: &ReviewWorkspaceListItem, query: &str) -> 
         || item.draft_count.to_string().contains(query)
         || workspace_health_label(item).contains(query)
         || workspace_next_action(item).contains(query)
+        || (workspace_needs_attention(item) && "needs attention".contains(query))
         || item.last_publish.as_ref().is_some_and(|publish| {
             publish.publisher_id.to_ascii_lowercase().contains(query)
                 || publish.review_id.to_ascii_lowercase().contains(query)
@@ -2307,6 +2308,7 @@ mod tests {
         let setup = item(workspace("new-review", Vec::new(), false));
 
         assert!(workspace_item_matches_query(&setup, "setup"));
+        assert!(workspace_item_matches_query(&setup, "needs attention"));
         assert!(workspace_item_matches_query(&published, "published"));
         assert!(workspace_item_matches_query(&published, "github"));
         assert!(workspace_item_matches_query(&published, "example.test"));
