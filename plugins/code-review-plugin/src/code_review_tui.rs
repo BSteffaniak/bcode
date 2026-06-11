@@ -2660,6 +2660,91 @@ pub struct ReviewDraftComment {
     pub session_id: Option<String>,
 }
 
+/// Local review thread lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalReviewThreadStatus {
+    /// Thread still needs review attention.
+    Open,
+    /// Thread has been resolved locally.
+    Resolved,
+}
+
+impl LocalReviewThreadStatus {
+    /// Return true when the thread is resolved.
+    #[must_use]
+    pub const fn is_resolved(self) -> bool {
+        matches!(self, Self::Resolved)
+    }
+}
+
+/// Durable local review comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalReviewComment {
+    /// Persisted comment id, when saved in the plugin database.
+    pub id: Option<String>,
+    /// Comment body.
+    pub body: String,
+    /// Whether the comment is known to be persisted.
+    pub persisted: bool,
+    /// Creation timestamp in milliseconds since Unix epoch.
+    pub created_at_ms: Option<u64>,
+    /// Last update timestamp in milliseconds since Unix epoch.
+    pub updated_at_ms: Option<u64>,
+    /// Linked Bcode session id, when this comment is associated with one.
+    pub session_id: Option<String>,
+}
+
+impl From<ReviewDraftComment> for LocalReviewComment {
+    fn from(comment: ReviewDraftComment) -> Self {
+        Self {
+            id: comment.id,
+            body: comment.body,
+            persisted: comment.persisted,
+            created_at_ms: comment.created_at_ms,
+            updated_at_ms: comment.updated_at_ms,
+            session_id: comment.session_id,
+        }
+    }
+}
+
+/// Durable local review thread anchored to review content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalReviewThread {
+    /// Stable local thread key derived from the anchor.
+    pub key: String,
+    /// Thread anchor.
+    pub anchor: ReviewCommentAnchor,
+    /// Thread comments.
+    pub comments: Vec<LocalReviewComment>,
+    /// Local lifecycle state.
+    pub status: LocalReviewThreadStatus,
+    /// Linked Bcode session id, when present.
+    pub session_id: Option<String>,
+}
+
+impl LocalReviewThread {
+    /// Return true when this thread still needs review attention.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        matches!(self.status, LocalReviewThreadStatus::Open)
+    }
+
+    /// Return a compact line label for the thread anchor.
+    #[must_use]
+    pub fn line_label(&self) -> String {
+        self.anchor.new_start.or(self.anchor.old_start).map_or_else(
+            || format!("@{}", self.anchor.diff_row),
+            |line| format!("+{line}"),
+        )
+    }
+
+    /// Return latest comment body, if any.
+    #[must_use]
+    pub fn latest_body(&self) -> Option<&str> {
+        self.comments.last().map(|comment| comment.body.as_str())
+    }
+}
+
 fn parse_range_spec(text: &str) -> Option<(&str, &str, bool)> {
     text.split_once("...")
         .map(|(base, head)| (base, head, true))
@@ -5156,30 +5241,77 @@ impl ReviewApp {
         }
     }
 
+    /// Return open and resolved local review thread counts.
+    #[must_use]
+    pub fn local_review_thread_status_counts(&self) -> (usize, usize) {
+        let threads = self.local_review_threads();
+        let resolved = threads
+            .iter()
+            .filter(|thread| thread.status.is_resolved())
+            .count();
+        (threads.len().saturating_sub(resolved), resolved)
+    }
+
+    /// Return durable local review threads in deterministic order.
+    #[must_use]
+    pub fn local_review_threads(&self) -> Vec<LocalReviewThread> {
+        self.draft_comments
+            .iter()
+            .map(|(anchor, comments)| {
+                let key = Self::thread_key_for_anchor(anchor);
+                let status = if self.resolved_review_threads.contains(&key) {
+                    LocalReviewThreadStatus::Resolved
+                } else {
+                    LocalReviewThreadStatus::Open
+                };
+                let comments = comments
+                    .iter()
+                    .cloned()
+                    .map(LocalReviewComment::from)
+                    .collect::<Vec<_>>();
+                let session_id = comments
+                    .iter()
+                    .rev()
+                    .find_map(|comment| comment.session_id.clone());
+                LocalReviewThread {
+                    key,
+                    anchor: anchor.clone(),
+                    comments,
+                    status,
+                    session_id,
+                }
+            })
+            .collect()
+    }
+
+    /// Return open durable local review threads.
+    #[must_use]
+    pub fn open_local_review_threads(&self) -> Vec<LocalReviewThread> {
+        self.local_review_threads()
+            .into_iter()
+            .filter(LocalReviewThread::is_open)
+            .collect()
+    }
+
     /// Return open and resolved thread counts.
     #[must_use]
     pub fn thread_status_counts(&self) -> (usize, usize) {
-        let summaries = self.thread_summaries();
-        let total = summaries.len();
-        let resolved = summaries.iter().filter(|thread| thread.resolved).count();
-        (total.saturating_sub(resolved), resolved)
+        self.local_review_thread_status_counts()
     }
 
     /// Return review thread summaries in deterministic order.
     #[must_use]
     pub fn thread_summaries(&self) -> Vec<ReviewThreadSummary> {
-        self.draft_comments
-            .iter()
-            .filter_map(|(anchor, comments)| {
-                let latest = comments.last()?;
+        self.local_review_threads()
+            .into_iter()
+            .filter_map(|thread| {
+                let latest_body = thread.latest_body()?.to_string();
                 Some(ReviewThreadSummary {
-                    anchor: anchor.clone(),
-                    draft_count: comments.len(),
-                    latest_body: latest.body.clone(),
-                    session_id: latest.session_id.clone(),
-                    resolved: self
-                        .resolved_review_threads
-                        .contains(&Self::thread_key_for_anchor(anchor)),
+                    anchor: thread.anchor,
+                    draft_count: thread.comments.len(),
+                    latest_body,
+                    session_id: thread.session_id,
+                    resolved: thread.status.is_resolved(),
                 })
             })
             .collect()
@@ -6761,7 +6893,7 @@ impl ReviewApp {
         );
         lines.push(format!("open threads: {open_threads}  (P jump)"));
         lines.extend(
-            self.open_thread_summaries()
+            self.open_local_review_threads()
                 .into_iter()
                 .take(3)
                 .map(|thread| format!("  • {} {}", thread.anchor.path, thread.line_label())),
@@ -9214,6 +9346,49 @@ mod tests {
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
         );
+    }
+
+    #[test]
+    fn local_review_threads_project_persisted_comment_state() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor.clone(),
+            vec![ReviewDraftComment {
+                id: Some("comment".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: Some(1),
+                updated_at_ms: Some(2),
+                session_id: Some("session".to_string()),
+            }],
+        );
+        app.resolved_review_threads
+            .insert(ReviewApp::thread_key_for_anchor(&anchor));
+
+        let threads = app.local_review_threads();
+
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].anchor, anchor);
+        assert_eq!(threads[0].status, LocalReviewThreadStatus::Resolved);
+        assert_eq!(threads[0].session_id.as_deref(), Some("session"));
+        assert_eq!(threads[0].latest_body(), Some("note"));
+        assert_eq!(app.local_review_thread_status_counts(), (0, 1));
     }
 
     #[test]
