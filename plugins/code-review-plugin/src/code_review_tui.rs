@@ -1736,6 +1736,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('T') => app.cycle_thread_filter(),
         KeyCode::Char('E') => app.mark_all_files_unviewed(),
         KeyCode::Char('V') => app.mark_all_files_viewed(),
+        KeyCode::Char('I') => app.select_previous_unviewed_file(),
         KeyCode::Char('W') => app.select_next_unviewed_file(),
         KeyCode::Char('w') => app.toggle_selected_file_viewed(),
         KeyCode::Char('u') => app.select_next_open_thread(),
@@ -8756,6 +8757,21 @@ mod tests {
         assert!(app.select_next_unviewed_file());
 
         assert_eq!(app.selected_file, 1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("selected unviewed file")
+        );
+    }
+
+    #[test]
+    fn selects_previous_unviewed_file() {
+        let mut app = sample_app();
+        app.selected_file = 1;
+        app.viewed_files.insert("b.rs".to_string());
+
+        assert!(app.select_previous_unviewed_file());
+
+        assert_eq!(app.selected_file, 0);
         assert_eq!(
             app.status_message.as_deref(),
             Some("selected unviewed file")
