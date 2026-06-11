@@ -3190,6 +3190,8 @@ pub struct ReviewApp {
     pub selected_publisher: usize,
     /// Active publish UI state.
     pub publish_state: Option<ReviewPublishState>,
+    /// Whether incomplete-review publish warning has been acknowledged.
+    pub publish_readiness_ack: bool,
     /// Active one-line prompt, if any.
     pub prompt_state: Option<ReviewPromptState>,
     /// Last current-file search query.
@@ -3263,6 +3265,7 @@ impl ReviewApp {
             pending_file_load: None,
             selected_publisher: 0,
             publish_state: None,
+            publish_readiness_ack: false,
             prompt_state: None,
             last_search_query: None,
             expanded_dirs: BTreeSet::new(),
@@ -6332,9 +6335,38 @@ impl ReviewApp {
         }
     }
 
+    /// Return warning message for publishing before review is complete.
+    #[must_use]
+    pub fn publish_readiness_warning(&self) -> Option<String> {
+        let (viewed, total) = self.viewed_file_counts();
+        let (open_threads, _) = self.thread_status_counts();
+        if viewed == total && open_threads == 0 {
+            return None;
+        }
+        let mut warnings = Vec::new();
+        if viewed < total {
+            warnings.push(format!("{viewed}/{total} files viewed"));
+        }
+        if open_threads > 0 {
+            warnings.push(format!("{open_threads} unresolved thread(s)"));
+        }
+        Some(format!(
+            "review incomplete: {}; press x again to publish anyway",
+            warnings.join(", ")
+        ))
+    }
+
     /// Queue generic review publish.
     pub fn publish_review(&mut self) -> bool {
+        if !self.publish_readiness_ack
+            && let Some(warning) = self.publish_readiness_warning()
+        {
+            self.publish_readiness_ack = true;
+            self.status_message = Some(warning);
+            return true;
+        }
         self.pending_publish_request = Some(PendingPublishRequest::ListPublishers);
+        self.publish_readiness_ack = false;
         self.status_message = Some("loading review publishers".to_string());
         true
     }
@@ -6373,6 +6405,7 @@ impl ReviewApp {
     /// Finish publish flow.
     pub fn finish_publish(&mut self, response: PublishReviewResponse) {
         self.publish_state = None;
+        self.publish_readiness_ack = false;
         self.status_message = Some(response.message);
     }
 
@@ -8736,5 +8769,37 @@ mod tests {
         assert!(app.workspace.viewed_files.is_empty());
         assert!(app.viewed_files.is_empty());
         assert!(app.pending_workspace_save);
+    }
+
+    #[test]
+    fn publish_warns_when_review_incomplete() {
+        let mut app = sample_app();
+
+        assert!(app.publish_review());
+        assert!(app.pending_publish_request.is_none());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("review incomplete: 0/2 files viewed; press x again to publish anyway")
+        );
+
+        assert!(app.publish_review());
+        assert!(matches!(
+            app.pending_publish_request,
+            Some(PendingPublishRequest::ListPublishers)
+        ));
+    }
+
+    #[test]
+    fn publish_without_warning_when_review_complete() {
+        let mut app = sample_app();
+        assert!(app.mark_all_files_viewed());
+        app.pending_workspace_save = false;
+
+        assert!(app.publish_review());
+
+        assert!(matches!(
+            app.pending_publish_request,
+            Some(PendingPublishRequest::ListPublishers)
+        ));
     }
 }
