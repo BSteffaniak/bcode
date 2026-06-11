@@ -1733,6 +1733,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('{') => app.select_previous_inline_draft(),
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
+        KeyCode::Char('!') => app.show_attention_sidebar(),
         KeyCode::Char('T') => app.cycle_thread_filter(),
         KeyCode::Char('E') => app.mark_all_files_unviewed(),
         KeyCode::Char('V') => app.mark_all_files_viewed(),
@@ -4392,7 +4393,19 @@ impl ReviewApp {
         self.queue_selected_file_load();
     }
 
-    /// Toggle sidebar between included, repository, threads, and sources.
+    /// Focus the attention sidebar.
+    pub fn show_attention_sidebar(&mut self) -> bool {
+        self.sidebar_mode = ReviewSidebarMode::NeedsAttention;
+        self.sidebar_visible = true;
+        self.selected_thread = self
+            .selected_thread
+            .min(self.visible_thread_summaries().len().saturating_sub(1));
+        self.thread_scroll = self.thread_scroll.min(self.selected_thread);
+        self.status_message = Some("sidebar: attention".to_string());
+        true
+    }
+
+    /// Toggle sidebar between included, repository, threads, sources, and attention.
     pub fn toggle_sidebar_mode(&mut self) -> bool {
         self.sidebar_mode = match self.sidebar_mode {
             ReviewSidebarMode::Included => ReviewSidebarMode::Repository,
@@ -8159,6 +8172,18 @@ mod tests {
         assert!(app.select_previous_open_thread());
 
         assert_eq!(app.selected_diff_line, first.diff_row);
+    }
+
+    #[test]
+    fn show_attention_sidebar_focuses_attention_mode() {
+        let mut app = sample_app();
+        app.sidebar_visible = false;
+
+        assert!(app.show_attention_sidebar());
+
+        assert!(app.sidebar_visible);
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::NeedsAttention);
+        assert_eq!(app.status_message.as_deref(), Some("sidebar: attention"));
     }
 
     #[test]
