@@ -1600,6 +1600,7 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         Style::new().fg(Color::White).bg(Color::BrightBlack),
     );
     match state {
+        ReviewPublishState::Checklist => render_publish_checklist(app, popup, frame),
         ReviewPublishState::Picker => render_publisher_picker(app, popup, frame),
         ReviewPublishState::Options {
             options, selected, ..
@@ -1616,6 +1617,57 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             scroll,
             ..
         } => render_publish_preview(publisher_id, preview, *scroll, true, popup, frame),
+    }
+}
+
+fn render_publish_checklist(app: &ReviewApp, popup: Rect, frame: &mut Frame<'_>) {
+    frame.write_line(
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup.y,
+            popup.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            " Publish checklist  Enter continue  Esc cancel ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    );
+    for (row, line) in app
+        .publish_checklist_lines()
+        .into_iter()
+        .take(usize::from(popup.height.saturating_sub(2)))
+        .enumerate()
+    {
+        let style = if line.starts_with('!') {
+            Style::new().fg(Color::Yellow).bg(Color::BrightBlack)
+        } else if line.starts_with('✓') {
+            Style::new().fg(Color::Green).bg(Color::BrightBlack)
+        } else {
+            Style::new().fg(Color::White).bg(Color::BrightBlack)
+        };
+        let y = popup
+            .y
+            .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                popup.x.saturating_add(1),
+                y,
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(
+                    &format!(" {line}"),
+                    usize::from(popup.width.saturating_sub(2)),
+                ),
+                style,
+            )]),
+            style,
+        );
     }
 }
 

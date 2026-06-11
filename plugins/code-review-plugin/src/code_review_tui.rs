@@ -3101,6 +3101,8 @@ impl ReviewPromptState {
 /// Publish modal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewPublishState {
+    /// Publish readiness checklist.
+    Checklist,
     /// Publisher picker.
     Picker,
     /// Options editor.
@@ -6476,9 +6478,8 @@ impl ReviewApp {
             self.status_message = Some(warning);
             return true;
         }
-        self.pending_publish_request = Some(PendingPublishRequest::ListPublishers);
-        self.publish_readiness_ack = false;
-        self.status_message = Some("loading review publishers".to_string());
+        self.publish_state = Some(ReviewPublishState::Checklist);
+        self.status_message = None;
         true
     }
 
@@ -6559,7 +6560,7 @@ impl ReviewApp {
                 *scroll = next;
                 true
             }
-            None => false,
+            Some(ReviewPublishState::Checklist) | None => false,
         }
     }
 
@@ -6593,7 +6594,7 @@ impl ReviewApp {
                 *scroll = next;
                 true
             }
-            None => false,
+            Some(ReviewPublishState::Checklist) | None => false,
         }
     }
 
@@ -6685,6 +6686,28 @@ impl ReviewApp {
         }
     }
 
+    /// Return publish readiness checklist lines.
+    #[must_use]
+    pub fn publish_checklist_lines(&self) -> Vec<String> {
+        let (viewed, total) = self.viewed_file_counts();
+        let unviewed = total.saturating_sub(viewed);
+        let (open_threads, resolved_threads) = self.thread_status_counts();
+        let drafts = self.draft_comment_count();
+        let readiness = if unviewed == 0 && open_threads == 0 {
+            "✓ ready to publish".to_string()
+        } else {
+            "! review has remaining attention items".to_string()
+        };
+        vec![
+            readiness,
+            format!("files viewed: {viewed}/{total}"),
+            format!("unviewed files: {unviewed}"),
+            format!("open threads: {open_threads}"),
+            format!("resolved threads: {resolved_threads}"),
+            format!("draft comments: {drafts}"),
+        ]
+    }
+
     fn current_publish_options(&self) -> Vec<ReviewPublishOption> {
         match &self.publish_state {
             Some(
@@ -6692,7 +6715,7 @@ impl ReviewApp {
                 | ReviewPublishState::Preview { options, .. }
                 | ReviewPublishState::ConfirmSubmit { options, .. },
             ) => options.clone(),
-            _ => Vec::new(),
+            Some(ReviewPublishState::Checklist | ReviewPublishState::Picker) | None => Vec::new(),
         }
     }
 
@@ -6720,6 +6743,12 @@ impl ReviewApp {
     /// Confirm current publish UI selection.
     pub fn confirm_publish_selection(&mut self) -> bool {
         match &self.publish_state {
+            Some(ReviewPublishState::Checklist) => {
+                self.pending_publish_request = Some(PendingPublishRequest::ListPublishers);
+                self.publish_readiness_ack = false;
+                self.status_message = Some("loading review publishers".to_string());
+                true
+            }
             Some(ReviewPublishState::Picker) => {
                 let Some(publisher) = self.publishers.get(self.selected_publisher) else {
                     self.status_message = Some("no publisher selected".to_string());
@@ -9083,9 +9112,39 @@ mod tests {
 
         assert!(app.publish_review());
         assert!(matches!(
+            app.publish_state,
+            Some(ReviewPublishState::Checklist)
+        ));
+        assert!(app.pending_publish_request.is_none());
+
+        assert!(app.confirm_publish_selection());
+        assert!(matches!(
             app.pending_publish_request,
             Some(PendingPublishRequest::ListPublishers)
         ));
+    }
+
+    #[test]
+    fn publish_checklist_summarizes_readiness() {
+        let mut app = sample_app();
+
+        assert_eq!(
+            app.publish_checklist_lines(),
+            vec![
+                "! review has remaining attention items".to_string(),
+                "files viewed: 0/2".to_string(),
+                "unviewed files: 2".to_string(),
+                "open threads: 0".to_string(),
+                "resolved threads: 0".to_string(),
+                "draft comments: 0".to_string(),
+            ]
+        );
+
+        assert!(app.mark_all_files_viewed());
+        assert_eq!(
+            app.publish_checklist_lines().first().map(String::as_str),
+            Some("✓ ready to publish")
+        );
     }
 
     #[test]
@@ -9096,6 +9155,13 @@ mod tests {
 
         assert!(app.publish_review());
 
+        assert!(matches!(
+            app.publish_state,
+            Some(ReviewPublishState::Checklist)
+        ));
+        assert!(app.pending_publish_request.is_none());
+
+        assert!(app.confirm_publish_selection());
         assert!(matches!(
             app.pending_publish_request,
             Some(PendingPublishRequest::ListPublishers)
