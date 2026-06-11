@@ -1,7 +1,7 @@
 //! Full-screen local code review TUI mode.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
+use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -6611,6 +6611,57 @@ impl ReviewApp {
         }
     }
 
+    /// Render a local-first markdown review report.
+    #[must_use]
+    pub fn local_review_report_markdown(&self) -> String {
+        let (viewed, total) = self.viewed_file_counts();
+        let (open_threads, resolved_threads) = self.local_review_thread_status_counts();
+        let mut report = String::new();
+        let _ = write!(report, "# Local review: {}\n\n", self.review.title);
+        report.push_str("## Summary\n\n");
+        let _ = writeln!(report, "* Files viewed: {viewed}/{total}");
+        let _ = writeln!(report, "* Open threads: {open_threads}");
+        let _ = writeln!(report, "* Resolved threads: {resolved_threads}");
+        let _ = writeln!(report, "* Draft comments: {}", self.draft_comment_count());
+        report.push('\n');
+
+        let unviewed = self.unviewed_file_paths();
+        if !unviewed.is_empty() {
+            report.push_str("## Unviewed files\n\n");
+            for path in unviewed {
+                let _ = writeln!(report, "* `{path}`");
+            }
+            report.push('\n');
+        }
+
+        let threads = self.local_review_threads();
+        if threads.is_empty() {
+            report.push_str("## Review threads\n\nNo local review threads.\n");
+            return report;
+        }
+
+        report.push_str("## Review threads\n\n");
+        for thread in threads {
+            let status = if thread.is_open() { "open" } else { "resolved" };
+            let _ = write!(
+                report,
+                "### `{}` {} ({status})\n\n",
+                thread.anchor.path,
+                thread.line_label()
+            );
+            if let Some(session_id) = &thread.session_id {
+                let _ = write!(report, "Linked Bcode session: `{session_id}`\n\n");
+            }
+            for comment in thread.comments {
+                report.push_str("* ");
+                report.push_str(&comment.body.replace('\n', "\n  "));
+                report.push('\n');
+            }
+            report.push('\n');
+        }
+        report
+    }
+
     /// Return a concise review readiness label.
     #[must_use]
     pub fn review_readiness_label(&self) -> String {
@@ -9346,6 +9397,47 @@ mod tests {
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
         );
+    }
+
+    #[test]
+    fn local_review_report_includes_threads_and_attention_state() {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment".to_string()),
+                body: "first line\nsecond line".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: Some("session-1".to_string()),
+            }],
+        );
+
+        let report = app.local_review_report_markdown();
+
+        assert!(report.contains("# Local review: test"));
+        assert!(report.contains("* Files viewed: 0/2"));
+        assert!(report.contains("* `a.rs`"));
+        assert!(report.contains("### `a.rs` +1 (open)"));
+        assert!(report.contains("Linked Bcode session: `session-1`"));
+        assert!(report.contains("first line\n  second line"));
     }
 
     #[test]
