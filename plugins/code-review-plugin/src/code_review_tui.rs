@@ -1734,6 +1734,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char(']') => app.select_next_inline_thread(),
         KeyCode::Char('[') => app.select_previous_inline_thread(),
         KeyCode::Char('T') => app.cycle_thread_filter(),
+        KeyCode::Char('E') => app.mark_all_files_unviewed(),
         KeyCode::Char('V') => app.mark_all_files_viewed(),
         KeyCode::Char('W') => app.select_next_unviewed_file(),
         KeyCode::Char('w') => app.toggle_selected_file_viewed(),
@@ -5611,6 +5612,21 @@ impl ReviewApp {
         true
     }
 
+    /// Mark every review file unviewed.
+    pub fn mark_all_files_unviewed(&mut self) -> bool {
+        if self.viewed_files.is_empty() && self.workspace.viewed_files.is_empty() {
+            self.status_message = Some("all files already unviewed".to_string());
+            return true;
+        }
+        self.viewed_files.clear();
+        self.workspace.viewed_files.clear();
+        self.sync_review_workspace();
+        self.pending_workspace_save = true;
+        let (_, total) = self.viewed_file_counts();
+        self.status_message = Some(format!("marked 0/{total} files viewed"));
+        true
+    }
+
     /// Mark every review file viewed.
     pub fn mark_all_files_viewed(&mut self) -> bool {
         self.viewed_files = self
@@ -8705,6 +8721,20 @@ mod tests {
             (app.review.files.len(), app.review.files.len())
         );
         assert_eq!(app.workspace.viewed_files, app.viewed_files);
+        assert!(app.pending_workspace_save);
+    }
+
+    #[test]
+    fn marks_all_files_unviewed() {
+        let mut app = sample_app();
+        assert!(app.mark_all_files_viewed());
+        app.pending_workspace_save = false;
+
+        assert!(app.mark_all_files_unviewed());
+
+        assert_eq!(app.viewed_file_counts(), (0, app.review.files.len()));
+        assert!(app.workspace.viewed_files.is_empty());
+        assert!(app.viewed_files.is_empty());
         assert!(app.pending_workspace_save);
     }
 }

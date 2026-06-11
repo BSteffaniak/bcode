@@ -239,7 +239,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  u/i unresolved  c comment  w viewed  W next-unviewed  V all-viewed  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  u/i unresolved  c comment  w viewed  W next-unviewed  V/E all-viewed/unviewed  v range  x publish  a ask Bcode  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
@@ -1518,6 +1518,7 @@ const REPOSITORY_HELP_LINES: &[&str] = &[
     " w                   mark selected file viewed/unviewed",
     " W                   next unviewed file",
     " V                   mark all files viewed",
+    " E                   mark all files unviewed",
     " t                   cycle included/repo/threads/sources",
     " b                   toggle sidebar",
     " ?                   toggle this help",
@@ -1548,6 +1549,7 @@ const DIFF_HELP_LINES: &[&str] = &[
     " w                   mark selected file viewed/unviewed",
     " W                   next unviewed file",
     " V                   mark all files viewed",
+    " E                   mark all files unviewed",
     " v                   select/clear line range",
     " a                   ask Bcode about selected line/thread",
     " o                   open linked Bcode session",
