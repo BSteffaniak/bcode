@@ -6335,6 +6335,25 @@ impl ReviewApp {
         }
     }
 
+    /// Return a concise review readiness label.
+    #[must_use]
+    pub fn review_readiness_label(&self) -> String {
+        let (viewed, total) = self.viewed_file_counts();
+        let unviewed = total.saturating_sub(viewed);
+        let (open_threads, _) = self.thread_status_counts();
+        if unviewed == 0 && open_threads == 0 {
+            return "ready".to_string();
+        }
+        let mut issues = Vec::new();
+        if unviewed > 0 {
+            issues.push(format!("{unviewed} unviewed"));
+        }
+        if open_threads > 0 {
+            issues.push(format!("{open_threads} open"));
+        }
+        format!("incomplete: {}", issues.join(", "))
+    }
+
     /// Return warning message for publishing before review is complete.
     #[must_use]
     pub fn publish_readiness_warning(&self) -> Option<String> {
@@ -8769,6 +8788,44 @@ mod tests {
         assert!(app.workspace.viewed_files.is_empty());
         assert!(app.viewed_files.is_empty());
         assert!(app.pending_workspace_save);
+    }
+
+    #[test]
+    fn review_readiness_tracks_unviewed_and_open_threads() {
+        let mut app = sample_app();
+        assert_eq!(app.review_readiness_label(), "incomplete: 2 unviewed");
+
+        assert!(app.mark_all_files_viewed());
+        assert_eq!(app.review_readiness_label(), "ready");
+
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor,
+            vec![ReviewDraftComment {
+                id: Some("comment".to_string()),
+                body: "note".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: None,
+            }],
+        );
+        assert_eq!(app.review_readiness_label(), "incomplete: 1 open");
     }
 
     #[test]

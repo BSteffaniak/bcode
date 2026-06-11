@@ -109,6 +109,7 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         format!("  💬 {drafts} draft")
     };
     let (viewed_files, total_files) = app.viewed_file_counts();
+    let readiness = app.review_readiness_label();
     let thread_label = header_thread_label(app);
     let surface_kind = app
         .review
@@ -141,7 +142,7 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         )
     } else if app.review.is_repository_review() {
         format!(
-            " bcode review  {}  {}  File {}  Surface {}  Line {}{}{}  viewed {}/{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Line {}{}{}  viewed {}/{}  {readiness} ",
             app.review.title,
             file_label,
             file_position,
@@ -155,7 +156,7 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         let (hunk, hunk_total) = app.hunk_position();
         format!(
-            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}{}  viewed {}/{}  +{} -{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}{}  viewed {}/{}  {readiness}  +{} -{} ",
             app.review.title,
             file_label,
             file_position,
