@@ -615,14 +615,7 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 (false, true) => "🤖💬",
                 (false, false) => "💬",
             };
-            let line_label = thread
-                .anchor
-                .new_start
-                .or(thread.anchor.old_start)
-                .map_or_else(
-                    || format!("@{}", thread.anchor.diff_row),
-                    |line| format!("+{line}"),
-                );
+            let line_label = thread.line_label();
             let body = thread.latest_body.lines().next().unwrap_or_default();
             let status = if thread.resolved { "resolved" } else { "open" };
             let text = format!(

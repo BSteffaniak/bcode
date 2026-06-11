@@ -2911,6 +2911,17 @@ pub struct ReviewThreadSummary {
     pub resolved: bool,
 }
 
+impl ReviewThreadSummary {
+    /// Return a compact line label for the thread anchor.
+    #[must_use]
+    pub fn line_label(&self) -> String {
+        self.anchor.new_start.or(self.anchor.old_start).map_or_else(
+            || format!("@{}", self.anchor.diff_row),
+            |line| format!("+{line}"),
+        )
+    }
+}
+
 /// Pending publish request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingPublishRequest {
@@ -5530,6 +5541,17 @@ impl ReviewApp {
             .is_some_and(|file| self.viewed_files.contains(file.display_path()))
     }
 
+    /// Return unviewed file display paths.
+    #[must_use]
+    pub fn unviewed_file_paths(&self) -> Vec<String> {
+        self.review
+            .files
+            .iter()
+            .filter(|file| !self.viewed_files.contains(file.display_path()))
+            .map(|file| file.display_path().to_string())
+            .collect()
+    }
+
     /// Return reviewed file progress.
     #[must_use]
     pub fn viewed_file_counts(&self) -> (usize, usize) {
@@ -6717,15 +6739,30 @@ impl ReviewApp {
         } else {
             "! review has remaining attention items".to_string()
         };
-        vec![
+        let mut lines = vec![
             readiness,
             format!("files viewed: {viewed}/{total}"),
             format!("unviewed files: {unviewed}  (W jump)"),
-            format!("open threads: {open_threads}  (P jump)"),
+        ];
+        lines.extend(
+            self.unviewed_file_paths()
+                .into_iter()
+                .take(3)
+                .map(|path| format!("  • {path}")),
+        );
+        lines.push(format!("open threads: {open_threads}  (P jump)"));
+        lines.extend(
+            self.open_thread_summaries()
+                .into_iter()
+                .take(3)
+                .map(|thread| format!("  • {} {}", thread.anchor.path, thread.line_label())),
+        );
+        lines.extend([
             format!("resolved threads: {resolved_threads}"),
             format!("draft comments: {drafts}"),
             "press ! for attention sidebar".to_string(),
-        ]
+        ]);
+        lines
     }
 
     fn current_publish_options(&self) -> Vec<ReviewPublishOption> {
@@ -9154,6 +9191,8 @@ mod tests {
                 "! review has remaining attention items".to_string(),
                 "files viewed: 0/2".to_string(),
                 "unviewed files: 2  (W jump)".to_string(),
+                "  • a.rs".to_string(),
+                "  • b.rs".to_string(),
                 "open threads: 0  (P jump)".to_string(),
                 "resolved threads: 0".to_string(),
                 "draft comments: 0".to_string(),
