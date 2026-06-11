@@ -230,7 +230,22 @@ impl ReviewHomeApp {
         self.open_workspace_unless_archived(workspace, false)
     }
 
+    fn select_review_by_attention(&mut self, forward: bool) -> bool {
+        self.select_review_by_predicate("attention", forward, workspace_needs_attention)
+    }
+
     fn select_review_by_health(&mut self, target: &str, forward: bool) -> bool {
+        self.select_review_by_predicate(target, forward, |item| {
+            workspace_health_label(item) == target
+        })
+    }
+
+    fn select_review_by_predicate(
+        &mut self,
+        label: &str,
+        forward: bool,
+        predicate: impl Fn(&ReviewWorkspaceListItem) -> bool,
+    ) -> bool {
         let visible = self.visible_indices();
         if visible.is_empty() {
             self.status_message = Some("no matching review workspaces".to_string());
@@ -245,16 +260,13 @@ impl ReviewHomeApp {
         for _ in 0..visible.len() {
             selected = selected.saturating_add(step) % visible.len();
             let workspace_index = visible[selected];
-            if self
-                .workspace_item(workspace_index)
-                .is_some_and(|item| workspace_health_label(item) == target)
-            {
+            if self.workspace_item(workspace_index).is_some_and(&predicate) {
                 self.selected = selected;
-                self.status_message = Some(format!("selected {target} review"));
+                self.status_message = Some(format!("selected {label} review"));
                 return true;
             }
         }
-        self.status_message = Some(format!("no {target} reviews in the current filter"));
+        self.status_message = Some(format!("no {label} reviews in the current filter"));
         true
     }
 
@@ -280,6 +292,14 @@ impl ReviewHomeApp {
 
     fn select_previous_published_review(&mut self) -> bool {
         self.select_review_by_health("published", false)
+    }
+
+    fn select_next_attention_review(&mut self) -> bool {
+        self.select_review_by_attention(true)
+    }
+
+    fn select_previous_attention_review(&mut self) -> bool {
+        self.select_review_by_attention(false)
     }
 
     fn start_new_review(&mut self) -> bool {
@@ -879,6 +899,8 @@ fn handle_plugin_normal_key(
         KeyCode::Char('B') => app.select_previous_draft_review(),
         KeyCode::Char('p') => app.select_next_published_review(),
         KeyCode::Char('P') => app.select_previous_published_review(),
+        KeyCode::Char('M') => app.select_next_attention_review(),
+        KeyCode::Char('N') => app.select_previous_attention_review(),
         KeyCode::Char('a') => queue_toggle_archived(app, pending_action),
         KeyCode::Char('g') => {
             app.selected = 0;
@@ -1110,6 +1132,8 @@ async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
         KeyCode::Char('B') => app.select_previous_draft_review(),
         KeyCode::Char('p') => app.select_next_published_review(),
         KeyCode::Char('P') => app.select_previous_published_review(),
+        KeyCode::Char('M') => app.select_next_attention_review(),
+        KeyCode::Char('N') => app.select_previous_attention_review(),
         KeyCode::Char('a') => toggle_archived(client, app).await,
         KeyCode::Char('g') => {
             app.selected = 0;
@@ -1608,6 +1632,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " S/U                 next/previous setup review",
         " F/B                 next/previous draft review",
         " p/P                 next/previous published review",
+        " M/N                 next/previous review needing attention",
         " j/k or arrows       move selection",
         " /                   search title, health, source, branch, commit, publish, id",
         " a                   show/hide archived reviews",
@@ -2382,6 +2407,8 @@ mod tests {
         assert_eq!(app.selected, 0);
         assert!(app.select_previous_draft_review());
         assert_eq!(app.selected, 2);
+        assert!(app.select_next_attention_review());
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
