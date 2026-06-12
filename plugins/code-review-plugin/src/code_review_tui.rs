@@ -13,7 +13,7 @@ use bcode_code_review_models::{
     OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST,
     OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST,
     OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
-    REVIEW_PUBLISHER_INTERFACE_ID, ReviewBundle, ReviewRepositoryCommit,
+    REVIEW_PUBLISHER_INTERFACE_ID, ReviewAnchorKind, ReviewBundle, ReviewRepositoryCommit,
     ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
     ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewWorkspace,
@@ -2118,6 +2118,8 @@ struct ResolveThreadResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DraftAnchor {
+    #[serde(default)]
+    kind: ReviewAnchorKind,
     file_path: String,
     diff_row: u64,
     old_line: Option<u32>,
@@ -2166,6 +2168,11 @@ struct SaveDraftResponse {
 impl From<ReviewCommentAnchor> for DraftAnchor {
     fn from(anchor: ReviewCommentAnchor) -> Self {
         Self {
+            kind: if anchor.is_file_anchor {
+                ReviewAnchorKind::File
+            } else {
+                ReviewAnchorKind::Range
+            },
             file_path: anchor.path.clone(),
             diff_row: u64::try_from(anchor.diff_row).unwrap_or(u64::MAX),
             start_diff_row: Some(u64::try_from(anchor.start_diff_row()).unwrap_or(u64::MAX)),
@@ -8715,6 +8722,7 @@ mod tests {
             comment_id: "comment-1".to_string(),
             thread_id: "thread-1".to_string(),
             anchor: DraftAnchor {
+                kind: ReviewAnchorKind::Range,
                 file_path: "a.rs".to_string(),
                 diff_row: 2,
                 start_diff_row: Some(2),
@@ -8762,6 +8770,7 @@ mod tests {
             comment_id: "comment-1".to_string(),
             thread_id: "thread-1".to_string(),
             anchor: DraftAnchor {
+                kind: ReviewAnchorKind::Range,
                 file_path: "a.rs".to_string(),
                 diff_row: 2,
                 start_diff_row: Some(2),

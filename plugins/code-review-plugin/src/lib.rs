@@ -26,8 +26,8 @@ use bcode_code_review_models::{
     OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
     PublishReviewPreviewResponse, PublishReviewRequest, PublishReviewResponse,
     RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest, ResolveThreadResponse,
-    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
-    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
+    ReviewAnchorKind, ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest,
+    ReviewFile, ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
     ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
     ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
@@ -1309,12 +1309,18 @@ const fn surface_kind_label(kind: ReviewSurfaceKind) -> &'static str {
 }
 
 fn anchor_label(anchor: &DraftAnchor) -> String {
-    let start = anchor.start_diff_row.unwrap_or(anchor.diff_row);
-    let end = anchor.end_diff_row.unwrap_or(anchor.diff_row);
-    if start == end {
-        format!("row {start}")
-    } else {
-        format!("rows {start}-{end}")
+    match anchor.kind {
+        ReviewAnchorKind::Review => "review".to_string(),
+        ReviewAnchorKind::File => "file".to_string(),
+        ReviewAnchorKind::Range => {
+            let start = anchor.start_diff_row.unwrap_or(anchor.diff_row);
+            let end = anchor.end_diff_row.unwrap_or(anchor.diff_row);
+            if start == end {
+                format!("row {start}")
+            } else {
+                format!("rows {start}-{end}")
+            }
+        }
     }
 }
 
@@ -2351,6 +2357,7 @@ impl<'a> CodeReviewDb<'a> {
             .select("draft_threads")
             .columns(&[
                 "thread_id",
+                "anchor_kind",
                 "session_id",
                 "file_path",
                 "diff_row",
@@ -2377,6 +2384,11 @@ impl<'a> CodeReviewDb<'a> {
             let session_id = optional_text(&thread, "session_id");
             let resolved_at_ms = optional_i64(&thread, "resolved_at_ms").map(i64_to_u64);
             let anchor = DraftAnchor {
+                kind: anchor_kind_from_str(
+                    optional_text(&thread, "anchor_kind")
+                        .as_deref()
+                        .unwrap_or("range"),
+                )?,
                 file_path: required_text(&thread, "file_path")?,
                 diff_row: i64_to_u64(required_i64(&thread, "diff_row")?),
                 start_diff_row: optional_i64(&thread, "start_diff_row").map(i64_to_u64),
@@ -2666,6 +2678,7 @@ impl<'a> CodeReviewDb<'a> {
             .insert("draft_threads")
             .value("thread_id", thread_id.to_string())
             .value("review_key", review_key.to_string())
+            .value("anchor_kind", anchor_kind_str(anchor.kind))
             .value("file_path", anchor.file_path.clone())
             .value("diff_row", u64_to_i64(anchor.diff_row))
             .value("start_diff_row", optional_u64(anchor.start_diff_row))
@@ -2805,6 +2818,18 @@ async fn reconcile_legacy_code_review_migrations(
 
     if has_draft_threads {
         if database
+            .column_exists("draft_threads", "anchor_kind")
+            .await?
+            && !tracker
+                .is_migration_applied(database, "011_thread_anchor_kind_column")
+                .await?
+        {
+            tracker
+                .record_migration(database, "011_thread_anchor_kind_column")
+                .await?;
+        }
+
+        if database
             .column_exists("draft_threads", "start_diff_row")
             .await?
             && !tracker
@@ -2923,6 +2948,19 @@ fn publish_records_table_migration() -> CodeMigration<'static> {
     )
 }
 
+fn thread_anchor_kind_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "011_thread_anchor_kind_column".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "anchor_kind".to_string(),
+            DataType::Text,
+            false,
+            Some(DatabaseValue::String("range".to_string())),
+        )),
+        None,
+    )
+}
+
 fn code_review_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
     source.add_migration(CodeMigration::new(
@@ -2947,6 +2985,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
                 .if_not_exists(true)
                 .column(text_column("thread_id"))
                 .column(text_column("review_key"))
+                .column(text_column("anchor_kind"))
                 .column(text_column("file_path"))
                 .column(int_column("diff_row"))
                 .column(nullable_int_column("old_line"))
@@ -3010,6 +3049,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(workspace_table_migration());
     source.add_migration(workspace_viewed_files_column_migration());
     source.add_migration(publish_records_table_migration());
+    source.add_migration(thread_anchor_kind_column_migration());
     source
 }
 
@@ -3213,6 +3253,25 @@ const fn target_kind(target: &ReviewTarget) -> &'static str {
         ReviewTarget::CommitRange { .. } => "commit_range",
         ReviewTarget::BranchCompare { .. } => "branch_compare",
         ReviewTarget::Repository => "repository",
+    }
+}
+
+const fn anchor_kind_str(kind: ReviewAnchorKind) -> &'static str {
+    match kind {
+        ReviewAnchorKind::Review => "review",
+        ReviewAnchorKind::File => "file",
+        ReviewAnchorKind::Range => "range",
+    }
+}
+
+fn anchor_kind_from_str(value: &str) -> Result<ReviewAnchorKind, ReviewError> {
+    match value {
+        "review" => Ok(ReviewAnchorKind::Review),
+        "file" => Ok(ReviewAnchorKind::File),
+        "range" => Ok(ReviewAnchorKind::Range),
+        _ => Err(ReviewError::InvalidRequest(format!(
+            "unknown anchor kind: {value}"
+        ))),
     }
 }
 
@@ -3740,6 +3799,7 @@ mod tests {
             threads: vec![ReviewBundleThread {
                 thread_id: "thread-1".to_string(),
                 anchor: DraftAnchor {
+                    kind: ReviewAnchorKind::Range,
                     file_path: "src/lib.rs".to_string(),
                     diff_row: 3,
                     old_line: None,
@@ -3759,6 +3819,7 @@ mod tests {
                     comment_id: "comment-1".to_string(),
                     thread_id: "thread-1".to_string(),
                     anchor: DraftAnchor {
+                        kind: ReviewAnchorKind::Range,
                         file_path: "src/lib.rs".to_string(),
                         diff_row: 3,
                         old_line: None,

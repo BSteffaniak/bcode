@@ -690,9 +690,25 @@ pub struct ReviewContextRequest {
     pub target: ReviewTarget,
 }
 
+/// Review thread anchor scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAnchorKind {
+    /// Thread applies to the entire review.
+    Review,
+    /// Thread applies to a whole file.
+    File,
+    /// Thread applies to a rendered line or range.
+    #[default]
+    Range,
+}
+
 /// Persisted draft anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftAnchor {
+    /// Anchor scope.
+    #[serde(default)]
+    pub kind: ReviewAnchorKind,
     /// File path in the review.
     pub file_path: String,
     /// Rendered diff row.
