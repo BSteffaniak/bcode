@@ -47,8 +47,8 @@ const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(750);
-const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(1200);
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(650);
+const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(1400);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
@@ -643,13 +643,17 @@ impl BmuxApp {
     /// Return whether there is a newer transcript entry fully below the viewport.
     #[must_use]
     pub fn newer_transcript_content_below(&self) -> bool {
+        self.hidden_entry_start_row_below_viewport().is_some()
+    }
+
+    fn hidden_entry_start_row_below_viewport(&self) -> Option<usize> {
         let total_rows = self.transcript_layout.total_rows();
         let viewport_bottom = self.viewport.bottom_row(total_rows);
         if viewport_bottom >= total_rows {
-            return false;
+            return None;
         }
         self.transcript_layout
-            .entry_starts_at_or_after_row(viewport_bottom)
+            .first_entry_start_at_or_after_row(viewport_bottom)
     }
 
     /// Return the most recent time hidden transcript content changed.
@@ -1044,11 +1048,14 @@ impl BmuxApp {
             }
             return;
         };
-        let overflow_rows = total_rows.saturating_sub(previous_bottom);
-        if overflow_rows > 0 && self.newer_transcript_content_below() {
-            self.record_latest_hidden_activity(now, overflow_rows);
+        let hidden_entry_start = self.hidden_entry_start_row_below_viewport();
+        let changed_hidden_entry_rows = hidden_entry_start.map_or(0, |entry_start| {
+            total_rows.saturating_sub(previous_bottom.max(entry_start))
+        });
+        if changed_hidden_entry_rows > 0 {
+            self.record_latest_hidden_activity(now, changed_hidden_entry_rows);
         }
-        let overflowed = overflow_rows > 0;
+        let overflowed = total_rows > previous_bottom;
         if self.manual_transcript_scroll_active()
             || self.transcript_scroll_animation.is_some()
             || !self.scroll_mode.allows_overflow_catch()
@@ -1070,17 +1077,29 @@ impl BmuxApp {
     }
 
     fn record_latest_hidden_activity(&mut self, now: Instant, changed_rows: usize) {
-        if self
-            .latest_hidden_activity_at
+        let previous_activity_at = self.latest_hidden_activity_at;
+        if previous_activity_at
             .is_none_or(|at| now.saturating_duration_since(at) >= LATEST_BAR_ACTIVE_WINDOW)
         {
             self.latest_hidden_activity_burst = 0;
         }
+        let elapsed_ms = previous_activity_at
+            .map_or_else(
+                || LATEST_BAR_ACTIVE_WINDOW.as_millis(),
+                |at| now.saturating_duration_since(at).as_millis(),
+            )
+            .max(1);
         self.latest_hidden_activity_at = Some(now);
-        let activity = u8::try_from(changed_rows.min(8)).unwrap_or(8);
+        let velocity_rows_per_second = u128::try_from(changed_rows)
+            .unwrap_or(u128::MAX)
+            .saturating_mul(1_000)
+            / elapsed_ms;
+        let row_score = u8::try_from(changed_rows.min(8)).unwrap_or(8);
+        let velocity_score = u8::try_from(velocity_rows_per_second.min(8)).unwrap_or(8);
+        let activity = row_score.max(velocity_score).max(1);
         self.latest_hidden_activity_burst = self
             .latest_hidden_activity_burst
-            .saturating_add(activity.max(1))
+            .saturating_add(activity)
             .min(8);
     }
 
@@ -2412,9 +2431,9 @@ fn tool_elapsed_invalidation_key(tool_call_id: &str) -> InvalidationKey {
 
 fn latest_bar_active_frame_duration(burst: u8) -> Duration {
     Duration::from_millis(
-        220_u64
-            .saturating_sub(u64::from(burst).saturating_mul(18))
-            .max(80),
+        210_u64
+            .saturating_sub(u64::from(burst).saturating_mul(21))
+            .max(36),
     )
 }
 

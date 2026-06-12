@@ -162,10 +162,10 @@ impl TranscriptLayoutCache {
         self.visible_lines_from_top(row, 1).into_iter().next()
     }
 
-    /// Return whether a distinct cached transcript entry starts at or after `row`.
+    /// Return the first distinct cached transcript entry start at or after `row`.
     #[must_use]
-    pub fn entry_starts_at_or_after_row(&self, row: usize) -> bool {
-        (row..self.total_rows()).any(|candidate| self.entry_starts_at_row(candidate))
+    pub fn first_entry_start_at_or_after_row(&self, row: usize) -> Option<usize> {
+        (row..self.total_rows()).find(|candidate| self.entry_starts_at_row(*candidate))
     }
 
     /// Return whether a distinct cached transcript entry starts at `row`.

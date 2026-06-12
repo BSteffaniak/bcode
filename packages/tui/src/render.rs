@@ -45,8 +45,8 @@ const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(750);
-const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(900);
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(650);
+const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(1400);
 /// Prepared geometry for one TUI frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLayout {
@@ -299,9 +299,9 @@ fn latest_bar_phase(started_at: Instant, now: Instant, frame: Duration) -> usize
 
 fn latest_bar_active_frame_duration(burst: u8) -> Duration {
     Duration::from_millis(
-        180_u64
-            .saturating_sub(u64::from(burst).saturating_mul(10))
-            .max(90),
+        210_u64
+            .saturating_sub(u64::from(burst).saturating_mul(21))
+            .max(36),
     )
 }
 
@@ -317,15 +317,16 @@ fn push_latest_bar_glow_rail(
         return;
     }
     let intensity = usize::from(burst.min(8));
-    let period = 14_usize.saturating_sub(intensity).max(7);
-    let trail = 2_usize.saturating_add(intensity / 2);
+    let period = 18_usize.saturating_sub(intensity.saturating_mul(2)).max(4);
+    let trail = 1_usize.saturating_add(intensity);
+    let phase_step = 1_usize.saturating_add(intensity / 3);
     for column in 0..width {
         let wave_column = if reverse {
             width.saturating_sub(column).saturating_sub(1)
         } else {
             column
         };
-        let wave = wave_column.saturating_add(phase) % period;
+        let wave = wave_column.saturating_add(phase.saturating_mul(phase_step)) % period;
         let distance = wave.min(period.saturating_sub(wave));
         let glyph_index = match distance {
             0 => 2,
@@ -338,7 +339,7 @@ fn push_latest_bar_glow_rail(
             continue;
         }
         let mut style = latest_bar_background_style().fg(latest_bar_glow_color(distance, burst));
-        if distance == 0 || (intensity >= 5 && distance <= 1) {
+        if distance == 0 || (intensity >= 3 && distance <= 1) || (intensity >= 7 && distance <= 2) {
             style = style.add_modifier(Modifier::BOLD);
         }
         spans.push(Span::styled(GLYPHS[glyph_index], style));
