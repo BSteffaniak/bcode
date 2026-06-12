@@ -1888,6 +1888,8 @@ pub enum ReviewMouseAction {
     SidebarMode(ReviewSidebarMode),
     ThreadFilter(ReviewThreadFilter),
     SelectThread(usize),
+    SelectFile(usize),
+    ToggleFileViewed(usize),
     JumpSelectedThread,
     NewReviewComment,
     Publish,
@@ -1895,6 +1897,7 @@ pub enum ReviewMouseAction {
     ReplyThread,
     ToggleThreadResolved,
     EditThread,
+    DeleteThread,
     OpenThreadSession,
 }
 
@@ -4594,6 +4597,13 @@ impl ReviewApp {
                 let selected = self.select_thread(index);
                 self.jump_to_selected_thread() || selected
             }
+            ReviewMouseAction::SelectFile(index) => self.select_file(index),
+            ReviewMouseAction::ToggleFileViewed(index) => {
+                if !self.select_file(index) && index >= self.review.files.len() {
+                    return false;
+                }
+                self.toggle_selected_file_viewed()
+            }
             ReviewMouseAction::JumpSelectedThread => self.jump_to_selected_thread(),
             ReviewMouseAction::NewReviewComment => self.open_review_comment_editor(),
             ReviewMouseAction::Publish => self.publish_review(),
@@ -4601,6 +4611,7 @@ impl ReviewApp {
             ReviewMouseAction::ReplyThread => self.open_comment_editor(),
             ReviewMouseAction::ToggleThreadResolved => self.toggle_selected_thread_resolved(),
             ReviewMouseAction::EditThread => self.open_latest_draft_editor(),
+            ReviewMouseAction::DeleteThread => self.delete_latest_draft_at_selection(),
             ReviewMouseAction::OpenThreadSession => self.open_linked_session_at_selection(),
         }
     }
@@ -5572,7 +5583,17 @@ impl ReviewApp {
             return false;
         }
         self.selected_thread = index;
+        self.sync_view_target_to_selected_thread();
         true
+    }
+
+    fn sync_view_target_to_selected_thread(&mut self) {
+        let threads = self.visible_thread_summaries();
+        let Some(thread) = threads.get(self.selected_thread) else {
+            return;
+        };
+        let thread_key = Self::thread_key_for_anchor(&thread.anchor);
+        self.selected_view_target = Some(ReviewViewTarget::Thread { thread_key });
     }
 
     /// Select previous thread.

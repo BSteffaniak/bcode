@@ -558,6 +558,16 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 line_area,
                 frame,
             );
+            app.register_mouse_region(
+                line_area,
+                ReviewMouseAction::SelectFile(index),
+                "select file",
+            );
+            app.register_mouse_region(
+                Rect::new(line_area.x, line_area.y, 4.min(line_area.width), 1),
+                ReviewMouseAction::ToggleFileViewed(index),
+                "toggle viewed",
+            );
         }
     }
 }
@@ -675,16 +685,21 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     }
     render_thread_toolbar(app, area, frame);
+    let threads = app.visible_thread_summaries();
+    let detail_height = if threads.is_empty() {
+        0
+    } else {
+        area.height.clamp(0, 7).min(area.height.saturating_sub(3))
+    };
     let list_area = Rect::new(
         area.x,
         area.y.saturating_add(1),
         area.width,
-        area.height.saturating_sub(1),
+        area.height.saturating_sub(1).saturating_sub(detail_height),
     );
     if list_area.is_empty() {
         return;
     }
-    let threads = app.visible_thread_summaries();
     let visible_rows = usize::from(list_area.height);
     if threads.is_empty() {
         let label = if app.sidebar_mode == ReviewSidebarMode::NeedsAttention {
@@ -754,6 +769,76 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 "select thread",
             );
         }
+    }
+
+    if detail_height > 0 {
+        let detail_area = Rect::new(
+            area.x,
+            area.bottom().saturating_sub(detail_height),
+            area.width,
+            detail_height,
+        );
+        render_thread_detail(app, detail_area, frame, &threads);
+    }
+}
+
+fn render_thread_detail(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    threads: &[crate::code_review_tui::ReviewThreadSummary],
+) {
+    let Some(thread) = threads.get(app.selected_thread) else {
+        return;
+    };
+    let border_style = Style::new().fg(Color::BrightBlack).bg(Color::Black);
+    frame.write_line(
+        Rect::new(area.x, area.y, area.width, 1),
+        &Line::from_spans(vec![Span::styled(
+            "─".repeat(usize::from(area.width)),
+            border_style,
+        )]),
+    );
+    let status = if thread.resolved { "resolved" } else { "open" };
+    let title = format!(
+        " {} {} {} {}",
+        status,
+        review_thread_kind_label(thread.thread_kind),
+        thread.anchor.scope_label(),
+        thread.line_label()
+    );
+    frame.write_line(
+        Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        &Line::from_spans(vec![Span::styled(
+            truncate_to_display_width(&title, usize::from(area.width)),
+            Style::new().fg(Color::Yellow).bg(Color::Black),
+        )]),
+    );
+    let actions = [
+        ("Reply", ReviewMouseAction::ReplyThread),
+        (
+            if thread.resolved { "Reopen" } else { "Resolve" },
+            ReviewMouseAction::ToggleThreadResolved,
+        ),
+        ("Edit", ReviewMouseAction::EditThread),
+        ("Delete", ReviewMouseAction::DeleteThread),
+        ("Session", ReviewMouseAction::OpenThreadSession),
+        ("Ask", ReviewMouseAction::AskBcode),
+    ];
+    let mut x = area.x;
+    let action_y = area.y.saturating_add(2);
+    for (label, action) in actions {
+        x = render_header_button(app, frame, x, action_y, label, action, false);
+    }
+    let body = thread.latest_body.lines().next().unwrap_or_default();
+    if area.height > 3 {
+        frame.write_line(
+            Rect::new(area.x, area.y.saturating_add(3), area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(body, usize::from(area.width)),
+                Style::new().fg(Color::White).bg(Color::Black),
+            )]),
+        );
     }
 }
 
