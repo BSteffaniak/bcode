@@ -103,7 +103,6 @@ impl SessionHandle {
         &self,
         client_id: ClientId,
         mode: AttachMode,
-        activity_timestamp_ms: u64,
     ) -> Result<SessionAttachment, SessionError> {
         let (reply, receiver) = oneshot::channel();
         let queued_at = Instant::now();
@@ -111,7 +110,6 @@ impl SessionHandle {
             .send(SessionCommand::Attach {
                 client_id,
                 mode,
-                activity_timestamp_ms,
                 queued_at,
                 reply,
             })
@@ -122,17 +120,9 @@ impl SessionHandle {
             .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?
     }
 
-    pub async fn detach(
-        &self,
-        client_id: ClientId,
-        activity_timestamp_ms: u64,
-    ) -> Result<Option<SessionEvent>, SessionError> {
-        self.send(|reply| SessionCommand::Detach {
-            client_id,
-            activity_timestamp_ms,
-            reply,
-        })
-        .await?
+    pub async fn detach(&self, client_id: ClientId) -> Result<bool, SessionError> {
+        self.send(|reply| SessionCommand::Detach { client_id, reply })
+            .await?
     }
 
     pub async fn summary(&self) -> Result<SessionSummary, SessionError> {
@@ -266,14 +256,12 @@ enum SessionCommand {
     Attach {
         client_id: ClientId,
         mode: AttachMode,
-        activity_timestamp_ms: u64,
         queued_at: Instant,
         reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
     },
     Detach {
         client_id: ClientId,
-        activity_timestamp_ms: u64,
-        reply: oneshot::Sender<Result<Option<SessionEvent>, SessionError>>,
+        reply: oneshot::Sender<Result<bool, SessionError>>,
     },
     Summary(oneshot::Sender<SessionSummary>),
     WorkingDirectory(oneshot::Sender<PathBuf>),
@@ -358,14 +346,10 @@ impl SessionActor {
             SessionCommand::Attach {
                 client_id,
                 mode,
-                activity_timestamp_ms,
                 queued_at,
                 reply,
             } => {
-                let _ = reply.send(
-                    self.attach(client_id, mode, activity_timestamp_ms, queued_at)
-                        .await,
-                );
+                let _ = reply.send(self.attach(client_id, mode, queued_at).await);
             }
             command => return self.handle_read_command(command).await,
         }
@@ -379,12 +363,8 @@ impl SessionActor {
             | SessionCommand::Attach { .. } => {
                 unreachable!("write commands are handled before read commands")
             }
-            SessionCommand::Detach {
-                client_id,
-                activity_timestamp_ms,
-                reply,
-            } => {
-                let _ = reply.send(self.detach(client_id, activity_timestamp_ms).await);
+            SessionCommand::Detach { client_id, reply } => {
+                let _ = reply.send(Ok(self.detach(client_id)));
             }
             SessionCommand::Summary(reply) => {
                 let _ = reply.send(self.state.summary());
@@ -660,7 +640,6 @@ impl SessionActor {
         &mut self,
         client_id: ClientId,
         mode: AttachMode,
-        activity_timestamp_ms: u64,
         queued_at: Instant,
     ) -> Result<SessionAttachment, SessionError> {
         let total_started_at = Instant::now();
@@ -737,20 +716,8 @@ impl SessionActor {
                 elapsed_ms(subscribe_started_at),
             );
         }
-        let append_started_at = Instant::now();
-        let attached_event = self
-            .append_event(
-                SessionEventKind::ClientAttached { client_id },
-                None,
-                activity_timestamp_ms,
-            )
-            .await?;
         let session = self.state.summary();
         if let Some(metrics) = &metrics {
-            metrics.record_histogram(
-                "session.actor.attach.append_client_attached_duration_ms",
-                elapsed_ms(append_started_at),
-            );
             metrics.record_histogram(
                 "session.actor.attach.total_duration_ms",
                 elapsed_ms(total_started_at),
@@ -760,29 +727,18 @@ impl SessionActor {
             session,
             history,
             input_history,
-            attached_event,
             events,
             live_events: self.state.live_events.subscribe(),
         })
     }
 
-    async fn detach(
-        &mut self,
-        client_id: ClientId,
-        activity_timestamp_ms: u64,
-    ) -> Result<Option<SessionEvent>, SessionError> {
+    fn detach(&mut self, client_id: ClientId) -> bool {
         if self.state.clients.remove(&client_id) {
             self.state.summary.client_count = self.state.clients.len();
-            return Ok(Some(
-                self.append_event(
-                    SessionEventKind::ClientDetached { client_id },
-                    None,
-                    activity_timestamp_ms,
-                )
-                .await?,
-            ));
+            self.refresh_snapshot();
+            return true;
         }
-        Ok(None)
+        false
     }
 
     async fn history(&mut self) -> Result<Vec<SessionEvent>, SessionError> {

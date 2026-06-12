@@ -585,12 +585,7 @@ impl ServerState {
             .await
             .remove(&client_id);
         if let Some(session_id) = session_id {
-            if let Some(event) = self.sessions.detach_session(session_id, client_id).await? {
-                publish_session_event(self, &event).await;
-                if let Ok(session) = self.sessions.session_summary(session_id).await {
-                    self.session_catalog.upsert_native_session(session).await;
-                }
-            }
+            let _detached = self.sessions.detach_session(session_id, client_id).await?;
             self.deactivate_session_namespace_if_inactive(session_id)
                 .await;
             self.release_session_resources_if_idle(session_id).await;
@@ -2408,11 +2403,6 @@ async fn handle_attach_session(
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             state.attach_client_session(client_id, session_id).await;
-            publish_session_event(state, &attachment.attached_event).await;
-            state
-                .session_catalog
-                .upsert_native_session(attachment.session.clone())
-                .await;
             send_response(
                 writer,
                 request_id,
@@ -2662,21 +2652,6 @@ async fn finish_attach_session_projection_window_success(
     state
         .attach_client_session(context.client_id, session_id)
         .await;
-    let publish_started_at = Instant::now();
-    publish_session_event(state, &attachment.attached_event).await;
-    state.metrics.record_histogram(
-        "server.attach_projection_window.publish_attached_event_duration_ms",
-        elapsed_ms(publish_started_at),
-    );
-    let catalog_started_at = Instant::now();
-    state
-        .session_catalog
-        .upsert_native_session(attachment.session.clone())
-        .await;
-    state.metrics.record_histogram(
-        "server.attach_projection_window.catalog_upsert_duration_ms",
-        elapsed_ms(catalog_started_at),
-    );
     let compact_started_at = Instant::now();
     let compacted_history = compact_attach_history(attachment.history);
     state.metrics.record_histogram(
@@ -2760,21 +2735,6 @@ async fn finish_attach_session_recent_success(
     state
         .attach_client_session(context.client_id, session_id)
         .await;
-    let publish_started_at = Instant::now();
-    publish_session_event(state, &attachment.attached_event).await;
-    state.metrics.record_histogram(
-        "server.attach_recent.publish_attached_event_duration_ms",
-        elapsed_ms(publish_started_at),
-    );
-    let catalog_started_at = Instant::now();
-    state
-        .session_catalog
-        .upsert_native_session(attachment.session.clone())
-        .await;
-    state.metrics.record_histogram(
-        "server.attach_recent.catalog_upsert_duration_ms",
-        elapsed_ms(catalog_started_at),
-    );
     let compact_started_at = Instant::now();
     let compacted_history = compact_attach_history(attachment.history);
     state.metrics.record_histogram(

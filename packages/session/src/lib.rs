@@ -496,7 +496,6 @@ pub struct SessionAttachment {
     pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
-    pub attached_event: SessionEvent,
     pub events: broadcast::Receiver<SessionEvent>,
     pub live_events: broadcast::Receiver<SessionLiveEvent>,
 }
@@ -1407,10 +1406,7 @@ impl SessionManager {
     ///
     /// # Errors
     ///
-    /// Returns an error when:
-    ///
-    /// * the session does not exist
-    /// * the client-attached event cannot be persisted
+    /// Returns an error when the session does not exist.
     pub async fn attach_session(
         &self,
         session_id: SessionId,
@@ -1423,11 +1419,8 @@ impl SessionManager {
             "session.manager.attach_full.handle_duration_ms",
             handle_timer.elapsed_ms(),
         );
-        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let result = handle
-            .attach(client_id, AttachMode::Full, activity_timestamp_ms)
-            .await;
+        let result = handle.attach(client_id, AttachMode::Full).await;
         self.metrics.record_histogram(
             "session.manager.attach_full.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -1443,10 +1436,7 @@ impl SessionManager {
     ///
     /// # Errors
     ///
-    /// Returns an error when:
-    ///
-    /// * the session does not exist
-    /// * the client-attached event cannot be persisted
+    /// Returns an error when the session does not exist.
     pub async fn attach_session_recent(
         &self,
         session_id: SessionId,
@@ -1462,15 +1452,8 @@ impl SessionManager {
             "session.manager.attach_recent.handle_duration_ms",
             handle_timer.elapsed_ms(),
         );
-        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
-        let result = handle
-            .attach(
-                client_id,
-                AttachMode::Recent { limit },
-                activity_timestamp_ms,
-            )
-            .await;
+        let result = handle.attach(client_id, AttachMode::Recent { limit }).await;
         self.metrics.record_histogram(
             "session.manager.attach_recent.actor_attach_duration_ms",
             attach_timer.elapsed_ms(),
@@ -1500,7 +1483,6 @@ impl SessionManager {
     ///
     /// * the session does not exist
     /// * the projection request is not supported
-    /// * the client-attached event cannot be persisted
     pub async fn attach_session_projection_window(
         &self,
         session_id: SessionId,
@@ -1545,14 +1527,9 @@ impl SessionManager {
         } else {
             Vec::new()
         };
-        let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let attach_timer = self.metrics.timer();
         let mut attachment = handle
-            .attach(
-                client_id,
-                AttachMode::ProjectionWindow { history },
-                activity_timestamp_ms,
-            )
+            .attach(client_id, AttachMode::ProjectionWindow { history })
             .await?;
         self.metrics.record_histogram(
             "session.manager.attach_projection_window.actor_attach_duration_ms",
@@ -1581,17 +1558,16 @@ impl SessionManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the client-detached event cannot be persisted.
+    /// Returns an error when the detach command cannot be delivered.
     pub async fn detach_session(
         &self,
         session_id: SessionId,
         client_id: ClientId,
-    ) -> Result<Option<SessionEvent>, SessionError> {
+    ) -> Result<bool, SessionError> {
         let Ok(handle) = self.session_handle(session_id).await else {
-            return Ok(None);
+            return Ok(false);
         };
-        let activity_timestamp_ms = self.next_activity_timestamp_ms();
-        handle.detach(client_id, activity_timestamp_ms).await
+        handle.detach(client_id).await
     }
 
     /// Release cached per-session resources when no clients remain attached.
