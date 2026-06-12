@@ -41,10 +41,9 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     render_overlays(app, area, frame);
 }
 
-fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_chrome(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(app, header, frame);
-    render_header_actions(app, header, frame);
 
     let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
     render_footer(app, footer, frame);
@@ -129,13 +128,20 @@ fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) -> Rect {
 }
 
 fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    render_header_actions(app, area, frame);
+    let content = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
     match app.sidebar_mode {
-        ReviewSidebarMode::Included => render_included(app, area, frame),
-        ReviewSidebarMode::Repository => render_files(app, area, frame),
+        ReviewSidebarMode::Included => render_included(app, content, frame),
+        ReviewSidebarMode::Repository => render_files(app, content, frame),
         ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention => {
-            render_threads(app, area, frame);
+            render_threads(app, content, frame);
         }
-        ReviewSidebarMode::Sources => render_sources(app, area, frame),
+        ReviewSidebarMode::Sources => render_sources(app, content, frame),
     }
 }
 
@@ -687,7 +693,7 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             app.thread_filter.label()
         };
         frame.write_line(
-            area,
+            list_area,
             &Line::from_spans(vec![Span::styled(
                 format!(" no {label} review threads"),
                 Style::new().fg(Color::BrightBlack),
