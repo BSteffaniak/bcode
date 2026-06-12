@@ -47,8 +47,7 @@ const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(650);
-const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(1400);
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
@@ -1041,7 +1040,7 @@ impl BmuxApp {
     }
 
     fn resolve_visual_overflow_follow(&mut self, total_rows: usize, now: Instant) {
-        let Some(previous_bottom) = self.pending_visual_overflow_bottom else {
+        let Some(previous_bottom) = self.pending_visual_overflow_bottom.take() else {
             if !self.newer_transcript_content_below() {
                 self.latest_hidden_activity_at = None;
                 self.latest_hidden_activity_burst = 0;
@@ -1062,7 +1061,6 @@ impl BmuxApp {
         {
             return;
         }
-        self.pending_visual_overflow_bottom = None;
         if !overflowed {
             if !self.newer_transcript_content_below() {
                 self.latest_hidden_activity_at = None;
@@ -1527,7 +1525,7 @@ impl BmuxApp {
                 now + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
             ));
         }
-        if self.newer_transcript_content_below() {
+        if self.newer_transcript_content_below() && self.latest_bar_active(now) {
             requests.push(InvalidationRequest::new(
                 InvalidationKey::new(LATEST_BAR_ANIMATION_INVALIDATION_KEY),
                 self.next_latest_bar_invalidation(now),
@@ -1562,14 +1560,14 @@ impl BmuxApp {
         })
     }
 
-    fn next_latest_bar_invalidation(&self, now: Instant) -> Instant {
-        if self
-            .latest_hidden_activity_at
+    fn latest_bar_active(&self, now: Instant) -> bool {
+        self.latest_hidden_activity_at
             .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW)
-        {
-            return now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst);
-        }
-        now + LATEST_BAR_STALE_FRAME
+    }
+
+    fn next_latest_bar_invalidation(&self, now: Instant) -> Instant {
+        debug_assert!(self.latest_bar_active(now));
+        now + latest_bar_active_frame_duration(self.latest_hidden_activity_burst)
     }
 
     fn handle_transcript_scroll_animation(&mut self, now: Instant) -> bool {

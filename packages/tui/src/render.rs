@@ -45,8 +45,7 @@ const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(650);
-const LATEST_BAR_STALE_FRAME: Duration = Duration::from_millis(1400);
+const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 /// Prepared geometry for one TUI frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLayout {
@@ -184,7 +183,7 @@ fn latest_bar_line(
         (age < LATEST_BAR_ACTIVE_WINDOW).then_some(age)
     });
     active_age.map_or_else(
-        || stale_latest_bar_line(width, key_label, animation_started_at, now),
+        || stale_latest_bar_line(width, key_label),
         |active_age| {
             active_latest_bar_line(
                 width,
@@ -245,12 +244,7 @@ fn active_latest_bar_line(
     Line::from_spans(spans)
 }
 
-fn stale_latest_bar_line(
-    width: u16,
-    key_label: &str,
-    animation_started_at: Instant,
-    now: Instant,
-) -> Line {
+fn stale_latest_bar_line(width: u16, key_label: &str) -> Line {
     let width = usize::from(width);
     let text = if width < 30 {
         format!("latest below · {key_label}")
@@ -264,23 +258,17 @@ fn stale_latest_bar_line(
         .saturating_sub(1)
         .saturating_sub(text_width)
         .saturating_sub(left_width);
-    let phase = latest_bar_phase(animation_started_at, now, LATEST_BAR_STALE_FRAME) % 2;
-    let chevron_color = if phase == 0 {
-        Color::Rgb(74, 154, 174)
-    } else {
-        Color::Rgb(110, 220, 235)
-    };
     Line::from_spans(vec![
         Span::styled(" ".repeat(left_width), latest_bar_background_style()),
         Span::styled(
             text,
-            latest_bar_background_style().fg(Color::Rgb(150, 180, 192)),
+            latest_bar_background_style().fg(Color::Rgb(130, 154, 166)),
         ),
         Span::styled(" ".repeat(right_width), latest_bar_background_style()),
         Span::styled(
             "▾",
             latest_bar_background_style()
-                .fg(chevron_color)
+                .fg(Color::Rgb(105, 210, 230))
                 .add_modifier(Modifier::BOLD),
         ),
     ])
@@ -312,7 +300,9 @@ fn push_latest_bar_glow_rail(
     burst: u8,
     reverse: bool,
 ) {
-    const GLYPHS: [&str; 3] = ["·", "•", "▾"];
+    const LOW_GLYPHS: [&str; 3] = ["·", "•", "▾"];
+    const HIGH_GLYPHS: [&str; 3] = ["·", "◆", "▾"];
+    let glyphs = if burst >= 5 { HIGH_GLYPHS } else { LOW_GLYPHS };
     if width == 0 {
         return;
     }
@@ -342,7 +332,7 @@ fn push_latest_bar_glow_rail(
         if distance == 0 || (intensity >= 3 && distance <= 1) || (intensity >= 7 && distance <= 2) {
             style = style.add_modifier(Modifier::BOLD);
         }
-        spans.push(Span::styled(GLYPHS[glyph_index], style));
+        spans.push(Span::styled(glyphs[glyph_index], style));
     }
 }
 
@@ -358,15 +348,16 @@ const fn latest_bar_active_text_color(burst: u8) -> Color {
 
 const fn latest_bar_glow_color(distance: usize, burst: u8) -> Color {
     match (burst >= 6, burst >= 3, distance) {
-        (true, _, 0) => Color::Rgb(245, 255, 255),
-        (true, _, 1 | 2) => Color::Rgb(120, 245, 255),
-        (true, _, _) => Color::Rgb(70, 170, 205),
-        (_, true, 0) => Color::Rgb(220, 255, 250),
-        (_, true, 1 | 2) => Color::Rgb(95, 230, 255),
-        (_, true, _) => Color::Rgb(60, 145, 180),
-        (_, _, 0) => Color::Rgb(205, 255, 245),
-        (_, _, 1 | 2) => Color::Rgb(90, 230, 255),
-        (_, _, _) => Color::Rgb(62, 142, 170),
+        (true, _, 0) => Color::Rgb(255, 255, 255),
+        (true, _, 1) => Color::Rgb(0, 255, 255),
+        (true, _, 2) => Color::Rgb(0, 190, 235),
+        (true, _, _) => Color::Rgb(18, 92, 128),
+        (_, true, 0) => Color::Rgb(235, 255, 255),
+        (_, true, 1 | 2) => Color::Rgb(55, 235, 255),
+        (_, true, _) => Color::Rgb(32, 125, 160),
+        (_, _, 0) => Color::Rgb(190, 245, 245),
+        (_, _, 1 | 2) => Color::Rgb(75, 190, 215),
+        (_, _, _) => Color::Rgb(40, 100, 125),
     }
 }
 
