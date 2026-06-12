@@ -1208,39 +1208,68 @@ fn publish_local_markdown(bundle: &ReviewBundle) -> String {
         return output;
     }
 
-    output.push_str("## Local review threads\n\n");
-    for thread in &bundle.threads {
-        let status = if thread.resolved_at_ms.is_some() {
-            "resolved"
-        } else {
-            "open"
-        };
-        let _ = write!(
-            output,
-            "### `{}` {} ({status})\n\n",
-            thread.anchor.file_path,
-            anchor_label(&thread.anchor)
-        );
-        let _ = writeln!(output, "* Thread id: `{}`", thread.thread_id);
-        if let Some(session_id) = &thread.session_id {
-            let _ = writeln!(output, "* Bcode session: `{session_id}`");
-        }
-        if let Some(resolved_at_ms) = thread.resolved_at_ms {
-            let _ = writeln!(output, "* Resolved at: `{resolved_at_ms}`");
-        }
-        output.push('\n');
-        for comment in &thread.comments {
-            let _ = writeln!(output, "#### Comment `{}`\n", comment.comment_id);
-            output.push_str(&comment.body);
-            output.push_str("\n\n");
-        }
-        if !thread.selected_diff_lines.is_empty() {
-            output.push_str("Context:\n\n```diff\n");
-            output.push_str(&thread.selected_diff_lines.join("\n"));
-            output.push_str("\n```\n\n");
+    let review_threads = bundle
+        .threads
+        .iter()
+        .filter(|thread| thread.anchor.kind == ReviewAnchorKind::Review)
+        .collect::<Vec<_>>();
+    if !review_threads.is_empty() {
+        output.push_str("## Review-level threads\n\n");
+        for thread in review_threads {
+            push_local_markdown_thread(&mut output, thread);
         }
     }
+
+    let file_threads = bundle
+        .threads
+        .iter()
+        .filter(|thread| thread.anchor.kind != ReviewAnchorKind::Review)
+        .collect::<Vec<_>>();
+    if file_threads.is_empty() {
+        return output;
+    }
+
+    output.push_str("## File threads\n\n");
+    for thread in file_threads {
+        push_local_markdown_thread(&mut output, thread);
+    }
     output
+}
+
+fn push_local_markdown_thread(output: &mut String, thread: &ReviewBundleThread) {
+    let status = if thread.resolved_at_ms.is_some() {
+        "resolved"
+    } else {
+        "open"
+    };
+    let heading = if thread.anchor.kind == ReviewAnchorKind::Review {
+        "Review".to_string()
+    } else {
+        format!(
+            "`{}` {}",
+            thread.anchor.file_path,
+            anchor_label(&thread.anchor)
+        )
+    };
+    let _ = write!(output, "### {heading} ({status})\n\n");
+    let _ = writeln!(output, "* Thread id: `{}`", thread.thread_id);
+    if let Some(session_id) = &thread.session_id {
+        let _ = writeln!(output, "* Bcode session: `{session_id}`");
+    }
+    if let Some(resolved_at_ms) = thread.resolved_at_ms {
+        let _ = writeln!(output, "* Resolved at: `{resolved_at_ms}`");
+    }
+    output.push('\n');
+    for comment in &thread.comments {
+        let _ = writeln!(output, "#### Comment `{}`\n", comment.comment_id);
+        output.push_str(&comment.body);
+        output.push_str("\n\n");
+    }
+    if !thread.selected_diff_lines.is_empty() {
+        output.push_str("Context:\n\n```diff\n");
+        output.push_str(&thread.selected_diff_lines.join("\n"));
+        output.push_str("\n```\n\n");
+    }
 }
 
 fn publish_markdown(bundle: &ReviewBundle) -> String {
@@ -3857,9 +3886,84 @@ mod tests {
 
         assert!(preview.contains("# Local review: Review"));
         assert!(preview.contains("* Open threads: `1`"));
+        assert!(preview.contains("## File threads"));
         assert!(preview.contains("### `src/lib.rs` row 3 (open)"));
         assert!(preview.contains("* Bcode session: `session-1`"));
         assert!(preview.contains("Needs local follow-up"));
+    }
+
+    #[test]
+    fn local_markdown_groups_review_level_threads() {
+        let bundle = ReviewBundle {
+            review_id: "review-1".to_string(),
+            title: "Review".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
+            files: Vec::new(),
+            threads: vec![ReviewBundleThread {
+                thread_id: "thread-review".to_string(),
+                anchor: DraftAnchor {
+                    kind: ReviewAnchorKind::Review,
+                    file_path: "<review>".to_string(),
+                    diff_row: 0,
+                    old_line: None,
+                    new_line: None,
+                    start_diff_row: None,
+                    end_diff_row: None,
+                    old_start: None,
+                    old_end: None,
+                    new_start: None,
+                    new_end: None,
+                    line_kind: ReviewLineKind::Context,
+                    is_file_anchor: false,
+                    surface_id: None,
+                    source_id: None,
+                },
+                comments: vec![DraftComment {
+                    comment_id: "comment-review".to_string(),
+                    thread_id: "thread-review".to_string(),
+                    anchor: DraftAnchor {
+                        kind: ReviewAnchorKind::Review,
+                        file_path: "<review>".to_string(),
+                        diff_row: 0,
+                        old_line: None,
+                        new_line: None,
+                        start_diff_row: None,
+                        end_diff_row: None,
+                        old_start: None,
+                        old_end: None,
+                        new_start: None,
+                        new_end: None,
+                        line_kind: ReviewLineKind::Context,
+                        is_file_anchor: false,
+                        surface_id: None,
+                        source_id: None,
+                    },
+                    body: "Overall review summary".to_string(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    session_id: None,
+                    resolved_at_ms: None,
+                }],
+                session_id: None,
+                resolved_at_ms: None,
+                selected_lines: Vec::new(),
+                selected_diff_lines: Vec::new(),
+                hunk_context: Vec::new(),
+            }],
+            generated_at_ms: 1,
+        };
+
+        let preview = with_publisher("local_markdown", |publisher| {
+            publisher.preview(&bundle, &serde_json::json!({}))
+        })
+        .expect("local markdown preview");
+
+        assert!(preview.contains("## Review-level threads"));
+        assert!(preview.contains("### Review (open)"));
+        assert!(preview.contains("Overall review summary"));
+        assert!(!preview.contains("## File threads"));
     }
 
     #[test]
