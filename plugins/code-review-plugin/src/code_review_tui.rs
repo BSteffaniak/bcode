@@ -2639,6 +2639,34 @@ pub struct ReviewCommentAnchor {
 }
 
 impl ReviewCommentAnchor {
+    /// Return this anchor's review scope kind.
+    #[must_use]
+    pub fn kind(&self) -> ReviewAnchorKind {
+        if self.path == REVIEW_LEVEL_ANCHOR_PATH {
+            ReviewAnchorKind::Review
+        } else if self.is_file_anchor {
+            ReviewAnchorKind::File
+        } else {
+            ReviewAnchorKind::Range
+        }
+    }
+
+    /// Return true when this anchor applies to the entire review.
+    #[must_use]
+    pub fn is_review_level(&self) -> bool {
+        self.kind() == ReviewAnchorKind::Review
+    }
+
+    /// Return a display label for this anchor's path/scope.
+    #[must_use]
+    pub fn scope_label(&self) -> &str {
+        if self.is_review_level() {
+            "Review"
+        } else {
+            self.path.as_str()
+        }
+    }
+
     /// Return the first rendered diff row for this anchor.
     #[must_use]
     pub const fn start_diff_row(&self) -> usize {
@@ -2744,7 +2772,7 @@ impl LocalReviewThread {
     /// Return a compact line label for the thread anchor.
     #[must_use]
     pub fn line_label(&self) -> String {
-        if self.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+        if self.anchor.is_review_level() {
             return "review".to_string();
         }
         self.anchor.new_start.or(self.anchor.old_start).map_or_else(
@@ -3016,7 +3044,7 @@ impl ReviewThreadSummary {
     /// Return a compact line label for the thread anchor.
     #[must_use]
     pub fn line_label(&self) -> String {
-        if self.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+        if self.anchor.is_review_level() {
             return "review".to_string();
         }
         self.anchor.new_start.or(self.anchor.old_start).map_or_else(
@@ -5599,7 +5627,7 @@ impl ReviewApp {
     }
 
     fn focus_thread_summary(&mut self, thread: &ReviewThreadSummary) {
-        if thread.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+        if thread.anchor.is_review_level() {
             self.selected_view_target = Some(ReviewViewTarget::Thread {
                 thread_key: Self::thread_key_for_anchor(&thread.anchor),
             });
@@ -5630,7 +5658,7 @@ impl ReviewApp {
             self.status_message = Some("no review thread selected".to_string());
             return true;
         };
-        if thread.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+        if thread.anchor.is_review_level() {
             self.selected_view_target = Some(ReviewViewTarget::Thread {
                 thread_key: Self::thread_key_for_anchor(&thread.anchor),
             });
@@ -6703,12 +6731,12 @@ impl ReviewApp {
         report.push_str("## Review threads\n\n");
         for thread in threads {
             let status = if thread.is_open() { "open" } else { "resolved" };
-            let _ = write!(
-                report,
-                "### `{}` {} ({status})\n\n",
-                thread.anchor.path,
-                thread.line_label()
-            );
+            let heading = if thread.anchor.is_review_level() {
+                "Review".to_string()
+            } else {
+                format!("`{}` {}", thread.anchor.path, thread.line_label())
+            };
+            let _ = write!(report, "### {heading} ({status})\n\n");
             if let Some(session_id) = &thread.session_id {
                 let _ = write!(report, "Linked Bcode session: `{session_id}`\n\n");
             }
@@ -9479,6 +9507,24 @@ mod tests {
         assert_eq!(
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
+        );
+    }
+
+    #[test]
+    fn review_level_thread_summary_uses_scope_label() {
+        let mut app = sample_app();
+        assert!(app.open_review_comment_editor());
+        let editor = app.comment_editor.as_mut().expect("editor should open");
+        editor.buffer = TextEditBuffer::from_text("overall");
+        assert!(app.save_comment_editor());
+
+        let summary = app.thread_summaries().pop().expect("thread summary");
+
+        assert_eq!(summary.anchor.scope_label(), "Review");
+        assert_eq!(summary.line_label(), "review");
+        assert!(
+            app.local_review_report_markdown()
+                .contains("### Review (open)")
         );
     }
 

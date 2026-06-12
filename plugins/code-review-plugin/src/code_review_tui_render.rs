@@ -618,9 +618,10 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             let line_label = thread.line_label();
             let body = thread.latest_body.lines().next().unwrap_or_default();
             let status = if thread.resolved { "resolved" } else { "open" };
+            let path_label = thread.anchor.scope_label();
             let text = format!(
-                " {marker} {status} {} {line_label} x{}  {body}",
-                thread.anchor.path, thread.draft_count
+                " {marker} {status} {path_label} {line_label} x{}  {body}",
+                thread.draft_count
             );
             frame.write_line_with_fallback_style(
                 line_area,
