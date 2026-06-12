@@ -1771,6 +1771,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('J') => app.select_next_hunk(),
         KeyCode::Char('K') => app.select_previous_hunk(),
         KeyCode::Char('v') => app.toggle_range_selection(),
+        KeyCode::Char('C') => app.open_review_comment_editor(),
         KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
@@ -9443,6 +9444,19 @@ mod tests {
         assert_eq!(
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
+        );
+    }
+
+    #[test]
+    fn uppercase_c_opens_review_level_comment_editor() {
+        let mut app = sample_app();
+
+        assert!(handle_review_navigation_key(&mut app, KeyCode::Char('C')));
+        assert_eq!(
+            app.comment_editor
+                .as_ref()
+                .map(|editor| editor.anchor.path.as_str()),
+            Some(REVIEW_LEVEL_ANCHOR_PATH)
         );
     }
 

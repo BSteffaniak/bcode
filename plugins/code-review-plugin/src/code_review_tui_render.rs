@@ -244,11 +244,11 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  ! attention-sidebar  c comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  ! attention-sidebar  c comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
-                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  C review-comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
