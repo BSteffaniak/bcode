@@ -1836,6 +1836,9 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(action) = app.mouse_action_at(mouse.position.x, mouse.position.y) {
+                return app.activate_mouse_action(action);
+            }
             if app.file_area_contains(mouse.position.x, mouse.position.y) {
                 if matches!(
                     app.sidebar_mode,
@@ -1878,6 +1881,28 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => false,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMouseAction {
+    SidebarMode(ReviewSidebarMode),
+    ThreadFilter(ReviewThreadFilter),
+    SelectThread(usize),
+    JumpSelectedThread,
+    NewReviewComment,
+    Publish,
+    AskBcode,
+    ReplyThread,
+    ToggleThreadResolved,
+    EditThread,
+    OpenThreadSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewMouseRegion {
+    pub rect: Rect,
+    pub action: ReviewMouseAction,
+    pub label: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -3448,6 +3473,7 @@ pub struct ReviewApp {
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
+    mouse_regions: Vec<ReviewMouseRegion>,
 }
 
 impl ReviewApp {
@@ -3507,6 +3533,7 @@ impl ReviewApp {
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
+            mouse_regions: Vec::new(),
         }
     }
 
@@ -4518,6 +4545,87 @@ impl ReviewApp {
             return true;
         }
         self.expanded_dirs.insert(path.to_path_buf());
+        true
+    }
+
+    /// Clear registered mouse hit regions for a new frame.
+    pub fn clear_mouse_regions(&mut self) {
+        self.mouse_regions.clear();
+    }
+
+    /// Register a mouse hit region.
+    pub fn register_mouse_region(
+        &mut self,
+        rect: Rect,
+        action: ReviewMouseAction,
+        label: &'static str,
+    ) {
+        if rect.is_empty() {
+            return;
+        }
+        self.mouse_regions.push(ReviewMouseRegion {
+            rect,
+            action,
+            label,
+        });
+    }
+
+    /// Return registered mouse action at terminal coordinates.
+    #[must_use]
+    pub fn mouse_action_at(&self, x: u16, y: u16) -> Option<ReviewMouseAction> {
+        self.mouse_regions
+            .iter()
+            .rev()
+            .find(|region| {
+                x >= region.rect.x
+                    && x < region.rect.right()
+                    && y >= region.rect.y
+                    && y < region.rect.bottom()
+            })
+            .map(|region| region.action)
+    }
+
+    /// Activate a registered mouse action.
+    pub fn activate_mouse_action(&mut self, action: ReviewMouseAction) -> bool {
+        match action {
+            ReviewMouseAction::SidebarMode(mode) => self.set_sidebar_mode(mode),
+            ReviewMouseAction::ThreadFilter(filter) => self.set_thread_filter(filter),
+            ReviewMouseAction::SelectThread(index) => {
+                let selected = self.select_thread(index);
+                self.jump_to_selected_thread() || selected
+            }
+            ReviewMouseAction::JumpSelectedThread => self.jump_to_selected_thread(),
+            ReviewMouseAction::NewReviewComment => self.open_review_comment_editor(),
+            ReviewMouseAction::Publish => self.publish_review(),
+            ReviewMouseAction::AskBcode => self.ask_bcode_about_selection(),
+            ReviewMouseAction::ReplyThread => self.open_comment_editor(),
+            ReviewMouseAction::ToggleThreadResolved => self.toggle_selected_thread_resolved(),
+            ReviewMouseAction::EditThread => self.open_latest_draft_editor(),
+            ReviewMouseAction::OpenThreadSession => self.open_linked_session_at_selection(),
+        }
+    }
+
+    /// Set sidebar mode directly.
+    pub fn set_sidebar_mode(&mut self, mode: ReviewSidebarMode) -> bool {
+        if self.sidebar_mode == mode {
+            return false;
+        }
+        self.sidebar_mode = mode;
+        self.selected_thread = 0;
+        self.thread_scroll = 0;
+        self.status_message = Some(format!("sidebar: {}", mode.label()));
+        true
+    }
+
+    /// Set thread filter directly.
+    pub fn set_thread_filter(&mut self, filter: ReviewThreadFilter) -> bool {
+        if self.thread_filter == filter {
+            return false;
+        }
+        self.thread_filter = filter;
+        self.selected_thread = 0;
+        self.thread_scroll = 0;
+        self.status_message = Some(format!("showing {} review threads", filter.label()));
         true
     }
 

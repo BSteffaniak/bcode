@@ -14,8 +14,9 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::truncate_to_display_width;
 
 use crate::code_review_tui::{
-    ReviewApp, ReviewFile, ReviewLineKind, ReviewPromptKind, ReviewPublishState, ReviewSidebarMode,
-    add_source_menu_items, review_thread_kind_label, review_thread_severity_label, sidebar_width,
+    ReviewApp, ReviewFile, ReviewLineKind, ReviewMouseAction, ReviewPromptKind, ReviewPublishState,
+    ReviewSidebarMode, ReviewThreadFilter, add_source_menu_items, review_thread_kind_label,
+    review_thread_severity_label, sidebar_width,
 };
 use crate::code_review_tui_display::{
     ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
@@ -33,12 +34,75 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     }
 
     frame.fill(area, " ", Style::new().bg(Color::Black));
+    app.clear_mouse_regions();
+    render_chrome(app, area, frame);
+    let diff_area = render_body(app, area, frame);
+    render_main_content(app, diff_area, frame);
+    render_overlays(app, area, frame);
+}
+
+fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(app, header, frame);
+    render_header_actions(app, header, frame);
 
     let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
     render_footer(app, footer, frame);
+}
 
+fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.width == 0 {
+        return;
+    }
+    let mut x = area.x;
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "Files",
+        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Included),
+        app.sidebar_mode == ReviewSidebarMode::Included,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "Repo",
+        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Repository),
+        app.sidebar_mode == ReviewSidebarMode::Repository,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "Threads",
+        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Threads),
+        app.sidebar_mode == ReviewSidebarMode::Threads,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "Attention",
+        ReviewMouseAction::SidebarMode(ReviewSidebarMode::NeedsAttention),
+        app.sidebar_mode == ReviewSidebarMode::NeedsAttention,
+    );
+    let _ = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "+Review note",
+        ReviewMouseAction::NewReviewComment,
+        false,
+    );
+}
+
+fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) -> Rect {
     let body = Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -46,36 +110,45 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
         area.height.saturating_sub(2),
     );
     let sidebar_width = sidebar_width(app, area.width);
-    let diff_area = if sidebar_width > 0 {
-        let file_area = Rect::new(body.x, body.y, sidebar_width, body.height);
-        app.set_file_area(Some(file_area));
-        match app.sidebar_mode {
-            ReviewSidebarMode::Included => render_included(app, file_area, frame),
-            ReviewSidebarMode::Repository => render_files(app, file_area, frame),
-            ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention => {
-                render_threads(app, file_area, frame);
-            }
-            ReviewSidebarMode::Sources => render_sources(app, file_area, frame),
-        }
-        let separator = Rect::new(file_area.right(), body.y, 1, body.height);
-        render_separator(separator, frame);
-        Rect::new(
-            separator.right(),
-            body.y,
-            body.width.saturating_sub(sidebar_width).saturating_sub(1),
-            body.height,
-        )
-    } else {
+    if sidebar_width == 0 {
         app.set_file_area(None);
-        body
-    };
-    app.set_diff_area(diff_area);
-    if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
-        render_build_workspace(app, diff_area, frame);
-    } else {
-        render_diff(app, diff_area, frame);
+        return body;
     }
 
+    let file_area = Rect::new(body.x, body.y, sidebar_width, body.height);
+    app.set_file_area(Some(file_area));
+    render_sidebar(app, file_area, frame);
+    let separator = Rect::new(file_area.right(), body.y, 1, body.height);
+    render_separator(separator, frame);
+    Rect::new(
+        separator.right(),
+        body.y,
+        body.width.saturating_sub(sidebar_width).saturating_sub(1),
+        body.height,
+    )
+}
+
+fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    match app.sidebar_mode {
+        ReviewSidebarMode::Included => render_included(app, area, frame),
+        ReviewSidebarMode::Repository => render_files(app, area, frame),
+        ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention => {
+            render_threads(app, area, frame);
+        }
+        ReviewSidebarMode::Sources => render_sources(app, area, frame),
+    }
+}
+
+fn render_main_content(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    app.set_diff_area(area);
+    if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
+        render_build_workspace(app, area, frame);
+    } else {
+        render_diff(app, area, frame);
+    }
+}
+
+fn render_overlays(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if app.help_visible {
         render_help(app, area, frame);
     }
@@ -88,6 +161,32 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     if app.publish_state.is_some() {
         render_publish_modal(app, area, frame);
     }
+}
+
+fn render_header_button(
+    app: &mut ReviewApp,
+    frame: &mut Frame<'_>,
+    x: u16,
+    y: u16,
+    label: &'static str,
+    action: ReviewMouseAction,
+    active: bool,
+) -> u16 {
+    let text = format!("[{label}]");
+    let width = u16::try_from(text.chars().count().saturating_add(1)).unwrap_or(u16::MAX);
+    let rect = Rect::new(x, y, width.saturating_sub(1), 1);
+    let style = if active {
+        Style::new().fg(Color::Black).bg(Color::White)
+    } else {
+        Style::new().fg(Color::Cyan).bg(Color::Black)
+    };
+    frame.write_line_with_fallback_style(
+        rect,
+        &Line::from_spans(vec![Span::styled(text, style)]),
+        style,
+    );
+    app.register_mouse_region(rect, action, label);
+    x.saturating_add(width)
 }
 
 fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
@@ -569,8 +668,18 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
+    render_thread_toolbar(app, area, frame);
+    let list_area = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    if list_area.is_empty() {
+        return;
+    }
     let threads = app.visible_thread_summaries();
-    let visible_rows = usize::from(area.height);
+    let visible_rows = usize::from(list_area.height);
     if threads.is_empty() {
         let label = if app.sidebar_mode == ReviewSidebarMode::NeedsAttention {
             "open"
@@ -597,11 +706,11 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
 
     for row in 0..visible_rows {
-        let y = area
+        let y = list_area
             .y
             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         let index = app.thread_scroll.saturating_add(row);
-        let line_area = Rect::new(area.x, y, area.width, 1);
+        let line_area = Rect::new(list_area.x, y, list_area.width, 1);
         if let Some(thread) = threads.get(index) {
             let selected = index == app.selected_thread;
             let style = if selected {
@@ -628,13 +737,58 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             frame.write_line_with_fallback_style(
                 line_area,
                 &Line::from_spans(vec![Span::styled(
-                    truncate_to_display_width(&text, usize::from(area.width)),
+                    truncate_to_display_width(&text, usize::from(list_area.width)),
                     style,
                 )]),
                 style,
             );
+            app.register_mouse_region(
+                line_area,
+                ReviewMouseAction::SelectThread(index),
+                "select thread",
+            );
         }
     }
+}
+
+fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let mut x = area.x;
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "All",
+        ReviewMouseAction::ThreadFilter(ReviewThreadFilter::All),
+        app.thread_filter == ReviewThreadFilter::All,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "Open",
+        ReviewMouseAction::ThreadFilter(ReviewThreadFilter::Open),
+        app.thread_filter == ReviewThreadFilter::Open,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "Resolved",
+        ReviewMouseAction::ThreadFilter(ReviewThreadFilter::Resolved),
+        app.thread_filter == ReviewThreadFilter::Resolved,
+    );
+    let _ = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "+Review",
+        ReviewMouseAction::NewReviewComment,
+        false,
+    );
 }
 
 fn render_file_row(
