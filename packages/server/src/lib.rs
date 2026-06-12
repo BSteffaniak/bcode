@@ -4036,6 +4036,7 @@ struct ToolArgumentStreamProgress {
     call_id: String,
     name: String,
     argument_bytes: usize,
+    emitted_progress_events: usize,
 }
 
 #[derive(Debug, Default)]
@@ -4246,6 +4247,7 @@ impl ModelStreamProgress {
             call_id,
             name,
             argument_bytes: 0,
+            emitted_progress_events: 0,
         });
     }
 
@@ -4270,6 +4272,30 @@ impl ModelStreamProgress {
         {
             self.active_tool_call = None;
         }
+    }
+
+    fn record_tool_call_delta(&mut self, call_id: &str, byte_len: usize) {
+        if let Some(active) = self.active_tool_call.as_mut()
+            && active.call_id == call_id
+        {
+            active.argument_bytes = active.argument_bytes.saturating_add(byte_len);
+        }
+    }
+
+    fn take_tool_progress_event(
+        &mut self,
+        max_progress_events: usize,
+    ) -> Option<ProviderToolCallProgress> {
+        let active = self.active_tool_call.as_mut()?;
+        if active.emitted_progress_events >= max_progress_events {
+            return None;
+        }
+        active.emitted_progress_events = active.emitted_progress_events.saturating_add(1);
+        Some(ProviderToolCallProgress {
+            tool_call_id: active.call_id.clone(),
+            tool_name: active.name.clone(),
+            argument_bytes: active.argument_bytes,
+        })
     }
 
     fn tool_progress_snapshot(&self) -> Option<ProviderToolCallProgress> {
@@ -5627,8 +5653,8 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         ProviderTurnEvent::ToolCallStarted { .. } | ProviderTurnEvent::ToolCallFinished { .. } => {
             true
         }
-        ProviderTurnEvent::ToolCallDelta { .. }
-        | ProviderTurnEvent::TurnStarted
+        ProviderTurnEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
+        ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::Usage { .. }
         | ProviderTurnEvent::Warning { .. }
         | ProviderTurnEvent::ProviderMetadata { .. }
@@ -5808,7 +5834,27 @@ async fn handle_provider_turn_event(
             stream.flush_if_ready(state).await;
             append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
         }
-        ProviderTurnEvent::ToolCallDelta { .. } => {}
+        ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
+            stream_progress.record_tool_call_delta(&call_id, delta.len());
+            if let Some(progress) = stream_progress
+                .take_tool_progress_event(state.model_streaming.max_tool_progress_events)
+            {
+                append_provider_stream_event_trace(
+                    state,
+                    session_id,
+                    turn_id,
+                    ProviderStreamEvent::ToolCallProgress {
+                        tool_call_id: progress.tool_call_id,
+                        tool_name: progress.tool_name,
+                        argument_bytes: progress.argument_bytes,
+                    },
+                )
+                .await;
+            } else {
+                append_provider_event_trace(state, session_id, turn_id, "tool_call_delta", None)
+                    .await;
+            }
+        }
     }
 }
 
@@ -9125,12 +9171,10 @@ mod tests {
                 text: "thinking".to_string(),
             }
         ));
-        assert!(!model_event_is_progress(
-            &ProviderTurnEvent::ToolCallDelta {
-                call_id: "call-test".to_string(),
-                delta: "{\"path\"".to_string(),
-            }
-        ));
+        assert!(model_event_is_progress(&ProviderTurnEvent::ToolCallDelta {
+            call_id: "call-test".to_string(),
+            delta: "{\"path\"".to_string(),
+        }));
         assert!(model_event_is_progress(
             &ProviderTurnEvent::ToolCallStarted {
                 call_id: "call-test".to_string(),

@@ -1181,7 +1181,7 @@ fn process_responses_stream_line(
             process_responses_output_item(&event, turn, tool_calls, saw_tool_call, name_map);
         }
         "response.function_call_arguments.delta" => {
-            process_responses_function_arguments_delta(&event, tool_calls);
+            process_responses_function_arguments_delta(&event, turn, tool_calls);
         }
         "response.function_call_arguments.done" => {
             process_responses_function_arguments_done(&event, tool_calls);
@@ -1294,6 +1294,7 @@ fn responses_output_index(
 
 fn process_responses_function_arguments_delta(
     event: &serde_json::Value,
+    turn: &TurnState,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
 ) {
     let output_index = event
@@ -1304,6 +1305,14 @@ fn process_responses_function_arguments_delta(
     if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
         let entry = tool_calls.entry(output_index).or_default();
         entry.arguments.push_str(delta);
+        if !delta.is_empty()
+            && let Some(call_id) = &entry.id
+        {
+            turn.push(ProviderTurnEvent::ToolCallDelta {
+                call_id: call_id.clone(),
+                delta: delta.to_string(),
+            });
+        }
     }
 }
 
@@ -1454,8 +1463,25 @@ fn process_tool_call_deltas(
             if let Some(name) = &function.name {
                 entry.name = Some(name.clone());
             }
+            if !entry.started
+                && let (Some(id), Some(name)) = (&entry.id, &entry.name)
+            {
+                turn.push(ProviderTurnEvent::ToolCallStarted {
+                    call_id: id.clone(),
+                    name: original_tool_name(name, name_map),
+                });
+                entry.started = true;
+            }
             if let Some(arguments) = &function.arguments {
                 entry.arguments.push_str(arguments);
+                if !arguments.is_empty()
+                    && let Some(call_id) = &entry.id
+                {
+                    turn.push(ProviderTurnEvent::ToolCallDelta {
+                        call_id: call_id.clone(),
+                        delta: arguments.clone(),
+                    });
+                }
             }
         }
         if !entry.started
@@ -4470,6 +4496,62 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+    }
+
+    #[test]
+    fn chat_completion_tool_argument_delta_emits_progress_event() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let name_map = BTreeMap::new();
+
+        let outcome = process_stream_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"filesystem_write","arguments":"{\"path\""}}]},"finish_reason":null}]}"#,
+            &turn,
+            &mut tool_calls,
+            &name_map,
+        )
+        .expect("stream event should process");
+
+        assert!(matches!(outcome, StreamOutcome::Cancelled));
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ToolCallDelta { call_id, delta }
+                if call_id == "call_1" && delta == "{\"path\""
+        )));
+    }
+
+    #[test]
+    fn responses_tool_argument_delta_emits_progress_event() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+
+        process_responses_stream_line(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"filesystem_write"}}"#,
+            &turn,
+            OpenAiCompatibleDialect::ResponsesApi,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("tool event should process");
+        let outcome = process_responses_stream_line(
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\""}"#,
+            &turn,
+            OpenAiCompatibleDialect::ResponsesApi,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("argument delta should process");
+
+        assert!(matches!(outcome, StreamOutcome::Cancelled));
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ToolCallDelta { call_id, delta }
+                if call_id == "call_1" && delta == "{\"path\""
+        )));
     }
 
     #[test]
