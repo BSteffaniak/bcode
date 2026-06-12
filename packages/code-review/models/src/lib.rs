@@ -750,6 +750,38 @@ pub struct DraftAnchor {
     pub source_id: Option<String>,
 }
 
+/// Local review thread kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewThreadKind {
+    /// General note.
+    #[default]
+    Note,
+    /// Question to answer before finishing review.
+    Question,
+    /// Follow-up task.
+    Todo,
+    /// Review finding.
+    Finding,
+    /// Review summary.
+    Summary,
+}
+
+/// Local review thread severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewThreadSeverity {
+    /// Informational thread.
+    #[default]
+    Info,
+    /// Minor nit.
+    Nit,
+    /// Warning that should be considered before publishing.
+    Warning,
+    /// Blocking issue.
+    Blocker,
+}
+
 /// Persisted draft comment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftComment {
@@ -771,6 +803,12 @@ pub struct DraftComment {
     /// Resolution timestamp in milliseconds since Unix epoch, when resolved.
     #[serde(default)]
     pub resolved_at_ms: Option<u64>,
+    /// Thread kind.
+    #[serde(default)]
+    pub thread_kind: ReviewThreadKind,
+    /// Thread severity.
+    #[serde(default)]
+    pub severity: ReviewThreadSeverity,
 }
 
 /// File status in a review.

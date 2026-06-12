@@ -16,8 +16,9 @@ use bcode_code_review_models::{
     REVIEW_PUBLISHER_INTERFACE_ID, ReviewAnchorKind, ReviewBundle, ReviewRepositoryCommit,
     ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
-    ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewWorkspace,
-    SavePublishRecordRequest, SavePublishRecordResponse, UpdateReviewWorkspaceRequest,
+    ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewThreadKind,
+    ReviewThreadSeverity, ReviewWorkspace, SavePublishRecordRequest, SavePublishRecordResponse,
+    UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
@@ -2154,6 +2155,10 @@ struct DraftComment {
     session_id: Option<String>,
     #[serde(default)]
     resolved_at_ms: Option<u64>,
+    #[serde(default)]
+    thread_kind: ReviewThreadKind,
+    #[serde(default)]
+    severity: ReviewThreadSeverity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -8845,6 +8850,8 @@ mod tests {
             updated_at_ms: 1,
             session_id: None,
             resolved_at_ms: None,
+            thread_kind: ReviewThreadKind::Note,
+            severity: ReviewThreadSeverity::Info,
         }]);
 
         assert!(app.open_latest_draft_editor());
@@ -8893,6 +8900,8 @@ mod tests {
             updated_at_ms: 1,
             session_id: None,
             resolved_at_ms: None,
+            thread_kind: ReviewThreadKind::Note,
+            severity: ReviewThreadSeverity::Info,
         }]);
 
         assert_eq!(app.draft_comment_count(), 1);
@@ -9556,6 +9565,8 @@ mod tests {
             updated_at_ms: 1,
             session_id: None,
             resolved_at_ms: None,
+            thread_kind: ReviewThreadKind::Note,
+            severity: ReviewThreadSeverity::Info,
         }]);
 
         let threads = app.local_review_threads();

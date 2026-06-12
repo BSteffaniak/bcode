@@ -31,10 +31,10 @@ use bcode_code_review_models::{
     ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
     ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
     ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSurface, ReviewSurfaceKind,
-    ReviewTarget, ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization,
-    SaveDraftRequest, SaveDraftResponse, SavePublishRecordRequest, SavePublishRecordResponse,
-    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
-    UpdateReviewWorkspaceResponse,
+    ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem,
+    ReviewWorkspaceMaterialization, SaveDraftRequest, SaveDraftResponse, SavePublishRecordRequest,
+    SavePublishRecordResponse, UpdateDraftRequest, UpdateDraftResponse,
+    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -2405,6 +2405,8 @@ impl<'a> CodeReviewDb<'a> {
                 "old_line",
                 "new_line",
                 "line_kind",
+                "thread_kind",
+                "severity",
                 "resolved_at_ms",
                 "is_file_anchor",
                 "surface_id",
@@ -2417,6 +2419,16 @@ impl<'a> CodeReviewDb<'a> {
         for thread in thread_rows {
             let thread_id = required_text(&thread, "thread_id")?;
             let session_id = optional_text(&thread, "session_id");
+            let thread_kind = thread_kind_from_str(
+                optional_text(&thread, "thread_kind")
+                    .as_deref()
+                    .unwrap_or("note"),
+            )?;
+            let severity = thread_severity_from_str(
+                optional_text(&thread, "severity")
+                    .as_deref()
+                    .unwrap_or("info"),
+            )?;
             let resolved_at_ms = optional_i64(&thread, "resolved_at_ms").map(i64_to_u64);
             let anchor = DraftAnchor {
                 kind: anchor_kind_from_str(
@@ -2456,6 +2468,8 @@ impl<'a> CodeReviewDb<'a> {
                             &anchor,
                             session_id.clone(),
                             resolved_at_ms,
+                            thread_kind,
+                            severity,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -2523,6 +2537,8 @@ impl<'a> CodeReviewDb<'a> {
             updated_at_ms: now,
             session_id: None,
             resolved_at_ms: None,
+            thread_kind: ReviewThreadKind::Note,
+            severity: ReviewThreadSeverity::Info,
         })
     }
 
@@ -2725,6 +2741,8 @@ impl<'a> CodeReviewDb<'a> {
             .value("old_line", optional_u32(anchor.old_line))
             .value("new_line", optional_u32(anchor.new_line))
             .value("line_kind", line_kind_str(anchor.line_kind))
+            .value("thread_kind", thread_kind_str(ReviewThreadKind::Note))
+            .value("severity", thread_severity_str(ReviewThreadSeverity::Info))
             .value("is_file_anchor", anchor.is_file_anchor)
             .value("surface_id", anchor.surface_id.clone())
             .value("source_id", anchor.source_id.clone())
@@ -2865,6 +2883,19 @@ async fn reconcile_legacy_code_review_migrations(
         }
 
         if database
+            .column_exists("draft_threads", "thread_kind")
+            .await?
+            && database.column_exists("draft_threads", "severity").await?
+            && !tracker
+                .is_migration_applied(database, "012_thread_metadata_columns")
+                .await?
+        {
+            tracker
+                .record_migration(database, "012_thread_metadata_columns")
+                .await?;
+        }
+
+        if database
             .column_exists("draft_threads", "start_diff_row")
             .await?
             && !tracker
@@ -2996,6 +3027,28 @@ fn thread_anchor_kind_column_migration() -> CodeMigration<'static> {
     )
 }
 
+fn thread_metadata_columns_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "012_thread_metadata_columns".to_string(),
+        Box::new(
+            alter_table("draft_threads")
+                .add_column(
+                    "thread_kind".to_string(),
+                    DataType::Text,
+                    false,
+                    Some(DatabaseValue::String("note".to_string())),
+                )
+                .add_column(
+                    "severity".to_string(),
+                    DataType::Text,
+                    false,
+                    Some(DatabaseValue::String("info".to_string())),
+                ),
+        ),
+        None,
+    )
+}
+
 fn code_review_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
     source.add_migration(CodeMigration::new(
@@ -3026,6 +3079,8 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
                 .column(nullable_int_column("old_line"))
                 .column(nullable_int_column("new_line"))
                 .column(text_column("line_kind"))
+                .column(text_column("thread_kind"))
+                .column(text_column("severity"))
                 .column(int_column("created_at_ms"))
                 .column(int_column("updated_at_ms"))
                 .primary_key("thread_id"),
@@ -3085,6 +3140,7 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(workspace_viewed_files_column_migration());
     source.add_migration(publish_records_table_migration());
     source.add_migration(thread_anchor_kind_column_migration());
+    source.add_migration(thread_metadata_columns_migration());
     source
 }
 
@@ -3175,6 +3231,8 @@ fn comment_from_row(
     anchor: &DraftAnchor,
     session_id: Option<String>,
     resolved_at_ms: Option<u64>,
+    thread_kind: ReviewThreadKind,
+    severity: ReviewThreadSeverity,
 ) -> Result<DraftComment, ReviewError> {
     Ok(DraftComment {
         comment_id: required_text(row, "comment_id")?,
@@ -3185,6 +3243,8 @@ fn comment_from_row(
         updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
         session_id,
         resolved_at_ms,
+        thread_kind,
+        severity,
     })
 }
 
@@ -3288,6 +3348,50 @@ const fn target_kind(target: &ReviewTarget) -> &'static str {
         ReviewTarget::CommitRange { .. } => "commit_range",
         ReviewTarget::BranchCompare { .. } => "branch_compare",
         ReviewTarget::Repository => "repository",
+    }
+}
+
+const fn thread_kind_str(kind: ReviewThreadKind) -> &'static str {
+    match kind {
+        ReviewThreadKind::Note => "note",
+        ReviewThreadKind::Question => "question",
+        ReviewThreadKind::Todo => "todo",
+        ReviewThreadKind::Finding => "finding",
+        ReviewThreadKind::Summary => "summary",
+    }
+}
+
+fn thread_kind_from_str(value: &str) -> Result<ReviewThreadKind, ReviewError> {
+    match value {
+        "note" => Ok(ReviewThreadKind::Note),
+        "question" => Ok(ReviewThreadKind::Question),
+        "todo" => Ok(ReviewThreadKind::Todo),
+        "finding" => Ok(ReviewThreadKind::Finding),
+        "summary" => Ok(ReviewThreadKind::Summary),
+        _ => Err(ReviewError::InvalidRequest(format!(
+            "unknown thread kind: {value}"
+        ))),
+    }
+}
+
+const fn thread_severity_str(severity: ReviewThreadSeverity) -> &'static str {
+    match severity {
+        ReviewThreadSeverity::Info => "info",
+        ReviewThreadSeverity::Nit => "nit",
+        ReviewThreadSeverity::Warning => "warning",
+        ReviewThreadSeverity::Blocker => "blocker",
+    }
+}
+
+fn thread_severity_from_str(value: &str) -> Result<ReviewThreadSeverity, ReviewError> {
+    match value {
+        "info" => Ok(ReviewThreadSeverity::Info),
+        "nit" => Ok(ReviewThreadSeverity::Nit),
+        "warning" => Ok(ReviewThreadSeverity::Warning),
+        "blocker" => Ok(ReviewThreadSeverity::Blocker),
+        _ => Err(ReviewError::InvalidRequest(format!(
+            "unknown thread severity: {value}"
+        ))),
     }
 }
 
@@ -3875,6 +3979,8 @@ mod tests {
                     updated_at_ms: 1,
                     session_id: Some("session-1".to_string()),
                     resolved_at_ms: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
                 session_id: Some("session-1".to_string()),
                 resolved_at_ms: None,
@@ -3951,6 +4057,8 @@ mod tests {
                     updated_at_ms: 1,
                     session_id: None,
                     resolved_at_ms: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
                 session_id: None,
                 resolved_at_ms: None,
