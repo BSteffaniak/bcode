@@ -618,6 +618,11 @@ fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visi
                     )]),
                     style,
                 );
+                app.register_mouse_region(
+                    line_area,
+                    ReviewMouseAction::ActivateTreeRow(tree_row_index),
+                    "activate tree row",
+                );
             }
             crate::code_review_tui::ReviewFileTreeRow::File { index, depth } => {
                 if let Some(path) = app.review_path_for_index(*index) {
@@ -632,6 +637,11 @@ fn render_file_tree(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, visi
                         },
                         line_area,
                         frame,
+                    );
+                    app.register_mouse_region(
+                        line_area,
+                        ReviewMouseAction::ActivateTreeRow(tree_row_index),
+                        "activate tree row",
                     );
                 }
             }

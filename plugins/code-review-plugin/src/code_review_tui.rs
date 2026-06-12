@@ -1839,36 +1839,8 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
             if let Some(action) = app.mouse_action_at(mouse.position.x, mouse.position.y) {
                 return app.activate_mouse_action(action);
             }
-            if app.file_area_contains(mouse.position.x, mouse.position.y) {
-                if matches!(
-                    app.sidebar_mode,
-                    ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
-                ) {
-                    app.thread_index_at(mouse.position.x, mouse.position.y)
-                        .is_some_and(|index| {
-                            app.select_thread(index);
-                            app.jump_to_selected_thread()
-                        })
-                } else if app.review.is_repository_review() {
-                    match app.file_tree_row_at(mouse.position.x, mouse.position.y) {
-                        Some(ReviewFileTreeRow::Directory { path, .. }) => {
-                            app.toggle_file_tree_directory(&path)
-                        }
-                        Some(ReviewFileTreeRow::File { index, .. }) => app.select_file(index),
-                        None => false,
-                    }
-                } else if let Some(index) = app.file_index_at(mouse.position.x, mouse.position.y) {
-                    app.select_file(index)
-                } else {
-                    false
-                }
-            } else if let Some(visual_row) =
-                app.view_visual_row_at(mouse.position.x, mouse.position.y)
-            {
-                app.handle_review_view_click(visual_row)
-            } else {
-                false
-            }
+            app.view_visual_row_at(mouse.position.x, mouse.position.y)
+                .is_some_and(|visual_row| app.handle_review_view_click(visual_row))
         }
         MouseEventKind::Drag(MouseButton::Left) => app
             .diff_line_index_at(mouse.position.x, mouse.position.y)
@@ -1890,6 +1862,7 @@ pub enum ReviewMouseAction {
     SelectThread(usize),
     SelectFile(usize),
     ToggleFileViewed(usize),
+    ActivateTreeRow(usize),
     JumpSelectedThread,
     NewReviewComment,
     Publish,
@@ -4542,6 +4515,12 @@ impl ReviewApp {
         }
     }
 
+    /// Activate a repository tree row by absolute rendered tree index.
+    pub fn activate_tree_row(&mut self, index: usize) -> bool {
+        self.selected_tree_row = index.min(self.file_tree_rows().len().saturating_sub(1));
+        self.activate_selected_tree_row()
+    }
+
     /// Toggle a directory in the repository sidebar.
     pub fn toggle_file_tree_directory(&mut self, path: &Path) -> bool {
         if self.expanded_dirs.remove(path) {
@@ -4604,6 +4583,7 @@ impl ReviewApp {
                 }
                 self.toggle_selected_file_viewed()
             }
+            ReviewMouseAction::ActivateTreeRow(index) => self.activate_tree_row(index),
             ReviewMouseAction::JumpSelectedThread => self.jump_to_selected_thread(),
             ReviewMouseAction::NewReviewComment => self.open_review_comment_editor(),
             ReviewMouseAction::Publish => self.publish_review(),
