@@ -212,11 +212,7 @@ fn active_latest_bar_line(
     now: Instant,
 ) -> Line {
     let width = usize::from(width);
-    let text = if width < 32 {
-        format!("activity below · {key_label}")
-    } else {
-        format!("New activity below · {key_label} to jump")
-    };
+    let text = latest_bar_message(width, key_label);
     let text = centered_bar_text(&text, width);
     let text_width = text_display_width(&text);
     let left_width = width.saturating_sub(text_width) / 2;
@@ -246,11 +242,7 @@ fn active_latest_bar_line(
 
 fn stale_latest_bar_line(width: u16, key_label: &str) -> Line {
     let width = usize::from(width);
-    let text = if width < 30 {
-        format!("latest below · {key_label}")
-    } else {
-        format!("New messages below · {key_label} to jump")
-    };
+    let text = latest_bar_message(width, key_label);
     let text = centered_bar_text(&text, width.saturating_sub(1));
     let text_width = text_display_width(&text);
     let left_width = width.saturating_sub(1).saturating_sub(text_width) / 2;
@@ -272,6 +264,14 @@ fn stale_latest_bar_line(width: u16, key_label: &str) -> Line {
                 .add_modifier(Modifier::BOLD),
         ),
     ])
+}
+
+fn latest_bar_message(width: usize, key_label: &str) -> String {
+    if width < 30 {
+        format!("messages below · {key_label}")
+    } else {
+        format!("New messages below · {key_label} to jump")
+    }
 }
 
 fn centered_bar_text(text: &str, width: usize) -> String {
