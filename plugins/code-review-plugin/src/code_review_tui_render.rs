@@ -15,7 +15,7 @@ use bmux_tui::text_width::truncate_to_display_width;
 
 use crate::code_review_tui::{
     ReviewApp, ReviewFile, ReviewLineKind, ReviewPromptKind, ReviewPublishState, ReviewSidebarMode,
-    add_source_menu_items, sidebar_width,
+    add_source_menu_items, review_thread_kind_label, review_thread_severity_label, sidebar_width,
 };
 use crate::code_review_tui_display::{
     ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
@@ -618,9 +618,11 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             let line_label = thread.line_label();
             let body = thread.latest_body.lines().next().unwrap_or_default();
             let status = if thread.resolved { "resolved" } else { "open" };
+            let kind = review_thread_kind_label(thread.thread_kind);
+            let severity = review_thread_severity_label(thread.severity);
             let path_label = thread.anchor.scope_label();
             let text = format!(
-                " {marker} {status} {path_label} {line_label} x{}  {body}",
+                " {marker} {status} {kind}/{severity} {path_label} {line_label} x{}  {body}",
                 thread.draft_count
             );
             frame.write_line_with_fallback_style(

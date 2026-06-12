@@ -2199,6 +2199,25 @@ impl From<ReviewCommentAnchor> for DraftAnchor {
     }
 }
 
+pub(crate) const fn review_thread_kind_label(kind: ReviewThreadKind) -> &'static str {
+    match kind {
+        ReviewThreadKind::Note => "note",
+        ReviewThreadKind::Question => "question",
+        ReviewThreadKind::Todo => "todo",
+        ReviewThreadKind::Finding => "finding",
+        ReviewThreadKind::Summary => "summary",
+    }
+}
+
+pub(crate) const fn review_thread_severity_label(severity: ReviewThreadSeverity) -> &'static str {
+    match severity {
+        ReviewThreadSeverity::Info => "info",
+        ReviewThreadSeverity::Nit => "nit",
+        ReviewThreadSeverity::Warning => "warning",
+        ReviewThreadSeverity::Blocker => "blocker",
+    }
+}
+
 /// Review interaction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewUxMode {
@@ -2703,6 +2722,10 @@ pub struct ReviewDraftComment {
     pub updated_at_ms: Option<u64>,
     /// Linked Bcode session id.
     pub session_id: Option<String>,
+    /// Thread kind.
+    pub thread_kind: ReviewThreadKind,
+    /// Thread severity.
+    pub severity: ReviewThreadSeverity,
 }
 
 /// Local review thread lifecycle state.
@@ -2737,6 +2760,10 @@ pub struct LocalReviewComment {
     pub updated_at_ms: Option<u64>,
     /// Linked Bcode session id, when this comment is associated with one.
     pub session_id: Option<String>,
+    /// Thread kind.
+    pub thread_kind: ReviewThreadKind,
+    /// Thread severity.
+    pub severity: ReviewThreadSeverity,
 }
 
 impl From<ReviewDraftComment> for LocalReviewComment {
@@ -2748,6 +2775,8 @@ impl From<ReviewDraftComment> for LocalReviewComment {
             created_at_ms: comment.created_at_ms,
             updated_at_ms: comment.updated_at_ms,
             session_id: comment.session_id,
+            thread_kind: comment.thread_kind,
+            severity: comment.severity,
         }
     }
 }
@@ -2765,6 +2794,10 @@ pub struct LocalReviewThread {
     pub status: LocalReviewThreadStatus,
     /// Linked Bcode session id, when present.
     pub session_id: Option<String>,
+    /// Thread kind.
+    pub thread_kind: ReviewThreadKind,
+    /// Thread severity.
+    pub severity: ReviewThreadSeverity,
 }
 
 impl LocalReviewThread {
@@ -3043,6 +3076,10 @@ pub struct ReviewThreadSummary {
     pub session_id: Option<String>,
     /// Whether the thread is locally resolved.
     pub resolved: bool,
+    /// Thread kind.
+    pub thread_kind: ReviewThreadKind,
+    /// Thread severity.
+    pub severity: ReviewThreadSeverity,
 }
 
 impl ReviewThreadSummary {
@@ -5324,12 +5361,20 @@ impl ReviewApp {
                     .iter()
                     .rev()
                     .find_map(|comment| comment.session_id.clone());
+                let thread_kind = comments
+                    .last()
+                    .map_or(ReviewThreadKind::Note, |comment| comment.thread_kind);
+                let severity = comments
+                    .last()
+                    .map_or(ReviewThreadSeverity::Info, |comment| comment.severity);
                 LocalReviewThread {
                     key,
                     anchor: anchor.clone(),
                     comments,
                     status,
                     session_id,
+                    thread_kind,
+                    severity,
                 }
             })
             .collect()
@@ -5363,6 +5408,8 @@ impl ReviewApp {
                     latest_body,
                     session_id: thread.session_id,
                     resolved: thread.status.is_resolved(),
+                    thread_kind: thread.thread_kind,
+                    severity: thread.severity,
                 })
             })
             .collect()
@@ -6551,6 +6598,8 @@ impl ReviewApp {
                         created_at_ms: None,
                         updated_at_ms: None,
                         session_id: None,
+                        thread_kind: ReviewThreadKind::Note,
+                        severity: ReviewThreadSeverity::Info,
                     });
                 self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
                 self.sync_selected_thread_to_anchor();
@@ -6630,6 +6679,8 @@ impl ReviewApp {
                     created_at_ms: None,
                     updated_at_ms: None,
                     session_id: Some(session_id),
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 });
         }
     }
@@ -6742,6 +6793,12 @@ impl ReviewApp {
                 format!("`{}` {}", thread.anchor.path, thread.line_label())
             };
             let _ = write!(report, "### {heading} ({status})\n\n");
+            let _ = writeln!(
+                report,
+                "* Type: `{}` / `{}`",
+                review_thread_kind_label(thread.thread_kind),
+                review_thread_severity_label(thread.severity)
+            );
             if let Some(session_id) = &thread.session_id {
                 let _ = write!(report, "Linked Bcode session: `{session_id}`\n\n");
             }
@@ -7578,6 +7635,8 @@ impl ReviewApp {
                         created_at_ms: Some(draft.created_at_ms),
                         updated_at_ms: Some(draft.updated_at_ms),
                         session_id: draft.session_id,
+                        thread_kind: draft.thread_kind,
+                        severity: draft.severity,
                     });
                 if draft.resolved_at_ms.is_some() {
                     self.resolved_review_threads
@@ -8099,6 +8158,8 @@ mod tests {
                     created_at_ms: None,
                     updated_at_ms: None,
                     session_id: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
             );
         }
@@ -8144,6 +8205,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
 
@@ -8182,6 +8245,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
         let document = app.current_review_view_document().expect("document");
@@ -8225,6 +8290,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
         let document = app.current_review_view_document().expect("document");
@@ -8274,6 +8341,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
         app.selected_view_target = Some(ReviewViewTarget::Thread {
@@ -8320,6 +8389,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
         app.resolved_review_threads.insert(thread_key.clone());
@@ -8369,6 +8440,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
         app.selected_view_target = Some(ReviewViewTarget::Thread {
@@ -8426,6 +8499,8 @@ mod tests {
                     created_at_ms: None,
                     updated_at_ms: None,
                     session_id: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
             );
         }
@@ -8490,6 +8565,8 @@ mod tests {
                     created_at_ms: None,
                     updated_at_ms: None,
                     session_id: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
             );
         }
@@ -8553,6 +8630,8 @@ mod tests {
                     created_at_ms: None,
                     updated_at_ms: None,
                     session_id: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
             );
         }
@@ -8623,6 +8702,8 @@ mod tests {
                     created_at_ms: None,
                     updated_at_ms: None,
                     session_id: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
             );
         }
@@ -8681,6 +8762,8 @@ mod tests {
                     created_at_ms: None,
                     updated_at_ms: None,
                     session_id: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
                 }],
             );
         }
@@ -8728,6 +8811,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
 
@@ -9463,6 +9548,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
         assert_eq!(app.review_readiness_label(), "incomplete: 1 open");
@@ -9636,6 +9723,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: Some("session-1".to_string()),
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
 
@@ -9677,6 +9766,8 @@ mod tests {
                 created_at_ms: Some(1),
                 updated_at_ms: Some(2),
                 session_id: Some("session".to_string()),
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
         app.resolved_review_threads
@@ -9729,6 +9820,8 @@ mod tests {
                 created_at_ms: None,
                 updated_at_ms: None,
                 session_id: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
         );
 

@@ -476,6 +476,7 @@ mod tests {
     use crate::code_review_tui::{
         ReviewDraftComment, ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine, ReviewLineKind,
     };
+    use bcode_code_review_models::{ReviewThreadKind, ReviewThreadSeverity};
 
     #[test]
     fn diff_file_document_maps_visual_rows_to_semantic_targets() {
@@ -522,6 +523,8 @@ mod tests {
             created_at_ms: None,
             updated_at_ms: None,
             session_id: None,
+            thread_kind: ReviewThreadKind::Note,
+            severity: ReviewThreadSeverity::Info,
         };
 
         let document = ReviewViewDocument::build_diff_file(7, &file, false)
@@ -571,6 +574,8 @@ mod tests {
             created_at_ms: None,
             updated_at_ms: None,
             session_id: None,
+            thread_kind: ReviewThreadKind::Note,
+            severity: ReviewThreadSeverity::Info,
         };
 
         let document = ReviewViewDocument::build_diff_file(7, &file, false)

@@ -743,7 +743,10 @@ bcode_plugin_sdk::export_plugin!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_code_review_models::{DraftAnchor, DraftComment, ReviewTarget};
+    use bcode_code_review_models::{
+        DraftAnchor, DraftComment, ReviewAnchorKind, ReviewTarget, ReviewThreadKind,
+        ReviewThreadSeverity,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -988,6 +991,7 @@ mod tests {
         ReviewBundleThread {
             thread_id: "thread".to_string(),
             anchor: DraftAnchor {
+                kind: ReviewAnchorKind::Range,
                 file_path: line.file_path.clone(),
                 diff_row: line.diff_row,
                 start_diff_row: None,
@@ -1007,6 +1011,7 @@ mod tests {
                 comment_id: "comment".to_string(),
                 thread_id: "thread".to_string(),
                 anchor: DraftAnchor {
+                    kind: ReviewAnchorKind::Range,
                     file_path: line.file_path.clone(),
                     diff_row: line.diff_row,
                     start_diff_row: None,
@@ -1027,6 +1032,8 @@ mod tests {
                 updated_at_ms: 1,
                 session_id: None,
                 resolved_at_ms: None,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
             }],
             session_id: None,
             resolved_at_ms: None,
