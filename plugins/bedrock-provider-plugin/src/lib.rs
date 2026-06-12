@@ -453,11 +453,7 @@ impl StreamAccumulator {
                     turn.push(ProviderTurnEvent::TextDelta { text: text.clone() });
                 }
                 Some(ContentBlockDelta::ToolUse(delta)) => {
-                    self.tool_calls
-                        .entry(event.content_block_index())
-                        .or_default()
-                        .arguments
-                        .push_str(delta.input());
+                    self.process_tool_use_delta(event.content_block_index(), delta.input(), turn);
                 }
                 Some(ContentBlockDelta::ReasoningContent(delta)) => {
                     turn.push(ProviderTurnEvent::ReasoningDelta {
@@ -494,6 +490,19 @@ impl StreamAccumulator {
             _ => {}
         }
         Ok(None)
+    }
+
+    fn process_tool_use_delta(&mut self, content_block_index: i32, input: &str, turn: &TurnState) {
+        let entry = self.tool_calls.entry(content_block_index).or_default();
+        entry.arguments.push_str(input);
+        if !input.is_empty()
+            && let Some(call_id) = &entry.id
+        {
+            turn.push(ProviderTurnEvent::ToolCallDelta {
+                call_id: call_id.clone(),
+                delta: input.to_string(),
+            });
+        }
     }
 
     fn finish_tool_calls(&self, turn: &TurnState) -> Result<(), ProviderError> {
@@ -2076,6 +2085,28 @@ mod tests {
         let value = serde_json::json!({"path":"/tmp/file", "count": 2, "ok": true});
         let document = json_value_to_document(&value);
         assert_eq!(document_to_json_value(&document), value);
+    }
+
+    #[test]
+    fn tool_use_delta_emits_progress_event_when_call_id_is_known() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+        accumulator.tool_calls.insert(
+            0,
+            ToolCallAccumulator {
+                id: Some("call-1".to_string()),
+                name: Some("filesystem_write".to_string()),
+                arguments: String::new(),
+            },
+        );
+
+        accumulator.process_tool_use_delta(0, "{\"path\"", &turn);
+
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ToolCallDelta { call_id, delta }
+                if call_id == "call-1" && delta == "{\"path\""
+        )));
     }
 
     #[test]
