@@ -2168,7 +2168,9 @@ struct SaveDraftResponse {
 impl From<ReviewCommentAnchor> for DraftAnchor {
     fn from(anchor: ReviewCommentAnchor) -> Self {
         Self {
-            kind: if anchor.is_file_anchor {
+            kind: if anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+                ReviewAnchorKind::Review
+            } else if anchor.is_file_anchor {
                 ReviewAnchorKind::File
             } else {
                 ReviewAnchorKind::Range
@@ -2600,6 +2602,8 @@ impl ReviewLineKind {
     }
 }
 
+const REVIEW_LEVEL_ANCHOR_PATH: &str = "<review>";
+
 /// Draft comment line anchor.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReviewCommentAnchor {
@@ -2739,6 +2743,9 @@ impl LocalReviewThread {
     /// Return a compact line label for the thread anchor.
     #[must_use]
     pub fn line_label(&self) -> String {
+        if self.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+            return "review".to_string();
+        }
         self.anchor.new_start.or(self.anchor.old_start).map_or_else(
             || format!("@{}", self.anchor.diff_row),
             |line| format!("+{line}"),
@@ -3008,6 +3015,9 @@ impl ReviewThreadSummary {
     /// Return a compact line label for the thread anchor.
     #[must_use]
     pub fn line_label(&self) -> String {
+        if self.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+            return "review".to_string();
+        }
         self.anchor.new_start.or(self.anchor.old_start).map_or_else(
             || format!("@{}", self.anchor.diff_row),
             |line| format!("+{line}"),
@@ -6394,6 +6404,34 @@ impl ReviewApp {
         }
     }
 
+    /// Open the draft comment editor for a whole-review thread.
+    pub fn open_review_comment_editor(&mut self) -> bool {
+        let anchor = self.review_comment_anchor();
+        self.comment_editor = Some(ReviewCommentEditor::new(anchor));
+        self.status_message =
+            Some("editing review-level comment; enter/ctrl+s saves, esc cancels".to_string());
+        true
+    }
+
+    fn review_comment_anchor(&self) -> ReviewCommentAnchor {
+        ReviewCommentAnchor {
+            file_index: self.selected_file,
+            path: REVIEW_LEVEL_ANCHOR_PATH.to_string(),
+            diff_row: 0,
+            end_diff_row: None,
+            old_line: None,
+            new_line: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        }
+    }
+
     /// Open the draft comment editor for the selected diff line.
     pub fn open_comment_editor(&mut self) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
@@ -9406,6 +9444,25 @@ mod tests {
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
         );
+    }
+
+    #[test]
+    fn review_level_comment_saves_as_global_thread() {
+        let mut app = sample_app();
+
+        assert!(app.open_review_comment_editor());
+        let editor = app.comment_editor.as_mut().expect("editor should open");
+        editor.buffer = TextEditBuffer::from_text("overall review note");
+        assert!(app.save_comment_editor());
+
+        let pending = app
+            .take_pending_draft_save()
+            .expect("global comment should be pending persistence");
+        assert_eq!(pending.anchor.path, REVIEW_LEVEL_ANCHOR_PATH);
+        let draft_anchor = DraftAnchor::from(pending.anchor);
+        assert_eq!(draft_anchor.kind, ReviewAnchorKind::Review);
+        assert_eq!(draft_anchor.file_path, REVIEW_LEVEL_ANCHOR_PATH);
+        assert_eq!(app.local_review_threads()[0].line_label(), "review");
     }
 
     #[test]
