@@ -868,6 +868,43 @@ trait ReviewPublisher {
     ) -> Result<PublishReviewResponse, ReviewError>;
 }
 
+struct LocalMarkdownPublisher;
+
+impl ReviewPublisher for LocalMarkdownPublisher {
+    fn manifest(&self) -> ReviewPublisherManifest {
+        ReviewPublisherManifest {
+            id: "local_markdown".to_string(),
+            label: "Local review markdown".to_string(),
+            description: "Write a local-first Markdown review notebook export".to_string(),
+            capabilities: file_publisher_capabilities(),
+            options_schema: file_publisher_options_schema(),
+            route: None,
+        }
+    }
+
+    fn preview(
+        &self,
+        bundle: &ReviewBundle,
+        _options: &serde_json::Value,
+    ) -> Result<String, ReviewError> {
+        Ok(publish_local_markdown(bundle))
+    }
+
+    fn submit(
+        &self,
+        bundle: &ReviewBundle,
+        options: &serde_json::Value,
+    ) -> Result<PublishReviewResponse, ReviewError> {
+        write_file_publish(
+            self.manifest().id,
+            bundle,
+            options,
+            "md",
+            publish_local_markdown(bundle),
+        )
+    }
+}
+
 struct MarkdownFilePublisher;
 
 impl ReviewPublisher for MarkdownFilePublisher {
@@ -943,7 +980,11 @@ impl ReviewPublisher for JsonFilePublisher {
 }
 
 fn builtin_review_publishers() -> Vec<Box<dyn ReviewPublisher>> {
-    vec![Box::new(MarkdownFilePublisher), Box::new(JsonFilePublisher)]
+    vec![
+        Box::new(LocalMarkdownPublisher),
+        Box::new(MarkdownFilePublisher),
+        Box::new(JsonFilePublisher),
+    ]
 }
 
 fn builtin_publishers() -> Vec<ReviewPublisherManifest> {
@@ -1126,6 +1167,80 @@ fn publish_output_path(
             },
             PathBuf::from,
         )
+}
+
+fn publish_local_markdown(bundle: &ReviewBundle) -> String {
+    let mut output = String::new();
+    let _ = write!(output, "# Local review: {}\n\n", bundle.title);
+    let _ = writeln!(output, "* Review id: `{}`", bundle.review_id);
+    let _ = writeln!(output, "* Repository: `{}`", bundle.repo_root.display());
+    let _ = writeln!(output, "* Generated: `{}`", bundle.generated_at_ms);
+    let _ = writeln!(output, "* Files: `{}`", bundle.files.len());
+    let open_threads = bundle
+        .threads
+        .iter()
+        .filter(|thread| thread.resolved_at_ms.is_none())
+        .count();
+    let resolved_threads = bundle.threads.len().saturating_sub(open_threads);
+    let comment_count = bundle
+        .threads
+        .iter()
+        .map(|thread| thread.comments.len())
+        .sum::<usize>();
+    let _ = writeln!(output, "* Open threads: `{open_threads}`");
+    let _ = writeln!(output, "* Resolved threads: `{resolved_threads}`");
+    let _ = write!(output, "* Local comments: `{comment_count}`\n\n");
+
+    if !bundle.files.is_empty() {
+        output.push_str("## Files\n\n");
+        for file in &bundle.files {
+            let _ = writeln!(
+                output,
+                "* `{}` {:?} +{} -{}",
+                file.path, file.status, file.additions, file.deletions
+            );
+        }
+        output.push('\n');
+    }
+
+    if bundle.threads.is_empty() {
+        output.push_str("## Local review threads\n\nNo local review threads.\n");
+        return output;
+    }
+
+    output.push_str("## Local review threads\n\n");
+    for thread in &bundle.threads {
+        let status = if thread.resolved_at_ms.is_some() {
+            "resolved"
+        } else {
+            "open"
+        };
+        let _ = write!(
+            output,
+            "### `{}` {} ({status})\n\n",
+            thread.anchor.file_path,
+            anchor_label(&thread.anchor)
+        );
+        let _ = writeln!(output, "* Thread id: `{}`", thread.thread_id);
+        if let Some(session_id) = &thread.session_id {
+            let _ = writeln!(output, "* Bcode session: `{session_id}`");
+        }
+        if let Some(resolved_at_ms) = thread.resolved_at_ms {
+            let _ = writeln!(output, "* Resolved at: `{resolved_at_ms}`");
+        }
+        output.push('\n');
+        for comment in &thread.comments {
+            let _ = writeln!(output, "#### Comment `{}`\n", comment.comment_id);
+            output.push_str(&comment.body);
+            output.push_str("\n\n");
+        }
+        if !thread.selected_diff_lines.is_empty() {
+            output.push_str("Context:\n\n```diff\n");
+            output.push_str(&thread.selected_diff_lines.join("\n"));
+            output.push_str("\n```\n\n");
+        }
+    }
+    output
 }
 
 fn publish_markdown(bundle: &ReviewBundle) -> String {
@@ -3588,7 +3703,12 @@ mod tests {
     fn publisher_registry_lists_builtin_publishers() {
         let publishers = builtin_publishers();
 
-        assert_eq!(publishers.len(), 2);
+        assert_eq!(publishers.len(), 3);
+        assert!(
+            publishers
+                .iter()
+                .any(|publisher| publisher.id == "local_markdown")
+        );
         assert!(
             publishers
                 .iter()
@@ -3599,6 +3719,86 @@ mod tests {
                 .iter()
                 .any(|publisher| publisher.id == "json_file")
         );
+    }
+
+    #[test]
+    fn local_markdown_publisher_preview_is_local_review_report() {
+        let bundle = ReviewBundle {
+            review_id: "review-1".to_string(),
+            title: "Review".to_string(),
+            repo_root: PathBuf::from("/repo"),
+            target: ReviewTarget::WorkingTreeUnstaged,
+            surfaces: Vec::new(),
+            files: vec![ReviewFileSummary {
+                path: "src/lib.rs".to_string(),
+                status: ReviewFileStatus::Modified,
+                additions: 2,
+                deletions: 1,
+                hunks: 1,
+                is_binary: false,
+            }],
+            threads: vec![ReviewBundleThread {
+                thread_id: "thread-1".to_string(),
+                anchor: DraftAnchor {
+                    file_path: "src/lib.rs".to_string(),
+                    diff_row: 3,
+                    old_line: None,
+                    new_line: Some(2),
+                    start_diff_row: Some(3),
+                    end_diff_row: Some(3),
+                    old_start: None,
+                    old_end: None,
+                    new_start: Some(2),
+                    new_end: Some(2),
+                    line_kind: ReviewLineKind::Added,
+                    is_file_anchor: false,
+                    surface_id: None,
+                    source_id: None,
+                },
+                comments: vec![DraftComment {
+                    comment_id: "comment-1".to_string(),
+                    thread_id: "thread-1".to_string(),
+                    anchor: DraftAnchor {
+                        file_path: "src/lib.rs".to_string(),
+                        diff_row: 3,
+                        old_line: None,
+                        new_line: Some(2),
+                        start_diff_row: Some(3),
+                        end_diff_row: Some(3),
+                        old_start: None,
+                        old_end: None,
+                        new_start: Some(2),
+                        new_end: Some(2),
+                        line_kind: ReviewLineKind::Added,
+                        is_file_anchor: false,
+                        surface_id: None,
+                        source_id: None,
+                    },
+                    body: "Needs local follow-up".to_string(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    session_id: Some("session-1".to_string()),
+                    resolved_at_ms: None,
+                }],
+                session_id: Some("session-1".to_string()),
+                resolved_at_ms: None,
+                selected_lines: Vec::new(),
+                selected_diff_lines: vec!["+let x = 1;".to_string()],
+                hunk_context: Vec::new(),
+            }],
+            generated_at_ms: 1,
+        };
+
+        let preview = with_publisher("local_markdown", |publisher| {
+            publisher.preview(&bundle, &serde_json::json!({}))
+        })
+        .expect("local markdown preview");
+
+        assert!(preview.contains("# Local review: Review"));
+        assert!(preview.contains("* Open threads: `1`"));
+        assert!(preview.contains("### `src/lib.rs` row 3 (open)"));
+        assert!(preview.contains("* Bcode session: `session-1`"));
+        assert!(preview.contains("Needs local follow-up"));
     }
 
     #[test]
