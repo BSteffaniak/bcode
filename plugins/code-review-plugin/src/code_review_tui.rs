@@ -5599,6 +5599,13 @@ impl ReviewApp {
     }
 
     fn focus_thread_summary(&mut self, thread: &ReviewThreadSummary) {
+        if thread.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+            self.selected_view_target = Some(ReviewViewTarget::Thread {
+                thread_key: Self::thread_key_for_anchor(&thread.anchor),
+            });
+            self.status_message = Some("selected review-level thread".to_string());
+            return;
+        }
         self.select_anchor(&thread.anchor);
         self.selected_view_target = Some(ReviewViewTarget::Thread {
             thread_key: Self::thread_key_for_anchor(&thread.anchor),
@@ -5623,6 +5630,13 @@ impl ReviewApp {
             self.status_message = Some("no review thread selected".to_string());
             return true;
         };
+        if thread.anchor.path == REVIEW_LEVEL_ANCHOR_PATH {
+            self.selected_view_target = Some(ReviewViewTarget::Thread {
+                thread_key: Self::thread_key_for_anchor(&thread.anchor),
+            });
+            self.status_message = Some("jumped to review-level thread".to_string());
+            return true;
+        }
         self.select_anchor(&thread.anchor);
         self.selected_view_target = Some(ReviewViewTarget::Thread {
             thread_key: Self::thread_key_for_anchor(&thread.anchor),
@@ -7541,6 +7555,27 @@ impl ReviewApp {
     }
 
     fn anchor_from_persisted_draft(&self, draft: &DraftComment) -> Option<ReviewCommentAnchor> {
+        if draft.anchor.kind == ReviewAnchorKind::Review {
+            return Some(ReviewCommentAnchor {
+                file_index: self
+                    .selected_file
+                    .min(self.review.files.len().saturating_sub(1)),
+                path: REVIEW_LEVEL_ANCHOR_PATH.to_string(),
+                diff_row: 0,
+                end_diff_row: None,
+                old_line: None,
+                new_line: None,
+                old_start: None,
+                old_end: None,
+                new_start: None,
+                new_end: None,
+                line_kind: ReviewLineKind::Context,
+                is_file_anchor: false,
+                surface_id: draft.anchor.surface_id.clone(),
+                source_id: draft.anchor.source_id.clone(),
+            });
+        }
+
         let diff_row = usize::try_from(draft.anchor.diff_row).ok()?;
         let end_diff_row = draft
             .anchor
@@ -9445,6 +9480,43 @@ mod tests {
             app.publish_checklist_lines().first().map(String::as_str),
             Some("✓ ready to publish")
         );
+    }
+
+    #[test]
+    fn loads_persisted_review_level_drafts() {
+        let mut app = sample_app();
+        app.load_persisted_drafts(vec![DraftComment {
+            comment_id: "comment-review".to_string(),
+            thread_id: "thread-review".to_string(),
+            anchor: DraftAnchor {
+                kind: ReviewAnchorKind::Review,
+                file_path: REVIEW_LEVEL_ANCHOR_PATH.to_string(),
+                diff_row: 0,
+                start_diff_row: None,
+                end_diff_row: None,
+                old_start: None,
+                old_end: None,
+                new_start: None,
+                new_end: None,
+                old_line: None,
+                new_line: None,
+                line_kind: ReviewLineKind::Context,
+                is_file_anchor: false,
+                surface_id: None,
+                source_id: None,
+            },
+            body: "overall".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            session_id: None,
+            resolved_at_ms: None,
+        }]);
+
+        let threads = app.local_review_threads();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].anchor.path, REVIEW_LEVEL_ANCHOR_PATH);
+        assert_eq!(threads[0].line_label(), "review");
+        assert_eq!(threads[0].latest_body(), Some("overall"));
     }
 
     #[test]

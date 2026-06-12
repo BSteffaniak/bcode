@@ -1912,10 +1912,16 @@ fn context_for_anchor(
     summary: &ReviewSummary,
     anchor: &DraftAnchor,
 ) -> (Vec<ReviewBundleLine>, Vec<String>, Vec<String>) {
-    if anchor.is_file_anchor {
-        file_context_for_anchor(summary, anchor)
-    } else {
-        diff_context_for_anchor(summary, anchor)
+    match anchor.kind {
+        ReviewAnchorKind::Review => (Vec::new(), Vec::new(), Vec::new()),
+        ReviewAnchorKind::File => file_context_for_anchor(summary, anchor),
+        ReviewAnchorKind::Range => {
+            if anchor.is_file_anchor {
+                file_context_for_anchor(summary, anchor)
+            } else {
+                diff_context_for_anchor(summary, anchor)
+            }
+        }
     }
 }
 
