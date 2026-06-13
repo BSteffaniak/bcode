@@ -21,15 +21,13 @@ pub async fn update_slash_palette(
     slash_palette: &mut Option<slash_palette::SlashPalette>,
 ) {
     if chat.app.composer().text().starts_with('/') {
+        let current_query = chat.app.composer().text();
         let previous = slash_palette
             .as_ref()
+            .filter(|palette| palette.query() == current_query)
             .and_then(|palette| palette.selected_command().map(str::to_owned));
-        let mut next = slash_palette::SlashPalette::new(
-            client,
-            chat.app.session_id(),
-            chat.app.composer().text(),
-        )
-        .await;
+        let mut next =
+            slash_palette::SlashPalette::new(client, chat.app.session_id(), current_query).await;
         if let Some(previous) = previous {
             next.select_command(&previous);
         }

@@ -8,6 +8,7 @@ use bcode_session_models::SessionId;
 pub struct SlashPalette {
     items: Vec<SlashItem>,
     selected: usize,
+    query: String,
 }
 
 /// One slash completion item.
@@ -30,7 +31,11 @@ impl SlashPalette {
     /// Create slash completion state.
     pub async fn new(client: &BcodeClient, session_id: Option<SessionId>, query: &str) -> Self {
         let items = slash_items(client, session_id, query).await;
-        Self { items, selected: 0 }
+        Self {
+            items,
+            selected: 0,
+            query: query.to_owned(),
+        }
     }
 
     /// Return true if there are no completions.
@@ -43,6 +48,12 @@ impl SlashPalette {
     #[must_use]
     pub fn selected_index(&self) -> usize {
         self.selected.min(self.items.len().saturating_sub(1))
+    }
+
+    /// Return the query text used to build the completions.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
     }
 
     /// Return the number of completion items.
@@ -116,6 +127,7 @@ impl SlashPalette {
                 .map(|(command, description)| item(command, description))
                 .collect(),
             selected: 0,
+            query: String::new(),
         }
     }
 }
