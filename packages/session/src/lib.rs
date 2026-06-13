@@ -372,6 +372,7 @@ pub struct SessionManager {
     activity_clock_ms: AtomicU64,
     catalog_status_tx: watch::Sender<CatalogLoadStatus>,
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
+    mutation_tx: broadcast::Sender<SessionMutationCommitted>,
     metrics: MetricsRegistry,
 }
 
@@ -500,6 +501,14 @@ pub struct SessionAttachment {
     pub live_events: broadcast::Receiver<SessionLiveEvent>,
 }
 
+/// Notification emitted after a durable session mutation is committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMutationCommitted {
+    pub session_id: SessionId,
+    pub event: SessionEvent,
+    pub summary: SessionSummary,
+}
+
 /// Active session attachment plus projection-window metadata.
 #[derive(Debug)]
 pub struct SessionProjectionWindowAttachment {
@@ -516,6 +525,7 @@ impl Default for SessionManager {
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
             catalog_status_tx,
             catalog_status_rx,
+            mutation_tx: broadcast::channel(1024).0,
             metrics: MetricsRegistry::default(),
         }
     }
@@ -600,6 +610,7 @@ impl SessionManager {
             CatalogLoadStatus::NotStarted
         };
         let (catalog_status_tx, catalog_status_rx) = watch::channel(catalog_status);
+        let (mutation_tx, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(Mutex::new(SessionManagerInner {
                 sessions: sessions
@@ -617,8 +628,23 @@ impl SessionManager {
             activity_clock_ms: AtomicU64::new(current_unix_millis()),
             catalog_status_tx,
             catalog_status_rx,
+            mutation_tx,
             metrics,
         }
+    }
+
+    /// Subscribe to committed durable session mutations.
+    #[must_use]
+    pub fn subscribe_mutations(&self) -> broadcast::Receiver<SessionMutationCommitted> {
+        self.mutation_tx.subscribe()
+    }
+
+    fn publish_committed_mutation(&self, event: SessionEvent, summary: SessionSummary) {
+        let _ = self.mutation_tx.send(SessionMutationCommitted {
+            session_id: event.session_id,
+            event,
+            summary,
+        });
     }
 
     /// Return the persistent session store root, when this manager is store-backed.
@@ -942,7 +968,7 @@ impl SessionManager {
             .map(|store| lease::acquire_session_lease(&store.root_path(), id, store.lease_owner()))
             .transpose()?;
         let handle = SessionHandle::new(state, self.store.clone());
-        handle
+        let event = handle
             .append_event(
                 SessionEventKind::SessionCreated {
                     name,
@@ -959,6 +985,7 @@ impl SessionManager {
             }
         }
         self.release_persistent_idle_session_resources(id).await;
+        self.publish_committed_mutation(event, summary.clone());
         Ok(summary)
     }
 
@@ -1617,8 +1644,12 @@ impl SessionManager {
         let events = handle
             .append_user_message(client_id, text, activity_timestamp_ms)
             .await?;
+        let summary = handle.summary().await?;
         self.release_persistent_idle_session_resources(session_id)
             .await;
+        for event in &events {
+            self.publish_committed_mutation(event.clone(), summary.clone());
+        }
         Ok(events)
     }
 
@@ -2034,8 +2065,10 @@ impl SessionManager {
         let handle = self.session_handle(session_id).await?;
         let activity_timestamp_ms = self.next_activity_timestamp_ms();
         let event = handle.append_event(kind, activity_timestamp_ms).await?;
+        let summary = handle.summary().await?;
         self.release_persistent_idle_session_resources(session_id)
             .await;
+        self.publish_committed_mutation(event.clone(), summary);
         Ok(event)
     }
 
@@ -2059,8 +2092,10 @@ impl SessionManager {
         let event = handle
             .append_event_with_provenance(kind, provenance, activity_timestamp_ms)
             .await?;
+        let summary = handle.summary().await?;
         self.release_persistent_idle_session_resources(session_id)
             .await;
+        self.publish_committed_mutation(event.clone(), summary);
         Ok(event)
     }
 

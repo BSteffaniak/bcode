@@ -848,6 +848,30 @@ impl ServerState {
                 broadcast_catalog_update(&state, revision).await;
             }
         });
+
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut mutations = state.sessions.subscribe_mutations();
+            loop {
+                match mutations.recv().await {
+                    Ok(mutation) => {
+                        state
+                            .session_catalog
+                            .upsert_native_session(mutation.summary)
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            target: "bcode_server::session_catalog",
+                            skipped,
+                            "session mutation subscriber lagged; refreshing native catalog"
+                        );
+                        state.session_catalog.refresh_native_now(&state).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     fn start_idle_shutdown_watcher(self: &Arc<Self>, idle_after: Duration) {
@@ -8649,9 +8673,6 @@ fn plugin_service_summaries(
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
-    if let Ok(session) = state.sessions.session_summary(event.session_id).await {
-        state.session_catalog.upsert_native_session(session).await;
-    }
     state
         .metrics
         .record_event("session.event", 1, session_event_metric_labels(event));
