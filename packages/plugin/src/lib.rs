@@ -2741,7 +2741,89 @@ mod tests {
     use bcode_plugin_sdk::{SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK};
     use semver::Version;
     use std::path::PathBuf;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn per_session_resource_limit_prevents_one_session_from_exhausting_global_slots() {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+
+        tokio.block_on(async {
+            let limiter = Arc::new(PluginResourceLimiter::new(2, 1));
+            let session_a = PluginInvocationScope::session("session-a");
+            let session_b = PluginInvocationScope::session("session-b");
+            let first_a = limiter
+                .acquire(&session_a)
+                .await
+                .expect("first session A permit should acquire");
+
+            let (acquired_sender, mut acquired_receiver) = oneshot::channel();
+            tokio::spawn({
+                let limiter = Arc::clone(&limiter);
+                let session_a = session_a.clone();
+                async move {
+                    let permit = limiter
+                        .acquire(&session_a)
+                        .await
+                        .expect("second session A permit should acquire");
+                    let _ = acquired_sender.send(());
+                    drop(permit);
+                }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut acquired_receiver)
+                    .await
+                    .is_err(),
+                "second session A permit should wait on per-session capacity"
+            );
+
+            let session_b_permit =
+                tokio::time::timeout(Duration::from_millis(100), limiter.acquire(&session_b))
+                    .await
+                    .expect("session B should not wait behind session A")
+                    .expect("session B permit should acquire");
+            drop(session_b_permit);
+            drop(first_a);
+
+            tokio::time::timeout(Duration::from_millis(100), acquired_receiver)
+                .await
+                .expect("session A waiter should complete after first permit drops")
+                .expect("session A waiter should signal acquisition");
+        });
+    }
+
+    #[test]
+    fn dropped_resource_permit_releases_session_slot() {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+
+        tokio.block_on(async {
+            let limiter = PluginResourceLimiter::new(1, 1);
+            let scope = PluginInvocationScope::session("session-a");
+            let permit = limiter
+                .acquire(&scope)
+                .await
+                .expect("first permit should acquire");
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), limiter.acquire(&scope))
+                    .await
+                    .is_err(),
+                "second permit should wait while slot is held"
+            );
+
+            drop(permit);
+            let permit = tokio::time::timeout(Duration::from_millis(100), limiter.acquire(&scope))
+                .await
+                .expect("permit should acquire after previous permit drops")
+                .expect("permit should acquire");
+            drop(permit);
+        });
+    }
 
     #[test]
     fn parses_invocation_class_names_as_manifest_snake_case() {
