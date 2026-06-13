@@ -842,6 +842,16 @@ pub enum PluginInvocationClass {
     Service,
 }
 
+/// Runtime isolation category for a plugin operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginOperationKind {
+    /// Short lifecycle, discovery, metadata, or policy operation.
+    Control,
+    /// Turn, tool, subprocess, network stream, or other user/session data-plane operation.
+    Data,
+}
+
 /// Runtime plugin invocation identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PluginInvocationId(u64);
@@ -961,6 +971,7 @@ struct PluginInvocation {
     id: PluginInvocationId,
     class: PluginInvocationClass,
     enqueued_at: Instant,
+    kind: PluginOperationKind,
     interface_id: String,
     operation: String,
     payload: Vec<u8>,
@@ -1054,6 +1065,7 @@ impl PluginExecutorHandle {
         let (response, response_receiver) = oneshot::channel();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let invocation_id = next_plugin_invocation_id();
+        let kind = classify_operation_kind(&interface_id, &operation, class);
         let cancel = PluginInvocationCancelHandle {
             id: invocation_id,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -1064,6 +1076,7 @@ impl PluginExecutorHandle {
                     id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
+                    kind,
                     interface_id,
                     operation,
                     payload,
@@ -1094,6 +1107,7 @@ impl PluginExecutorHandle {
                     id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
+                    kind,
                     interface_id,
                     operation,
                     payload,
@@ -1129,10 +1143,12 @@ impl PluginExecutorHandle {
         event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let invocation_id = next_plugin_invocation_id();
+        let kind = classify_operation_kind(&interface_id, &operation, class);
         let invocation = PluginInvocation {
             id: invocation_id,
             class,
             enqueued_at: Instant::now(),
+            kind,
             interface_id,
             operation,
             payload,
@@ -1704,6 +1720,7 @@ fn execute_plugin_service_invocation(
         plugin_id = %plugin.manifest.id,
         invocation_id = invocation.id.get(),
         class = ?invocation.class,
+        kind = ?invocation.kind,
         queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
         interface_id = %invocation.interface_id,
         operation = %invocation.operation,
@@ -1789,6 +1806,7 @@ fn spawn_exclusive_plugin_executor(
                         plugin_id = %plugin.manifest.id,
                         invocation_id = invocation.id.get(),
                         class = ?invocation.class,
+                        kind = ?invocation.kind,
                         queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
                         interface_id = %invocation.interface_id,
                         operation = %invocation.operation,
@@ -1878,14 +1896,45 @@ fn spawn_exclusive_plugin_executor(
 
 fn classify_invocation(interface_id: &str, operation: &str) -> PluginInvocationClass {
     match (interface_id, operation) {
-        ("bcode.tool", "invoke_tool") => PluginInvocationClass::ToolExecution,
-        ("bcode.tool", "list_tools") => PluginInvocationClass::Query,
-        ("bcode.model", _) => PluginInvocationClass::ModelProvider,
+        ("bcode.tool/v1", "invoke_tool") => PluginInvocationClass::ToolExecution,
+        ("bcode.tool/v1", "list_tools") => PluginInvocationClass::Query,
+        ("bcode.model-provider/v1", "capabilities" | "models" | "validate_config") => {
+            PluginInvocationClass::Query
+        }
+        ("bcode.model-provider/v1", _) => PluginInvocationClass::ModelProvider,
         ("bcode.agent_profile", "policy_status" | "list_agents" | "agent_context") => {
             PluginInvocationClass::Control
         }
         ("bcode.agent_profile", "evaluate_tool_call") => PluginInvocationClass::Control,
         _ => PluginInvocationClass::Service,
+    }
+}
+
+fn classify_operation_kind(
+    interface_id: &str,
+    operation: &str,
+    class: PluginInvocationClass,
+) -> PluginOperationKind {
+    match (interface_id, operation) {
+        ("bcode.tool/v1", "list_tools")
+        | ("bcode.model-provider/v1", "capabilities" | "models" | "validate_config") => {
+            return PluginOperationKind::Control;
+        }
+        ("bcode.tool/v1", "invoke_tool")
+        | (
+            "bcode.model-provider/v1",
+            "start_turn" | "poll_turn_events" | "cancel_turn" | "finish_turn" | "native_web_search",
+        ) => return PluginOperationKind::Data,
+        _ => {}
+    }
+    match class {
+        PluginInvocationClass::ToolExecution | PluginInvocationClass::ModelProvider => {
+            PluginOperationKind::Data
+        }
+        PluginInvocationClass::Control
+        | PluginInvocationClass::Query
+        | PluginInvocationClass::EventDelivery
+        | PluginInvocationClass::Service => PluginOperationKind::Control,
     }
 }
 
@@ -2487,6 +2536,54 @@ library = "libexample_plugin.dylib"
         let encoded = serde_json::to_value(PluginInvocationClass::ToolExecution)
             .expect("invocation class should encode");
         assert_eq!(encoded, serde_json::json!("tool_execution"));
+    }
+
+    #[test]
+    fn classifies_versioned_tool_and_model_operations() {
+        assert_eq!(
+            classify_invocation("bcode.tool/v1", "invoke_tool"),
+            PluginInvocationClass::ToolExecution
+        );
+        assert_eq!(
+            classify_invocation("bcode.tool/v1", "list_tools"),
+            PluginInvocationClass::Query
+        );
+        assert_eq!(
+            classify_invocation("bcode.model-provider/v1", "start_turn"),
+            PluginInvocationClass::ModelProvider
+        );
+        assert_eq!(
+            classify_invocation("bcode.model-provider/v1", "models"),
+            PluginInvocationClass::Query
+        );
+    }
+
+    #[test]
+    fn classifies_data_plane_operation_kind_explicitly() {
+        assert_eq!(
+            classify_operation_kind(
+                "bcode.tool/v1",
+                "invoke_tool",
+                PluginInvocationClass::ToolExecution,
+            ),
+            PluginOperationKind::Data
+        );
+        assert_eq!(
+            classify_operation_kind(
+                "bcode.model-provider/v1",
+                "start_turn",
+                PluginInvocationClass::ModelProvider,
+            ),
+            PluginOperationKind::Data
+        );
+        assert_eq!(
+            classify_operation_kind(
+                "bcode.model-provider/v1",
+                "models",
+                PluginInvocationClass::Query,
+            ),
+            PluginOperationKind::Control
+        );
     }
 
     #[test]
