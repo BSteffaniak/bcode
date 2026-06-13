@@ -4061,7 +4061,7 @@ struct ToolArgumentStreamProgress {
     name: String,
     argument_bytes: usize,
     last_emitted_argument_bytes: usize,
-    next_byte_threshold: usize,
+    last_emitted_at: Option<Instant>,
     emitted_progress_events: usize,
     force_emit_final: bool,
 }
@@ -4269,8 +4269,10 @@ impl ModelStreamAccumulator {
 }
 
 impl ModelStreamProgress {
-    const INITIAL_TOOL_PROGRESS_THRESHOLD: usize = 4 * 1024;
-    const MAX_TOOL_PROGRESS_EVENTS: usize = 64;
+    const FIRST_TOOL_PROGRESS_BYTES: usize = 512;
+    const TOOL_PROGRESS_MIN_BYTES: usize = 1024;
+    const TOOL_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_TOOL_PROGRESS_EVENTS: usize = 512;
 
     fn start_tool_call(&mut self, call_id: String, name: String) {
         self.active_tool_call = Some(ToolArgumentStreamProgress {
@@ -4278,7 +4280,7 @@ impl ModelStreamProgress {
             name,
             argument_bytes: 0,
             last_emitted_argument_bytes: 0,
-            next_byte_threshold: Self::INITIAL_TOOL_PROGRESS_THRESHOLD,
+            last_emitted_at: None,
             emitted_progress_events: 0,
             force_emit_final: false,
         });
@@ -4322,8 +4324,22 @@ impl ModelStreamProgress {
             if active.emitted_progress_events >= Self::MAX_TOOL_PROGRESS_EVENTS {
                 return None;
             }
-            if active.argument_bytes < active.next_byte_threshold {
-                return None;
+            if active.emitted_progress_events == 0 {
+                if active.argument_bytes < Self::FIRST_TOOL_PROGRESS_BYTES {
+                    return None;
+                }
+            } else {
+                let byte_delta = active
+                    .argument_bytes
+                    .saturating_sub(active.last_emitted_argument_bytes);
+                if byte_delta < Self::TOOL_PROGRESS_MIN_BYTES {
+                    return None;
+                }
+                if active.last_emitted_at.is_some_and(|emitted_at| {
+                    emitted_at.elapsed() < Self::TOOL_PROGRESS_MIN_INTERVAL
+                }) {
+                    return None;
+                }
             }
         } else if active.argument_bytes == active.last_emitted_argument_bytes {
             return None;
@@ -4331,14 +4347,7 @@ impl ModelStreamProgress {
         active.force_emit_final = false;
         active.emitted_progress_events = active.emitted_progress_events.saturating_add(1);
         active.last_emitted_argument_bytes = active.argument_bytes;
-        while active.next_byte_threshold <= active.argument_bytes {
-            let next = active.next_byte_threshold.saturating_mul(2);
-            if next == active.next_byte_threshold {
-                active.next_byte_threshold = usize::MAX;
-                break;
-            }
-            active.next_byte_threshold = next;
-        }
+        active.last_emitted_at = Some(Instant::now());
         Some(ProviderToolCallProgress {
             tool_call_id: active.call_id.clone(),
             tool_name: active.name.clone(),
