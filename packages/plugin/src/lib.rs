@@ -2796,6 +2796,60 @@ mod tests {
     }
 
     #[test]
+    fn many_waiters_in_one_session_do_not_starve_other_sessions() {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+
+        tokio.block_on(async {
+            let limiter = Arc::new(PluginResourceLimiter::new(2, 1));
+            let session_a = PluginInvocationScope::session("session-a");
+            let session_b = PluginInvocationScope::session("session-b");
+            let first_a = limiter
+                .acquire(&session_a)
+                .await
+                .expect("first session A permit should acquire");
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let mut waiters = Vec::new();
+
+            for _ in 0..8 {
+                let limiter = Arc::clone(&limiter);
+                let session_a = session_a.clone();
+                let sender = sender.clone();
+                waiters.push(tokio::spawn(async move {
+                    let permit = limiter
+                        .acquire(&session_a)
+                        .await
+                        .expect("session A waiter permit should acquire");
+                    let _ = sender.send(());
+                    drop(permit);
+                }));
+            }
+            drop(sender);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), receiver.recv())
+                    .await
+                    .is_err(),
+                "queued session A waiters should not acquire while session A is at capacity"
+            );
+
+            let session_b_permit =
+                tokio::time::timeout(Duration::from_millis(100), limiter.acquire(&session_b))
+                    .await
+                    .expect("session B should acquire despite queued session A waiters")
+                    .expect("session B permit should acquire");
+            drop(session_b_permit);
+
+            for waiter in waiters {
+                waiter.abort();
+            }
+            drop(first_a);
+        });
+    }
+
+    #[test]
     fn dropped_resource_permit_releases_session_slot() {
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
