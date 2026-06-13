@@ -7,6 +7,9 @@ description  = "Amazon Bedrock ConverseStream model provider"
 interface_id = "bcode.model-provider/v1"
 name         = "Amazon Bedrock Model Provider"
 
+[concurrency]
+type = "concurrent"
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"

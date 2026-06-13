@@ -9,8 +9,7 @@ interface_id = "bcode.tool/v1"
 name         = "Shell Tools"
 
 [concurrency]
-max  = 2
-type = "limited"
+type = "concurrent"
 
 [runtime]
 abi_version    = 1
