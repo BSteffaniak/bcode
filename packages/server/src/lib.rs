@@ -66,9 +66,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const CLIENT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const CATALOG_EVENT_BROADCAST_BATCH_SIZE: usize = 16;
 
 /// Shared client writer.
 type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
@@ -8840,20 +8841,52 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
 async fn broadcast_catalog_update(state: &ServerState, revision: u64) {
     let event = Event::SessionCatalogUpdated { revision };
     let mut disconnected_clients = Vec::new();
+    let mut send_tasks = JoinSet::new();
     for sink in state.catalog_event_sinks().await {
-        let client_id = sink.client_id();
-        if let Err(error) = sink.send(event.clone()).await {
-            disconnected_clients.push(client_id);
-            if !is_expected_disconnect(&error) {
-                eprintln!("failed to send catalog update event to {client_id}: {error}");
-            }
-        } else {
-            state.mark_catalog_event_sent(client_id, revision).await;
+        let event = event.clone();
+        send_tasks.spawn(async move {
+            let client_id = sink.client_id();
+            (client_id, sink.send(event).await)
+        });
+        if send_tasks.len() >= CATALOG_EVENT_BROADCAST_BATCH_SIZE {
+            collect_catalog_send_result(
+                state,
+                revision,
+                &mut send_tasks,
+                &mut disconnected_clients,
+            )
+            .await;
         }
+    }
+    while !send_tasks.is_empty() {
+        collect_catalog_send_result(state, revision, &mut send_tasks, &mut disconnected_clients)
+            .await;
     }
     state
         .unregister_catalog_event_clients(&disconnected_clients)
         .await;
+}
+
+async fn collect_catalog_send_result(
+    state: &ServerState,
+    revision: u64,
+    send_tasks: &mut JoinSet<(ClientId, Result<(), CodecError>)>,
+    disconnected_clients: &mut Vec<ClientId>,
+) {
+    let Some(result) = send_tasks.join_next().await else {
+        return;
+    };
+    let Ok((client_id, send_result)) = result else {
+        return;
+    };
+    if let Err(error) = send_result {
+        disconnected_clients.push(client_id);
+        if !is_expected_disconnect(&error) {
+            eprintln!("failed to send catalog update event to {client_id}: {error}");
+        }
+    } else {
+        state.mark_catalog_event_sent(client_id, revision).await;
+    }
 }
 
 fn is_expected_disconnect(error: &CodecError) -> bool {
