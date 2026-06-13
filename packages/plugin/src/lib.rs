@@ -2741,6 +2741,7 @@ mod tests {
     use bcode_plugin_sdk::{SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK};
     use semver::Version;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -3257,6 +3258,132 @@ library = "libexample_plugin.dylib"
         });
         assert_eq!(SLOW_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(FAST_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn concurrent_model_provider_invocations_do_not_block_other_sessions() {
+        use bcode_plugin_sdk::StaticPluginVtable;
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        static SLOW_MODEL_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static FAST_MODEL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        fn service(
+            _: *const c_void,
+            input_ptr: *const u8,
+            input_len: usize,
+            output: *mut u8,
+            cap: usize,
+            len: *mut usize,
+        ) -> i32 {
+            let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+            let context = serde_json::from_slice::<bcode_plugin_sdk::NativeServiceContext>(input)
+                .expect("service context should decode");
+            if context.request.operation == "slow_start_turn" {
+                SLOW_MODEL_CALLS.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                write_test_response(&ServiceResponse::text("slow"), output, cap, len)
+            } else {
+                FAST_MODEL_CALLS.fetch_add(1, Ordering::SeqCst);
+                write_test_response(&ServiceResponse::text("fast"), output, cap, len)
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn service_streaming(
+            _: *const c_void,
+            input_ptr: *const u8,
+            input_len: usize,
+            output: *mut u8,
+            cap: usize,
+            len: *mut usize,
+            _: Option<ServiceEventCallback>,
+            _: *mut c_void,
+        ) -> i32 {
+            service(std::ptr::null(), input_ptr, input_len, output, cap, len)
+        }
+
+        fn manifest() -> PluginManifest {
+            let mut manifest = test_manifest("model");
+            manifest.concurrency = PluginConcurrencyConfig::Concurrent;
+            manifest.services = vec![PluginService {
+                interface_id: "bcode.model-provider/v1".to_string(),
+                name: Some("model".to_string()),
+                description: None,
+                class: Some(PluginInvocationClass::ModelProvider),
+                concurrency: None,
+            }];
+            manifest
+        }
+
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+
+        tokio.block_on(async {
+            let runtime = PluginRuntimeHost::from(PluginHost {
+                configs: BTreeMap::new(),
+                loaded: vec![LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: manifest(),
+                    backend: LoadedPluginBackend::Static {
+                        vtable: StaticPluginVtable {
+                            instance: std::ptr::null(),
+                            manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
+                                std::ptr::null()
+                            },
+                            activate: test_activate,
+                            deactivate: test_deactivate,
+                            invoke_service: service,
+                            invoke_service_streaming: service_streaming,
+                            handle_event: test_handle_event,
+                            tui_registry: None,
+                        },
+                    },
+                }],
+            });
+
+            let slow_runtime = runtime.clone();
+            let slow = tokio::spawn(async move {
+                slow_runtime
+                    .invoke_service_scoped(
+                        "model",
+                        "bcode.model-provider/v1",
+                        "slow_start_turn",
+                        Vec::new(),
+                        PluginInvocationScope::session("session-a"),
+                    )
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            let fast_start = Instant::now();
+            let fast = runtime
+                .invoke_service_scoped(
+                    "model",
+                    "bcode.model-provider/v1",
+                    "fast_start_turn",
+                    Vec::new(),
+                    PluginInvocationScope::session("session-b"),
+                )
+                .await
+                .expect("fast model invocation should complete");
+            assert!(fast_start.elapsed() < Duration::from_millis(100));
+            assert_eq!(fast.payload, b"fast");
+
+            let slow = slow
+                .await
+                .expect("slow invocation task should join")
+                .expect("slow model invocation should complete");
+            assert_eq!(slow.payload, b"slow");
+        });
+
+        assert_eq!(SLOW_MODEL_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(FAST_MODEL_CALLS.load(Ordering::SeqCst), 1);
     }
 
     fn test_activate(_: *const std::ffi::c_void) -> i32 {
